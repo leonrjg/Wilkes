@@ -1,52 +1,38 @@
 import { useState, useCallback, useEffect, useRef } from "react";
-import { tauriApi } from "../services/tauri";
-import DirectoryPicker from "./DirectoryPicker";
 import ExtensionFilter from "./ExtensionFilter";
 import type { FileEntry, SearchQuery } from "../lib/types";
 
 interface Props {
   onSearch: (query: SearchQuery) => void;
   searching: boolean;
-  initialDirectory?: string;
-  bookmarks?: string[];
+  sourceSlot: React.ReactNode;
+  directory?: string;
   respectGitignore?: boolean;
   maxFileSize?: number;
   contextLines?: number;
   fileList?: FileEntry[];
   excluded?: Set<string>;
   onExcludedChange?: (excluded: Set<string>) => void;
-  onDirectoryChange?: (dir: string) => void;
-  onBookmarkAdd?: (dir: string) => void;
-  onBookmarkRemove?: (dir: string) => void;
   onQueryChange?: (hasQuery: boolean) => void;
 }
 
 export default function SearchBar({
   onSearch,
   searching,
-  initialDirectory = "",
-  bookmarks = [],
+  sourceSlot,
+  directory = "",
   respectGitignore = true,
   maxFileSize = 10 * 1024 * 1024,
   contextLines = 2,
   fileList = [],
   excluded = new Set<string>(),
   onExcludedChange,
-  onDirectoryChange,
-  onBookmarkAdd,
-  onBookmarkRemove,
   onQueryChange,
 }: Props) {
   const [pattern, setPattern] = useState("");
   const [isRegex, setIsRegex] = useState(false);
   const [caseSensitive, setCaseSensitive] = useState(false);
-  const [directory, setDirectory] = useState(initialDirectory);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // Sync initialDirectory after settings load
-  useEffect(() => {
-    if (initialDirectory && !directory) setDirectory(initialDirectory);
-  }, [initialDirectory]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const buildQuery = useCallback(
     (pat: string): SearchQuery => {
@@ -80,7 +66,7 @@ export default function SearchBar({
   // Notify parent when query presence changes
   useEffect(() => {
     onQueryChange?.(pattern.trim().length > 0);
-  }, [pattern]);  // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pattern]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Debounce pattern changes
   useEffect(() => {
@@ -95,16 +81,6 @@ export default function SearchBar({
   useEffect(() => {
     if (pattern.trim()) triggerSearch(pattern);
   }, [isRegex, caseSensitive, directory, excluded, fileList]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const handleDirectoryChange = (dir: string) => {
-    setDirectory(dir);
-    onDirectoryChange?.(dir);
-  };
-
-  const handlePickDirectory = async () => {
-    const picked = await tauriApi.pickDirectory();
-    if (picked) handleDirectoryChange(picked);
-  };
 
   return (
     <div className="flex flex-col gap-2 p-3 border-b border-neutral-800 bg-neutral-900">
@@ -138,17 +114,9 @@ export default function SearchBar({
         />
       </div>
 
-      {/* Bottom row: directory + extension filter */}
+      {/* Bottom row: source slot + extension filter */}
       <div className="flex items-center gap-2 flex-wrap">
-        <DirectoryPicker
-          directory={directory}
-          bookmarks={bookmarks}
-          onChange={handleDirectoryChange}
-          onPickDirectory={handlePickDirectory}
-          onBookmarkAdd={onBookmarkAdd}
-          onBookmarkRemove={onBookmarkRemove}
-        />
-
+        {sourceSlot}
         <ExtensionFilter fileList={fileList} excluded={excluded} onChange={onExcludedChange ?? (() => {})} />
       </div>
     </div>

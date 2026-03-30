@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { EditorState } from "@codemirror/state";
 import { EditorView, Decoration, DecorationSet } from "@codemirror/view";
 import { basicSetup } from "codemirror";
@@ -23,6 +22,7 @@ import { StateField, StateEffect } from "@codemirror/state";
 import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/TextLayer.css";
 import type { MatchRef, PreviewData, BoundingBox } from "../lib/types";
+import type { SearchApi } from "../services/api";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -335,13 +335,14 @@ interface Props {
   previewData: PreviewData | null;
   loading: boolean;
   selectedMatch: MatchRef | null;
+  api: SearchApi;
 }
 
 function fileName(path: string) {
   return path.split(/[/\\]/).pop() ?? path;
 }
 
-export default function PreviewPane({ previewData, loading, selectedMatch }: Props) {
+export default function PreviewPane({ previewData, loading, selectedMatch, api }: Props) {
   // Keep the last valid previewData so the content stays mounted while a new
   // match is loading. This prevents PdfViewer from unmounting/remounting on
   // every match click, which would force react-pdf to re-parse the PDF file.
@@ -394,7 +395,7 @@ export default function PreviewPane({ previewData, loading, selectedMatch }: Pro
           />
         ) : (
           <PdfViewer
-            url={convertFileSrc(selectedMatch.path)}
+            url={api.resolvePdfUrl(selectedMatch.path)}
             page={displayData.Pdf.page}
             highlight_bbox={displayData.Pdf.highlight_bbox}
           />

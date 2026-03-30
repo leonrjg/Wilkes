@@ -6,6 +6,12 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::task::JoinHandle;
 use wilkes_core::types::{FileEntry, MatchRef, SearchQuery, SearchStats, Settings};
 
+fn desktop_settings_path() -> anyhow::Result<std::path::PathBuf> {
+    let config = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
+    Ok(config.join("wilkes").join("settings.json"))
+}
+
 // ── App state ────────────────────────────────────────────────────────────────
 
 struct ActiveSearches(Mutex<HashMap<String, JoinHandle<()>>>);
@@ -90,7 +96,8 @@ async fn preview(match_ref: MatchRef) -> Result<wilkes_core::types::PreviewData,
 /// Load persisted settings (returns defaults if no settings file exists yet).
 #[tauri::command]
 async fn get_settings() -> Result<Settings, String> {
-    wilkes_api::commands::settings::get_settings()
+    let path = desktop_settings_path().map_err(|e| e.to_string())?;
+    wilkes_api::commands::settings::get_settings(&path)
         .await
         .map_err(|e| e.to_string())
 }
@@ -98,7 +105,8 @@ async fn get_settings() -> Result<Settings, String> {
 /// Merge a partial settings patch and persist. Returns the full new settings.
 #[tauri::command]
 async fn update_settings(patch: serde_json::Value) -> Result<Settings, String> {
-    wilkes_api::commands::settings::update_settings(patch)
+    let path = desktop_settings_path().map_err(|e| e.to_string())?;
+    wilkes_api::commands::settings::update_settings(&path, patch)
         .await
         .map_err(|e| e.to_string())
 }

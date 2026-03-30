@@ -37,3 +37,23 @@ clippy:
 # Vite dev server only (no Tauri, for UI-only iteration)
 ui-dev:
     npm --prefix ui run dev
+
+# Run the HTTP server in dev mode (requires a separate `just ui-build` or `just ui-dev`)
+server-dev: ui-install
+    cargo run --bin wilkes-server -- --data-dir ./data --dist-dir ./ui/dist --port 3000
+
+# Build the server binary for release
+server-build:
+    cargo build --release --bin wilkes-server
+
+# Build the frontend for server mode (output to ui/dist)
+ui-build: ui-install
+    npm --prefix ui run build
+
+# Build the Docker image
+docker-build:
+    docker build -t wilkes-server .
+
+# Run the Docker container (mounts ./data for persistence)
+docker-run:
+    docker run -p 3000:3000 -v "$(pwd)/data:/data" wilkes-server

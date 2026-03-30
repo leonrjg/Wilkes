@@ -2,8 +2,17 @@ import { useState, useCallback, useRef, useEffect, useTransition } from "react";
 import SearchBar from "./components/SearchBar";
 import ResultList from "./components/ResultList";
 import PreviewPane from "./components/PreviewPane";
-import { tauriApi } from "./services/tauri";
+import DirectoryPicker from "./components/DirectoryPicker";
+import UploadZone from "./components/UploadZone";
+import { TauriSearchApi, TauriSourceApi } from "./services/tauri";
+import { HttpSearchApi, HttpSourceApi } from "./services/http";
+import type { SearchApi, SourceApi, DesktopSourceApi, WebSourceApi } from "./services/api";
 import type { FileEntry, FileMatches, MatchRef, PreviewData, SearchQuery, SearchStats } from "./lib/types";
+
+const isTauri = "__TAURI_INTERNALS__" in window;
+
+const api: SearchApi = isTauri ? new TauriSearchApi() : new HttpSearchApi();
+const source: SourceApi = isTauri ? new TauriSourceApi() : new HttpSourceApi();
 
 export default function App() {
   const [results, setResults] = useState<FileMatches[]>([]);
@@ -16,7 +25,6 @@ export default function App() {
   const currentSearchId = useRef<string | null>(null);
 
   const [bookmarks, setBookmarks] = useState<string[]>([]);
-  const [initialDirectory, setInitialDirectory] = useState<string>("");
   const [directory, setDirectory] = useState<string>("");
   const [respectGitignore, setRespectGitignore] = useState(true);
   const [maxFileSize, setMaxFileSize] = useState(10 * 1024 * 1024);
@@ -25,10 +33,9 @@ export default function App() {
   const [excluded, setExcluded] = useState<Set<string>>(new Set());
 
   useEffect(() => {
-    tauriApi.getSettings().then((s) => {
+    api.getSettings().then((s) => {
       setBookmarks(s.bookmarked_dirs);
       const dir = s.last_directory ?? "";
-      setInitialDirectory(dir);
       setDirectory(dir);
       setRespectGitignore(s.respect_gitignore);
       setMaxFileSize(s.max_file_size);
@@ -38,7 +45,7 @@ export default function App() {
 
   useEffect(() => {
     if (!directory) return;
-    tauriApi.listFiles(directory).then((files) => {
+    api.listFiles(directory).then((files) => {
       setFileList(files);
       setExcluded(new Set());
     }).catch(() => {});
@@ -46,14 +53,19 @@ export default function App() {
 
   const handleDirectoryChange = useCallback((dir: string) => {
     setDirectory(dir);
-    tauriApi.updateSettings({ last_directory: dir }).catch(() => {});
+    api.updateSettings({ last_directory: dir }).catch(() => {});
   }, []);
+
+  const handlePickDirectory = useCallback(async () => {
+    const picked = await (source as DesktopSourceApi).pickDirectory();
+    if (picked) handleDirectoryChange(picked);
+  }, [handleDirectoryChange]);
 
   const handleBookmarkAdd = useCallback((dir: string) => {
     setBookmarks((prev) => {
       if (prev.includes(dir)) return prev;
       const next = [...prev, dir];
-      tauriApi.updateSettings({ bookmarked_dirs: next }).catch(() => {});
+      api.updateSettings({ bookmarked_dirs: next }).catch(() => {});
       return next;
     });
   }, []);
@@ -61,15 +73,14 @@ export default function App() {
   const handleBookmarkRemove = useCallback((dir: string) => {
     setBookmarks((prev) => {
       const next = prev.filter((b) => b !== dir);
-      tauriApi.updateSettings({ bookmarked_dirs: next }).catch(() => {});
+      api.updateSettings({ bookmarked_dirs: next }).catch(() => {});
       return next;
     });
   }, []);
 
   const handleSearch = useCallback(async (query: SearchQuery) => {
-    // Cancel any running search
     if (currentSearchId.current) {
-      await tauriApi.cancelSearch(currentSearchId.current).catch(() => {});
+      await api.cancelSearch(currentSearchId.current).catch(() => {});
     }
 
     setResults([]);
@@ -78,7 +89,7 @@ export default function App() {
     setSelectedMatch(null);
     setPreviewData(null);
 
-    const searchId = await tauriApi.search(
+    const searchId = await api.search(
       query,
       (fm) => {
         setResults((prev) => [...prev, fm]);
@@ -97,7 +108,7 @@ export default function App() {
     setSelectedMatch(matchRef);
     startPreviewTransition(async () => {
       try {
-        const data = await tauriApi.preview(matchRef);
+        const data = await api.preview(matchRef);
         setPreviewData(data);
       } catch (e) {
         console.error("Preview failed:", e);
@@ -110,7 +121,7 @@ export default function App() {
     setSelectedMatch({ path, origin: { PdfPage: { page: 1, bbox: null } } });
     startPreviewTransition(async () => {
       try {
-        const data = await tauriApi.openFile(path);
+        const data = await api.openFile(path);
         setPreviewData(data);
       } catch (e) {
         console.error("Open file failed:", e);
@@ -119,22 +130,37 @@ export default function App() {
     });
   }, []);
 
+  const sourceSlot = source.type === "desktop" ? (
+    <DirectoryPicker
+      directory={directory}
+      bookmarks={bookmarks}
+      onChange={handleDirectoryChange}
+      onPickDirectory={handlePickDirectory}
+      onBookmarkAdd={handleBookmarkAdd}
+      onBookmarkRemove={handleBookmarkRemove}
+    />
+  ) : (
+    <UploadZone
+      source={source as WebSourceApi}
+      api={api}
+      root={directory}
+      onRootChange={handleDirectoryChange}
+    />
+  );
+
   return (
     <div className="flex flex-col h-screen bg-neutral-900 text-neutral-100 select-none">
       <SearchBar
         onSearch={handleSearch}
         searching={searching}
-        initialDirectory={initialDirectory}
-        bookmarks={bookmarks}
+        sourceSlot={sourceSlot}
+        directory={directory}
         respectGitignore={respectGitignore}
         maxFileSize={maxFileSize}
         contextLines={contextLines}
         fileList={fileList}
         excluded={excluded}
         onExcludedChange={setExcluded}
-        onDirectoryChange={handleDirectoryChange}
-        onBookmarkAdd={handleBookmarkAdd}
-        onBookmarkRemove={handleBookmarkRemove}
         onQueryChange={setHasQuery}
       />
 
@@ -157,6 +183,7 @@ export default function App() {
             previewData={previewData}
             loading={previewPending}
             selectedMatch={selectedMatch}
+            api={api}
           />
         </div>
       </div>

@@ -1,0 +1,19 @@
+[package]
+name = "wilkes-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wilkes-server"
+
+[dependencies]
+wilkes-api = { path = "../api" }
+wilkes-core = { path = "../core" }
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
