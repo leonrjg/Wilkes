@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default capabilities for Wilkes","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open"]}}

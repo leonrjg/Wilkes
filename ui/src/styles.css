@@ -1,0 +1,24 @@
+@import "tailwindcss";
+
+* {
+  scrollbar-color: #404040 #262626;
+  scrollbar-width: thin;
+}
+
+/* CodeMirror baseline */
+.cm-editor {
+  height: 100%;
+  font-size: 13px;
+}
+
+.cm-scroller {
+  overflow: auto;
+  height: 100%;
+}
+
+/* Match highlight in result list */
+.match-highlight {
+  background-color: rgb(250 204 21 / 0.4);
+  border-radius: 2px;
+  padding: 0 1px;
+}

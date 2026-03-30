@@ -1,0 +1,17 @@
+[package]
+name = "wilkes-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+infer = "0.16"
+mupdf = "0.6"
+regex = "1"
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+serde = { version = "1", features = ["derive"] }
