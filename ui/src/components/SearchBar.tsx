@@ -6,6 +6,8 @@ interface Props {
   onSearch: (query: SearchQuery) => void;
   searching: boolean;
   sourceSlot: React.ReactNode;
+  settingsSlot?: React.ReactNode;
+  semanticReady?: boolean;
   directory?: string;
   respectGitignore?: boolean;
   maxFileSize?: number;
@@ -20,6 +22,8 @@ export default function SearchBar({
   onSearch,
   searching,
   sourceSlot,
+  settingsSlot,
+  semanticReady = false,
   directory = "",
   respectGitignore = true,
   maxFileSize = 10 * 1024 * 1024,
@@ -32,14 +36,19 @@ export default function SearchBar({
   const [pattern, setPattern] = useState("");
   const [isRegex, setIsRegex] = useState(false);
   const [caseSensitive, setCaseSensitive] = useState(false);
+  const [isSemanticMode, setIsSemanticMode] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Reset semantic mode when it becomes unavailable
+  useEffect(() => {
+    if (!semanticReady) setIsSemanticMode(false);
+  }, [semanticReady]);
 
   const buildQuery = useCallback(
     (pat: string): SearchQuery => {
       const allExtensions = [...new Set(fileList.map((f) => f.extension))];
-      const file_type_filters = excluded.size === 0
-        ? []
-        : allExtensions.filter((ext) => !excluded.has(ext));
+      const file_type_filters =
+        excluded.size === 0 ? [] : allExtensions.filter((ext) => !excluded.has(ext));
       return {
         pattern: pat,
         is_regex: isRegex,
@@ -50,9 +59,10 @@ export default function SearchBar({
         respect_gitignore: respectGitignore,
         max_file_size: maxFileSize,
         context_lines: contextLines,
+        mode: isSemanticMode ? "Semantic" : "Grep",
       };
     },
-    [isRegex, caseSensitive, directory, excluded, fileList, respectGitignore, maxFileSize, contextLines],
+    [isRegex, caseSensitive, directory, excluded, fileList, respectGitignore, maxFileSize, contextLines, isSemanticMode],
   );
 
   const triggerSearch = useCallback(
@@ -80,7 +90,7 @@ export default function SearchBar({
   // Re-trigger when options change (if there's already a pattern)
   useEffect(() => {
     if (pattern.trim()) triggerSearch(pattern);
-  }, [isRegex, caseSensitive, directory, excluded, fileList]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isRegex, caseSensitive, directory, excluded, isSemanticMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="flex flex-col gap-2 p-3 border-b border-neutral-800 bg-neutral-900">
@@ -98,6 +108,13 @@ export default function SearchBar({
           active={caseSensitive}
           onToggle={() => setCaseSensitive((v) => !v)}
         />
+        <Toggle
+          label="~"
+          title={semanticReady ? "Semantic search" : "Set up semantic search in Settings"}
+          active={isSemanticMode}
+          disabled={!semanticReady}
+          onToggle={() => setIsSemanticMode((v) => !v)}
+        />
 
         {searching && (
           <span className="text-xs text-blue-400 animate-pulse">searching…</span>
@@ -112,6 +129,8 @@ export default function SearchBar({
           spellCheck={false}
           autoFocus
         />
+
+        {settingsSlot}
       </div>
 
       {/* Bottom row: source slot + extension filter */}
@@ -127,21 +146,26 @@ function Toggle({
   label,
   title,
   active,
+  disabled,
   onToggle,
 }: {
   label: string;
   title: string;
   active: boolean;
+  disabled?: boolean;
   onToggle: () => void;
 }) {
   return (
     <button
       onClick={onToggle}
       title={title}
+      disabled={disabled}
       className={`px-2 py-1 rounded text-xs font-mono font-semibold transition-colors ${
-        active
-          ? "bg-blue-600 text-white"
-          : "bg-neutral-800 text-neutral-400 hover:text-neutral-100"
+        disabled
+          ? "bg-neutral-800 text-neutral-600 cursor-not-allowed"
+          : active
+            ? "bg-blue-600 text-white"
+            : "bg-neutral-800 text-neutral-400 hover:text-neutral-100"
       }`}
     >
       {label}

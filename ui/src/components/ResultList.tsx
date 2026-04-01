@@ -290,6 +290,11 @@ function MatchRow({
       <span className="text-xs text-blue-400 w-10 flex-shrink-0 font-mono text-right pt-px">
         {originLabel(match.origin)}
       </span>
+      {match.score != null && (
+        <span className="text-xs text-neutral-500 flex-shrink-0 font-mono pt-px">
+          {(match.score * 100).toFixed(0)}%
+        </span>
+      )}
       <span className="text-xs line-clamp-3 flex-1 font-mono break-all">
         {highlightMatch(
           match.context_before + match.matched_text + match.context_after,

@@ -1,4 +1,5 @@
 pub mod grep;
+pub mod semantic;
 
 use crate::extract::ExtractorRegistry;
 use crate::types::{FileMatches, SearchCapabilities, SearchQuery};

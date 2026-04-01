@@ -57,7 +57,7 @@ fn detect_file_type(path: &Path) -> Option<FileType> {
         "sass", "less", "c", "cpp", "cc", "cxx", "h", "hpp", "java", "go",
         "rb", "sh", "bash", "zsh", "fish", "lua", "php", "swift", "kt",
         "cs", "r", "sql", "graphql", "gql", "proto", "ini", "cfg", "conf",
-        "env", "gitignore", "lock", "log", "csv", "tsv",
+        "env", "gitignore", "lock", "log", "csv", "tsv", "jsonl",
     ];
     if TEXT_EXTENSIONS.contains(&ext.as_str()) {
         Some(FileType::PlainText)

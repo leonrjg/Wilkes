@@ -6,6 +6,8 @@ export interface ByteRange {
   end: number;
 }
 
+export type SearchMode = "Grep" | "Semantic";
+
 export interface SearchQuery {
   pattern: string;
   is_regex: boolean;
@@ -18,6 +20,8 @@ export interface SearchQuery {
   /** 0 = unlimited */
   max_file_size: number;
   context_lines: number;
+  /** Defaults to "Grep" */
+  mode: SearchMode;
 }
 
 export type FileType = "PlainText" | "Pdf";
@@ -27,11 +31,14 @@ export type SourceOrigin =
   | { PdfPage: { page: number; bbox: BoundingBox | null } };
 
 export interface Match {
-  text_range: ByteRange;
+  /** null for PDF chunks — highlight position is carried by origin.bbox. */
+  text_range: ByteRange | null;
   matched_text: string;
   context_before: string;
   context_after: string;
   origin: SourceOrigin;
+  /** Cosine similarity score for semantic matches; absent for grep matches. */
+  score?: number;
 }
 
 export interface FileMatches {
@@ -75,6 +82,25 @@ export interface FileEntry {
   extension: string;
 }
 
+/** HuggingFace model code, e.g. "BAAI/bge-base-en-v1.5". */
+export type EmbedderModel = string;
+
+export interface ModelDescriptor {
+  model_id: string;
+  display_name: string;
+  description: string;
+  dimension: number;
+  is_cached: boolean;
+  /** Total bytes of all model files. Null for uncached models until fetched. */
+  size_bytes: number | null;
+}
+
+export interface SemanticSettings {
+  enabled: boolean;
+  model: EmbedderModel;
+  index_path: string | null;
+}
+
 export interface Settings {
   bookmarked_dirs: string[];
   last_directory: string | null;
@@ -82,13 +108,58 @@ export interface Settings {
   max_file_size: number;
   context_lines: number;
   theme: Theme;
+  semantic: SemanticSettings;
 }
 
 export type Theme = "System" | "Light" | "Dark";
+
+export interface SearchCapabilities {
+  supports_regex: boolean;
+  supports_case_sensitivity: boolean;
+  is_indexed: boolean;
+  supported_file_types: string[];
+  requires_index: boolean;
+  semantic_index_built: boolean;
+}
 
 export interface SearchStats {
   files_scanned: number;
   total_matches: number;
   elapsed_ms: number;
   errors: string[];
+}
+
+export interface IndexStatus {
+  indexed_files: number;
+  total_chunks: number;
+  built_at: number | null;
+  model_id: string;
+  dimension: number;
+}
+
+export interface DownloadProgress {
+  bytes_received: number;
+  total_bytes: number;
+  done: boolean;
+}
+
+export interface IndexBuildProgress {
+  files_processed: number;
+  total_files: number;
+  done: boolean;
+}
+
+export type EmbedProgress =
+  | { Download: DownloadProgress }
+  | { Build: IndexBuildProgress };
+
+export type EmbedOperation = "Download" | "Build";
+
+export interface EmbedDone {
+  operation: EmbedOperation;
+}
+
+export interface EmbedError {
+  operation: EmbedOperation;
+  message: string;
 }

@@ -9,6 +9,15 @@ pub struct ByteRange {
     pub end: usize,
 }
 
+// ── Search mode ───────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub enum SearchMode {
+    #[default]
+    Grep,
+    Semantic,
+}
+
 // ── Query ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -29,6 +38,9 @@ pub struct SearchQuery {
     /// Lines of context to include around each match (text files only).
     #[serde(default = "default_context_lines")]
     pub context_lines: u32,
+    /// Which search backend to use.
+    #[serde(default)]
+    pub mode: SearchMode,
 }
 
 fn default_true() -> bool { true }
@@ -38,11 +50,17 @@ fn default_context_lines() -> u32 { 2 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Match {
-    pub text_range: ByteRange,
+    /// Byte range into the extracted text.
+    /// Some for plain-text files (used for highlight positioning).
+    /// None for PDF chunks (highlight routes through origin.bbox instead).
+    pub text_range: Option<ByteRange>,
     pub matched_text: String,
     pub context_before: String,
     pub context_after: String,
     pub origin: SourceOrigin,
+    /// Cosine similarity score for semantic matches; None for grep matches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -140,6 +158,80 @@ pub enum PreviewData {
     },
 }
 
+// ── Embedder model ────────────────────────────────────────────────────────────
+
+/// Identifies an embedding model by its HuggingFace model code (e.g. "BAAI/bge-base-en-v1.5").
+/// Serialises as a plain string. The custom Deserialize maps legacy enum variant names written
+/// by older app versions so existing settings files migrate transparently.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(transparent)]
+pub struct EmbedderModel(pub String);
+
+impl EmbedderModel {
+    pub fn model_id(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for EmbedderModel {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        let code = match s.as_str() {
+            // Legacy enum variant names written by versions that used a closed enum.
+            "MiniLML6V2"          => "sentence-transformers/all-MiniLM-L6-v2",
+            "BgeBaseEn"           => "BAAI/bge-base-en-v1.5",
+            "BgeLargeEn"          => "BAAI/bge-large-en-v1.5",
+            "MultilingualE5Large" => "intfloat/multilingual-e5-large",
+            other                 => other,
+        };
+        Ok(EmbedderModel(code.to_string()))
+    }
+}
+
+// ── Model descriptor (returned by list_models) ────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelDescriptor {
+    pub model_id: String,
+    pub display_name: String,
+    pub description: String,
+    pub dimension: usize,
+    pub is_cached: bool,
+    /// Total bytes of all model files. Populated from disk for cached models;
+    /// `None` for uncached models until explicitly fetched from HuggingFace.
+    pub size_bytes: Option<u64>,
+}
+
+// ── Semantic settings ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SemanticSettings {
+    pub enabled: bool,
+    pub model: EmbedderModel,
+    pub index_path: Option<PathBuf>,
+}
+
+impl Default for SemanticSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: EmbedderModel("BAAI/bge-base-en-v1.5".to_string()),
+            index_path: None,
+        }
+    }
+}
+
+// ── Index status ──────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IndexStatus {
+    pub indexed_files: usize,
+    pub total_chunks: usize,
+    pub built_at: Option<u64>,
+    pub model_id: String,
+    pub dimension: usize,
+}
+
 // ── Settings ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,6 +243,8 @@ pub struct Settings {
     pub max_file_size: u64,
     pub context_lines: u32,
     pub theme: Theme,
+    #[serde(default)]
+    pub semantic: SemanticSettings,
 }
 
 impl Default for Settings {
@@ -162,6 +256,7 @@ impl Default for Settings {
             max_file_size: 10 * 1024 * 1024,
             context_lines: 2,
             theme: Theme::System,
+            semantic: SemanticSettings::default(),
         }
     }
 }
@@ -191,6 +286,12 @@ pub struct SearchCapabilities {
     pub supports_case_sensitivity: bool,
     pub is_indexed: bool,
     pub supported_file_types: Vec<String>,
+    /// True if this provider requires a pre-built index.
+    #[serde(default)]
+    pub requires_index: bool,
+    /// True if the semantic index has been built and is ready.
+    #[serde(default)]
+    pub semantic_index_built: bool,
 }
 
 // ── Search completion stats ───────────────────────────────────────────────────

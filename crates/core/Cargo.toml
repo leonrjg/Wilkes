@@ -3,6 +3,11 @@ name = "wilkes-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+fastembed = ["dep:fastembed", "dep:hf-hub", "dep:ureq"]
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "dep:ureq"]
+metal = ["candle", "candle-core/metal", "candle-core/accelerate", "candle-nn/metal", "candle-transformers/metal"]
+
 [dependencies]
 grep-matcher = "0.1"
 grep-regex = "0.1"
@@ -15,3 +20,37 @@ anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+notify = "6"
+notify-debouncer-mini = "0.4"
+text-splitter = { version = "0.27", features = ["markdown"] }
+async-trait = "0.1"
+
+[dependencies.fastembed]
+version = "4"
+optional = true
+
+[dependencies.hf-hub]
+version = "0.4"
+optional = true
+
+[dependencies.ureq]
+version = "2"
+optional = true
+
+[dependencies.candle-core]
+version = "0.9"
+optional = true
+
+[dependencies.candle-nn]
+version = "0.9"
+optional = true
+
+[dependencies.candle-transformers]
+version = "0.9"
+optional = true
+
+[dependencies.tokenizers]
+version = "0.20"
+optional = true

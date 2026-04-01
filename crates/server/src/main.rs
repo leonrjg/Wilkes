@@ -45,7 +45,7 @@ async fn search_handler(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::spawn(async move {
-        let mut handle = wilkes_api::commands::search::start_search(query);
+        let mut handle = wilkes_api::commands::search::start_search(query, None, None);
         let started = Instant::now();
         let mut total_matches = 0usize;
         let mut files_scanned = 0usize;

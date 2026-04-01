@@ -4,6 +4,7 @@ import ResultList from "./components/ResultList";
 import PreviewPane from "./components/PreviewPane";
 import DirectoryPicker from "./components/DirectoryPicker";
 import UploadZone from "./components/UploadZone";
+import SemanticPanel from "./components/SemanticPanel";
 import { TauriSearchApi, TauriSourceApi } from "./services/tauri";
 import { HttpSearchApi, HttpSourceApi } from "./services/http";
 import type { SearchApi, SourceApi, DesktopSourceApi, WebSourceApi } from "./services/api";
@@ -31,6 +32,8 @@ export default function App() {
   const [contextLines, setContextLines] = useState(2);
   const [fileList, setFileList] = useState<FileEntry[]>([]);
   const [excluded, setExcluded] = useState<Set<string>>(new Set());
+  const [semanticIndexBuilt, setSemanticIndexBuilt] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
     api.getSettings().then((s) => {
@@ -40,6 +43,7 @@ export default function App() {
       setRespectGitignore(s.respect_gitignore);
       setMaxFileSize(s.max_file_size);
       setContextLines(s.context_lines);
+      setSemanticIndexBuilt(s.semantic.enabled && s.semantic.index_path !== null);
     }).catch(() => {});
   }, []);
 
@@ -78,6 +82,16 @@ export default function App() {
     });
   }, []);
 
+  const refreshSemanticReady = useCallback(async () => {
+    if (!isTauri) return;
+    try {
+      const s = await api.getSettings();
+      setSemanticIndexBuilt(s.semantic.enabled && s.semantic.index_path !== null);
+    } catch (e) {
+      console.error("getSettings failed in refreshSemanticReady:", e);
+    }
+  }, []);
+
   const handleSearch = useCallback(async (query: SearchQuery) => {
     if (currentSearchId.current) {
       await api.cancelSearch(currentSearchId.current).catch(() => {});
@@ -89,19 +103,23 @@ export default function App() {
     setSelectedMatch(null);
     setPreviewData(null);
 
-    const searchId = await api.search(
-      query,
-      (fm) => {
-        setResults((prev) => [...prev, fm]);
-      },
-      (s) => {
-        setStats(s);
-        setSearching(false);
-        currentSearchId.current = null;
-      },
-    );
-
-    currentSearchId.current = searchId;
+    try {
+      const searchId = await api.search(
+        query,
+        (fm) => {
+          setResults((prev) => [...prev, fm]);
+        },
+        (s) => {
+          setStats(s);
+          setSearching(false);
+          currentSearchId.current = null;
+        },
+      );
+      currentSearchId.current = searchId;
+    } catch (e) {
+      console.error("Search failed:", e);
+      setSearching(false);
+    }
   }, []);
 
   const handleMatchClick = useCallback((matchRef: MatchRef) => {
@@ -148,12 +166,39 @@ export default function App() {
     />
   );
 
+  const settingsSlot = isTauri ? (
+    <div className="relative">
+      <button
+        onClick={() => setSettingsOpen((v) => !v)}
+        title="Settings"
+        className={`px-2 py-1 rounded text-xs font-mono transition-colors ${
+          settingsOpen
+            ? "bg-neutral-700 text-neutral-100"
+            : "bg-neutral-800 text-neutral-400 hover:text-neutral-100"
+        }`}
+      >
+        ⚙
+      </button>
+      {settingsOpen && (
+        <div className="absolute right-0 top-full mt-1 z-50 bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl">
+          <SemanticPanel
+            api={api as TauriSearchApi}
+            directory={directory}
+            refreshSemanticReady={refreshSemanticReady}
+          />
+        </div>
+      )}
+    </div>
+  ) : null;
+
   return (
     <div className="flex flex-col h-screen bg-neutral-900 text-neutral-100 select-none">
       <SearchBar
         onSearch={handleSearch}
         searching={searching}
         sourceSlot={sourceSlot}
+        settingsSlot={settingsSlot}
+        semanticReady={semanticIndexBuilt}
         directory={directory}
         respectGitignore={respectGitignore}
         maxFileSize={maxFileSize}

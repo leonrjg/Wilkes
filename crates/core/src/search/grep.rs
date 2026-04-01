@@ -34,7 +34,7 @@ impl GrepSearchProvider {
             "sass", "less", "c", "cpp", "cc", "cxx", "h", "hpp", "java", "go",
             "rb", "sh", "bash", "zsh", "fish", "lua", "php", "swift", "kt",
             "cs", "r", "sql", "graphql", "gql", "proto", "ini", "cfg", "conf",
-            "env", "gitignore", "lock", "log", "csv", "tsv",
+            "env", "gitignore", "lock", "log", "csv", "tsv", "jsonl",
         ];
 
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -178,6 +178,8 @@ impl SearchProvider for GrepSearchProvider {
                 "txt".into(), "md".into(), "rs".into(), "py".into(), "js".into(),
                 "ts".into(), "json".into(), "toml".into(), "yaml".into(),
             ],
+            requires_index: false,
+            semantic_index_built: false,
         }
     }
 }
@@ -217,10 +219,10 @@ impl<'m> Sink for CollectSink<'m> {
                 let matched_text =
                     String::from_utf8_lossy(&line[start..end]).into_owned();
                 line_matches.push(Match {
-                    text_range: ByteRange {
+                    text_range: Some(ByteRange {
                         start: base_offset + start,
                         end: base_offset + end,
-                    },
+                    }),
                     matched_text,
                     context_before: String::new(),
                     context_after: line_text.clone(),
@@ -228,6 +230,7 @@ impl<'m> Sink for CollectSink<'m> {
                         line: line_num,
                         col: start as u32,
                     },
+                    score: None,
                 });
                 true
             })
@@ -282,11 +285,12 @@ fn search_extracted_content(
             let ctx_after = extract_context_after(full, end, 120);
 
             matches.push(Match {
-                text_range: ByteRange { start, end },
+                text_range: Some(ByteRange { start, end }),
                 matched_text,
                 context_before: ctx_before,
                 context_after: ctx_after,
                 origin,
+                score: None,
             });
             true
         })

@@ -2,9 +2,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type {
+  EmbedderModel,
+  EmbedDone,
+  EmbedError,
+  EmbedProgress,
   FileEntry,
   FileMatches,
+  IndexStatus,
   MatchRef,
+  ModelDescriptor,
   PreviewData,
   SearchQuery,
   SearchStats,
@@ -18,7 +24,10 @@ export class TauriSearchApi implements SearchApi {
     onResult: (fm: FileMatches) => void,
     onComplete: (stats: SearchStats) => void,
   ): Promise<string> {
-    const searchId: string = await invoke("search", { query });
+    // Generate the ID here so we can register listeners before the backend
+    // starts emitting, eliminating the race where search-complete fires before
+    // the listener exists.
+    const searchId = crypto.randomUUID();
 
     const unlistenResult = await listen<FileMatches>(
       `search-result-${searchId}`,
@@ -34,6 +43,7 @@ export class TauriSearchApi implements SearchApi {
       },
     );
 
+    await invoke("search", { query, searchId });
     return searchId;
   }
 
@@ -63,6 +73,52 @@ export class TauriSearchApi implements SearchApi {
 
   resolvePdfUrl(path: string): string {
     return convertFileSrc(path);
+  }
+
+  // ── Semantic / embed commands ──────────────────────────────────────────────
+
+  async listModels(): Promise<ModelDescriptor[]> {
+    return invoke<ModelDescriptor[]>("list_models");
+  }
+
+  async getModelSize(modelId: string): Promise<number> {
+    return invoke<number>("get_model_size", { modelId });
+  }
+
+  async downloadModel(model: EmbedderModel): Promise<void> {
+    return invoke("download_model", { model });
+  }
+
+  async buildIndex(root: string, model: EmbedderModel): Promise<void> {
+    return invoke("build_index", { root, model });
+  }
+
+  async cancelEmbed(): Promise<void> {
+    return invoke("cancel_embed");
+  }
+
+  async getIndexStatus(): Promise<IndexStatus> {
+    return invoke<IndexStatus>("get_index_status");
+  }
+
+  async deleteIndex(): Promise<void> {
+    return invoke("delete_index");
+  }
+
+  async onEmbedProgress(
+    handler: (progress: EmbedProgress) => void,
+  ): Promise<() => void> {
+    return listen<EmbedProgress>("embed-progress", (e) => handler(e.payload));
+  }
+
+  async onEmbedDone(handler: (done: EmbedDone) => void): Promise<() => void> {
+    return listen<EmbedDone>("embed-done", (e) => handler(e.payload));
+  }
+
+  async onEmbedError(
+    handler: (err: EmbedError) => void,
+  ): Promise<() => void> {
+    return listen<EmbedError>("embed-error", (e) => handler(e.payload));
   }
 }
 

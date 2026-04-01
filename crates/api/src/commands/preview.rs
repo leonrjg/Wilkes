@@ -45,7 +45,7 @@ pub fn detect_language(path: &std::path::Path) -> Option<String> {
         "py" => "python",
         "js" | "jsx" => "javascript",
         "ts" | "tsx" => "typescript",
-        "json" => "json",
+        "json" | "jsonl" => "json",
         "toml" => "toml",
         "yaml" | "yml" => "yaml",
         "md" | "markdown" => "markdown",

@@ -1,3 +1,4 @@
+pub mod embed;
 pub mod files;
 pub mod preview;
 pub mod search;
