@@ -110,6 +110,16 @@ interface CodeViewerProps {
 function CodeViewer({ content, language, highlightLine, highlightRange }: CodeViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
+  const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
+
+  // Observe theme changes on the html element
+  useEffect(() => {
+    const observer = new MutationObserver(() => {
+      setIsDark(window.document.documentElement.classList.contains("dark"));
+    });
+    observer.observe(window.document.documentElement, { attributes: true, attributeFilter: ["class"] });
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -117,12 +127,12 @@ function CodeViewer({ content, language, highlightLine, highlightRange }: CodeVi
     const langExt = getLanguageExtension(language);
     const extensions = [
       basicSetup,
-      oneDark,
       EditorState.readOnly.of(true),
       highlightField,
       highlightTheme,
       EditorView.lineWrapping,
     ];
+    if (isDark) extensions.push(oneDark);
     if (langExt) extensions.push(langExt);
 
     const state = EditorState.create({ doc: content, extensions });
@@ -133,7 +143,7 @@ function CodeViewer({ content, language, highlightLine, highlightRange }: CodeVi
       view.destroy();
       viewRef.current = null;
     };
-  }, [content, language]); // re-create editor when content/language changes
+  }, [content, language, isDark]);
 
   // Apply highlight whenever highlight params change
   useEffect(() => {
@@ -218,31 +228,31 @@ function PdfViewer({
   return (
     <div className="h-full relative">
       {/* Zoom controls */}
-      <div className="absolute bottom-3 right-3 z-20 flex items-center gap-1 bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-300 select-none">
+      <div className="absolute bottom-3 right-3 z-20 flex items-center gap-1 bg-[var(--bg-active)] border border-[var(--border-main)] rounded px-2 py-1 text-xs text-[var(--text-main)] select-none">
         <button
           onClick={() => setZoom((z) => Math.max(0.25, +(z - 0.25).toFixed(2)))}
-          className="px-1 hover:text-white"
+          className="px-1 hover:text-[var(--accent-blue)]"
         >
           −
         </button>
         <span className="w-10 text-center">{Math.round(zoom * 100)}%</span>
         <button
           onClick={() => setZoom((z) => Math.min(3.0, +(z + 0.25).toFixed(2)))}
-          className="px-1 hover:text-white"
+          className="px-1 hover:text-[var(--accent-blue)]"
         >
           +
         </button>
       </div>
       <div
         ref={containerRef}
-        className="h-full overflow-auto bg-neutral-900 pr-1"
+        className="h-full overflow-auto bg-[var(--bg-sidebar)] pr-1"
         style={{ WebkitUserSelect: "text", userSelect: "text" }}
       >
       <Document
         file={url}
         onLoadSuccess={({ numPages }) => setNumPages(numPages)}
         loading={
-          <div className="text-neutral-500 text-sm p-4 animate-pulse">
+          <div className="text-[var(--text-muted)] text-sm p-4 animate-pulse">
             Loading PDF…
           </div>
         }
@@ -352,7 +362,7 @@ export default function PreviewPane({ previewData, loading, selectedMatch, api }
 
   if (!selectedMatch) {
     return (
-      <div className="flex items-center justify-center h-full text-neutral-600 text-sm">
+      <div className="flex items-center justify-center h-full text-[var(--text-dim)] text-sm">
         Select a match to preview
       </div>
     );
@@ -361,7 +371,7 @@ export default function PreviewPane({ previewData, loading, selectedMatch, api }
   if (!displayData) {
     // First-ever load: no cached data to show yet.
     return (
-      <div className="flex items-center justify-center h-full text-neutral-500 text-sm animate-pulse">
+      <div className="flex items-center justify-center h-full text-[var(--text-muted)] text-sm animate-pulse">
         Loading…
       </div>
     );
@@ -370,11 +380,11 @@ export default function PreviewPane({ previewData, loading, selectedMatch, api }
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="px-4 py-2 border-b border-neutral-800 flex items-center gap-2 flex-shrink-0">
-        <span className="text-sm font-medium text-neutral-200 truncate">
+      <div className="px-4 py-2 border-b border-[var(--border-main)] flex items-center gap-2 flex-shrink-0 selectable">
+        <span className="text-sm font-medium text-[var(--text-main)] truncate">
           {fileName(selectedMatch.path)}
         </span>
-        <span className="text-xs text-neutral-500 truncate flex-1">
+        <span className="text-xs text-[var(--text-muted)] truncate flex-1">
           {selectedMatch.path}
         </span>
       </div>
@@ -382,8 +392,8 @@ export default function PreviewPane({ previewData, loading, selectedMatch, api }
       {/* Content */}
       <div className="flex-1 overflow-hidden relative">
         {loading && (
-          <div className="absolute inset-0 flex items-center justify-center bg-neutral-950/60 z-10 pointer-events-none">
-            <span className="text-neutral-400 text-sm animate-pulse">Loading…</span>
+          <div className="absolute inset-0 flex items-center justify-center bg-[var(--bg-app)]/60 z-10 pointer-events-none">
+            <span className="text-[var(--text-muted)] text-sm animate-pulse">Loading…</span>
           </div>
         )}
         {"Text" in displayData ? (

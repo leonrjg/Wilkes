@@ -4,18 +4,51 @@ import ResultList from "./components/ResultList";
 import PreviewPane from "./components/PreviewPane";
 import DirectoryPicker from "./components/DirectoryPicker";
 import UploadZone from "./components/UploadZone";
-import SemanticPanel from "./components/SemanticPanel";
 import { TauriSearchApi, TauriSourceApi } from "./services/tauri";
 import { HttpSearchApi, HttpSourceApi } from "./services/http";
+import SettingsModal from "./components/SettingsModal";
 import type { SearchApi, SourceApi, DesktopSourceApi, WebSourceApi } from "./services/api";
-import type { FileEntry, FileMatches, MatchRef, PreviewData, SearchQuery, SearchStats } from "./lib/types";
+import type { FileEntry, FileMatches, MatchRef, PreviewData, SearchQuery, SearchStats, Theme } from "./lib/types";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
 
 const api: SearchApi = isTauri ? new TauriSearchApi() : new HttpSearchApi();
 const source: SourceApi = isTauri ? new TauriSourceApi() : new HttpSourceApi();
 
+function useTheme() {
+  const [theme, setTheme] = useState<Theme>("System");
+
+  useEffect(() => {
+    const applyTheme = (t: Theme) => {
+      const root = window.document.documentElement;
+      root.classList.remove("light", "dark");
+
+      if (t === "Light") {
+        root.classList.add("light");
+      } else if (t === "Dark") {
+        root.classList.add("dark");
+      } else {
+        // System
+        const systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+        root.classList.add(systemDark ? "dark" : "light");
+      }
+    };
+
+    applyTheme(theme);
+
+    if (theme === "System") {
+      const media = window.matchMedia("(prefers-color-scheme: dark)");
+      const listener = () => applyTheme("System");
+      media.addEventListener("change", listener);
+      return () => media.removeEventListener("change", listener);
+    }
+  }, [theme]);
+
+  return { theme, setTheme };
+}
+
 export default function App() {
+  const { setTheme } = useTheme();
   const [results, setResults] = useState<FileMatches[]>([]);
   const [stats, setStats] = useState<SearchStats | null>(null);
   const [searching, setSearching] = useState(false);
@@ -44,8 +77,9 @@ export default function App() {
       setMaxFileSize(s.max_file_size);
       setContextLines(s.context_lines);
       setSemanticIndexBuilt(s.semantic.enabled && s.semantic.index_path !== null);
+      setTheme(s.theme);
     }).catch(() => {});
-  }, []);
+  }, [setTheme]);
 
   useEffect(() => {
     if (!directory) return;
@@ -167,32 +201,29 @@ export default function App() {
   );
 
   const settingsSlot = isTauri ? (
-    <div className="relative">
+    <>
       <button
-        onClick={() => setSettingsOpen((v) => !v)}
+        onClick={() => setSettingsOpen(true)}
         title="Settings"
-        className={`px-2 py-1 rounded text-xs font-mono transition-colors ${
-          settingsOpen
-            ? "bg-neutral-700 text-neutral-100"
-            : "bg-neutral-800 text-neutral-400 hover:text-neutral-100"
-        }`}
+        className="px-2 py-1 rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors text-xs font-mono"
       >
         ⚙
       </button>
-      {settingsOpen && (
-        <div className="absolute right-0 top-full mt-1 z-50 bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl">
-          <SemanticPanel
-            api={api as TauriSearchApi}
-            directory={directory}
-            refreshSemanticReady={refreshSemanticReady}
-          />
-        </div>
-      )}
-    </div>
+      <SettingsModal
+        api={api}
+        isOpen={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        directory={directory}
+        refreshSemanticReady={refreshSemanticReady}
+        onSettingsUpdate={(patch) => {
+          if (patch.theme) setTheme(patch.theme);
+        }}
+      />
+    </>
   ) : null;
 
   return (
-    <div className="flex flex-col h-screen bg-neutral-900 text-neutral-100 select-none">
+    <div className="flex flex-col h-screen bg-[var(--bg-app)] text-[var(--text-main)] select-none">
       <SearchBar
         onSearch={handleSearch}
         searching={searching}
@@ -210,7 +241,7 @@ export default function App() {
       />
 
       <div className="flex flex-1 overflow-hidden">
-        <div className="w-[420px] min-w-[320px] flex-shrink-0 border-r border-neutral-800 flex flex-col">
+        <div className="w-[420px] min-w-[320px] flex-shrink-0 border-r border-[var(--border-main)] flex flex-col">
           <ResultList
             results={results}
             stats={stats}

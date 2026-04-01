@@ -5,7 +5,7 @@ use anyhow::Context;
 use rusqlite::{Connection, params};
 
 use crate::extract::ExtractorRegistry;
-use crate::types::{ByteRange, IndexStatus, SourceOrigin};
+use crate::types::{ByteRange, EmbeddingEngine, IndexStatus, SourceOrigin};
 
 use super::Embedder;
 use super::chunk::{Chunk, chunk_content};
@@ -56,6 +56,14 @@ impl SemanticIndex {
         let conn = Connection::open(&path)
             .with_context(|| format!("Failed to open index at {}", path.display()))?;
 
+        let _stored_engine: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'engine'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "candle".to_string()); // Fallback for legacy indexes
+
         let stored_model_id: String = conn
             .query_row(
                 "SELECT value FROM meta WHERE key = 'model_id'",
@@ -97,7 +105,7 @@ impl SemanticIndex {
 
     /// Create a new empty index at `data_dir` (schema only, no files indexed).
     /// Removes any existing index at that path.
-    pub fn create(data_dir: &Path, embedder: &dyn Embedder) -> anyhow::Result<Self> {
+    pub fn create(data_dir: &Path, embedder: &dyn Embedder, engine: EmbeddingEngine) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let path = db_path(data_dir);
         if path.exists() {
@@ -107,7 +115,7 @@ impl SemanticIndex {
         let conn = Connection::open(&path)
             .with_context(|| format!("Failed to create index at {}", path.display()))?;
 
-        Self::create_schema(&conn, embedder)?;
+        Self::create_schema(&conn, embedder, engine)?;
 
         let built_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -132,33 +140,87 @@ impl SemanticIndex {
         paths: &[PathBuf],
         extractors: &ExtractorRegistry,
         embedder: &dyn Embedder,
+        engine: EmbeddingEngine,
         tx: ProgressTx,
     ) -> anyhow::Result<Self> {
-        let total = paths.len();
-        let mut idx = Self::create(data_dir, embedder)?;
+        let start_time = std::time::Instant::now();
+        let total_files = paths.len();
+        let mut idx = Self::create(data_dir, embedder, engine)?;
 
+        // Phase 1: extract and chunk all files (0% to 30% progress).
+        let mut file_chunks: Vec<(PathBuf, Vec<Chunk>)> = Vec::new();
         for (i, path) in paths.iter().enumerate() {
             let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
                 files_processed: i,
-                total_files: total,
+                total_files,
+                message: format!("Extracting {} of {}...", i + 1, total_files),
                 done: false,
             }));
 
-            if let Err(e) = idx.index_file(path, extractors, embedder) {
-                eprintln!("Skipping {}: {e:#}", path.display());
+            match Self::extract_chunks(path, extractors) {
+                Ok(chunks) if !chunks.is_empty() => file_chunks.push((path.clone(), chunks)),
+                _ => {}
             }
         }
 
+        // Phase 2: embed all chunks in one batch (30% to 70% progress).
         let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
-            files_processed: total,
-            total_files: total,
+            files_processed: total_files / 3, // Approximation
+            total_files,
+            message: "Generating embeddings (this may take a while)...".to_string(),
+            done: false,
+        }));
+
+        let all_embeddings = {
+            let all_texts: Vec<&str> = file_chunks
+                .iter()
+                .flat_map(|(_, chunks)| chunks.iter().map(|c| c.text.as_str()))
+                .collect();
+            if all_texts.is_empty() {
+                vec![]
+            } else {
+                embedder.embed_passages(&all_texts)?
+            }
+        };
+
+        // Phase 3: pair embeddings back with their chunks and write (70% to 100% progress).
+        let mut emb_iter = all_embeddings.into_iter();
+        let total_extracted = file_chunks.len();
+        for (i, (path, chunks)) in file_chunks.into_iter().enumerate() {
+            let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
+                files_processed: (total_files * 2 / 3) + (i * total_files / (3 * total_extracted.max(1))),
+                total_files,
+                message: format!("Writing {} of {}...", i + 1, total_extracted),
+                done: false,
+            }));
+
+            let n = chunks.len();
+            let prepared = PreparedFile {
+                path: path.clone(),
+                chunks: chunks.into_iter().zip(emb_iter.by_ref().take(n)).collect(),
+            };
+            if let Err(e) = idx.write_file(prepared) {
+                eprintln!("Failed to write {}: {e:#}", path.display());
+            }
+        }
+
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        idx.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('build_duration_ms', ?1)",
+            params![duration_ms.to_string()],
+        )?;
+
+        let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
+            files_processed: total_files,
+            total_files,
+            message: "Done!".to_string(),
             done: true,
         }));
 
         Ok(idx)
     }
 
-    fn create_schema(conn: &Connection, embedder: &dyn Embedder) -> anyhow::Result<()> {
+    fn create_schema(conn: &Connection, embedder: &dyn Embedder, engine: EmbeddingEngine) -> anyhow::Result<()> {
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -184,6 +246,10 @@ impl SemanticIndex {
             ",
         )?;
 
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('engine', ?1)",
+            params![engine.as_str()],
+        )?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('model_id', ?1)",
             params![embedder.model_id()],
@@ -354,6 +420,16 @@ impl SemanticIndex {
 
     /// Read index metadata without re-validating model_id/dimension.
     pub fn status(&self) -> IndexStatus {
+        let engine_str: String = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'engine'", [], |r| r.get(0))
+            .unwrap_or_else(|_| "candle".to_string());
+        
+        let engine = match engine_str.as_str() {
+            "fastembed" => EmbeddingEngine::Fastembed,
+            _ => EmbeddingEngine::Candle,
+        };
+
         let model_id = self
             .conn
             .query_row("SELECT value FROM meta WHERE key = 'model_id'", [], |r| r.get(0))
@@ -375,6 +451,14 @@ impl SemanticIndex {
             })
             .unwrap_or(None);
 
+        let build_duration_ms: Option<u64> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'build_duration_ms'", [], |r| {
+                let s: String = r.get(0)?;
+                Ok(s.parse::<u64>().ok())
+            })
+            .unwrap_or(None);
+
         let indexed_files: usize = self
             .conn
             .query_row("SELECT COUNT(DISTINCT file_path) FROM chunks", [], |r| r.get(0))
@@ -391,6 +475,8 @@ impl SemanticIndex {
             indexed_files,
             total_chunks,
             built_at,
+            build_duration_ms,
+            engine,
             model_id,
             dimension,
         }
@@ -402,6 +488,15 @@ impl SemanticIndex {
         let path = db_path(data_dir);
         anyhow::ensure!(path.exists(), "No semantic index found");
         let conn = Connection::open(&path)?;
+
+        let engine_str: String = conn
+            .query_row("SELECT value FROM meta WHERE key = 'engine'", [], |r| r.get(0))
+            .unwrap_or_else(|_| "candle".to_string());
+
+        let engine = match engine_str.as_str() {
+            "fastembed" => EmbeddingEngine::Fastembed,
+            _ => EmbeddingEngine::Candle,
+        };
 
         let model_id: String = conn
             .query_row("SELECT value FROM meta WHERE key = 'model_id'", [], |r| r.get(0))
@@ -421,6 +516,13 @@ impl SemanticIndex {
             })
             .unwrap_or(None);
 
+        let build_duration_ms: Option<u64> = conn
+            .query_row("SELECT value FROM meta WHERE key = 'build_duration_ms'", [], |r| {
+                let s: String = r.get(0)?;
+                Ok(s.parse::<u64>().ok())
+            })
+            .unwrap_or(None);
+
         let indexed_files: usize = conn
             .query_row("SELECT COUNT(DISTINCT file_path) FROM chunks", [], |r| r.get(0))
             .map(|n: i64| n as usize)
@@ -435,6 +537,8 @@ impl SemanticIndex {
             indexed_files,
             total_chunks,
             built_at,
+            build_duration_ms,
+            engine,
             model_id,
             dimension,
         })

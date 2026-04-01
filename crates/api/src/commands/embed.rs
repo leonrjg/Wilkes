@@ -27,6 +27,7 @@ pub async fn download_model(
 pub async fn build_index(
     root: PathBuf,
     installer: &dyn EmbedderInstaller,
+    engine: wilkes_core::types::EmbeddingEngine,
     data_dir: PathBuf,
     tx: ProgressTx,
 ) -> anyhow::Result<Arc<dyn Embedder>> {
@@ -48,62 +49,14 @@ pub async fn build_index(
         let mut registry = ExtractorRegistry::new();
         registry.register(Box::new(PdfExtractor::new()));
 
-        let mut idx = SemanticIndex::create(&data_dir_clone, embedder_clone.as_ref())?;
-        let total = paths.len();
-
-        let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
-            files_processed: 0,
-            total_files: total,
-            done: false,
-        }));
-
-        // Phase 1: extract and chunk all files (no embedding yet).
-        let mut file_chunks: Vec<(PathBuf, Vec<_>)> = Vec::new();
-        for path in &paths {
-            match SemanticIndex::extract_chunks(path, &registry) {
-                Ok(chunks) if !chunks.is_empty() => file_chunks.push((path.clone(), chunks)),
-                Ok(_) => {}
-                Err(e) => eprintln!("Skipping {}: {e:#}", path.display()),
-            }
-        }
-
-        // Phase 2: embed all chunks in one batch.
-        let all_embeddings = {
-            let all_texts: Vec<&str> = file_chunks
-                .iter()
-                .flat_map(|(_, chunks)| chunks.iter().map(|c| c.text.as_str()))
-                .collect();
-            if all_texts.is_empty() {
-                vec![]
-            } else {
-                embedder_clone.embed_passages(&all_texts)?
-            }
-        };
-
-        // Phase 3: pair embeddings back with their chunks and write.
-        let mut emb_iter = all_embeddings.into_iter();
-        for (i, (path, chunks)) in file_chunks.into_iter().enumerate() {
-            let n = chunks.len();
-            let prepared = PreparedFile {
-                path: path.clone(),
-                chunks: chunks.into_iter().zip(emb_iter.by_ref().take(n)).collect(),
-            };
-            if let Err(e) = idx.write_file(prepared) {
-                eprintln!("Failed to write {}: {e:#}", path.display());
-            }
-            let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
-                files_processed: i + 1,
-                total_files: total,
-                done: false,
-            }));
-        }
-
-        let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
-            files_processed: total,
-            total_files: total,
-            done: true,
-        }));
-
+        SemanticIndex::build(
+            &data_dir_clone,
+            &paths,
+            &registry,
+            embedder_clone.as_ref(),
+            engine,
+            tx,
+        )?;
         anyhow::Ok(())
     })
     .await??;
@@ -112,18 +65,18 @@ pub async fn build_index(
 }
 
 /// Fetch the total download size for `model_id` from the HuggingFace API.
-pub async fn get_model_size(model_id: String) -> anyhow::Result<u64> {
+pub async fn get_model_size(engine: wilkes_core::types::EmbeddingEngine, model_id: String) -> anyhow::Result<u64> {
     tokio::task::spawn_blocking(move || {
-        wilkes_core::embed::candle::fetch_model_size(&model_id)
+        wilkes_core::embed::dispatch::fetch_model_size(engine, &model_id)
     })
     .await?
 }
 
-/// Return all candle-supported models, annotated with local cache availability.
-pub async fn list_models(data_dir: &Path) -> Vec<wilkes_core::types::ModelDescriptor> {
+/// Return all engine-supported models, annotated with local cache availability.
+pub async fn list_models(engine: wilkes_core::types::EmbeddingEngine, data_dir: &Path) -> Vec<wilkes_core::types::ModelDescriptor> {
     let data_dir = data_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        wilkes_core::embed::candle::list_supported_models(&data_dir)
+        wilkes_core::embed::dispatch::list_models(engine, &data_dir)
     })
     .await
     .unwrap_or_default()

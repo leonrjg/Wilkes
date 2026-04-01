@@ -1,4 +1,5 @@
 pub mod chunk;
+pub mod dispatch;
 pub mod downloader;
 pub mod index;
 pub mod installer;
@@ -16,6 +17,13 @@ pub trait Embedder: Send + Sync {
     fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>>;
     fn model_id(&self) -> &str;
     fn dimension(&self) -> usize;
+
+    /// Suggested batch size for this model.
+    /// `None` means the entire input should be embedded as a single batch
+    /// (e.g. for dynamically quantized models).
+    fn preferred_batch_size(&self) -> Option<usize> {
+        Some(32)
+    }
 
     /// Embed texts that will be used as search queries.
     /// Override to add model-specific query prefixes (e.g. "query: " for E5).

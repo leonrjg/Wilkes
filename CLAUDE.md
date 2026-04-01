@@ -1,4 +1,6 @@
-Read and obey my user-wide CLAUDE.md. Do not use sub-agents.
+Use Gemini MCP as a sub-agent for codebase exploration or any use case in which you need sub-agents - your own subagents are forbidden, do not use them.
+Offload any tasks whose intermediate states you don't need to Gemini, specifying model = "gemini-3-flash-preview".
+You remain responsible for doing the final analysis of root causes and cost-benefit; Gemini only provides information - give it quick queries.
 
 # Wilkes
 - This is a GUI built on Tauri to search across multiple files, prioritizing PDFs.

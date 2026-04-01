@@ -1,7 +1,14 @@
 import type {
+  EmbedderModel,
+  EmbedDone,
+  EmbedError,
+  EmbedProgress,
+  EmbeddingEngine,
   FileEntry,
   FileMatches,
+  IndexStatus,
   MatchRef,
+  ModelDescriptor,
   PreviewData,
   SearchQuery,
   SearchStats,
@@ -129,6 +136,40 @@ export class HttpSearchApi implements SearchApi {
 
   resolvePdfUrl(path: string): string {
     return `/asset?path=${encodeURIComponent(path)}`;
+  }
+
+  // ── Semantic / embed commands ──────────────────────────────────────────────
+
+  async listModels(_engine: EmbeddingEngine): Promise<ModelDescriptor[]> {
+    return [];
+  }
+
+  async getModelSize(_engine: EmbeddingEngine, _modelId: string): Promise<number> {
+    return 0;
+  }
+
+  async downloadModel(_model: EmbedderModel, _engine: EmbeddingEngine): Promise<void> {}
+
+  async buildIndex(_root: string, _model: EmbedderModel, _engine: EmbeddingEngine): Promise<void> {}
+
+  async cancelEmbed(): Promise<void> {}
+
+  async getIndexStatus(): Promise<IndexStatus> {
+    throw new Error("Semantic search not available on web");
+  }
+
+  async deleteIndex(): Promise<void> {}
+
+  async onEmbedProgress(_handler: (p: EmbedProgress) => void): Promise<() => void> {
+    return Promise.resolve(() => {});
+  }
+
+  async onEmbedDone(_handler: (d: EmbedDone) => void): Promise<() => void> {
+    return Promise.resolve(() => {});
+  }
+
+  async onEmbedError(_handler: (e: EmbedError) => void): Promise<() => void> {
+    return Promise.resolve(() => {});
   }
 }
 

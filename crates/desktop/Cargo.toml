@@ -16,7 +16,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 wilkes-api = { path = "../api" }
-wilkes-core = { path = "../core", features = ["metal"] }
+wilkes-core = { path = "../core", features = ["metal", "fastembed"] }
 tauri = { version = "2", features = ["protocol-asset", "devtools"] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }

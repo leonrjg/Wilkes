@@ -1,7 +1,14 @@
 import type {
+  EmbedderModel,
+  EmbedDone,
+  EmbedError,
+  EmbedProgress,
+  EmbeddingEngine,
   FileEntry,
   FileMatches,
+  IndexStatus,
   MatchRef,
+  ModelDescriptor,
   PreviewData,
   SearchQuery,
   SearchStats,
@@ -22,6 +29,19 @@ export interface SearchApi {
   listFiles(root: string): Promise<FileEntry[]>;
   openFile(path: string): Promise<PreviewData>;
   resolvePdfUrl(path: string): string;
+
+  // ── Semantic / embed commands ──────────────────────────────────────────────
+  listModels(engine: EmbeddingEngine): Promise<ModelDescriptor[]>;
+  getModelSize(engine: EmbeddingEngine, modelId: string): Promise<number>;
+  downloadModel(model: EmbedderModel, engine: EmbeddingEngine): Promise<void>;
+  buildIndex(root: string, model: EmbedderModel, engine: EmbeddingEngine): Promise<void>;
+  cancelEmbed(): Promise<void>;
+  getIndexStatus(): Promise<IndexStatus>;
+  deleteIndex(): Promise<void>;
+
+  onEmbedProgress(handler: (progress: EmbedProgress) => void): Promise<() => void>;
+  onEmbedDone(handler: (done: EmbedDone) => void): Promise<() => void>;
+  onEmbedError(handler: (err: EmbedError) => void): Promise<() => void>;
 }
 
 // Desktop: native directory picker.

@@ -6,6 +6,7 @@ import type {
   EmbedDone,
   EmbedError,
   EmbedProgress,
+  EmbeddingEngine,
   FileEntry,
   FileMatches,
   IndexStatus,
@@ -77,20 +78,20 @@ export class TauriSearchApi implements SearchApi {
 
   // ── Semantic / embed commands ──────────────────────────────────────────────
 
-  async listModels(): Promise<ModelDescriptor[]> {
-    return invoke<ModelDescriptor[]>("list_models");
+  async listModels(engine: EmbeddingEngine): Promise<ModelDescriptor[]> {
+    return invoke<ModelDescriptor[]>("list_models", { engine });
   }
 
-  async getModelSize(modelId: string): Promise<number> {
-    return invoke<number>("get_model_size", { modelId });
+  async getModelSize(engine: EmbeddingEngine, modelId: string): Promise<number> {
+    return invoke<number>("get_model_size", { engine, modelId });
   }
 
-  async downloadModel(model: EmbedderModel): Promise<void> {
-    return invoke("download_model", { model });
+  async downloadModel(model: EmbedderModel, engine: EmbeddingEngine): Promise<void> {
+    return invoke("download_model", { model, engine });
   }
 
-  async buildIndex(root: string, model: EmbedderModel): Promise<void> {
-    return invoke("build_index", { root, model });
+  async buildIndex(root: string, model: EmbedderModel, engine: EmbeddingEngine): Promise<void> {
+    return invoke("build_index", { root, model, engine });
   }
 
   async cancelEmbed(): Promise<void> {

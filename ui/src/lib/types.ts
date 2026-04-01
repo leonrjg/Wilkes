@@ -85,6 +85,8 @@ export interface FileEntry {
 /** HuggingFace model code, e.g. "BAAI/bge-base-en-v1.5". */
 export type EmbedderModel = string;
 
+export type EmbeddingEngine = "Candle" | "Fastembed";
+
 export interface ModelDescriptor {
   model_id: string;
   display_name: string;
@@ -97,6 +99,7 @@ export interface ModelDescriptor {
 
 export interface SemanticSettings {
   enabled: boolean;
+  engine: EmbeddingEngine;
   model: EmbedderModel;
   index_path: string | null;
 }
@@ -133,6 +136,8 @@ export interface IndexStatus {
   indexed_files: number;
   total_chunks: number;
   built_at: number | null;
+  build_duration_ms: number | null;
+  engine: EmbeddingEngine;
   model_id: string;
   dimension: number;
 }
@@ -146,6 +151,7 @@ export interface DownloadProgress {
 export interface IndexBuildProgress {
   files_processed: number;
   total_files: number;
+  message: string;
   done: boolean;
 }
 

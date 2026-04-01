@@ -32,8 +32,8 @@ export default function ExtensionFilter({ fileList, excluded, onChange }: Props)
             onClick={() => toggle(ext)}
             className={`px-2 py-0.5 rounded text-xs transition-colors ${
               active
-                ? "bg-neutral-700 text-neutral-200"
-                : "bg-neutral-800 text-neutral-600"
+                ? "bg-[var(--bg-active)] text-[var(--text-main)]"
+                : "bg-[var(--bg-active)]/40 text-[var(--text-dim)]"
             }`}
           >
             .{ext} ({counts[ext]})

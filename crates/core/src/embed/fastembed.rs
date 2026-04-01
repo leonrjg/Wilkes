@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
@@ -60,12 +60,13 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
                 .to_string();
 
             ModelDescriptor {
-                model_id: info.model_code,
+                model_id: info.model_code.clone(),
                 display_name,
                 description: info.description,
                 dimension: info.dim,
                 is_cached,
                 size_bytes,
+                preferred_batch_size: get_preferred_batch_size(&info.model_code),
             }
         })
         .collect()
@@ -122,12 +123,17 @@ pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {
 
 /// ONNX batch size for CPU inference. Large batches (fastembed's default of 256)
 /// exceed L3 cache and thrash; 32 keeps the working set cache-resident.
-const EMBED_BATCH_SIZE: usize = 32;
+const DEFAULT_BATCH_SIZE: usize = 32;
+
+fn get_preferred_batch_size(_model_id: &str) -> Option<usize> {
+    Some(DEFAULT_BATCH_SIZE)
+}
 
 pub struct FastEmbedder {
-    inner: TextEmbedding,
+    inner: Mutex<TextEmbedding>,
     model_id: String,
     dimension: usize,
+    preferred_batch_size: Option<usize>,
 }
 
 impl FastEmbedder {
@@ -142,15 +148,16 @@ impl FastEmbedder {
     }
 
     fn embed_with_prefix(&self, texts: &[&str], prefix: &str) -> anyhow::Result<Vec<Vec<f32>>> {
+        let mut inner = self.inner.lock().unwrap();
         if prefix.is_empty() {
-            return self.inner
-                .embed(texts.to_vec(), Some(EMBED_BATCH_SIZE))
+            return inner
+                .embed(texts.to_vec(), self.preferred_batch_size)
                 .map_err(|e| anyhow::anyhow!("fastembed error: {e}"));
         }
         let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
         let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
-        self.inner
-            .embed(refs, Some(EMBED_BATCH_SIZE))
+        inner
+            .embed(refs, self.preferred_batch_size)
             .map_err(|e| anyhow::anyhow!("fastembed error: {e}"))
     }
 }
@@ -158,7 +165,9 @@ impl FastEmbedder {
 impl Embedder for FastEmbedder {
     fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         self.inner
-            .embed(texts.to_vec(), Some(EMBED_BATCH_SIZE))
+            .lock()
+            .unwrap()
+            .embed(texts.to_vec(), self.preferred_batch_size)
             .map_err(|e| anyhow::anyhow!("fastembed error: {e}"))
     }
 
@@ -168,6 +177,10 @@ impl Embedder for FastEmbedder {
 
     fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    fn preferred_batch_size(&self) -> Option<usize> {
+        self.preferred_batch_size
     }
 
     fn embed_query(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -217,11 +230,19 @@ impl EmbedderInstaller for FastembedInstaller {
             .await;
 
         tokio::task::spawn_blocking(move || {
-            TextEmbedding::try_new(
-                InitOptions::new(fm)
-                    .with_cache_dir(cache_dir)
-                    .with_show_download_progress(true),
-            )
+            let mut options = InitOptions::new(fm)
+                .with_cache_dir(cache_dir)
+                .with_show_download_progress(true);
+
+            #[cfg(target_os = "macos")]
+            {
+                options = options.with_execution_providers(vec![
+                    ort::execution_providers::CoreMLExecutionProvider::default().into(),
+                    ort::execution_providers::CPUExecutionProvider::default().into(),
+                ]);
+            }
+
+            TextEmbedding::try_new(options)
         })
         .await?
         .map_err(|e| anyhow::anyhow!("fastembed install: {e}"))?;
@@ -246,14 +267,28 @@ impl EmbedderInstaller for FastembedInstaller {
         let dimension = info.dim;
         let model_id = self.model.0.clone();
         let cache_dir = data_dir.to_path_buf();
+        let preferred_batch_size = get_preferred_batch_size(&model_id);
 
-        let inner = TextEmbedding::try_new(
-            InitOptions::new(info.model)
-                .with_cache_dir(cache_dir)
-                .with_show_download_progress(true),
-        )
-        .map_err(|e| anyhow::anyhow!("fastembed build: {e}"))?;
+        let mut options = InitOptions::new(info.model)
+            .with_cache_dir(cache_dir)
+            .with_show_download_progress(true);
 
-        Ok(Arc::new(FastEmbedder { inner, model_id, dimension }))
+        #[cfg(target_os = "macos")]
+        {
+            options = options.with_execution_providers(vec![
+                ort::execution_providers::CoreMLExecutionProvider::default().into(),
+                ort::execution_providers::CPUExecutionProvider::default().into(),
+            ]);
+        }
+
+        let inner = TextEmbedding::try_new(options)
+            .map_err(|e| anyhow::anyhow!("fastembed build: {e}"))?;
+
+        Ok(Arc::new(FastEmbedder {
+            inner: Mutex::new(inner),
+            model_id,
+            dimension,
+            preferred_batch_size,
+        }))
     }
 }

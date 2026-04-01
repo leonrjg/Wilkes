@@ -1,8 +1,57 @@
 @import "tailwindcss";
 
+:root {
+  --bg-app: #ffffff;
+  --bg-sidebar: #f5f5f5;
+  --bg-header: #fafafa;
+  --bg-active: #f3f4f6;
+  --bg-hover: #f9fafb;
+  --bg-input: #ffffff;
+  --bg-card: #f9fafb;
+  
+  --text-main: #171717;
+  --text-muted: #737373;
+  --text-dim: #a3a3a3;
+  --text-on-active: #000000;
+  
+  --border-main: #e5e5e5;
+  --border-strong: #d4d4d4;
+  
+  --accent-blue: #2563eb;
+  --accent-blue-hover: #1d4ed8;
+  --accent-blue-muted: #dbeafe;
+}
+
+.dark {
+  --bg-app: #0a0a0a;
+  --bg-sidebar: #121212;
+  --bg-header: #171717;
+  --bg-active: #262626;
+  --bg-hover: #1c1c1c;
+  --bg-input: #171717;
+  --bg-card: #141414;
+  
+  --text-main: #ededed;
+  --text-muted: #a3a3a3;
+  --text-dim: #737373;
+  --text-on-active: #ffffff;
+  
+  --border-main: #262626;
+  --border-strong: #404040;
+  
+  --accent-blue: #3b82f6;
+  --accent-blue-hover: #60a5fa;
+  --accent-blue-muted: #1e3a8a;
+}
+
 * {
-  scrollbar-color: #404040 #262626;
+  scrollbar-color: var(--border-strong) var(--bg-sidebar);
   scrollbar-width: thin;
+  user-select: none;
+}
+
+.selectable {
+  user-select: text;
 }
 
 /* CodeMirror baseline */
@@ -21,4 +70,30 @@
   background-color: rgb(250 204 21 / 0.4);
   border-radius: 2px;
   padding: 0 1px;
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.animate-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+
+.animate-shimmer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.2),
+    transparent
+  );
+  animation: shimmer 1.5s infinite;
 }

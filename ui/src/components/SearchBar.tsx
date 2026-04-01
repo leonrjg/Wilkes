@@ -93,7 +93,7 @@ export default function SearchBar({
   }, [isRegex, caseSensitive, directory, excluded, isSemanticMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <div className="flex flex-col gap-2 p-3 border-b border-neutral-800 bg-neutral-900">
+    <div className="flex flex-col gap-2 p-3 border-b border-[var(--border-main)] bg-[var(--bg-app)]">
       {/* Top row: toggles + pattern */}
       <div className="flex items-center gap-2">
         <Toggle
@@ -117,7 +117,7 @@ export default function SearchBar({
         />
 
         {searching && (
-          <span className="text-xs text-blue-400 animate-pulse">searching…</span>
+          <span className="text-xs text-[var(--accent-blue)] animate-pulse">searching…</span>
         )}
 
         <input
@@ -125,7 +125,7 @@ export default function SearchBar({
           value={pattern}
           onChange={(e) => setPattern(e.target.value)}
           placeholder="Search…"
-          className="flex-1 bg-neutral-800 rounded px-3 py-1.5 text-sm outline-none focus:ring-1 focus:ring-blue-500 placeholder:text-neutral-500"
+          className="flex-1 bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-3 py-1.5 text-sm outline-none focus:ring-1 focus:ring-[var(--accent-blue)] placeholder:text-[var(--text-dim)] text-[var(--text-main)] transition-colors"
           spellCheck={false}
           autoFocus
         />
@@ -160,12 +160,12 @@ function Toggle({
       onClick={onToggle}
       title={title}
       disabled={disabled}
-      className={`px-2 py-1 rounded text-xs font-mono font-semibold transition-colors ${
+      className={`px-2 py-1 rounded text-xs font-mono font-semibold transition-all border ${
         disabled
-          ? "bg-neutral-800 text-neutral-600 cursor-not-allowed"
+          ? "bg-[var(--bg-active)] text-[var(--text-dim)] border-transparent cursor-not-allowed"
           : active
-            ? "bg-blue-600 text-white"
-            : "bg-neutral-800 text-neutral-400 hover:text-neutral-100"
+            ? "bg-[var(--accent-blue)] text-white border-[var(--accent-blue)] shadow-sm"
+            : "bg-[var(--bg-active)] text-[var(--text-muted)] border-[var(--border-main)] hover:text-[var(--text-main)] hover:border-[var(--border-strong)]"
       }`}
     >
       {label}

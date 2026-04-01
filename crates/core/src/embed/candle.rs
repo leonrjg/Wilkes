@@ -5,7 +5,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use candle_core::{Device, DType, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE};
+use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::Cache;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
@@ -97,6 +97,7 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
                 dimension: 0,
                 is_cached,
                 size_bytes,
+                preferred_batch_size: Some(EMBED_BATCH_SIZE),
             }
         })
         .collect()
@@ -356,6 +357,10 @@ impl Embedder for CandleEmbedder {
 
     fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    fn preferred_batch_size(&self) -> Option<usize> {
+        Some(EMBED_BATCH_SIZE)
     }
 
     fn embed_query(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {

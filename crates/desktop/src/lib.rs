@@ -6,13 +6,13 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use wilkes_core::embed::Embedder;
-use wilkes_core::embed::candle::CandleInstaller;
+use wilkes_core::embed::dispatch;
 use wilkes_core::embed::index::SemanticIndex;
-use wilkes_core::embed::installer::{EmbedProgress, EmbedderInstaller};
+use wilkes_core::embed::installer::EmbedProgress;
 use wilkes_core::embed::watcher::IndexWatcher;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::types::{
-    EmbedderModel, FileEntry, IndexStatus, MatchRef, ModelDescriptor, SearchMode, SearchQuery,
+    EmbedderModel, EmbeddingEngine, FileEntry, IndexStatus, MatchRef, ModelDescriptor, SearchMode, SearchQuery,
     SearchStats, SemanticSettings, Settings,
 };
 
@@ -209,9 +209,9 @@ async fn pick_directory(app: AppHandle) -> Result<Option<String>, String> {
 
 /// Download the selected embedding model. Emits `embed-progress`, `embed-done`, or `embed-error`.
 #[tauri::command]
-async fn download_model(model: EmbedderModel, app: AppHandle) -> Result<(), String> {
+async fn download_model(model: EmbedderModel, engine: EmbeddingEngine, app: AppHandle) -> Result<(), String> {
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let installer = Arc::new(CandleInstaller::new(model));
+    let installer = dispatch::get_installer(engine, model.clone());
     let (tx, mut rx) = tokio::sync::mpsc::channel::<EmbedProgress>(64);
 
     let app_clone = app.clone();
@@ -237,7 +237,7 @@ async fn download_model(model: EmbedderModel, app: AppHandle) -> Result<(), Stri
                 match installer_clone.build(&data_dir_clone) {
                     Ok(embedder) => {
                         *app_clone.state::<ActiveEmbedderState>().0.lock().unwrap() = Some(embedder);
-                        update_semantic_settings(|s| SemanticSettings { enabled: true, ..s }).await;
+                        update_semantic_settings(|s| SemanticSettings { enabled: true, engine, model, ..s }).await;
                         let _ = app_clone.emit("embed-done", EmbedDone { operation: EmbedOperation::Download });
                     }
                     Err(e) => {
@@ -273,7 +273,7 @@ async fn download_model(model: EmbedderModel, app: AppHandle) -> Result<(), Stri
 /// Build the semantic index for `root` using `model`.
 /// Emits `embed-progress`, `embed-done`, or `embed-error`.
 #[tauri::command]
-async fn build_index(root: String, model: EmbedderModel, app: AppHandle) -> Result<(), String> {
+async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine, app: AppHandle) -> Result<(), String> {
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
 
     // Stop the active watcher before rebuilding (a watcher event against a
@@ -283,7 +283,7 @@ async fn build_index(root: String, model: EmbedderModel, app: AppHandle) -> Resu
     let cancel = CancellationToken::new();
     let cancel_for_select = cancel.clone();
 
-    let installer = Arc::new(CandleInstaller::new(model));
+    let installer = dispatch::get_installer(engine, model.clone());
     let (tx, mut rx) = tokio::sync::mpsc::channel::<EmbedProgress>(64);
 
     let app_clone = app.clone();
@@ -308,6 +308,7 @@ async fn build_index(root: String, model: EmbedderModel, app: AppHandle) -> Resu
             result = wilkes_api::commands::embed::build_index(
                 root_path.clone(),
                 installer_clone.as_ref(),
+                engine,
                 data_dir_clone.clone(),
                 tx,
             ) => result,
@@ -397,17 +398,17 @@ async fn build_index(root: String, model: EmbedderModel, app: AppHandle) -> Resu
     Ok(())
 }
 
-/// Return all fastembed-supported models annotated with local cache availability.
+/// Return all supported models annotated with local cache availability.
 #[tauri::command]
-async fn list_models(app: AppHandle) -> Result<Vec<ModelDescriptor>, String> {
+async fn list_models(engine: EmbeddingEngine, app: AppHandle) -> Result<Vec<ModelDescriptor>, String> {
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    Ok(wilkes_api::commands::embed::list_models(&data_dir).await)
+    Ok(wilkes_api::commands::embed::list_models(engine, &data_dir).await)
 }
 
 /// Fetch the total download size for `model_id` from the HuggingFace API.
 #[tauri::command]
-async fn get_model_size(model_id: String) -> Result<u64, String> {
-    wilkes_api::commands::embed::get_model_size(model_id)
+async fn get_model_size(engine: EmbeddingEngine, model_id: String) -> Result<u64, String> {
+    wilkes_api::commands::embed::get_model_size(engine, model_id)
         .await
         .map_err(|e| e.to_string())
 }
@@ -500,7 +501,8 @@ async fn restore_semantic_state(app: &AppHandle) {
     }
 
     let model = settings.semantic.model;
-    let installer = CandleInstaller::new(model);
+    let engine = settings.semantic.engine;
+    let installer = dispatch::get_installer(engine, model);
     if !installer.is_available(&data_dir) {
         eprintln!("restore_semantic_state: model files not found, skipping restore");
         return;

@@ -28,7 +28,7 @@ export default function DirectoryPicker({
       <button
         onClick={onPickDirectory}
         title={directory || "Choose directory"}
-        className="text-xs text-neutral-400 hover:text-neutral-100 bg-neutral-800 rounded px-2 py-1 truncate max-w-[200px] text-left"
+        className="text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] bg-[var(--bg-active)] rounded px-2 py-1 truncate max-w-[200px] text-left"
       >
         {directory ? shortPath(directory) : "Choose directory…"}
       </button>
@@ -42,8 +42,8 @@ export default function DirectoryPicker({
           title={isBookmarked ? "Remove bookmark" : "Bookmark this directory"}
           className={`text-xs px-1.5 py-1 rounded transition-colors ${
             isBookmarked
-              ? "text-yellow-400 hover:text-neutral-400"
-              : "text-neutral-600 hover:text-yellow-400"
+              ? "text-yellow-400 hover:text-[var(--text-muted)]"
+              : "text-[var(--text-dim)] hover:text-yellow-400"
           }`}
         >
           ★
@@ -60,8 +60,8 @@ export default function DirectoryPicker({
               title={b}
               className={`text-xs px-1.5 py-1 rounded flex-shrink-0 truncate max-w-[80px] transition-colors ${
                 b === directory
-                  ? "text-blue-400 bg-neutral-800"
-                  : "text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800"
+                  ? "text-[var(--accent-blue)] bg-[var(--bg-active)]"
+                  : "text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-active)]"
               }`}
             >
               {shortPath(b).split("/").pop() || shortPath(b)}

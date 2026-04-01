@@ -19,6 +19,7 @@ pub struct DownloadProgress {
 pub struct IndexBuildProgress {
     pub files_processed: usize,
     pub total_files: usize,
+    pub message: String,
     pub done: bool,
 }
 

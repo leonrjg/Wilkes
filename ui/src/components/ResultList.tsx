@@ -55,9 +55,9 @@ function highlightMatch(line: string, matchedText: string): React.ReactNode {
   if (idx === -1) return <span>{line}</span>;
   return (
     <>
-      <span className="text-neutral-400">{line.slice(0, idx)}</span>
-      <mark className="match-highlight text-neutral-100 bg-transparent">{matchedText}</mark>
-      <span className="text-neutral-400">{line.slice(idx + matchedText.length)}</span>
+      <span className="text-[var(--text-muted)]">{line.slice(0, idx)}</span>
+      <mark className="match-highlight text-[var(--text-main)] bg-transparent">{matchedText}</mark>
+      <span className="text-[var(--text-muted)]">{line.slice(idx + matchedText.length)}</span>
     </>
   );
 }
@@ -121,7 +121,7 @@ export default function ResultList({
   if (!hasQuery) {
     return (
       <div className="flex flex-col h-full overflow-hidden">
-        <div className="px-3 py-1.5 text-xs text-neutral-500 border-b border-neutral-800 flex-shrink-0">
+        <div className="px-3 py-1.5 text-xs text-[var(--text-muted)] border-b border-[var(--border-main)] flex-shrink-0">
           {fileList.length} files
         </div>
         <div className="flex-1 overflow-y-auto">
@@ -139,9 +139,9 @@ export default function ResultList({
   }
 
   return (
-    <div className="flex flex-col h-full overflow-hidden">
+    <div className="flex flex-col h-full overflow-hidden bg-[var(--bg-app)]">
       {/* Status bar */}
-      <div className="px-3 py-1.5 text-xs text-neutral-500 border-b border-neutral-800 flex-shrink-0 flex flex-col gap-0.5">
+      <div className="px-3 py-1.5 text-xs text-[var(--text-muted)] border-b border-[var(--border-main)] flex-shrink-0 flex flex-col gap-0.5 bg-[var(--bg-header)]">
         <span>
           {searching
             ? `${totalCount} matches…`
@@ -150,19 +150,20 @@ export default function ResultList({
               : "Ready"}
         </span>
         {stats && stats.errors.length > 0 && (
-          <span className="text-red-400" title={stats.errors.join("\n")}>
+          <span className="text-red-500 font-medium" title={stats.errors.join("\n")}>
             {stats.errors.length} file{stats.errors.length === 1 ? "" : "s"} failed (hover for details)
           </span>
         )}
       </div>
-
+    ...
       {/* Virtual list */}
       <div ref={parentRef} className="flex-1 overflow-y-auto">
         {rows.length === 0 && !searching && (
-          <div className="text-neutral-600 text-sm p-4 text-center">
+          <div className="text-[var(--text-dim)] text-sm p-4 text-center">
             {stats ? "No results" : "Type to search"}
           </div>
         )}
+
 
         <div
           style={{ height: `${rowVirtualizer.getTotalSize()}px`, position: "relative" }}
@@ -209,12 +210,12 @@ export default function ResultList({
 
 function FileHeader({ fm }: { fm: FileMatches }) {
   return (
-    <div className="flex items-baseline gap-2 px-3 py-1.5 bg-neutral-900 border-b border-neutral-800">
-      <span className="text-sm font-medium text-neutral-100 truncate">
+    <div className="flex items-baseline gap-2 px-3 py-1.5 bg-[var(--bg-header)] border-b border-[var(--border-main)] selectable">
+      <span className="text-sm font-medium text-[var(--text-main)] truncate">
         {fileName(fm.path)}
       </span>
-      <span className="text-xs text-neutral-500 truncate flex-1">{dirName(fm.path)}</span>
-      <span className="text-xs text-neutral-500 flex-shrink-0">
+      <span className="text-xs text-[var(--text-muted)] truncate flex-1">{dirName(fm.path)}</span>
+      <span className="text-xs text-[var(--text-muted)] flex-shrink-0">
         {fm.matches.length} {fm.matches.length === 1 ? "match" : "matches"}
       </span>
     </div>
@@ -225,7 +226,7 @@ function ExpandStrip({ remaining, onExpand }: { remaining: number; onExpand: () 
   return (
     <button
       onClick={onExpand}
-      className="w-full flex items-center gap-2 px-3 py-1 text-left hover:bg-neutral-800 transition-colors text-xs text-neutral-500 hover:text-neutral-300"
+      className="w-full flex items-center gap-2 px-3 py-1 text-left hover:bg-[var(--bg-hover)] transition-colors text-xs text-[var(--text-muted)] hover:text-[var(--text-main)]"
     >
       <span className="w-10 flex-shrink-0" />
       <span>
@@ -253,16 +254,16 @@ function FileEntryRow({
   return (
     <button
       onClick={onClick}
-      className={`w-full flex items-baseline gap-2 px-3 py-1.5 text-left hover:bg-neutral-800 transition-colors ${
-        selected ? "bg-neutral-800" : ""
+      className={`w-full flex items-baseline gap-2 px-3 py-1.5 text-left hover:bg-[var(--bg-hover)] transition-colors selectable ${
+        selected ? "bg-[var(--bg-active)]" : ""
       }`}
     >
-      <span className="text-sm font-medium text-neutral-200 truncate">
+      <span className="text-sm font-medium text-[var(--text-main)] truncate">
         {fileName(entry.path)}
       </span>
-      <span className="text-xs text-neutral-500 truncate flex-1">{dirName(entry.path)}</span>
-      <span className="text-xs text-neutral-500 flex-shrink-0 font-mono">
-        {entry.file_type === "Pdf" && <span className="text-blue-500 mr-1.5">PDF</span>}
+      <span className="text-xs text-[var(--text-muted)] truncate flex-1">{dirName(entry.path)}</span>
+      <span className="text-xs text-[var(--text-muted)] flex-shrink-0 font-mono">
+        {entry.file_type === "Pdf" && <span className="text-[var(--accent-blue)] mr-1.5">PDF</span>}
         {formatSize(entry.size_bytes)}
       </span>
     </button>
@@ -283,15 +284,15 @@ function MatchRow({
   return (
     <button
       onClick={onClick}
-      className={`w-full flex items-start gap-2 px-3 py-1 text-left hover:bg-neutral-800 transition-colors ${
-        selected ? "bg-neutral-800" : ""
+      className={`w-full flex items-start gap-2 px-3 py-1 text-left hover:bg-[var(--bg-hover)] transition-colors selectable ${
+        selected ? "bg-[var(--bg-active)]" : ""
       }`}
     >
-      <span className="text-xs text-blue-400 w-10 flex-shrink-0 font-mono text-right pt-px">
+      <span className="text-xs text-[var(--accent-blue)] w-10 flex-shrink-0 font-mono text-right pt-px">
         {originLabel(match.origin)}
       </span>
       {match.score != null && (
-        <span className="text-xs text-neutral-500 flex-shrink-0 font-mono pt-px">
+        <span className="text-xs text-[var(--text-muted)] flex-shrink-0 font-mono pt-px">
           {(match.score * 100).toFixed(0)}%
         </span>
       )}

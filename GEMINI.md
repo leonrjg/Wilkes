@@ -1,0 +1,1 @@
+- Do not modify aspects that were not requested explicitly, e.g. no UI redesign of existing elements.

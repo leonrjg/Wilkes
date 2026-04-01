@@ -167,6 +167,12 @@ pub enum PreviewData {
 #[serde(transparent)]
 pub struct EmbedderModel(pub String);
 
+impl Default for EmbedderModel {
+    fn default() -> Self {
+        Self("BAAI/bge-base-en-v1.5".to_string())
+    }
+}
+
 impl EmbedderModel {
     pub fn model_id(&self) -> &str {
         &self.0
@@ -200,6 +206,27 @@ pub struct ModelDescriptor {
     /// Total bytes of all model files. Populated from disk for cached models;
     /// `None` for uncached models until explicitly fetched from HuggingFace.
     pub size_bytes: Option<u64>,
+    /// How many texts to embed at once. `None` means process all texts as one batch
+    /// (required for some quantized models to ensure consistent results).
+    pub preferred_batch_size: Option<usize>,
+}
+
+// ── Embedding engine ──────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub enum EmbeddingEngine {
+    #[default]
+    Candle,
+    Fastembed,
+}
+
+impl EmbeddingEngine {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EmbeddingEngine::Candle => "candle",
+            EmbeddingEngine::Fastembed => "fastembed",
+        }
+    }
 }
 
 // ── Semantic settings ─────────────────────────────────────────────────────────
@@ -207,6 +234,9 @@ pub struct ModelDescriptor {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SemanticSettings {
     pub enabled: bool,
+    #[serde(default)]
+    pub engine: EmbeddingEngine,
+    #[serde(default)]
     pub model: EmbedderModel,
     pub index_path: Option<PathBuf>,
 }
@@ -215,6 +245,7 @@ impl Default for SemanticSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            engine: EmbeddingEngine::default(),
             model: EmbedderModel("BAAI/bge-base-en-v1.5".to_string()),
             index_path: None,
         }
@@ -222,12 +253,13 @@ impl Default for SemanticSettings {
 }
 
 // ── Index status ──────────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IndexStatus {
     pub indexed_files: usize,
     pub total_chunks: usize,
     pub built_at: Option<u64>,
+    pub build_duration_ms: Option<u64>,
+    pub engine: EmbeddingEngine,
     pub model_id: String,
     pub dimension: usize,
 }
