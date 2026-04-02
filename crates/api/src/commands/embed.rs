@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use ignore::WalkBuilder;
 use wilkes_core::embed::Embedder;
-use wilkes_core::embed::index::{PreparedFile, SemanticIndex};
-use wilkes_core::embed::installer::{EmbedProgress, EmbedderInstaller, IndexBuildProgress, ProgressTx};
+use wilkes_core::embed::index::SemanticIndex;
+use wilkes_core::embed::installer::{EmbedderInstaller, ProgressTx};
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::types::IndexStatus;
