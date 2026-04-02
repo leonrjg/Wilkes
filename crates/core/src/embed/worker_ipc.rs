@@ -7,7 +7,7 @@ use super::installer::EmbedProgress;
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct WorkerRequest {
     #[serde(default = "default_mode")]
-    pub mode: String, // "build" or "list-models"
+    pub mode: String, // "build" or "embed"
     pub root: PathBuf,
     pub engine: EmbeddingEngine,
     pub model: String, // HuggingFace model ID
@@ -17,6 +17,7 @@ pub struct WorkerRequest {
     #[serde(default = "default_device")]
     pub device: String, // "auto", "cpu", "mps", "cuda", etc.
     pub paths: Option<Vec<PathBuf>>, // Optional: incremental update for specific files
+    pub texts: Option<Vec<String>>,  // Used by "embed" mode
 }
 
 fn default_mode() -> String {
@@ -32,17 +33,10 @@ fn default_device() -> String {
 pub enum WorkerEvent {
     /// Forwarded from the index build progress channel.
     Progress(EmbedProgress),
-    /// List of models locally available in the HF cache.
-    Models(Vec<ModelInfo>),
+    /// Embedding vectors returned by the "embed" mode.
+    Embeddings(Vec<Vec<f32>>),
     /// Index build completed successfully.
     Done,
     /// Index build failed.
     Error(String),
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct ModelInfo {
-    pub model_id: String,
-    pub dimension: usize,
-    pub size_bytes: u64,
 }

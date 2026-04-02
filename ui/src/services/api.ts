@@ -31,6 +31,7 @@ export interface SearchApi {
   resolvePdfUrl(path: string): string;
   getLogs(): Promise<string[]>;
   clearLogs(): Promise<void>;
+  getPythonInfo(): Promise<string>;
 
   // ── Semantic / embed commands ──────────────────────────────────────────────
   listModels(engine: EmbeddingEngine): Promise<ModelDescriptor[]>;

@@ -1,0 +1,5 @@
+sentence-transformers
+semantic-text-splitter
+sqlite-vec
+numpy
+PyMuPDF

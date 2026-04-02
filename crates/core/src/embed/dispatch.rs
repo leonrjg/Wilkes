@@ -5,15 +5,15 @@ use super::installer::EmbedderInstaller;
 
 pub fn list_models(engine: EmbeddingEngine, _data_dir: &Path) -> Vec<ModelDescriptor> {
     match engine {
-        EmbeddingEngine::Python => vec![], // Handled by desktop spawning worker
+        EmbeddingEngine::Python => super::hf_cache::list_cached_models(),
 
         #[cfg(feature = "candle")]
-        EmbeddingEngine::Candle => super::candle::list_supported_models(data_dir),
+        EmbeddingEngine::Candle => super::candle::list_supported_models(_data_dir),
         #[cfg(not(feature = "candle"))]
         EmbeddingEngine::Candle => vec![],
 
         #[cfg(feature = "fastembed")]
-        EmbeddingEngine::Fastembed => super::fastembed::list_supported_models(data_dir),
+        EmbeddingEngine::Fastembed => super::fastembed::list_supported_models(_data_dir),
         #[cfg(not(feature = "fastembed"))]
         EmbeddingEngine::Fastembed => vec![],
     }

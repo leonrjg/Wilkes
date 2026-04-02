@@ -5911,6 +5911,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlite-vec"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0ba424237a9a5db2f6071f193319e2b6a32f7f3961debb2fbbfe67067abce3f"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7617,6 +7626,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "chrono",
+ "dirs 5.0.1",
  "fastembed",
  "grep-matcher",
  "grep-regex",
@@ -7633,6 +7643,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sqlite-vec",
  "text-splitter",
  "thiserror 2.0.18",
  "tokenizers 0.20.4",

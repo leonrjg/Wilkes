@@ -12,6 +12,20 @@ use super::Embedder;
 use super::chunk::{Chunk, chunk_content};
 use super::installer::{EmbedProgress, IndexBuildProgress, ProgressTx};
 
+// ── sqlite-vec extension loading ──────────────────────────────────────────────
+
+fn load_sqlite_vec() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        // sqlite3_vec_init is declared as fn() but sqlite3_auto_extension expects
+        // the full 3-argument extension init signature. transmute bridges the gap;
+        // this is the canonical pattern shown in the sqlite-vec crate's own tests.
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
+}
+
 // ── File path of the SQLite DB ────────────────────────────────────────────────
 
 fn db_path(data_dir: &Path) -> PathBuf {
@@ -49,21 +63,31 @@ pub struct SemanticIndex {
 
 impl SemanticIndex {
     /// Open an existing index. Returns `Err` if no index exists at `data_dir` or
-    /// if `model_id`/`dimension` in the stored metadata mismatches the parameters.
-    pub fn open(data_dir: &Path, model_id: &str, dimension: usize) -> anyhow::Result<Self> {
+    /// if `model_id` in the stored metadata mismatches the parameter.
+    /// The dimension is read from the DB; callers can inspect it via `status()`.
+    pub fn open(data_dir: &Path, model_id: &str) -> anyhow::Result<Self> {
+        load_sqlite_vec();
+
         let path = db_path(data_dir);
         anyhow::ensure!(path.exists(), "No semantic index found at {}", path.display());
 
         let conn = Connection::open(&path)
             .with_context(|| format!("Failed to open index at {}", path.display()))?;
 
-        let _stored_engine: String = conn
+        // Require the sqlite-vec schema. A missing vec_chunks table means the index
+        // was built before this migration; the caller should rebuild.
+        let has_vec_table: bool = conn
             .query_row(
-                "SELECT value FROM meta WHERE key = 'engine'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='vec_chunks'",
                 [],
-                |row| row.get(0),
+                |r| r.get::<_, i64>(0),
             )
-            .unwrap_or_else(|_| "candle".to_string()); // Fallback for legacy indexes
+            .map(|n| n > 0)
+            .unwrap_or(false);
+        anyhow::ensure!(
+            has_vec_table,
+            "Index uses legacy schema (no vec_chunks table); rebuild the index"
+        );
 
         let stored_model_id: String = conn
             .query_row(
@@ -72,6 +96,13 @@ impl SemanticIndex {
                 |row| row.get(0),
             )
             .context("Index is missing model_id metadata")?;
+
+        anyhow::ensure!(
+            stored_model_id == model_id,
+            "Index was built with model '{}' but requested is '{}'; rebuild the index",
+            stored_model_id,
+            model_id
+        );
 
         let stored_dimension: usize = conn
             .query_row(
@@ -82,20 +113,7 @@ impl SemanticIndex {
                     Ok(s.parse::<usize>().unwrap_or(0))
                 },
             )
-            .context("Index is missing dimension metadata")?;
-
-        anyhow::ensure!(
-            stored_model_id == model_id,
-            "Index was built with model '{}' but requested is '{}'; rebuild the index",
-            stored_model_id,
-            model_id
-        );
-        anyhow::ensure!(
-            stored_dimension == dimension,
-            "Index dimension {} does not match requested dimension {}; rebuild the index",
-            stored_dimension,
-            dimension
-        );
+            .unwrap_or(0);
 
         Ok(Self {
             conn,
@@ -112,6 +130,8 @@ impl SemanticIndex {
         dimension: usize,
         engine: EmbeddingEngine,
     ) -> anyhow::Result<Self> {
+        load_sqlite_vec();
+
         std::fs::create_dir_all(data_dir)?;
         let path = db_path(data_dir);
         if path.exists() {
@@ -239,14 +259,17 @@ impl SemanticIndex {
                 origin_json TEXT    NOT NULL,
                 chunk_text  TEXT    NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS chunk_vectors (
-                chunk_id  INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
-                embedding BLOB    NOT NULL
-            );
             CREATE INDEX IF NOT EXISTS idx_chunks_file_path ON chunks(file_path);
             PRAGMA foreign_keys = ON;
             ",
         )?;
+
+        // vec0 DDL requires the dimension to be a literal in the column type, so
+        // it cannot be parameterised and must be interpolated as a string.
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks \
+             USING vec0(embedding float[{dimension}] distance_metric=cosine);"
+        ))?;
 
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('engine', ?1)",
@@ -324,6 +347,12 @@ impl SemanticIndex {
     /// for that path first.
     pub fn write_file(&mut self, prepared: PreparedFile) -> anyhow::Result<()> {
         let path_str = prepared.path.to_string_lossy();
+
+        // Delete vectors first (vec0 has no FK cascade), then the chunk rows.
+        self.conn.execute(
+            "DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE file_path = ?1)",
+            params![path_str],
+        )?;
         self.conn.execute(
             "DELETE FROM chunks WHERE file_path = ?1",
             params![path_str],
@@ -347,7 +376,7 @@ impl SemanticIndex {
             let chunk_id = tx.last_insert_rowid();
             let blob = f32_slice_to_bytes(&embedding);
             tx.execute(
-                "INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?1, ?2)",
+                "INSERT INTO vec_chunks(rowid, embedding) VALUES (?1, ?2)",
                 params![chunk_id, blob],
             )?;
         }
@@ -372,6 +401,10 @@ impl SemanticIndex {
     pub fn remove_file(&mut self, path: &Path) -> anyhow::Result<()> {
         let path_str = path.to_string_lossy();
         self.conn.execute(
+            "DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE file_path = ?1)",
+            params![path_str],
+        )?;
+        self.conn.execute(
             "DELETE FROM chunks WHERE file_path = ?1",
             params![path_str],
         )?;
@@ -381,51 +414,71 @@ impl SemanticIndex {
     /// Query the index for the top-k nearest neighbours to `embedding`.
     /// Uses cosine similarity computed in Rust (O(n) over all stored vectors).
     pub fn query(&self, embedding: &[f32], top_k: usize) -> anyhow::Result<Vec<IndexedChunk>> {
-        // Load all chunk ids + vectors.
+        // cosine distance = 1 - cosine_similarity.
+        // No hard threshold: top_k already bounds the result count, and a fixed
+        // distance cutoff is model-dependent (short queries on MiniLM-style models
+        // produce distances of 0.7–0.85 even for clearly relevant chunks).
+
+        let stored_count: i64 = self.conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap_or(0);
+        tracing::info!("[query] vec_chunks rows={stored_count}, embedding_dim={}, top_k={top_k}", embedding.len());
+
+        let blob = f32_slice_to_bytes(embedding);
+
         let mut stmt = self.conn.prepare(
-            "SELECT cv.chunk_id, cv.embedding, c.file_path, c.byte_start, c.byte_end,
+            "SELECT v.rowid, v.distance, c.file_path, c.byte_start, c.byte_end,
                     c.origin_json, c.chunk_text
-             FROM chunk_vectors cv
-             JOIN chunks c ON c.id = cv.chunk_id",
+             FROM vec_chunks v
+             JOIN chunks c ON c.id = v.rowid
+             WHERE v.embedding MATCH ?1
+               AND v.k = ?2
+             ORDER BY v.distance",
         )?;
 
-        let mut scored: Vec<(f32, IndexedChunk)> = stmt
-            .query_map([], |row| {
-                let chunk_id: i64 = row.get(0)?;
-                let blob: Vec<u8> = row.get(1)?;
+        let raw_rows: Vec<_> = stmt
+            .query_map(params![blob, top_k as i64], |row| {
+                let distance: f32 = row.get(1)?;
                 let file_path: String = row.get(2)?;
                 let byte_start: i64 = row.get(3)?;
                 let byte_end: i64 = row.get(4)?;
                 let origin_json: String = row.get(5)?;
                 let chunk_text: String = row.get(6)?;
-                Ok((chunk_id, blob, file_path, byte_start, byte_end, origin_json, chunk_text))
+                Ok((distance, file_path, byte_start, byte_end, origin_json, chunk_text))
             })?
-            .filter_map(|r| r.ok())
-            .filter_map(|(_, blob, file_path, byte_start, byte_end, origin_json, chunk_text)| {
-                let stored = bytes_to_f32_vec(&blob);
-                let score = cosine_similarity(embedding, &stored);
-                let origin: SourceOrigin = serde_json::from_str(&origin_json).ok()?;
-                Some((
-                    score,
-                    IndexedChunk {
-                        file_path: PathBuf::from(file_path),
-                        chunk_text,
-                        extraction_byte_range: ByteRange {
-                            start: byte_start as usize,
-                            end: byte_end as usize,
-                        },
-                        origin,
-                        score,
-                    },
-                ))
+            .map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => { error!("[query] row error: {e}"); None }
             })
             .collect();
 
-        scored.retain(|(score, _)| *score >= 0.2);
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(top_k);
+        tracing::info!("[query] sqlite-vec returned {} rows ({} errors)", raw_rows.iter().filter(|r| r.is_some()).count(), raw_rows.iter().filter(|r| r.is_none()).count());
 
-        Ok(scored.into_iter().map(|(_, c)| c).collect())
+        let results: Vec<IndexedChunk> = raw_rows.into_iter()
+            .flatten()
+            .inspect(|(distance, file_path, ..)| {
+                tracing::info!("[query] candidate: distance={distance:.4}, file={file_path}");
+            })
+            .filter_map(|(distance, file_path, byte_start, byte_end, origin_json, chunk_text)| {
+                let score = 1.0 - distance;
+                let origin: SourceOrigin = serde_json::from_str(&origin_json)
+                    .map_err(|e| error!("[query] origin_json parse error for {file_path}: {e}"))
+                    .ok()?;
+                Some(IndexedChunk {
+                    file_path: PathBuf::from(file_path),
+                    chunk_text,
+                    extraction_byte_range: ByteRange {
+                        start: byte_start as usize,
+                        end: byte_end as usize,
+                    },
+                    origin,
+                    score,
+                })
+            })
+            .collect();
+
+        tracing::info!("[query] returning {} results", results.len());
+        Ok(results)
     }
 
     /// Read index metadata without re-validating model_id/dimension.
@@ -573,21 +626,4 @@ fn f32_slice_to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
-}
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-    dot / (norm_a * norm_b)
-}

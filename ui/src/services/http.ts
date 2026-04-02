@@ -149,6 +149,10 @@ export class HttpSearchApi implements SearchApi {
     if (!res.ok && res.status !== 204) throw new Error(`clearLogs failed: ${res.status}`);
   }
 
+  async getPythonInfo(): Promise<string> {
+    throw new Error("getPythonInfo is not available in web mode");
+  }
+
   // ── Semantic / embed commands ──────────────────────────────────────────────
 
   async listModels(_engine: EmbeddingEngine): Promise<ModelDescriptor[]> {

@@ -84,6 +84,10 @@ export class TauriSearchApi implements SearchApi {
     return invoke("clear_logs");
   }
 
+  async getPythonInfo(): Promise<string> {
+    return invoke<string>("get_python_info");
+  }
+
   // ── Semantic / embed commands ──────────────────────────────────────────────
 
   async listModels(engine: EmbeddingEngine): Promise<ModelDescriptor[]> {

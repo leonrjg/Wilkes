@@ -37,9 +37,11 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   const [customModelInput, setCustomModelInput] = useState("");
   const [isAddingCustom, setIsAddingCustom] = useState(false);
   const [isEngineAvailable, setIsEngineAvailable] = useState(true);
+  const [pythonPath, setPythonPath] = useState<string | null>(null);
+  const [pythonError, setPythonError] = useState<string | null>(null);
 
   const supportsCustomModels = useCallback((engine: EmbeddingEngine) => {
-    return engine === "Candle" || engine === "Python";
+    return true;
   }, []);
 
   const refreshState = useCallback(async () => {
@@ -48,6 +50,12 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       const sem = s.semantic;
       setSettings(sem);
 
+      if (sem.engine === "Python") {
+        api.getPythonInfo()
+          .then((p) => { setPythonPath(p); setPythonError(null); })
+          .catch((e) => { setPythonPath(null); setPythonError(e.toString()); });
+      }
+
       let descriptors: ModelDescriptor[] = [];
       try {
         descriptors = await api.listModels(sem.engine);
@@ -55,7 +63,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
         setIsEngineAvailable(true);
       } catch (e: any) {
         if (sem.engine === "Python") {
-          setError("Python engine unavailable. Please install the bundled version or set up a Python environment.");
+          setError(e.toString());
           setIsEngineAvailable(false);
         } else {
           setError(e.toString());
@@ -216,6 +224,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     setSettings(next);
     setModels([]);
     setModelFilter("");
+    if (engine !== "Python") { setPythonPath(null); setPythonError(null); }
     await api.updateSettings({ semantic: next });
     await refreshState();
   };
@@ -321,12 +330,24 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
           ))}
         </div>
         <p className="text-[10px] text-[var(--text-dim)] mt-1.5 px-1 selectable">
-          {settings?.engine === "Python" 
-            ? "Default. Native PyTorch (MPS/CUDA). Best compatibility."
+          {settings?.engine === "Python"
+            ? "Default. Best compatibility."
             : settings?.engine === "Candle"
-              ? "Native Rust. Uses GPU via Metal (Apple Silicon only)." 
+              ? "Native Rust. Uses GPU via Metal (Apple Silicon only)."
               : "Optimized ONNX Runtime. Best performance on Intel Macs."}
         </p>
+        {settings?.engine === "Python" && (
+          <div className="mt-1.5 px-2 py-1.5 rounded bg-[var(--bg-active)] flex items-start gap-1.5">
+            <span className="text-[10px] text-[var(--text-dim)] shrink-0 mt-px">python</span>
+            {pythonPath ? (
+              <span className="text-[10px] text-[var(--text-main)] font-mono break-all selectable">{pythonPath}</span>
+            ) : (
+              <span className="text-[10px] text-[var(--accent-red,#f87171)] font-mono break-all selectable">
+                {pythonError ?? "Resolving…"}
+              </span>
+            )}
+          </div>
+        )}
       </section>
 
       {/* Model list */}

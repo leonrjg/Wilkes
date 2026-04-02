@@ -150,8 +150,10 @@ export default function App() {
         },
       );
       currentSearchId.current = searchId;
-    } catch (e) {
+    } catch (e: any) {
+      const msg = e?.toString() ?? "Search failed";
       console.error("Search failed:", e);
+      setStats({ files_scanned: 0, total_matches: 0, elapsed_ms: 0, errors: [msg] });
       setSearching(false);
     }
   }, []);

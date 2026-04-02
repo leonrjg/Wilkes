@@ -140,6 +140,7 @@ fn spawn_python_worker(
         chunk_overlap,
         device: cfg.device.clone(),
         paths: Some(paths.to_vec()),
+        texts: None,
     };
 
     let request_json = serde_json::to_string(&request)?;

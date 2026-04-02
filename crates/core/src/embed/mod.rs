@@ -1,6 +1,7 @@
 pub mod chunk;
 pub mod dispatch;
 pub mod downloader;
+pub mod hf_cache;
 pub mod index;
 pub mod installer;
 pub mod watcher;

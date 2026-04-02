@@ -27,11 +27,11 @@ fn desktop_settings_path() -> anyhow::Result<std::path::PathBuf> {
 }
 
 fn resolve_python() -> anyhow::Result<std::path::PathBuf> {
+    let mut attempted_paths = Vec::new();
+
     // 1. Bundled Python
     let exe = std::env::current_exe()?;
-    let bundled = if cfg!(target_os = "macos") {
-        // Wilkes.app/Contents/MacOS/wilkes-desktop
-        // Wilkes.app/Contents/Resources/python/bin/python3
+    let bundled_path = if cfg!(target_os = "macos") {
         exe.parent()
             .and_then(|p| p.parent())
             .map(|p| p.join("Resources").join("python").join("bin").join("python3"))
@@ -43,35 +43,122 @@ fn resolve_python() -> anyhow::Result<std::path::PathBuf> {
             .map(|p| p.join("lib").join("python").join("bin").join("python3"))
     };
 
-    if let Some(p) = bundled {
+    if let Some(ref p) = bundled_path {
+        attempted_paths.push(p.clone());
         if p.exists() {
-            return Ok(p);
+            return Ok(p.clone());
         }
     }
 
     // 2. System Python
-    let system = if cfg!(target_os = "windows") { "python.exe" } else { "python3" };
+    let system_name = if cfg!(target_os = "windows") { "python.exe" } else { "python3" };
     // Check if system python exists in PATH
     if let Ok(output) = std::process::Command::new(if cfg!(target_os = "windows") { "where" } else { "which" })
-        .arg(system)
+        .arg(system_name)
         .output()
     {
         if output.status.success() {
             let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path_str.is_empty() {
-                return Ok(std::path::PathBuf::from(path_str));
+                let system_path = std::path::PathBuf::from(path_str);
+                attempted_paths.push(system_path.clone()); // Add to attempted paths
+                return Ok(system_path);
             }
         }
     }
 
-    anyhow::bail!("Python interpreter not found. Please install the bundled version or set up a Python environment with infinity-emb.")
+    // If no Python found, generate a detailed error message
+    let mut error_message = "Python interpreter not found. Tried the following locations:\n".to_string();
+    for path in attempted_paths {
+        error_message.push_str(&format!("- {}\n", path.display()));
+    }
+    error_message.push_str("\nPlease install the bundled version or set up a Python environment with `pip install 'infinity-emb[torch]' sentence-transformers semantic-text-splitter pymupdf`.");
+
+    anyhow::bail!("{}", error_message);
 }
 
 fn resolve_worker_script(app: &AppHandle) -> anyhow::Result<std::path::PathBuf> {
     let resource_dir = app.path().resource_dir()?;
-    let script = resource_dir.join("wilkes_worker.py");
-    anyhow::ensure!(script.exists(), "Python worker script not found at {}", script.display());
-    Ok(script)
+    // Production bundles flatten resources; dev mode preserves the relative path via _up_/worker/.
+    let candidates = [
+        resource_dir.join("wilkes_worker.py"),
+        resource_dir.join("_up_").join("worker").join("wilkes_worker.py"),
+    ];
+    candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| anyhow::anyhow!("Python worker script not found at {}", resource_dir.display()))
+}
+
+// ── PythonEmbedder ────────────────────────────────────────────────────────────
+
+/// Implements `Embedder` for the Python engine by spawning `wilkes_worker.py`
+/// with mode="embed". Each call loads the model in a subprocess, so latency
+/// depends on model size. A persistent-process variant can be added later.
+struct PythonEmbedder {
+    python_path: std::path::PathBuf,
+    script_path: std::path::PathBuf,
+    model_id: String,
+    dimension: usize,
+    device: String,
+}
+
+impl wilkes_core::embed::Embedder for PythonEmbedder {
+    fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let request = WorkerRequest {
+            mode: "embed".to_string(),
+            root: std::path::PathBuf::new(),
+            engine: EmbeddingEngine::Python,
+            model: self.model_id.clone(),
+            data_dir: std::path::PathBuf::new(),
+            chunk_size: 0,
+            chunk_overlap: 0,
+            device: self.device.clone(),
+            paths: None,
+            texts: Some(texts.iter().map(|s| s.to_string()).collect()),
+        };
+
+        let request_json = serde_json::to_string(&request)
+            .map_err(|e| anyhow::anyhow!("Failed to serialise embed request: {e}"))?;
+
+        let mut child = std::process::Command::new(&self.python_path)
+            .arg(&self.script_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn Python worker: {e}"))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(request_json.as_bytes())?;
+            stdin.write_all(b"\n")?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| anyhow::anyhow!("Python worker wait failed: {e}"))?;
+
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            match serde_json::from_str::<WorkerEvent>(line) {
+                Ok(WorkerEvent::Embeddings(vecs)) => return Ok(vecs),
+                Ok(WorkerEvent::Error(e)) => anyhow::bail!("Python embedder error: {e}"),
+                _ => {}
+            }
+        }
+
+        anyhow::bail!("Python worker did not return embeddings (exit: {:?})", output.status)
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
 }
 
 // ── App state ────────────────────────────────────────────────────────────────
@@ -133,7 +220,10 @@ async fn search(query: SearchQuery, search_id: Option<String>, app: AppHandle) -
         let guard = state.0.lock().unwrap();
         match guard.clone() {
             Some(e) => Some(e),
-            None => return Err("No embedder loaded. Download and install a model first.".into()),
+            None => {
+                error!("semantic search requested but no embedder is loaded in state");
+                return Err("No embedder loaded. Download and install a model first.".into());
+            }
         }
     } else {
         None
@@ -209,6 +299,14 @@ async fn cancel_search(search_id: String, app: AppHandle) -> Result<(), String> 
 async fn preview(match_ref: MatchRef) -> Result<wilkes_core::types::PreviewData, String> {
     wilkes_api::commands::preview::preview(match_ref)
         .await
+        .map_err(|e| e.to_string())
+}
+
+/// Returns the resolved Python interpreter path, or an error describing what was tried.
+#[tauri::command]
+async fn get_python_info() -> Result<String, String> {
+    resolve_python()
+        .map(|p| p.display().to_string())
         .map_err(|e| e.to_string())
 }
 
@@ -373,6 +471,7 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
         chunk_overlap,
         device,
         paths: None,
+        texts: None,
     };
     let request_json = serde_json::to_string(&request)
         .map_err(|e| format!("Failed to serialise worker request: {e}"))?;
@@ -452,7 +551,7 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
 
         match final_event {
             Some(WorkerEvent::Done) => {
-                let mut loaded_embedder = None;
+                let mut loaded_embedder: Option<Arc<dyn Embedder>> = None;
 
                 if engine != EmbeddingEngine::Python {
                     let installer = dispatch::get_installer(engine, model.clone());
@@ -490,13 +589,34 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
                 let open_result = tokio::task::spawn_blocking({
                     let d = data_dir_clone.clone();
                     let m = model.model_id().to_string();
-                    let dim = current_settings.semantic.dimension;
-                    move || SemanticIndex::open(&d, &m, dim)
+                    move || SemanticIndex::open(&d, &m)
                 })
                 .await;
 
                 let open_msg = match open_result {
                     Ok(Ok(idx)) => {
+                        let actual_dimension = idx.status().dimension;
+
+                        // For Python engine, create the embedder now that we know the real dimension.
+                        if engine == EmbeddingEngine::Python {
+                            match (resolve_python(), resolve_worker_script(&app_clone)) {
+                                (Ok(py), Ok(script)) => {
+                                    let emb = Arc::new(PythonEmbedder {
+                                        python_path: py,
+                                        script_path: script,
+                                        model_id: model.model_id().to_string(),
+                                        dimension: actual_dimension,
+                                        device: current_settings.semantic.device.clone(),
+                                    });
+                                    *app_clone.state::<ActiveEmbedderState>().0.lock().unwrap() = Some(Arc::clone(&emb) as Arc<dyn Embedder>);
+                                    loaded_embedder = Some(emb);
+                                }
+                                (Err(e), _) | (_, Err(e)) => {
+                                    error!("build_index: failed to resolve Python paths for embedder: {e:#}");
+                                }
+                            }
+                        }
+
                         *app_clone.state::<SemanticIndexState>().0.lock().unwrap() = Arc::new(Mutex::new(Some(idx)));
 
                         let index_arc = app_clone.state::<SemanticIndexState>().0.lock().unwrap().clone();
@@ -531,7 +651,12 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
                         }
 
                         let db_path = data_dir_clone.join("semantic_index.db");
-                        update_semantic_settings(|s| SemanticSettings { index_path: Some(db_path), ..s }).await;
+                        update_semantic_settings(|s| SemanticSettings {
+                            index_path: Some(db_path),
+                            dimension: actual_dimension,
+                            enabled: true,
+                            ..s
+                        }).await;
                         let _ = app_clone.emit("embed-done", EmbedDone { operation: EmbedOperation::Build });
                         None
                     }
@@ -579,56 +704,6 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
 /// Return all supported models annotated with local cache availability.
 #[tauri::command]
 async fn list_models(engine: EmbeddingEngine, app: AppHandle) -> Result<Vec<ModelDescriptor>, String> {
-    if engine == EmbeddingEngine::Python {
-        let python = resolve_python().map_err(|e| e.to_string())?;
-        let script = resolve_worker_script(&app).map_err(|e| e.to_string())?;
-        let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-
-        let request = WorkerRequest {
-            mode: "list-models".to_string(),
-            root: std::path::PathBuf::new(),
-            engine,
-            model: String::new(),
-            data_dir,
-            chunk_size: 0,
-            chunk_overlap: 0,
-            device: "auto".to_string(),
-            paths: None,
-        };
-        let request_json = serde_json::to_string(&request).map_err(|e| e.to_string())?;
-
-        let mut child = tokio::process::Command::new(python)
-            .arg(script)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn worker: {e}"))?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(request_json.as_bytes()).await.ok();
-            stdin.write_all(b"\n").await.ok();
-        }
-
-        let stdout = child.stdout.take().ok_or("Failed to open stdout")?;
-        let mut reader = BufReader::new(stdout).lines();
-        
-        while let Ok(Some(line)) = reader.next_line().await {
-            if let Ok(WorkerEvent::Models(models)) = serde_json::from_str::<WorkerEvent>(&line) {
-                return Ok(models.into_iter().map(|m| ModelDescriptor {
-                    model_id: m.model_id.clone(),
-                    display_name: m.model_id.split('/').last().unwrap_or(&m.model_id).to_string(),
-                    description: format!("Locally cached Python model ({} dimensions)", m.dimension),
-                    dimension: m.dimension,
-                    is_cached: true,
-                    size_bytes: Some(m.size_bytes),
-                    preferred_batch_size: Some(32),
-                }).collect());
-            }
-        }
-        
-        return Ok(vec![]);
-    }
-
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     Ok(wilkes_api::commands::embed::list_models(engine, &data_dir).await)
 }
@@ -735,12 +810,31 @@ async fn restore_semantic_state(app: &AppHandle) {
         Err(e) => { error!("restore_semantic_state: cannot read settings: {e:#}"); return; }
     };
 
-    if !settings.semantic.enabled || settings.semantic.index_path.is_none() {
-        return;
-    }
+    // Use the DB as the ground truth: check if an index exists and its model_id
+    // matches settings. The `enabled` flag in settings is derived state; do not
+    // gate on it so that a valid index is always restored after a restart.
+    let db_status = match tokio::task::spawn_blocking({
+        let d = data_dir.clone();
+        move || SemanticIndex::read_status_from_path(&d)
+    })
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => return, // No index on disk.
+    };
 
     let model = settings.semantic.model.clone();
     let engine = settings.semantic.engine;
+
+    if db_status.model_id != model.model_id() {
+        info!(
+            "restore_semantic_state: index model '{}' does not match settings model '{}', skipping restore",
+            db_status.model_id,
+            model.model_id()
+        );
+        return;
+    }
+
     let mut loaded_embedder = None;
 
     if engine != EmbeddingEngine::Python {
@@ -759,18 +853,35 @@ async fn restore_semantic_state(app: &AppHandle) {
         loaded_embedder = Some(embedder);
     }
 
-    if let Some(ref emb) = loaded_embedder {
-        *app.state::<ActiveEmbedderState>().0.lock().unwrap() = Some(Arc::clone(emb));
-    }
-
     let data_dir_clone = data_dir.clone();
     let m = model.model_id().to_string();
-    let dim = settings.semantic.dimension;
-    let index = match tokio::task::spawn_blocking(move || SemanticIndex::open(&data_dir_clone, &m, dim)).await {
+    let index = match tokio::task::spawn_blocking(move || SemanticIndex::open(&data_dir_clone, &m)).await {
         Ok(Ok(idx)) => idx,
         Ok(Err(e)) => { error!("restore_semantic_state: open index failed: {e:#}"); return; }
         Err(e) => { error!("restore_semantic_state: open index panicked: {e}"); return; }
     };
+
+    // For Python engine, create the embedder now that we have the real dimension.
+    if engine == EmbeddingEngine::Python {
+        match (resolve_python(), resolve_worker_script(app)) {
+            (Ok(py), Ok(script)) => {
+                loaded_embedder = Some(Arc::new(PythonEmbedder {
+                    python_path: py,
+                    script_path: script,
+                    model_id: model.model_id().to_string(),
+                    dimension: index.status().dimension,
+                    device: settings.semantic.device.clone(),
+                }) as Arc<dyn Embedder>);
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                error!("restore_semantic_state: failed to resolve Python paths for embedder: {e:#}");
+            }
+        }
+    }
+
+    if let Some(ref emb) = loaded_embedder {
+        *app.state::<ActiveEmbedderState>().0.lock().unwrap() = Some(Arc::clone(emb));
+    }
     
     let index_arc = Arc::new(Mutex::new(Some(index)));
     *app.state::<SemanticIndexState>().0.lock().unwrap() = Arc::clone(&index_arc);
@@ -808,6 +919,17 @@ async fn restore_semantic_state(app: &AppHandle) {
         }
     }
 
+    // Persist the ground-truth state back to settings so the UI reflects it.
+    let db_path = data_dir.join("semantic_index.db");
+    let dim = db_status.dimension;
+    update_semantic_settings(|s| SemanticSettings {
+        enabled: true,
+        index_path: Some(db_path),
+        dimension: dim,
+        ..s
+    })
+    .await;
+
     info!("restore_semantic_state: embedder and index restored");
 }
 
@@ -836,6 +958,7 @@ pub fn run() {
             preview,
             list_files,
             open_file,
+            get_python_info,
             get_settings,
             update_settings,
             pick_directory,

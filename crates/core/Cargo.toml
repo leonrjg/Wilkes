@@ -16,6 +16,7 @@ ignore = "0.4"
 infer = "0.16"
 mupdf = "0.6"
 regex = "1"
+dirs = "5"
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -30,6 +31,7 @@ notify = "6"
 notify-debouncer-mini = "0.4"
 text-splitter = { version = "0.27", features = ["markdown"] }
 async-trait = "0.1"
+sqlite-vec = "0.1.9"
 
 [dependencies.ort]
 version = "=2.0.0-rc.11"
