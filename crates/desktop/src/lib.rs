@@ -128,7 +128,7 @@ impl wilkes_core::embed::Embedder for PythonEmbedder {
             .arg(&self.script_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn Python worker: {e}"))?;
 
@@ -140,6 +140,12 @@ impl wilkes_core::embed::Embedder for PythonEmbedder {
         let output = child
             .wait_with_output()
             .map_err(|e| anyhow::anyhow!("Python worker wait failed: {e}"))?;
+
+        if !output.stderr.is_empty() {
+            for line in String::from_utf8_lossy(&output.stderr).lines() {
+                tracing::info!("[python-worker] {}", line);
+            }
+        }
 
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             match serde_json::from_str::<WorkerEvent>(line) {
@@ -541,6 +547,7 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
                 }
                 line = stderr_reader.next_line() => {
                     if let Ok(Some(line)) = line {
+                        tracing::info!("[python-worker] {}", line);
                         stderr_logs.push(line);
                     }
                 }

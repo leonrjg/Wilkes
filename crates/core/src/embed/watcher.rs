@@ -149,18 +149,26 @@ fn spawn_python_worker(
         .arg(&cfg.script_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null()) // We don't need stdout for watcher updates
-        .stderr(Stdio::inherit()) // Log errors to stderr
+        .stderr(Stdio::piped())
         .spawn()?;
 
     if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
         stdin.write_all(request_json.as_bytes())?;
         stdin.write_all(b"\n")?;
     }
 
     // Wait for worker to finish (incremental updates should be fast)
-    let status = child.wait()?;
-    if !status.success() {
-        anyhow::bail!("Python worker failed with status: {status}");
+    let output = child.wait_with_output()?;
+
+    if !output.stderr.is_empty() {
+        for line in String::from_utf8_lossy(&output.stderr).lines() {
+            info!("[python-worker] {}", line);
+        }
+    }
+
+    if !output.status.success() {
+        anyhow::bail!("Python worker failed with status: {}", output.status);
     }
 
     Ok(())

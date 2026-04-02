@@ -2,7 +2,24 @@ import sys
 import json
 import os
 import sqlite3
+import logging
 from pathlib import Path
+
+# Configure logging to stderr so the Rust side can capture and display it
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(name)s - %(levelname)s - %(message)s",
+    stream=sys.stderr
+)
+
+# Ensure transformers is also verbose enough
+try:
+    from transformers.utils import logging as tf_logging
+    tf_logging.set_verbosity_info()
+    tf_logging.enable_default_handler()
+    tf_logging.enable_explicit_format()
+except ImportError:
+    pass
 
 SUPPORTED_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".rst", ".py", ".js", ".ts", ".jsx", ".tsx",
@@ -55,7 +72,12 @@ def build_index(request):
         "done": False
     }}})
 
-    model = SentenceTransformer(model_id, device=None if device == "auto" else device, trust_remote_code=True)
+    model = SentenceTransformer(
+        model_id,
+        device=None if device == "auto" else device,
+        trust_remote_code=True,
+        model_kwargs={"attn_implementation": "sdpa"}
+    )
 
     splitter = TextSplitter(chunk_size)
 
@@ -207,8 +229,12 @@ def embed_texts(request):
         return
 
     from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer(model_id, device=None if device == "auto" else device,
-                trust_remote_code=True)
+    model = SentenceTransformer(
+        model_id,
+        device=None if device == "auto" else device,
+        trust_remote_code=True,
+        model_kwargs={"attn_implementation": "sdpa"}
+    )
     embeddings = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True, task='retrieval')
     emit({"Embeddings": embeddings.tolist()})
     emit({"Done": None})
