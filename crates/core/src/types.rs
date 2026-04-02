@@ -317,6 +317,8 @@ pub struct IndexStatus {
 pub struct Settings {
     pub bookmarked_dirs: Vec<PathBuf>,
     #[serde(default)]
+    pub recent_dirs: Vec<PathBuf>,
+    #[serde(default)]
     pub last_directory: Option<PathBuf>,
     pub respect_gitignore: bool,
     pub max_file_size: u64,
@@ -330,6 +332,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             bookmarked_dirs: Vec::new(),
+            recent_dirs: Vec::new(),
             last_directory: None,
             respect_gitignore: true,
             max_file_size: 10 * 1024 * 1024,

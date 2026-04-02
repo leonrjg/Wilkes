@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from "react";
-import ExtensionFilter from "./ExtensionFilter";
+import { Search, Type, Database, Check } from "react-feather";
 import type { FileEntry, SearchQuery } from "../lib/types";
 
 interface Props {
@@ -97,27 +97,44 @@ export default function SearchBar({
       {/* Top row: toggles + pattern */}
       <div className="flex items-center gap-2">
         <Toggle
-          label=".*"
           title="Regular expression"
           active={isRegex}
           onToggle={() => setIsRegex((v) => !v)}
-        />
+        >
+          <span className="font-mono text-[10px] w-4">.*</span>
+        </Toggle>
         <Toggle
-          label="Aa"
           title="Case sensitive"
           active={caseSensitive}
           onToggle={() => setCaseSensitive((v) => !v)}
-        />
+        >
+          <Type size={12} />
+        </Toggle>
         <Toggle
-          label="~"
           title={semanticReady ? "Semantic search" : "Set up semantic search in Settings"}
           active={isSemanticMode}
           disabled={!semanticReady}
           onToggle={() => setIsSemanticMode((v) => !v)}
-        />
+          className="px-3 min-w-[100px]"
+        >
+          <div className="flex items-center gap-2">
+            <div className={`w-3 h-3 rounded border flex items-center justify-center transition-colors ${
+              isSemanticMode ? "bg-white border-white text-[var(--accent-blue)]" : "border-[var(--text-dim)]"
+            }`}>
+              {isSemanticMode && <Check size={10} strokeWidth={4} />}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <Database size={12} />
+              <span className="text-[10px] font-bold uppercase tracking-wider">Semantic</span>
+            </div>
+          </div>
+        </Toggle>
 
         {searching && (
-          <span className="text-xs text-[var(--accent-blue)] animate-pulse">searching…</span>
+          <span className="text-xs text-[var(--accent-blue)] animate-pulse flex items-center gap-1.5">
+            <Search size={12} className="animate-spin" />
+            <span>searching…</span>
+          </span>
         )}
 
         <input
@@ -133,42 +150,43 @@ export default function SearchBar({
         {settingsSlot}
       </div>
 
-      {/* Bottom row: source slot + extension filter */}
+      {/* Bottom row: source slot */}
       <div className="flex items-center gap-2 flex-wrap">
         {sourceSlot}
-        <ExtensionFilter fileList={fileList} excluded={excluded} onChange={onExcludedChange ?? (() => {})} />
       </div>
     </div>
   );
 }
 
 function Toggle({
-  label,
+  children,
   title,
   active,
   disabled,
   onToggle,
+  className = "min-w-[32px]",
 }: {
-  label: string;
+  children: React.ReactNode;
   title: string;
   active: boolean;
   disabled?: boolean;
   onToggle: () => void;
+  className?: string;
 }) {
   return (
     <button
       onClick={onToggle}
       title={title}
       disabled={disabled}
-      className={`px-2 py-1 rounded text-xs font-mono font-semibold transition-all border ${
+      className={`h-[32px] px-2 py-1 rounded text-xs font-mono font-semibold transition-all border flex items-center justify-center ${className} ${
         disabled
           ? "bg-[var(--bg-active)] text-[var(--text-dim)] border-transparent cursor-not-allowed"
           : active
-            ? "bg-[var(--accent-blue)] text-white border-[var(--accent-blue)] shadow-sm"
+            ? "bg-[var(--accent-blue)] text-white border-[var(--accent-blue)]"
             : "bg-[var(--bg-active)] text-[var(--text-muted)] border-[var(--border-main)] hover:text-[var(--text-main)] hover:border-[var(--border-strong)]"
       }`}
     >
-      {label}
+      {children}
     </button>
   );
 }

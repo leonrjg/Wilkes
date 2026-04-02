@@ -10,6 +10,8 @@ interface Props {
   searching: boolean;
   hasQuery: boolean;
   fileList: FileEntry[];
+  filterText: string;
+  onFilterChange: (text: string) => void;
   selectedMatch: MatchRef | null;
   onMatchClick: (ref: MatchRef) => void;
   onFileClick: (path: string) => void;
@@ -98,6 +100,8 @@ export default function ResultList({
   searching,
   hasQuery,
   fileList,
+  filterText,
+  onFilterChange,
   selectedMatch,
   onMatchClick,
   onFileClick,
@@ -129,13 +133,28 @@ export default function ResultList({
   const totalCount = results.reduce((n, fm) => n + fm.matches.length, 0);
 
   if (!hasQuery) {
+    const filteredList = fileList.filter((entry) => {
+      if (!filterText) return true;
+      const search = filterText.toLowerCase();
+      return entry.path.toLowerCase().includes(search);
+    });
+
     return (
       <div className="flex flex-col h-full overflow-hidden">
-        <div className="px-3 py-1.5 text-xs text-[var(--text-muted)] border-b border-[var(--border-main)] flex-shrink-0">
-          {fileList.length} files
+        <div className="px-3 py-1.5 text-xs text-[var(--text-muted)] border-b border-[var(--border-main)] flex-shrink-0 flex items-center gap-2">
+          <div className="flex-shrink-0 whitespace-nowrap">{fileList.length} files</div>
+          <span className="text-[var(--text-dim)]">/</span>
+          <input
+            type="text"
+            placeholder="Filter files..."
+            value={filterText}
+            onChange={(e) => onFilterChange(e.target.value)}
+            className="flex-1 min-w-0 bg-transparent border-none outline-none text-[11px] text-[var(--text-main)] placeholder-[var(--text-dim)]"
+            autoFocus
+          />
         </div>
         <div className="flex-1 overflow-y-auto">
-          {fileList.map((entry) => (
+          {filteredList.map((entry) => (
             <FileEntryRow
               key={entry.path}
               entry={entry}
@@ -143,6 +162,11 @@ export default function ResultList({
               onClick={() => onFileClick(entry.path)}
             />
           ))}
+          {filteredList.length === 0 && fileList.length > 0 && (
+            <div className="px-3 py-8 text-center text-xs text-[var(--text-dim)] italic">
+              No files match "{filterText}"
+            </div>
+          )}
         </div>
       </div>
     );

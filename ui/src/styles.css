@@ -72,6 +72,23 @@
   padding: 0 1px;
 }
 
+/* PDF Viewer Styling */
+.react-pdf__Page {
+  background-color: transparent !important;
+  margin-bottom: 12px;
+}
+
+.react-pdf__Page canvas {
+  background-color: white; /* Only used in light mode */
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+}
+
+.pdf-dark-mode .react-pdf__Page canvas {
+  background-color: transparent !important;
+  filter: invert(0.9) hue-rotate(180deg) brightness(1.1);
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.5);
+}
+
 @keyframes shimmer {
   0% { transform: translateX(-100%); }
   100% { transform: translateX(100%); }

@@ -15,9 +15,8 @@ logging.basicConfig(
 # Ensure transformers is also verbose enough
 try:
     from transformers.utils import logging as tf_logging
-    tf_logging.set_verbosity_info()
+    tf_logging.set_verbosity_warning()
     tf_logging.enable_default_handler()
-    tf_logging.enable_explicit_format()
 except ImportError:
     pass
 
@@ -127,6 +126,7 @@ def build_index(request):
     embeddings = model.encode([c[2] for c in all_chunks],
                                 normalize_embeddings=True,
                                 convert_to_numpy=True,
+                                show_progress_bar=True,
                                 task='retrieval')
 
     import sqlite_vec
@@ -235,7 +235,7 @@ def embed_texts(request):
         trust_remote_code=True,
         model_kwargs={"attn_implementation": "sdpa"}
     )
-    embeddings = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True, task='retrieval')
+    embeddings = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=True, task='retrieval')
     emit({"Embeddings": embeddings.tolist()})
     emit({"Done": None})
 

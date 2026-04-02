@@ -1,4 +1,6 @@
 import { useState, useCallback, useRef, useEffect, useTransition } from "react";
+import { Settings as SettingsIcon } from "react-feather";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import SearchBar from "./components/SearchBar";
 import ResultList from "./components/ResultList";
 import PreviewPane from "./components/PreviewPane";
@@ -59,18 +61,51 @@ export default function App() {
   const currentSearchId = useRef<string | null>(null);
 
   const [bookmarks, setBookmarks] = useState<string[]>([]);
+  const [recentDirs, setRecentDirs] = useState<string[]>([]);
   const [directory, setDirectory] = useState<string>("");
   const [respectGitignore, setRespectGitignore] = useState(true);
   const [maxFileSize, setMaxFileSize] = useState(10 * 1024 * 1024);
   const [contextLines, setContextLines] = useState(2);
   const [fileList, setFileList] = useState<FileEntry[]>([]);
+  const [filterText, setFilterText] = useState("");
   const [excluded, setExcluded] = useState<Set<string>>(new Set());
   const [semanticIndexBuilt, setSemanticIndexBuilt] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(420);
+  const isResizing = useRef(false);
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    isResizing.current = true;
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+    document.body.style.cursor = "col-resize";
+  }, []);
+
+  const handleMouseMove = useCallback((e: MouseEvent) => {
+    if (!isResizing.current) return;
+    const newWidth = Math.max(200, Math.min(window.innerWidth * 0.8, e.clientX));
+    setSidebarWidth(newWidth);
+  }, []);
+
+  const handleMouseUp = useCallback(() => {
+    isResizing.current = false;
+    document.removeEventListener("mousemove", handleMouseMove);
+    document.removeEventListener("mouseup", handleMouseUp);
+    document.body.style.cursor = "";
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [handleMouseMove, handleMouseUp]);
 
   useEffect(() => {
     api.getSettings().then((s) => {
       setBookmarks(s.bookmarked_dirs);
+      setRecentDirs(s.recent_dirs || []);
       const dir = s.last_directory ?? "";
       setDirectory(dir);
       setRespectGitignore(s.respect_gitignore);
@@ -91,7 +126,13 @@ export default function App() {
 
   const handleDirectoryChange = useCallback((dir: string) => {
     setDirectory(dir);
-    api.updateSettings({ last_directory: dir }).catch(() => {});
+    setFilterText("");
+    setRecentDirs((prev) => {
+      // Remove if already exists to move to front, and limit to 10
+      const next = [dir, ...prev.filter((d) => d !== dir)].slice(0, 10);
+      api.updateSettings({ last_directory: dir, recent_dirs: next }).catch(() => {});
+      return next;
+    });
   }, []);
 
   const handlePickDirectory = useCallback(async () => {
@@ -188,6 +229,7 @@ export default function App() {
     <DirectoryPicker
       directory={directory}
       bookmarks={bookmarks}
+      recentDirs={recentDirs}
       onChange={handleDirectoryChange}
       onPickDirectory={handlePickDirectory}
       onBookmarkAdd={handleBookmarkAdd}
@@ -207,9 +249,9 @@ export default function App() {
       <button
         onClick={() => setSettingsOpen(true)}
         title="Settings"
-        className="px-2 py-1 rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors text-xs font-mono"
+        className="w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all border border-[var(--border-main)] hover:border-[var(--border-strong)]"
       >
-        ⚙
+        <SettingsIcon size={14} />
       </button>
       <SettingsModal
         api={api}
@@ -243,25 +285,36 @@ export default function App() {
       />
 
       <div className="flex flex-1 overflow-hidden">
-        <div className="w-[420px] min-w-[320px] flex-shrink-0 border-r border-[var(--border-main)] flex flex-col">
+        <div 
+          className="flex-shrink-0 flex flex-col bg-[var(--bg-sidebar)]"
+          style={{ width: `${sidebarWidth}px`, minWidth: "200px" }}
+        >
           <ResultList
             results={results}
             stats={stats}
             searching={searching}
             hasQuery={hasQuery}
             fileList={fileList.filter((f) => !excluded.has(f.extension))}
+            filterText={filterText}
+            onFilterChange={setFilterText}
             onMatchClick={handleMatchClick}
             onFileClick={handleFileClick}
             selectedMatch={selectedMatch}
           />
         </div>
 
-        <div className="flex-1 overflow-hidden">
+        <div
+          onMouseDown={handleMouseDown}
+          className="w-1 cursor-col-resize flex-shrink-0 bg-transparent hover:bg-[var(--accent-blue)]/30 border-l border-[var(--border-main)] transition-colors"
+        />
+
+        <div className="flex-1 overflow-hidden bg-[var(--bg-app)]">
           <PreviewPane
             previewData={previewData}
             loading={previewPending}
             selectedMatch={selectedMatch}
             api={api}
+            onClose={() => setSelectedMatch(null)}
           />
         </div>
       </div>

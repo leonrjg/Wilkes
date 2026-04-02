@@ -113,6 +113,7 @@ export interface SemanticSettings {
 
 export interface Settings {
   bookmarked_dirs: string[];
+  recent_dirs: string[];
   last_directory: string | null;
   respect_gitignore: boolean;
   max_file_size: number;

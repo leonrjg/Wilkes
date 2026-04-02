@@ -10,6 +10,7 @@ import type {
   EmbeddingEngine,
 } from "../lib/types";
 import type { SearchApi } from "../services/api";
+import LogsPanel from "./LogsPanel";
 
 type Phase = "not_downloaded" | "downloading" | "ready" | "building" | "indexed" | "engine_mismatch";
 
@@ -569,27 +570,33 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
         </button>
 
         {isActive && (
-          <div className="flex flex-col gap-2 mt-1 px-1">
-            <div className="flex justify-between text-[10px] text-[var(--text-muted)] mb-0.5">
-              <span>
-                {phase === "downloading" ? (
-                  "Downloading model files..."
-                ) : (
-                  `${progressPct}%`
-                )}
-              </span>
-              <span className="truncate max-w-[180px]">
-                {phase === "building" && progress && "message" in progress ? (progress as any).message : ""}
-              </span>
+          <div className="flex flex-col gap-3 mt-1 px-1">
+            <div className="flex flex-col gap-1.5">
+              <div className="flex justify-between text-[10px] text-[var(--text-muted)] mb-0.5">
+                <span>
+                  {phase === "downloading" ? (
+                    "Downloading model files..."
+                  ) : (
+                    `${progressPct}%`
+                  )}
+                </span>
+                <span className="truncate max-w-[180px]">
+                  {phase === "building" && progress && "message" in progress ? (progress as any).message : ""}
+                </span>
+              </div>
+              <div className="h-1.5 bg-[var(--bg-app)] rounded-full overflow-hidden">
+                <div
+                  className={`h-full bg-[var(--accent-blue)] transition-all duration-300 ease-out animate-shimmer`}
+                  style={{ width: phase === "downloading" ? "100%" : `${progressPct}%` }}
+                />
+              </div>
             </div>
-            <div className="h-1.5 bg-[var(--bg-app)] rounded-full overflow-hidden">
-              <div
-                className={`h-full bg-[var(--accent-blue)] transition-all duration-300 ease-out ${
-                  phase === "downloading" ? "w-full animate-shimmer" : ""
-                }`}
-                style={{ width: phase === "downloading" ? "100%" : `${progressPct}%` }}
-              />
-            </div>
+
+            {phase === "building" && (
+              <div className="h-48 border border-[var(--border-main)] rounded-lg overflow-hidden bg-black/20">
+                <LogsPanel api={api} />
+              </div>
+            )}
           </div>
         )}
       </section>

@@ -7,7 +7,6 @@ interface LogsPanelProps {
 
 export default function LogsPanel({ api }: LogsPanelProps) {
   const [logs, setLogs] = useState<string[]>([]);
-  const [autoScroll, setAutoScroll] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -33,12 +32,6 @@ export default function LogsPanel({ api }: LogsPanelProps) {
     };
   }, [api]);
 
-  useEffect(() => {
-    if (autoScroll && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [logs, autoScroll]);
-
   const handleCopy = () => {
     navigator.clipboard.writeText(logs.join("\n"));
   };
@@ -61,15 +54,6 @@ export default function LogsPanel({ api }: LogsPanelProps) {
           System Logs
         </h3>
         <div className="flex items-center gap-2">
-          <label className="flex items-center gap-1.5 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={autoScroll}
-              onChange={(e) => setAutoScroll(e.target.checked)}
-              className="w-3 h-3 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)]"
-            />
-            <span className="text-[10px] text-[var(--text-muted)]">Auto-scroll</span>
-          </label>
           <button
             onClick={handleCopy}
             className="text-[10px] px-2 py-1 bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] text-[var(--text-main)] rounded border border-[var(--border-main)] transition-colors"

@@ -1,6 +1,10 @@
+import { useMemo } from "react";
+import { Folder, Bookmark } from "react-feather";
+
 interface Props {
   directory: string;
   bookmarks: string[];
+  recentDirs: string[];
   onChange: (dir: string) => void;
   onPickDirectory: () => void;
   onBookmarkAdd?: (dir: string) => void;
@@ -16,57 +20,85 @@ function shortPath(p: string): string {
 export default function DirectoryPicker({
   directory,
   bookmarks,
+  recentDirs,
   onChange,
   onPickDirectory,
   onBookmarkAdd,
   onBookmarkRemove,
 }: Props) {
-  const isBookmarked = directory ? bookmarks.includes(directory) : false;
+  const isBookmarked = (dir: string) => bookmarks.includes(dir);
+
+  // Combine bookmarks and recent dirs for the list, prioritizing bookmarks
+  // and removing duplicates.
+  const displayDirs = useMemo(() => {
+    const combined = [...bookmarks];
+    for (const d of recentDirs) {
+      if (!combined.includes(d)) {
+        combined.push(d);
+      }
+    }
+    // Always ensure the current directory is in the list if it's not empty
+    if (directory && !combined.includes(directory)) {
+      combined.push(directory);
+    }
+    return combined;
+  }, [bookmarks, recentDirs, directory]);
 
   return (
     <div className="flex items-center gap-1 min-w-0">
-      <button
-        onClick={onPickDirectory}
-        title={directory || "Choose directory"}
-        className="text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] bg-[var(--bg-active)] rounded px-2 py-1 truncate max-w-[200px] text-left"
-      >
-        {directory ? shortPath(directory) : "Choose directory…"}
-      </button>
-
-      {/* Bookmark toggle for current directory */}
-      {directory && onBookmarkAdd && onBookmarkRemove && (
+      <div className="flex items-center gap-0.5 bg-[var(--bg-active)] rounded overflow-hidden">
         <button
-          onClick={() =>
-            isBookmarked ? onBookmarkRemove(directory) : onBookmarkAdd(directory)
-          }
-          title={isBookmarked ? "Remove bookmark" : "Bookmark this directory"}
-          className={`text-xs px-1.5 py-1 rounded transition-colors ${
-            isBookmarked
-              ? "text-yellow-400 hover:text-[var(--text-muted)]"
-              : "text-[var(--text-dim)] hover:text-yellow-400"
-          }`}
+          onClick={onPickDirectory}
+          title={directory || "Choose directory"}
+          className="text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] px-2 py-1 flex-shrink-0 flex items-center gap-1.5"
         >
-          ★
+          <Folder size={12} />
+          <span>Open folder</span>
         </button>
-      )}
+      </div>
 
-      {/* Bookmarks dropdown */}
-      {bookmarks.length > 0 && (
-        <div className="flex items-center gap-0.5 overflow-x-auto max-w-[160px]">
-          {bookmarks.map((b) => (
-            <button
-              key={b}
-              onClick={() => onChange(b)}
-              title={b}
-              className={`text-xs px-1.5 py-1 rounded flex-shrink-0 truncate max-w-[80px] transition-colors ${
-                b === directory
-                  ? "text-[var(--accent-blue)] bg-[var(--bg-active)]"
-                  : "text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-active)]"
-              }`}
-            >
-              {shortPath(b).split("/").pop() || shortPath(b)}
-            </button>
-          ))}
+      {/* Folders list (Bookmarks + History) */}
+      {displayDirs.length > 0 && (
+        <div className="flex items-center gap-1 overflow-x-auto max-w-[400px] custom-scrollbar">
+          {displayDirs.map((b) => {
+            const bookmarked = isBookmarked(b);
+            const active = b === directory;
+            
+            return (
+              <div
+                key={b}
+                className={`flex items-center gap-0.5 rounded transition-colors group bg-[var(--bg-active)]`}
+              >
+                <button
+                  onClick={() => onChange(b)}
+                  title={b}
+                  className={`text-xs px-2 py-1 flex-shrink-0 truncate max-w-[100px] transition-colors ${
+                    active
+                      ? "text-[var(--text-main)] font-bold"
+                      : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
+                  }`}
+                >
+                  {shortPath(b).split("/").pop() || shortPath(b)}
+                </button>
+                {onBookmarkAdd && onBookmarkRemove && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      bookmarked ? onBookmarkRemove(b) : onBookmarkAdd(b);
+                    }}
+                    title={bookmarked ? "Remove bookmark" : "Bookmark this directory"}
+                    className={`text-[10px] pr-1.5 py-1 transition-colors ${
+                      bookmarked
+                        ? "text-[var(--accent-blue)]"
+                        : "text-[var(--text-dim)] hover:text-[var(--accent-blue)]"
+                    }`}
+                  >
+                    <Bookmark size={10} fill={bookmarked ? "currentColor" : "none"} />
+                  </button>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
