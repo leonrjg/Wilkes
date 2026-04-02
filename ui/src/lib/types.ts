@@ -86,7 +86,7 @@ export interface FileEntry {
 /** HuggingFace model code, e.g. "BAAI/bge-base-en-v1.5". */
 export type EmbedderModel = string;
 
-export type EmbeddingEngine = "Candle" | "Fastembed";
+export type EmbeddingEngine = "Python" | "Candle" | "Fastembed";
 
 export interface ModelDescriptor {
   model_id: string;
@@ -103,6 +103,8 @@ export interface SemanticSettings {
   enabled: boolean;
   engine: EmbeddingEngine;
   model: EmbedderModel;
+  dimension: number;
+  device: string;
   index_path: string | null;
   custom_models: string[];
   chunk_size: number;

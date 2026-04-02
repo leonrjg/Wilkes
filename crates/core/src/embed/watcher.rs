@@ -12,6 +12,14 @@ use super::index::SemanticIndex;
 
 // ── IndexWatcher ──────────────────────────────────────────────────────────────
 
+pub struct WatcherConfig {
+    pub python_path: PathBuf,
+    pub script_path: PathBuf,
+    pub model_id: String,
+    pub data_dir: PathBuf,
+    pub device: String,
+}
+
 pub struct IndexWatcher {
     debouncer: Option<notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -23,7 +31,8 @@ impl IndexWatcher {
         root: PathBuf,
         index: Arc<Mutex<Option<SemanticIndex>>>,
         extractors: Arc<ExtractorRegistry>,
-        embedder: Arc<dyn Embedder>,
+        embedder: Option<Arc<dyn Embedder>>,
+        config: Option<WatcherConfig>,
         chunk_size: usize,
         chunk_overlap: usize,
     ) -> anyhow::Result<Self> {
@@ -42,8 +51,43 @@ impl IndexWatcher {
             for result in &rx_events {
                 match result {
                     Ok(events) => {
+                        let mut changed_paths = Vec::new();
+                        let mut removed_paths = Vec::new();
+
                         for event in events {
-                            handle_event(&event.path, &index, &extractors, &embedder, chunk_size, chunk_overlap);
+                            if event.path.exists() && event.path.is_file() {
+                                changed_paths.push(event.path.clone());
+                            } else if !event.path.exists() {
+                                removed_paths.push(event.path.clone());
+                            }
+                        }
+
+                        // Handle removals
+                        if !removed_paths.is_empty() {
+                            if let Ok(mut guard) = index.lock() {
+                                if let Some(idx) = guard.as_mut() {
+                                    for path in removed_paths {
+                                        if let Err(e) = idx.remove_file(&path) {
+                                            error!("[IndexWatcher] remove_file {}: {e:#}", path.display());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Handle additions/modifications
+                        if !changed_paths.is_empty() {
+                            if let Some(ref emb) = embedder {
+                                for path in changed_paths {
+                                    handle_event(&path, &index, &extractors, emb, chunk_size, chunk_overlap);
+                                }
+                            } else if let Some(ref cfg) = config {
+                                // Python engine: spawn worker for the batch
+                                info!("[IndexWatcher] Spawning Python worker for incremental update: {} files", changed_paths.len());
+                                if let Err(e) = spawn_python_worker(cfg, &changed_paths, chunk_size, chunk_overlap) {
+                                    error!("[IndexWatcher] Failed to spawn Python worker: {e:#}");
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -73,6 +117,52 @@ impl Drop for IndexWatcher {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn spawn_python_worker(
+    cfg: &WatcherConfig,
+    paths: &[PathBuf],
+    chunk_size: usize,
+    chunk_overlap: usize,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use crate::embed::worker_ipc::WorkerRequest;
+    use crate::types::EmbeddingEngine;
+
+    let request = WorkerRequest {
+        mode: "build".to_string(),
+        root: PathBuf::new(), // Not used for incremental
+        engine: EmbeddingEngine::Python,
+        model: cfg.model_id.clone(),
+        data_dir: cfg.data_dir.clone(),
+        chunk_size,
+        chunk_overlap,
+        device: cfg.device.clone(),
+        paths: Some(paths.to_vec()),
+    };
+
+    let request_json = serde_json::to_string(&request)?;
+
+    let mut child = Command::new(&cfg.python_path)
+        .arg(&cfg.script_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null()) // We don't need stdout for watcher updates
+        .stderr(Stdio::inherit()) // Log errors to stderr
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(request_json.as_bytes())?;
+        stdin.write_all(b"\n")?;
+    }
+
+    // Wait for worker to finish (incremental updates should be fast)
+    let status = child.wait()?;
+    if !status.success() {
+        anyhow::bail!("Python worker failed with status: {status}");
+    }
+
+    Ok(())
 }
 
 // ── Event handler ─────────────────────────────────────────────────────────────

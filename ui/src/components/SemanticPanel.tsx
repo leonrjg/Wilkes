@@ -36,9 +36,10 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   const [sizeFetchingFor, setSizeFetchingFor] = useState<string | null>(null);
   const [customModelInput, setCustomModelInput] = useState("");
   const [isAddingCustom, setIsAddingCustom] = useState(false);
+  const [isEngineAvailable, setIsEngineAvailable] = useState(true);
 
   const supportsCustomModels = useCallback((engine: EmbeddingEngine) => {
-    return engine === "Candle";
+    return engine === "Candle" || engine === "Python";
   }, []);
 
   const refreshState = useCallback(async () => {
@@ -47,7 +48,20 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       const sem = s.semantic;
       setSettings(sem);
 
-      const descriptors = await api.listModels(sem.engine);
+      let descriptors: ModelDescriptor[] = [];
+      try {
+        descriptors = await api.listModels(sem.engine);
+        setError(null);
+        setIsEngineAvailable(true);
+      } catch (e: any) {
+        if (sem.engine === "Python") {
+          setError("Python engine unavailable. Please install the bundled version or set up a Python environment.");
+          setIsEngineAvailable(false);
+        } else {
+          setError(e.toString());
+          setIsEngineAvailable(false);
+        }
+      }
       
       // Merge custom models from settings
       const customDescriptors: ModelDescriptor[] = (sem.custom_models || []).map(id => ({
@@ -87,7 +101,15 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       } catch (e) {
         // No index or error reading it
         setIndexStatus(null);
-        if (!selected?.is_cached) {
+        if (sem.engine === "Python") {
+          // For Python, we don't have a "not_downloaded" phase in the same way
+          // because build handles it. But we can check if it's cached.
+          if (!selected?.is_cached) {
+            setPhase("ready"); // "Build" will trigger download
+          } else {
+            setPhase("ready");
+          }
+        } else if (!selected?.is_cached) {
           setPhase("not_downloaded");
         } else {
           setPhase("ready");
@@ -255,6 +277,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   }, [phase, settings, api, directory, refreshSemanticReady]);
 
   const isActive = phase === "downloading" || phase === "building";
+  const isDisabled = !isEngineAvailable || isCancelling;
 
   const formatBytes = (bytes: number): string => {
     if (bytes >= 1_073_741_824) return `${(bytes / 1_073_741_824).toFixed(1)} GB`;
@@ -281,11 +304,11 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       <section>
         <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Inference Engine</h3>
         <div className="flex p-0.5 bg-[var(--bg-active)] rounded-lg w-full">
-          {(["Candle", "Fastembed"] as const).map((e) => (
+          {(["Python", "Candle", "Fastembed"] as const).map((e) => (
             <button
               key={e}
               type="button"
-              disabled={isActive}
+              disabled={isActive || !isEngineAvailable}
               onClick={() => handleEngineChange(e)}
               className={`flex-1 px-3 py-1 rounded-md text-xs transition-all ${
                 settings?.engine === e
@@ -293,14 +316,16 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
                   : "text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50"
               }`}
             >
-              {e === "Candle" ? "Candle (Metal)" : "Fastembed (ONNX)"}
+              {e === "Python" ? "Python" : e === "Candle" ? "Candle" : "Fastembed"}
             </button>
           ))}
         </div>
         <p className="text-[10px] text-[var(--text-dim)] mt-1.5 px-1 selectable">
-          {settings?.engine === "Candle" 
-            ? "Native Rust implementation. Uses GPU via Metal." 
-            : "Optimized ONNX Runtime. Uses CoreML acceleration (fastest)."}
+          {settings?.engine === "Python" 
+            ? "Default. Native PyTorch (MPS/CUDA). Best compatibility."
+            : settings?.engine === "Candle"
+              ? "Native Rust. Uses GPU via Metal (Apple Silicon only)." 
+              : "Optimized ONNX Runtime. Best performance on Intel Macs."}
         </p>
       </section>
 
@@ -322,7 +347,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
               placeholder="Search models…"
               value={modelFilter}
               onChange={(e) => setModelFilter(e.target.value)}
-              disabled={isActive}
+              disabled={isActive || !isEngineAvailable}
               className="flex-1 text-xs bg-[var(--bg-input)] border border-[var(--border-main)] rounded-lg px-2.5 py-1.5 text-[var(--text-main)] placeholder-[var(--text-dim)] focus:outline-none focus:border-[var(--accent-blue)] disabled:opacity-50 transition-colors"
             />
             {settings && supportsCustomModels(settings.engine) && (
@@ -373,7 +398,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
               return (
                 <button
                   key={m.model_id}
-                  disabled={isActive}
+                  disabled={isActive || !isEngineAvailable}
                   type="button"
                   onClick={() => handleModelChange(m.model_id)}
                   className={`flex flex-col text-left rounded-lg p-2 transition-all ${
@@ -422,7 +447,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
               min={100}
               max={10000}
               step={100}
-              disabled={isActive}
+              disabled={isActive || !isEngineAvailable}
               value={settings?.chunk_size ?? 1200}
               onChange={async (e) => {
                 if (!settings) return;
@@ -442,7 +467,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
               min={0}
               max={5000}
               step={50}
-              disabled={isActive}
+              disabled={isActive || !isEngineAvailable}
               value={settings?.chunk_overlap ?? 200}
               onChange={async (e) => {
                 if (!settings) return;
@@ -502,7 +527,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
 
         <button
           onClick={handleAction}
-          disabled={isCancelling}
+          disabled={isDisabled}
           type="button"
           className={`w-full py-2 rounded-lg text-xs font-semibold transition-all shadow-lg active:scale-[0.98] disabled:opacity-50 ${
             isActive

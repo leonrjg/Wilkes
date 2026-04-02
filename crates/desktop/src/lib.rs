@@ -26,6 +26,54 @@ fn desktop_settings_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(config.join("wilkes").join("settings.json"))
 }
 
+fn resolve_python() -> anyhow::Result<std::path::PathBuf> {
+    // 1. Bundled Python
+    let exe = std::env::current_exe()?;
+    let bundled = if cfg!(target_os = "macos") {
+        // Wilkes.app/Contents/MacOS/wilkes-desktop
+        // Wilkes.app/Contents/Resources/python/bin/python3
+        exe.parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("Resources").join("python").join("bin").join("python3"))
+    } else if cfg!(target_os = "windows") {
+        exe.parent().map(|p| p.join("python").join("python.exe"))
+    } else {
+        exe.parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("lib").join("python").join("bin").join("python3"))
+    };
+
+    if let Some(p) = bundled {
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    // 2. System Python
+    let system = if cfg!(target_os = "windows") { "python.exe" } else { "python3" };
+    // Check if system python exists in PATH
+    if let Ok(output) = std::process::Command::new(if cfg!(target_os = "windows") { "where" } else { "which" })
+        .arg(system)
+        .output()
+    {
+        if output.status.success() {
+            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path_str.is_empty() {
+                return Ok(std::path::PathBuf::from(path_str));
+            }
+        }
+    }
+
+    anyhow::bail!("Python interpreter not found. Please install the bundled version or set up a Python environment with infinity-emb.")
+}
+
+fn resolve_worker_script(app: &AppHandle) -> anyhow::Result<std::path::PathBuf> {
+    let resource_dir = app.path().resource_dir()?;
+    let script = resource_dir.join("wilkes_worker.py");
+    anyhow::ensure!(script.exists(), "Python worker script not found at {}", script.display());
+    Ok(script)
+}
+
 // ── App state ────────────────────────────────────────────────────────────────
 
 struct ActiveSearches(Mutex<HashMap<String, JoinHandle<()>>>);
@@ -39,7 +87,7 @@ struct ActiveEmbedderState(Mutex<Option<Arc<dyn Embedder>>>);
 
 /// The open index, shared with the watcher and query path.
 /// `None` when no index has been built yet.
-struct SemanticIndexState(Arc<Mutex<Option<SemanticIndex>>>);
+struct SemanticIndexState(Mutex<Arc<Mutex<Option<SemanticIndex>>>>);
 
 /// The active filesystem watcher. Stopped and replaced when the root changes.
 struct WatcherState(Mutex<Option<IndexWatcher>>);
@@ -92,7 +140,7 @@ async fn search(query: SearchQuery, search_id: Option<String>, app: AppHandle) -
     };
 
     let index = if query.mode == SearchMode::Semantic {
-        Some(app.state::<SemanticIndexState>().0.clone())
+        Some(app.state::<SemanticIndexState>().0.lock().unwrap().clone())
     } else {
         None
     };
@@ -294,32 +342,47 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
         .unwrap_or_default();
     let chunk_size = current_settings.semantic.chunk_size;
     let chunk_overlap = current_settings.semantic.chunk_overlap;
+    let device = current_settings.semantic.device.clone();
 
     // Stop the active watcher before rebuilding.
     stop_watcher(&app);
 
-    // Resolve the worker binary: same directory as the running executable.
-    let worker_bin = std::env::current_exe()
-        .map_err(|e| format!("Cannot resolve current exe: {e}"))?
-        .with_file_name("wilkes-worker");
+    let mut command = match engine {
+        EmbeddingEngine::Python => {
+            let python = resolve_python().map_err(|e| e.to_string())?;
+            let script = resolve_worker_script(&app).map_err(|e| e.to_string())?;
+            let mut cmd = tokio::process::Command::new(python);
+            cmd.arg(script);
+            cmd
+        }
+        _ => {
+            let worker_bin = std::env::current_exe()
+                .map_err(|e| format!("Cannot resolve current exe: {e}"))?
+                .with_file_name("wilkes-worker");
+            tokio::process::Command::new(worker_bin)
+        }
+    };
 
     let request = WorkerRequest {
+        mode: "build".to_string(),
         root: root.into(),
         engine,
-        model: model.clone(),
+        model: model.model_id().to_string(),
         data_dir: data_dir.clone(),
         chunk_size,
         chunk_overlap,
+        device,
+        paths: None,
     };
     let request_json = serde_json::to_string(&request)
         .map_err(|e| format!("Failed to serialise worker request: {e}"))?;
 
-    let mut child = tokio::process::Command::new(&worker_bin)
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to spawn wilkes-worker ({worker_bin:?}): {e}"))?;
+        .map_err(|e| format!("Failed to spawn worker process: {e}"))?;
 
     // Send the config and close stdin so the worker can proceed.
     if let Some(mut stdin) = child.stdin.take() {
@@ -330,6 +393,7 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
     }
 
     let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
 
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
@@ -340,7 +404,9 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
 
     let join: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
         let mut reader = BufReader::new(stdout).lines();
+        let mut stderr_reader = BufReader::new(stderr).lines();
         let mut final_event: Option<WorkerEvent> = None;
+        let mut stderr_logs = Vec::new();
 
         loop {
             tokio::select! {
@@ -363,7 +429,6 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
                                     let _ = app_clone.emit("embed-progress", &p);
                                 }
                                 Ok(ev) => {
-                                    // Done or Error — no more lines expected.
                                     final_event = Some(ev);
                                     break;
                                 }
@@ -372,7 +437,12 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
                                 }
                             }
                         }
-                        _ => break, // EOF or read error
+                        _ => break,
+                    }
+                }
+                line = stderr_reader.next_line() => {
+                    if let Ok(Some(line)) = line {
+                        stderr_logs.push(line);
                     }
                 }
             }
@@ -382,53 +452,75 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
 
         match final_event {
             Some(WorkerEvent::Done) => {
-                // Worker completed: reload embedder + open index in-process.
-                let installer = dispatch::get_installer(engine, model.clone());
-                let embedder = match tokio::task::spawn_blocking({
-                    let d = data_dir_clone.clone();
-                    move || installer.build(&d)
-                })
-                .await
-                {
-                    Ok(Ok(e)) => e,
-                    Ok(Err(e)) => {
-                        let _ = app_clone.emit("embed-error", EmbedError {
-                            operation: EmbedOperation::Build,
-                            message: e.to_string(),
-                        });
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        let _ = app_clone.emit("embed-error", EmbedError {
-                            operation: EmbedOperation::Build,
-                            message: e.to_string(),
-                        });
-                        return Ok(());
-                    }
-                };
+                let mut loaded_embedder = None;
 
-                *app_clone.state::<ActiveEmbedderState>().0.lock().unwrap() = Some(Arc::clone(&embedder));
+                if engine != EmbeddingEngine::Python {
+                    let installer = dispatch::get_installer(engine, model.clone());
+                    let embedder = match tokio::task::spawn_blocking({
+                        let d = data_dir_clone.clone();
+                        move || installer.build(&d)
+                    })
+                    .await
+                    {
+                        Ok(Ok(e)) => e,
+                        Ok(Err(e)) => {
+                            let _ = app_clone.emit("embed-error", EmbedError {
+                                operation: EmbedOperation::Build,
+                                message: e.to_string(),
+                            });
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            let _ = app_clone.emit("embed-error", EmbedError {
+                                operation: EmbedOperation::Build,
+                                message: e.to_string(),
+                            });
+                            return Ok(());
+                        }
+                    };
+                    loaded_embedder = Some(embedder);
+                }
+
+                if let Some(ref emb) = loaded_embedder {
+                    *app_clone.state::<ActiveEmbedderState>().0.lock().unwrap() = Some(Arc::clone(emb));
+                } else {
+                    *app_clone.state::<ActiveEmbedderState>().0.lock().unwrap() = None;
+                }
 
                 let open_result = tokio::task::spawn_blocking({
                     let d = data_dir_clone.clone();
-                    let emb = Arc::clone(&embedder);
-                    move || SemanticIndex::open(&d, emb.as_ref())
+                    let m = model.model_id().to_string();
+                    let dim = current_settings.semantic.dimension;
+                    move || SemanticIndex::open(&d, &m, dim)
                 })
                 .await;
 
                 let open_msg = match open_result {
                     Ok(Ok(idx)) => {
-                        *app_clone.state::<SemanticIndexState>().0.lock().unwrap() = Some(idx);
+                        *app_clone.state::<SemanticIndexState>().0.lock().unwrap() = Arc::new(Mutex::new(Some(idx)));
 
-                        let index_arc = app_clone.state::<SemanticIndexState>().0.clone();
+                        let index_arc = app_clone.state::<SemanticIndexState>().0.lock().unwrap().clone();
                         let mut registry = ExtractorRegistry::new();
                         registry.register(Box::new(wilkes_core::extract::pdf::PdfExtractor::new()));
+
+                        let watcher_config = if engine == EmbeddingEngine::Python {
+                            Some(wilkes_core::embed::watcher::WatcherConfig {
+                                python_path: resolve_python().unwrap_or_default(),
+                                script_path: resolve_worker_script(&app_clone).unwrap_or_default(),
+                                model_id: model.model_id().to_string(),
+                                data_dir: data_dir_clone.clone(),
+                                device: current_settings.semantic.device.clone(),
+                            })
+                        } else {
+                            None
+                        };
 
                         match IndexWatcher::start(
                             root_path,
                             index_arc,
                             Arc::new(registry),
-                            Arc::clone(&embedder),
+                            loaded_embedder,
+                            watcher_config,
                             chunk_size,
                             chunk_overlap,
                         ) {
@@ -453,38 +545,23 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
                     });
                 }
             }
-            Some(WorkerEvent::Error(msg)) => {
-                let _ = std::fs::remove_file(data_dir_clone.join("semantic_index.db"));
+            Some(WorkerEvent::Error(e)) => {
+                let mut full_error = e;
+                if !stderr_logs.is_empty() {
+                    full_error.push_str("\n\nWorker stderr:\n");
+                    full_error.push_str(&stderr_logs.join("\n"));
+                }
                 let _ = app_clone.emit("embed-error", EmbedError {
                     operation: EmbedOperation::Build,
-                    message: msg,
+                    message: full_error,
                 });
             }
             _ => {
-                // Worker exited without sending Done or Error (ungraceful termination).
-                let _ = std::fs::remove_file(data_dir_clone.join("semantic_index.db"));
-                #[cfg(unix)]
-                let message = {
-                    use std::os::unix::process::ExitStatusExt;
-                    if exit_status.and_then(|s| s.signal()) == Some(9) {
-                        error!("[worker] killed by OS out-of-memory killer (SIGKILL)");
-                        "Worker ran out of memory. Try a smaller model or index a smaller directory.".to_string()
-                    } else {
-                        let status_info = exit_status
-                            .map(|s| format!(" (exit status: {s})"))
-                            .unwrap_or_default();
-                        error!("[worker] terminated without Done/Error{status_info}");
-                        format!("Worker process terminated unexpectedly{status_info}")
-                    }
-                };
-                #[cfg(not(unix))]
-                let message = {
-                    let status_info = exit_status
-                        .map(|s| format!(" (exit status: {s})"))
-                        .unwrap_or_default();
-                    error!("[worker] terminated without Done/Error{status_info}");
-                    format!("Worker process terminated unexpectedly{status_info}")
-                };
+                let mut message = format!("Worker process exited unexpectedly (code: {:?})", exit_status);
+                if !stderr_logs.is_empty() {
+                    message.push_str("\n\nWorker stderr:\n");
+                    message.push_str(&stderr_logs.join("\n"));
+                }
                 let _ = app_clone.emit("embed-error", EmbedError {
                     operation: EmbedOperation::Build,
                     message,
@@ -502,6 +579,56 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
 /// Return all supported models annotated with local cache availability.
 #[tauri::command]
 async fn list_models(engine: EmbeddingEngine, app: AppHandle) -> Result<Vec<ModelDescriptor>, String> {
+    if engine == EmbeddingEngine::Python {
+        let python = resolve_python().map_err(|e| e.to_string())?;
+        let script = resolve_worker_script(&app).map_err(|e| e.to_string())?;
+        let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+
+        let request = WorkerRequest {
+            mode: "list-models".to_string(),
+            root: std::path::PathBuf::new(),
+            engine,
+            model: String::new(),
+            data_dir,
+            chunk_size: 0,
+            chunk_overlap: 0,
+            device: "auto".to_string(),
+            paths: None,
+        };
+        let request_json = serde_json::to_string(&request).map_err(|e| e.to_string())?;
+
+        let mut child = tokio::process::Command::new(python)
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn worker: {e}"))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(request_json.as_bytes()).await.ok();
+            stdin.write_all(b"\n").await.ok();
+        }
+
+        let stdout = child.stdout.take().ok_or("Failed to open stdout")?;
+        let mut reader = BufReader::new(stdout).lines();
+        
+        while let Ok(Some(line)) = reader.next_line().await {
+            if let Ok(WorkerEvent::Models(models)) = serde_json::from_str::<WorkerEvent>(&line) {
+                return Ok(models.into_iter().map(|m| ModelDescriptor {
+                    model_id: m.model_id.clone(),
+                    display_name: m.model_id.split('/').last().unwrap_or(&m.model_id).to_string(),
+                    description: format!("Locally cached Python model ({} dimensions)", m.dimension),
+                    dimension: m.dimension,
+                    is_cached: true,
+                    size_bytes: Some(m.size_bytes),
+                    preferred_batch_size: Some(32),
+                }).collect());
+            }
+        }
+        
+        return Ok(vec![]);
+    }
+
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     Ok(wilkes_api::commands::embed::list_models(engine, &data_dir).await)
 }
@@ -537,7 +664,7 @@ async fn get_index_status(app: AppHandle) -> Result<IndexStatus, String> {
 #[tauri::command]
 async fn delete_index(app: AppHandle) -> Result<(), String> {
     stop_watcher(&app);
-    *app.state::<SemanticIndexState>().0.lock().unwrap() = None;
+    *app.state::<SemanticIndexState>().0.lock().unwrap() = Arc::new(Mutex::new(None));
     *app.state::<ActiveEmbedderState>().0.lock().unwrap() = None;
 
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -612,30 +739,74 @@ async fn restore_semantic_state(app: &AppHandle) {
         return;
     }
 
-    let model = settings.semantic.model;
+    let model = settings.semantic.model.clone();
     let engine = settings.semantic.engine;
-    let installer = dispatch::get_installer(engine, model);
-    if !installer.is_available(&data_dir) {
-        info!("restore_semantic_state: model files not found, skipping restore");
-        return;
+    let mut loaded_embedder = None;
+
+    if engine != EmbeddingEngine::Python {
+        let installer = dispatch::get_installer(engine, model.clone());
+        if !installer.is_available(&data_dir) {
+            info!("restore_semantic_state: model files not found, skipping restore");
+            return;
+        }
+
+        let data_dir_clone = data_dir.clone();
+        let embedder = match tokio::task::spawn_blocking(move || installer.build(&data_dir_clone)).await {
+            Ok(Ok(e)) => e,
+            Ok(Err(e)) => { error!("restore_semantic_state: build embedder failed: {e:#}"); return; }
+            Err(e) => { error!("restore_semantic_state: build embedder panicked: {e}"); return; }
+        };
+        loaded_embedder = Some(embedder);
+    }
+
+    if let Some(ref emb) = loaded_embedder {
+        *app.state::<ActiveEmbedderState>().0.lock().unwrap() = Some(Arc::clone(emb));
     }
 
     let data_dir_clone = data_dir.clone();
-    let embedder = match tokio::task::spawn_blocking(move || installer.build(&data_dir_clone)).await {
-        Ok(Ok(e)) => e,
-        Ok(Err(e)) => { error!("restore_semantic_state: build embedder failed: {e:#}"); return; }
-        Err(e) => { error!("restore_semantic_state: build embedder panicked: {e}"); return; }
-    };
-    *app.state::<ActiveEmbedderState>().0.lock().unwrap() = Some(Arc::clone(&embedder));
-
-    let data_dir_clone = data_dir.clone();
-    let emb = Arc::clone(&embedder);
-    let index = match tokio::task::spawn_blocking(move || SemanticIndex::open(&data_dir_clone, emb.as_ref())).await {
+    let m = model.model_id().to_string();
+    let dim = settings.semantic.dimension;
+    let index = match tokio::task::spawn_blocking(move || SemanticIndex::open(&data_dir_clone, &m, dim)).await {
         Ok(Ok(idx)) => idx,
         Ok(Err(e)) => { error!("restore_semantic_state: open index failed: {e:#}"); return; }
         Err(e) => { error!("restore_semantic_state: open index panicked: {e}"); return; }
     };
-    *app.state::<SemanticIndexState>().0.lock().unwrap() = Some(index);
+    
+    let index_arc = Arc::new(Mutex::new(Some(index)));
+    *app.state::<SemanticIndexState>().0.lock().unwrap() = Arc::clone(&index_arc);
+
+    // Start watcher
+    if let Some(root) = settings.last_directory {
+        let mut registry = ExtractorRegistry::new();
+        registry.register(Box::new(wilkes_core::extract::pdf::PdfExtractor::new()));
+
+        let watcher_config = if engine == EmbeddingEngine::Python {
+            Some(wilkes_core::embed::watcher::WatcherConfig {
+                python_path: resolve_python().unwrap_or_default(),
+                script_path: resolve_worker_script(app).unwrap_or_default(),
+                model_id: model.model_id().to_string(),
+                data_dir: data_dir.clone(),
+                device: settings.semantic.device.clone(),
+            })
+        } else {
+            None
+        };
+
+        match IndexWatcher::start(
+            root,
+            index_arc,
+            Arc::new(registry),
+            loaded_embedder,
+            watcher_config,
+            settings.semantic.chunk_size,
+            settings.semantic.chunk_overlap,
+        ) {
+            Ok(watcher) => {
+                *app.state::<WatcherState>().0.lock().unwrap() = Some(watcher);
+            }
+            Err(e) => error!("restore_semantic_state: failed to start watcher: {e:#}"),
+        }
+    }
 
     info!("restore_semantic_state: embedder and index restored");
 }
@@ -657,7 +828,7 @@ pub fn run() {
         .manage(ActiveSearches(Mutex::new(HashMap::new())))
         .manage(EmbedState(Mutex::new(None)))
         .manage(ActiveEmbedderState(Mutex::new(None)))
-        .manage(SemanticIndexState(Arc::new(Mutex::new(None))))
+        .manage(SemanticIndexState(Mutex::new(Arc::new(Mutex::new(None)))))
         .manage(WatcherState(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             search,

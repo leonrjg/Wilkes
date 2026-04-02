@@ -217,6 +217,7 @@ pub struct ModelDescriptor {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub enum EmbeddingEngine {
     #[default]
+    Python,
     Candle,
     Fastembed,
 }
@@ -224,6 +225,7 @@ pub enum EmbeddingEngine {
 impl EmbeddingEngine {
     pub fn as_str(&self) -> &'static str {
         match self {
+            EmbeddingEngine::Python => "python",
             EmbeddingEngine::Candle => "candle",
             EmbeddingEngine::Fastembed => "fastembed",
         }
@@ -231,6 +233,7 @@ impl EmbeddingEngine {
 
     pub fn supports_custom_models(&self) -> bool {
         match self {
+            EmbeddingEngine::Python => true,
             EmbeddingEngine::Candle => true,
             EmbeddingEngine::Fastembed => false,
         }
@@ -238,7 +241,6 @@ impl EmbeddingEngine {
 }
 
 // ── Semantic settings ─────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SemanticSettings {
     pub enabled: bool,
@@ -246,6 +248,12 @@ pub struct SemanticSettings {
     pub engine: EmbeddingEngine,
     #[serde(default)]
     pub model: EmbedderModel,
+    /// Embedding dimension for the current model.
+    #[serde(default = "SemanticSettings::default_dimension")]
+    pub dimension: usize,
+    /// Device override for Python engine ("auto", "cpu", "mps", "cuda").
+    #[serde(default = "SemanticSettings::default_device")]
+    pub device: String,
     pub index_path: Option<PathBuf>,
     /// List of arbitrary HuggingFace IDs manually added by the user.
     #[serde(default)]
@@ -259,16 +267,30 @@ pub struct SemanticSettings {
 }
 
 impl SemanticSettings {
-    fn default_chunk_size() -> usize { 1200 }
-    fn default_chunk_overlap() -> usize { 200 }
-}
+    fn default_chunk_size() -> usize {
+        1200
+    }
 
+    fn default_chunk_overlap() -> usize {
+        128
+    }
+
+    fn default_dimension() -> usize {
+        768 // Default for BgeBaseEn
+    }
+
+    fn default_device() -> String {
+        "auto".to_string()
+    }
+}
 impl Default for SemanticSettings {
     fn default() -> Self {
         Self {
             enabled: false,
             engine: EmbeddingEngine::default(),
             model: EmbedderModel("BAAI/bge-base-en-v1.5".to_string()),
+            dimension: Self::default_dimension(),
+            device: Self::default_device(),
             index_path: None,
             custom_models: Vec::new(),
             chunk_size: Self::default_chunk_size(),

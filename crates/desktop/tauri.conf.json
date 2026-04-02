@@ -13,7 +13,7 @@
     "active": true,
     "targets": "all",
     "icon": [],
-    "resources": ["resources/*"]
+    "resources": ["resources/*", "../worker/wilkes_worker.py"]
   },
   "app": {
     "windows": [

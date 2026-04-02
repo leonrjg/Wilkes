@@ -5,6 +5,8 @@ use super::installer::EmbedderInstaller;
 
 pub fn list_models(engine: EmbeddingEngine, data_dir: &Path) -> Vec<ModelDescriptor> {
     match engine {
+        EmbeddingEngine::Python => vec![], // Handled by desktop spawning worker
+
         #[cfg(feature = "candle")]
         EmbeddingEngine::Candle => super::candle::list_supported_models(data_dir),
         #[cfg(not(feature = "candle"))]
@@ -19,6 +21,8 @@ pub fn list_models(engine: EmbeddingEngine, data_dir: &Path) -> Vec<ModelDescrip
 
 pub fn get_installer(engine: EmbeddingEngine, model: EmbedderModel) -> Arc<dyn EmbedderInstaller> {
     match engine {
+        EmbeddingEngine::Python => panic!("Python engine does not use in-process installers"),
+
         #[cfg(feature = "candle")]
         EmbeddingEngine::Candle => Arc::new(super::candle::CandleInstaller::new(model)),
         #[cfg(not(feature = "candle"))]
@@ -33,6 +37,8 @@ pub fn get_installer(engine: EmbeddingEngine, model: EmbedderModel) -> Arc<dyn E
 
 pub fn fetch_model_size(engine: EmbeddingEngine, model_id: &str) -> anyhow::Result<u64> {
     match engine {
+        EmbeddingEngine::Python => anyhow::bail!("Python engine model size fetched via worker"),
+
         #[cfg(feature = "candle")]
         EmbeddingEngine::Candle => super::candle::fetch_model_size(model_id),
         #[cfg(not(feature = "candle"))]

@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let installer = dispatch::get_installer(req.engine, req.model);
+    let installer = dispatch::get_installer(req.engine, wilkes_core::types::EmbedderModel(req.model));
     let result = wilkes_api::commands::embed::build_index(
         req.root,
         installer.as_ref(),

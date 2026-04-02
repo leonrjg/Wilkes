@@ -49,8 +49,8 @@ pub struct SemanticIndex {
 
 impl SemanticIndex {
     /// Open an existing index. Returns `Err` if no index exists at `data_dir` or
-    /// if `model_id`/`dimension` in the stored metadata mismatches `embedder`.
-    pub fn open(data_dir: &Path, embedder: &dyn Embedder) -> anyhow::Result<Self> {
+    /// if `model_id`/`dimension` in the stored metadata mismatches the parameters.
+    pub fn open(data_dir: &Path, model_id: &str, dimension: usize) -> anyhow::Result<Self> {
         let path = db_path(data_dir);
         anyhow::ensure!(path.exists(), "No semantic index found at {}", path.display());
 
@@ -85,16 +85,16 @@ impl SemanticIndex {
             .context("Index is missing dimension metadata")?;
 
         anyhow::ensure!(
-            stored_model_id == embedder.model_id(),
-            "Index was built with model '{}' but embedder is '{}'; rebuild the index",
+            stored_model_id == model_id,
+            "Index was built with model '{}' but requested is '{}'; rebuild the index",
             stored_model_id,
-            embedder.model_id()
+            model_id
         );
         anyhow::ensure!(
-            stored_dimension == embedder.dimension(),
-            "Index dimension {} does not match embedder dimension {}; rebuild the index",
+            stored_dimension == dimension,
+            "Index dimension {} does not match requested dimension {}; rebuild the index",
             stored_dimension,
-            embedder.dimension()
+            dimension
         );
 
         Ok(Self {
@@ -106,7 +106,12 @@ impl SemanticIndex {
 
     /// Create a new empty index at `data_dir` (schema only, no files indexed).
     /// Removes any existing index at that path.
-    pub fn create(data_dir: &Path, embedder: &dyn Embedder, engine: EmbeddingEngine) -> anyhow::Result<Self> {
+    pub fn create(
+        data_dir: &Path,
+        model_id: &str,
+        dimension: usize,
+        engine: EmbeddingEngine,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let path = db_path(data_dir);
         if path.exists() {
@@ -121,7 +126,7 @@ impl SemanticIndex {
         let conn = Connection::open(&path)
             .with_context(|| format!("Failed to create index at {}", path.display()))?;
 
-        Self::create_schema(&conn, embedder, engine)?;
+        Self::create_schema(&conn, model_id, dimension, engine)?;
 
         let built_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -134,8 +139,8 @@ impl SemanticIndex {
 
         Ok(Self {
             conn,
-            model_id: embedder.model_id().to_string(),
-            dimension: embedder.dimension(),
+            model_id: model_id.to_string(),
+            dimension,
         })
     }
 
@@ -153,7 +158,7 @@ impl SemanticIndex {
     ) -> anyhow::Result<Self> {
         let start_time = std::time::Instant::now();
         let total_files = paths.len();
-        let mut idx = Self::create(data_dir, embedder, engine)?;
+        let mut idx = Self::create(data_dir, embedder.model_id(), embedder.dimension(), engine)?;
 
         // Phase 1: extract and chunk all files (0% to 30% progress).
         let mut file_chunks: Vec<(PathBuf, Vec<Chunk>)> = Vec::new();
@@ -212,7 +217,12 @@ impl SemanticIndex {
         Ok(idx)
     }
 
-    fn create_schema(conn: &Connection, embedder: &dyn Embedder, engine: EmbeddingEngine) -> anyhow::Result<()> {
+    fn create_schema(
+        conn: &Connection,
+        model_id: &str,
+        dimension: usize,
+        engine: EmbeddingEngine,
+    ) -> anyhow::Result<()> {
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -244,13 +254,12 @@ impl SemanticIndex {
         )?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('model_id', ?1)",
-            params![embedder.model_id()],
+            params![model_id],
         )?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('dimension', ?1)",
-            params![embedder.dimension().to_string()],
+            params![dimension.to_string()],
         )?;
-
         Ok(())
     }
 
@@ -427,6 +436,7 @@ impl SemanticIndex {
             .unwrap_or_else(|_| "candle".to_string());
         
         let engine = match engine_str.as_str() {
+            "python" => EmbeddingEngine::Python,
             "fastembed" => EmbeddingEngine::Fastembed,
             _ => EmbeddingEngine::Candle,
         };
@@ -495,6 +505,7 @@ impl SemanticIndex {
             .unwrap_or_else(|_| "candle".to_string());
 
         let engine = match engine_str.as_str() {
+            "python" => EmbeddingEngine::Python,
             "fastembed" => EmbeddingEngine::Fastembed,
             _ => EmbeddingEngine::Candle,
         };
