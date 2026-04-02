@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tracing::{debug, error, info, warn};
 
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
@@ -62,11 +63,11 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
             ModelDescriptor {
                 model_id: info.model_code.clone(),
                 display_name,
-                description: info.description,
+                description: info.description.clone(),
                 dimension: info.dim,
                 is_cached,
                 size_bytes,
-                preferred_batch_size: get_preferred_batch_size(&info.model_code),
+                preferred_batch_size: get_preferred_batch_size(&info.model_code, &info.description),
             }
         })
         .collect()
@@ -125,8 +126,22 @@ pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {
 /// exceed L3 cache and thrash; 32 keeps the working set cache-resident.
 const DEFAULT_BATCH_SIZE: usize = 32;
 
-fn get_preferred_batch_size(_model_id: &str) -> Option<usize> {
-    Some(DEFAULT_BATCH_SIZE)
+fn get_preferred_batch_size(model_id: &str, description: &str) -> Option<usize> {
+    // Dynamic quantization (e.g. Q4_K_M, Q4_0, etc) makes embeddings incompatible
+    // across batches because the scale factor is adjusted per-batch. These models
+    // must be processed as a single batch (None).
+    let id_lower = model_id.to_lowercase();
+    let desc_lower = description.to_lowercase();
+
+    if id_lower.contains("-q")
+        || id_lower.contains("-int8")
+        || id_lower.contains("quantized")
+        || desc_lower.contains("quantized")
+    {
+        None
+    } else {
+        Some(DEFAULT_BATCH_SIZE)
+    }
 }
 
 pub struct FastEmbedder {
@@ -148,27 +163,31 @@ impl FastEmbedder {
     }
 
     fn embed_with_prefix(&self, texts: &[&str], prefix: &str) -> anyhow::Result<Vec<Vec<f32>>> {
+        let total = texts.len();
+        debug!("[fastembed] embed: {total} texts, batch_size={:?}", self.preferred_batch_size);
+        let t0 = std::time::Instant::now();
+
         let mut inner = self.inner.lock().unwrap();
-        if prefix.is_empty() {
-            return inner
+        let result = if prefix.is_empty() {
+            inner
                 .embed(texts.to_vec(), self.preferred_batch_size)
-                .map_err(|e| anyhow::anyhow!("fastembed error: {e}"));
-        }
-        let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
-        let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
-        inner
-            .embed(refs, self.preferred_batch_size)
-            .map_err(|e| anyhow::anyhow!("fastembed error: {e}"))
+                .map_err(|e| anyhow::anyhow!("fastembed error: {e}"))
+        } else {
+            let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
+            let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+            inner
+                .embed(refs, self.preferred_batch_size)
+                .map_err(|e| anyhow::anyhow!("fastembed error: {e}"))
+        };
+
+        debug!("[fastembed] embed total: {:.1}s", t0.elapsed().as_secs_f64());
+        result
     }
 }
 
 impl Embedder for FastEmbedder {
     fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        self.inner
-            .lock()
-            .unwrap()
-            .embed(texts.to_vec(), self.preferred_batch_size)
-            .map_err(|e| anyhow::anyhow!("fastembed error: {e}"))
+        self.embed_with_prefix(texts, "")
     }
 
     fn model_id(&self) -> &str {
@@ -267,7 +286,7 @@ impl EmbedderInstaller for FastembedInstaller {
         let dimension = info.dim;
         let model_id = self.model.0.clone();
         let cache_dir = data_dir.to_path_buf();
-        let preferred_batch_size = get_preferred_batch_size(&model_id);
+        let preferred_batch_size = get_preferred_batch_size(&model_id, &info.description);
 
         let mut options = InitOptions::new(info.model)
             .with_cache_dir(cache_dir)

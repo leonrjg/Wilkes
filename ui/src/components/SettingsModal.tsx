@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import type { SearchApi } from "../services/api";
 import type { Settings } from "../lib/types";
 import SemanticPanel from "./SemanticPanel";
+import LogsPanel from "./LogsPanel";
 
 interface SettingsModalProps {
   api: SearchApi;
@@ -20,7 +21,7 @@ export default function SettingsModal({
   refreshSemanticReady,
   onSettingsUpdate,
 }: SettingsModalProps) {
-  const [activeTab, setActiveTab] = useState<"general" | "semantic">("general");
+  const [activeTab, setActiveTab] = useState<"general" | "semantic" | "logs">("general");
   const [settings, setSettings] = useState<Settings | null>(null);
 
   useEffect(() => {
@@ -79,6 +80,16 @@ export default function SettingsModal({
               }`}
             >
               Semantic Search
+            </button>
+            <button
+              onClick={() => setActiveTab("logs")}
+              className={`px-3 py-1.5 rounded-lg text-sm text-left transition-colors ${
+                activeTab === "logs"
+                  ? "bg-[var(--bg-active)] text-[var(--text-main)]"
+                  : "text-[var(--text-muted)] hover:bg-[var(--bg-active)]/50 hover:text-[var(--text-main)]"
+              }`}
+            >
+              Logs
             </button>
           </div>
 
@@ -157,6 +168,10 @@ export default function SettingsModal({
                 directory={directory}
                 refreshSemanticReady={refreshSemanticReady}
               />
+            )}
+
+            {activeTab === "logs" && (
+              <LogsPanel api={api} />
             )}
           </div>
         </div>

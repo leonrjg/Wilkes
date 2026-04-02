@@ -204,10 +204,6 @@ impl<'m> Sink for CollectSink<'m> {
         let line = mat.bytes();
         let line_num = mat.line_number().unwrap_or(0) as u32;
         let base_offset = mat.absolute_byte_offset() as usize;
-        let line_text = std::str::from_utf8(line)
-            .unwrap_or("")
-            .trim_end_matches(['\n', '\r'])
-            .to_string();
 
         // Collect all matches within this line without holding self borrow.
         let mut line_matches: Vec<Match> = Vec::new();
@@ -218,14 +214,21 @@ impl<'m> Sink for CollectSink<'m> {
                 let end = m.end();
                 let matched_text =
                     String::from_utf8_lossy(&line[start..end]).into_owned();
+                let context_before =
+                    String::from_utf8_lossy(&line[..start]).into_owned();
+                let context_after =
+                    String::from_utf8_lossy(&line[end..])
+                        .trim_end_matches(['\n', '\r'])
+                        .to_owned();
+
                 line_matches.push(Match {
                     text_range: Some(ByteRange {
                         start: base_offset + start,
                         end: base_offset + end,
                     }),
                     matched_text,
-                    context_before: String::new(),
-                    context_after: line_text.clone(),
+                    context_before,
+                    context_after,
                     origin: SourceOrigin::TextFile {
                         line: line_num,
                         col: start as u32,

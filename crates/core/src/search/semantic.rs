@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use tracing::{error, info};
 use crate::extract::ExtractorRegistry;
 use crate::types::{FileMatches, FileType, Match, SearchCapabilities, SearchQuery, SourceOrigin};
 
@@ -29,10 +30,10 @@ impl SearchProvider for SemanticSearchProvider {
         tx: SearchResultTx,
     ) -> anyhow::Result<Vec<String>> {
         // 1. Embed the query string.
-        eprintln!("[semantic] embedding query...");
+        info!("[semantic] embedding query...");
         let query_vecs = self.embedder.embed_query(&[query.pattern.as_str()])
-            .map_err(|e| { eprintln!("[semantic] embed error: {e:#}"); e })?;
-        eprintln!("[semantic] query embedded, running index query");
+            .map_err(|e| { error!("[semantic] embed error: {e:#}"); e })?;
+        info!("[semantic] query embedded, running index query");
         let query_vec = query_vecs
             .into_iter()
             .next()

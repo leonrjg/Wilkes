@@ -223,7 +223,7 @@ export default function App() {
   ) : null;
 
   return (
-    <div className="flex flex-col h-screen bg-[var(--bg-app)] text-[var(--text-main)] select-none">
+    <div className="flex flex-col h-screen bg-[var(--bg-app)] text-[var(--text-main)]">
       <SearchBar
         onSearch={handleSearch}
         searching={searching}

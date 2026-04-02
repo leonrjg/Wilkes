@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
+use tracing::{error, info};
 use wilkes_core::types::{MatchRef, SearchQuery, SearchStats};
 
 const MAX_UPLOAD_BYTES: u64 = 500 * 1024 * 1024; // 500 MB
@@ -56,7 +57,7 @@ async fn search_handler(
             let data = match serde_json::to_string(&fm) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("search serialize error: {e}");
+                    error!("search serialize error: {e}");
                     continue;
                 }
             };
@@ -92,6 +93,15 @@ async fn preview_handler(
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
+
+async fn get_logs_handler() -> impl IntoResponse {
+    Json(wilkes_api::commands::logs::get_logs())
+}
+
+async fn clear_logs_handler() -> StatusCode {
+    wilkes_api::commands::logs::clear_logs();
+    StatusCode::NO_CONTENT
+}
 
 async fn get_settings_handler(
     State(state): State<Arc<AppState>>,
@@ -403,6 +413,7 @@ fn parse_config() -> Config {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    wilkes_core::logging::init_logging();
     let config = parse_config();
 
     let uploads_dir = config.data_dir.join("uploads");
@@ -423,6 +434,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/preview", post(preview_handler))
         .route("/api/settings", get(get_settings_handler))
         .route("/api/settings", patch(update_settings_handler))
+        .route("/api/logs", get(get_logs_handler))
+        .route("/api/logs", delete(clear_logs_handler))
         .route("/api/files", get(list_files_handler))
         .route("/api/file", post(open_file_handler))
         .route("/api/upload", post(upload_handler))
@@ -437,7 +450,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", config.port);
-    println!("wilkes-server listening on {addr}");
+    info!("wilkes-server listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
 

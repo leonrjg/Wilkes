@@ -34,6 +34,12 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   const [models, setModels] = useState<ModelDescriptor[]>([]);
   const [modelFilter, setModelFilter] = useState("");
   const [sizeFetchingFor, setSizeFetchingFor] = useState<string | null>(null);
+  const [customModelInput, setCustomModelInput] = useState("");
+  const [isAddingCustom, setIsAddingCustom] = useState(false);
+
+  const supportsCustomModels = useCallback((engine: EmbeddingEngine) => {
+    return engine === "Candle";
+  }, []);
 
   const refreshState = useCallback(async () => {
     try {
@@ -42,9 +48,29 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       setSettings(sem);
 
       const descriptors = await api.listModels(sem.engine);
-      setModels(descriptors);
+      
+      // Merge custom models from settings
+      const customDescriptors: ModelDescriptor[] = (sem.custom_models || []).map(id => ({
+        model_id: id,
+        display_name: id.split('/').pop() || id,
+        description: "User-defined HuggingFace model",
+        dimension: 0, // Unknown until downloaded
+        is_cached: false, // Will be checked by backend if needed, or we can probe it
+        size_bytes: null,
+        preferred_batch_size: 32,
+      }));
 
-      const selected = descriptors.find((m) => m.model_id === sem.model);
+      // Avoid duplicates if a custom model is already in the built-in list
+      const allModels = [...descriptors];
+      for (const custom of customDescriptors) {
+        if (!allModels.find(m => m.model_id === custom.model_id)) {
+          allModels.push(custom);
+        }
+      }
+
+      setModels(allModels);
+
+      const selected = allModels.find((m) => m.model_id === sem.model);
       
       // Check if there is an existing index
       try {
@@ -71,6 +97,36 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       console.error("refreshState failed:", e);
     }
   }, [api]);
+
+  const handleAddCustomModel = async () => {
+    if (!settings || !customModelInput.trim()) return;
+    const modelId = customModelInput.trim();
+    
+    // Simple validation: should look like "org/repo"
+    if (!modelId.includes('/')) {
+      setError("Please enter a valid HuggingFace repository ID (e.g., org/model)");
+      return;
+    }
+
+    if (settings.custom_models.includes(modelId)) {
+      setError("Model already added");
+      return;
+    }
+
+    const next = { 
+      ...settings, 
+      custom_models: [...(settings.custom_models || []), modelId],
+      model: modelId // Select it immediately
+    };
+    
+    setSettings(next);
+    setCustomModelInput("");
+    setIsAddingCustom(false);
+    setError(null);
+
+    await api.updateSettings({ semantic: next });
+    await refreshState();
+  };
 
   useEffect(() => {
     refreshState();
@@ -260,14 +316,53 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
         </div>
         
         <div className="flex flex-col gap-2">
-          <input
-            type="text"
-            placeholder="Search models…"
-            value={modelFilter}
-            onChange={(e) => setModelFilter(e.target.value)}
-            disabled={isActive}
-            className="text-xs bg-[var(--bg-input)] border border-[var(--border-main)] rounded-lg px-2.5 py-1.5 text-[var(--text-main)] placeholder-[var(--text-dim)] focus:outline-none focus:border-[var(--accent-blue)] disabled:opacity-50 transition-colors"
-          />
+          <div className="flex gap-2">
+            <input
+              type="text"
+              placeholder="Search models…"
+              value={modelFilter}
+              onChange={(e) => setModelFilter(e.target.value)}
+              disabled={isActive}
+              className="flex-1 text-xs bg-[var(--bg-input)] border border-[var(--border-main)] rounded-lg px-2.5 py-1.5 text-[var(--text-main)] placeholder-[var(--text-dim)] focus:outline-none focus:border-[var(--accent-blue)] disabled:opacity-50 transition-colors"
+            />
+            {settings && supportsCustomModels(settings.engine) && (
+              <button
+                type="button"
+                onClick={() => setIsAddingCustom(!isAddingCustom)}
+                className={`px-2 py-1.5 rounded-lg border text-[10px] font-medium transition-all ${
+                  isAddingCustom 
+                    ? "bg-[var(--accent-blue)] text-white border-[var(--accent-blue)]" 
+                    : "bg-[var(--bg-active)] text-[var(--text-muted)] border-[var(--border-main)] hover:text-[var(--text-main)]"
+                }`}
+              >
+                {isAddingCustom ? "Cancel" : "Add Custom"}
+              </button>
+            )}
+          </div>
+
+          {isAddingCustom && (
+            <div className="flex flex-col gap-2 p-2 bg-[var(--bg-active)] rounded-lg border border-[var(--accent-blue)]/30 animate-in fade-in slide-in-from-top-1">
+              <p className="text-[10px] text-[var(--text-dim)]">Enter HuggingFace Repository ID:</p>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  placeholder="e.g. org/repo-name"
+                  value={customModelInput}
+                  onChange={(e) => setCustomModelInput(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleAddCustomModel()}
+                  className="flex-1 text-[11px] bg-[var(--bg-app)] border border-[var(--border-main)] rounded px-2 py-1 text-[var(--text-main)] placeholder-[var(--text-dim)] focus:outline-none focus:border-[var(--accent-blue)]"
+                  autoFocus
+                />
+                <button
+                  type="button"
+                  onClick={handleAddCustomModel}
+                  className="px-3 py-1 bg-[var(--accent-blue)] text-white text-[10px] font-semibold rounded hover:bg-[var(--accent-blue-hover)]"
+                >
+                  Add
+                </button>
+              </div>
+            </div>
+          )}
 
           <div className="flex flex-col gap-1 max-h-40 overflow-y-auto pr-1 custom-scrollbar">
             {filteredModels.length === 0 && (
@@ -314,6 +409,54 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
             })}
           </div>
         </div>
+      </section>
+
+      {/* Chunking */}
+      <section>
+        <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Chunking</h3>
+        <div className="flex gap-3">
+          <label className="flex flex-col gap-1 flex-1">
+            <span className="text-[10px] text-[var(--text-muted)]">Chunk size (chars)</span>
+            <input
+              type="number"
+              min={100}
+              max={10000}
+              step={100}
+              disabled={isActive}
+              value={settings?.chunk_size ?? 1200}
+              onChange={async (e) => {
+                if (!settings) return;
+                const val = Number(e.target.value);
+                if (!Number.isFinite(val) || val < 100) return;
+                const next = { ...settings, chunk_size: val };
+                setSettings(next);
+                await api.updateSettings({ semantic: next });
+              }}
+              className="text-xs bg-[var(--bg-input)] border border-[var(--border-main)] rounded-lg px-2.5 py-1.5 text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] disabled:opacity-50 transition-colors"
+            />
+          </label>
+          <label className="flex flex-col gap-1 flex-1">
+            <span className="text-[10px] text-[var(--text-muted)]">Overlap (chars)</span>
+            <input
+              type="number"
+              min={0}
+              max={5000}
+              step={50}
+              disabled={isActive}
+              value={settings?.chunk_overlap ?? 200}
+              onChange={async (e) => {
+                if (!settings) return;
+                const val = Number(e.target.value);
+                if (!Number.isFinite(val) || val < 0) return;
+                const next = { ...settings, chunk_overlap: val };
+                setSettings(next);
+                await api.updateSettings({ semantic: next });
+              }}
+              className="text-xs bg-[var(--bg-input)] border border-[var(--border-main)] rounded-lg px-2.5 py-1.5 text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] disabled:opacity-50 transition-colors"
+            />
+          </label>
+        </div>
+        <p className="text-[10px] text-[var(--text-dim)] mt-1.5 px-1">Rebuild the index for changes to take effect.</p>
       </section>
 
       {/* Action Area */}

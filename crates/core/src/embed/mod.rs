@@ -4,6 +4,7 @@ pub mod downloader;
 pub mod index;
 pub mod installer;
 pub mod watcher;
+pub mod worker_ipc;
 
 #[cfg(feature = "fastembed")]
 pub mod fastembed;

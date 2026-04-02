@@ -1,1 +1,4 @@
 - Do not modify aspects that were not requested explicitly, e.g. no UI redesign of existing elements.
+- Do as told concisely and atomically; no extras.
+- Perform surgical edits only: use the `replace` tool. The `write_file` tool for complete rewrites is not allowed under any circumstances.
+- Perform refactors using multiple small, sequential replace calls rather than one large block replacement.

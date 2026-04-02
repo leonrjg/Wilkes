@@ -228,7 +228,7 @@ function PdfViewer({
   return (
     <div className="h-full relative">
       {/* Zoom controls */}
-      <div className="absolute bottom-3 right-3 z-20 flex items-center gap-1 bg-[var(--bg-active)] border border-[var(--border-main)] rounded px-2 py-1 text-xs text-[var(--text-main)] select-none">
+      <div className="absolute bottom-3 right-3 z-20 flex items-center gap-1 bg-[var(--bg-active)] border border-[var(--border-main)] rounded px-2 py-1 text-xs text-[var(--text-main)]">
         <button
           onClick={() => setZoom((z) => Math.max(0.25, +(z - 0.25).toFixed(2)))}
           className="px-1 hover:text-[var(--accent-blue)]"

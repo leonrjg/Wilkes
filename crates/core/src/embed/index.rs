@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use rusqlite::{Connection, params};
+use tracing::error;
 
 use crate::extract::ExtractorRegistry;
 use crate::types::{ByteRange, EmbeddingEngine, IndexStatus, SourceOrigin};
@@ -111,6 +112,11 @@ impl SemanticIndex {
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
+        // Remove orphaned WAL/SHM files left by a previous unclean shutdown.
+        // If the main DB was deleted but these remain, SQLite will try to replay
+        // them into the new database and fail with a disk I/O error.
+        let _ = std::fs::remove_file(data_dir.join("semantic_index.db-wal"));
+        let _ = std::fs::remove_file(data_dir.join("semantic_index.db-shm"));
 
         let conn = Connection::open(&path)
             .with_context(|| format!("Failed to create index at {}", path.display()))?;
@@ -142,6 +148,8 @@ impl SemanticIndex {
         embedder: &dyn Embedder,
         engine: EmbeddingEngine,
         tx: ProgressTx,
+        chunk_size: usize,
+        chunk_overlap: usize,
     ) -> anyhow::Result<Self> {
         let start_time = std::time::Instant::now();
         let total_files = paths.len();
@@ -157,50 +165,34 @@ impl SemanticIndex {
                 done: false,
             }));
 
-            match Self::extract_chunks(path, extractors) {
+            match Self::extract_chunks(path, extractors, chunk_size, chunk_overlap) {
                 Ok(chunks) if !chunks.is_empty() => file_chunks.push((path.clone(), chunks)),
                 _ => {}
             }
         }
 
-        // Phase 2: embed all chunks in one batch (30% to 70% progress).
-        let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
-            files_processed: total_files / 3, // Approximation
-            total_files,
-            message: "Generating embeddings (this may take a while)...".to_string(),
-            done: false,
-        }));
-
-        let all_embeddings = {
-            let all_texts: Vec<&str> = file_chunks
-                .iter()
-                .flat_map(|(_, chunks)| chunks.iter().map(|c| c.text.as_str()))
-                .collect();
-            if all_texts.is_empty() {
-                vec![]
-            } else {
-                embedder.embed_passages(&all_texts)?
-            }
-        };
-
-        // Phase 3: pair embeddings back with their chunks and write (70% to 100% progress).
-        let mut emb_iter = all_embeddings.into_iter();
+        // Phase 2: embed and write per file to bound peak memory usage.
+        // Embedding all files at once would hold all chunk texts + all embedding
+        // vectors in memory simultaneously; per-file processing keeps peak at
+        // (one file's chunks + embeddings) on top of the model weights.
         let total_extracted = file_chunks.len();
         for (i, (path, chunks)) in file_chunks.into_iter().enumerate() {
             let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
-                files_processed: (total_files * 2 / 3) + (i * total_files / (3 * total_extracted.max(1))),
+                files_processed: total_files / 3 + (i * total_files * 2 / (3 * total_extracted.max(1))),
                 total_files,
-                message: format!("Writing {} of {}...", i + 1, total_extracted),
+                message: format!("Embedding {} of {}...", i + 1, total_extracted),
                 done: false,
             }));
 
-            let n = chunks.len();
+            let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+            let embeddings = embedder.embed_passages(&texts)?;
+
             let prepared = PreparedFile {
                 path: path.clone(),
-                chunks: chunks.into_iter().zip(emb_iter.by_ref().take(n)).collect(),
+                chunks: chunks.into_iter().zip(embeddings).collect(),
             };
             if let Err(e) = idx.write_file(prepared) {
-                eprintln!("Failed to write {}: {e:#}", path.display());
+                error!("Failed to write {}: {e:#}", path.display());
             }
         }
 
@@ -264,7 +256,12 @@ impl SemanticIndex {
 
     /// Extract and chunk a file without embedding. Use this to collect chunks
     /// from many files before embedding them all in a single batch.
-    pub fn extract_chunks(path: &Path, extractors: &ExtractorRegistry) -> anyhow::Result<Vec<Chunk>> {
+    pub fn extract_chunks(
+        path: &Path,
+        extractors: &ExtractorRegistry,
+        chunk_size: usize,
+        chunk_overlap: usize,
+    ) -> anyhow::Result<Vec<Chunk>> {
         let content = match extractors.find(path, None) {
             Some(ext) => ext.extract(path)?,
             None => {
@@ -284,7 +281,7 @@ impl SemanticIndex {
                 }
             }
         };
-        Ok(chunk_content(&content, path.to_path_buf()))
+        Ok(chunk_content(&content, path.to_path_buf(), chunk_size, chunk_overlap))
     }
 
     /// Extract, chunk, and embed a file without holding the index lock.
@@ -292,8 +289,10 @@ impl SemanticIndex {
         path: &Path,
         extractors: &ExtractorRegistry,
         embedder: &dyn Embedder,
+        chunk_size: usize,
+        chunk_overlap: usize,
     ) -> anyhow::Result<PreparedFile> {
-        let raw_chunks = Self::extract_chunks(path, extractors)?;
+        let raw_chunks = Self::extract_chunks(path, extractors, chunk_size, chunk_overlap)?;
         if raw_chunks.is_empty() {
             return Ok(PreparedFile { path: path.to_path_buf(), chunks: Vec::new() });
         }
@@ -353,8 +352,10 @@ impl SemanticIndex {
         path: &Path,
         extractors: &ExtractorRegistry,
         embedder: &dyn Embedder,
+        chunk_size: usize,
+        chunk_overlap: usize,
     ) -> anyhow::Result<()> {
-        let prepared = Self::prepare_file(path, extractors, embedder)?;
+        let prepared = Self::prepare_file(path, extractors, embedder, chunk_size, chunk_overlap)?;
         self.write_file(prepared)
     }
 

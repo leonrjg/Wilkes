@@ -30,6 +30,8 @@ pub async fn build_index(
     engine: wilkes_core::types::EmbeddingEngine,
     data_dir: PathBuf,
     tx: ProgressTx,
+    chunk_size: usize,
+    chunk_overlap: usize,
 ) -> anyhow::Result<Arc<dyn Embedder>> {
     let embedder: Arc<dyn Embedder> = installer.build(&data_dir)?;
     let embedder_clone = Arc::clone(&embedder);
@@ -56,6 +58,8 @@ pub async fn build_index(
             embedder_clone.as_ref(),
             engine,
             tx,
+            chunk_size,
+            chunk_overlap,
         )?;
         anyhow::Ok(())
     })

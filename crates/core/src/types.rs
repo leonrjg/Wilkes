@@ -142,6 +142,7 @@ pub struct FileMetadata {
 pub struct MatchRef {
     pub path: PathBuf,
     pub origin: SourceOrigin,
+    pub text_range: Option<ByteRange>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -227,6 +228,13 @@ impl EmbeddingEngine {
             EmbeddingEngine::Fastembed => "fastembed",
         }
     }
+
+    pub fn supports_custom_models(&self) -> bool {
+        match self {
+            EmbeddingEngine::Candle => true,
+            EmbeddingEngine::Fastembed => false,
+        }
+    }
 }
 
 // ── Semantic settings ─────────────────────────────────────────────────────────
@@ -239,6 +247,20 @@ pub struct SemanticSettings {
     #[serde(default)]
     pub model: EmbedderModel,
     pub index_path: Option<PathBuf>,
+    /// List of arbitrary HuggingFace IDs manually added by the user.
+    #[serde(default)]
+    pub custom_models: Vec<String>,
+    /// Target characters per chunk (~1200 ≈ 256 tokens).
+    #[serde(default = "SemanticSettings::default_chunk_size")]
+    pub chunk_size: usize,
+    /// Overlap between adjacent chunks in characters.
+    #[serde(default = "SemanticSettings::default_chunk_overlap")]
+    pub chunk_overlap: usize,
+}
+
+impl SemanticSettings {
+    fn default_chunk_size() -> usize { 1200 }
+    fn default_chunk_overlap() -> usize { 200 }
 }
 
 impl Default for SemanticSettings {
@@ -248,6 +270,9 @@ impl Default for SemanticSettings {
             engine: EmbeddingEngine::default(),
             model: EmbedderModel("BAAI/bge-base-en-v1.5".to_string()),
             index_path: None,
+            custom_models: Vec::new(),
+            chunk_size: Self::default_chunk_size(),
+            chunk_overlap: Self::default_chunk_overlap(),
         }
     }
 }

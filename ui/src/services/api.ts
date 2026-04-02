@@ -29,6 +29,8 @@ export interface SearchApi {
   listFiles(root: string): Promise<FileEntry[]>;
   openFile(path: string): Promise<PreviewData>;
   resolvePdfUrl(path: string): string;
+  getLogs(): Promise<string[]>;
+  clearLogs(): Promise<void>;
 
   // ── Semantic / embed commands ──────────────────────────────────────────────
   listModels(engine: EmbeddingEngine): Promise<ModelDescriptor[]>;

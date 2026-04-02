@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import type { FileEntry, FileMatches, Match, MatchRef, SearchStats, SourceOrigin } from "../lib/types";
+import { FileMatches, Match, MatchRef, SourceOrigin, FileEntry, SearchStats } from "../lib/types";
 
 const COLLAPSED_LIMIT = 5;
 
@@ -17,7 +17,7 @@ interface Props {
 
 // Flatten the results tree into a list of rows for the virtualizer.
 type Row =
-  | { kind: "file"; fileMatches: FileMatches; fileIndex: number }
+  | { kind: "file"; fileMatches: FileMatches; fileIndex: number; path: string }
   | { kind: "match"; match: Match; path: string; matchIndex: number; fileIndex: number }
   | { kind: "expand"; fileIndex: number; totalMatches: number };
 
@@ -25,10 +25,11 @@ function buildRows(results: FileMatches[], expandedFiles: Set<number>): Row[] {
   const rows: Row[] = [];
   for (let fi = 0; fi < results.length; fi++) {
     const fm = results[fi];
-    rows.push({ kind: "file", fileMatches: fm, fileIndex: fi });
+    rows.push({ kind: "file", fileMatches: fm, fileIndex: fi, path: fm.path });
     const isExpanded = expandedFiles.has(fi);
-    const limit = isExpanded ? fm.matches.length : Math.min(COLLAPSED_LIMIT, fm.matches.length);
-    for (let mi = 0; mi < limit; mi++) {
+    const limit = isExpanded ? fm.matches.length : COLLAPSED_LIMIT;
+
+    for (let mi = 0; mi < Math.min(fm.matches.length, limit); mi++) {
       rows.push({
         kind: "match",
         match: fm.matches[mi],
@@ -50,14 +51,16 @@ function originLabel(origin: SourceOrigin): string {
   return "";
 }
 
-function highlightMatch(line: string, matchedText: string): React.ReactNode {
-  const idx = line.indexOf(matchedText);
-  if (idx === -1) return <span>{line}</span>;
+function highlightMatch(contextBefore: string, matchedText: string, contextAfter: string): React.ReactNode {
+  // If contexts are empty, it's a semantic chunk — show it muted without the yellow highlight.
+  if (!contextBefore && !contextAfter) {
+    return <span className="text-[var(--text-muted)]">{matchedText}</span>;
+  }
   return (
     <>
-      <span className="text-[var(--text-muted)]">{line.slice(0, idx)}</span>
+      <span className="text-[var(--text-muted)]">{contextBefore}</span>
       <mark className="match-highlight text-[var(--text-main)] bg-transparent">{matchedText}</mark>
-      <span className="text-[var(--text-muted)]">{line.slice(idx + matchedText.length)}</span>
+      <span className="text-[var(--text-muted)]">{contextAfter}</span>
     </>
   );
 }
@@ -72,18 +75,21 @@ function dirName(path: string): string {
   return parts.join("/");
 }
 
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function isSelected(row: Row, selectedMatch: MatchRef | null): boolean {
   if (!selectedMatch || row.kind !== "match") return false;
   if (row.path !== selectedMatch.path) return false;
-  const origin = row.match.origin;
-  const sel = selectedMatch.origin;
-  if ("TextFile" in origin && "TextFile" in sel) {
-    return origin.TextFile.line === sel.TextFile.line;
-  }
-  if ("PdfPage" in origin && "PdfPage" in sel) {
-    return origin.PdfPage.page === sel.PdfPage.page;
-  }
-  return false;
+  
+  // Use stringification for structural equality of origin and text_range
+  return (
+    JSON.stringify(row.match.origin) === JSON.stringify(selectedMatch.origin) &&
+    JSON.stringify(row.match.text_range) === JSON.stringify(selectedMatch.text_range)
+  );
 }
 
 export default function ResultList({
@@ -105,16 +111,20 @@ export default function ResultList({
 
   const rows = buildRows(results, expandedFiles);
 
-  function expandFile(fileIndex: number) {
-    setExpandedFiles((prev) => new Set([...prev, fileIndex]));
-  }
-
   const rowVirtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: (i) => (rows[i].kind === "file" ? 36 : rows[i].kind === "match" ? 60 : 28),
-    overscan: 10,
+    estimateSize: (index) => (rows[index].kind === "file" ? 40 : 28),
+    overscan: 20,
   });
+
+  const expandFile = (fileIndex: number) => {
+    setExpandedFiles((prev) => {
+      const next = new Set(prev);
+      next.add(fileIndex);
+      return next;
+    });
+  };
 
   const totalCount = results.reduce((n, fm) => n + fm.matches.length, 0);
 
@@ -155,8 +165,7 @@ export default function ResultList({
           </span>
         )}
       </div>
-    ...
-      {/* Virtual list */}
+
       <div ref={parentRef} className="flex-1 overflow-y-auto">
         {rows.length === 0 && !searching && (
           <div className="text-[var(--text-dim)] text-sm p-4 text-center">
@@ -164,59 +173,76 @@ export default function ResultList({
           </div>
         )}
 
-
         <div
-          style={{ height: `${rowVirtualizer.getTotalSize()}px`, position: "relative" }}
+          style={{
+            height: `${rowVirtualizer.getTotalSize()}px`,
+            width: "100%",
+            position: "relative",
+          }}
         >
-          {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-            const row = rows[virtualRow.index];
-            return (
-              <div
-                key={virtualRow.key}
-                style={{
-                  position: "absolute",
-                  top: 0,
-                  left: 0,
-                  width: "100%",
-                  transform: `translateY(${virtualRow.start}px)`,
-                  height: `${virtualRow.size}px`,
-                }}
-              >
-                {row.kind === "file" ? (
-                  <FileHeader fm={row.fileMatches} />
-                ) : row.kind === "expand" ? (
-                  <ExpandStrip
-                    remaining={row.totalMatches - COLLAPSED_LIMIT}
-                    onExpand={() => expandFile(row.fileIndex)}
-                  />
-                ) : (
-                  <MatchRow
-                    match={row.match}
-                    path={row.path}
-                    selected={isSelected(row, selectedMatch)}
-                    onClick={() =>
-                      onMatchClick({ path: row.path, origin: row.match.origin })
-                    }
-                  />
-                )}
-              </div>
-            );
-          })}
+          <div
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              width: "100%",
+              transform: `translateY(${rowVirtualizer.getVirtualItems()[0]?.start ?? 0}px)`,
+            }}
+          >
+            {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+              const row = rows[virtualRow.index];
+              return (
+                <div
+                  key={virtualRow.key}
+                  data-index={virtualRow.index}
+                  ref={rowVirtualizer.measureElement}
+                >
+                  {row.kind === "file" ? (
+                    <FileHeader
+                      path={row.path}
+                      count={row.fileMatches.matches.length}
+                      onClick={() => onFileClick(row.path)}
+                    />
+                  ) : row.kind === "expand" ? (
+                    <ExpandStrip
+                      remaining={row.totalMatches - COLLAPSED_LIMIT}
+                      onExpand={() => expandFile(row.fileIndex)}
+                    />
+                  ) : (
+                    <MatchRow
+                      match={row.match}
+                      path={row.path}
+                      selected={isSelected(row, selectedMatch)}
+                      onClick={() =>
+                        onMatchClick({ 
+                          path: row.path, 
+                          origin: row.match.origin,
+                          text_range: row.match.text_range ?? undefined
+                        })
+                      }
+                    />
+                  )}
+                </div>
+              );
+            })}
+          </div>
         </div>
       </div>
     </div>
   );
 }
 
-function FileHeader({ fm }: { fm: FileMatches }) {
+function FileHeader({ path, count, onClick }: { path: string; count: number; onClick: () => void }) {
   return (
-    <div className="flex items-baseline gap-2 px-3 py-1.5 bg-[var(--bg-header)] border-b border-[var(--border-main)] selectable">
-      <span className="text-sm font-medium text-[var(--text-main)] truncate">
-        {fileName(fm.path)}
+    <div className="flex items-center gap-2 px-3 py-2 bg-[var(--bg-sidebar)] border-y border-[var(--border-main)] cursor-pointer hover:bg-[var(--bg-hover)] transition-colors" onClick={onClick}>
+      <span className="text-xs font-semibold text-[var(--text-main)] truncate">
+        {fileName(path)}
       </span>
-      <span className="text-xs text-[var(--text-muted)] truncate flex-1">{dirName(fm.path)}</span>
-      <span className="text-xs text-[var(--text-muted)] flex-shrink-0">
-        {fm.matches.length} {fm.matches.length === 1 ? "match" : "matches"}
+      <span className="text-[10px] text-[var(--text-muted)] bg-[var(--bg-active)] px-1.5 py-0.5 rounded-full">
+        {count}
+      </span>
+      <span className="text-[10px] text-[var(--text-dim)] truncate">
+        {path}
       </span>
     </div>
   );
@@ -226,20 +252,11 @@ function ExpandStrip({ remaining, onExpand }: { remaining: number; onExpand: () 
   return (
     <button
       onClick={onExpand}
-      className="w-full flex items-center gap-2 px-3 py-1 text-left hover:bg-[var(--bg-hover)] transition-colors text-xs text-[var(--text-muted)] hover:text-[var(--text-main)]"
+      className="w-full py-1 text-[10px] text-[var(--accent-blue)] hover:bg-[var(--accent-blue-muted)] transition-colors border-b border-[var(--border-main)]"
     >
-      <span className="w-10 flex-shrink-0" />
-      <span>
-        Show {remaining} more {remaining === 1 ? "match" : "matches"}
-      </span>
+      Show {remaining} more matches...
     </button>
   );
-}
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function FileEntryRow({
@@ -298,8 +315,9 @@ function MatchRow({
       )}
       <span className="text-xs line-clamp-3 flex-1 font-mono break-all">
         {highlightMatch(
-          match.context_before + match.matched_text + match.context_after,
+          match.context_before,
           match.matched_text,
+          match.context_after
         )}
       </span>
     </button>

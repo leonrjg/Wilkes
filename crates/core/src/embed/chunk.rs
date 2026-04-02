@@ -18,19 +18,23 @@ pub struct Chunk {
 
 // ── Chunker ───────────────────────────────────────────────────────────────────
 
-/// Target ~256 tokens (≈ 1200 chars) per chunk with 200-char overlap.
-const WINDOW_CHARS: usize = 1200;
-const OVERLAP_CHARS: usize = 200;
-
 /// Split `content` into overlapping chunks, resolving each chunk's `SourceOrigin`
 /// from the embedded `SourceMap`.
-pub fn chunk_content(content: &ExtractedContent, file_path: PathBuf) -> Vec<Chunk> {
+///
+/// `window_chars` is the target chunk size in characters (~256 tokens at 1200).
+/// `overlap_chars` is the overlap between adjacent chunks.
+pub fn chunk_content(
+    content: &ExtractedContent,
+    file_path: PathBuf,
+    window_chars: usize,
+    overlap_chars: usize,
+) -> Vec<Chunk> {
     if content.text.is_empty() {
         return Vec::new();
     }
 
-    let config = ChunkConfig::new(WINDOW_CHARS)
-        .with_overlap(OVERLAP_CHARS)
+    let config = ChunkConfig::new(window_chars)
+        .with_overlap(overlap_chars)
         .expect("overlap must be smaller than chunk size");
     let splitter = TextSplitter::new(config);
 

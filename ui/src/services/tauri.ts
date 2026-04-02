@@ -76,6 +76,14 @@ export class TauriSearchApi implements SearchApi {
     return convertFileSrc(path);
   }
 
+  async getLogs(): Promise<string[]> {
+    return invoke<string[]>("get_logs");
+  }
+
+  async clearLogs(): Promise<void> {
+    return invoke("clear_logs");
+  }
+
   // ── Semantic / embed commands ──────────────────────────────────────────────
 
   async listModels(engine: EmbeddingEngine): Promise<ModelDescriptor[]> {

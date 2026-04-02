@@ -50,6 +50,7 @@ export interface FileMatches {
 export interface MatchRef {
   path: string;
   origin: SourceOrigin;
+  text_range?: ByteRange;
 }
 
 export interface BoundingBox {
@@ -95,6 +96,7 @@ export interface ModelDescriptor {
   is_cached: boolean;
   /** Total bytes of all model files. Null for uncached models until fetched. */
   size_bytes: number | null;
+  preferred_batch_size: number | null;
 }
 
 export interface SemanticSettings {
@@ -102,6 +104,9 @@ export interface SemanticSettings {
   engine: EmbeddingEngine;
   model: EmbedderModel;
   index_path: string | null;
+  custom_models: string[];
+  chunk_size: number;
+  chunk_overlap: number;
 }
 
 export interface Settings {

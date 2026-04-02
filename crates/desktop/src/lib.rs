@@ -3,13 +3,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tauri::{AppHandle, Emitter, Manager};
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 use wilkes_core::embed::Embedder;
 use wilkes_core::embed::dispatch;
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::installer::EmbedProgress;
 use wilkes_core::embed::watcher::IndexWatcher;
+use wilkes_core::embed::worker_ipc::{WorkerEvent, WorkerRequest};
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::types::{
     EmbedderModel, EmbeddingEngine, FileEntry, IndexStatus, MatchRef, ModelDescriptor, SearchMode, SearchQuery,
@@ -272,71 +276,150 @@ async fn download_model(model: EmbedderModel, engine: EmbeddingEngine, app: AppH
 
 /// Build the semantic index for `root` using `model`.
 /// Emits `embed-progress`, `embed-done`, or `embed-error`.
+///
+/// The actual embedding work runs in a separate `wilkes-worker` process so that
+/// a crash inside the embedder (OOM, Metal/ONNX driver fault, etc.) cannot kill
+/// the Tauri UI. On success the worker exits, then the desktop reopens the index
+/// and starts the watcher in-process as before.
+///
+/// The worker binary must sit next to the desktop binary at runtime. During
+/// development `cargo build -p wilkes-worker` places it in the same target
+/// directory. For bundled distributions list it as a Tauri sidecar in
+/// `tauri.conf.json` under `bundle.externalBin`.
 #[tauri::command]
 async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine, app: AppHandle) -> Result<(), String> {
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let settings_path = desktop_settings_path().map_err(|e| e.to_string())?;
+    let current_settings = wilkes_api::commands::settings::get_settings(&settings_path).await
+        .unwrap_or_default();
+    let chunk_size = current_settings.semantic.chunk_size;
+    let chunk_overlap = current_settings.semantic.chunk_overlap;
 
-    // Stop the active watcher before rebuilding (a watcher event against a
-    // half-written index during rebuild would corrupt it).
+    // Stop the active watcher before rebuilding.
     stop_watcher(&app);
 
-    let cancel = CancellationToken::new();
-    let cancel_for_select = cancel.clone();
+    // Resolve the worker binary: same directory as the running executable.
+    let worker_bin = std::env::current_exe()
+        .map_err(|e| format!("Cannot resolve current exe: {e}"))?
+        .with_file_name("wilkes-worker");
 
-    let installer = dispatch::get_installer(engine, model.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<EmbedProgress>(64);
+    let request = WorkerRequest {
+        root: root.into(),
+        engine,
+        model: model.clone(),
+        data_dir: data_dir.clone(),
+        chunk_size,
+        chunk_overlap,
+    };
+    let request_json = serde_json::to_string(&request)
+        .map_err(|e| format!("Failed to serialise worker request: {e}"))?;
+
+    let mut child = tokio::process::Command::new(&worker_bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn wilkes-worker ({worker_bin:?}): {e}"))?;
+
+    // Send the config and close stdin so the worker can proceed.
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(request_json.as_bytes()).await
+            .map_err(|e| format!("Failed to write worker config: {e}"))?;
+        stdin.write_all(b"\n").await
+            .map_err(|e| format!("Failed to write worker config newline: {e}"))?;
+    }
+
+    let stdout = child.stdout.take().expect("stdout was piped");
+
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
 
     let app_clone = app.clone();
-    let installer_clone = Arc::clone(&installer);
     let data_dir_clone = data_dir.clone();
-    let root_path: std::path::PathBuf = root.into();
+    let root_path = request.root.clone();
 
     let join: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-        let forward_app = app_clone.clone();
-        let forward_handle = tokio::spawn(async move {
-            while let Some(progress) = rx.recv().await {
-                let _ = forward_app.emit("embed-progress", &progress);
+        let mut reader = BufReader::new(stdout).lines();
+        let mut final_event: Option<WorkerEvent> = None;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel_for_task.cancelled() => {
+                    child.kill().await.ok();
+                    child.wait().await.ok();
+                    let _ = std::fs::remove_file(data_dir_clone.join("semantic_index.db"));
+                    let _ = app_clone.emit("embed-error", EmbedError {
+                        operation: EmbedOperation::Build,
+                        message: String::new(), // empty = user-cancelled
+                    });
+                    return Ok(());
+                }
+                line = reader.next_line() => {
+                    match line {
+                        Ok(Some(line)) => {
+                            match serde_json::from_str::<WorkerEvent>(&line) {
+                                Ok(WorkerEvent::Progress(p)) => {
+                                    let _ = app_clone.emit("embed-progress", &p);
+                                }
+                                Ok(ev) => {
+                                    // Done or Error — no more lines expected.
+                                    final_event = Some(ev);
+                                    break;
+                                }
+                                Err(e) => {
+                                    eprintln!("[worker] Unrecognised stdout line ({e}): {line}");
+                                }
+                            }
+                        }
+                        _ => break, // EOF or read error
+                    }
+                }
             }
-        });
+        }
 
-        // Race the build against the cancel token. When cancel fires the
-        // select drops the build_index future at its next await point
-        // (the spawn_blocking await), giving an immediate response.
-        let result = tokio::select! {
-            biased;
-            _ = cancel_for_select.cancelled() => Err(anyhow::anyhow!("cancelled")),
-            result = wilkes_api::commands::embed::build_index(
-                root_path.clone(),
-                installer_clone.as_ref(),
-                engine,
-                data_dir_clone.clone(),
-                tx,
-            ) => result,
-        };
+        let exit_status = child.wait().await.ok();
 
-        // The progress forwarder can be dropped immediately; any in-flight
-        // events from the still-running background thread are irrelevant now.
-        forward_handle.abort();
+        match final_event {
+            Some(WorkerEvent::Done) => {
+                // Worker completed: reload embedder + open index in-process.
+                let installer = dispatch::get_installer(engine, model.clone());
+                let embedder = match tokio::task::spawn_blocking({
+                    let d = data_dir_clone.clone();
+                    move || installer.build(&d)
+                })
+                .await
+                {
+                    Ok(Ok(e)) => e,
+                    Ok(Err(e)) => {
+                        let _ = app_clone.emit("embed-error", EmbedError {
+                            operation: EmbedOperation::Build,
+                            message: e.to_string(),
+                        });
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let _ = app_clone.emit("embed-error", EmbedError {
+                            operation: EmbedOperation::Build,
+                            message: e.to_string(),
+                        });
+                        return Ok(());
+                    }
+                };
 
-        match result {
-            Ok(embedder) => {
-                // Store the embedder in state.
                 *app_clone.state::<ActiveEmbedderState>().0.lock().unwrap() = Some(Arc::clone(&embedder));
 
-                // Open the newly built index.
-                let open_result =
-                    tokio::task::spawn_blocking({
-                        let data_dir = data_dir_clone.clone();
-                        let emb = Arc::clone(&embedder);
-                        move || SemanticIndex::open(&data_dir, emb.as_ref())
-                    })
-                    .await;
+                let open_result = tokio::task::spawn_blocking({
+                    let d = data_dir_clone.clone();
+                    let emb = Arc::clone(&embedder);
+                    move || SemanticIndex::open(&d, emb.as_ref())
+                })
+                .await;
 
                 let open_msg = match open_result {
                     Ok(Ok(idx)) => {
                         *app_clone.state::<SemanticIndexState>().0.lock().unwrap() = Some(idx);
 
-                        // Start the watcher.
                         let index_arc = app_clone.state::<SemanticIndexState>().0.clone();
                         let mut registry = ExtractorRegistry::new();
                         registry.register(Box::new(wilkes_core::extract::pdf::PdfExtractor::new()));
@@ -346,13 +429,13 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
                             index_arc,
                             Arc::new(registry),
                             Arc::clone(&embedder),
+                            chunk_size,
+                            chunk_overlap,
                         ) {
                             Ok(watcher) => {
                                 *app_clone.state::<WatcherState>().0.lock().unwrap() = Some(watcher);
                             }
-                            Err(e) => {
-                                eprintln!("Failed to start watcher: {e:#}");
-                            }
+                            Err(e) => error!("Failed to start watcher: {e:#}"),
                         }
 
                         let db_path = data_dir_clone.join("semantic_index.db");
@@ -364,30 +447,48 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
                     Err(e) => Some(e.to_string()),
                 };
                 if let Some(msg) = open_msg {
-                    let _ = app_clone.emit(
-                        "embed-error",
-                        EmbedError {
-                            operation: EmbedOperation::Build,
-                            message: msg,
-                        },
-                    );
-                }
-            }
-            Err(e) => {
-                // Remove the partial index so a future build starts clean.
-                let _ = std::fs::remove_file(data_dir_clone.join("semantic_index.db"));
-                let msg = if e.to_string() == "cancelled" {
-                    String::new()
-                } else {
-                    e.to_string()
-                };
-                let _ = app_clone.emit(
-                    "embed-error",
-                    EmbedError {
+                    let _ = app_clone.emit("embed-error", EmbedError {
                         operation: EmbedOperation::Build,
                         message: msg,
-                    },
-                );
+                    });
+                }
+            }
+            Some(WorkerEvent::Error(msg)) => {
+                let _ = std::fs::remove_file(data_dir_clone.join("semantic_index.db"));
+                let _ = app_clone.emit("embed-error", EmbedError {
+                    operation: EmbedOperation::Build,
+                    message: msg,
+                });
+            }
+            _ => {
+                // Worker exited without sending Done or Error (ungraceful termination).
+                let _ = std::fs::remove_file(data_dir_clone.join("semantic_index.db"));
+                #[cfg(unix)]
+                let message = {
+                    use std::os::unix::process::ExitStatusExt;
+                    if exit_status.and_then(|s| s.signal()) == Some(9) {
+                        error!("[worker] killed by OS out-of-memory killer (SIGKILL)");
+                        "Worker ran out of memory. Try a smaller model or index a smaller directory.".to_string()
+                    } else {
+                        let status_info = exit_status
+                            .map(|s| format!(" (exit status: {s})"))
+                            .unwrap_or_default();
+                        error!("[worker] terminated without Done/Error{status_info}");
+                        format!("Worker process terminated unexpectedly{status_info}")
+                    }
+                };
+                #[cfg(not(unix))]
+                let message = {
+                    let status_info = exit_status
+                        .map(|s| format!(" (exit status: {s})"))
+                        .unwrap_or_default();
+                    error!("[worker] terminated without Done/Error{status_info}");
+                    format!("Worker process terminated unexpectedly{status_info}")
+                };
+                let _ = app_clone.emit("embed-error", EmbedError {
+                    operation: EmbedOperation::Build,
+                    message,
+                });
             }
         }
 
@@ -447,6 +548,17 @@ async fn delete_index(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn get_logs() -> Result<Vec<String>, String> {
+    Ok(wilkes_api::commands::logs::get_logs())
+}
+
+#[tauri::command]
+async fn clear_logs() -> Result<(), String> {
+    wilkes_api::commands::logs::clear_logs();
+    Ok(())
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn stop_watcher(app: &AppHandle) {
@@ -461,11 +573,11 @@ fn stop_watcher(app: &AppHandle) {
 async fn update_semantic_settings<F: FnOnce(SemanticSettings) -> SemanticSettings>(f: F) {
     let path = match desktop_settings_path() {
         Ok(p) => p,
-        Err(e) => { eprintln!("Failed to resolve settings path: {e:#}"); return; }
+        Err(e) => { error!("Failed to resolve settings path: {e:#}"); return; }
     };
     let current = match wilkes_api::commands::settings::get_settings(&path).await {
         Ok(s) => s,
-        Err(e) => { eprintln!("Failed to read settings for semantic update: {e:#}"); return; }
+        Err(e) => { error!("Failed to read settings for semantic update: {e:#}"); return; }
     };
     let semantic = f(current.semantic);
     if let Err(e) = wilkes_api::commands::settings::update_settings(
@@ -474,7 +586,7 @@ async fn update_semantic_settings<F: FnOnce(SemanticSettings) -> SemanticSetting
     )
     .await
     {
-        eprintln!("Failed to write semantic settings: {e:#}");
+        error!("Failed to write semantic settings: {e:#}");
     }
 }
 
@@ -485,7 +597,7 @@ async fn update_semantic_settings<F: FnOnce(SemanticSettings) -> SemanticSetting
 async fn restore_semantic_state(app: &AppHandle) {
     let data_dir = match app.path().app_data_dir() {
         Ok(d) => d,
-        Err(e) => { eprintln!("restore_semantic_state: cannot get data dir: {e:#}"); return; }
+        Err(e) => { error!("restore_semantic_state: cannot get data dir: {e:#}"); return; }
     };
     let settings_path = match desktop_settings_path() {
         Ok(p) => p,
@@ -493,7 +605,7 @@ async fn restore_semantic_state(app: &AppHandle) {
     };
     let settings = match wilkes_api::commands::settings::get_settings(&settings_path).await {
         Ok(s) => s,
-        Err(e) => { eprintln!("restore_semantic_state: cannot read settings: {e:#}"); return; }
+        Err(e) => { error!("restore_semantic_state: cannot read settings: {e:#}"); return; }
     };
 
     if !settings.semantic.enabled || settings.semantic.index_path.is_none() {
@@ -504,15 +616,15 @@ async fn restore_semantic_state(app: &AppHandle) {
     let engine = settings.semantic.engine;
     let installer = dispatch::get_installer(engine, model);
     if !installer.is_available(&data_dir) {
-        eprintln!("restore_semantic_state: model files not found, skipping restore");
+        info!("restore_semantic_state: model files not found, skipping restore");
         return;
     }
 
     let data_dir_clone = data_dir.clone();
     let embedder = match tokio::task::spawn_blocking(move || installer.build(&data_dir_clone)).await {
         Ok(Ok(e)) => e,
-        Ok(Err(e)) => { eprintln!("restore_semantic_state: build embedder failed: {e:#}"); return; }
-        Err(e) => { eprintln!("restore_semantic_state: build embedder panicked: {e}"); return; }
+        Ok(Err(e)) => { error!("restore_semantic_state: build embedder failed: {e:#}"); return; }
+        Err(e) => { error!("restore_semantic_state: build embedder panicked: {e}"); return; }
     };
     *app.state::<ActiveEmbedderState>().0.lock().unwrap() = Some(Arc::clone(&embedder));
 
@@ -520,17 +632,19 @@ async fn restore_semantic_state(app: &AppHandle) {
     let emb = Arc::clone(&embedder);
     let index = match tokio::task::spawn_blocking(move || SemanticIndex::open(&data_dir_clone, emb.as_ref())).await {
         Ok(Ok(idx)) => idx,
-        Ok(Err(e)) => { eprintln!("restore_semantic_state: open index failed: {e:#}"); return; }
-        Err(e) => { eprintln!("restore_semantic_state: open index panicked: {e}"); return; }
+        Ok(Err(e)) => { error!("restore_semantic_state: open index failed: {e:#}"); return; }
+        Err(e) => { error!("restore_semantic_state: open index panicked: {e}"); return; }
     };
     *app.state::<SemanticIndexState>().0.lock().unwrap() = Some(index);
 
-    eprintln!("restore_semantic_state: embedder and index restored");
+    info!("restore_semantic_state: embedder and index restored");
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 pub fn run() {
+    wilkes_core::logging::init_logging();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -561,6 +675,8 @@ pub fn run() {
             cancel_embed,
             get_index_status,
             delete_index,
+            get_logs,
+            clear_logs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

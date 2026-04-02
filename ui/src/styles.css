@@ -47,7 +47,7 @@
 * {
   scrollbar-color: var(--border-strong) var(--bg-sidebar);
   scrollbar-width: thin;
-  user-select: none;
+  user-select: text !important;
 }
 
 .selectable {

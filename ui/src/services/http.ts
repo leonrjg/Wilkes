@@ -138,6 +138,17 @@ export class HttpSearchApi implements SearchApi {
     return `/asset?path=${encodeURIComponent(path)}`;
   }
 
+  async getLogs(): Promise<string[]> {
+    const res = await fetch("/api/logs");
+    if (!res.ok) throw new Error(`getLogs failed: ${res.status}`);
+    return res.json() as Promise<string[]>;
+  }
+
+  async clearLogs(): Promise<void> {
+    const res = await fetch("/api/logs", { method: "DELETE" });
+    if (!res.ok && res.status !== 204) throw new Error(`clearLogs failed: ${res.status}`);
+  }
+
   // ── Semantic / embed commands ──────────────────────────────────────────────
 
   async listModels(_engine: EmbeddingEngine): Promise<ModelDescriptor[]> {

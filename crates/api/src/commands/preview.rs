@@ -3,21 +3,30 @@ use wilkes_core::types::{ByteRange, MatchRef, PreviewData, SourceOrigin};
 /// Load preview data for a match.
 pub async fn preview(match_ref: MatchRef) -> anyhow::Result<PreviewData> {
     match &match_ref.origin {
-        SourceOrigin::TextFile { line, .. } => preview_text(&match_ref, *line).await,
+        SourceOrigin::TextFile { .. } => preview_text(&match_ref).await,
         SourceOrigin::PdfPage { page, bbox } => {
             preview_pdf(&match_ref, *page, bbox.clone()).await
         }
     }
 }
 
-async fn preview_text(match_ref: &MatchRef, highlight_line: u32) -> anyhow::Result<PreviewData> {
+async fn preview_text(match_ref: &MatchRef) -> anyhow::Result<PreviewData> {
     let content = tokio::fs::read_to_string(&match_ref.path).await?;
     let language = detect_language(&match_ref.path);
 
-    // Compute the character range of the matched line so the frontend can
-    // highlight it. For Phase 1 we highlight the whole line; Phase 2 adds
-    // column-level precision via MatchRef.
-    let highlight_range = line_range(&content, highlight_line);
+    let (highlight_line, highlight_range) = if let Some(range) = &match_ref.text_range {
+        // Compute line number from byte offset
+        let line = content[..range.start.min(content.len())].lines().count() as u32;
+        // Adjust for potential missing trailing newline on last line or empty file
+        let highlight_line = if line == 0 { 1 } else { line as u32 };
+        (highlight_line, range.clone())
+    } else {
+        let line = match &match_ref.origin {
+            SourceOrigin::TextFile { line, .. } => *line,
+            _ => 1,
+        };
+        (line, line_range(&content, line))
+    };
 
     Ok(PreviewData::Text {
         content,

@@ -1,14 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing::{debug, error, info, warn};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use candle_core::{Device, DType, Tensor};
+use candle_core::{Device, DType, Tensor, Module};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
+use candle_transformers::models::jina_bert::{BertModel as JinaBertModel, Config as JinaBertConfig};
+use candle_transformers::models::modernbert::{ModernBert, Config as ModernBertConfig};
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::Cache;
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+use tokenizers::Tokenizer;
 
 use crate::types::{EmbedderModel, ModelDescriptor};
 use super::Embedder;
@@ -20,6 +23,7 @@ struct ModelInfo {
     model_id: &'static str,
     display_name: &'static str,
     description: &'static str,
+    dimension: usize,
 }
 
 const SUPPORTED_MODELS: &[ModelInfo] = &[
@@ -27,26 +31,31 @@ const SUPPORTED_MODELS: &[ModelInfo] = &[
         model_id: "BAAI/bge-base-en-v1.5",
         display_name: "bge-base-en-v1.5",
         description: "BGE base English embeddings (768-dim)",
+        dimension: 768,
     },
     ModelInfo {
         model_id: "sentence-transformers/all-MiniLM-L6-v2",
         display_name: "all-MiniLM-L6-v2",
         description: "Compact, fast English sentence embeddings (384-dim)",
+        dimension: 384,
     },
     ModelInfo {
         model_id: "intfloat/multilingual-e5-large-instruct",
         display_name: "multilingual-e5-large-instruct",
         description: "Multilingual instruction-tuned E5 (1024-dim)",
+        dimension: 1024,
     },
     ModelInfo {
         model_id: "jinaai/jina-embeddings-v5-text-small",
         display_name: "jina-embeddings-v5-text-small",
-        description: "Jina small text embeddings (~300M)",
+        description: "Jina AI v5 small English embeddings (768-dim)",
+        dimension: 768,
     },
     ModelInfo {
         model_id: "jinaai/jina-embeddings-v5-text-nano",
         display_name: "jina-embeddings-v5-text-nano",
-        description: "Jina nano text embeddings (~100M)",
+        description: "Jina AI v5 nano English embeddings (384-dim)",
+        dimension: 384,
     },
 ];
 
@@ -93,8 +102,7 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
                 model_id: info.model_id.to_string(),
                 display_name: info.display_name.to_string(),
                 description: info.description.to_string(),
-                // Dimension is read from config.json; 0 until the model is loaded.
-                dimension: 0,
+                dimension: info.dimension,
                 is_cached,
                 size_bytes,
                 preferred_batch_size: Some(EMBED_BATCH_SIZE),
@@ -180,7 +188,7 @@ fn select_device() -> Device {
     if candle_core::utils::metal_is_available() {
         match Device::new_metal(0) {
             Ok(d) => return d,
-            Err(e) => eprintln!("Metal device init failed ({e:#}), falling back to CPU"),
+            Err(e) => warn!("Metal device init failed ({e:#}), falling back to CPU"),
         }
     }
     Device::Cpu
@@ -202,8 +210,19 @@ fn select_dtype(_device: &Device) -> DType {
 const EMBED_BATCH_SIZE: usize = 32;
 const MAX_SEQUENCE_LENGTH: usize = 512;
 
+enum LoadedModel {
+    Bert(BertModel),
+    JinaBert(JinaBertModel),
+    ModernBert(ModernBert),
+}
+
+#[derive(serde::Deserialize)]
+struct ModelTypePeek {
+    model_type: String,
+}
+
 pub struct CandleEmbedder {
-    model: BertModel,
+    model: LoadedModel,
     tokenizer: Tokenizer,
     device: Device,
     dtype: DType,
@@ -236,15 +255,15 @@ impl CandleEmbedder {
 
     fn embed_slices(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         let total = texts.len();
-        eprintln!("[candle] embed_slices: {total} texts, batch_size={EMBED_BATCH_SIZE}");
+        debug!("[candle] embed_slices: {total} texts, batch_size={EMBED_BATCH_SIZE}");
         let t0 = std::time::Instant::now();
         let mut out = Vec::with_capacity(total);
         for (i, chunk) in texts.chunks(EMBED_BATCH_SIZE).enumerate() {
             let tb = std::time::Instant::now();
             out.extend(self.embed_batch(chunk)?);
-            eprintln!("[candle]   batch {i}: {} texts in {:.1}s", chunk.len(), tb.elapsed().as_secs_f64());
+            debug!("[candle]   batch {i}: {} texts in {:.1}s", chunk.len(), tb.elapsed().as_secs_f64());
         }
-        eprintln!("[candle] embed_slices total: {:.1}s", t0.elapsed().as_secs_f64());
+        debug!("[candle] embed_slices total: {:.1}s", t0.elapsed().as_secs_f64());
         Ok(out)
     }
 
@@ -261,7 +280,7 @@ impl CandleEmbedder {
 
         let batch_size = encodings.len();
         let seq_len = encodings[0].get_ids().len();
-        eprintln!("[candle]   tokenize: {batch_size}×{seq_len} in {:.3}s", t_tok.elapsed().as_secs_f64());
+        debug!("[candle]   tokenize: {batch_size}×{seq_len} in {:.3}s", t_tok.elapsed().as_secs_f64());
         if seq_len == 0 {
             return Ok(vec![vec![0.0_f32; self.dimension]; batch_size]);
         }
@@ -287,11 +306,14 @@ impl CandleEmbedder {
             Tensor::from_vec(token_type_ids, (batch_size, seq_len), &self.device)?;
 
         let t_fwd = std::time::Instant::now();
-        let token_embeddings =
-            self.model.forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
+        let token_embeddings = match &self.model {
+            LoadedModel::Bert(m) => m.forward(&input_ids, &token_type_ids, Some(&attention_mask))?,
+            LoadedModel::JinaBert(m) => Module::forward(m, &input_ids)?,
+            LoadedModel::ModernBert(m) => m.forward(&input_ids, &attention_mask)?,
+        };
         // Force GPU sync so we measure real forward time, not just command submission.
         let _ = token_embeddings.flatten_all()?.narrow(0, 0, 1)?.to_vec1::<f32>()?;
-        eprintln!("[candle]   forward (synced): {:.3}s", t_fwd.elapsed().as_secs_f64());
+        debug!("[candle]   forward (synced): {:.3}s", t_fwd.elapsed().as_secs_f64());
 
         let t_pool = std::time::Instant::now();
         let mask_f32 = attention_mask.to_dtype(self.dtype)?;
@@ -299,7 +321,7 @@ impl CandleEmbedder {
         let normalized = l2_normalize(&pooled)?;
 
         let result = normalized.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-        eprintln!("[candle]   pool+normalize+download: {:.3}s", t_pool.elapsed().as_secs_f64());
+        debug!("[candle]   pool+normalize+download: {:.3}s", t_pool.elapsed().as_secs_f64());
         Ok(result)
     }
 
@@ -448,27 +470,11 @@ impl EmbedderInstaller for CandleInstaller {
         let weights_path = cached_path(data_dir, model_id, "model.safetensors")
             .ok_or_else(|| anyhow::anyhow!("model.safetensors not cached for '{model_id}'"))?;
 
-        let config: BertConfig = serde_json::from_str(
-            &std::fs::read_to_string(&config_path)
-                .with_context(|| format!("Failed to read config.json for '{model_id}'"))?,
-        )
-        .with_context(|| format!("Failed to parse config.json for '{model_id}'"))?;
+        let config_text = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("Failed to read config.json for '{model_id}'"))?;
 
-        let dimension = config.hidden_size;
-
-        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer for '{model_id}': {e}"))?;
-
-        tokenizer.with_padding(Some(PaddingParams {
-            strategy: PaddingStrategy::BatchLongest,
-            ..Default::default()
-        }));
-        tokenizer
-            .with_truncation(Some(TruncationParams {
-                max_length: MAX_SEQUENCE_LENGTH,
-                ..Default::default()
-            }))
-            .map_err(|e| anyhow::anyhow!("Failed to configure truncation for '{model_id}': {e}"))?;
+        let peek: ModelTypePeek = serde_json::from_str(&config_text)
+            .with_context(|| format!("Failed to peek model_type from config.json for '{model_id}'"))?;
 
         let device = select_device();
         let dtype = select_dtype(&device);
@@ -479,12 +485,52 @@ impl EmbedderInstaller for CandleInstaller {
                 .with_context(|| format!("Failed to load weights for '{model_id}'"))?
         };
 
-        let model = BertModel::load(vb, &config)
-            .with_context(|| format!("Failed to build BERT model for '{model_id}'"))?;
+        info!("[candle] dispatching '{model_id}' with model_type='{}'", peek.model_type);
+
+        let (model, dimension) = match peek.model_type.as_str() {
+            "jina_bert_v2" | "jina_bert" | "jina_bert_v3" | "qwen2" | "qwen" | "jina_embeddings_v5" => {
+                let config: JinaBertConfig = serde_json::from_str(&config_text)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse JinaBertConfig for '{model_id}': {e}. Config: {config_text}"))?;
+                let dim = config.hidden_size;
+                let m = JinaBertModel::new(vb, &config)
+                    .with_context(|| format!("Failed to build JinaBert model for '{model_id}'"))?;
+                (LoadedModel::JinaBert(m), dim)
+            }
+            "modern_bert" => {
+                let config: ModernBertConfig = serde_json::from_str(&config_text)
+                    .with_context(|| format!("Failed to parse ModernBertConfig for '{model_id}'"))?;
+                let dim = config.hidden_size;
+                let m = ModernBert::load(vb, &config)
+                    .with_context(|| format!("Failed to build ModernBert model for '{model_id}'"))?;
+                (LoadedModel::ModernBert(m), dim)
+            }
+            _ => {
+                let config: BertConfig = serde_json::from_str(&config_text)
+                    .with_context(|| format!("Failed to parse BertConfig for '{model_id}'"))?;
+                let dim = config.hidden_size;
+                let m = BertModel::load(vb, &config)
+                    .with_context(|| format!("Failed to build BERT model for '{model_id}'"))?;
+                (LoadedModel::Bert(m), dim)
+            }
+        };
+
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer for '{model_id}': {e}"))?;
+
+        tokenizer.with_padding(Some(tokenizers::PaddingParams {
+            strategy: tokenizers::PaddingStrategy::BatchLongest,
+            ..Default::default()
+        }));
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: MAX_SEQUENCE_LENGTH,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow::anyhow!("Failed to configure truncation for '{model_id}': {e}"))?;
 
         let pooling = load_pooling_strategy(data_dir, model_id);
 
-        eprintln!(
+        info!(
             "[candle] loaded '{model_id}' dim={dimension} pooling={pooling:?} device={device:?} dtype={dtype:?}"
         );
 

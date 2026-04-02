@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tracing::error;
 use wilkes_core::embed::Embedder;
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::search::semantic::SemanticSearchProvider;
@@ -28,7 +29,7 @@ impl SearchHandle {
         match self.worker.await {
             Ok(errors) => errors,
             Err(e) => {
-                eprintln!("search worker panicked: {e}");
+                error!("search worker panicked: {e}");
                 vec![format!("search worker panicked: {e}")]
             }
         }

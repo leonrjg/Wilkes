@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use notify::RecursiveMode;
 use notify_debouncer_mini::new_debouncer;
+use tracing::{error, info};
 
 use crate::extract::ExtractorRegistry;
 use super::Embedder;
@@ -23,6 +24,8 @@ impl IndexWatcher {
         index: Arc<Mutex<Option<SemanticIndex>>>,
         extractors: Arc<ExtractorRegistry>,
         embedder: Arc<dyn Embedder>,
+        chunk_size: usize,
+        chunk_overlap: usize,
     ) -> anyhow::Result<Self> {
         let (tx_events, rx_events) =
             std::sync::mpsc::channel::<notify_debouncer_mini::DebounceEventResult>();
@@ -40,11 +43,11 @@ impl IndexWatcher {
                 match result {
                     Ok(events) => {
                         for event in events {
-                            handle_event(&event.path, &index, &extractors, &embedder);
+                            handle_event(&event.path, &index, &extractors, &embedder, chunk_size, chunk_overlap);
                         }
                     }
                     Err(e) => {
-                        eprintln!("[IndexWatcher] watch error: {e}");
+                        error!("[IndexWatcher] watch error: {e}");
                     }
                 }
             }
@@ -82,13 +85,15 @@ fn handle_event(
     index: &Arc<Mutex<Option<SemanticIndex>>>,
     extractors: &Arc<ExtractorRegistry>,
     embedder: &Arc<dyn Embedder>,
+    chunk_size: usize,
+    chunk_overlap: usize,
 ) {
     if !path.exists() {
         // File was removed (or renamed away).
         if let Ok(mut guard) = index.lock() {
             if let Some(idx) = guard.as_mut() {
                 if let Err(e) = idx.remove_file(path) {
-                    eprintln!("[IndexWatcher] remove_file {}: {e:#}", path.display());
+                    error!("[IndexWatcher] remove_file {}: {e:#}", path.display());
                 }
             }
         }
@@ -101,25 +106,25 @@ fn handle_event(
 
     // File exists: treat as create or modify.
     if let Err(e) = try_open_exclusive(path, 5, Duration::from_millis(500)) {
-        eprintln!(
+        error!(
             "[IndexWatcher] skipping {} (file not ready after retries): {e:#}",
             path.display()
         );
         return;
     }
 
-    match SemanticIndex::prepare_file(path, extractors, embedder.as_ref()) {
+    match SemanticIndex::prepare_file(path, extractors, embedder.as_ref(), chunk_size, chunk_overlap) {
         Ok(prepared) => {
             if let Ok(mut guard) = index.lock() {
                 if let Some(idx) = guard.as_mut() {
                     if let Err(e) = idx.write_file(prepared) {
-                        eprintln!("[IndexWatcher] write_file {}: {e:#}", path.display());
+                        error!("[IndexWatcher] write_file {}: {e:#}", path.display());
                     }
                 }
             }
         }
         Err(e) => {
-            eprintln!("[IndexWatcher] prepare_file {}: {e:#}", path.display());
+            error!("[IndexWatcher] prepare_file {}: {e:#}", path.display());
         }
     }
 }
