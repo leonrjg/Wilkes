@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::types::{EmbeddingEngine, EmbedderModel, ModelDescriptor};
 use super::installer::EmbedderInstaller;
 
-pub fn list_models(engine: EmbeddingEngine, data_dir: &Path) -> Vec<ModelDescriptor> {
+pub fn list_models(engine: EmbeddingEngine, _data_dir: &Path) -> Vec<ModelDescriptor> {
     match engine {
         EmbeddingEngine::Python => vec![], // Handled by desktop spawning worker
 
@@ -19,7 +19,7 @@ pub fn list_models(engine: EmbeddingEngine, data_dir: &Path) -> Vec<ModelDescrip
     }
 }
 
-pub fn get_installer(engine: EmbeddingEngine, model: EmbedderModel) -> Arc<dyn EmbedderInstaller> {
+pub fn get_installer(engine: EmbeddingEngine, _model: EmbedderModel) -> Arc<dyn EmbedderInstaller> {
     match engine {
         EmbeddingEngine::Python => panic!("Python engine does not use in-process installers"),
 
@@ -35,7 +35,7 @@ pub fn get_installer(engine: EmbeddingEngine, model: EmbedderModel) -> Arc<dyn E
     }
 }
 
-pub fn fetch_model_size(engine: EmbeddingEngine, model_id: &str) -> anyhow::Result<u64> {
+pub fn fetch_model_size(engine: EmbeddingEngine, _model_id: &str) -> anyhow::Result<u64> {
     match engine {
         EmbeddingEngine::Python => anyhow::bail!("Python engine model size fetched via worker"),
 
