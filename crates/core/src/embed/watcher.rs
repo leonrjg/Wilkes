@@ -13,8 +13,7 @@ use super::index::SemanticIndex;
 // ── IndexWatcher ──────────────────────────────────────────────────────────────
 
 pub struct WatcherConfig {
-    pub python_path: PathBuf,
-    pub script_path: PathBuf,
+    pub manager: crate::embed::worker_manager::WorkerManager,
     pub model_id: String,
     pub data_dir: PathBuf,
     pub device: String,
@@ -82,10 +81,10 @@ impl IndexWatcher {
                                     handle_event(&path, &index, &extractors, emb, chunk_size, chunk_overlap);
                                 }
                             } else if let Some(ref cfg) = config {
-                                // Python engine: spawn worker for the batch
-                                info!("[IndexWatcher] Spawning Python worker for incremental update: {} files", changed_paths.len());
-                                if let Err(e) = spawn_python_worker(cfg, &changed_paths, chunk_size, chunk_overlap) {
-                                    error!("[IndexWatcher] Failed to spawn Python worker: {e:#}");
+                                // SBERT engine: spawn worker for the batch
+                                info!("[IndexWatcher] Spawning SBERT worker for incremental update: {} files", changed_paths.len());
+                                if let Err(e) = spawn_sbert_worker(cfg, &changed_paths, chunk_size, chunk_overlap) {
+                                    error!("[IndexWatcher] Failed to spawn SBERT worker: {e:#}");
                                 }
                             }
                         }
@@ -119,21 +118,19 @@ impl Drop for IndexWatcher {
     }
 }
 
-fn spawn_python_worker(
+fn spawn_sbert_worker(
     cfg: &WatcherConfig,
     paths: &[PathBuf],
     chunk_size: usize,
     chunk_overlap: usize,
 ) -> anyhow::Result<()> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
     use crate::embed::worker_ipc::WorkerRequest;
     use crate::types::EmbeddingEngine;
 
     let request = WorkerRequest {
         mode: "build".to_string(),
         root: PathBuf::new(), // Not used for incremental
-        engine: EmbeddingEngine::Python,
+        engine: EmbeddingEngine::SBERT,
         model: cfg.model_id.clone(),
         data_dir: cfg.data_dir.clone(),
         chunk_size,
@@ -143,32 +140,22 @@ fn spawn_python_worker(
         texts: None,
     };
 
-    let request_json = serde_json::to_string(&request)?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let cmd = crate::embed::worker_manager::ManagerCommand::Submit {
+        req: request,
+        reply: tx,
+    };
 
-    let mut child = Command::new(&cfg.python_path)
-        .arg(&cfg.script_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null()) // We don't need stdout for watcher updates
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin.write_all(request_json.as_bytes())?;
-        stdin.write_all(b"\n")?;
-    }
+    cfg.manager.sender().blocking_send(cmd)
+        .map_err(|e| anyhow::anyhow!("Failed to send to worker manager: {e}"))?;
 
     // Wait for worker to finish (incremental updates should be fast)
-    let output = child.wait_with_output()?;
-
-    if !output.stderr.is_empty() {
-        for line in String::from_utf8_lossy(&output.stderr).lines() {
-            info!("[python-worker] {}", line);
+    while let Some(event) = rx.blocking_recv() {
+        match event {
+            crate::embed::worker_ipc::WorkerEvent::Done => break,
+            crate::embed::worker_ipc::WorkerEvent::Error(e) => anyhow::bail!("SBERT worker error: {e}"),
+            _ => {}
         }
-    }
-
-    if !output.status.success() {
-        anyhow::bail!("Python worker failed with status: {}", output.status);
     }
 
     Ok(())

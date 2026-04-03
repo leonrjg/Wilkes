@@ -1,6 +1,5 @@
 import { useState, useCallback, useRef, useEffect, useTransition } from "react";
 import { Settings as SettingsIcon } from "react-feather";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import SearchBar from "./components/SearchBar";
 import ResultList from "./components/ResultList";
 import PreviewPane from "./components/PreviewPane";

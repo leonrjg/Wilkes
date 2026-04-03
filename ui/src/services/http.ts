@@ -153,6 +153,32 @@ export class HttpSearchApi implements SearchApi {
     throw new Error("getPythonInfo is not available in web mode");
   }
 
+  async getSupportedEngines(): Promise<EmbeddingEngine[]> {
+    return ["SBERT"]; // Or fetch from an endpoint if applicable
+  }
+
+  async getDataPaths(): Promise<any> {
+    throw new Error("getDataPaths is not available in web mode");
+  }
+
+  async openPath(_path: string): Promise<void> {
+    throw new Error("openPath is not available in web mode");
+  }
+
+  // ── Worker Management ────────────────────────────────────────────────────────
+
+  async getWorkerStatus(): Promise<import("../lib/types").WorkerStatus> {
+    throw new Error("Worker management is not available in web mode");
+  }
+
+  async killWorker(): Promise<void> {
+    throw new Error("Worker management is not available in web mode");
+  }
+
+  async setWorkerTimeout(_secs: number): Promise<void> {
+    throw new Error("Worker management is not available in web mode");
+  }
+
   // ── Semantic / embed commands ──────────────────────────────────────────────
 
   async listModels(_engine: EmbeddingEngine): Promise<ModelDescriptor[]> {

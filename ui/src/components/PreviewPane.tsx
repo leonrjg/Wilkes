@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useMemo } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { EditorState } from "@codemirror/state";
 import { EditorView, Decoration, DecorationSet } from "@codemirror/view";

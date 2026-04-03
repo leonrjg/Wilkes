@@ -5,7 +5,7 @@ use super::installer::EmbedderInstaller;
 
 pub fn list_models(engine: EmbeddingEngine, _data_dir: &Path) -> Vec<ModelDescriptor> {
     match engine {
-        EmbeddingEngine::Python => super::hf_cache::list_cached_models(),
+        EmbeddingEngine::SBERT => super::hf_cache::list_cached_models(),
 
         #[cfg(feature = "candle")]
         EmbeddingEngine::Candle => super::candle::list_supported_models(_data_dir),
@@ -21,15 +21,15 @@ pub fn list_models(engine: EmbeddingEngine, _data_dir: &Path) -> Vec<ModelDescri
 
 pub fn get_installer(engine: EmbeddingEngine, _model: EmbedderModel) -> Arc<dyn EmbedderInstaller> {
     match engine {
-        EmbeddingEngine::Python => panic!("Python engine does not use in-process installers"),
+        EmbeddingEngine::SBERT => panic!("SBERT engine does not use in-process installers"),
 
         #[cfg(feature = "candle")]
-        EmbeddingEngine::Candle => Arc::new(super::candle::CandleInstaller::new(model)),
+        EmbeddingEngine::Candle => Arc::new(super::candle::CandleInstaller::new(_model)),
         #[cfg(not(feature = "candle"))]
         EmbeddingEngine::Candle => panic!("Candle feature is disabled"),
 
         #[cfg(feature = "fastembed")]
-        EmbeddingEngine::Fastembed => Arc::new(super::fastembed::FastembedInstaller::new(model)),
+        EmbeddingEngine::Fastembed => Arc::new(super::fastembed::FastembedInstaller::new(_model)),
         #[cfg(not(feature = "fastembed"))]
         EmbeddingEngine::Fastembed => panic!("Fastembed feature is disabled"),
     }
@@ -37,15 +37,15 @@ pub fn get_installer(engine: EmbeddingEngine, _model: EmbedderModel) -> Arc<dyn 
 
 pub fn fetch_model_size(engine: EmbeddingEngine, _model_id: &str) -> anyhow::Result<u64> {
     match engine {
-        EmbeddingEngine::Python => anyhow::bail!("Python engine model size fetched via worker"),
+        EmbeddingEngine::SBERT => super::hf_hub::fetch_model_size(_model_id),
 
         #[cfg(feature = "candle")]
-        EmbeddingEngine::Candle => super::candle::fetch_model_size(model_id),
+        EmbeddingEngine::Candle => super::hf_hub::fetch_model_size(_model_id),
         #[cfg(not(feature = "candle"))]
         EmbeddingEngine::Candle => anyhow::bail!("Candle feature is disabled"),
 
         #[cfg(feature = "fastembed")]
-        EmbeddingEngine::Fastembed => super::fastembed::fetch_model_size(model_id),
+        EmbeddingEngine::Fastembed => super::fastembed::fetch_model_size(_model_id),
         #[cfg(not(feature = "fastembed"))]
         EmbeddingEngine::Fastembed => anyhow::bail!("Fastembed feature is disabled"),
     }

@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from "react";
-import { Search, Type, Database, Check } from "react-feather";
+import { Search, Database, Check } from "react-feather";
 import type { FileEntry, SearchQuery } from "../lib/types";
 
 interface Props {
@@ -30,7 +30,6 @@ export default function SearchBar({
   contextLines = 2,
   fileList = [],
   excluded = new Set<string>(),
-  onExcludedChange,
   onQueryChange,
 }: Props) {
   const [pattern, setPattern] = useState("");
@@ -108,7 +107,7 @@ export default function SearchBar({
           active={caseSensitive}
           onToggle={() => setCaseSensitive((v) => !v)}
         >
-          <Type size={12} />
+          <span className="text-[11px] font-bold tracking-tight">Aa</span>
         </Toggle>
         <Toggle
           title={semanticReady ? "Semantic search" : "Set up semantic search in Settings"}

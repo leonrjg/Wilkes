@@ -1,13 +1,14 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
-import type {
-  EmbedderModel,
-  EmbedProgress,
-  EmbedDone,
-  EmbedError,
-  ModelDescriptor,
-  SemanticSettings,
-  IndexStatus,
-  EmbeddingEngine,
+import {
+  ALL_ENGINES,
+  type EmbedderModel,
+  type EmbedProgress,
+  type EmbedDone,
+  type EmbedError,
+  type ModelDescriptor,
+  type SemanticSettings,
+  type IndexStatus,
+  type EmbeddingEngine,
 } from "../lib/types";
 import type { SearchApi } from "../services/api";
 import LogsPanel from "./LogsPanel";
@@ -40,18 +41,23 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   const [isEngineAvailable, setIsEngineAvailable] = useState(true);
   const [pythonPath, setPythonPath] = useState<string | null>(null);
   const [pythonError, setPythonError] = useState<string | null>(null);
+  const [supportedEngines, setSupportedEngines] = useState<import("../lib/types").EmbeddingEngine[]>([]);
 
-  const supportsCustomModels = useCallback((engine: EmbeddingEngine) => {
-    return true;
+  const supportsCustomModels = useCallback((engine: import("../lib/types").EmbeddingEngine) => {
+    return engine !== "Fastembed";
   }, []);
 
   const refreshState = useCallback(async () => {
     try {
-      const s = await api.getSettings();
+      const [s, se] = await Promise.all([
+        api.getSettings(),
+        api.getSupportedEngines().catch(() => ["SBERT"] as import("../lib/types").EmbeddingEngine[])
+      ]);
       const sem = s.semantic;
       setSettings(sem);
+      setSupportedEngines(se);
 
-      if (sem.engine === "Python") {
+      if (sem.engine === "SBERT") {
         api.getPythonInfo()
           .then((p) => { setPythonPath(p); setPythonError(null); })
           .catch((e) => { setPythonPath(null); setPythonError(e.toString()); });
@@ -63,7 +69,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
         setError(null);
         setIsEngineAvailable(true);
       } catch (e: any) {
-        if (sem.engine === "Python") {
+        if (sem.engine === "SBERT") {
           setError(e.toString());
           setIsEngineAvailable(false);
         } else {
@@ -72,16 +78,20 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
         }
       }
       
-      // Merge custom models from settings
-      const customDescriptors: ModelDescriptor[] = (sem.custom_models || []).map(id => ({
-        model_id: id,
-        display_name: id.split('/').pop() || id,
-        description: "User-defined HuggingFace model",
-        dimension: 0, // Unknown until downloaded
-        is_cached: false, // Will be checked by backend if needed, or we can probe it
-        size_bytes: null,
-        preferred_batch_size: 32,
-      }));
+      // Merge custom models from settings that match current engine
+      const customDescriptors: ModelDescriptor[] = (sem.custom_models || [])
+        .filter(m => m.engine === sem.engine)
+        .map(m => ({
+          model_id: m.model_id,
+          display_name: m.model_id.split('/').pop() || m.model_id,
+          description: "User-defined HuggingFace model",
+          dimension: 0, // Unknown until downloaded
+          is_cached: false, // Will be checked by backend if needed
+          is_default: false,
+          is_recommended: false,
+          size_bytes: null,
+          preferred_batch_size: 32,
+        }));
 
       // Avoid duplicates if a custom model is already in the built-in list
       const allModels = [...descriptors];
@@ -110,8 +120,8 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       } catch (e) {
         // No index or error reading it
         setIndexStatus(null);
-        if (sem.engine === "Python") {
-          // For Python, we don't have a "not_downloaded" phase in the same way
+        if (sem.engine === "SBERT") {
+          // For SBERT, we don't have a "not_downloaded" phase in the same way
           // because build handles it. But we can check if it's cached.
           if (!selected?.is_cached) {
             setPhase("ready"); // "Build" will trigger download
@@ -131,22 +141,29 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
 
   const handleAddCustomModel = async () => {
     if (!settings || !customModelInput.trim()) return;
-    const modelId = customModelInput.trim();
     
-    // Simple validation: should look like "org/repo"
-    if (!modelId.includes('/')) {
-      setError("Please enter a valid HuggingFace repository ID (e.g., org/model)");
+    let modelId = customModelInput.trim();
+    
+    // Flexible parsing to extract org/model preserving case.
+    // Matches optional http(s)://, optional www., optional huggingface.co/ or hf.co/,
+    // then captures the organization and model name.
+    const match = modelId.match(/^(?:https?:\/\/)?(?:www\.)?(?:huggingface\.co\/|hf\.co\/)?([^/]+)\/([^/?#]+)/i);
+    
+    if (match && match[1] && match[2]) {
+      modelId = `${match[1]}/${match[2]}`;
+    } else {
+      setError("Please enter a valid HuggingFace repository ID (e.g., org/model) or URL");
       return;
     }
 
-    if (settings.custom_models.includes(modelId)) {
-      setError("Model already added");
+    if (settings.custom_models.find(m => m.model_id === modelId && m.engine === settings.engine)) {
+      setError("Model already added for this engine");
       return;
     }
 
     const next = { 
       ...settings, 
-      custom_models: [...(settings.custom_models || []), modelId],
+      custom_models: [...(settings.custom_models || []), { engine: settings.engine, model_id: modelId }],
       model: modelId // Select it immediately
     };
     
@@ -225,7 +242,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     setSettings(next);
     setModels([]);
     setModelFilter("");
-    if (engine !== "Python") { setPythonPath(null); setPythonError(null); }
+    if (engine !== "SBERT") { setPythonPath(null); setPythonError(null); }
     await api.updateSettings({ semantic: next });
     await refreshState();
   };
@@ -298,48 +315,65 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
 
   const filteredModels = useMemo(() => {
     const search = modelFilter.trim().toLowerCase();
-    if (!modelFilter) return models;
-    if (!search) return [];
-    return models.filter(
-      (m) =>
-        m.model_id.toLowerCase().includes(search) ||
-        m.display_name.toLowerCase().includes(search) ||
-        m.description.toLowerCase().includes(search),
-    );
-  }, [models, modelFilter]);
+    let results = models;
+    if (search) {
+      results = models.filter(
+        (m) =>
+          m.model_id.toLowerCase().includes(search) ||
+          m.display_name.toLowerCase().includes(search) ||
+          m.description.toLowerCase().includes(search),
+      );
+    }
+
+    // Pin active model to top
+    const activeModelId = indexStatus?.model_id;
+    return [...results].sort((a, b) => {
+      const aActive = activeModelId === a.model_id;
+      const bActive = activeModelId === b.model_id;
+      if (aActive && !bActive) return -1;
+      if (!aActive && bActive) return 1;
+      return 0;
+    });
+  }, [models, modelFilter, indexStatus?.model_id]);
 
   return (
     <div className="flex flex-col gap-4">
       {/* Engine Selection */}
       <section>
-        <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Inference Engine</h3>
+        <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Embedding Engine</h3>
         <div className="flex p-0.5 bg-[var(--bg-active)] rounded-lg w-full">
-          {(["Python", "Candle", "Fastembed"] as const).map((e) => (
+          {ALL_ENGINES.map((e) => {
+            const isSupported = supportedEngines.includes(e);
+            return (
             <button
               key={e}
               type="button"
-              disabled={isActive || !isEngineAvailable}
+              disabled={isActive || (!isEngineAvailable && settings?.engine === e) || !isSupported}
               onClick={() => handleEngineChange(e)}
+              title={!isSupported ? "Feature disabled in this build" : undefined}
               className={`flex-1 px-3 py-1 rounded-md text-xs transition-all ${
                 settings?.engine === e
                   ? "bg-[var(--bg-app)] text-[var(--text-main)] shadow-sm"
-                  : "text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50"
+                  : !isSupported
+                    ? "text-[var(--text-muted)]/50 opacity-50 cursor-not-allowed"
+                    : "text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50"
               }`}
             >
-              {e === "Python" ? "Python" : e === "Candle" ? "Candle" : "Fastembed"}
+              {e}
             </button>
-          ))}
+            );
+          })}
         </div>
         <p className="text-[10px] text-[var(--text-dim)] mt-1.5 px-1 selectable">
-          {settings?.engine === "Python"
-            ? "Default. Best compatibility."
+          {settings?.engine === "SBERT"
+            ? "Sentence-Transformers via Python. Best compatibility and performance."
             : settings?.engine === "Candle"
               ? "Native Rust. Uses GPU via Metal (Apple Silicon only)."
               : "Optimized ONNX Runtime. Best performance on Intel Macs."}
         </p>
-        {settings?.engine === "Python" && (
+        {settings?.engine === "SBERT" && (
           <div className="mt-1.5 px-2 py-1.5 rounded bg-[var(--bg-active)] flex items-start gap-1.5">
-            <span className="text-[10px] text-[var(--text-dim)] shrink-0 mt-px">python</span>
+            <span className="text-[10px] text-[var(--text-dim)] shrink-0 mt-px uppercase font-bold tracking-tighter">python runtime</span>
             {pythonPath ? (
               <span className="text-[10px] text-[var(--text-main)] font-mono break-all selectable">{pythonPath}</span>
             ) : (
@@ -434,6 +468,15 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
                     <span className={`text-[11px] font-medium ${m.is_cached ? "text-[var(--text-main)]" : "text-[var(--text-muted)]"}`}>
                       {m.display_name}
                     </span>
+                    {indexStatus?.model_id === m.model_id && (
+                      <span className="text-[var(--accent-blue)] text-[9px] bg-[var(--accent-blue)]/10 px-1 rounded font-bold uppercase tracking-tighter">Active</span>
+                    )}
+                    {m.is_default && (
+                      <span className="text-amber-500 text-[9px] bg-amber-500/10 px-1 rounded font-bold uppercase tracking-tighter">Default</span>
+                    )}
+                    {m.is_recommended && !m.is_default && (
+                      <span className="text-purple-500 text-[9px] bg-purple-500/10 px-1 rounded font-bold uppercase tracking-tighter">Recommended</span>
+                    )}
                     {m.is_cached && (
                       <span className="text-green-500 text-[9px] bg-green-500/10 px-1 rounded">Cached</span>
                     )}
@@ -456,54 +499,6 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
             })}
           </div>
         </div>
-      </section>
-
-      {/* Chunking */}
-      <section>
-        <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Chunking</h3>
-        <div className="flex gap-3">
-          <label className="flex flex-col gap-1 flex-1">
-            <span className="text-[10px] text-[var(--text-muted)]">Chunk size (chars)</span>
-            <input
-              type="number"
-              min={100}
-              max={10000}
-              step={100}
-              disabled={isActive || !isEngineAvailable}
-              value={settings?.chunk_size ?? 1200}
-              onChange={async (e) => {
-                if (!settings) return;
-                const val = Number(e.target.value);
-                if (!Number.isFinite(val) || val < 100) return;
-                const next = { ...settings, chunk_size: val };
-                setSettings(next);
-                await api.updateSettings({ semantic: next });
-              }}
-              className="text-xs bg-[var(--bg-input)] border border-[var(--border-main)] rounded-lg px-2.5 py-1.5 text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] disabled:opacity-50 transition-colors"
-            />
-          </label>
-          <label className="flex flex-col gap-1 flex-1">
-            <span className="text-[10px] text-[var(--text-muted)]">Overlap (chars)</span>
-            <input
-              type="number"
-              min={0}
-              max={5000}
-              step={50}
-              disabled={isActive || !isEngineAvailable}
-              value={settings?.chunk_overlap ?? 200}
-              onChange={async (e) => {
-                if (!settings) return;
-                const val = Number(e.target.value);
-                if (!Number.isFinite(val) || val < 0) return;
-                const next = { ...settings, chunk_overlap: val };
-                setSettings(next);
-                await api.updateSettings({ semantic: next });
-              }}
-              className="text-xs bg-[var(--bg-input)] border border-[var(--border-main)] rounded-lg px-2.5 py-1.5 text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] disabled:opacity-50 transition-colors"
-            />
-          </label>
-        </div>
-        <p className="text-[10px] text-[var(--text-dim)] mt-1.5 px-1">Rebuild the index for changes to take effect.</p>
       </section>
 
       {/* Action Area */}

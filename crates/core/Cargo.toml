@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+default = ["candle"]
 fastembed = ["dep:fastembed", "dep:hf-hub", "dep:ureq", "dep:ort"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "dep:ureq"]
 metal = ["candle", "candle-core/metal", "candle-core/accelerate", "candle-nn/metal", "candle-transformers/metal"]

@@ -2,10 +2,12 @@ pub mod chunk;
 pub mod dispatch;
 pub mod downloader;
 pub mod hf_cache;
+pub mod hf_hub;
 pub mod index;
 pub mod installer;
 pub mod watcher;
 pub mod worker_ipc;
+pub mod worker_manager;
 
 #[cfg(feature = "fastembed")]
 pub mod fastembed;

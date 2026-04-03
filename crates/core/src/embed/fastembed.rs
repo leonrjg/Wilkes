@@ -66,6 +66,8 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
                 description: info.description.clone(),
                 dimension: info.dim,
                 is_cached,
+                is_default: info.model_code == "BAAI/bge-base-en-v1.5",
+                is_recommended: info.model_code == "BAAI/bge-base-en-v1.5" || info.model_code == "sentence-transformers/all-MiniLM-L6-v2",
                 size_bytes,
                 preferred_batch_size: get_preferred_batch_size(&info.model_code, &info.description),
             }

@@ -10,7 +10,6 @@ use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use candle_transformers::models::jina_bert::{BertModel as JinaBertModel, Config as JinaBertConfig};
 use candle_transformers::models::modernbert::{ModernBert, Config as ModernBertConfig};
 use hf_hub::api::sync::ApiBuilder;
-use hf_hub::Cache;
 use tokenizers::Tokenizer;
 
 use crate::types::{EmbedderModel, ModelDescriptor};
@@ -24,38 +23,50 @@ struct ModelInfo {
     display_name: &'static str,
     description: &'static str,
     dimension: usize,
+    is_default: bool,
+    is_recommended: bool,
 }
 
-const SUPPORTED_MODELS: &[ModelInfo] = &[
+const PREEXISTING_MODELS: &[ModelInfo] = &[
     ModelInfo {
         model_id: "BAAI/bge-base-en-v1.5",
         display_name: "bge-base-en-v1.5",
         description: "BGE base English embeddings (768-dim)",
         dimension: 768,
+        is_default: false,
+        is_recommended: false,
     },
     ModelInfo {
-        model_id: "sentence-transformers/all-MiniLM-L6-v2",
-        display_name: "all-MiniLM-L6-v2",
-        description: "Compact, fast English sentence embeddings (384-dim)",
+        model_id: "sentence-transformers/all-MiniLM-L12-v2",
+        display_name: "all-MiniLM-L12-v2",
+        description: "Speed: high, accuracy: medium (English)",
         dimension: 384,
+        is_default: true,
+        is_recommended: false,
     },
     ModelInfo {
         model_id: "intfloat/multilingual-e5-large-instruct",
         display_name: "multilingual-e5-large-instruct",
         description: "Multilingual instruction-tuned E5 (1024-dim)",
         dimension: 1024,
+        is_default: false,
+        is_recommended: false,
     },
     ModelInfo {
         model_id: "jinaai/jina-embeddings-v5-text-small",
         display_name: "jina-embeddings-v5-text-small",
-        description: "Jina AI v5 small English embeddings (768-dim)",
+        description: "Speed: medium, accuracy: high (English)",
         dimension: 768,
+        is_default: false,
+        is_recommended: false,
     },
     ModelInfo {
         model_id: "jinaai/jina-embeddings-v5-text-nano",
         display_name: "jina-embeddings-v5-text-nano",
         description: "Jina AI v5 nano English embeddings (384-dim)",
         dimension: 384,
+        is_default: false,
+        is_recommended: false,
     },
 ];
 
@@ -65,13 +76,9 @@ const MODEL_FILES: &[&str] = &["config.json", "tokenizer.json", "model.safetenso
 // ── HF cache helpers ──────────────────────────────────────────────────────────
 
 fn cached_path(data_dir: &Path, model_id: &str, filename: &str) -> Option<PathBuf> {
-    Cache::new(data_dir.to_path_buf())
+    hf_hub::Cache::new(data_dir.to_path_buf())
         .repo(hf_hub::Repo::model(model_id.to_string()))
         .get(filename)
-}
-
-fn all_files_cached(data_dir: &Path, model_id: &str) -> bool {
-    MODEL_FILES.iter().all(|f| cached_path(data_dir, model_id, f).is_some())
 }
 
 fn cached_size_bytes(data_dir: &Path, model_id: &str) -> Option<u64> {
@@ -89,10 +96,10 @@ fn cached_size_bytes(data_dir: &Path, model_id: &str) -> Option<u64> {
 // ── Public model list ─────────────────────────────────────────────────────────
 
 pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
-    SUPPORTED_MODELS
+    PREEXISTING_MODELS
         .iter()
         .map(|info| {
-            let is_cached = all_files_cached(data_dir, info.model_id);
+            let is_cached = super::hf_hub::is_model_cached(data_dir, info.model_id);
             let size_bytes = if is_cached {
                 cached_size_bytes(data_dir, info.model_id)
             } else {
@@ -104,47 +111,13 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
                 description: info.description.to_string(),
                 dimension: info.dimension,
                 is_cached,
+                is_default: info.is_default,
+                is_recommended: info.is_recommended,
                 size_bytes,
                 preferred_batch_size: Some(EMBED_BATCH_SIZE),
             }
         })
         .collect()
-}
-
-/// Fetch total download size for `model_id` from the HuggingFace API.
-pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {
-    #[derive(serde::Deserialize)]
-    struct Sibling {
-        rfilename: String,
-        size: Option<u64>,
-    }
-    #[derive(serde::Deserialize)]
-    struct HfModelInfo {
-        siblings: Vec<Sibling>,
-    }
-
-    let url = format!("https://huggingface.co/api/models/{model_id}?blobs=true");
-    let hf_info: HfModelInfo = ureq::get(&url)
-        .call()
-        .map_err(|e| anyhow::anyhow!("HF API request failed: {e}"))?
-        .into_json()
-        .map_err(|e| anyhow::anyhow!("HF API response parse failed: {e}"))?;
-
-    let relevant: std::collections::HashSet<&str> = MODEL_FILES.iter().copied().collect();
-    let total: u64 = hf_info
-        .siblings
-        .iter()
-        .filter(|s| {
-            relevant.contains(s.rfilename.as_str())
-                || relevant
-                    .iter()
-                    .any(|f| s.rfilename.ends_with(&format!("/{f}")))
-        })
-        .filter_map(|s| s.size)
-        .sum();
-
-    anyhow::ensure!(total > 0, "No relevant model files found in HF repo for '{model_id}'");
-    Ok(total)
 }
 
 // ── Pooling strategy ──────────────────────────────────────────────────────────
@@ -411,7 +384,7 @@ impl CandleInstaller {
 #[async_trait]
 impl EmbedderInstaller for CandleInstaller {
     fn is_available(&self, data_dir: &Path) -> bool {
-        all_files_cached(data_dir, &self.model.0)
+        super::hf_hub::is_model_cached(data_dir, &self.model.0)
     }
 
     async fn install(&self, data_dir: &Path, tx: ProgressTx) -> anyhow::Result<()> {

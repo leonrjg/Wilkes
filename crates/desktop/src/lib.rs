@@ -3,8 +3,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tauri::{AppHandle, Emitter, Manager};
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -90,28 +88,22 @@ fn resolve_worker_script(app: &AppHandle) -> anyhow::Result<std::path::PathBuf> 
         .ok_or_else(|| anyhow::anyhow!("Python worker script not found at {}", resource_dir.display()))
 }
 
-// ── PythonEmbedder ────────────────────────────────────────────────────────────
+// ── SBERTEmbedder ────────────────────────────────────────────────────────────
 
-/// Implements `Embedder` for the Python engine by spawning `wilkes_worker.py`
-/// with mode="embed". Each call loads the model in a subprocess, so latency
-/// depends on model size. A persistent-process variant can be added later.
-struct PythonEmbedder {
-    python_path: std::path::PathBuf,
-    script_path: std::path::PathBuf,
+/// Implements `Embedder` for the SBERT engine by dispatching to the `WorkerManager`.
+struct SBERTEmbedder {
+    manager: wilkes_core::embed::worker_manager::WorkerManager,
     model_id: String,
     dimension: usize,
     device: String,
 }
 
-impl wilkes_core::embed::Embedder for PythonEmbedder {
+impl wilkes_core::embed::Embedder for SBERTEmbedder {
     fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        use std::io::Write;
-        use std::process::Stdio;
-
         let request = WorkerRequest {
             mode: "embed".to_string(),
             root: std::path::PathBuf::new(),
-            engine: EmbeddingEngine::Python,
+            engine: EmbeddingEngine::SBERT,
             model: self.model_id.clone(),
             data_dir: std::path::PathBuf::new(),
             chunk_size: 0,
@@ -121,41 +113,30 @@ impl wilkes_core::embed::Embedder for PythonEmbedder {
             texts: Some(texts.iter().map(|s| s.to_string()).collect()),
         };
 
-        let request_json = serde_json::to_string(&request)
-            .map_err(|e| anyhow::anyhow!("Failed to serialise embed request: {e}"))?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        
+        let cmd = wilkes_core::embed::worker_manager::ManagerCommand::Submit {
+            req: request,
+            reply: tx,
+        };
 
-        let mut child = std::process::Command::new(&self.python_path)
-            .arg(&self.script_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn Python worker: {e}"))?;
+        // Since embed() is synchronous, we block on sending and receiving.
+        let handle = tokio::runtime::Handle::current();
+        
+        handle.block_on(async move {
+            self.manager.sender().send(cmd).await
+                .map_err(|e| anyhow::anyhow!("Failed to send command to manager: {e}"))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(request_json.as_bytes())?;
-            stdin.write_all(b"\n")?;
-        }
-
-        let output = child
-            .wait_with_output()
-            .map_err(|e| anyhow::anyhow!("Python worker wait failed: {e}"))?;
-
-        if !output.stderr.is_empty() {
-            for line in String::from_utf8_lossy(&output.stderr).lines() {
-                tracing::info!("[python-worker] {}", line);
+            while let Some(event) = rx.recv().await {
+                match event {
+                    wilkes_core::embed::worker_ipc::WorkerEvent::Embeddings(vecs) => return Ok(vecs),
+                    wilkes_core::embed::worker_ipc::WorkerEvent::Error(err) => return Err(anyhow::anyhow!("Worker error: {}", err)),
+                    wilkes_core::embed::worker_ipc::WorkerEvent::Done => break,
+                    _ => {}
+                }
             }
-        }
-
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            match serde_json::from_str::<WorkerEvent>(line) {
-                Ok(WorkerEvent::Embeddings(vecs)) => return Ok(vecs),
-                Ok(WorkerEvent::Error(e)) => anyhow::bail!("Python embedder error: {e}"),
-                _ => {}
-            }
-        }
-
-        anyhow::bail!("Python worker did not return embeddings (exit: {:?})", output.status)
+            Err(anyhow::anyhow!("Worker finished without returning embeddings"))
+        })
     }
 
     fn model_id(&self) -> &str {
@@ -210,7 +191,58 @@ enum EmbedOperation {
     Build,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct DataPaths {
+    hf_cache: String,
+    app_data: String,
+}
+
 // ── Tauri commands ───────────────────────────────────────────────────────────
+
+/// Return the resolved data paths for HuggingFace and the application.
+#[tauri::command]
+async fn get_data_paths(app: AppHandle) -> Result<DataPaths, String> {
+    let app_data = app.path().app_data_dir()
+        .map(|p| p.display().to_string())
+        .map_err(|e| e.to_string())?;
+    let hf_cache = wilkes_core::embed::hf_cache::get_hf_cache_root().display().to_string();
+    Ok(DataPaths { hf_cache, app_data })
+}
+
+/// Open a path in the system file manager.
+#[tauri::command]
+async fn open_path(path: String) -> Result<(), String> {
+    let p = std::path::PathBuf::from(path);
+    if !p.exists() {
+        return Err("Path does not exist".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(p)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(p)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(p)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
 
 /// Start a search. Returns a `search_id` that identifies this run.
 /// Results are emitted as `search-result-{id}` events (payload: FileMatches).
@@ -314,6 +346,12 @@ async fn get_python_info() -> Result<String, String> {
     resolve_python()
         .map(|p| p.display().to_string())
         .map_err(|e| e.to_string())
+}
+
+/// Returns the embedding engines compiled into this app build.
+#[tauri::command]
+fn get_supported_engines() -> Vec<wilkes_core::types::EmbeddingEngine> {
+    wilkes_core::types::EmbeddingEngine::supported_engines()
 }
 
 /// Load persisted settings (returns defaults if no settings file exists yet).
@@ -451,21 +489,7 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
     // Stop the active watcher before rebuilding.
     stop_watcher(&app);
 
-    let mut command = match engine {
-        EmbeddingEngine::Python => {
-            let python = resolve_python().map_err(|e| e.to_string())?;
-            let script = resolve_worker_script(&app).map_err(|e| e.to_string())?;
-            let mut cmd = tokio::process::Command::new(python);
-            cmd.arg(script);
-            cmd
-        }
-        _ => {
-            let worker_bin = std::env::current_exe()
-                .map_err(|e| format!("Cannot resolve current exe: {e}"))?
-                .with_file_name("wilkes-worker");
-            tokio::process::Command::new(worker_bin)
-        }
-    };
+    let manager = app.state::<wilkes_core::embed::worker_manager::WorkerManager>().inner().clone();
 
     let request = WorkerRequest {
         mode: "build".to_string(),
@@ -479,26 +503,14 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
         paths: None,
         texts: None,
     };
-    let request_json = serde_json::to_string(&request)
-        .map_err(|e| format!("Failed to serialise worker request: {e}"))?;
 
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn worker process: {e}"))?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+    let cmd = wilkes_core::embed::worker_manager::ManagerCommand::Submit {
+        req: request.clone(),
+        reply: tx,
+    };
 
-    // Send the config and close stdin so the worker can proceed.
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(request_json.as_bytes()).await
-            .map_err(|e| format!("Failed to write worker config: {e}"))?;
-        stdin.write_all(b"\n").await
-            .map_err(|e| format!("Failed to write worker config newline: {e}"))?;
-    }
-
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
+    manager.sender().send(cmd).await.map_err(|e| format!("Failed to send build request: {e}"))?;
 
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
@@ -508,17 +520,15 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
     let root_path = request.root.clone();
 
     let join: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout).lines();
-        let mut stderr_reader = BufReader::new(stderr).lines();
         let mut final_event: Option<WorkerEvent> = None;
-        let mut stderr_logs = Vec::new();
+        let stderr_logs: Vec<String> = Vec::new();
 
         loop {
             tokio::select! {
                 biased;
                 _ = cancel_for_task.cancelled() => {
-                    child.kill().await.ok();
-                    child.wait().await.ok();
+                    // Note: We can't kill the child process directly here anymore since the manager owns it.
+                    // But we can just stop processing.
                     let _ = std::fs::remove_file(data_dir_clone.join("semantic_index.db"));
                     let _ = app_clone.emit("embed-error", EmbedError {
                         operation: EmbedOperation::Build,
@@ -526,41 +536,26 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
                     });
                     return Ok(());
                 }
-                line = reader.next_line() => {
-                    match line {
-                        Ok(Some(line)) => {
-                            match serde_json::from_str::<WorkerEvent>(&line) {
-                                Ok(WorkerEvent::Progress(p)) => {
-                                    let _ = app_clone.emit("embed-progress", &p);
-                                }
-                                Ok(ev) => {
-                                    final_event = Some(ev);
-                                    break;
-                                }
-                                Err(e) => {
-                                    eprintln!("[worker] Unrecognised stdout line ({e}): {line}");
-                                }
-                            }
+                event_opt = rx.recv() => {
+                    match event_opt {
+                        Some(WorkerEvent::Progress(p)) => {
+                            let _ = app_clone.emit("embed-progress", &p);
                         }
-                        _ => break,
-                    }
-                }
-                line = stderr_reader.next_line() => {
-                    if let Ok(Some(line)) = line {
-                        tracing::info!("[python-worker] {}", line);
-                        stderr_logs.push(line);
+                        Some(ev) => {
+                            final_event = Some(ev);
+                            break;
+                        }
+                        None => break,
                     }
                 }
             }
         }
 
-        let exit_status = child.wait().await.ok();
-
         match final_event {
             Some(WorkerEvent::Done) => {
                 let mut loaded_embedder: Option<Arc<dyn Embedder>> = None;
 
-                if engine != EmbeddingEngine::Python {
+                if engine != EmbeddingEngine::SBERT {
                     let installer = dispatch::get_installer(engine, model.clone());
                     let embedder = match tokio::task::spawn_blocking({
                         let d = data_dir_clone.clone();
@@ -604,24 +599,17 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
                     Ok(Ok(idx)) => {
                         let actual_dimension = idx.status().dimension;
 
-                        // For Python engine, create the embedder now that we know the real dimension.
-                        if engine == EmbeddingEngine::Python {
-                            match (resolve_python(), resolve_worker_script(&app_clone)) {
-                                (Ok(py), Ok(script)) => {
-                                    let emb = Arc::new(PythonEmbedder {
-                                        python_path: py,
-                                        script_path: script,
-                                        model_id: model.model_id().to_string(),
-                                        dimension: actual_dimension,
-                                        device: current_settings.semantic.device.clone(),
-                                    });
-                                    *app_clone.state::<ActiveEmbedderState>().0.lock().unwrap() = Some(Arc::clone(&emb) as Arc<dyn Embedder>);
-                                    loaded_embedder = Some(emb);
-                                }
-                                (Err(e), _) | (_, Err(e)) => {
-                                    error!("build_index: failed to resolve Python paths for embedder: {e:#}");
-                                }
-                            }
+                        // For SBERT engine, create the embedder now that we know the real dimension.
+                        if engine == EmbeddingEngine::SBERT {
+                            let manager = app_clone.state::<wilkes_core::embed::worker_manager::WorkerManager>().inner().clone();
+                            let emb = Arc::new(SBERTEmbedder {
+                                manager,
+                                model_id: model.model_id().to_string(),
+                                dimension: actual_dimension,
+                                device: current_settings.semantic.device.clone(),
+                            });
+                            *app_clone.state::<ActiveEmbedderState>().0.lock().unwrap() = Some(Arc::clone(&emb) as Arc<dyn Embedder>);
+                            loaded_embedder = Some(emb);
                         }
 
                         *app_clone.state::<SemanticIndexState>().0.lock().unwrap() = Arc::new(Mutex::new(Some(idx)));
@@ -630,10 +618,10 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
                         let mut registry = ExtractorRegistry::new();
                         registry.register(Box::new(wilkes_core::extract::pdf::PdfExtractor::new()));
 
-                        let watcher_config = if engine == EmbeddingEngine::Python {
+                        let watcher_config = if engine == EmbeddingEngine::SBERT {
+                            let manager = app_clone.state::<wilkes_core::embed::worker_manager::WorkerManager>().inner().clone();
                             Some(wilkes_core::embed::watcher::WatcherConfig {
-                                python_path: resolve_python().unwrap_or_default(),
-                                script_path: resolve_worker_script(&app_clone).unwrap_or_default(),
+                                manager,
                                 model_id: model.model_id().to_string(),
                                 data_dir: data_dir_clone.clone(),
                                 device: current_settings.semantic.device.clone(),
@@ -689,7 +677,7 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
                 });
             }
             _ => {
-                let mut message = format!("Worker process exited unexpectedly (code: {:?})", exit_status);
+                let mut message = "Worker process exited unexpectedly without completion".to_string();
                 if !stderr_logs.is_empty() {
                     message.push_str("\n\nWorker stderr:\n");
                     message.push_str(&stderr_logs.join("\n"));
@@ -799,6 +787,28 @@ async fn update_semantic_settings<F: FnOnce(SemanticSettings) -> SemanticSetting
     }
 }
 
+// ── Worker Management ─────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn get_worker_status(app: AppHandle) -> Result<wilkes_core::embed::worker_manager::WorkerStatus, String> {
+    let manager = app.state::<wilkes_core::embed::worker_manager::WorkerManager>().inner().clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    manager.sender().send(wilkes_core::embed::worker_manager::ManagerCommand::GetStatus(tx)).await.map_err(|e| e.to_string())?;
+    rx.await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn kill_worker(app: AppHandle) -> Result<(), String> {
+    let manager = app.state::<wilkes_core::embed::worker_manager::WorkerManager>().inner().clone();
+    manager.sender().send(wilkes_core::embed::worker_manager::ManagerCommand::KillWorker).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_worker_timeout(app: AppHandle, secs: u64) -> Result<(), String> {
+    let manager = app.state::<wilkes_core::embed::worker_manager::WorkerManager>().inner().clone();
+    manager.sender().send(wilkes_core::embed::worker_manager::ManagerCommand::SetTimeout(secs)).await.map_err(|e| e.to_string())
+}
+
 // ── Startup state restore ─────────────────────────────────────────────────────
 
 /// If settings indicate a model was downloaded and an index was built, reload
@@ -844,7 +854,7 @@ async fn restore_semantic_state(app: &AppHandle) {
 
     let mut loaded_embedder = None;
 
-    if engine != EmbeddingEngine::Python {
+    if engine != EmbeddingEngine::SBERT {
         let installer = dispatch::get_installer(engine, model.clone());
         if !installer.is_available(&data_dir) {
             info!("restore_semantic_state: model files not found, skipping restore");
@@ -868,22 +878,15 @@ async fn restore_semantic_state(app: &AppHandle) {
         Err(e) => { error!("restore_semantic_state: open index panicked: {e}"); return; }
     };
 
-    // For Python engine, create the embedder now that we have the real dimension.
-    if engine == EmbeddingEngine::Python {
-        match (resolve_python(), resolve_worker_script(app)) {
-            (Ok(py), Ok(script)) => {
-                loaded_embedder = Some(Arc::new(PythonEmbedder {
-                    python_path: py,
-                    script_path: script,
-                    model_id: model.model_id().to_string(),
-                    dimension: index.status().dimension,
-                    device: settings.semantic.device.clone(),
-                }) as Arc<dyn Embedder>);
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                error!("restore_semantic_state: failed to resolve Python paths for embedder: {e:#}");
-            }
-        }
+    // For SBERT engine, create the embedder now that we have the real dimension.
+    if engine == EmbeddingEngine::SBERT {
+        let manager = app.state::<wilkes_core::embed::worker_manager::WorkerManager>().inner().clone();
+        loaded_embedder = Some(Arc::new(SBERTEmbedder {
+            manager,
+            model_id: model.model_id().to_string(),
+            dimension: index.status().dimension,
+            device: settings.semantic.device.clone(),
+        }) as Arc<dyn Embedder>);
     }
 
     if let Some(ref emb) = loaded_embedder {
@@ -898,10 +901,10 @@ async fn restore_semantic_state(app: &AppHandle) {
         let mut registry = ExtractorRegistry::new();
         registry.register(Box::new(wilkes_core::extract::pdf::PdfExtractor::new()));
 
-        let watcher_config = if engine == EmbeddingEngine::Python {
+        let watcher_config = if engine == EmbeddingEngine::SBERT {
+            let manager = app.state::<wilkes_core::embed::worker_manager::WorkerManager>().inner().clone();
             Some(wilkes_core::embed::watcher::WatcherConfig {
-                python_path: resolve_python().unwrap_or_default(),
-                script_path: resolve_worker_script(app).unwrap_or_default(),
+                manager,
                 model_id: model.model_id().to_string(),
                 data_dir: data_dir.clone(),
                 device: settings.semantic.device.clone(),
@@ -949,7 +952,16 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle().clone();
+            
+            let python_path = resolve_python().unwrap_or_default();
+            let script_path = resolve_worker_script(&handle).unwrap_or_default();
+            let worker_bin = std::env::current_exe().unwrap_or_default().with_file_name("wilkes-worker");
+            let paths = wilkes_core::embed::worker_manager::WorkerPaths { python_path, script_path, worker_bin };
+            let (manager, loop_fut) = wilkes_core::embed::worker_manager::WorkerManager::new(paths);
+            app.manage(manager);
+
             tauri::async_runtime::spawn(async move {
+                tauri::async_runtime::spawn(loop_fut);
                 restore_semantic_state(&handle).await;
             });
             Ok(())
@@ -966,6 +978,7 @@ pub fn run() {
             list_files,
             open_file,
             get_python_info,
+            get_supported_engines,
             get_settings,
             update_settings,
             pick_directory,
@@ -978,6 +991,11 @@ pub fn run() {
             delete_index,
             get_logs,
             clear_logs,
+            get_data_paths,
+            open_path,
+            get_worker_status,
+            kill_worker,
+            set_worker_timeout,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

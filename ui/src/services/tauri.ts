@@ -17,7 +17,7 @@ import type {
   SearchStats,
   Settings,
 } from "../lib/types";
-import type { SearchApi, DesktopSourceApi } from "./api";
+import type { SearchApi, DesktopSourceApi, DataPaths } from "./api";
 
 export class TauriSearchApi implements SearchApi {
   async search(
@@ -86,6 +86,32 @@ export class TauriSearchApi implements SearchApi {
 
   async getPythonInfo(): Promise<string> {
     return invoke<string>("get_python_info");
+  }
+
+  async getSupportedEngines(): Promise<EmbeddingEngine[]> {
+    return invoke<EmbeddingEngine[]>("get_supported_engines");
+  }
+
+  async getDataPaths(): Promise<DataPaths> {
+    return invoke<DataPaths>("get_data_paths");
+  }
+
+  async openPath(path: string): Promise<void> {
+    return invoke("open_path", { path });
+  }
+
+  // ── Worker Management ────────────────────────────────────────────────────────
+
+  async getWorkerStatus(): Promise<import("../lib/types").WorkerStatus> {
+    return invoke<import("../lib/types").WorkerStatus>("get_worker_status");
+  }
+
+  async killWorker(): Promise<void> {
+    return invoke("kill_worker");
+  }
+
+  async setWorkerTimeout(secs: number): Promise<void> {
+    return invoke("set_worker_timeout", { secs });
   }
 
   // ── Semantic / embed commands ──────────────────────────────────────────────

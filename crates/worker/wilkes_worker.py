@@ -30,6 +30,28 @@ SUPPORTED_EXTENSIONS = {
 def emit(event):
     print(json.dumps(event), flush=True)
 
+MODEL_CACHE = {}
+
+def get_model(model_id, device):
+    import time
+    cache_key = (model_id, device)
+    if cache_key not in MODEL_CACHE:
+        emit({"Progress": {"Build": {
+            "files_processed": 0,
+            "total_files": 0,
+            "message": "Initializing embedding engine...",
+            "done": False
+        }}})
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer(
+            model_id,
+            device=None if device == "auto" else device,
+            trust_remote_code=True,
+            model_kwargs={"attn_implementation": "sdpa"}
+        )
+        MODEL_CACHE[cache_key] = model
+    return MODEL_CACHE[cache_key]
+
 def extract_text(path):
     suffix = Path(path).suffix.lower()
     if suffix == ".pdf":
@@ -64,19 +86,7 @@ def build_index(request):
 
     db_path = data_dir / "semantic_index.db"
 
-    emit({"Progress": {"Build": {
-        "files_processed": 0,
-        "total_files": 0,
-        "message": "Initializing embedding engine...",
-        "done": False
-    }}})
-
-    model = SentenceTransformer(
-        model_id,
-        device=None if device == "auto" else device,
-        trust_remote_code=True,
-        model_kwargs={"attn_implementation": "sdpa"}
-    )
+    model = get_model(model_id, device)
 
     splitter = TextSplitter(chunk_size)
 
@@ -180,7 +190,7 @@ def build_index(request):
 
     built_at = int(build_start)
     build_duration_ms = int((time.time() - build_start) * 1000)
-    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('engine', 'python')")
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('engine', 'sbert')")
     conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('model_id', ?)", (model_id,))
     conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('dimension', ?)", (str(dimension),))
     conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('built_at', ?)", (str(built_at),))
@@ -228,36 +238,31 @@ def embed_texts(request):
         emit({"Done": None})
         return
 
-    from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer(
-        model_id,
-        device=None if device == "auto" else device,
-        trust_remote_code=True,
-        model_kwargs={"attn_implementation": "sdpa"}
-    )
+    model = get_model(model_id, device)
     embeddings = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=True, task='retrieval')
     emit({"Embeddings": embeddings.tolist()})
     emit({"Done": None})
 
 def main():
-    line = sys.stdin.readline()
-    if not line:
-        return
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
 
-    try:
-        request = json.loads(line)
-        sys.stderr.write(f"Request: {json.dumps(request)}\n")
-        mode = request.get("mode", "build")
+        try:
+            request = json.loads(line)
+            sys.stderr.write(f"Request: {json.dumps(request)}\n")
+            mode = request.get("mode", "build")
 
-        if mode == "build":
-            build_index(request)
-        elif mode == "embed":
-            embed_texts(request)
-        else:
-            emit({"Error": f"Unknown mode: {mode}"})
-    except Exception as e:
-        import traceback
-        emit({"Error": traceback.format_exc()})
+            if mode == "build":
+                build_index(request)
+            elif mode == "embed":
+                embed_texts(request)
+            else:
+                emit({"Error": f"Unknown mode: {mode}"})
+        except Exception as e:
+            import traceback
+            emit({"Error": traceback.format_exc()})
 
 if __name__ == "__main__":
     main()

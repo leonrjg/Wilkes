@@ -113,6 +113,7 @@ impl SearchProvider for SemanticSearchProvider {
             ],
             requires_index: true,
             semantic_index_built: index_built,
+            supported_engines: crate::types::EmbeddingEngine::supported_engines(),
         }
     }
 }

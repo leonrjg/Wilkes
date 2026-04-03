@@ -204,6 +204,8 @@ pub struct ModelDescriptor {
     pub description: String,
     pub dimension: usize,
     pub is_cached: bool,
+    pub is_default: bool,
+    pub is_recommended: bool,
     /// Total bytes of all model files. Populated from disk for cached models;
     /// `None` for uncached models until explicitly fetched from HuggingFace.
     pub size_bytes: Option<u64>,
@@ -217,7 +219,7 @@ pub struct ModelDescriptor {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub enum EmbeddingEngine {
     #[default]
-    Python,
+    SBERT,
     Candle,
     Fastembed,
 }
@@ -225,7 +227,7 @@ pub enum EmbeddingEngine {
 impl EmbeddingEngine {
     pub fn as_str(&self) -> &'static str {
         match self {
-            EmbeddingEngine::Python => "python",
+            EmbeddingEngine::SBERT => "sbert",
             EmbeddingEngine::Candle => "candle",
             EmbeddingEngine::Fastembed => "fastembed",
         }
@@ -233,11 +235,26 @@ impl EmbeddingEngine {
 
     pub fn supports_custom_models(&self) -> bool {
         match self {
-            EmbeddingEngine::Python => true,
+            EmbeddingEngine::SBERT => true,
             EmbeddingEngine::Candle => true,
             EmbeddingEngine::Fastembed => false,
         }
     }
+
+    pub fn supported_engines() -> Vec<Self> {
+        let mut engines = vec![EmbeddingEngine::SBERT];
+        #[cfg(feature = "candle")]
+        engines.push(EmbeddingEngine::Candle);
+        #[cfg(feature = "fastembed")]
+        engines.push(EmbeddingEngine::Fastembed);
+        engines
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CustomModel {
+    pub engine: EmbeddingEngine,
+    pub model_id: String,
 }
 
 // ── Semantic settings ─────────────────────────────────────────────────────────
@@ -251,19 +268,48 @@ pub struct SemanticSettings {
     /// Embedding dimension for the current model.
     #[serde(default = "SemanticSettings::default_dimension")]
     pub dimension: usize,
-    /// Device override for Python engine ("auto", "cpu", "mps", "cuda").
+    /// Device override for SBERT engine ("auto", "cpu", "mps", "cuda").
     #[serde(default = "SemanticSettings::default_device")]
     pub device: String,
     pub index_path: Option<PathBuf>,
-    /// List of arbitrary HuggingFace IDs manually added by the user.
-    #[serde(default)]
-    pub custom_models: Vec<String>,
-    /// Target characters per chunk (~1200 ≈ 256 tokens).
+    /// List of arbitrary HuggingFace IDs manually added by the user, scoped by engine.
+    #[serde(default, deserialize_with = "deserialize_custom_models")]
+    pub custom_models: Vec<CustomModel>,
     #[serde(default = "SemanticSettings::default_chunk_size")]
     pub chunk_size: usize,
-    /// Overlap between adjacent chunks in characters.
     #[serde(default = "SemanticSettings::default_chunk_overlap")]
     pub chunk_overlap: usize,
+    /// Idle timeout for worker processes in seconds.
+    #[serde(default = "SemanticSettings::default_worker_timeout")]
+    pub worker_timeout_secs: u64,
+}
+
+fn deserialize_custom_models<'de, D>(deserializer: D) -> Result<Vec<CustomModel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(deserializer)?;
+
+    if let Some(arr) = value.as_array() {
+        let mut result = Vec::new();
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                // Migration: old Vec<String> format. Default to SBERT.
+                result.push(CustomModel {
+                    engine: EmbeddingEngine::SBERT,
+                    model_id: s.to_string(),
+                });
+            } else if let Ok(custom) = serde_json::from_value::<CustomModel>(item.clone()) {
+                result.push(custom);
+            } else {
+                return Err(D::Error::custom("Invalid custom_model format"));
+            }
+        }
+        Ok(result)
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 impl SemanticSettings {
@@ -273,6 +319,10 @@ impl SemanticSettings {
 
     fn default_chunk_overlap() -> usize {
         128
+    }
+
+    fn default_worker_timeout() -> u64 {
+        300
     }
 
     fn default_dimension() -> usize {
@@ -295,6 +345,7 @@ impl Default for SemanticSettings {
             custom_models: Vec::new(),
             chunk_size: Self::default_chunk_size(),
             chunk_overlap: Self::default_chunk_overlap(),
+            worker_timeout_secs: Self::default_worker_timeout(),
         }
     }
 }
@@ -374,6 +425,9 @@ pub struct SearchCapabilities {
     /// True if the semantic index has been built and is ready.
     #[serde(default)]
     pub semantic_index_built: bool,
+    /// List of embedding engines compiled into the app.
+    #[serde(default)]
+    pub supported_engines: Vec<EmbeddingEngine>,
 }
 
 // ── Search completion stats ───────────────────────────────────────────────────

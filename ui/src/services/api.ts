@@ -15,6 +15,11 @@ import type {
   Settings,
 } from "../lib/types";
 
+export interface DataPaths {
+  hf_cache: string;
+  app_data: string;
+}
+
 // Shared across desktop and web. All methods are identical.
 export interface SearchApi {
   search(
@@ -32,6 +37,14 @@ export interface SearchApi {
   getLogs(): Promise<string[]>;
   clearLogs(): Promise<void>;
   getPythonInfo(): Promise<string>;
+  getSupportedEngines(): Promise<EmbeddingEngine[]>;
+  getDataPaths(): Promise<DataPaths>;
+  openPath(path: string): Promise<void>;
+
+  // ── Worker Management ────────────────────────────────────────────────────────
+  getWorkerStatus(): Promise<import("../lib/types").WorkerStatus>;
+  killWorker(): Promise<void>;
+  setWorkerTimeout(secs: number): Promise<void>;
 
   // ── Semantic / embed commands ──────────────────────────────────────────────
   listModels(engine: EmbeddingEngine): Promise<ModelDescriptor[]>;

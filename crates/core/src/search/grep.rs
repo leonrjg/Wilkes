@@ -180,6 +180,7 @@ impl SearchProvider for GrepSearchProvider {
             ],
             requires_index: false,
             semantic_index_built: false,
+            supported_engines: crate::types::EmbeddingEngine::supported_engines(),
         }
     }
 }

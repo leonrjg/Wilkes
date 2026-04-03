@@ -52,7 +52,7 @@ pub fn list_cached_models() -> Vec<ModelDescriptor> {
     models
 }
 
-fn get_hf_cache_root() -> PathBuf {
+pub fn get_hf_cache_root() -> PathBuf {
     if let Ok(hf_home) = std::env::var("HF_HOME") {
         PathBuf::from(hf_home).join("hub")
     } else {
@@ -101,6 +101,8 @@ fn get_model_descriptor(model_dir: &Path, model_id: &str) -> Option<ModelDescrip
         description: format!("Locally cached Python model ({} dimensions)", dimension),
         dimension,
         is_cached: true,
+        is_default: model_id == "BAAI/bge-base-en-v1.5",
+        is_recommended: model_id == "BAAI/bge-base-en-v1.5" || model_id == "sentence-transformers/all-MiniLM-L6-v2",
         size_bytes: Some(size_bytes),
         preferred_batch_size: Some(32),
     })

@@ -489,7 +489,7 @@ impl SemanticIndex {
             .unwrap_or_else(|_| "candle".to_string());
         
         let engine = match engine_str.as_str() {
-            "python" => EmbeddingEngine::Python,
+            "sbert" | "python" => EmbeddingEngine::SBERT,
             "fastembed" => EmbeddingEngine::Fastembed,
             _ => EmbeddingEngine::Candle,
         };
@@ -558,7 +558,7 @@ impl SemanticIndex {
             .unwrap_or_else(|_| "candle".to_string());
 
         let engine = match engine_str.as_str() {
-            "python" => EmbeddingEngine::Python,
+            "sbert" | "python" => EmbeddingEngine::SBERT,
             "fastembed" => EmbeddingEngine::Fastembed,
             _ => EmbeddingEngine::Candle,
         };

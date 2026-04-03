@@ -1,8 +1,17 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import type { SearchApi } from "../services/api";
 import type { Settings } from "../lib/types";
 import SemanticPanel from "./SemanticPanel";
+import ChunkingPanel from "./ChunkingPanel";
+import DataPanel from "./DataPanel";
 import LogsPanel from "./LogsPanel";
+import WorkersPanel from "./WorkersPanel";
+import { EditorState } from "@codemirror/state";
+import { EditorView, keymap } from "@codemirror/view";
+import { basicSetup } from "codemirror";
+import { json } from "@codemirror/lang-json";
+import { oneDark } from "@codemirror/theme-one-dark";
+import { indentWithTab } from "@codemirror/commands";
 
 interface SettingsModalProps {
   api: SearchApi;
@@ -13,6 +22,123 @@ interface SettingsModalProps {
   onSettingsUpdate?: (patch: Partial<Settings>) => void;
 }
 
+function TechnicalSettings({ api, onUpdate }: { api: SearchApi; onUpdate: (s: Settings) => void }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const viewRef = useRef<EditorView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
+
+  useEffect(() => {
+    const observer = new MutationObserver(() => {
+      setIsDark(window.document.documentElement.classList.contains("dark"));
+    });
+    observer.observe(window.document.documentElement, { attributes: true, attributeFilter: ["class"] });
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    
+    const init = async () => {
+      try {
+        const s = await api.getSettings();
+        if (!mounted) return;
+        
+        // Clean up previous view
+        if (viewRef.current) {
+          viewRef.current.destroy();
+          viewRef.current = null;
+        }
+
+        if (!containerRef.current) return;
+
+        const content = JSON.stringify(s, null, 2);
+        const extensions = [
+          basicSetup,
+          json(),
+          keymap.of([indentWithTab]),
+          EditorView.lineWrapping,
+          EditorView.theme({
+            "&": { height: "100%", fontSize: "12px" },
+            ".cm-scroller": { overflow: "auto" }
+          })
+        ];
+        if (isDark) extensions.push(oneDark);
+
+        const state = EditorState.create({
+          doc: content,
+          extensions
+        });
+
+        const view = new EditorView({
+          state,
+          parent: containerRef.current
+        });
+        viewRef.current = view;
+        setLoading(false);
+      } catch (e: any) {
+        if (mounted) {
+          setError(`Failed to load settings: ${e.toString()}`);
+          setLoading(false);
+        }
+      }
+    };
+
+    init();
+
+    return () => {
+      mounted = false;
+      if (viewRef.current) {
+        viewRef.current.destroy();
+        viewRef.current = null;
+      }
+    };
+  }, [api, isDark]);
+
+  const handleSave = async () => {
+    if (!viewRef.current) return;
+    const content = viewRef.current.state.doc.toString();
+    try {
+      const parsed = JSON.parse(content);
+      const updated = await api.updateSettings(parsed);
+      onUpdate(updated);
+      setError(null);
+      // Brief visual feedback could go here
+    } catch (e: any) {
+      setError(e.toString());
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-full gap-3">
+      <div className="flex items-center justify-between">
+        <h3 className="text-[10px] font-medium text-[var(--text-dim)] uppercase tracking-wider">Direct JSON Editor</h3>
+        <button
+          onClick={handleSave}
+          disabled={loading}
+          className="px-3 py-1 bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white text-[10px] font-bold uppercase tracking-wider rounded transition-colors disabled:opacity-50"
+        >
+          Apply Changes
+        </button>
+      </div>
+      <div className="flex-1 border border-[var(--border-main)] rounded-lg overflow-hidden bg-[var(--bg-active)]/20 relative min-h-[300px]">
+        {loading && (
+          <div className="absolute inset-0 flex items-center justify-center bg-[var(--bg-app)]/50 z-10">
+            <div className="w-5 h-5 border-2 border-[var(--accent-blue)] border-t-transparent rounded-full animate-spin" />
+          </div>
+        )}
+        <div ref={containerRef} className="absolute inset-0" />
+      </div>
+      {error && (
+        <div className="p-2 bg-red-900/20 border border-red-900/50 rounded text-[10px] text-red-400 font-mono break-all whitespace-pre-wrap">
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function SettingsModal({
   api,
   isOpen,
@@ -21,7 +147,7 @@ export default function SettingsModal({
   refreshSemanticReady,
   onSettingsUpdate,
 }: SettingsModalProps) {
-  const [activeTab, setActiveTab] = useState<"general" | "semantic" | "logs">("general");
+  const [activeTab, setActiveTab] = useState<"general" | "models" | "chunking" | "data" | "workers" | "logs" | "technical">("general");
   const [settings, setSettings] = useState<Settings | null>(null);
 
   useEffect(() => {
@@ -42,6 +168,21 @@ export default function SettingsModal({
     }
   };
 
+  const TabButton = ({ id, label, indent = false }: { id: typeof activeTab; label: string; indent?: boolean }) => (
+    <button
+      onClick={() => setActiveTab(id)}
+      className={`px-3 py-1.5 rounded-lg text-sm text-left transition-colors ${
+        indent ? "ml-2" : ""
+      } ${
+        activeTab === id
+          ? "bg-[var(--bg-active)] text-[var(--text-main)] font-medium shadow-sm"
+          : "text-[var(--text-muted)] hover:bg-[var(--bg-active)]/50 hover:text-[var(--text-main)]"
+      }`}
+    >
+      {label}
+    </button>
+  );
+
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
       <div className="bg-[var(--bg-app)] border border-[var(--border-main)] rounded-xl shadow-2xl w-full max-w-xl h-[600px] flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200">
@@ -60,37 +201,24 @@ export default function SettingsModal({
 
         <div className="flex flex-1 overflow-hidden">
           {/* Sidebar */}
-          <div className="w-40 border-r border-[var(--border-main)] bg-[var(--bg-sidebar)] p-1.5 flex flex-col gap-0.5">
-            <button
-              onClick={() => setActiveTab("general")}
-              className={`px-3 py-1.5 rounded-lg text-sm text-left transition-colors ${
-                activeTab === "general"
-                  ? "bg-[var(--bg-active)] text-[var(--text-main)]"
-                  : "text-[var(--text-muted)] hover:bg-[var(--bg-active)]/50 hover:text-[var(--text-main)]"
-              }`}
-            >
-              General
-            </button>
-            <button
-              onClick={() => setActiveTab("semantic")}
-              className={`px-3 py-1.5 rounded-lg text-sm text-left transition-colors ${
-                activeTab === "semantic"
-                  ? "bg-[var(--bg-active)] text-[var(--text-main)]"
-                  : "text-[var(--text-muted)] hover:bg-[var(--bg-active)]/50 hover:text-[var(--text-main)]"
-              }`}
-            >
-              Semantic Search
-            </button>
-            <button
-              onClick={() => setActiveTab("logs")}
-              className={`px-3 py-1.5 rounded-lg text-sm text-left transition-colors ${
-                activeTab === "logs"
-                  ? "bg-[var(--bg-active)] text-[var(--text-main)]"
-                  : "text-[var(--text-muted)] hover:bg-[var(--bg-active)]/50 hover:text-[var(--text-main)]"
-              }`}
-            >
-              Logs
-            </button>
+          <div className="w-44 border-r border-[var(--border-main)] bg-[var(--bg-sidebar)] p-2 flex flex-col gap-4">
+            <div className="flex flex-col gap-0.5">
+              <TabButton id="general" label="General" />
+            </div>
+
+            <div className="flex flex-col gap-0.5">
+              <span className="px-3 py-1 text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Semantic Search</span>
+              <TabButton id="models" label="Models" indent />
+              <TabButton id="chunking" label="Chunking" indent />
+            </div>
+
+            <div className="flex flex-col gap-0.5">
+              <span className="px-3 py-1 text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Advanced</span>
+              <TabButton id="data" label="Data" indent />
+              <TabButton id="workers" label="Workers" indent />
+              <TabButton id="logs" label="Logs" indent />
+              <TabButton id="technical" label="Technical" indent />
+            </div>
           </div>
 
           {/* Content */}
@@ -162,7 +290,7 @@ export default function SettingsModal({
               </div>
             )}
 
-            {activeTab === "semantic" && (
+            {activeTab === "models" && (
               <SemanticPanel
                 api={api}
                 directory={directory}
@@ -170,8 +298,24 @@ export default function SettingsModal({
               />
             )}
 
+            {activeTab === "chunking" && settings && (
+              <ChunkingPanel api={api} settings={settings} onUpdate={setSettings} />
+            )}
+
+            {activeTab === "data" && (
+              <DataPanel api={api} />
+            )}
+
+            {activeTab === "workers" && settings && (
+              <WorkersPanel api={api} settings={settings} onUpdateSettings={handleUpdateSettings} />
+            )}
+
             {activeTab === "logs" && (
               <LogsPanel api={api} />
+            )}
+
+            {activeTab === "technical" && (
+              <TechnicalSettings api={api} onUpdate={setSettings} />
             )}
           </div>
         </div>

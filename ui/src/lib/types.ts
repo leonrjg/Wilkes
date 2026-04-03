@@ -86,7 +86,8 @@ export interface FileEntry {
 /** HuggingFace model code, e.g. "BAAI/bge-base-en-v1.5". */
 export type EmbedderModel = string;
 
-export type EmbeddingEngine = "Python" | "Candle" | "Fastembed";
+export type EmbeddingEngine = "SBERT" | "Candle" | "Fastembed";
+export const ALL_ENGINES: EmbeddingEngine[] = ["SBERT", "Candle", "Fastembed"];
 
 export interface ModelDescriptor {
   model_id: string;
@@ -94,9 +95,15 @@ export interface ModelDescriptor {
   description: string;
   dimension: number;
   is_cached: boolean;
+  is_default: boolean;
+  is_recommended: boolean;
   /** Total bytes of all model files. Null for uncached models until fetched. */
   size_bytes: number | null;
   preferred_batch_size: number | null;
+}
+export interface CustomModel {
+  engine: EmbeddingEngine;
+  model_id: string;
 }
 
 export interface SemanticSettings {
@@ -106,9 +113,17 @@ export interface SemanticSettings {
   dimension: number;
   device: string;
   index_path: string | null;
-  custom_models: string[];
+  custom_models: CustomModel[];
   chunk_size: number;
   chunk_overlap: number;
+  worker_timeout_secs: number;
+}
+
+export interface WorkerStatus {
+  active: boolean;
+  engine: string | null;
+  model: string | null;
+  timeout_secs: number;
 }
 
 export interface Settings {

@@ -4,7 +4,7 @@ use crate::types::{EmbeddingEngine};
 use super::installer::EmbedProgress;
 
 /// Sent once from the desktop to the worker on stdin to configure the build.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct WorkerRequest {
     #[serde(default = "default_mode")]
     pub mode: String, // "build" or "embed"
