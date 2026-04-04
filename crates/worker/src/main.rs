@@ -1,21 +1,35 @@
 use std::io::BufRead;
+use std::sync::Arc;
 
 use wilkes_core::embed::dispatch;
 use wilkes_core::embed::installer::EmbedProgress;
 use wilkes_core::embed::worker_ipc::{WorkerEvent, WorkerRequest};
+use wilkes_core::types::EmbedderModel;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    wilkes_core::logging::init_logging();
+    wilkes_core::logging::init_logging_stderr();
+
+    tracing::info!("[worker] starting up...");
 
     let stdin = std::io::stdin();
+    let mut active_embedder: Option<Arc<dyn wilkes_core::embed::Embedder>> = None;
+
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
             break;
         }
 
-        let req: WorkerRequest = match serde_json::from_str(line.trim()) {
+        let trimmed = line.trim();
+        let log_line = if trimmed.len() > 200 {
+            format!("{}...", &trimmed[..200])
+        } else {
+            trimmed.to_string()
+        };
+        tracing::info!("[worker] received request: {}", log_line);
+
+        let req: WorkerRequest = match serde_json::from_str(trimmed) {
             Ok(r) => r,
             Err(e) => {
                 emit(WorkerEvent::Error(format!("Failed to parse worker config: {e}")));
@@ -23,54 +37,98 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<EmbedProgress>(64);
+        match req.mode.as_str() {
+            "build" => {
+                let model = EmbedderModel(req.model.clone());
+                let embedder = match dispatch::load_embedder_local(req.engine, &model, &req.data_dir, &req.device) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        emit(WorkerEvent::Error(format!("Failed to load embedder: {e}")));
+                        continue;
+                    }
+                };
+                active_embedder = Some(Arc::clone(&embedder));
 
-        // Forward progress events to stdout so the parent can emit Tauri events.
-        let forward = tokio::spawn(async move {
-            while let Some(progress) = rx.recv().await {
-                emit(WorkerEvent::Progress(progress));
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<EmbedProgress>(64);
+                let forward = tokio::spawn(async move {
+                    while let Some(progress) = rx.recv().await {
+                        emit(WorkerEvent::Progress(progress));
+                    }
+                });
+
+                let result = wilkes_api::commands::embed::build_index_with_embedder(
+                    req.root,
+                    req.engine,
+                    embedder,
+                    req.data_dir,
+                    tx,
+                    req.chunk_size,
+                    req.chunk_overlap,
+                    req.supported_extensions,
+                )
+                .await;
+
+                forward.await?;
+
+                match result {
+                    Ok(_) => emit(WorkerEvent::Done),
+                    Err(e) => emit(WorkerEvent::Error(e.to_string())),
+                }
             }
-        });
 
-        // The worker binary only handles Candle/Fastembed, never SBERT.
-        // We create a dummy manager to satisfy the API.
-        let (dummy_manager, _, _) = wilkes_core::embed::worker_manager::WorkerManager::new(
-            wilkes_core::embed::worker_manager::WorkerPaths {
-                python_path: "".into(),
-                script_path: "".into(),
-                worker_bin: "".into(),
+            "embed" => {
+                let embedder = match get_or_load_embedder(&mut active_embedder, &req) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        emit(WorkerEvent::Error(format!("Failed to load embedder: {e}")));
+                        continue;
+                    }
+                };
+
+                let texts = req.texts.unwrap_or_default();
+                let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                match embedder.embed(&text_refs) {
+                    Ok(embeddings) => {
+                        emit(WorkerEvent::Embeddings(embeddings));
+                        emit(WorkerEvent::Done);
+                    }
+                    Err(e) => emit(WorkerEvent::Error(format!("Embed error: {e}"))),
+                }
             }
-        );
 
-        let result = if req.mode == "build" {
-            wilkes_api::commands::embed::build_index(
-                req.root,
-                req.engine,
-                wilkes_core::types::EmbedderModel(req.model.clone()),
-                dummy_manager,
-                req.device.clone(),
-                req.data_dir,
-                tx,
-                req.chunk_size,
-                req.chunk_overlap,
-            )
-            .await
-        } else {
-            // Note: Rust worker embed texts mode isn't implemented in the binary yet,
-            // but we can just emit an error or skip if it's called.
-            Err(anyhow::anyhow!("Rust worker embed mode not implemented via binary"))
-        };
+            "info" => {
+                let embedder = match get_or_load_embedder(&mut active_embedder, &req) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        emit(WorkerEvent::Error(format!("Failed to load embedder for info: {e}")));
+                        continue;
+                    }
+                };
+                emit(WorkerEvent::Info {
+                    dimension: embedder.dimension(),
+                    max_seq_length: 512,
+                });
+                emit(WorkerEvent::Done);
+            }
 
-        // Wait for the forwarder so all progress lines are flushed before Done/Error.
-        forward.await?;
-
-        match result {
-            Ok(_) => emit(WorkerEvent::Done),
-            Err(e) => emit(WorkerEvent::Error(e.to_string())),
+            other => emit(WorkerEvent::Error(format!("Unknown mode: {other}"))),
         }
     }
 
     Ok(())
+}
+
+fn get_or_load_embedder(
+    active: &mut Option<Arc<dyn wilkes_core::embed::Embedder>>,
+    req: &WorkerRequest,
+) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
+    if let Some(ref e) = active {
+        return Ok(Arc::clone(e));
+    }
+    let model = EmbedderModel(req.model.clone());
+    let embedder = dispatch::load_embedder_local(req.engine, &model, &req.data_dir, &req.device)?;
+    *active = Some(Arc::clone(&embedder));
+    Ok(embedder)
 }
 
 fn emit(event: WorkerEvent) {

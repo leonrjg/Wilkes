@@ -1,5 +1,7 @@
-sentence-transformers
-semantic-text-splitter
-sqlite-vec
-numpy
-PyMuPDF
+sentence-transformers==5.3.0
+semantic-text-splitter==0.29.0
+sqlite-vec==0.1.9
+numpy==1.26.4
+PyMuPDF==1.27.2.2
+einops==0.8.2
+peft==0.18.1

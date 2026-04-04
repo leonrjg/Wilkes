@@ -137,7 +137,10 @@ async fn list_files_handler(
     if !is_under(&root, &state.data_dir) {
         return Err(err("Path outside data directory"));
     }
-    let files = wilkes_api::commands::files::list_files(root)
+    let settings = wilkes_api::commands::settings::get_settings(&state.settings_path)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    let files = wilkes_api::commands::files::list_files(root, settings.supported_extensions)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(files))
@@ -156,7 +159,10 @@ async fn open_file_handler(
     if !is_under(&path, &state.data_dir) {
         return Err(err("Path outside data directory"));
     }
-    let data = wilkes_api::commands::files::open_file(path)
+    let settings = wilkes_api::commands::settings::get_settings(&state.settings_path)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    let data = wilkes_api::commands::files::open_file(path, settings.supported_extensions)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(data))

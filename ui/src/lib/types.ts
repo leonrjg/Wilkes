@@ -22,6 +22,7 @@ export interface SearchQuery {
   context_lines: number;
   /** Defaults to "Grep" */
   mode: SearchMode;
+  supported_extensions: string[];
 }
 
 export type FileType = "PlainText" | "Pdf";
@@ -111,7 +112,8 @@ export interface SemanticSettings {
   engine: EmbeddingEngine;
   model: EmbedderModel;
   dimension: number;
-  device: string;
+  /** Per-engine device overrides. Missing entries use the engine's built-in default. */
+  engine_devices: Partial<Record<EmbeddingEngine, string>>;
   index_path: string | null;
   custom_models: CustomModel[];
   chunk_size: number;
@@ -136,6 +138,7 @@ export interface Settings {
   theme: Theme;
   search_prefer_semantic: boolean;
   semantic: SemanticSettings;
+  supported_extensions: string[];
 }
 
 export type Theme = "System" | "Light" | "Dark";

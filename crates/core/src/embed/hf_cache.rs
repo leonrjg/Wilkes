@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::fs;
 use crate::types::ModelDescriptor;
 
@@ -9,6 +10,44 @@ pub fn get_hf_cache_root() -> PathBuf {
         match dirs::home_dir() {
             Some(home) => home.join(".cache").join("huggingface").join("hub"),
             None => PathBuf::new(),
+        }
+    }
+}
+
+/// Overlay models found in the global HF cache onto `models`.
+/// For models already in the map, marks them `is_cached = true` and fills in `size_bytes`.
+/// Models found in the cache but not yet in the map are added as-is.
+pub fn overlay_hf_cache(models: &mut HashMap<String, ModelDescriptor>) {
+    let root = get_hf_cache_root();
+    if !root.exists() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let folder_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) if name.starts_with("models--") => name.to_string(),
+            _ => continue,
+        };
+        let encoded = &folder_name[8..];
+        let model_id = if let Some(pos) = encoded.find("--") {
+            let (org, name) = encoded.split_at(pos);
+            format!("{}/{}", org, &name[2..])
+        } else {
+            encoded.to_string()
+        };
+        if let Some(desc) = get_model_descriptor_from_path(&path, &model_id) {
+            models.entry(model_id)
+                .and_modify(|e| {
+                    e.is_cached = true;
+                    if e.size_bytes.is_none() {
+                        e.size_bytes = desc.size_bytes;
+                    }
+                })
+                .or_insert(desc);
         }
     }
 }

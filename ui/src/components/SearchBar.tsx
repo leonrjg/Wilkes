@@ -12,6 +12,7 @@ interface Props {
   respectGitignore?: boolean;
   maxFileSize?: number;
   contextLines?: number;
+  supportedExtensions?: string[];
   fileList?: FileEntry[];
   excluded?: Set<string>;
   onExcludedChange?: (excluded: Set<string>) => void;
@@ -30,6 +31,7 @@ export default function SearchBar({
   respectGitignore = true,
   maxFileSize = 10 * 1024 * 1024,
   contextLines = 2,
+  supportedExtensions = [],
   fileList = [],
   excluded = new Set<string>(),
   onQueryChange,
@@ -69,9 +71,10 @@ export default function SearchBar({
         max_file_size: maxFileSize,
         context_lines: contextLines,
         mode: isSemanticMode ? "Semantic" : "Grep",
+        supported_extensions: supportedExtensions,
       };
     },
-    [isRegex, caseSensitive, directory, excluded, fileList, respectGitignore, maxFileSize, contextLines, isSemanticMode],
+    [isRegex, caseSensitive, directory, excluded, fileList, respectGitignore, maxFileSize, contextLines, isSemanticMode, supportedExtensions],
   );
 
   const triggerSearch = useCallback(
@@ -90,7 +93,7 @@ export default function SearchBar({
   // Debounce pattern changes
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => triggerSearch(pattern), 400);
+    debounceRef.current = setTimeout(() => triggerSearch(pattern), 300);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };

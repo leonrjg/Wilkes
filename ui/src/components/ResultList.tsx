@@ -150,7 +150,6 @@ export default function ResultList({
             value={filterText}
             onChange={(e) => onFilterChange(e.target.value)}
             className="flex-1 min-w-0 bg-transparent border-none outline-none text-[11px] text-[var(--text-main)] placeholder-[var(--text-dim)]"
-            autoFocus
           />
         </div>
         <div className="flex-1 overflow-y-auto">

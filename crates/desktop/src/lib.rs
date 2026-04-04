@@ -190,7 +190,12 @@ async fn open_path(path: String) -> Result<(), String> {
 /// before this invocation, preventing a race between event emission and listener
 /// registration.
 #[tauri::command]
-async fn search(query: SearchQuery, search_id: Option<String>, app: AppHandle) -> Result<String, String> {
+async fn search(mut query: SearchQuery, search_id: Option<String>, app: AppHandle) -> Result<String, String> {
+    let settings_path = desktop_settings_path().map_err(|e| e.to_string())?;
+    let settings = wilkes_api::commands::settings::get_settings(&settings_path).await
+        .unwrap_or_default();
+    query.supported_extensions = settings.supported_extensions.clone();
+
     // Block if a reindex or download is already running AND it is a semantic search.
     if query.mode == SearchMode::Semantic {
         let embed_state = app.state::<EmbedState>();
@@ -364,7 +369,10 @@ async fn update_settings(patch: serde_json::Value) -> Result<Settings, String> {
 /// List all supported files under a directory (no pattern matching).
 #[tauri::command]
 async fn list_files(root: String) -> Result<Vec<FileEntry>, String> {
-    wilkes_api::commands::files::list_files(root.into())
+    let settings_path = desktop_settings_path().map_err(|e| e.to_string())?;
+    let settings = wilkes_api::commands::settings::get_settings(&settings_path).await
+        .unwrap_or_default();
+    wilkes_api::commands::files::list_files(root.into(), settings.supported_extensions)
         .await
         .map_err(|e| e.to_string())
 }
@@ -372,7 +380,10 @@ async fn list_files(root: String) -> Result<Vec<FileEntry>, String> {
 /// Open a file for preview at page/line 1 with no highlight.
 #[tauri::command]
 async fn open_file(path: String) -> Result<wilkes_core::types::PreviewData, String> {
-    wilkes_api::commands::files::open_file(path.into())
+    let settings_path = desktop_settings_path().map_err(|e| e.to_string())?;
+    let settings = wilkes_api::commands::settings::get_settings(&settings_path).await
+        .unwrap_or_default();
+    wilkes_api::commands::files::open_file(path.into(), settings.supported_extensions)
         .await
         .map_err(|e| e.to_string())
 }
@@ -397,7 +408,7 @@ async fn download_model(model: EmbedderModel, engine: EmbeddingEngine, app: AppH
     let settings_path = desktop_settings_path().map_err(|e| e.to_string())?;
     let current_settings = wilkes_api::commands::settings::get_settings(&settings_path).await
         .unwrap_or_default();
-    let device = current_settings.semantic.device.clone();
+    let device = current_settings.semantic.device_for(engine).to_string();
     let manager = app.state::<wilkes_core::embed::worker_manager::WorkerManager>().inner().clone();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<EmbedProgress>(64);
@@ -483,7 +494,7 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
         .unwrap_or_default();
     let chunk_size = current_settings.semantic.chunk_size;
     let chunk_overlap = current_settings.semantic.chunk_overlap;
-    let device = current_settings.semantic.device.clone();
+    let device = current_settings.semantic.device_for(engine).to_string();
 
     // Stop the active watcher before rebuilding.
     stop_watcher(&app);
@@ -522,6 +533,7 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
             tx,
             chunk_size,
             chunk_overlap,
+            current_settings.supported_extensions.clone(),
         );
 
         tokio::pin!(build_fut);
@@ -567,6 +579,7 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
                                             model_id: model_clone.model_id().to_string(),
                                             data_dir: data_dir_clone.clone(),
                                             device: device.clone(),
+                                            supported_extensions: current_settings.supported_extensions.clone(),
                                         })
                                     } else {
                                         None
@@ -582,6 +595,7 @@ async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine
                                         watcher_config,
                                         chunk_size,
                                         chunk_overlap,
+                                        current_settings.supported_extensions.clone(),
                                         move || {
                                             let _ = handle_for_watcher.emit("manager-event", "Reindexing");
                                         },
@@ -661,9 +675,13 @@ async fn get_model_size(engine: EmbeddingEngine, model_id: String) -> Result<u64
 /// Cancel the active download or index build.
 #[tauri::command]
 async fn cancel_embed(app: AppHandle) -> Result<(), String> {
+    // Kill the worker process first — don't wait for the manager loop.
+    app.state::<wilkes_core::embed::worker_manager::WorkerManager>()
+        .inner()
+        .kill_active();
+
     if let Some(task) = app.state::<EmbedState>().0.lock().unwrap().take() {
         task.cancel.cancel();
-        // Don't await the join handle here — let it finish in background.
     }
     Ok(())
 }
@@ -747,7 +765,10 @@ async fn get_worker_status(app: AppHandle) -> Result<wilkes_core::embed::worker_
 #[tauri::command]
 async fn kill_worker(app: AppHandle) -> Result<(), String> {
     let manager = app.state::<wilkes_core::embed::worker_manager::WorkerManager>().inner().clone();
-    manager.sender().send(wilkes_core::embed::worker_manager::ManagerCommand::KillWorker).await.map_err(|e| e.to_string())
+    manager.kill_active();
+    // Also send through the channel so the manager loop cleans up its state.
+    let _ = manager.sender().send(wilkes_core::embed::worker_manager::ManagerCommand::KillWorker).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -800,7 +821,7 @@ async fn restore_semantic_state(app: &AppHandle) {
     }
 
     let manager = app.state::<wilkes_core::embed::worker_manager::WorkerManager>().inner().clone();
-    let installer = dispatch::get_installer(engine, model.clone(), manager, settings.semantic.device.clone());
+    let installer = dispatch::get_installer(engine, model.clone(), manager, settings.semantic.device_for(engine).to_string());
     
     // Ensure dimension is probed/known before build()
     let (tx, _) = tokio::sync::mpsc::channel(1);
@@ -849,7 +870,8 @@ async fn restore_semantic_state(app: &AppHandle) {
                 manager,
                 model_id: model.model_id().to_string(),
                 data_dir: data_dir.clone(),
-                device: settings.semantic.device.clone(),
+                device: settings.semantic.device_for(EmbeddingEngine::SBERT).to_string(),
+                supported_extensions: settings.supported_extensions.clone(),
             })
         } else {
             None
@@ -865,6 +887,7 @@ async fn restore_semantic_state(app: &AppHandle) {
             watcher_config,
             settings.semantic.chunk_size,
             settings.semantic.chunk_overlap,
+            settings.supported_extensions.clone(),
             move || {
                 let _ = handle_for_watcher.emit("manager-event", "Reindexing");
             },
@@ -906,6 +929,12 @@ pub fn run() {
             let python_path = resolve_python().unwrap_or_default();
             let script_path = resolve_worker_script(&handle).unwrap_or_default();
             let worker_bin = std::env::current_exe().unwrap_or_default().with_file_name("wilkes-worker");
+            
+            info!("Worker binary path: {}", worker_bin.display());
+            if !worker_bin.exists() {
+                error!("Worker binary NOT FOUND at {}", worker_bin.display());
+            }
+
             let paths = wilkes_core::embed::worker_manager::WorkerPaths { python_path, script_path, worker_bin };
             let (manager, mut event_rx, loop_fut) = wilkes_core::embed::worker_manager::WorkerManager::new(paths);
             app.manage(manager);

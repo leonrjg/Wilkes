@@ -18,6 +18,8 @@ pub struct WorkerRequest {
     pub device: String, // "auto", "cpu", "mps", "cuda", etc.
     pub paths: Option<Vec<PathBuf>>, // Optional: incremental update for specific files
     pub texts: Option<Vec<String>>,  // Used by "embed" mode
+    #[serde(default)]
+    pub supported_extensions: Vec<String>,
 }
 
 fn default_mode() -> String {

@@ -69,6 +69,25 @@ pub fn init_logging() {
         .init();
 }
 
+/// Like `init_logging`, but writes to stderr instead of stdout.
+/// Must be used by worker subprocesses whose stdout is a JSON protocol channel.
+pub fn init_logging_stderr() {
+    let fmt_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_thread_names(false);
+
+    let filter_layer = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new("debug"))
+        .unwrap();
+
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer)
+        .init();
+}
+
 pub fn get_logs() -> Vec<String> {
     LOG_BUFFER.lock().iter().cloned().collect()
 }

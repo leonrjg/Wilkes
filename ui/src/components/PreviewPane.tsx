@@ -197,6 +197,9 @@ function PdfViewer({
   const [zoom, setZoom] = useState(1.0);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const hasCalledRenderSuccess = useRef(false);
+  // Track the URL that onRenderSuccess is valid for, so in-flight renders from
+  // a previous document cannot dismiss the spinner for a newly opened file.
+  const activeUrlRef = useRef(url);
 
   // Find in document state
   const [isSearchOpen, setIsSearchOpen] = useState(false);
@@ -206,10 +209,11 @@ function PdfViewer({
   const [isSearching, setIsSearching] = useState(false);
   const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
 
-  // Reset success flag when URL changes
+  // Reset success flag when selection changes
   useEffect(() => {
+    activeUrlRef.current = url;
     hasCalledRenderSuccess.current = false;
-  }, [url]);
+  }, [url, page, highlight_bbox]);
 
   // Observe theme changes
   useEffect(() => {
@@ -497,6 +501,7 @@ function PdfViewer({
                     renderTextLayer={true}
                     canvasBackground="transparent"
                     onRenderSuccess={() => {
+                      if (url !== activeUrlRef.current) return;
                       if (pageNum === page || (!page && pageNum === 1)) {
                         if (!hasCalledRenderSuccess.current) {
                           hasCalledRenderSuccess.current = true;
@@ -525,8 +530,8 @@ function PdfViewer({
                           position: "absolute",
                           left: cx - r,
                           top: cy - r,
-                          width: r * 4,
-                          height: r * 4,
+                          width: r,
+                          height: r,
                           borderRadius: "50%",
                           backgroundColor: "rgba(202, 138, 4, 0.45)",
                           animationIterationCount: 2,
@@ -555,28 +560,55 @@ interface Props {
   selectedMatch: MatchRef | null;
   api: SearchApi;
   onClose: () => void;
+  canGoBack?: boolean;
+  canGoForward?: boolean;
+  onGoBack?: () => void;
+  onGoForward?: () => void;
 }
 
 function fileName(path: string) {
   return path.split(/[/\\]/).pop() ?? path;
 }
 
-export default function PreviewPane({ previewData, loading, selectedMatch, api, onClose }: Props) {
+export default function PreviewPane({ 
+  previewData, 
+  loading, 
+  selectedMatch, 
+  api, 
+  onClose,
+  canGoBack = false,
+  canGoForward = false,
+  onGoBack,
+  onGoForward
+}: Props) {
   // Keep the last valid previewData so the content stays mounted while a new
   // match is loading. This prevents PdfViewer from unmounting/remounting on
   // every match click, which would force react-pdf to re-parse the PDF file.
   const lastPreviewRef = useRef<PreviewData | null>(null);
   const [isPdfRendering, setIsPdfRendering] = useState(false);
+  const prevPdfUrlRef = useRef<string | null>(null);
 
   if (previewData) lastPreviewRef.current = previewData;
   const displayData = previewData ?? lastPreviewRef.current;
 
-  // Whenever the selection changes, we're definitely loading a new view
+  // Show the loading spinner only when a new PDF file is opened, not when
+  // navigating to a different match within the same file. Same-file navigation
+  // keeps PdfViewer mounted, so pages are already rendered and onRenderSuccess
+  // will never fire again — which would leave the spinner stuck forever.
   useEffect(() => {
     if (selectedMatch) {
       const isPdf = selectedMatch.path.toLowerCase().endsWith(".pdf");
-      setIsPdfRendering(isPdf);
+      if (isPdf) {
+        const newUrl = api.resolvePdfUrl(selectedMatch.path);
+        const isNewFile = newUrl !== prevPdfUrlRef.current;
+        prevPdfUrlRef.current = newUrl;
+        if (isNewFile) setIsPdfRendering(true);
+      } else {
+        prevPdfUrlRef.current = null;
+        setIsPdfRendering(false);
+      }
     } else {
+      prevPdfUrlRef.current = null;
       setIsPdfRendering(false);
     }
   }, [selectedMatch?.path, selectedMatch?.origin]);
@@ -588,8 +620,8 @@ export default function PreviewPane({ previewData, loading, selectedMatch, api, 
           <img src="/logo.transparent.png" alt="Wilkes" className="w-full h-full object-contain" />
         </div>
         <div className="flex flex-col items-center gap-1">
-          <span className="text-sm font-medium">Select a file to preview</span>
-          <span className="text-[11px] opacity-60">Search results and document contents will appear here</span>
+          <span className="text-sm font-medium">Select a file or perform a search</span>
+          <span className="text-[11px] opacity-60">Search results and documents will appear here</span>
         </div>
       </div>
     );
@@ -610,14 +642,16 @@ export default function PreviewPane({ previewData, loading, selectedMatch, api, 
       <div className="px-3 py-2 border-b border-[var(--border-main)] flex items-center gap-3 flex-shrink-0 bg-[var(--bg-header)]">
         <div className="flex items-center gap-1">
           <button
-            disabled
+            onClick={onGoBack}
+            disabled={!canGoBack}
             className="p-1 hover:bg-[var(--bg-active)] rounded text-[var(--text-dim)] disabled:opacity-30"
             title="Go back"
           >
             <ArrowLeft size={14} />
           </button>
           <button
-            disabled
+            onClick={onGoForward}
+            disabled={!canGoForward}
             className="p-1 hover:bg-[var(--bg-active)] rounded text-[var(--text-dim)] disabled:opacity-30"
             title="Go forward"
           >

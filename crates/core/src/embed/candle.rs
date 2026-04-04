@@ -140,8 +140,11 @@ fn load_pooling_strategy(data_dir: &Path, model_id: &str) -> PoolingStrategy {
 
 // ── Device / dtype selection ──────────────────────────────────────────────────
 
-fn select_device() -> Device {
-    #[cfg(feature = "metal")]
+fn select_device(device: &str) -> Device {
+    if device == "cpu" {
+        return Device::Cpu;
+    }
+    #[cfg(feature = "candle-metal")]
     if candle_core::utils::metal_is_available() {
         match Device::new_metal(0) {
             Ok(d) => return d,
@@ -357,11 +360,13 @@ impl Embedder for CandleEmbedder {
 
 pub struct CandleInstaller {
     pub model: EmbedderModel,
+    pub manager: super::worker_manager::WorkerManager,
+    pub device: String,
 }
 
 impl CandleInstaller {
-    pub fn new(model: EmbedderModel) -> Self {
-        Self { model }
+    pub fn new(model: EmbedderModel, manager: super::worker_manager::WorkerManager, device: String) -> Self {
+        Self { model, manager, device }
     }
 }
 
@@ -419,86 +424,119 @@ impl EmbedderInstaller for CandleInstaller {
 
     fn build(&self, data_dir: &Path) -> anyhow::Result<Arc<dyn Embedder>> {
         let model_id = &self.model.0;
-
-        let config_path = cached_path(data_dir, model_id, "config.json")
-            .ok_or_else(|| anyhow::anyhow!("config.json not cached for '{model_id}'"))?;
-        let tokenizer_path = cached_path(data_dir, model_id, "tokenizer.json")
-            .ok_or_else(|| anyhow::anyhow!("tokenizer.json not cached for '{model_id}'"))?;
-        let weights_path = cached_path(data_dir, model_id, "model.safetensors")
-            .ok_or_else(|| anyhow::anyhow!("model.safetensors not cached for '{model_id}'"))?;
-
-        let config_text = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config.json for '{model_id}'"))?;
-
-        let peek: ModelTypePeek = serde_json::from_str(&config_text)
-            .with_context(|| format!("Failed to peek model_type from config.json for '{model_id}'"))?;
-
-        let device = select_device();
-        let dtype = select_dtype(&device);
-
-        // Safety: memory-mapping model weights from a local path we own.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[&weights_path], dtype, &device)
-                .with_context(|| format!("Failed to load weights for '{model_id}'"))?
-        };
-
-        info!("[candle] dispatching '{model_id}' with model_type='{}'", peek.model_type);
-
-        let (model, dimension) = match peek.model_type.as_str() {
-            "jina_bert_v2" | "jina_bert" | "jina_bert_v3" | "qwen2" | "qwen" | "jina_embeddings_v5" => {
-                let config: JinaBertConfig = serde_json::from_str(&config_text)
-                    .map_err(|e| anyhow::anyhow!("Failed to parse JinaBertConfig for '{model_id}': {e}. Config: {config_text}"))?;
-                let dim = config.hidden_size;
-                let m = JinaBertModel::new(vb, &config)
-                    .with_context(|| format!("Failed to build JinaBert model for '{model_id}'"))?;
-                (LoadedModel::JinaBert(m), dim)
-            }
-            "modern_bert" => {
-                let config: ModernBertConfig = serde_json::from_str(&config_text)
-                    .with_context(|| format!("Failed to parse ModernBertConfig for '{model_id}'"))?;
-                let dim = config.hidden_size;
-                let m = ModernBert::load(vb, &config)
-                    .with_context(|| format!("Failed to build ModernBert model for '{model_id}'"))?;
-                (LoadedModel::ModernBert(m), dim)
-            }
-            _ => {
-                let config: BertConfig = serde_json::from_str(&config_text)
-                    .with_context(|| format!("Failed to parse BertConfig for '{model_id}'"))?;
-                let dim = config.hidden_size;
-                let m = BertModel::load(vb, &config)
-                    .with_context(|| format!("Failed to build BERT model for '{model_id}'"))?;
-                (LoadedModel::Bert(m), dim)
-            }
-        };
-
-        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer for '{model_id}': {e}"))?;
-
-        tokenizer.with_padding(Some(tokenizers::PaddingParams {
-            strategy: tokenizers::PaddingStrategy::BatchLongest,
-            ..Default::default()
-        }));
-        tokenizer
-            .with_truncation(Some(tokenizers::TruncationParams {
-                max_length: MAX_SEQUENCE_LENGTH,
-                ..Default::default()
-            }))
-            .map_err(|e| anyhow::anyhow!("Failed to configure truncation for '{model_id}': {e}"))?;
-
-        let pooling = load_pooling_strategy(data_dir, model_id);
-
-        info!(
-            "[candle] loaded '{model_id}' dim={dimension} pooling={pooling:?} device={device:?} dtype={dtype:?}"
-        );
-
-        Ok(Arc::new(CandleEmbedder {
-            model,
-            tokenizer,
-            device,
-            dtype,
-            model_id: model_id.clone(),
+        let dimension = read_dimension(data_dir, model_id)?;
+        Ok(Arc::new(super::sbert::WorkerEmbedder::new(
+            self.manager.clone(),
+            model_id.clone(),
             dimension,
-            pooling,
-        }))
+            self.device.clone(),
+            crate::types::EmbeddingEngine::Candle,
+            data_dir.to_path_buf(),
+        )))
     }
+}
+
+/// Read the embedding dimension for a model without loading its weights.
+/// Checks the static catalog first, then falls back to parsing config.json.
+fn read_dimension(data_dir: &Path, model_id: &str) -> anyhow::Result<usize> {
+    if let Some(m) = PREEXISTING_MODELS.iter().find(|m| m.model_id == model_id) {
+        return Ok(m.dimension);
+    }
+    let config_path = cached_path(data_dir, model_id, "config.json")
+        .ok_or_else(|| anyhow::anyhow!("config.json not cached for '{model_id}'"))?;
+    let config_text = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config.json for '{model_id}'"))?;
+    let v: serde_json::Value = serde_json::from_str(&config_text)
+        .with_context(|| format!("Failed to parse config.json for '{model_id}'"))?;
+    v.get("hidden_size")
+        .and_then(|v| v.as_u64())
+        .map(|d| d as usize)
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine embedding dimension for '{model_id}'"))
+}
+
+/// Load a `CandleEmbedder` directly in the calling process.
+/// Only called from the worker subprocess, never from the main Tauri process.
+pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> anyhow::Result<Arc<dyn Embedder>> {
+    let model_id = &model.0;
+
+    let config_path = cached_path(data_dir, model_id, "config.json")
+        .ok_or_else(|| anyhow::anyhow!("config.json not cached for '{model_id}'"))?;
+    let tokenizer_path = cached_path(data_dir, model_id, "tokenizer.json")
+        .ok_or_else(|| anyhow::anyhow!("tokenizer.json not cached for '{model_id}'"))?;
+    let weights_path = cached_path(data_dir, model_id, "model.safetensors")
+        .ok_or_else(|| anyhow::anyhow!("model.safetensors not cached for '{model_id}'"))?;
+
+    let config_text = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config.json for '{model_id}'"))?;
+
+    let peek: ModelTypePeek = serde_json::from_str(&config_text)
+        .with_context(|| format!("Failed to peek model_type from config.json for '{model_id}'"))?;
+
+    let device = select_device(device);
+    let dtype = select_dtype(&device);
+
+    // Safety: memory-mapping model weights from a local path we own.
+    let vb = unsafe {
+        VarBuilder::from_mmaped_safetensors(&[&weights_path], dtype, &device)
+            .with_context(|| format!("Failed to load weights for '{model_id}'"))?
+    };
+
+    info!("[candle] dispatching '{model_id}' with model_type='{}'", peek.model_type);
+
+    let (model_loaded, dimension) = match peek.model_type.as_str() {
+        "jina_bert_v2" | "jina_bert" | "jina_bert_v3" | "qwen2" | "qwen" | "jina_embeddings_v5" => {
+            let config: JinaBertConfig = serde_json::from_str(&config_text)
+                .map_err(|e| anyhow::anyhow!("Failed to parse JinaBertConfig for '{model_id}': {e}. Config: {config_text}"))?;
+            let dim = config.hidden_size;
+            let m = JinaBertModel::new(vb, &config)
+                .with_context(|| format!("Failed to build JinaBert model for '{model_id}'"))?;
+            (LoadedModel::JinaBert(m), dim)
+        }
+        "modern_bert" => {
+            let config: ModernBertConfig = serde_json::from_str(&config_text)
+                .with_context(|| format!("Failed to parse ModernBertConfig for '{model_id}'"))?;
+            let dim = config.hidden_size;
+            let m = ModernBert::load(vb, &config)
+                .with_context(|| format!("Failed to build ModernBert model for '{model_id}'"))?;
+            (LoadedModel::ModernBert(m), dim)
+        }
+        _ => {
+            let config: BertConfig = serde_json::from_str(&config_text)
+                .with_context(|| format!("Failed to parse BertConfig for '{model_id}'"))?;
+            let dim = config.hidden_size;
+            let m = BertModel::load(vb, &config)
+                .with_context(|| format!("Failed to build BERT model for '{model_id}'"))?;
+            (LoadedModel::Bert(m), dim)
+        }
+    };
+
+    let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load tokenizer for '{model_id}': {e}"))?;
+
+    tokenizer.with_padding(Some(tokenizers::PaddingParams {
+        strategy: tokenizers::PaddingStrategy::BatchLongest,
+        ..Default::default()
+    }));
+    tokenizer
+        .with_truncation(Some(tokenizers::TruncationParams {
+            max_length: MAX_SEQUENCE_LENGTH,
+            ..Default::default()
+        }))
+        .map_err(|e| anyhow::anyhow!("Failed to configure truncation for '{model_id}': {e}"))?;
+
+    let pooling = load_pooling_strategy(data_dir, model_id);
+
+    info!(
+        "[candle] loaded '{model_id}' dim={dimension} pooling={pooling:?} device={device:?} dtype={dtype:?}"
+    );
+
+    Ok(Arc::new(CandleEmbedder {
+        model: model_loaded,
+        tokenizer,
+        device,
+        dtype,
+        model_id: model_id.clone(),
+        dimension,
+        pooling,
+    }))
 }

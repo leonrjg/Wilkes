@@ -17,6 +17,7 @@ pub struct WatcherConfig {
     pub model_id: String,
     pub data_dir: PathBuf,
     pub device: String,
+    pub supported_extensions: Vec<String>,
 }
 
 pub struct IndexWatcher {
@@ -34,6 +35,7 @@ impl IndexWatcher {
         config: Option<WatcherConfig>,
         chunk_size: usize,
         chunk_overlap: usize,
+        supported_extensions: Vec<String>,
         on_reindex: impl Fn() + Send + Sync + 'static,
         on_reindex_done: impl Fn() + Send + Sync + 'static,
     ) -> anyhow::Result<Self> {
@@ -56,6 +58,11 @@ impl IndexWatcher {
                         let mut removed_paths = Vec::new();
 
                         for event in events {
+                            // Only care about supported extensions
+                            if crate::types::FileType::detect(&event.path, &supported_extensions).is_none() && event.path.exists() {
+                                continue;
+                            }
+
                             if event.path.exists() && event.path.is_file() {
                                 changed_paths.push(event.path.clone());
                             } else if !event.path.exists() {
@@ -142,6 +149,7 @@ fn spawn_sbert_worker(
         device: cfg.device.clone(),
         paths: Some(paths.to_vec()),
         texts: None,
+        supported_extensions: cfg.supported_extensions.clone(),
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);

@@ -59,6 +59,9 @@ export default function App() {
   const [selectedMatch, setSelectedMatch] = useState<MatchRef | null>(null);
   const [previewData, setPreviewData] = useState<PreviewData | null>(null);
   const [previewPending, startPreviewTransition] = useTransition();
+  const [history, setHistory] = useState<MatchRef[]>([]);
+  const [historyIndex, setHistoryIndex] = useState(-1);
+  const isNavigatingHistory = useRef(false);
   const currentSearchId = useRef<string | null>(null);
   const reindexToastId = useRef<string | null>(null);
 
@@ -68,6 +71,7 @@ export default function App() {
   const [respectGitignore, setRespectGitignore] = useState(true);
   const [maxFileSize, setMaxFileSize] = useState(10 * 1024 * 1024);
   const [contextLines, setContextLines] = useState(2);
+  const [supportedExtensions, setSupportedExtensions] = useState<string[]>([]);
   const [fileList, setFileList] = useState<FileEntry[]>([]);
   const [filterText, setFilterText] = useState("");
   const [excluded, setExcluded] = useState<Set<string>>(new Set());
@@ -115,11 +119,11 @@ export default function App() {
       if (!mounted) return;
       listen<string>("manager-event", (event) => {
         if (event.payload === "WorkerStarting") {
-          addToast("Starting worker - next queries will be faster", "info");
+          addToast("Starting worker... Next queries will be faster", "info");
         } else if (event.payload === "Reindexing") {
           if (!reindexToastId.current) {
             reindexToastId.current = addToast(
-              "Reindexing - semantic search is temporarily unavailable",
+              "Reindexing... Semantic search is temporarily unavailable",
               "info",
               0
             );
@@ -154,6 +158,7 @@ export default function App() {
       setRespectGitignore(s.respect_gitignore);
       setMaxFileSize(s.max_file_size);
       setContextLines(s.context_lines);
+      setSupportedExtensions(s.supported_extensions || []);
       setSemanticIndexBuilt(s.semantic.enabled && s.semantic.index_path !== null);
       setPreferSemantic(s.search_prefer_semantic);
       setTheme(s.theme);
@@ -243,7 +248,22 @@ export default function App() {
     }
   }, []);
 
-  const handleMatchClick = useCallback((matchRef: MatchRef) => {
+  const addToHistory = useCallback((matchRef: MatchRef) => {
+    if (isNavigatingHistory.current) return;
+    setHistory((prev) => {
+      const next = prev.slice(0, historyIndex + 1);
+      // Don't add if it's the same as current
+      if (next.length > 0 && 
+          next[next.length - 1].path === matchRef.path && 
+          JSON.stringify(next[next.length - 1].origin) === JSON.stringify(matchRef.origin)) {
+        return prev;
+      }
+      return [...next, matchRef];
+    });
+    setHistoryIndex((prev) => prev + 1);
+  }, [historyIndex]);
+
+  const handleSelectMatchInternal = useCallback((matchRef: MatchRef) => {
     setSelectedMatch(matchRef);
     startPreviewTransition(async () => {
       try {
@@ -256,18 +276,38 @@ export default function App() {
     });
   }, []);
 
+  const goBack = useCallback(() => {
+    if (historyIndex > 0) {
+      isNavigatingHistory.current = true;
+      const nextIndex = historyIndex - 1;
+      const matchRef = history[nextIndex];
+      setHistoryIndex(nextIndex);
+      handleSelectMatchInternal(matchRef);
+      setTimeout(() => { isNavigatingHistory.current = false; }, 0);
+    }
+  }, [history, historyIndex, handleSelectMatchInternal]);
+
+  const goForward = useCallback(() => {
+    if (historyIndex < history.length - 1) {
+      isNavigatingHistory.current = true;
+      const nextIndex = historyIndex + 1;
+      const matchRef = history[nextIndex];
+      setHistoryIndex(nextIndex);
+      handleSelectMatchInternal(matchRef);
+      setTimeout(() => { isNavigatingHistory.current = false; }, 0);
+    }
+  }, [history, historyIndex, handleSelectMatchInternal]);
+
+  const handleMatchClick = useCallback((matchRef: MatchRef) => {
+    addToHistory(matchRef);
+    handleSelectMatchInternal(matchRef);
+  }, [addToHistory, handleSelectMatchInternal]);
+
   const handleFileClick = useCallback((path: string) => {
-    setSelectedMatch({ path, origin: { PdfPage: { page: 1, bbox: null } } });
-    startPreviewTransition(async () => {
-      try {
-        const data = await api.openFile(path);
-        setPreviewData(data);
-      } catch (e) {
-        console.error("Open file failed:", e);
-        setPreviewData(null);
-      }
-    });
-  }, []);
+    const matchRef: MatchRef = { path, origin: { PdfPage: { page: 1, bbox: null } } };
+    addToHistory(matchRef);
+    handleSelectMatchInternal(matchRef);
+  }, [addToHistory, handleSelectMatchInternal]);
 
   const sourceSlot = source.type === "desktop" ? (
     <DirectoryPicker
@@ -305,6 +345,7 @@ export default function App() {
         refreshSemanticReady={refreshSemanticReady}
         onSettingsUpdate={(patch) => {
           if (patch.theme) setTheme(patch.theme);
+          if (patch.supported_extensions) setSupportedExtensions(patch.supported_extensions);
         }}
       />
     </>
@@ -327,6 +368,7 @@ export default function App() {
         respectGitignore={respectGitignore}
         maxFileSize={maxFileSize}
         contextLines={contextLines}
+        supportedExtensions={supportedExtensions}
         fileList={fileList}
         excluded={excluded}
         onExcludedChange={setExcluded}
@@ -366,6 +408,10 @@ export default function App() {
             selectedMatch={selectedMatch}
             api={api}
             onClose={() => setSelectedMatch(null)}
+            canGoBack={historyIndex > 0}
+            canGoForward={historyIndex < history.length - 1}
+            onGoBack={goBack}
+            onGoForward={goForward}
           />
         </div>
       </div>

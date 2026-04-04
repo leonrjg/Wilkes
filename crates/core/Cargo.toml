@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["candle", "metal", "fastembed"]
+default = ["candle", "candle-metal", "fastembed"]
 fastembed = ["dep:fastembed", "dep:hf-hub", "dep:ureq", "dep:ort"]
+fastembed-coreml = ["fastembed"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "dep:ureq"]
-metal = ["candle", "candle-core/metal", "candle-core/accelerate", "candle-nn/metal", "candle-transformers/metal"]
+candle-metal = ["candle", "candle-core/metal", "candle-core/accelerate", "candle-nn/metal", "candle-transformers/metal"]
 
 [dependencies]
 grep-matcher = "0.1"
@@ -32,7 +33,9 @@ notify = "6"
 notify-debouncer-mini = "0.4"
 text-splitter = { version = "0.27", features = ["markdown"] }
 async-trait = "0.1"
+libc = "0.2"
 sqlite-vec = "0.1.9"
+strip-ansi-escapes = "0.2.1"
 
 [dependencies.ort]
 version = "=2.0.0-rc.11"

@@ -216,34 +216,20 @@ impl SemanticIndex {
 
         let mut idx = Self::create_at_path(&tmp_path, embedder.model_id(), embedder.dimension(), engine)?;
 
-        // Phase 1: extract and chunk all files (0% to 30% progress).
-        let mut file_chunks: Vec<(PathBuf, Vec<Chunk>)> = Vec::new();
+        // Extract, embed, and write one file at a time so peak memory is bounded
+        // to a single file's chunks + embeddings on top of the model weights.
         for (i, path) in paths.iter().enumerate() {
             let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
                 files_processed: i,
                 total_files,
-                message: format!("Extracting {} of {}...", i + 1, total_files),
+                message: format!("Indexing {} of {}...", i + 1, total_files),
                 done: false,
             }));
 
-            match Self::extract_chunks(path, extractors, chunk_size, chunk_overlap) {
-                Ok(chunks) if !chunks.is_empty() => file_chunks.push((path.clone(), chunks)),
-                _ => {}
-            }
-        }
-
-        // Phase 2: embed and write per file to bound peak memory usage.
-        // Embedding all files at once would hold all chunk texts + all embedding
-        // vectors in memory simultaneously; per-file processing keeps peak at
-        // (one file's chunks + embeddings) on top of the model weights.
-        let total_extracted = file_chunks.len();
-        for (i, (path, chunks)) in file_chunks.into_iter().enumerate() {
-            let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
-                files_processed: total_files / 3 + (i * total_files * 2 / (3 * total_extracted.max(1))),
-                total_files,
-                message: format!("Embedding {} of {}...", i + 1, total_extracted),
-                done: false,
-            }));
+            let chunks = match Self::extract_chunks(path, extractors, chunk_size, chunk_overlap) {
+                Ok(c) if !c.is_empty() => c,
+                _ => continue,
+            };
 
             let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
             let embeddings = embedder.embed_passages(&texts)?;

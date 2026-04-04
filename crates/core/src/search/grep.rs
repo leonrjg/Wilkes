@@ -29,40 +29,6 @@ impl GrepSearchProvider {
             .build(&pattern)?;
         Ok(matcher)
     }
-
-    fn detect_file_type(path: &Path) -> Option<FileType> {
-        const TEXT_EXTENSIONS: &[&str] = &[
-            "txt", "md", "markdown", "rst", "rs", "py", "js", "ts", "jsx", "tsx",
-            "json", "toml", "yaml", "yml", "xml", "html", "htm", "css", "scss",
-            "sass", "less", "c", "cpp", "cc", "cxx", "h", "hpp", "java", "go",
-            "rb", "sh", "bash", "zsh", "fish", "lua", "php", "swift", "kt",
-            "cs", "r", "sql", "graphql", "gql", "proto", "ini", "cfg", "conf",
-            "env", "gitignore", "lock", "log", "csv", "tsv", "jsonl",
-        ];
-
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            let ext_lc = ext.to_ascii_lowercase();
-            if ext_lc == "pdf" {
-                return Some(FileType::Pdf);
-            }
-            if TEXT_EXTENSIONS.contains(&ext_lc.as_str()) {
-                return Some(FileType::PlainText);
-            }
-        }
-
-        // No extension or unknown extension — check well-known filenames.
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            let name_lc = name.to_ascii_lowercase();
-            if ["makefile", "dockerfile", "jenkinsfile", "procfile", "gemfile",
-                "rakefile", "vagrantfile", "podfile", "brewfile"]
-                .contains(&name_lc.as_str())
-            {
-                return Some(FileType::PlainText);
-            }
-        }
-
-        None
-    }
 }
 
 impl Default for GrepSearchProvider {
@@ -123,7 +89,7 @@ impl SearchProvider for GrepSearchProvider {
                 }
             }
 
-            let file_type = match Self::detect_file_type(path) {
+            let file_type = match FileType::detect(path, &query.supported_extensions) {
                 Some(ft) => ft,
                 None => {
                     // Use infer for unknown types; skip if recognised binary.
@@ -283,7 +249,7 @@ fn search_extracted_content(
             let matched_text = String::from_utf8_lossy(&text[start..end]).into_owned();
             let origin = content
                 .source_map
-                .resolve(start)
+                .resolve_range(ByteRange { start, end })
                 .unwrap_or(SourceOrigin::PdfPage { page: 1, bbox: None });
 
             // Extract ~120-char context windows around the match using char

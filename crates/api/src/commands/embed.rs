@@ -4,7 +4,7 @@ use std::sync::Arc;
 use ignore::WalkBuilder;
 use wilkes_core::embed::Embedder;
 use wilkes_core::embed::index::SemanticIndex;
-use wilkes_core::embed::installer::{EmbedderInstaller, ProgressTx};
+use wilkes_core::embed::installer::ProgressTx;
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::types::IndexStatus;
@@ -22,29 +22,18 @@ pub async fn download_model(
     installer.install(&data_dir, tx).await
 }
 
-/// Walk `root`, embed every file, and write a new `SemanticIndex` at `data_dir`.
-/// Returns the `Arc<dyn Embedder>` used during the build so the caller can store
-/// it in state without loading the model a second time.
-///
-/// Cancellation is handled by the caller via `tokio::select!` on the returned
-/// future; this function runs to completion once started.
-pub async fn build_index(
+/// Walk `root`, embed every file using `embedder`, and write a new `SemanticIndex`
+/// at `data_dir`. The embedder is returned so callers can cache it without reloading.
+pub async fn build_index_with_embedder(
     root: PathBuf,
     engine: wilkes_core::types::EmbeddingEngine,
-    model: wilkes_core::types::EmbedderModel,
-    manager: wilkes_core::embed::worker_manager::WorkerManager,
-    device: String,
+    embedder: Arc<dyn Embedder>,
     data_dir: PathBuf,
     tx: ProgressTx,
     chunk_size: usize,
     chunk_overlap: usize,
+    supported_extensions: Vec<String>,
 ) -> anyhow::Result<Arc<dyn Embedder>> {
-    let installer = wilkes_core::embed::dispatch::get_installer(engine, model, manager, device);
-    
-    // Ensure model is ready (probes dimension for SBERT, no-op for others if already cached)
-    installer.install(&data_dir, tx.clone()).await?;
-    
-    let embedder: Arc<dyn Embedder> = installer.build(&data_dir)?;
     let embedder_clone = Arc::clone(&embedder);
 
     let paths: Vec<PathBuf> = WalkBuilder::new(&root)
@@ -52,7 +41,9 @@ pub async fn build_index(
         .git_ignore(true)
         .build()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file())
+        .filter(|e| {
+            e.path().is_file() && wilkes_core::types::FileType::detect(e.path(), &supported_extensions).is_some()
+        })
         .map(|e| e.path().to_path_buf())
         .collect();
 
@@ -79,6 +70,33 @@ pub async fn build_index(
     .await??;
 
     Ok(embedder)
+}
+
+/// Walk `root`, embed every file, and write a new `SemanticIndex` at `data_dir`.
+/// Returns the `Arc<dyn Embedder>` used during the build so the caller can store
+/// it in state without loading the model a second time.
+///
+/// Cancellation is handled by the caller via `tokio::select!` on the returned
+/// future; this function runs to completion once started.
+pub async fn build_index(
+    root: PathBuf,
+    engine: wilkes_core::types::EmbeddingEngine,
+    model: wilkes_core::types::EmbedderModel,
+    manager: wilkes_core::embed::worker_manager::WorkerManager,
+    device: String,
+    data_dir: PathBuf,
+    tx: ProgressTx,
+    chunk_size: usize,
+    chunk_overlap: usize,
+    supported_extensions: Vec<String>,
+) -> anyhow::Result<Arc<dyn Embedder>> {
+    let installer = wilkes_core::embed::dispatch::get_installer(engine, model, manager, device);
+
+    // Ensure model is ready (probes dimension for SBERT, no-op for others if already cached)
+    installer.install(&data_dir, tx.clone()).await?;
+
+    let embedder = installer.build(&data_dir)?;
+    build_index_with_embedder(root, engine, embedder, data_dir, tx, chunk_size, chunk_overlap, supported_extensions).await
 }
 
 /// Fetch the total download size for `model_id` from the HuggingFace API.

@@ -55,7 +55,7 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
     ModelInfo {
         model_id: "jinaai/jina-embeddings-v5-text-small",
         display_name: "jina-embeddings-v5-text-small",
-        description: "Speed: slow, accuracy: medium-high (English only)",
+        description: "Speed: slow, accuracy: high (English only)",
         dimension: 1024,
         is_default: false,
         is_recommended: false,
@@ -95,107 +95,76 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
 ];
 
 pub fn list_supported_models() -> Vec<ModelDescriptor> {
-    let mut models: std::collections::HashMap<String, ModelDescriptor> = PREEXISTING_MODELS
+    PREEXISTING_MODELS
         .iter()
-        .map(|info| {
-            (
-                info.model_id.to_string(),
-                ModelDescriptor {
-                    model_id: info.model_id.to_string(),
-                    display_name: info.display_name.to_string(),
-                    description: info.description.to_string(),
-                    dimension: info.dimension,
-                    is_cached: false,
-                    is_default: info.is_default,
-                    is_recommended: info.is_recommended,
-                    size_bytes: None,
-                    preferred_batch_size: Some(32),
-                },
-            )
+        .map(|info| ModelDescriptor {
+            model_id: info.model_id.to_string(),
+            display_name: info.display_name.to_string(),
+            description: info.description.to_string(),
+            dimension: info.dimension,
+            is_cached: false,
+            is_default: info.is_default,
+            is_recommended: info.is_recommended,
+            size_bytes: None,
+            preferred_batch_size: Some(32),
         })
-        .collect();
-
-    let cache_root = super::hf_cache::get_hf_cache_root();
-    if cache_root.exists() {
-        if let Ok(entries) = std::fs::read_dir(cache_root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-
-                let folder_name = match path.file_name().and_then(|n| n.to_str()) {
-                    Some(name) if name.starts_with("models--") => name,
-                    _ => continue,
-                };
-
-                // models--org--name -> org/name
-                let model_id_encoded = &folder_name[8..];
-                let model_id = if let Some(pos) = model_id_encoded.find("--") {
-                    let (org, name) = model_id_encoded.split_at(pos);
-                    format!("{}/{}", org, &name[2..])
-                } else {
-                    model_id_encoded.to_string()
-                };
-
-                if let Some(desc) = super::hf_cache::get_model_descriptor_from_path(&path, &model_id) {
-                    if let Some(existing) = models.get_mut(&model_id) {
-                        existing.is_cached = true;
-                        existing.size_bytes = desc.size_bytes;
-                    } else {
-                        models.insert(model_id, desc);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut result: Vec<ModelDescriptor> = models.into_values().collect();
-    result.sort_by(|a, b| a.model_id.cmp(&b.model_id));
-    result
+        .collect()
 }
 
-// ── SBERTEmbedder ────────────────────────────────────────────────────────────
+// ── WorkerEmbedder ────────────────────────────────────────────────────────────
 
-/// Implements `Embedder` for the SBERT engine by dispatching to the `WorkerManager`.
-pub struct SBERTEmbedder {
+/// Implements `Embedder` by dispatching to a worker subprocess via `WorkerManager`.
+/// Used by SBERT (Python worker), Fastembed, and Candle (Rust worker binary).
+pub struct WorkerEmbedder {
     manager: WorkerManager,
     model_id: String,
     dimension: usize,
     device: String,
+    engine: EmbeddingEngine,
+    /// Passed in embed requests so the worker can load the model on demand.
+    data_dir: std::path::PathBuf,
 }
 
-impl SBERTEmbedder {
-    pub fn new(manager: WorkerManager, model_id: String, dimension: usize, device: String) -> Self {
-        Self { manager, model_id, dimension, device }
+impl WorkerEmbedder {
+    pub fn new(
+        manager: WorkerManager,
+        model_id: String,
+        dimension: usize,
+        device: String,
+        engine: EmbeddingEngine,
+        data_dir: std::path::PathBuf,
+    ) -> Self {
+        Self { manager, model_id, dimension, device, engine, data_dir }
     }
-}
 
-impl Embedder for SBERTEmbedder {
-    fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+    /// Returns (query_prefix, passage_prefix) for models that require them.
+    fn prefixes(&self) -> (&'static str, &'static str) {
+        if self.model_id.contains("/multilingual-e5") || self.model_id.contains("/e5-") {
+            ("query: ", "passage: ")
+        } else {
+            ("", "")
+        }
+    }
+
+    fn send_embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         let request = WorkerRequest {
             mode: "embed".to_string(),
             root: std::path::PathBuf::new(),
-            engine: EmbeddingEngine::SBERT,
+            engine: self.engine,
             model: self.model_id.clone(),
-            data_dir: std::path::PathBuf::new(),
+            data_dir: self.data_dir.clone(),
             chunk_size: 0,
             chunk_overlap: 0,
             device: self.device.clone(),
             paths: None,
             texts: Some(texts.iter().map(|s| s.to_string()).collect()),
+            supported_extensions: Vec::new(),
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        
-        let cmd = ManagerCommand::Submit {
-            req: request,
-            reply: tx,
-        };
+        let cmd = ManagerCommand::Submit { req: request, reply: tx };
 
-        // Since embed() is synchronous, we block on sending and receiving.
         let handle = tokio::runtime::Handle::current();
-        
         handle.block_on(async move {
             self.manager.sender().send(cmd).await
                 .map_err(|e| anyhow::anyhow!("Failed to send command to manager: {e}"))?;
@@ -210,6 +179,34 @@ impl Embedder for SBERTEmbedder {
             }
             Err(anyhow::anyhow!("Worker finished without returning embeddings"))
         })
+    }
+}
+
+impl Embedder for WorkerEmbedder {
+    fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.send_embed(texts)
+    }
+
+    fn embed_query(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let (qp, _) = self.prefixes();
+        if qp.is_empty() {
+            self.send_embed(texts)
+        } else {
+            let prefixed: Vec<String> = texts.iter().map(|t| format!("{qp}{t}")).collect();
+            let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+            self.send_embed(&refs)
+        }
+    }
+
+    fn embed_passages(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let (_, pp) = self.prefixes();
+        if pp.is_empty() {
+            self.send_embed(texts)
+        } else {
+            let prefixed: Vec<String> = texts.iter().map(|t| format!("{pp}{t}")).collect();
+            let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+            self.send_embed(&refs)
+        }
     }
 
     fn model_id(&self) -> &str {
@@ -269,6 +266,7 @@ impl EmbedderInstaller for SBERTInstaller {
             device: self.device.clone(),
             paths: None,
             texts: None,
+            supported_extensions: Vec::new(),
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -325,11 +323,13 @@ impl EmbedderInstaller for SBERTInstaller {
                 model_id
             ))?;
 
-        Ok(Arc::new(SBERTEmbedder::new(
+        Ok(Arc::new(WorkerEmbedder::new(
             self.manager.clone(),
             model_id.to_string(),
             dimension,
             self.device.clone(),
+            EmbeddingEngine::SBERT,
+            std::path::PathBuf::new(),
         )))
     }
 }

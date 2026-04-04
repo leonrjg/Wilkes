@@ -5,7 +5,7 @@ use wilkes_core::types::{ByteRange, FileEntry, FileType, PreviewData};
 
 use super::preview::detect_language;
 
-pub async fn list_files(root: PathBuf) -> anyhow::Result<Vec<FileEntry>> {
+pub async fn list_files(root: PathBuf, supported_extensions: Vec<String>) -> anyhow::Result<Vec<FileEntry>> {
     tokio::task::spawn_blocking(move || {
         let mut entries = Vec::new();
         for result in WalkBuilder::new(&root).build() {
@@ -15,7 +15,7 @@ pub async fn list_files(root: PathBuf) -> anyhow::Result<Vec<FileEntry>> {
             };
             if entry.file_type().map(|t: std::fs::FileType| t.is_file()).unwrap_or(false) {
                 let path = entry.path().to_path_buf();
-                let Some(file_type) = detect_file_type(&path) else {
+                let Some(file_type) = FileType::detect(&path, &supported_extensions) else {
                     continue;
                 };
                 let size_bytes = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
@@ -29,8 +29,8 @@ pub async fn list_files(root: PathBuf) -> anyhow::Result<Vec<FileEntry>> {
     .await?
 }
 
-pub async fn open_file(path: PathBuf) -> anyhow::Result<PreviewData> {
-    match detect_file_type(&path) {
+pub async fn open_file(path: PathBuf, supported_extensions: Vec<String>) -> anyhow::Result<PreviewData> {
+    match FileType::detect(&path, &supported_extensions) {
         Some(FileType::Pdf) => Ok(PreviewData::Pdf { page: 1, highlight_bbox: None }),
         Some(FileType::PlainText) => {
             let content = tokio::fs::read_to_string(&path).await?;
@@ -43,25 +43,5 @@ pub async fn open_file(path: PathBuf) -> anyhow::Result<PreviewData> {
             })
         }
         None => anyhow::bail!("unsupported file type: {}", path.display()),
-    }
-}
-
-fn detect_file_type(path: &Path) -> Option<FileType> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    if ext == "pdf" {
-        return Some(FileType::Pdf);
-    }
-    const TEXT_EXTENSIONS: &[&str] = &[
-        "txt", "md", "markdown", "rst", "rs", "py", "js", "ts", "jsx", "tsx",
-        "json", "toml", "yaml", "yml", "xml", "html", "htm", "css", "scss",
-        "sass", "less", "c", "cpp", "cc", "cxx", "h", "hpp", "java", "go",
-        "rb", "sh", "bash", "zsh", "fish", "lua", "php", "swift", "kt",
-        "cs", "r", "sql", "graphql", "gql", "proto", "ini", "cfg", "conf",
-        "env", "gitignore", "lock", "log", "csv", "tsv", "jsonl",
-    ];
-    if TEXT_EXTENSIONS.contains(&ext.as_str()) {
-        Some(FileType::PlainText)
-    } else {
-        None
     }
 }

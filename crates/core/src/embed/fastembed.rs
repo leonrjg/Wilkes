@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 use async_trait::async_trait;
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 
 use crate::types::{EmbedderModel, ModelDescriptor};
 use super::Embedder;
@@ -219,11 +219,13 @@ impl Embedder for FastEmbedder {
 
 pub struct FastembedInstaller {
     pub model: EmbedderModel,
+    pub manager: super::worker_manager::WorkerManager,
+    pub device: String,
 }
 
 impl FastembedInstaller {
-    pub fn new(model: EmbedderModel) -> Self {
-        Self { model }
+    pub fn new(model: EmbedderModel, manager: super::worker_manager::WorkerManager, device: String) -> Self {
+        Self { model, manager, device }
     }
 }
 
@@ -239,8 +241,23 @@ impl EmbedderInstaller for FastembedInstaller {
 
     async fn install(&self, data_dir: &Path, tx: ProgressTx) -> anyhow::Result<()> {
         let info = find_model_info(&self.model.0)?;
+
+        // If the main model file is already cached, skip re-initialisation.
+        // Calling TextEmbedding::try_new for an already-present model only
+        // loads the ONNX runtime (and potentially CoreML), which can crash the
+        // process on some configurations. The download step is the only reason
+        // to call try_new here.
+        if hf_hub::Cache::new(data_dir.to_path_buf())
+            .repo(hf_hub::Repo::model(info.model_code.clone()))
+            .get(&info.model_file)
+            .is_some()
+        {
+            return Ok(());
+        }
+
         let fm = info.model;
         let cache_dir = data_dir.to_path_buf();
+        let device = self.device.clone();
 
         let _ = tx
             .send(EmbedProgress::Download(DownloadProgress {
@@ -251,18 +268,20 @@ impl EmbedderInstaller for FastembedInstaller {
             .await;
 
         tokio::task::spawn_blocking(move || {
-            let mut options = InitOptions::new(fm)
+            let device_clean = device.trim().to_lowercase();
+            let providers = if device_clean == "cpu" {
+                tracing::info!("[fastembed] install: forcing CPU execution provider");
+                vec![ort::ep::CPUExecutionProvider::default().into()]
+            } else {
+                vec![
+                    ort::ep::CoreMLExecutionProvider::default().into(),
+                    ort::ep::CPUExecutionProvider::default().into(),
+                ]
+            };
+            let options = TextInitOptions::new(fm)
                 .with_cache_dir(cache_dir)
-                .with_show_download_progress(true);
-
-            #[cfg(target_os = "macos")]
-            {
-                options = options.with_execution_providers(vec![
-                    ort::execution_providers::CoreMLExecutionProvider::default().into(),
-                    ort::execution_providers::CPUExecutionProvider::default().into(),
-                ]);
-            }
-
+                .with_show_download_progress(true)
+                .with_execution_providers(providers);
             TextEmbedding::try_new(options)
         })
         .await?
@@ -285,31 +304,48 @@ impl EmbedderInstaller for FastembedInstaller {
 
     fn build(&self, data_dir: &Path) -> anyhow::Result<Arc<dyn Embedder>> {
         let info = find_model_info(&self.model.0)?;
-        let dimension = info.dim;
-        let model_id = self.model.0.clone();
-        let cache_dir = data_dir.to_path_buf();
-        let preferred_batch_size = get_preferred_batch_size(&model_id, &info.description);
-
-        let mut options = InitOptions::new(info.model)
-            .with_cache_dir(cache_dir)
-            .with_show_download_progress(true);
-
-        #[cfg(target_os = "macos")]
-        {
-            options = options.with_execution_providers(vec![
-                ort::execution_providers::CoreMLExecutionProvider::default().into(),
-                ort::execution_providers::CPUExecutionProvider::default().into(),
-            ]);
-        }
-
-        let inner = TextEmbedding::try_new(options)
-            .map_err(|e| anyhow::anyhow!("fastembed build: {e}"))?;
-
-        Ok(Arc::new(FastEmbedder {
-            inner: Mutex::new(inner),
-            model_id,
-            dimension,
-            preferred_batch_size,
-        }))
+        Ok(Arc::new(super::sbert::WorkerEmbedder::new(
+            self.manager.clone(),
+            self.model.0.clone(),
+            info.dim,
+            self.device.clone(),
+            crate::types::EmbeddingEngine::Fastembed,
+            data_dir.to_path_buf(),
+        )))
     }
+}
+
+/// Load a `FastEmbedder` directly in the calling process.
+/// Only called from the worker subprocess, never from the main Tauri process.
+pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> anyhow::Result<Arc<dyn Embedder>> {
+    let info = find_model_info(&model.0)?;
+    let dimension = info.dim;
+    let model_id = model.0.clone();
+    let cache_dir = data_dir.to_path_buf();
+    let preferred_batch_size = get_preferred_batch_size(&model_id, &info.description);
+
+    let device_clean = device.trim().to_lowercase();
+    let providers = if device_clean == "cpu" {
+        tracing::info!("[fastembed] forcing CPU execution provider for {}", model_id);
+        vec![ort::ep::CPUExecutionProvider::default().into()]
+    } else {
+        vec![
+            ort::ep::CoreMLExecutionProvider::default().into(),
+            ort::ep::CPUExecutionProvider::default().into(),
+        ]
+    };
+    let options = TextInitOptions::new(info.model)
+        .with_cache_dir(cache_dir)
+        .with_show_download_progress(true)
+        .with_execution_providers(providers);
+
+    let inner = TextEmbedding::try_new(options)
+        .map_err(|e| anyhow::anyhow!("fastembed load: {e}"))?;
+
+    Ok(Arc::new(FastEmbedder {
+        inner: Mutex::new(inner),
+        model_id,
+        dimension,
+        preferred_batch_size,
+    }))
 }

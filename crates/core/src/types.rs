@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 // ── Byte range (replaces std::ops::Range<usize> for serde compat) ────────────
@@ -41,6 +42,9 @@ pub struct SearchQuery {
     /// Which search backend to use.
     #[serde(default)]
     pub mode: SearchMode,
+    /// The global list of supported extensions from settings.
+    #[serde(default)]
+    pub supported_extensions: Vec<String>,
 }
 
 fn default_true() -> bool { true }
@@ -70,10 +74,36 @@ pub struct FileMatches {
     pub matches: Vec<Match>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileType {
     PlainText,
     Pdf,
+}
+
+impl FileType {
+    pub fn detect(path: &std::path::Path, supported_extensions: &[String]) -> Option<Self> {
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+
+        if !supported_extensions.iter().any(|s| s.to_ascii_lowercase() == ext) {
+            // Special case: check well-known filenames if no extension or unknown extension
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                let name_lc = name.to_ascii_lowercase();
+                if ["makefile", "dockerfile", "jenkinsfile", "procfile", "gemfile",
+                    "rakefile", "vagrantfile", "podfile", "brewfile"]
+                    .contains(&name_lc.as_str())
+                {
+                    return Some(FileType::PlainText);
+                }
+            }
+            return None;
+        }
+
+        if ext == "pdf" {
+            Some(FileType::Pdf)
+        } else {
+            Some(FileType::PlainText)
+        }
+    }
 }
 
 // ── Source Mapping ───────────────────────────────────────────────────────────
@@ -103,6 +133,21 @@ pub struct BoundingBox {
     pub height: f32,
 }
 
+impl BoundingBox {
+    pub fn merge(&self, other: &Self) -> Self {
+        let x1 = self.x.min(other.x);
+        let y1 = self.y.min(other.y);
+        let x2 = (self.x + self.width).max(other.x + other.width);
+        let y2 = (self.y + self.height).max(other.y + other.height);
+        BoundingBox {
+            x: x1,
+            y: y1,
+            width: (x2 - x1).max(0.0),
+            height: (y2 - y1).max(0.0),
+        }
+    }
+}
+
 impl SourceMap {
     /// Resolve a byte offset in extracted text to a SourceOrigin.
     pub fn resolve(&self, offset: usize) -> Option<SourceOrigin> {
@@ -115,6 +160,54 @@ impl SourceMap {
         }
         // Fall back to last segment
         self.segments.last().map(|s| s.origin.clone())
+    }
+
+    /// Resolve a byte range in extracted text to a merged SourceOrigin.
+    /// If the range spans multiple PDF segments on the same page, their bboxes are merged.
+    pub fn resolve_range(&self, range: ByteRange) -> Option<SourceOrigin> {
+        let mut merged_bbox: Option<BoundingBox> = None;
+        let mut page_num: Option<u32> = None;
+        let mut first_origin: Option<SourceOrigin> = None;
+
+        for seg in &self.segments {
+            // Check if segment overlaps with the range
+            if seg.text_range.start < range.end && seg.text_range.end > range.start {
+                if first_origin.is_none() {
+                    first_origin = Some(seg.origin.clone());
+                }
+
+                match &seg.origin {
+                    SourceOrigin::PdfPage { page, bbox } => {
+                        if let Some(p) = page_num {
+                            if p != *page {
+                                // If match spans multiple pages, we stick to segments on the first page
+                                // that overlaps with the match start.
+                                continue;
+                            }
+                        } else {
+                            page_num = Some(*page);
+                        }
+
+                        if let Some(b) = bbox {
+                            merged_bbox = match merged_bbox {
+                                Some(existing) => Some(existing.merge(b)),
+                                None => Some(b.clone()),
+                            };
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some(p) = page_num {
+            Some(SourceOrigin::PdfPage {
+                page: p,
+                bbox: merged_bbox,
+            })
+        } else {
+            first_origin.or_else(|| self.resolve(range.start))
+        }
     }
 }
 
@@ -207,7 +300,7 @@ pub struct ModelDescriptor {
 
 // ── Embedding engine ──────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum EmbeddingEngine {
     #[default]
     SBERT,
@@ -221,6 +314,15 @@ impl EmbeddingEngine {
             EmbeddingEngine::SBERT => "sbert",
             EmbeddingEngine::Candle => "candle",
             EmbeddingEngine::Fastembed => "fastembed",
+        }
+    }
+
+    /// Default device string for this engine. Used when no explicit override is set.
+    pub fn default_device(&self) -> &'static str {
+        match self {
+            EmbeddingEngine::SBERT => "auto",
+            EmbeddingEngine::Candle => "auto",
+            EmbeddingEngine::Fastembed => "cpu",
         }
     }
 
@@ -259,9 +361,10 @@ pub struct SemanticSettings {
     /// Embedding dimension for the current model.
     #[serde(default = "SemanticSettings::default_dimension")]
     pub dimension: usize,
-    /// Device override for SBERT engine ("auto", "cpu", "mps", "cuda").
-    #[serde(default = "SemanticSettings::default_device")]
-    pub device: String,
+    /// Per-engine device overrides ("auto", "cpu", "mps", "cuda").
+    /// Missing entries fall back to each engine's own default_device().
+    #[serde(default)]
+    pub engine_devices: HashMap<EmbeddingEngine, String>,
     pub index_path: Option<PathBuf>,
     /// List of arbitrary HuggingFace IDs manually added by the user, scoped by engine.
     #[serde(default, deserialize_with = "deserialize_custom_models")]
@@ -320,8 +423,12 @@ impl SemanticSettings {
         768 // Default for BgeBaseEn
     }
 
-    fn default_device() -> String {
-        "auto".to_string()
+    /// Returns the effective device string for the given engine,
+    /// falling back to that engine's built-in default when no override is set.
+    pub fn device_for(&self, engine: EmbeddingEngine) -> &str {
+        self.engine_devices.get(&engine)
+            .map(String::as_str)
+            .unwrap_or_else(|| engine.default_device())
     }
 }
 impl Default for SemanticSettings {
@@ -331,7 +438,7 @@ impl Default for SemanticSettings {
             engine: EmbeddingEngine::default(),
             model: EmbedderModel("BAAI/bge-base-en-v1.5".to_string()),
             dimension: Self::default_dimension(),
-            device: Self::default_device(),
+            engine_devices: HashMap::new(),
             index_path: None,
             custom_models: Vec::new(),
             chunk_size: Self::default_chunk_size(),
@@ -370,6 +477,22 @@ pub struct Settings {
     #[serde(default)]
     pub search_prefer_semantic: bool,
     pub semantic: SemanticSettings,
+    #[serde(default = "default_supported_extensions")]
+    pub supported_extensions: Vec<String>,
+}
+
+fn default_supported_extensions() -> Vec<String> {
+    vec![
+        "txt", "md", "markdown", "rst", "rs", "py", "js", "ts", "jsx", "tsx",
+        "json", "toml", "yaml", "yml", "xml", "html", "htm", "css", "scss",
+        "sass", "less", "c", "cpp", "cc", "cxx", "h", "hpp", "java", "go",
+        "rb", "sh", "bash", "zsh", "fish", "lua", "php", "swift", "kt",
+        "cs", "r", "sql", "graphql", "gql", "proto", "ini", "cfg", "conf",
+        "env", "gitignore", "lock", "log", "csv", "tsv", "jsonl", "pdf",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 impl Default for Settings {
@@ -384,6 +507,7 @@ impl Default for Settings {
             theme: Theme::default(),
             search_prefer_semantic: false,
             semantic: SemanticSettings::default(),
+            supported_extensions: default_supported_extensions(),
         }
     }
 }

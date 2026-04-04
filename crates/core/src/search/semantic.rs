@@ -56,9 +56,8 @@ impl SearchProvider for SemanticSearchProvider {
         let mut file_order: Vec<std::path::PathBuf> = Vec::new();
 
         for chunk in results {
-            let file_type = match chunk.file_path.extension().and_then(|e| e.to_str()) {
-                Some("pdf") => FileType::Pdf,
-                _ => FileType::PlainText,
+            let Some(file_type) = FileType::detect(&chunk.file_path, &query.supported_extensions) else {
+                continue;
             };
 
             let text_range = match &chunk.origin {

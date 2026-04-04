@@ -19,7 +19,18 @@ async fn preview_text(match_ref: &MatchRef) -> anyhow::Result<PreviewData> {
         let line = content[..range.start.min(content.len())].lines().count() as u32;
         // Adjust for potential missing trailing newline on last line or empty file
         let highlight_line = if line == 0 { 1 } else { line as u32 };
-        (highlight_line, range.clone())
+
+        // Convert byte range to UTF-16 code unit range for the frontend (JS/CodeMirror)
+        let utf16_start = content[..range.start.min(content.len())].encode_utf16().count();
+        let utf16_len = content[range.start.min(content.len())..range.end.min(content.len())]
+            .encode_utf16()
+            .count();
+        let highlight_range = ByteRange {
+            start: utf16_start,
+            end: utf16_start + utf16_len,
+        };
+
+        (highlight_line, highlight_range)
     } else {
         let line = match &match_ref.origin {
             SourceOrigin::TextFile { line, .. } => *line,

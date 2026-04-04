@@ -48,7 +48,7 @@ export default function LogsPanel({ api }: LogsPanelProps) {
   };
 
   return (
-    <div className="flex flex-col h-full gap-3">
+    <div className="flex flex-col h-full gap-3 p-1">
       <div className="flex items-center justify-between">
         <h3 className="text-[10px] font-medium text-[var(--text-dim)] uppercase tracking-wider">
           System Logs
@@ -71,17 +71,19 @@ export default function LogsPanel({ api }: LogsPanelProps) {
 
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto bg-black/20 rounded-lg p-3 font-mono text-[11px] leading-relaxed text-[var(--text-muted)] border border-[var(--border-main)]"
+        className="flex-1 overflow-y-auto bg-[var(--bg-input)] rounded-lg p-4 font-mono text-[11px] leading-relaxed text-[var(--text-muted)] border border-[var(--border-main)] flex flex-col-reverse"
       >
-        {logs.length === 0 ? (
-          <div className="text-[var(--text-dim)] italic">No logs available.</div>
-        ) : (
-          logs.map((line, i) => (
-            <div key={i} className="whitespace-pre-wrap break-all mb-1 last:mb-0">
-              {line}
-            </div>
-          ))
-        )}
+        <div className="flex flex-col">
+          {logs.length === 0 ? (
+            <div className="text-[var(--text-dim)] italic">No logs available.</div>
+          ) : (
+            logs.map((line, i) => (
+              <div key={i} className="whitespace-pre-wrap break-all mb-1 last:mb-0">
+                {line}
+              </div>
+            ))
+          )}
+        </div>
       </div>
     </div>
   );

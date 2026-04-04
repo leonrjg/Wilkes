@@ -49,13 +49,19 @@ pub fn chunk_content(
             }
             // chunks() returns subslices of the original — pointer diff gives the byte offset.
             let offset = chunk_str.as_ptr() as usize - base;
+            let byte_range = ByteRange { start: offset, end: offset + chunk_str.len() };
             let origin = content
                 .source_map
-                .resolve(offset)
+                .resolve_range(byte_range.clone())
                 .or_else(|| {
                     // Chunk start may land on a gap (e.g. inter-page whitespace in PDFs).
                     // Walk forward to the first byte that resolves.
-                    (1..chunk_str.len()).find_map(|i| content.source_map.resolve(offset + i))
+                    (1..chunk_str.len()).find_map(|i| {
+                        content.source_map.resolve_range(ByteRange { 
+                            start: offset + i, 
+                            end: offset + chunk_str.len() 
+                        })
+                    })
                 })
                 .unwrap_or_else(|| {
                     let line = content.text[..offset].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
@@ -63,7 +69,7 @@ pub fn chunk_content(
                 });
             Some(Chunk {
                 text,
-                byte_range: ByteRange { start: offset, end: offset + chunk_str.len() },
+                byte_range,
                 origin,
                 file_path: file_path.clone(),
             })
