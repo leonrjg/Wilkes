@@ -16,6 +16,8 @@ interface Props {
   excluded?: Set<string>;
   onExcludedChange?: (excluded: Set<string>) => void;
   onQueryChange?: (hasQuery: boolean) => void;
+  initialSemanticMode?: boolean;
+  onSemanticModeChange?: (active: boolean) => void;
 }
 
 export default function SearchBar({
@@ -31,17 +33,25 @@ export default function SearchBar({
   fileList = [],
   excluded = new Set<string>(),
   onQueryChange,
+  initialSemanticMode = false,
+  onSemanticModeChange,
 }: Props) {
   const [pattern, setPattern] = useState("");
   const [isRegex, setIsRegex] = useState(false);
   const [caseSensitive, setCaseSensitive] = useState(false);
-  const [isSemanticMode, setIsSemanticMode] = useState(false);
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [isSemanticMode, setIsSemanticMode] = useState(initialSemanticMode);
 
-  // Reset semantic mode when it becomes unavailable
+  // Sync state if initial prop changes (e.g. on load)
   useEffect(() => {
-    if (!semanticReady) setIsSemanticMode(false);
-  }, [semanticReady]);
+    setIsSemanticMode(initialSemanticMode);
+  }, [initialSemanticMode]);
+
+  const handleToggleSemantic = () => {
+    const next = !isSemanticMode;
+    setIsSemanticMode(next);
+    onSemanticModeChange?.(next);
+  };
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const buildQuery = useCallback(
     (pat: string): SearchQuery => {
@@ -80,7 +90,7 @@ export default function SearchBar({
   // Debounce pattern changes
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => triggerSearch(pattern), 200);
+    debounceRef.current = setTimeout(() => triggerSearch(pattern), 400);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
@@ -112,8 +122,7 @@ export default function SearchBar({
         <Toggle
           title={semanticReady ? "Semantic search" : "Set up semantic search in Settings"}
           active={isSemanticMode}
-          disabled={!semanticReady}
-          onToggle={() => setIsSemanticMode((v) => !v)}
+          onToggle={handleToggleSemantic}
           className="px-3 min-w-[100px]"
         >
           <div className="flex items-center gap-2">

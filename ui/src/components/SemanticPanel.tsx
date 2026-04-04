@@ -147,7 +147,11 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     // Flexible parsing to extract org/model preserving case.
     // Matches optional http(s)://, optional www., optional huggingface.co/ or hf.co/,
     // then captures the organization and model name.
-    const match = modelId.match(/^(?:https?:\/\/)?(?:www\.)?(?:huggingface\.co\/|hf\.co\/)?([^/]+)\/([^/?#]+)/i);
+    // We try to find the full URL pattern first, then fall back to any org/model substring.
+    const hfUrlRegex = /(?:https?:\/\/)?(?:www\.)?(?:huggingface\.co\/|hf\.co\/)([a-zA-Z0-9._-]+)\/([a-zA-Z0-9._-]+)/i;
+    const hfIdRegex = /([a-zA-Z0-9._-]+)\/([a-zA-Z0-9._-]+)/;
+    
+    const match = modelId.match(hfUrlRegex) || modelId.match(hfIdRegex);
     
     if (match && match[1] && match[2]) {
       modelId = `${match[1]}/${match[2]}`;
@@ -480,7 +484,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
                     {m.is_cached && (
                       <span className="text-green-500 text-[9px] bg-green-500/10 px-1 rounded">Cached</span>
                     )}
-                    <span className="text-[9px] text-[var(--text-dim)] ml-auto">{m.dimension}d</span>
+                    <span className="text-[9px] text-[var(--text-dim)] ml-auto">{m.size_bytes ? formatBytes(m.size_bytes) : ""}</span>
                   </div>
                   <p className="text-[9px] text-[var(--text-dim)] leading-snug line-clamp-1 ml-3.5 selectable">
                     {m.description}
@@ -491,7 +495,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
                         ? "Checking size…"
                         : m.size_bytes !== null
                           ? `Estimated download: ${formatBytes(m.size_bytes)}`
-                          : "Download required"}
+                          : `Download required: ${m.size_bytes ? formatBytes(m.size_bytes) : "Unknown"}`}
                     </span>
                   )}
                 </button>

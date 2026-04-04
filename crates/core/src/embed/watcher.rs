@@ -34,6 +34,8 @@ impl IndexWatcher {
         config: Option<WatcherConfig>,
         chunk_size: usize,
         chunk_overlap: usize,
+        on_reindex: impl Fn() + Send + Sync + 'static,
+        on_reindex_done: impl Fn() + Send + Sync + 'static,
     ) -> anyhow::Result<Self> {
         let (tx_events, rx_events) =
             std::sync::mpsc::channel::<notify_debouncer_mini::DebounceEventResult>();
@@ -76,6 +78,7 @@ impl IndexWatcher {
 
                         // Handle additions/modifications
                         if !changed_paths.is_empty() {
+                            on_reindex();
                             if let Some(ref emb) = embedder {
                                 for path in changed_paths {
                                     handle_event(&path, &index, &extractors, emb, chunk_size, chunk_overlap);
@@ -87,6 +90,7 @@ impl IndexWatcher {
                                     error!("[IndexWatcher] Failed to spawn SBERT worker: {e:#}");
                                 }
                             }
+                            on_reindex_done();
                         }
                     }
                     Err(e) => {

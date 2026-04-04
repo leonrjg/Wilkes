@@ -40,7 +40,7 @@ impl PdfBackend for MuPdfBackend {
         let size_bytes = std::fs::metadata(path)?.len();
 
         Ok(ExtractedContent {
-            text,
+            text: text.clone(),
             source_map: SourceMap { segments },
             metadata: FileMetadata {
                 path: path.to_path_buf(),

@@ -525,8 +525,8 @@ function PdfViewer({
                           position: "absolute",
                           left: cx - r,
                           top: cy - r,
-                          width: r * 2,
-                          height: r * 2,
+                          width: r * 4,
+                          height: r * 4,
                           borderRadius: "50%",
                           backgroundColor: "rgba(202, 138, 4, 0.45)",
                           animationIterationCount: 2,
@@ -584,7 +584,7 @@ export default function PreviewPane({ previewData, loading, selectedMatch, api, 
   if (!selectedMatch) {
     return (
       <div className="flex flex-col items-center justify-center h-full bg-[var(--bg-app)] text-[var(--text-dim)]">
-        <div className="w-80 h-80 mb-8 opacity-20 grayscale brightness-150 transition-all hover:opacity-40 hover:grayscale-0">
+        <div className="w-80 h-80 mb-8 opacity-20 transition-all hover:opacity-50">
           <img src="/logo.transparent.png" alt="Wilkes" className="w-full h-full object-contain" />
         </div>
         <div className="flex flex-col items-center gap-1">

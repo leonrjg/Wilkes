@@ -35,6 +35,8 @@ pub enum WorkerEvent {
     Progress(EmbedProgress),
     /// Embedding vectors returned by the "embed" mode.
     Embeddings(Vec<Vec<f32>>),
+    /// Model metadata returned by the "info" mode.
+    Info { dimension: usize, max_seq_length: usize },
     /// Index build completed successfully.
     Done,
     /// Index build failed.

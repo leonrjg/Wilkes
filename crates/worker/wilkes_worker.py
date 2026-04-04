@@ -43,12 +43,21 @@ def get_model(model_id, device):
             "done": False
         }}})
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer(
-            model_id,
-            device=None if device == "auto" else device,
-            trust_remote_code=True,
-            model_kwargs={"attn_implementation": "sdpa"}
-        )
+        try:
+            # Try optimized SDPA first
+            model = SentenceTransformer(
+                model_id,
+                device=None if device == "auto" else device,
+                trust_remote_code=True,
+                model_kwargs={"attn_implementation": "sdpa"}
+            )
+        except (ValueError, Exception):
+            # Fallback to default attention if SDPA is not supported by this architecture
+            model = SentenceTransformer(
+                model_id,
+                device=None if device == "auto" else device,
+                trust_remote_code=True
+            )
         MODEL_CACHE[cache_key] = model
     return MODEL_CACHE[cache_key]
 
@@ -71,6 +80,26 @@ def extract_text(path):
         except Exception as e:
             return f"Error reading file: {e}"
 
+def _safe_encode(model, texts, **kwargs):
+    """
+    Centralized encoding helper that handles both modern task-based API 
+    and legacy SentenceTransformer models with a robust fallback.
+    """
+    # Default settings for indexing/retrieval
+    params = {
+        "normalize_embeddings": True,
+        "convert_to_numpy": True,
+        "show_progress_bar": False,
+    }
+    params.update(kwargs)
+    
+    try:
+        # Try modern API with task='retrieval'
+        return model.encode(texts, task='retrieval', **params)
+    except (TypeError, ValueError):
+        # Fallback for models that don't support 'task'
+        return model.encode(texts, **params)
+
 def build_index(request):
     import time
     import numpy as np
@@ -85,6 +114,10 @@ def build_index(request):
     build_start = time.time()
 
     db_path = data_dir / "semantic_index.db"
+    if not paths:
+        actual_db_path = data_dir / "semantic_index.db.tmp"
+    else:
+        actual_db_path = db_path
 
     model = get_model(model_id, device)
 
@@ -133,15 +166,11 @@ def build_index(request):
         "done": False
     }}})
 
-    embeddings = model.encode([c[2] for c in all_chunks],
-                                normalize_embeddings=True,
-                                convert_to_numpy=True,
-                                show_progress_bar=True,
-                                task='retrieval')
+    embeddings = _safe_encode(model, [c[2] for c in all_chunks], show_progress_bar=True)
 
     import sqlite_vec
 
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(actual_db_path)
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
@@ -195,6 +224,7 @@ def build_index(request):
     conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('dimension', ?)", (str(dimension),))
     conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('built_at', ?)", (str(built_at),))
     conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('build_duration_ms', ?)", (str(build_duration_ms),))
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('root_path', ?)", (str(root),))
 
     cur = conn.cursor()
     for path_str in {str(p) for p, *_ in all_chunks}:
@@ -219,6 +249,19 @@ def build_index(request):
     conn.commit()
     conn.close()
 
+    if not paths:
+        # Atomic rename for full build
+        import os
+        # Remove old files to avoid rename issues
+        for suffix in ["", "-wal", "-shm"]:
+            try:
+                p = str(db_path) + suffix
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+        os.rename(str(actual_db_path), str(db_path))
+
     emit({"Progress": {"Build": {
         "files_processed": total_files,
         "total_files": total_files,
@@ -239,7 +282,7 @@ def embed_texts(request):
         return
 
     model = get_model(model_id, device)
-    embeddings = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=True, task='retrieval')
+    embeddings = _safe_encode(model, texts, show_progress_bar=True)
     emit({"Embeddings": embeddings.tolist()})
     emit({"Done": None})
 
@@ -258,6 +301,28 @@ def main():
                 build_index(request)
             elif mode == "embed":
                 embed_texts(request)
+            elif mode == "info":
+                model_id = request["model"]
+                device = request.get("device", "auto")
+                model = get_model(model_id, device)
+                # SentenceTransformer models have a 'get_sentence_embedding_dimension' method
+                dim = model.get_sentence_embedding_dimension()
+                seq_len = model.get_max_seq_length()
+
+                # Fallback: If metadata is missing, perform a dummy probe to see the actual output shape
+                if dim is None:
+                    dummy_emb = _safe_encode(model, [""])
+                    dim = dummy_emb.shape[1]
+                
+                if dim is None or int(dim) == 0:
+                    emit({"Error": f"Unable to determine dimension for model '{model_id}' via probe."})
+                    return
+                
+                # Handle Infinity for JSON compatibility
+                if seq_len == float('inf') or seq_len > 1_000_000:
+                    seq_len = 999999
+                emit({"Info": {"dimension": int(dim), "max_seq_length": int(seq_len)}})
+                emit({"Done": None})
             else:
                 emit({"Error": f"Unknown mode: {mode}"})
         except Exception as e:

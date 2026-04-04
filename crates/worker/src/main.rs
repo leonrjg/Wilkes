@@ -32,13 +32,23 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-        let installer = dispatch::get_installer(req.engine.clone(), wilkes_core::types::EmbedderModel(req.model.clone()));
-        
+        // The worker binary only handles Candle/Fastembed, never SBERT.
+        // We create a dummy manager to satisfy the API.
+        let (dummy_manager, _, _) = wilkes_core::embed::worker_manager::WorkerManager::new(
+            wilkes_core::embed::worker_manager::WorkerPaths {
+                python_path: "".into(),
+                script_path: "".into(),
+                worker_bin: "".into(),
+            }
+        );
+
         let result = if req.mode == "build" {
             wilkes_api::commands::embed::build_index(
                 req.root,
-                installer.as_ref(),
                 req.engine,
+                wilkes_core::types::EmbedderModel(req.model.clone()),
+                dummy_manager,
+                req.device.clone(),
                 req.data_dir,
                 tx,
                 req.chunk_size,

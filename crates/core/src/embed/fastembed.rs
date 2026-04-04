@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error, info, warn};
+use tracing::debug;
 
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};

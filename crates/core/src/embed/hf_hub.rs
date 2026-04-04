@@ -1,4 +1,3 @@
-use hf_hub::api::sync::ApiBuilder;
 use std::path::Path;
 
 /// Fetch total download size for `model_id` from the HuggingFace API.

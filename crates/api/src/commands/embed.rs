@@ -9,12 +9,16 @@ use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::types::IndexStatus;
 
-/// Download and install the model for `installer`. Reports progress via `tx`.
+/// Download and install the model. Reports progress via `tx`.
 pub async fn download_model(
-    installer: &dyn EmbedderInstaller,
+    engine: wilkes_core::types::EmbeddingEngine,
+    model: wilkes_core::types::EmbedderModel,
+    manager: wilkes_core::embed::worker_manager::WorkerManager,
+    device: String,
     data_dir: PathBuf,
     tx: ProgressTx,
 ) -> anyhow::Result<()> {
+    let installer = wilkes_core::embed::dispatch::get_installer(engine, model, manager, device);
     installer.install(&data_dir, tx).await
 }
 
@@ -26,13 +30,20 @@ pub async fn download_model(
 /// future; this function runs to completion once started.
 pub async fn build_index(
     root: PathBuf,
-    installer: &dyn EmbedderInstaller,
     engine: wilkes_core::types::EmbeddingEngine,
+    model: wilkes_core::types::EmbedderModel,
+    manager: wilkes_core::embed::worker_manager::WorkerManager,
+    device: String,
     data_dir: PathBuf,
     tx: ProgressTx,
     chunk_size: usize,
     chunk_overlap: usize,
 ) -> anyhow::Result<Arc<dyn Embedder>> {
+    let installer = wilkes_core::embed::dispatch::get_installer(engine, model, manager, device);
+    
+    // Ensure model is ready (probes dimension for SBERT, no-op for others if already cached)
+    installer.install(&data_dir, tx.clone()).await?;
+    
     let embedder: Arc<dyn Embedder> = installer.build(&data_dir)?;
     let embedder_clone = Arc::clone(&embedder);
 
@@ -46,6 +57,7 @@ pub async fn build_index(
         .collect();
 
     let data_dir_clone = data_dir.clone();
+    let root_clone = root.clone();
 
     tokio::task::spawn_blocking(move || {
         let mut registry = ExtractorRegistry::new();
@@ -53,6 +65,7 @@ pub async fn build_index(
 
         SemanticIndex::build(
             &data_dir_clone,
+            &root_clone,
             &paths,
             &registry,
             embedder_clone.as_ref(),

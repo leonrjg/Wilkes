@@ -4,6 +4,7 @@ pub mod downloader;
 pub mod hf_cache;
 pub mod hf_hub;
 pub mod index;
+pub mod sbert;
 pub mod installer;
 pub mod watcher;
 pub mod worker_ipc;

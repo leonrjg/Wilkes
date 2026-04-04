@@ -2,10 +2,11 @@ use std::path::Path;
 use std::sync::Arc;
 use crate::types::{EmbeddingEngine, EmbedderModel, ModelDescriptor};
 use super::installer::EmbedderInstaller;
+use super::worker_manager::WorkerManager;
 
 pub fn list_models(engine: EmbeddingEngine, _data_dir: &Path) -> Vec<ModelDescriptor> {
     match engine {
-        EmbeddingEngine::SBERT => super::hf_cache::list_cached_models(),
+        EmbeddingEngine::SBERT => super::sbert::list_supported_models(),
 
         #[cfg(feature = "candle")]
         EmbeddingEngine::Candle => super::candle::list_supported_models(_data_dir),
@@ -19,17 +20,22 @@ pub fn list_models(engine: EmbeddingEngine, _data_dir: &Path) -> Vec<ModelDescri
     }
 }
 
-pub fn get_installer(engine: EmbeddingEngine, _model: EmbedderModel) -> Arc<dyn EmbedderInstaller> {
+pub fn get_installer(
+    engine: EmbeddingEngine, 
+    model: EmbedderModel, 
+    manager: WorkerManager,
+    device: String,
+) -> Arc<dyn EmbedderInstaller> {
     match engine {
-        EmbeddingEngine::SBERT => panic!("SBERT engine does not use in-process installers"),
+        EmbeddingEngine::SBERT => Arc::new(super::sbert::SBERTInstaller::new(model, manager, device)),
 
         #[cfg(feature = "candle")]
-        EmbeddingEngine::Candle => Arc::new(super::candle::CandleInstaller::new(_model)),
+        EmbeddingEngine::Candle => Arc::new(super::candle::CandleInstaller::new(model)),
         #[cfg(not(feature = "candle"))]
         EmbeddingEngine::Candle => panic!("Candle feature is disabled"),
 
         #[cfg(feature = "fastembed")]
-        EmbeddingEngine::Fastembed => Arc::new(super::fastembed::FastembedInstaller::new(_model)),
+        EmbeddingEngine::Fastembed => Arc::new(super::fastembed::FastembedInstaller::new(model)),
         #[cfg(not(feature = "fastembed"))]
         EmbeddingEngine::Fastembed => panic!("Fastembed feature is disabled"),
     }

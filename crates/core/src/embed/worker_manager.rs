@@ -34,16 +34,23 @@ pub enum ManagerCommand {
     SetTimeout(u64),
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ManagerEvent {
+    WorkerStarting,
+    ReindexingDone,
+}
+
 #[derive(Clone)]
 pub struct WorkerManager {
     sender: mpsc::Sender<ManagerCommand>,
 }
 
 impl WorkerManager {
-    pub fn new(paths: WorkerPaths) -> (Self, impl std::future::Future<Output = ()> + Send) {
+    pub fn new(paths: WorkerPaths) -> (Self, mpsc::Receiver<ManagerEvent>, impl std::future::Future<Output = ()> + Send) {
         let (tx, rx) = mpsc::channel(32);
-        let fut = manager_loop(paths, rx);
-        (Self { sender: tx }, fut)
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let fut = manager_loop(paths, rx, event_tx);
+        (Self { sender: tx }, event_rx, fut)
     }
 
     pub fn sender(&self) -> &mpsc::Sender<ManagerCommand> {
@@ -56,7 +63,7 @@ struct ActiveProcess {
     stdout: BufReader<tokio::process::ChildStdout>,
 }
 
-async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>) {
+async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>, event_tx: mpsc::Sender<ManagerEvent>) {
     let mut active_process: Option<ActiveProcess> = None;
     let mut active_engine = None;
     let mut active_model = None;
@@ -119,6 +126,8 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
                     if let Some(mut proc) = active_process.take() {
                         let _ = proc.child.kill().await;
                     }
+
+                    let _ = event_tx.send(ManagerEvent::WorkerStarting).await;
 
                     let mut command = match req.engine {
                         EmbeddingEngine::SBERT => {

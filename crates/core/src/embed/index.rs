@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
 
 use anyhow::Context;
 use rusqlite::{Connection, params};
@@ -55,17 +55,16 @@ pub struct IndexedChunk {
 
 pub struct SemanticIndex {
     conn: Connection,
-    #[allow(dead_code)]
     model_id: String,
-    #[allow(dead_code)]
     dimension: usize,
+    root_path: Option<PathBuf>,
 }
 
 impl SemanticIndex {
     /// Open an existing index. Returns `Err` if no index exists at `data_dir` or
     /// if `model_id` in the stored metadata mismatches the parameter.
     /// The dimension is read from the DB; callers can inspect it via `status()`.
-    pub fn open(data_dir: &Path, model_id: &str) -> anyhow::Result<Self> {
+    pub fn open(data_dir: &Path, model_id: &str, expected_dimension: usize) -> anyhow::Result<Self> {
         load_sqlite_vec();
 
         let path = db_path(data_dir);
@@ -115,35 +114,55 @@ impl SemanticIndex {
             )
             .unwrap_or(0);
 
+        anyhow::ensure!(
+            stored_dimension == expected_dimension,
+            "Index dimension mismatch: stored={}, expected={}. Rebuild the index.",
+            stored_dimension,
+            expected_dimension
+        );
+
+        let root_path: Option<PathBuf> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'root_path'",
+                [],
+                |row| {
+                    let s: String = row.get(0)?;
+                    Ok(Some(PathBuf::from(s)))
+                },
+            )
+            .unwrap_or(None);
+
         Ok(Self {
             conn,
             model_id: stored_model_id,
             dimension: stored_dimension,
+            root_path,
         })
     }
 
-    /// Create a new empty index at `data_dir` (schema only, no files indexed).
-    /// Removes any existing index at that path.
-    pub fn create(
-        data_dir: &Path,
+    /// Create a new empty index at the specified path.
+    pub fn create_at_path(
+        path: &Path,
         model_id: &str,
         dimension: usize,
         engine: EmbeddingEngine,
     ) -> anyhow::Result<Self> {
         load_sqlite_vec();
 
-        std::fs::create_dir_all(data_dir)?;
-        let path = db_path(data_dir);
-        if path.exists() {
-            std::fs::remove_file(&path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        // Remove orphaned WAL/SHM files left by a previous unclean shutdown.
-        // If the main DB was deleted but these remain, SQLite will try to replay
-        // them into the new database and fail with a disk I/O error.
+        
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+
+        // Remove orphaned WAL/SHM files if any.
+        let data_dir = path.parent().unwrap_or(Path::new("."));
         let _ = std::fs::remove_file(data_dir.join("semantic_index.db-wal"));
         let _ = std::fs::remove_file(data_dir.join("semantic_index.db-shm"));
 
-        let conn = Connection::open(&path)
+        let conn = Connection::open(path)
             .with_context(|| format!("Failed to create index at {}", path.display()))?;
 
         Self::create_schema(&conn, model_id, dimension, engine)?;
@@ -161,13 +180,26 @@ impl SemanticIndex {
             conn,
             model_id: model_id.to_string(),
             dimension,
+            root_path: None,
         })
+    }
+
+    /// Create a new empty index at `data_dir` (schema only, no files indexed).
+    /// Removes any existing index at that path.
+    pub fn create(
+        data_dir: &Path,
+        model_id: &str,
+        dimension: usize,
+        engine: EmbeddingEngine,
+    ) -> anyhow::Result<Self> {
+        Self::create_at_path(&db_path(data_dir), model_id, dimension, engine)
     }
 
     /// Full build: creates the database at `data_dir`, indexes every path, and
     /// returns the open index.
     pub fn build(
         data_dir: &Path,
+        root_path: &Path,
         paths: &[PathBuf],
         extractors: &ExtractorRegistry,
         embedder: &dyn Embedder,
@@ -176,9 +208,13 @@ impl SemanticIndex {
         chunk_size: usize,
         chunk_overlap: usize,
     ) -> anyhow::Result<Self> {
-        let start_time = std::time::Instant::now();
+        let start_time = Instant::now();
         let total_files = paths.len();
-        let mut idx = Self::create(data_dir, embedder.model_id(), embedder.dimension(), engine)?;
+
+        let final_path = db_path(data_dir);
+        let tmp_path = data_dir.join("semantic_index.db.tmp");
+
+        let mut idx = Self::create_at_path(&tmp_path, embedder.model_id(), embedder.dimension(), engine)?;
 
         // Phase 1: extract and chunk all files (0% to 30% progress).
         let mut file_chunks: Vec<(PathBuf, Vec<Chunk>)> = Vec::new();
@@ -226,6 +262,23 @@ impl SemanticIndex {
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('build_duration_ms', ?1)",
             params![duration_ms.to_string()],
         )?;
+        idx.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('root_path', ?1)",
+            params![root_path.to_string_lossy()],
+        )?;
+
+        // Success! Close connection and rename.
+        let model_id = idx.model_id.clone();
+        let dimension = idx.dimension;
+        drop(idx);
+
+        // Remove old files if they exist to avoid rename errors on some systems.
+        let _ = std::fs::remove_file(&final_path);
+        let _ = std::fs::remove_file(data_dir.join("semantic_index.db-wal"));
+        let _ = std::fs::remove_file(data_dir.join("semantic_index.db-shm"));
+
+        std::fs::rename(&tmp_path, &final_path)
+            .with_context(|| format!("Failed to rename {} to {}", tmp_path.display(), final_path.display()))?;
 
         let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
             files_processed: total_files,
@@ -234,7 +287,8 @@ impl SemanticIndex {
             done: true,
         }));
 
-        Ok(idx)
+        // Reopen at final path
+        Self::open(data_dir, &model_id, dimension)
     }
 
     fn create_schema(
@@ -301,7 +355,7 @@ impl SemanticIndex {
                 let text = std::fs::read_to_string(path)
                     .with_context(|| format!("Failed to read {}", path.display()))?;
                 crate::types::ExtractedContent {
-                    text,
+                    text: text.clone(),
                     source_map: crate::types::SourceMap { segments: Vec::new() },
                     metadata: crate::types::FileMetadata {
                         path: path.to_path_buf(),
@@ -347,6 +401,17 @@ impl SemanticIndex {
     /// for that path first.
     pub fn write_file(&mut self, prepared: PreparedFile) -> anyhow::Result<()> {
         let path_str = prepared.path.to_string_lossy();
+
+        // Validate dimensions before starting transaction.
+        for (_, embedding) in &prepared.chunks {
+            anyhow::ensure!(
+                embedding.len() == self.dimension,
+                "Dimension mismatch: expected {}, received {} for path {}",
+                self.dimension,
+                embedding.len(),
+                path_str
+            );
+        }
 
         // Delete vectors first (vec0 has no FK cascade), then the chunk rows.
         self.conn.execute(
@@ -457,7 +522,7 @@ impl SemanticIndex {
         let results: Vec<IndexedChunk> = raw_rows.into_iter()
             .flatten()
             .inspect(|(distance, file_path, ..)| {
-                tracing::info!("[query] candidate: distance={distance:.4}, file={file_path}");
+                // tracing::info!("[query] candidate: distance={distance:.4}, file={file_path}");
             })
             .filter_map(|(distance, file_path, byte_start, byte_end, origin_json, chunk_text)| {
                 let score = 1.0 - distance;
@@ -535,6 +600,14 @@ impl SemanticIndex {
             .map(|n: i64| n as usize)
             .unwrap_or(0);
 
+        let root_path: Option<PathBuf> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'root_path'", [], |r| {
+                let s: String = r.get(0)?;
+                Ok(Some(PathBuf::from(s)))
+            })
+            .unwrap_or(None);
+
         IndexStatus {
             indexed_files,
             total_chunks,
@@ -543,6 +616,7 @@ impl SemanticIndex {
             engine,
             model_id,
             dimension,
+            root_path,
         }
     }
 
@@ -598,6 +672,13 @@ impl SemanticIndex {
             .map(|n: i64| n as usize)
             .unwrap_or(0);
 
+        let root_path: Option<PathBuf> = conn
+            .query_row("SELECT value FROM meta WHERE key = 'root_path'", [], |r| {
+                let s: String = r.get(0)?;
+                Ok(Some(PathBuf::from(s)))
+            })
+            .unwrap_or(None);
+
         Ok(IndexStatus {
             indexed_files,
             total_chunks,
@@ -606,6 +687,7 @@ impl SemanticIndex {
             engine,
             model_id,
             dimension,
+            root_path,
         })
     }
 

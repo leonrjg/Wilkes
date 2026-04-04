@@ -8,6 +8,7 @@ import UploadZone from "./components/UploadZone";
 import { TauriSearchApi, TauriSourceApi } from "./services/tauri";
 import { HttpSearchApi, HttpSourceApi } from "./services/http";
 import SettingsModal from "./components/SettingsModal";
+import { useToasts } from "./components/Toast";
 import type { SearchApi, SourceApi, DesktopSourceApi, WebSourceApi } from "./services/api";
 import type { FileEntry, FileMatches, MatchRef, PreviewData, SearchQuery, SearchStats, Theme } from "./lib/types";
 
@@ -50,6 +51,7 @@ function useTheme() {
 
 export default function App() {
   const { setTheme } = useTheme();
+  const { addToast, removeToast } = useToasts();
   const [results, setResults] = useState<FileMatches[]>([]);
   const [stats, setStats] = useState<SearchStats | null>(null);
   const [searching, setSearching] = useState(false);
@@ -58,6 +60,7 @@ export default function App() {
   const [previewData, setPreviewData] = useState<PreviewData | null>(null);
   const [previewPending, startPreviewTransition] = useTransition();
   const currentSearchId = useRef<string | null>(null);
+  const reindexToastId = useRef<string | null>(null);
 
   const [bookmarks, setBookmarks] = useState<string[]>([]);
   const [recentDirs, setRecentDirs] = useState<string[]>([]);
@@ -69,8 +72,9 @@ export default function App() {
   const [filterText, setFilterText] = useState("");
   const [excluded, setExcluded] = useState<Set<string>>(new Set());
   const [semanticIndexBuilt, setSemanticIndexBuilt] = useState(false);
+  const [preferSemantic, setPreferSemantic] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [sidebarWidth, setSidebarWidth] = useState(420);
+  const [sidebarWidth, setSidebarWidth] = useState(320);
   const isResizing = useRef(false);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
@@ -102,6 +106,46 @@ export default function App() {
   }, [handleMouseMove, handleMouseUp]);
 
   useEffect(() => {
+    if (!isTauri) return;
+    
+    let unlisten: (() => void) | undefined;
+    let mounted = true;
+    
+    import("@tauri-apps/api/event").then(({ listen }) => {
+      if (!mounted) return;
+      listen<string>("manager-event", (event) => {
+        if (event.payload === "WorkerStarting") {
+          addToast("Starting worker - next queries will be faster", "info");
+        } else if (event.payload === "Reindexing") {
+          if (!reindexToastId.current) {
+            reindexToastId.current = addToast(
+              "Reindexing - semantic search is temporarily unavailable",
+              "info",
+              0
+            );
+          }
+        } else if (event.payload === "ReindexingDone") {
+          if (reindexToastId.current) {
+            removeToast(reindexToastId.current);
+            reindexToastId.current = null;
+          }
+        }
+      }).then(u => {
+        if (!mounted) {
+          u();
+        } else {
+          unlisten = u;
+        }
+      });
+    });
+
+    return () => {
+      mounted = false;
+      if (unlisten) unlisten();
+    };
+  }, [addToast, removeToast]);
+
+  useEffect(() => {
     api.getSettings().then((s) => {
       setBookmarks(s.bookmarked_dirs);
       setRecentDirs(s.recent_dirs || []);
@@ -111,6 +155,7 @@ export default function App() {
       setMaxFileSize(s.max_file_size);
       setContextLines(s.context_lines);
       setSemanticIndexBuilt(s.semantic.enabled && s.semantic.index_path !== null);
+      setPreferSemantic(s.search_prefer_semantic);
       setTheme(s.theme);
     }).catch(() => {});
   }, [setTheme]);
@@ -265,6 +310,11 @@ export default function App() {
     </>
   ) : null;
 
+  const handleSemanticModeChange = useCallback((active: boolean) => {
+    setPreferSemantic(active);
+    api.updateSettings({ search_prefer_semantic: active }).catch(console.error);
+  }, []);
+
   return (
     <div className="flex flex-col h-screen bg-[var(--bg-app)] text-[var(--text-main)]">
       <SearchBar
@@ -281,6 +331,8 @@ export default function App() {
         excluded={excluded}
         onExcludedChange={setExcluded}
         onQueryChange={setHasQuery}
+        initialSemanticMode={preferSemantic}
+        onSemanticModeChange={handleSemanticModeChange}
       />
 
       <div className="flex flex-1 overflow-hidden">

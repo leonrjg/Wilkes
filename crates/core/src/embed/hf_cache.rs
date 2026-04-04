@@ -2,56 +2,6 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use crate::types::ModelDescriptor;
 
-/// Scan the HuggingFace cache directory to discover cached models.
-/// This implementation follows the standard HF hub cache layout:
-/// ~/.cache/huggingface/hub/
-///   models--<org>--<name>/
-///     snapshots/
-///       <hash>/
-///         config.json
-///         tokenizer_config.json
-///         pytorch_model.bin / model.safetensors
-///         ...
-pub fn list_cached_models() -> Vec<ModelDescriptor> {
-    let cache_root = get_hf_cache_root();
-    if !cache_root.exists() {
-        return vec![];
-    }
-
-    let mut models = Vec::new();
-    if let Ok(entries) = fs::read_dir(cache_root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            let folder_name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(name) if name.starts_with("models--") => name,
-                _ => continue,
-            };
-
-            // models--org--name -> org/name
-            // models--name -> name
-            let model_id_encoded = &folder_name[8..];
-            let model_id = if let Some(pos) = model_id_encoded.find("--") {
-                let (org, name) = model_id_encoded.split_at(pos);
-                format!("{}/{}", org, &name[2..])
-            } else {
-                model_id_encoded.to_string()
-            };
-
-            if let Some(desc) = get_model_descriptor(&path, &model_id) {
-                models.push(desc);
-            }
-        }
-    }
-
-    // Sort by model_id for consistent output
-    models.sort_by(|a, b| a.model_id.cmp(&b.model_id));
-    models
-}
-
 pub fn get_hf_cache_root() -> PathBuf {
     if let Ok(hf_home) = std::env::var("HF_HOME") {
         PathBuf::from(hf_home).join("hub")
@@ -63,7 +13,37 @@ pub fn get_hf_cache_root() -> PathBuf {
     }
 }
 
-fn get_model_descriptor(model_dir: &Path, model_id: &str) -> Option<ModelDescriptor> {
+pub fn list_cached_models() -> Vec<ModelDescriptor> {
+    let mut models = Vec::new();
+    let root = get_hf_cache_root();
+    if !root.exists() {
+        return models;
+    }
+
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Models are stored as "models--org--repo"
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("models--") {
+                    let parts: Vec<&str> = name.split("--").collect();
+                    if parts.len() >= 3 {
+                        let org = parts[1];
+                        let repo = parts[2..].join("/");
+                        let model_id = format!("{}/{}", org, repo);
+                        if let Some(desc) = get_model_descriptor_from_path(&path, &model_id) {
+                            models.push(desc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    models
+}
+
+pub fn get_model_descriptor_from_path(model_dir: &Path, model_id: &str) -> Option<ModelDescriptor> {
     let snapshots_dir = model_dir.join("snapshots");
     if !snapshots_dir.exists() {
         return None;
@@ -86,12 +66,23 @@ fn get_model_descriptor(model_dir: &Path, model_id: &str) -> Option<ModelDescrip
 
     // Extract dimension from config.json.
     // Try common keys used by embedding models.
-    let dimension = config
+    let mut dimension = config
         .get("hidden_size")
         .and_then(|v| v.as_u64())
         .or_else(|| config.get("dim").and_then(|v| v.as_u64()))
-        .or_else(|| config.get("d_model").and_then(|v| v.as_u64()))
-        .unwrap_or(768) as usize; // Default to 768 if not found
+        .or_else(|| config.get("d_model").and_then(|v| v.as_u64()));
+
+    // Fallback: check sentence_bert_config.json if config.json didn't have it.
+    if dimension.is_none() {
+        let sbert_config_path = snapshot_path.join("sentence_bert_config.json");
+        if let Ok(sbert_content) = fs::read_to_string(sbert_config_path) {
+            if let Ok(sbert_config) = serde_json::from_str::<serde_json::Value>(&sbert_content) {
+                dimension = sbert_config.get("dimension").and_then(|v| v.as_u64());
+            }
+        }
+    }
+
+    let dimension = dimension? as usize;
 
     let size_bytes = calculate_dir_size(&snapshot_path);
 
@@ -101,8 +92,9 @@ fn get_model_descriptor(model_dir: &Path, model_id: &str) -> Option<ModelDescrip
         description: format!("Locally cached Python model ({} dimensions)", dimension),
         dimension,
         is_cached: true,
-        is_default: model_id == "BAAI/bge-base-en-v1.5",
-        is_recommended: model_id == "BAAI/bge-base-en-v1.5" || model_id == "sentence-transformers/all-MiniLM-L6-v2",
+        // Flags are handled by the caller (built-in vs custom)
+        is_default: false,
+        is_recommended: false,
         size_bytes: Some(size_bytes),
         preferred_batch_size: Some(32),
     })

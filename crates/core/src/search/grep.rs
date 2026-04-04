@@ -19,7 +19,10 @@ impl GrepSearchProvider {
         let pattern = if query.is_regex {
             query.pattern.clone()
         } else {
-            regex::escape(&query.pattern)
+            let escaped = regex::escape(&query.pattern);
+            // Replace literal spaces with \s+ to handle varying whitespace/newlines
+            // in all file types (especially PDFs).
+            escaped.replace(" ", r"\s+")
         };
         let matcher = RegexMatcherBuilder::new()
             .case_insensitive(!query.case_sensitive)
@@ -285,8 +288,10 @@ fn search_extracted_content(
 
             // Extract ~120-char context windows around the match using char
             // boundaries so we don't split UTF-8 sequences.
-            let ctx_before = extract_context_before(full, start, 120);
-            let ctx_after = extract_context_after(full, end, 120);
+            // We replace newlines with spaces in the context so the result looks
+            // clean in the UI list even if it spans a line break.
+            let ctx_before = extract_context_before(full, start, 120).replace(['\n', '\r'], " ");
+            let ctx_after = extract_context_after(full, end, 120).replace(['\n', '\r'], " ");
 
             matches.push(Match {
                 text_range: Some(ByteRange { start, end }),

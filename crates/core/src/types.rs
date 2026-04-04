@@ -119,7 +119,6 @@ impl SourceMap {
 }
 
 // ── Extraction ───────────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExtractedContent {
     pub text: String,
@@ -183,15 +182,7 @@ impl EmbedderModel {
 impl<'de> Deserialize<'de> for EmbedderModel {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        let code = match s.as_str() {
-            // Legacy enum variant names written by versions that used a closed enum.
-            "MiniLML6V2"          => "sentence-transformers/all-MiniLM-L6-v2",
-            "BgeBaseEn"           => "BAAI/bge-base-en-v1.5",
-            "BgeLargeEn"          => "BAAI/bge-large-en-v1.5",
-            "MultilingualE5Large" => "intfloat/multilingual-e5-large",
-            other                 => other,
-        };
-        Ok(EmbedderModel(code.to_string()))
+        Ok(EmbedderModel(s))
     }
 }
 
@@ -360,6 +351,7 @@ pub struct IndexStatus {
     pub engine: EmbeddingEngine,
     pub model_id: String,
     pub dimension: usize,
+    pub root_path: Option<std::path::PathBuf>,
 }
 
 // ── Settings ─────────────────────────────────────────────────────────────────
@@ -373,9 +365,10 @@ pub struct Settings {
     pub last_directory: Option<PathBuf>,
     pub respect_gitignore: bool,
     pub max_file_size: u64,
-    pub context_lines: u32,
+    pub context_lines: usize,
     pub theme: Theme,
     #[serde(default)]
+    pub search_prefer_semantic: bool,
     pub semantic: SemanticSettings,
 }
 
@@ -388,14 +381,16 @@ impl Default for Settings {
             respect_gitignore: true,
             max_file_size: 10 * 1024 * 1024,
             context_lines: 2,
-            theme: Theme::System,
+            theme: Theme::default(),
+            search_prefer_semantic: false,
             semantic: SemanticSettings::default(),
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub enum Theme {
+    #[default]
     System,
     Light,
     Dark,

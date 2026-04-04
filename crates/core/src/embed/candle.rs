@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -49,22 +49,6 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
         display_name: "multilingual-e5-large-instruct",
         description: "Multilingual instruction-tuned E5 (1024-dim)",
         dimension: 1024,
-        is_default: false,
-        is_recommended: false,
-    },
-    ModelInfo {
-        model_id: "jinaai/jina-embeddings-v5-text-small",
-        display_name: "jina-embeddings-v5-text-small",
-        description: "Speed: medium, accuracy: high (English)",
-        dimension: 768,
-        is_default: false,
-        is_recommended: false,
-    },
-    ModelInfo {
-        model_id: "jinaai/jina-embeddings-v5-text-nano",
-        display_name: "jina-embeddings-v5-text-nano",
-        description: "Jina AI v5 nano English embeddings (384-dim)",
-        dimension: 384,
         is_default: false,
         is_recommended: false,
     },

@@ -134,6 +134,7 @@ export interface Settings {
   max_file_size: number;
   context_lines: number;
   theme: Theme;
+  search_prefer_semantic: boolean;
   semantic: SemanticSettings;
 }
 
