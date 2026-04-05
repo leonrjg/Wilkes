@@ -1,0 +1,5 @@
+{
+  "build": {
+    "beforeBuildCommand": "cargo build --release --bin wilkes-rust-worker --features fastembed-coreml && npm --prefix ../ui run build"
+  }
+}

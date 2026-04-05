@@ -78,7 +78,7 @@ export default function LogsPanel({ api }: LogsPanelProps) {
             <div className="text-[var(--text-dim)] italic">No logs available.</div>
           ) : (
             logs.map((line, i) => (
-              <div key={i} className="whitespace-pre-wrap break-all mb-1 last:mb-0">
+              <div key={i} className="whitespace-pre-wrap break-all mb-3 last:mb-0">
                 {line}
               </div>
             ))

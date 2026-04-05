@@ -85,7 +85,6 @@ export default function ChunkingPanel({ api, settings, onUpdate }: Props) {
       </section>
 
       <div className="p-3 bg-amber-900/10 border border-amber-900/20 rounded-lg flex gap-3">
-        <span className="text-amber-500 text-sm mt-0.5">⚠️</span>
         <div className="flex flex-col gap-1">
           <span className="text-[11px] font-bold text-amber-600 uppercase tracking-tight">Rebuild Required</span>
           <p className="text-[10px] text-[var(--text-muted)] leading-relaxed">

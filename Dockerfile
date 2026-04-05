@@ -14,12 +14,14 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/core/Cargo.toml crates/core/Cargo.toml
 COPY crates/api/Cargo.toml crates/api/Cargo.toml
 COPY crates/server/Cargo.toml crates/server/Cargo.toml
-# desktop is in the workspace but not built here; provide a stub so cargo resolves deps
+COPY crates/worker/Cargo.toml crates/worker/Cargo.toml
+# desktop is in the workspace but not built here; provide stubs so cargo resolves deps
 COPY crates/desktop/Cargo.toml crates/desktop/Cargo.toml
 
 # Create stub sources so `cargo fetch` can resolve all deps
-RUN mkdir -p crates/core/src crates/api/src crates/server/src crates/desktop/src && \
+RUN mkdir -p crates/core/src crates/api/src crates/server/src crates/worker/src crates/desktop/src && \
     echo "fn main() {}" > crates/server/src/main.rs && \
+    echo "fn main() {}" > crates/worker/src/main.rs && \
     echo "" > crates/core/src/lib.rs && \
     echo "" > crates/api/src/lib.rs && \
     echo "fn main() {}" > crates/desktop/src/main.rs && \
@@ -30,7 +32,7 @@ RUN cargo fetch
 # Copy actual sources
 COPY crates/ crates/
 
-RUN cargo build --release --bin wilkes-server
+RUN cargo build --release --bin wilkes-server --bin wilkes-rust-worker
 
 # Stage 2: Build frontend
 FROM node:22-bookworm AS ui-builder
@@ -47,11 +49,13 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /app/dist /data
 
 COPY --from=rust-builder /build/target/release/wilkes-server /app/wilkes-server
+COPY --from=rust-builder /build/target/release/wilkes-rust-worker /app/wilkes-rust-worker
 COPY --from=ui-builder /build/ui/dist /app/dist
 
 VOLUME /data

@@ -1,51 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { FileMatches, Match, MatchRef, SourceOrigin, FileEntry, SearchStats } from "../lib/types";
-
-const COLLAPSED_LIMIT = 5;
-
-interface Props {
-  results: FileMatches[];
-  stats: SearchStats | null;
-  searching: boolean;
-  hasQuery: boolean;
-  fileList: FileEntry[];
-  filterText: string;
-  onFilterChange: (text: string) => void;
-  selectedMatch: MatchRef | null;
-  onMatchClick: (ref: MatchRef) => void;
-  onFileClick: (path: string) => void;
-}
-
-// Flatten the results tree into a list of rows for the virtualizer.
-type Row =
-  | { kind: "file"; fileMatches: FileMatches; fileIndex: number; path: string }
-  | { kind: "match"; match: Match; path: string; matchIndex: number; fileIndex: number }
-  | { kind: "expand"; fileIndex: number; totalMatches: number };
-
-function buildRows(results: FileMatches[], expandedFiles: Set<number>): Row[] {
-  const rows: Row[] = [];
-  for (let fi = 0; fi < results.length; fi++) {
-    const fm = results[fi];
-    rows.push({ kind: "file", fileMatches: fm, fileIndex: fi, path: fm.path });
-    const isExpanded = expandedFiles.has(fi);
-    const limit = isExpanded ? fm.matches.length : COLLAPSED_LIMIT;
-
-    for (let mi = 0; mi < Math.min(fm.matches.length, limit); mi++) {
-      rows.push({
-        kind: "match",
-        match: fm.matches[mi],
-        path: fm.path,
-        matchIndex: mi,
-        fileIndex: fi,
-      });
-    }
-    if (!isExpanded && fm.matches.length > COLLAPSED_LIMIT) {
-      rows.push({ kind: "expand", fileIndex: fi, totalMatches: fm.matches.length });
-    }
-  }
-  return rows;
-}
+import { buildRows, COLLAPSED_LIMIT, type Row } from "../lib/utils/flattenResults";
+import { useSearchStore } from "../stores/useSearchStore";
+import { useSettingsStore } from "../stores/useSettingsStore";
+import type { Match, MatchRef, SourceOrigin, FileEntry } from "../lib/types";
 
 function originLabel(origin: SourceOrigin): string {
   if ("TextFile" in origin) return `L${origin.TextFile.line}`;
@@ -54,7 +12,6 @@ function originLabel(origin: SourceOrigin): string {
 }
 
 function highlightMatch(contextBefore: string, matchedText: string, contextAfter: string): React.ReactNode {
-  // If contexts are empty, it's a semantic chunk — show it muted without the yellow highlight.
   if (!contextBefore && !contextAfter) {
     return <span className="text-[var(--text-muted)]">{matchedText}</span>;
   }
@@ -86,26 +43,30 @@ function formatSize(bytes: number): string {
 function isSelected(row: Row, selectedMatch: MatchRef | null): boolean {
   if (!selectedMatch || row.kind !== "match") return false;
   if (row.path !== selectedMatch.path) return false;
-  
-  // Use stringification for structural equality of origin and text_range
   return (
     JSON.stringify(row.match.origin) === JSON.stringify(selectedMatch.origin) &&
     JSON.stringify(row.match.text_range) === JSON.stringify(selectedMatch.text_range)
   );
 }
 
-export default function ResultList({
-  results,
-  stats,
-  searching,
-  hasQuery,
-  fileList,
-  filterText,
-  onFilterChange,
-  selectedMatch,
-  onMatchClick,
-  onFileClick,
-}: Props) {
+interface Props {
+  onMatchClick: (ref: MatchRef) => void;
+  onFileClick: (path: string) => void;
+}
+
+export default function ResultList({ onMatchClick, onFileClick }: Props) {
+  const results = useSearchStore((s) => s.results);
+  const stats = useSearchStore((s) => s.stats);
+  const searching = useSearchStore((s) => s.searching);
+  const hasQuery = useSearchStore((s) => s.hasQuery);
+  const selectedMatch = useSearchStore((s) => s.selectedMatch);
+
+  const excluded = useSettingsStore((s) => s.excluded);
+  const fileList = useSettingsStore((s) => s.fileList);
+  const filterText = useSettingsStore((s) => s.filterText);
+  const setFilterText = useSettingsStore((s) => s.setFilterText);
+  const indexing = useSettingsStore((s) => s.indexing);
+
   const parentRef = useRef<HTMLDivElement>(null);
   const [expandedFiles, setExpandedFiles] = useState<Set<number>>(new Set());
 
@@ -113,6 +74,7 @@ export default function ResultList({
     if (results.length === 0) setExpandedFiles(new Set());
   }, [results.length]);
 
+  const filteredFileList = fileList.filter((f) => !excluded.has(f.extension));
   const rows = buildRows(results, expandedFiles);
 
   const rowVirtualizer = useVirtualizer({
@@ -133,22 +95,36 @@ export default function ResultList({
   const totalCount = results.reduce((n, fm) => n + fm.matches.length, 0);
 
   if (!hasQuery) {
-    const filteredList = fileList.filter((entry) => {
+    const filteredList = filteredFileList.filter((entry) => {
       if (!filterText) return true;
       const search = filterText.toLowerCase();
       return entry.path.toLowerCase().includes(search);
     });
 
     return (
-      <div className="flex flex-col h-full overflow-hidden">
+      <div className="flex flex-col h-full overflow-hidden relative bg-[var(--bg-app)]">
+        {indexing && (
+          <div className="absolute inset-0 z-10 pointer-events-none overflow-hidden">
+            <div className="absolute inset-0 bg-[var(--bg-app)] opacity-30" />
+            <div
+              className="absolute inset-y-0 w-1/2"
+              style={{
+                background: "linear-gradient(90deg, transparent, var(--shimmer-highlight), transparent)",
+                animation: "shimmer 1.5s ease-in-out infinite",
+              }}
+            />
+          </div>
+        )}
         <div className="px-3 py-1.5 text-xs text-[var(--text-muted)] border-b border-[var(--border-main)] flex-shrink-0 flex items-center gap-2">
-          <div className="flex-shrink-0 whitespace-nowrap">{fileList.length} files</div>
+          <div className="flex-shrink-0 whitespace-nowrap">
+            {indexing ? "Indexing..." : `${filteredFileList.length} files`}
+          </div>
           <span className="text-[var(--text-dim)]">/</span>
           <input
             type="text"
             placeholder="Filter files..."
             value={filterText}
-            onChange={(e) => onFilterChange(e.target.value)}
+            onChange={(e) => setFilterText(e.target.value)}
             className="flex-1 min-w-0 bg-transparent border-none outline-none text-[11px] text-[var(--text-main)] placeholder-[var(--text-dim)]"
           />
         </div>
@@ -161,7 +137,7 @@ export default function ResultList({
               onClick={() => onFileClick(entry.path)}
             />
           ))}
-          {filteredList.length === 0 && fileList.length > 0 && (
+          {filteredList.length === 0 && filteredFileList.length > 0 && (
             <div className="px-3 py-8 text-center text-xs text-[var(--text-dim)] italic">
               No files match "{filterText}"
             </div>
@@ -172,15 +148,28 @@ export default function ResultList({
   }
 
   return (
-    <div className="flex flex-col h-full overflow-hidden bg-[var(--bg-app)]">
-      {/* Status bar */}
+    <div className="flex flex-col h-full overflow-hidden bg-[var(--bg-app)] relative">
+      {(searching || indexing) && (
+        <div className="absolute inset-0 z-10 pointer-events-none overflow-hidden">
+          <div className="absolute inset-0 bg-[var(--bg-app)] opacity-30" />
+          <div
+            className="absolute inset-y-0 w-1/2"
+            style={{
+              background: "linear-gradient(90deg, transparent, var(--shimmer-highlight), transparent)",
+              animation: "shimmer 1.5s ease-in-out infinite",
+            }}
+          />
+        </div>
+      )}
       <div className="px-3 py-1.5 text-xs text-[var(--text-muted)] border-b border-[var(--border-main)] flex-shrink-0 flex flex-col gap-0.5 bg-[var(--bg-header)]">
         <span>
           {searching
             ? `${totalCount} matches…`
-            : stats
-              ? `${stats.total_matches} matches in ${stats.files_scanned} files (${stats.elapsed_ms}ms)`
-              : "Ready"}
+            : indexing
+              ? "Indexing files…"
+              : stats
+                ? `${stats.total_matches} matches in ${stats.files_scanned} files (${stats.elapsed_ms}ms)`
+                : "Ready"}
         </span>
         {stats && stats.errors.length > 0 && (
           <span className="text-red-500 font-medium" title={stats.errors.join("\n")}>
@@ -189,7 +178,8 @@ export default function ResultList({
         )}
       </div>
 
-      <div ref={parentRef} className="flex-1 overflow-y-auto">
+      <div className="flex-1 overflow-hidden relative">
+        <div ref={parentRef} className="h-full overflow-y-auto">
         {rows.length === 0 && !searching && (
           <div className="text-[var(--text-dim)] text-sm p-4 text-center">
             {stats ? "No results" : "Type to search"}
@@ -237,10 +227,10 @@ export default function ResultList({
                       path={row.path}
                       selected={isSelected(row, selectedMatch)}
                       onClick={() =>
-                        onMatchClick({ 
-                          path: row.path, 
+                        onMatchClick({
+                          path: row.path,
                           origin: row.match.origin,
-                          text_range: row.match.text_range ?? undefined
+                          text_range: row.match.text_range ?? undefined,
                         })
                       }
                     />
@@ -251,22 +241,22 @@ export default function ResultList({
           </div>
         </div>
       </div>
+      </div>
     </div>
   );
 }
 
 function FileHeader({ path, count, onClick }: { path: string; count: number; onClick: () => void }) {
   return (
-    <div className="flex items-center gap-2 px-3 py-2 bg-[var(--bg-sidebar)] border-y border-[var(--border-main)] cursor-pointer hover:bg-[var(--bg-hover)] transition-colors" onClick={onClick}>
-      <span className="text-xs font-semibold text-[var(--text-main)] truncate">
-        {fileName(path)}
-      </span>
+    <div
+      className="flex items-center gap-2 px-3 py-2 bg-[var(--bg-sidebar)] border-y border-[var(--border-main)] cursor-pointer hover:bg-[var(--bg-hover)] transition-colors"
+      onClick={onClick}
+    >
+      <span className="text-xs font-semibold text-[var(--text-main)] truncate">{fileName(path)}</span>
       <span className="text-[10px] text-[var(--text-muted)] bg-[var(--bg-active)] px-1.5 py-0.5 rounded-full">
         {count}
       </span>
-      <span className="text-[10px] text-[var(--text-dim)] truncate">
-        {path}
-      </span>
+      <span className="text-[10px] text-[var(--text-dim)] truncate">{path}</span>
     </div>
   );
 }
@@ -282,15 +272,7 @@ function ExpandStrip({ remaining, onExpand }: { remaining: number; onExpand: () 
   );
 }
 
-function FileEntryRow({
-  entry,
-  selected,
-  onClick,
-}: {
-  entry: FileEntry;
-  selected: boolean;
-  onClick: () => void;
-}) {
+function FileEntryRow({ entry, selected, onClick }: { entry: FileEntry; selected: boolean; onClick: () => void }) {
   return (
     <button
       onClick={onClick}
@@ -298,9 +280,7 @@ function FileEntryRow({
         selected ? "bg-[var(--bg-active)]" : ""
       }`}
     >
-      <span className="text-sm font-medium text-[var(--text-main)] truncate">
-        {fileName(entry.path)}
-      </span>
+      <span className="text-sm font-medium text-[var(--text-main)] truncate">{fileName(entry.path)}</span>
       <span className="text-xs text-[var(--text-muted)] truncate flex-1">{dirName(entry.path)}</span>
       <span className="text-xs text-[var(--text-muted)] flex-shrink-0 font-mono">
         {entry.file_type === "Pdf" && <span className="text-[var(--accent-blue)] mr-1.5">PDF</span>}
@@ -337,11 +317,7 @@ function MatchRow({
         </span>
       )}
       <span className="text-xs line-clamp-3 flex-1 font-mono break-all">
-        {highlightMatch(
-          match.context_before,
-          match.matched_text,
-          match.context_after
-        )}
+        {highlightMatch(match.context_before, match.matched_text, match.context_after)}
       </span>
     </button>
   );

@@ -476,6 +476,11 @@ pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> an
     let dtype = select_dtype(&device);
 
     // Safety: memory-mapping model weights from a local path we own.
+    // The `?` catches mmap() errors, but a page access on a file that is
+    // truncated or corrupted on disk after mapping succeeds will raise SIGBUS
+    // with no Rust error path. The embed_task guard prevents a concurrent
+    // download from replacing this file while it is mapped; disk corruption
+    // remains an unrecoverable crash risk.
     let vb = unsafe {
         VarBuilder::from_mmaped_safetensors(&[&weights_path], dtype, &device)
             .with_context(|| format!("Failed to load weights for '{model_id}'"))?

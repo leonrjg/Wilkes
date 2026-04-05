@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["candle", "candle-metal", "fastembed"]
+default = ["fastembed"]
 fastembed = ["dep:fastembed", "dep:hf-hub", "dep:ureq", "dep:ort"]
-fastembed-coreml = ["fastembed"]
+fastembed-coreml = ["fastembed", "ort/coreml"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "dep:ureq"]
 candle-metal = ["candle", "candle-core/metal", "candle-core/accelerate", "candle-nn/metal", "candle-transformers/metal"]
 
@@ -25,7 +25,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 chrono = "0.4"
 parking_lot = "0.12"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "process", "io-util", "rt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -40,7 +40,6 @@ strip-ansi-escapes = "0.2.1"
 [dependencies.ort]
 version = "=2.0.0-rc.11"
 optional = true
-features = ["coreml"]
 
 [dependencies.fastembed]
 version = "5"

@@ -202,10 +202,10 @@ export default function SettingsModal({
 
         <div className="flex flex-1 overflow-hidden">
           {/* Sidebar */}
-          <div className="w-44 border-r border-[var(--border-main)] bg-[var(--bg-sidebar)] p-2 flex flex-col gap-4">
+          <div className="w-40 border-r border-[var(--border-main)] bg-[var(--bg-sidebar)] p-2 flex flex-col gap-3">
             <div className="flex flex-col gap-0.5">
               <TabButton id="general" label="General" />
-              <TabButton id="extensions" label="Extensions" />
+              <TabButton id="extensions" label="File extensions" />
             </div>
 
             <div className="flex flex-col gap-0.5">
@@ -219,7 +219,7 @@ export default function SettingsModal({
               <TabButton id="data" label="Data" indent />
               <TabButton id="workers" label="Workers" indent />
               <TabButton id="logs" label="Logs" indent />
-              <TabButton id="technical" label="Technical" indent />
+              <TabButton id="technical" label="Settings (JSON)" indent />
             </div>
           </div>
 
@@ -243,22 +243,7 @@ export default function SettingsModal({
 
                       <div className="space-y-1">
                         <div className="flex justify-between items-baseline">
-                          <label className="text-xs text-[var(--text-muted)]">Context Lines ({settings.context_lines})</label>
-                          <p className="text-[10px] text-[var(--text-dim)] italic">Shown around matches</p>
-                        </div>
-                        <input
-                          type="range"
-                          min="0"
-                          max="10"
-                          value={settings.context_lines}
-                          onChange={(e) => handleUpdateSettings({ context_lines: parseInt(e.target.value) })}
-                          className="w-full h-1 bg-[var(--bg-active)] rounded-lg appearance-none cursor-pointer accent-[var(--accent-blue)]"
-                        />
-                      </div>
-
-                      <div className="space-y-1">
-                        <div className="flex justify-between items-baseline">
-                          <label className="text-xs text-[var(--text-muted)]">Max File Size (MB)</label>
+                          <label className="text-xs text-[var(--text-muted)]">Max file size (MB)</label>
                           <p className="text-[10px] text-[var(--text-dim)] italic">Skip larger files</p>
                         </div>
                         <input

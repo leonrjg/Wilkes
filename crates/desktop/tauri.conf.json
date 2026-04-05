@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../../ui/dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "npm --prefix ../ui run dev",
-    "beforeBuildCommand": "npm --prefix ../ui run build"
+    "beforeDevCommand": "cargo build --bin wilkes-rust-worker && npm --prefix ../ui run dev",
+    "beforeBuildCommand": "cargo build --release --bin wilkes-rust-worker && npm --prefix ../ui run build"
   },
   "bundle": {
     "active": true,
@@ -19,7 +19,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["resources/*", "../worker/wilkes_worker", "../worker/wilkes_worker.py"]
+    "resources": ["resources/*", "../worker/wilkes_python_worker", "../worker/requirements.txt"]
   },
   "app": {
     "windows": [

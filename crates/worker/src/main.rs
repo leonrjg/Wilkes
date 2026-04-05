@@ -22,8 +22,8 @@ async fn main() -> anyhow::Result<()> {
         }
 
         let trimmed = line.trim();
-        let log_line = if trimmed.len() > 200 {
-            format!("{}...", &trimmed[..200])
+        let log_line = if trimmed.len() > 300 {
+            format!("{}...", &trimmed[..300])
         } else {
             trimmed.to_string()
         };
@@ -62,8 +62,20 @@ async fn main() -> anyhow::Result<()> {
                     embedder,
                     req.data_dir,
                     tx,
-                    req.chunk_size,
-                    req.chunk_overlap,
+                    match req.chunk_size {
+                        Some(v) => v,
+                        None => {
+                            emit(WorkerEvent::Error("build request missing chunk_size".into()));
+                            continue;
+                        }
+                    },
+                    match req.chunk_overlap {
+                        Some(v) => v,
+                        None => {
+                            emit(WorkerEvent::Error("build request missing chunk_overlap".into()));
+                            continue;
+                        }
+                    },
                     req.supported_extensions,
                 )
                 .await;

@@ -274,6 +274,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   const [customModelInput, setCustomModelInput] = useState("");
   const [isAddingCustom, setIsAddingCustom] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   // Bumped to re-trigger model + index fetches after async ops (download, build, etc.)
   const [fetchEpoch, setFetchEpoch] = useState(0);
 
@@ -590,18 +591,6 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
               ? "Medium performance. Uses GPU via Metal (Apple Silicon) if available."
               : "For ONNX models. Good performance on CPU."}
         </p>
-        {settings && (
-          <label className="flex items-center gap-2.5 cursor-pointer group mt-1.5 px-1">
-            <input
-              type="checkbox"
-              checked={isForceCpu(settings.engine)}
-              disabled={isActive}
-              onChange={(e) => handleDeviceChange(settings.engine, e.target.checked)}
-              className="w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)] disabled:opacity-50"
-            />
-            <span className="text-xs text-[var(--text-main)]">Force CPU only</span>
-          </label>
-        )}
         {settings?.engine === "SBERT" && (
           <div className="mt-1.5 px-2 py-1.5 rounded bg-[var(--bg-active)] flex items-start gap-1.5">
             <span className="text-[10px] text-[var(--text-dim)] shrink-0 mt-px uppercase font-bold tracking-tighter">python runtime</span>
@@ -683,8 +672,8 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       {/* Action Area */}
       <section className="bg-[var(--bg-active)]/30 rounded-xl p-3 border border-[var(--border-main)] flex flex-col gap-3">
         {phase === "engine_mismatch" && (
-          <div className="bg-amber-900/20 border border-amber-900/50 rounded-lg p-2">
-            <p className="text-[10px] leading-relaxed">
+          <div className="bg-amber-900/20 border border-amber-900/50 rounded-lg p-1">
+            <p className="text-[10px] leading-relaxed text-[var(--text-muted)]">
               <center>Choosing this model and/or engine will trigger a reindex.</center>
             </p>
           </div>
@@ -725,21 +714,21 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
           onClick={handleAction}
           disabled={!isEngineAvailable || state.isCancelling}
           type="button"
-          className={`w-full py-2 rounded-lg text-xs font-semibold transition-all shadow-lg active:scale-[0.98] disabled:opacity-50 ${
+          className={`w-full py-2 rounded-lg text-xs font-semibold transition-all shadow-sm active:scale-[0.98] disabled:opacity-50 ${
             isActive
-              ? "bg-red-600 hover:bg-red-500 text-white"
+              ? "bg-red-700 hover:bg-red-600 text-white"
               : phase === "indexed"
                 ? "bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] text-[var(--text-main)] border border-[var(--border-main)]"
                 : phase === "engine_mismatch"
-                  ? "bg-amber-600 hover:bg-amber-500 text-white"
+                  ? "bg-amber-700 hover:bg-amber-600 text-white"
                   : "bg-[var(--accent-blue)] hover:bg-[var(--accent-blue)] text-white"
           }`}
         >
           {phase === "not_downloaded" && "Download Model"}
-          {phase === "downloading" && (state.isCancelling ? "Cancelling…" : "Cancel Download")}
-          {phase === "ready" && "Build Semantic Index"}
-          {phase === "engine_mismatch" && "Rebuild Index"}
-          {phase === "building" && (state.isCancelling ? "Cancelling…" : "Cancel Build")}
+          {phase === "downloading" && (state.isCancelling ? "Cancelling…" : "Cancel download")}
+          {phase === "ready" && "Build semantic index"}
+          {phase === "engine_mismatch" && "Save model"}
+          {phase === "building" && (state.isCancelling ? "Cancelling…" : "Cancel build")}
           {phase === "indexed" && "Delete Index"}
         </button>
 
@@ -749,7 +738,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
               <div className="flex flex-col gap-1.5">
                 <div className="flex justify-between text-[10px] text-[var(--text-muted)] mb-0.5">
                   <span>
-                    {phase === "downloading" ? "Downloading model files..." : `${progressPct}%`}
+                    {phase === "downloading" ? "Starting engine..." : `${progressPct}%`}
                   </span>
                   <span className="truncate max-w-[180px]">
                     {phase === "building" && state.progress && "message" in state.progress ? (state.progress as any).message : ""}
@@ -769,6 +758,33 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
                 <LogsPanel api={api} />
               </div>
             )}
+          </div>
+        )}
+      </section>
+
+      {/* Advanced Section */}
+      <section className="mt-2 border-t border-[var(--border-main)]/50 pt-4 p-1">
+        <button
+          type="button"
+          onClick={() => setShowAdvanced(!showAdvanced)}
+          className="flex items-center gap-2 text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider hover:text-[var(--text-muted)] transition-colors w-full text-left"
+        >
+          <span className="w-2">{showAdvanced ? "▼" : "▶"}</span>
+          Advanced
+        </button>
+        {showAdvanced && settings && (
+          <div className="mt-3 px-1 animate-in fade-in slide-in-from-top-1">
+            <label className="flex items-center gap-2.5 cursor-pointer group">
+              <input
+                type="checkbox"
+                checked={isForceCpu(settings.engine)}
+                disabled={isActive}
+                onChange={(e) => handleDeviceChange(settings.engine, e.target.checked)}
+                className="w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)] disabled:opacity-50"
+              />
+              <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Disable hardware acceleration</span>
+            </label>
+            <p className="text-[10px] text-[var(--text-dim)] mt-1.5 ml-6 leading-relaxed">Recommended for Fastembed on macOS</p>
           </div>
         )}
       </section>

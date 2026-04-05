@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -22,7 +23,9 @@ pub struct WorkerStatus {
 #[derive(Clone)]
 pub struct WorkerPaths {
     pub python_path: PathBuf,
-    pub script_path: PathBuf,
+    pub python_package_dir: PathBuf,
+    pub requirements_path: PathBuf,
+    pub venv_dir: PathBuf,
     pub worker_bin: PathBuf,
 }
 
@@ -84,6 +87,117 @@ async fn kill_and_reap(proc: &mut ActiveProcess, pid_slot: &AtomicU32) {
     let _ = proc.child.kill().await;
     let _ = proc.child.wait().await;
     pid_slot.store(0, Ordering::Relaxed);
+}
+
+fn venv_python(venv_dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        venv_dir.join("Scripts").join("python.exe")
+    } else {
+        venv_dir.join("bin").join("python3")
+    }
+}
+
+/// Runs a subprocess, forwarding each line of stdout and stderr to tracing.
+/// Returns an error string if the process fails to spawn or exits non-zero.
+async fn run_setup_step(program: &Path, args: Vec<OsString>, label: &str) -> Result<(), String> {
+    tracing::info!("[python-setup] {label}");
+    let mut child = Command::new(program)
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("[python-setup] Failed to start {label}: {e}"))?;
+
+    let (line_tx, mut line_rx) = mpsc::channel::<String>(64);
+
+    if let Some(stdout) = child.stdout.take() {
+        let tx = line_tx.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            while reader.read_line(&mut line).await.map(|n| n > 0).unwrap_or(false) {
+                let _ = tx.send(line.trim_end().to_string()).await;
+                line.clear();
+            }
+        });
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        let tx = line_tx.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            while reader.read_line(&mut line).await.map(|n| n > 0).unwrap_or(false) {
+                let _ = tx.send(line.trim_end().to_string()).await;
+                line.clear();
+            }
+        });
+    }
+
+    drop(line_tx);
+    while let Some(line) = line_rx.recv().await {
+        if !line.is_empty() {
+            tracing::info!("[python-setup] {line}");
+        }
+    }
+
+    let status = child.wait().await.map_err(|e| format!("[python-setup] {label} wait failed: {e}"))?;
+    if !status.success() {
+        return Err(format!("[python-setup] {label} failed (exit code {:?})", status.code()));
+    }
+    Ok(())
+}
+
+/// Ensures the Python virtualenv exists and has the correct packages installed.
+/// Returns the path to the venv's Python interpreter on success.
+async fn setup_python_env(paths: &WorkerPaths) -> Result<PathBuf, String> {
+    let python = venv_python(&paths.venv_dir);
+    let stamp = paths.venv_dir.join(".requirements_installed");
+
+    // Check if setup can be skipped.
+    let current_requirements = std::fs::read_to_string(&paths.requirements_path)
+        .map_err(|e| format!("[python-setup] Cannot read requirements.txt: {e}"))?;
+
+    if python.exists() && stamp.exists() {
+        let installed = std::fs::read_to_string(&stamp).unwrap_or_default();
+        if installed == current_requirements {
+            tracing::info!("[python-setup] Virtualenv up to date, skipping setup.");
+            return Ok(python);
+        }
+        tracing::info!("[python-setup] Requirements changed, reinstalling.");
+    } else {
+        tracing::info!("[python-setup] Setting up Python environment in {}", paths.venv_dir.display());
+    }
+
+    // Create the virtualenv.
+    run_setup_step(
+        &paths.python_path,
+        vec!["-m".into(), "venv".into(), paths.venv_dir.as_os_str().to_owned()],
+        "Create virtualenv",
+    ).await?;
+
+    // Ensure pip is available.
+    run_setup_step(
+        &python,
+        vec!["-m".into(), "ensurepip".into(), "--upgrade".into()],
+        "Ensure pip",
+    ).await?;
+
+    // Install requirements.
+    run_setup_step(
+        &python,
+        vec!["-m".into(), "pip".into(), "install".into(), "-r".into(), paths.requirements_path.as_os_str().to_owned()],
+        "Install requirements",
+    ).await?;
+
+    // Write stamp so we can skip next time.
+    if let Err(e) = std::fs::write(&stamp, &current_requirements) {
+        tracing::warn!("[python-setup] Failed to write requirements stamp: {e}");
+    }
+
+    tracing::info!("[python-setup] Python environment ready.");
+    Ok(python)
 }
 
 async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>, event_tx: mpsc::Sender<ManagerEvent>, active_pid: Arc<AtomicU32>) {
@@ -178,12 +292,17 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
 
                     let mut command = match req.engine {
                         EmbeddingEngine::SBERT => {
-                            let mut c = Command::new(&paths.python_path);
-                            if let Some(parent) = paths.script_path.parent() {
-                                c.env("PYTHONPATH", parent);
-                            }
+                            let python = match setup_python_env(&paths).await {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    let _ = reply.send(WorkerEvent::Error(e)).await;
+                                    continue;
+                                }
+                            };
+                            let mut c = Command::new(&python);
+                            c.env("PYTHONPATH", &paths.python_package_dir);
                             c.arg("-m");
-                            c.arg("wilkes_worker");
+                            c.arg("wilkes_python_worker");
                             c
                         }
                         _ => Command::new(&paths.worker_bin),

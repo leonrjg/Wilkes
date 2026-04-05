@@ -1,14 +1,17 @@
 [package]
-name = "wilkes-worker"
+name = "wilkes-rust-worker"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "wilkes-worker"
+name = "wilkes-rust-worker"
 path = "src/main.rs"
 
+[features]
+fastembed-coreml = ["wilkes-core/fastembed-coreml"]
+
 [dependencies]
-wilkes-core = { path = "../core", features = ["candle", "candle-metal", "fastembed"] }
+wilkes-core = { path = "../core", features = ["fastembed"] }
 wilkes-api = { path = "../api" }
 anyhow = "1"
 serde_json = "1"

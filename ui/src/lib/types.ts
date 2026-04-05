@@ -134,7 +134,6 @@ export interface Settings {
   last_directory: string | null;
   respect_gitignore: boolean;
   max_file_size: number;
-  context_lines: number;
   theme: Theme;
   search_prefer_semantic: boolean;
   semantic: SemanticSettings;
@@ -167,8 +166,9 @@ export interface IndexStatus {
   engine: EmbeddingEngine;
   model_id: string;
   dimension: number;
+  root_path: string | null;
+  db_size_bytes: number | null;
 }
-
 export interface DownloadProgress {
   bytes_received: number;
   total_bytes: number;

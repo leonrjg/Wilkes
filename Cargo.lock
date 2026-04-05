@@ -7693,6 +7693,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wilkes-rust-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wilkes-api",
+ "wilkes-core",
+]
+
+[[package]]
 name = "wilkes-server"
 version = "0.1.0"
 dependencies = [
@@ -7705,18 +7717,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
- "wilkes-api",
- "wilkes-core",
-]
-
-[[package]]
-name = "wilkes-worker"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde_json",
- "tokio",
- "tracing",
  "wilkes-api",
  "wilkes-core",
 ]

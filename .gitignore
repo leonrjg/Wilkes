@@ -1,16 +1,29 @@
+# General
+**/*.log*
+
 # OS
 **/.DS_Store
 
 # Frontend
 **/node_modules
 **/dist/
+**/.env
 
 # Backend
 target/
+build/
 **/*.db
+**/wilkes-worker
+**/wilkes-rust-worker
 
 # IDEs
 .idea/
+.vscode/
 
 # AI
 .claude/
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/venv/

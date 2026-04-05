@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use mupdf::{Document, MetadataName, TextPageFlags};
+use tracing::trace;
 
 use crate::types::{
     BoundingBox, ByteRange, ExtractedContent, FileMetadata, SourceMap, SourceOrigin, SourceSegment,
@@ -16,6 +17,8 @@ impl PdfBackend for MuPdfBackend {
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?;
 
+        // Log before any mupdf FFI call so a C-level abort leaves a breadcrumb.
+        trace!("mupdf: opening {:?}", path);
         let doc = Document::open(path_str)?;
         let page_count = doc.page_count()? as u32;
 

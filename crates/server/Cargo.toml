@@ -8,7 +8,7 @@ name = "wilkes-server"
 
 [dependencies]
 wilkes-api = { path = "../api" }
-wilkes-core = { path = "../core" }
+wilkes-core = { path = "../core", default-features = false, features = ["fastembed"] }
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"

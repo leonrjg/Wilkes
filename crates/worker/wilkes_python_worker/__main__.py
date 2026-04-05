@@ -4,7 +4,8 @@ import logging
 import traceback
 
 from .ipc import emit
-from .handlers import build_index, embed_texts, info
+from .handlers import embed_texts, info
+from .protocol import WorkerRequest, event_error
 
 def configure_logging():
     # Configure logging to stderr so the Rust side can capture and display it
@@ -31,20 +32,18 @@ def main():
             break
 
         try:
-            request = json.loads(line)
-            sys.stderr.write(f"Request: {json.dumps({k: v for k, v in request.items() if k != "texts"})}\n")
-            mode = request.get("mode", "build")
+            request: WorkerRequest = json.loads(line)
+            sys.stderr.write(f"Request: {json.dumps({k: v for k, v in request.items() if k != 'texts'})}\n")
+            mode = request.get("mode", "embed")
 
-            if mode == "build":
-                build_index(request)
-            elif mode == "embed":
+            if mode == "embed":
                 embed_texts(request)
             elif mode == "info":
                 info(request)
             else:
-                emit({"Error": f"Unknown mode: {mode}"})
-        except Exception as e:
-            emit({"Error": traceback.format_exc()})
+                emit(event_error(f"Unknown mode: {mode}"))
+        except Exception:
+            emit(event_error(traceback.format_exc()))
 
 if __name__ == "__main__":
     main()

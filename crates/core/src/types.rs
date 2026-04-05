@@ -302,9 +302,9 @@ pub struct ModelDescriptor {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum EmbeddingEngine {
-    #[default]
     SBERT,
     Candle,
+    #[default]
     Fastembed,
 }
 
@@ -408,7 +408,7 @@ where
 
 impl SemanticSettings {
     fn default_chunk_size() -> usize {
-        1200
+        600
     }
 
     fn default_chunk_overlap() -> usize {
@@ -459,6 +459,7 @@ pub struct IndexStatus {
     pub model_id: String,
     pub dimension: usize,
     pub root_path: Option<std::path::PathBuf>,
+    pub db_size_bytes: Option<u64>,
 }
 
 // ── Settings ─────────────────────────────────────────────────────────────────

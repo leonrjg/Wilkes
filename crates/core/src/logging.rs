@@ -79,7 +79,7 @@ pub fn init_logging_stderr() {
         .with_thread_names(false);
 
     let filter_layer = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("debug"))
+        .or_else(|_| EnvFilter::try_new("info"))
         .unwrap();
 
     tracing_subscriber::registry()

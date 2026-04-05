@@ -603,6 +603,7 @@ impl SemanticIndex {
             model_id,
             dimension,
             root_path,
+            db_size_bytes: None,
         }
     }
 
@@ -612,6 +613,8 @@ impl SemanticIndex {
         let path = db_path(data_dir);
         anyhow::ensure!(path.exists(), "No semantic index found");
         let conn = Connection::open(&path)?;
+
+        let db_size_bytes = std::fs::metadata(&path).ok().map(|m| m.len());
 
         let engine_str: String = conn
             .query_row("SELECT value FROM meta WHERE key = 'engine'", [], |r| r.get(0))
@@ -674,6 +677,7 @@ impl SemanticIndex {
             model_id,
             dimension,
             root_path,
+            db_size_bytes,
         })
     }
 
@@ -693,5 +697,3 @@ impl SemanticIndex {
 fn f32_slice_to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
-
-

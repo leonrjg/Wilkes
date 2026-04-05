@@ -1,94 +1,89 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { Search, Database, Check } from "react-feather";
-import type { FileEntry, SearchQuery } from "../lib/types";
+import { useSearchStore } from "../stores/useSearchStore";
+import { useSettingsStore } from "../stores/useSettingsStore";
+import type { SearchQuery } from "../lib/types";
 
 interface Props {
-  onSearch: (query: SearchQuery) => void;
-  searching: boolean;
   sourceSlot: React.ReactNode;
   settingsSlot?: React.ReactNode;
-  semanticReady?: boolean;
-  directory?: string;
-  respectGitignore?: boolean;
-  maxFileSize?: number;
-  contextLines?: number;
-  supportedExtensions?: string[];
-  fileList?: FileEntry[];
-  excluded?: Set<string>;
-  onExcludedChange?: (excluded: Set<string>) => void;
-  onQueryChange?: (hasQuery: boolean) => void;
-  initialSemanticMode?: boolean;
-  onSemanticModeChange?: (active: boolean) => void;
 }
 
-export default function SearchBar({
-  onSearch,
-  searching,
-  sourceSlot,
-  settingsSlot,
-  semanticReady = false,
-  directory = "",
-  respectGitignore = true,
-  maxFileSize = 10 * 1024 * 1024,
-  contextLines = 2,
-  supportedExtensions = [],
-  fileList = [],
-  excluded = new Set<string>(),
-  onQueryChange,
-  initialSemanticMode = false,
-  onSemanticModeChange,
-}: Props) {
+export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
+  const search = useSearchStore((s) => s.search);
+  const searching = useSearchStore((s) => s.searching);
+  const setHasQuery = useSearchStore((s) => s.setHasQuery);
+
+  const directory = useSettingsStore((s) => s.directory);
+  const respectGitignore = useSettingsStore((s) => s.respectGitignore);
+  const maxFileSize = useSettingsStore((s) => s.maxFileSize);
+  const contextLines = useSettingsStore((s) => s.contextLines);
+  const supportedExtensions = useSettingsStore((s) => s.supportedExtensions);
+  const fileList = useSettingsStore((s) => s.fileList);
+  const excluded = useSettingsStore((s) => s.excluded);
+  const semanticReady = useSettingsStore((s) => s.semanticIndexBuilt);
+  const preferSemantic = useSettingsStore((s) => s.preferSemantic);
+  const setPreferSemantic = useSettingsStore((s) => s.setPreferSemantic);
+
   const [pattern, setPattern] = useState("");
   const [isRegex, setIsRegex] = useState(false);
   const [caseSensitive, setCaseSensitive] = useState(false);
-  const [isSemanticMode, setIsSemanticMode] = useState(initialSemanticMode);
-
-  // Sync state if initial prop changes (e.g. on load)
-  useEffect(() => {
-    setIsSemanticMode(initialSemanticMode);
-  }, [initialSemanticMode]);
-
-  const handleToggleSemantic = () => {
-    const next = !isSemanticMode;
-    setIsSemanticMode(next);
-    onSemanticModeChange?.(next);
-  };
+  const [isSemanticMode, setIsSemanticMode] = useState(preferSemantic);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Sync semantic mode when the setting is loaded from the backend
+  useEffect(() => {
+    setIsSemanticMode(preferSemantic);
+  }, [preferSemantic]);
+
   const buildQuery = useCallback(
-    (pat: string): SearchQuery => {
+    (
+      pat: string,
+      opts: { isRegex?: boolean; caseSensitive?: boolean; isSemanticMode?: boolean } = {},
+    ): SearchQuery => {
       const allExtensions = [...new Set(fileList.map((f) => f.extension))];
       const file_type_filters =
         excluded.size === 0 ? [] : allExtensions.filter((ext) => !excluded.has(ext));
       return {
         pattern: pat,
-        is_regex: isRegex,
-        case_sensitive: caseSensitive,
+        is_regex: opts.isRegex ?? isRegex,
+        case_sensitive: opts.caseSensitive ?? caseSensitive,
         root: directory || ".",
         file_type_filters,
         max_results: 0,
         respect_gitignore: respectGitignore,
         max_file_size: maxFileSize,
         context_lines: contextLines,
-        mode: isSemanticMode ? "Semantic" : "Grep",
+        mode: (opts.isSemanticMode ?? isSemanticMode) ? "Semantic" : "Grep",
         supported_extensions: supportedExtensions,
       };
     },
-    [isRegex, caseSensitive, directory, excluded, fileList, respectGitignore, maxFileSize, contextLines, isSemanticMode, supportedExtensions],
+    [
+      isRegex,
+      caseSensitive,
+      directory,
+      excluded,
+      fileList,
+      respectGitignore,
+      maxFileSize,
+      contextLines,
+      isSemanticMode,
+      supportedExtensions,
+    ],
   );
 
   const triggerSearch = useCallback(
-    (pat: string) => {
+    (pat: string, opts?: { isRegex?: boolean; caseSensitive?: boolean; isSemanticMode?: boolean }) => {
       if (!pat.trim()) return;
-      onSearch(buildQuery(pat));
+      search(buildQuery(pat, opts));
     },
-    [onSearch, buildQuery],
+    [search, buildQuery],
   );
 
-  // Notify parent when query presence changes
+  // Notify store when query presence changes
   useEffect(() => {
-    onQueryChange?.(pattern.trim().length > 0);
-  }, [pattern]); // eslint-disable-line react-hooks/exhaustive-deps
+    setHasQuery(pattern.trim().length > 0);
+  }, [pattern, setHasQuery]);
 
   // Debounce pattern changes
   useEffect(() => {
@@ -99,27 +94,38 @@ export default function SearchBar({
     };
   }, [pattern, triggerSearch]);
 
-  // Re-trigger when options change (if there's already a pattern)
+  // Re-trigger when externally-driven settings change (directory, excluded)
   useEffect(() => {
     if (pattern.trim()) triggerSearch(pattern);
-  }, [isRegex, caseSensitive, directory, excluded, isSemanticMode]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [directory, excluded]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleToggleRegex = () => {
+    const next = !isRegex;
+    setIsRegex(next);
+    triggerSearch(pattern, { isRegex: next });
+  };
+
+  const handleToggleCaseSensitive = () => {
+    const next = !caseSensitive;
+    setCaseSensitive(next);
+    triggerSearch(pattern, { caseSensitive: next });
+  };
+
+  const handleToggleSemantic = () => {
+    const next = !isSemanticMode;
+    setIsSemanticMode(next);
+    setPreferSemantic(next);
+    triggerSearch(pattern, { isSemanticMode: next });
+  };
 
   return (
     <div className="flex flex-col gap-2 p-3 border-b border-[var(--border-main)] bg-[var(--bg-app)]">
       {/* Top row: toggles + pattern */}
       <div className="flex items-center gap-2">
-        <Toggle
-          title="Regular expression"
-          active={isRegex}
-          onToggle={() => setIsRegex((v) => !v)}
-        >
+        <Toggle title="Regular expression" active={isRegex} onToggle={handleToggleRegex}>
           <span className="font-mono text-[10px] w-4">.*</span>
         </Toggle>
-        <Toggle
-          title="Case sensitive"
-          active={caseSensitive}
-          onToggle={() => setCaseSensitive((v) => !v)}
-        >
+        <Toggle title="Case sensitive" active={caseSensitive} onToggle={handleToggleCaseSensitive}>
           <span className="text-[11px] font-bold tracking-tight">Aa</span>
         </Toggle>
         <Toggle
@@ -129,9 +135,13 @@ export default function SearchBar({
           className="px-3 min-w-[100px]"
         >
           <div className="flex items-center gap-2">
-            <div className={`w-3 h-3 rounded border flex items-center justify-center transition-colors ${
-              isSemanticMode ? "bg-white border-white text-[var(--accent-blue)]" : "border-[var(--text-dim)]"
-            }`}>
+            <div
+              className={`w-3 h-3 rounded border flex items-center justify-center transition-colors ${
+                isSemanticMode
+                  ? "bg-white border-white text-[var(--accent-blue)]"
+                  : "border-[var(--text-dim)]"
+              }`}
+            >
               {isSemanticMode && <Check size={10} strokeWidth={4} />}
             </div>
             <div className="flex items-center gap-1.5">
@@ -162,9 +172,7 @@ export default function SearchBar({
       </div>
 
       {/* Bottom row: source slot */}
-      <div className="flex items-center gap-2 flex-wrap">
-        {sourceSlot}
-      </div>
+      <div className="flex items-center gap-2 flex-wrap">{sourceSlot}</div>
     </div>
   );
 }

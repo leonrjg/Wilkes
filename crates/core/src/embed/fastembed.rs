@@ -273,10 +273,17 @@ impl EmbedderInstaller for FastembedInstaller {
                 tracing::info!("[fastembed] install: forcing CPU execution provider");
                 vec![ort::ep::CPUExecutionProvider::default().into()]
             } else {
-                vec![
-                    ort::ep::CoreMLExecutionProvider::default().into(),
-                    ort::ep::CPUExecutionProvider::default().into(),
-                ]
+                #[cfg(feature = "fastembed-coreml")]
+                {
+                    vec![
+                        ort::ep::CoreMLExecutionProvider::default().into(),
+                        ort::ep::CPUExecutionProvider::default().into(),
+                    ]
+                }
+                #[cfg(not(feature = "fastembed-coreml"))]
+                {
+                    vec![ort::ep::CPUExecutionProvider::default().into()]
+                }
             };
             let options = TextInitOptions::new(fm)
                 .with_cache_dir(cache_dir)
@@ -329,10 +336,17 @@ pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> an
         tracing::info!("[fastembed] forcing CPU execution provider for {}", model_id);
         vec![ort::ep::CPUExecutionProvider::default().into()]
     } else {
-        vec![
-            ort::ep::CoreMLExecutionProvider::default().into(),
-            ort::ep::CPUExecutionProvider::default().into(),
-        ]
+        #[cfg(feature = "fastembed-coreml")]
+        {
+            vec![
+                ort::ep::CoreMLExecutionProvider::default().into(),
+                ort::ep::CPUExecutionProvider::default().into(),
+            ]
+        }
+        #[cfg(not(feature = "fastembed-coreml"))]
+        {
+            vec![ort::ep::CPUExecutionProvider::default().into()]
+        }
     };
     let options = TextInitOptions::new(info.model)
         .with_cache_dir(cache_dir)

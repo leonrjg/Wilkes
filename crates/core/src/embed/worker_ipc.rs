@@ -12,8 +12,11 @@ pub struct WorkerRequest {
     pub engine: EmbeddingEngine,
     pub model: String, // HuggingFace model ID
     pub data_dir: PathBuf,
-    pub chunk_size: usize,
-    pub chunk_overlap: usize,
+    /// Only used for "build" mode; absent (None) in "embed" and "info" requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_overlap: Option<usize>,
     #[serde(default = "default_device")]
     pub device: String, // "auto", "cpu", "mps", "cuda", etc.
     pub paths: Option<Vec<PathBuf>>, // Optional: incremental update for specific files
