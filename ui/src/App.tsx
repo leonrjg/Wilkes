@@ -10,7 +10,7 @@ import { useToasts } from "./components/Toast";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useHistory } from "./hooks/useHistory";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
-import { api, source, isTauri } from "./services";
+import { api, source } from "./services";
 import type { DesktopSourceApi, WebSourceApi } from "./services/api";
 
 export default function App() {

@@ -64,4 +64,36 @@ mod tests {
         assert!(registry.find(Path::new("test.mock"), None).is_some());
         assert!(registry.find(Path::new("test.txt"), None).is_none());
     }
+
+    struct MimeExtractor;
+    impl ContentExtractor for MimeExtractor {
+        fn can_handle(&self, _path: &Path, mime: Option<&str>) -> bool {
+            mime == Some("text/plain")
+        }
+        fn extract(&self, _path: &Path) -> anyhow::Result<ExtractedContent> {
+            anyhow::bail!("mime")
+        }
+    }
+
+    #[test]
+    fn test_extractor_registry_priority_and_mime() {
+        let mut registry = ExtractorRegistry::new();
+        registry.register(Box::new(MockExtractor));
+        registry.register(Box::new(MimeExtractor));
+
+        // Extension match
+        assert!(registry.find(Path::new("test.mock"), None).is_some());
+        
+        // MIME match
+        assert!(registry.find(Path::new("test.txt"), Some("text/plain")).is_some());
+        
+        // No match
+        assert!(registry.find(Path::new("test.txt"), Some("image/png")).is_none());
+    }
+
+    #[test]
+    fn test_extractor_registry_default() {
+        let registry = ExtractorRegistry::default();
+        assert!(registry.extractors.is_empty());
+    }
 }

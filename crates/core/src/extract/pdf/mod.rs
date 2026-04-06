@@ -40,3 +40,19 @@ impl ContentExtractor for PdfExtractor {
         self.backend.extract(path)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pdf_extractor_can_handle() {
+        let extractor = PdfExtractor::default();
+        
+        assert!(extractor.can_handle(Path::new("test.pdf"), None));
+        assert!(extractor.can_handle(Path::new("TEST.PDF"), None));
+        
+        assert!(!extractor.can_handle(Path::new("test.txt"), None));
+        assert!(!extractor.can_handle(Path::new("test"), None));
+    }
+}

@@ -7,6 +7,7 @@ use super::super::Embedder;
 use super::super::models::installer::{EmbedderInstaller, ProgressTx};
 use super::super::worker::manager::{WorkerManager, ManagerCommand};
 use super::super::worker::ipc::{WorkerRequest, WorkerEvent};
+use super::aux_config;
 
 // ── Static model catalog ──────────────────────────────────────────────────────
 
@@ -123,6 +124,8 @@ pub struct WorkerEmbedder {
     engine: EmbeddingEngine,
     /// Passed in embed requests so the worker can load the model on demand.
     data_dir: std::path::PathBuf,
+    query_prefix: String,
+    passage_prefix: String,
 }
 
 impl WorkerEmbedder {
@@ -133,17 +136,10 @@ impl WorkerEmbedder {
         device: String,
         engine: EmbeddingEngine,
         data_dir: std::path::PathBuf,
+        query_prefix: String,
+        passage_prefix: String,
     ) -> Self {
-        Self { manager, model_id, dimension, device, engine, data_dir }
-    }
-
-    /// Returns (query_prefix, passage_prefix) for models that require them.
-    fn prefixes(&self) -> (&'static str, &'static str) {
-        if self.model_id.contains("/multilingual-e5") || self.model_id.contains("/e5-") {
-            ("query: ", "passage: ")
-        } else {
-            ("", "")
-        }
+        Self { manager, model_id, dimension, device, engine, data_dir, query_prefix, passage_prefix }
     }
 
     fn send_embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -188,22 +184,20 @@ impl Embedder for WorkerEmbedder {
     }
 
     fn embed_query(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let (qp, _) = self.prefixes();
-        if qp.is_empty() {
+        if self.query_prefix.is_empty() {
             self.send_embed(texts)
         } else {
-            let prefixed: Vec<String> = texts.iter().map(|t| format!("{qp}{t}")).collect();
+            let prefixed: Vec<String> = texts.iter().map(|t| format!("{}{t}", self.query_prefix)).collect();
             let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
             self.send_embed(&refs)
         }
     }
 
     fn embed_passages(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let (_, pp) = self.prefixes();
-        if pp.is_empty() {
+        if self.passage_prefix.is_empty() {
             self.send_embed(texts)
         } else {
-            let prefixed: Vec<String> = texts.iter().map(|t| format!("{pp}{t}")).collect();
+            let prefixed: Vec<String> = texts.iter().map(|t| format!("{}{t}", self.passage_prefix)).collect();
             let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
             self.send_embed(&refs)
         }
@@ -309,7 +303,7 @@ impl EmbedderInstaller for SBERTInstaller {
 
     fn build(&self, _data_dir: &Path) -> anyhow::Result<Arc<dyn Embedder>> {
         let model_id = self.model.model_id();
-        
+
         // Use the dimension discovered during install() or from the built-in list.
         let dimension = self.dimension.lock().unwrap()
             .or_else(|| {
@@ -323,6 +317,10 @@ impl EmbedderInstaller for SBERTInstaller {
                 model_id
             ))?;
 
+        // sentence_transformers downloads full repo snapshots to the global HF cache.
+        let hf_cache = super::super::models::hf_cache::get_hf_cache_root();
+        let prefixes = aux_config::load_prefixes(&hf_cache, model_id);
+
         Ok(Arc::new(WorkerEmbedder::new(
             self.manager.clone(),
             model_id.to_string(),
@@ -330,6 +328,8 @@ impl EmbedderInstaller for SBERTInstaller {
             self.device.clone(),
             EmbeddingEngine::SBERT,
             std::path::PathBuf::new(),
+            prefixes.query_prefix,
+            prefixes.passage_prefix,
         )))
     }
 }

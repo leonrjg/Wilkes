@@ -83,7 +83,7 @@ pub fn start_search(
             SearchMode::Semantic => {
                 match (embedder, index) {
                     (Some(emb), Some(idx)) => {
-                        Box::new(SemanticSearchProvider::new(emb, idx))
+                        Box::new(SemanticSearchProvider::new(emb, idx, query.supported_extensions.clone()))
                     }
                     _ => {
                         return vec!["Semantic search requires a loaded embedder and built index".into()];
@@ -164,5 +164,38 @@ mod tests {
         let errors = handle.finish().await;
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("Semantic search requires"));
+    }
+
+    #[tokio::test]
+    async fn test_search_handle_run() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::write(root.join("test1.txt"), "hello first").unwrap();
+        fs::write(root.join("test2.txt"), "hello second").unwrap();
+
+        let query = SearchQuery {
+            pattern: "hello".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: root.clone(),
+            file_type_filters: vec![],
+            max_results: 10,
+            respect_gitignore: true,
+            max_file_size: 1024 * 1024,
+            context_lines: 0,
+            mode: SearchMode::Grep,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let handle = start_search(query, None, None);
+        
+        let stats = handle.run(|fm| async move {
+            assert!(!fm.matches.is_empty());
+            true
+        }).await;
+
+        assert_eq!(stats.files_scanned, 2);
+        assert_eq!(stats.total_matches, 2);
+        assert!(stats.errors.is_empty());
     }
 }

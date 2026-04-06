@@ -191,4 +191,45 @@ mod tests {
         assert_eq!(desc.dimension, 384);
         assert!(desc.size_bytes.unwrap() > 0);
     }
+
+    #[test]
+    fn test_overlay_and_list_cached_models() {
+        let dir = tempdir().unwrap();
+        let hf_home = dir.path().to_path_buf();
+        std::env::set_var("HF_HOME", hf_home.to_str().unwrap());
+
+        let hub_dir = hf_home.join("hub");
+        let model_dir = hub_dir.join("models--org--repo");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        let snapshots = model_dir.join("snapshots");
+        let snapshot = snapshots.join("abc");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("config.json"), r#"{"hidden_size": 768}"#).unwrap();
+
+        let cached = list_cached_models();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].model_id, "org/repo");
+        assert_eq!(cached[0].dimension, 768);
+
+        let mut models = HashMap::new();
+        models.insert("org/repo".to_string(), ModelDescriptor {
+            model_id: "org/repo".to_string(),
+            display_name: "repo".to_string(),
+            description: "test".to_string(),
+            dimension: 768,
+            is_cached: false,
+            is_default: false,
+            is_recommended: false,
+            size_bytes: None,
+            preferred_batch_size: None,
+        });
+
+        overlay_hf_cache(&mut models);
+        let m = models.get("org/repo").unwrap();
+        assert!(m.is_cached);
+        assert!(m.size_bytes.is_some());
+
+        std::env::remove_var("HF_HOME");
+    }
 }

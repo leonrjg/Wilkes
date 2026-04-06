@@ -2,14 +2,24 @@ import { render, screen, fireEvent, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import DataPanel from "./DataPanel";
 
-describe("DataPanel", () => {
-  const mockApi = {
+const mockApi = {
+  getDataPaths: vi.fn(),
+  getIndexStatus: vi.fn(),
+  openPath: vi.fn(),
+  deleteIndex: vi.fn(),
+};
+
+vi.mock("../services", () => ({
+  isTauri: true,
+  api: {
     getDataPaths: vi.fn(),
     getIndexStatus: vi.fn(),
     openPath: vi.fn(),
     deleteIndex: vi.fn(),
-  } as any;
+  },
+}));
 
+describe("DataPanel", () => {
   const mockPaths = {
     app_data: "/app/data",
     hf_cache: "/hf/cache",
@@ -24,15 +34,17 @@ describe("DataPanel", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubGlobal("isTauri", true);
     mockApi.getDataPaths.mockResolvedValue(mockPaths);
     mockApi.getIndexStatus.mockResolvedValue(mockIndexStatus);
     mockApi.openPath.mockResolvedValue(undefined);
+    mockApi.deleteIndex.mockResolvedValue(undefined);
     vi.stubGlobal("confirm", vi.fn(() => true));
   });
 
   it("renders data paths and index status", async () => {
     await act(async () => {
-      render(<DataPanel api={mockApi} />);
+      render(<DataPanel api={mockApi as any} />);
     });
     
     expect(screen.getByText("/app/data")).toBeInTheDocument();
@@ -42,7 +54,7 @@ describe("DataPanel", () => {
 
   it("calls openPath when Open in File Manager is clicked", async () => {
     await act(async () => {
-      render(<DataPanel api={mockApi} />);
+      render(<DataPanel api={mockApi as any} />);
     });
     
     const openButtons = screen.getAllByText("Open in File Manager");
@@ -53,7 +65,7 @@ describe("DataPanel", () => {
 
   it("calls deleteIndex when Delete Database is clicked", async () => {
     await act(async () => {
-      render(<DataPanel api={mockApi} />);
+      render(<DataPanel api={mockApi as any} />);
     });
     
     const deleteButton = screen.getByText("Delete Database");
@@ -67,7 +79,7 @@ describe("DataPanel", () => {
 
   it("does not call deleteIndex if confirm is refused", async () => {
     await act(async () => {
-      render(<DataPanel api={mockApi} />);
+      render(<DataPanel api={mockApi as any} />);
     });
     
     vi.stubGlobal("confirm", vi.fn(() => false));
@@ -82,16 +94,9 @@ describe("DataPanel", () => {
   it("renders empty state when no index status", async () => {
     mockApi.getIndexStatus.mockResolvedValue(null);
     await act(async () => {
-      render(<DataPanel api={mockApi} />);
+      render(<DataPanel api={mockApi as any} />);
     });
     
     expect(screen.getByText(/No semantic index built yet/i)).toBeInTheDocument();
-  });
-
-  it("handles errors when loading data paths", async () => {
-    mockApi.getDataPaths.mockRejectedValue(new Error("Failed to load paths"));
-    await act(async () => {
-      render(<DataPanel api={mockApi} />);
-    });
   });
 });

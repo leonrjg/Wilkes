@@ -658,4 +658,47 @@ mod tests {
             _ => panic!("Expected PdfPage origin"),
         }
     }
+
+    #[test]
+    fn test_embedding_engine_methods() {
+        assert_eq!(EmbeddingEngine::SBERT.as_str(), "sbert");
+        assert_eq!(EmbeddingEngine::Candle.as_str(), "candle");
+        assert_eq!(EmbeddingEngine::Fastembed.as_str(), "fastembed");
+
+        assert_eq!(EmbeddingEngine::SBERT.default_device(), "auto");
+        assert_eq!(EmbeddingEngine::Candle.default_device(), "auto");
+        assert_eq!(EmbeddingEngine::Fastembed.default_device(), "cpu");
+
+        assert!(EmbeddingEngine::SBERT.supports_custom_models());
+        assert!(EmbeddingEngine::Candle.supports_custom_models());
+        assert!(!EmbeddingEngine::Fastembed.supports_custom_models());
+    }
+
+    #[test]
+    fn test_semantic_settings_defaults() {
+        let settings = SemanticSettings::default();
+        assert_eq!(settings.enabled, false);
+        assert_eq!(settings.engine, EmbeddingEngine::default());
+        assert_eq!(settings.model.model_id(), "BAAI/bge-base-en-v1.5");
+        assert_eq!(settings.dimension, 768);
+        assert_eq!(settings.chunk_size, 600);
+        assert_eq!(settings.chunk_overlap, 128);
+        assert_eq!(settings.worker_timeout_secs, 300);
+        
+        assert_eq!(settings.device_for(EmbeddingEngine::SBERT), "auto");
+        
+        let mut settings = SemanticSettings::default();
+        settings.engine_devices.insert(EmbeddingEngine::SBERT, "cuda".to_string());
+        assert_eq!(settings.device_for(EmbeddingEngine::SBERT), "cuda");
+    }
+
+    #[test]
+    fn test_settings_defaults() {
+        let settings = Settings::default();
+        assert_eq!(settings.max_file_size, 10 * 1024 * 1024);
+        assert_eq!(settings.context_lines, 2);
+        assert!(matches!(settings.theme, Theme::System));
+        assert!(settings.supported_extensions.contains(&"txt".to_string()));
+        assert!(settings.supported_extensions.contains(&"rs".to_string()));
+    }
 }

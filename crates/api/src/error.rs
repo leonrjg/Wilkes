@@ -26,5 +26,15 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let err = ApiError::from(io_err);
         assert!(format!("{err}").contains("IO error: file not found"));
+
+        let err = ApiError::Extract("extraction failed".to_string());
+        assert_eq!(format!("{err}"), "Extract error: extraction failed");
+
+        let err = ApiError::Settings("settings are wrong".to_string());
+        assert_eq!(format!("{err}"), "Settings error: settings are wrong");
+
+        let other_err = anyhow::anyhow!("some other error");
+        let err = ApiError::from(other_err);
+        assert_eq!(format!("{err}"), "some other error");
     }
 }

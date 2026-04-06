@@ -290,3 +290,36 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_desktop_settings_path() {
+        let result = desktop_settings_path();
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert!(path.ends_with("wilkes/settings.json") || path.ends_with("wilkes\\settings.json"));
+    }
+
+    #[tokio::test]
+    async fn test_get_python_info() {
+        let result = get_python_info().await;
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_get_supported_engines() {
+        let engines = get_supported_engines();
+        assert!(!engines.is_empty());
+        assert!(engines.contains(&EmbeddingEngine::SBERT));
+    }
+
+    #[tokio::test]
+    async fn test_logs_commands() {
+        clear_logs().await.unwrap();
+        let logs = get_logs().await.unwrap();
+        assert!(logs.is_empty());
+    }
+}

@@ -273,4 +273,25 @@ mod tests {
 
         watcher.stop();
     }
+
+    #[test]
+    fn test_index_watcher_invalid_path() {
+        let index = Arc::new(Mutex::new(None));
+        let registry = Arc::new(ExtractorRegistry::new());
+        
+        let result = IndexWatcher::start(
+            PathBuf::from("/non/existent/path/for/watcher"),
+            index,
+            registry,
+            None,
+            None,
+            100,
+            10,
+            vec!["txt".to_string()],
+            || {},
+            || {},
+        );
+
+        assert!(result.is_err());
+    }
 }

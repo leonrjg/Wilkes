@@ -189,20 +189,10 @@ pub struct CandleEmbedder {
     model_id: String,
     dimension: usize,
     pooling: PoolingStrategy,
+    passage_prefix: String,
 }
 
 impl CandleEmbedder {
-    fn prefixes(&self) -> (&'static str, &'static str) {
-        // E5 family requires explicit prefixes for reliable retrieval.
-        if self.model_id.contains("/multilingual-e5")
-            || self.model_id.contains("/e5-")
-        {
-            ("query: ", "passage: ")
-        } else {
-            ("", "")
-        }
-    }
-
     fn embed_with_prefix(&self, texts: &[&str], prefix: &str) -> anyhow::Result<Vec<Vec<f32>>> {
         if prefix.is_empty() {
             self.embed_slices(texts)
@@ -345,14 +335,8 @@ impl Embedder for CandleEmbedder {
         Some(EMBED_BATCH_SIZE)
     }
 
-    fn embed_query(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let (qp, _) = self.prefixes();
-        self.embed_with_prefix(texts, qp)
-    }
-
     fn embed_passages(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let (_, pp) = self.prefixes();
-        self.embed_with_prefix(texts, pp)
+        self.embed_with_prefix(texts, &self.passage_prefix)
     }
 }
 
@@ -425,6 +409,7 @@ impl EmbedderInstaller for CandleInstaller {
     fn build(&self, data_dir: &Path) -> anyhow::Result<Arc<dyn Embedder>> {
         let model_id = &self.model.0;
         let dimension = read_dimension(data_dir, model_id)?;
+        let prefixes = super::aux_config::load_prefixes(data_dir, model_id);
         Ok(Arc::new(super::sbert::WorkerEmbedder::new(
             self.manager.clone(),
             model_id.clone(),
@@ -432,6 +417,8 @@ impl EmbedderInstaller for CandleInstaller {
             self.device.clone(),
             crate::types::EmbeddingEngine::Candle,
             data_dir.to_path_buf(),
+            prefixes.query_prefix,
+            prefixes.passage_prefix,
         )))
     }
 }
@@ -535,6 +522,8 @@ pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> an
         "[candle] loaded '{model_id}' dim={dimension} pooling={pooling:?} device={device:?} dtype={dtype:?}"
     );
 
+    let passage_prefix = super::aux_config::load_prefixes(data_dir, model_id).passage_prefix;
+
     Ok(Arc::new(CandleEmbedder {
         model: model_loaded,
         tokenizer,
@@ -543,5 +532,6 @@ pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> an
         model_id: model_id.clone(),
         dimension,
         pooling,
+        passage_prefix,
     }))
 }

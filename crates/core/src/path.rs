@@ -158,4 +158,16 @@ mod tests {
         let result = resolve_python_package_dir();
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_resolve_python_with_env_var() {
+        let exe_path = std::env::current_exe().unwrap();
+        std::env::set_var("WILKES_PYTHON", exe_path.to_str().unwrap());
+        
+        let result = resolve_python();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), exe_path);
+        
+        std::env::remove_var("WILKES_PYTHON");
+    }
 }

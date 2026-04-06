@@ -11,14 +11,16 @@ use crate::embed::index::SemanticIndex;
 pub struct SemanticSearchProvider {
     embedder: Arc<dyn Embedder>,
     index: Arc<Mutex<Option<SemanticIndex>>>,
+    supported_extensions: Vec<String>,
 }
 
 impl SemanticSearchProvider {
     pub fn new(
         embedder: Arc<dyn Embedder>,
         index: Arc<Mutex<Option<SemanticIndex>>>,
+        supported_extensions: Vec<String>,
     ) -> Self {
-        Self { embedder, index }
+        Self { embedder, index, supported_extensions }
     }
 }
 
@@ -106,13 +108,98 @@ impl SearchProvider for SemanticSearchProvider {
             supports_regex: false,
             supports_case_sensitivity: false,
             is_indexed: true,
-            supported_file_types: vec![
-                "txt".into(), "md".into(), "rs".into(), "py".into(), "js".into(),
-                "ts".into(), "json".into(), "toml".into(), "yaml".into(), "pdf".into(),
-            ],
+            supported_file_types: self.supported_extensions.clone(),
             requires_index: true,
             semantic_index_built: index_built,
             supported_engines: crate::types::EmbeddingEngine::supported_engines(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct MockEmbedder;
+    impl Embedder for MockEmbedder {
+        fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![0.0; 768]])
+        }
+        fn model_id(&self) -> &str { "mock" }
+        fn dimension(&self) -> usize { 768 }
+    }
+
+    #[test]
+    fn test_capabilities_without_index() {
+        let embedder = Arc::new(MockEmbedder);
+        let index = Arc::new(Mutex::new(None));
+        let extensions = vec!["pdf".to_string(), "txt".to_string()];
+        let provider = SemanticSearchProvider::new(embedder, index, extensions);
+
+        let caps = provider.capabilities();
+        assert!(!caps.supports_regex);
+        assert!(!caps.supports_case_sensitivity);
+        assert!(caps.is_indexed);
+        assert!(caps.requires_index);
+        assert!(!caps.semantic_index_built);
+        assert!(caps.supported_file_types.contains(&"pdf".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_search_unbuilt_index() {
+        let embedder = Arc::new(MockEmbedder);
+        let index = Arc::new(Mutex::new(None));
+        let provider = SemanticSearchProvider::new(embedder, index, vec![]);
+        
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let query = SearchQuery {
+            pattern: "test".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: std::path::PathBuf::from("/"),
+            file_type_filters: vec![],
+            max_results: 10,
+            respect_gitignore: false,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Semantic,
+            supported_extensions: vec![],
+        };
+        
+        let res = provider.search(&query, &ExtractorRegistry::new(), tx);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("not built yet"));
+    }
+
+    #[tokio::test]
+    async fn test_search_empty_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = SemanticIndex::create(
+            dir.path(), "mock", 768,
+            crate::types::EmbeddingEngine::SBERT,
+            None,
+        ).unwrap();
+        let embedder = Arc::new(MockEmbedder);
+        let index = Arc::new(Mutex::new(Some(idx)));
+        let provider = SemanticSearchProvider::new(embedder, index, vec![]);
+        
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let query = SearchQuery {
+            pattern: "test".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: std::path::PathBuf::from("/"),
+            file_type_filters: vec![],
+            max_results: 10,
+            respect_gitignore: false,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Semantic,
+            supported_extensions: vec![],
+        };
+        
+        let res = provider.search(&query, &ExtractorRegistry::new(), tx);
+        assert!(res.is_ok());
     }
 }

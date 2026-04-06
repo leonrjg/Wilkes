@@ -200,3 +200,29 @@ fn extract_page_words(
         segments,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use std::fs;
+
+    #[test]
+    fn test_mupdf_backend_invalid_file() {
+        let backend = MuPdfBackend;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("invalid.pdf");
+        fs::write(&path, "not a pdf").unwrap();
+
+        let result = backend.extract(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mupdf_backend_non_existent_file() {
+        let backend = MuPdfBackend;
+        let path = Path::new("non_existent.pdf");
+        let result = backend.extract(path);
+        assert!(result.is_err());
+    }
+}

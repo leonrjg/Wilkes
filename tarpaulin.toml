@@ -1,5 +1,6 @@
 [tarpaulin]
 workspace = true
+target-dir = "target/tarpaulin"
 exclude-files = [
     # External engine wrappers
     "crates/core/src/embed/engines/fastembed.rs",
@@ -12,6 +13,7 @@ exclude-files = [
     "crates/core/src/embed/worker/manager.rs",
     "crates/core/src/embed/worker/ipc.rs",
     "crates/worker/src/main.rs",
+    "target/*",
 ]
 ignore-tests = true
 out = ["Lcov"]

@@ -38,3 +38,32 @@ pub trait Embedder: Send + Sync {
 /// The active embedder is stored as `Mutex<Option<Arc<dyn Embedder>>>` in app state.
 /// Only one embedder is live at a time because each model occupies significant memory.
 pub type ActiveEmbedder = std::sync::Mutex<Option<Arc<dyn Embedder>>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestEmbedder;
+
+    impl Embedder for TestEmbedder {
+        fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![1.0, 2.0]])
+        }
+
+        fn model_id(&self) -> &str {
+            "test"
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+    }
+
+    #[test]
+    fn test_embedder_defaults() {
+        let embedder = TestEmbedder;
+        assert_eq!(embedder.preferred_batch_size(), Some(32));
+        assert!(embedder.embed_query(&["a"]).is_ok());
+        assert!(embedder.embed_passages(&["b"]).is_ok());
+    }
+}

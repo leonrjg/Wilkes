@@ -138,6 +138,12 @@ export class HttpSearchApi implements SearchApi {
     return `/asset?path=${encodeURIComponent(path)}`;
   }
 
+  async isSemanticReady(): Promise<boolean> {
+    const res = await fetch("/api/embed/ready");
+    if (!res.ok) throw new Error(`isSemanticReady failed: ${res.status}`);
+    return res.json() as Promise<boolean>;
+  }
+
   async getLogs(): Promise<string[]> {
     const res = await fetch("/api/logs");
     if (!res.ok) throw new Error(`getLogs failed: ${res.status}`);

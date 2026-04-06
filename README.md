@@ -9,7 +9,8 @@ This project aims to provide a plug-and-play, cross-platform solution for local 
 - **Local semantic search**: data is embedded using open-source models, no cloud
   - You can choose from a set of predefined models or any HuggingFace model
 - Fully configurable: adjust embedding chunk size and overlap, or just use the default settings
-- Cross-platform: works on Windows, Linux, macOS, and the web
+- Cross-platform: works on Windows, Linux, macOS
+- Desktop and web versions
 
 ### Installation
 #### Desktop
@@ -30,7 +31,7 @@ If you're concerned about security due to the project's recency, this is highly 
 - [Semantic](https://github.com/Bklieger/Semantic) is single-file and unmaintained
 - Most others are terminal-based
 
-### Technology
+### Engines
 This app can be run on desktop or online, thanks to [Tauri](https://tauri.app/).
 
 Because semantic search accuracy is on the eye of the beholder, it maximizes model variety by supporting multiple engines:

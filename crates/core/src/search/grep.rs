@@ -370,4 +370,106 @@ mod tests {
             _ => panic!("Expected TextFile origin"),
         }
     }
+
+    #[test]
+    fn test_search_regex() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        fs::write(&path, "user_123\nadmin_456\nguest").unwrap();
+
+        let query = SearchQuery {
+            pattern: r"\w+_\d+".to_string(),
+            is_regex: true,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            file_type_filters: vec![],
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
+        let matches = search_text_file(&path, &matcher, 0).unwrap();
+        
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].matched_text, "user_123");
+        assert_eq!(matches[1].matched_text, "admin_456");
+    }
+
+    #[test]
+    fn test_search_with_context() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        fs::write(&path, "line 1\nline 2 (target)\nline 3").unwrap();
+
+        let query = SearchQuery {
+            pattern: "target".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            file_type_filters: vec![],
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 1, // One line of context
+            mode: crate::types::SearchMode::Grep,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
+        let matches = search_text_file(&path, &matcher, 1).unwrap();
+        
+        assert_eq!(matches.len(), 1);
+        // Note: CollectSink currently only captures the matched line, 
+        // but it could be extended to capture context if needed.
+        // Currently context_before/after in Match struct are from the SAME line.
+        assert_eq!(matches[0].matched_text, "target");
+        assert!(matches[0].context_before.contains("line 2 ("));
+        assert!(matches[0].context_after.contains(")"));
+    }
+
+    #[test]
+    fn test_search_provider_filtering() {
+        let dir = tempdir().unwrap();
+        let path_txt = dir.path().join("test.txt");
+        let path_rs = dir.path().join("test.rs");
+        fs::write(&path_txt, "hello world").unwrap();
+        fs::write(&path_rs, "hello world").unwrap();
+
+        let query = SearchQuery {
+            pattern: "hello".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            file_type_filters: vec!["rs".to_string()], // Only .rs files
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            supported_extensions: vec!["txt".to_string(), "rs".to_string()],
+        };
+
+        let provider = GrepSearchProvider::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        
+        // Use a separate thread or async block to avoid blocking
+        let query_clone = query.clone();
+        let extractors = ExtractorRegistry::new();
+        std::thread::spawn(move || {
+            provider.search(&query_clone, &extractors, tx).unwrap();
+        });
+
+        let mut results = Vec::new();
+        while let Some(m) = rx.blocking_recv() {
+            results.push(m);
+        }
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].path.ends_with("test.rs"));
+        assert!(!results[0].path.ends_with("test.txt"));
+    }
 }

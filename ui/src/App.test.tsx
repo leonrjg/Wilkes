@@ -4,6 +4,7 @@ import App from "./App";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useSearchStore } from "./stores/useSearchStore";
 import { api, source } from "./services";
+import { ToastProvider } from "./components/Toast";
 
 // Mock services and hooks at top level
 vi.mock("./services", () => ({
@@ -11,6 +12,7 @@ vi.mock("./services", () => ({
     onEmbedProgress: vi.fn(() => Promise.resolve(() => {})),
     onEmbedDone: vi.fn(() => Promise.resolve(() => {})),
     onEmbedError: vi.fn(() => Promise.resolve(() => {})),
+    onManagerEvent: vi.fn(() => Promise.resolve(() => {})),
     getSettings: vi.fn(() => Promise.resolve({
       bookmarked_dirs: [],
       recent_dirs: [],
@@ -25,6 +27,7 @@ vi.mock("./services", () => ({
     getLogs: vi.fn(() => Promise.resolve([])),
     getSupportedEngines: vi.fn(() => Promise.resolve(["SBERT"])),
     getIndexStatus: vi.fn(() => Promise.resolve(null)),
+    isSemanticReady: vi.fn(() => Promise.resolve(true)),
     getDataPaths: vi.fn(() => Promise.resolve({ app_data: "", hf_cache: "" })),
     listFiles: vi.fn(() => Promise.resolve([])),
   },
@@ -65,7 +68,11 @@ describe("App", () => {
 
   it("renders correctly", async () => {
     await act(async () => {
-      render(<App />);
+      render(
+        <ToastProvider>
+          <App />
+        </ToastProvider>
+      );
     });
     expect(screen.getByPlaceholderText("Search…")).toBeInTheDocument();
     expect(screen.getByText("Open folder")).toBeInTheDocument();
@@ -76,7 +83,11 @@ describe("App", () => {
     useSettingsStore.setState({ load: loadMock });
     
     await act(async () => {
-      render(<App />);
+      render(
+        <ToastProvider>
+          <App />
+        </ToastProvider>
+      );
     });
     
     expect(loadMock).toHaveBeenCalled();
@@ -84,7 +95,11 @@ describe("App", () => {
 
   it("opens settings modal when clicked", async () => {
     await act(async () => {
-      render(<App />);
+      render(
+        <ToastProvider>
+          <App />
+        </ToastProvider>
+      );
     });
     
     const settingsButton = screen.getByTitle("Settings");
@@ -99,7 +114,11 @@ describe("App", () => {
     (source as any).pickDirectory.mockResolvedValue("/picked/path");
 
     await act(async () => {
-      render(<App />);
+      render(
+        <ToastProvider>
+          <App />
+        </ToastProvider>
+      );
     });
 
     const pickButton = screen.getByText("Open folder");

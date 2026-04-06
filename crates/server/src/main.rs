@@ -245,8 +245,7 @@ async fn delete_upload_handler(
     Query(params): Query<DeleteUploadQuery>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     let rel: PathBuf = params.path
-        .split(['/', '\\'])
-        .filter(|s| !s.is_empty() && *s != "..")
+        .split(['/', '\\'])        .filter(|s| !s.is_empty() && *s != "..")
         .collect();
     if rel.as_os_str().is_empty() {
         return Err(err("Cannot delete uploads root via this endpoint; use DELETE /api/upload/all"));
@@ -532,7 +531,7 @@ async fn main() -> anyhow::Result<()> {
         emitter,
     );
 
-    ctx.spawn_background_tasks(event_rx, loop_fut);
+    ctx.clone().spawn_background_tasks(event_rx, loop_fut);
 
     let state = Arc::new(AppState { ctx, uploads_dir, events_tx });
     let index_html = config.dist_dir.join("index.html");
@@ -583,18 +582,74 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-/worker/timeout", patch(set_worker_timeout_handler))
-        // Static assets
-        .fallback_service(
-            ServeDir::new(&config.dist_dir).not_found_service(ServeFile::new(index_html)),
-        )
-        .layer(CorsLayer::permissive())
-        .with_state(state);
 
-    let addr = format!("0.0.0.0:{}", config.port);
-    info!("wilkes-server listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    Ok(())
+    #[test]
+    fn test_mime_for_path() {
+        assert_eq!(mime_for_path(Path::new("test.pdf")), "application/pdf");
+        assert_eq!(mime_for_path(Path::new("test.txt")), "text/plain");
+        assert_eq!(mime_for_path(Path::new("test.html")), "text/html");
+        assert_eq!(mime_for_path(Path::new("test.json")), "application/json");
+        assert_eq!(mime_for_path(Path::new("test.png")), "image/png");
+        assert_eq!(mime_for_path(Path::new("test.jpg")), "image/jpeg");
+        assert_eq!(mime_for_path(Path::new("test.unknown")), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_parse_config_defaults() {
+        // Clear environment variables that might affect parsing
+        std::env::remove_var("WILKES_PORT");
+        std::env::remove_var("WILKES_DATA_DIR");
+        std::env::remove_var("WILKES_DIST_DIR");
+
+        // This assumes no command line arguments are passed during cargo test
+        let config = parse_config();
+        
+        // The default port is 3000 if WILKES_PORT is not set
+        assert_eq!(config.port, 3000);
+        assert_eq!(config.data_dir, PathBuf::from("/data"));
+        assert_eq!(config.dist_dir, PathBuf::from("./dist"));
+    }
+
+    #[test]
+    fn test_error_helpers() {
+        let (status, body) = err("bad request");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0.error, "bad request");
+
+        let (status, body) = server_err("internal error");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.0.error, "internal error");
+    }
+
+    #[test]
+    fn test_broadcast_emitter() {
+        let (tx, mut rx) = broadcast::channel(10);
+        let emitter = BroadcastEmitter { tx };
+        
+        emitter.emit("test-event", serde_json::json!({"key": "value"}));
+        
+        let msg = rx.try_recv().unwrap();
+        assert_eq!(msg.0, "test-event");
+        assert_eq!(msg.1["key"], "value");
+    }
+
+    #[tokio::test]
+    async fn test_dir_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        
+        tokio::fs::write(root.join("f1.txt"), "abc").await.unwrap(); // 3 bytes
+        tokio::fs::write(root.join("f2.txt"), "de").await.unwrap();  // 2 bytes
+        
+        let sub = root.join("sub");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("f3.txt"), "f").await.unwrap();    // 1 byte
+        
+        let size = dir_size(root).await.unwrap();
+        assert_eq!(size, 6);
+    }
 }

@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import type { SearchApi, DataPaths } from "../services/api";
+import { isTauri } from "../services";
 import type { IndexStatus } from "../lib/types";
 
 interface Props {

@@ -150,4 +150,44 @@ mod tests {
         delete_index(dir.path()).await.unwrap();
         assert!(!db_path.exists());
     }
+
+    struct MockEmbedder;
+    impl Embedder for MockEmbedder {
+        fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![0.0; 768]])
+        }
+        fn model_id(&self) -> &str { "mock" }
+        fn dimension(&self) -> usize { 768 }
+    }
+
+    #[tokio::test]
+    async fn test_build_index_with_embedder() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("files");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("test.txt"), "hello world").unwrap();
+
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+
+        let embedder = Arc::new(MockEmbedder);
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        let supported_extensions = vec!["txt".to_string()];
+
+        let result = build_index_with_embedder(
+            root,
+            wilkes_core::types::EmbeddingEngine::SBERT,
+            embedder,
+            data_dir.clone(),
+            tx,
+            600,
+            128,
+            supported_extensions,
+        ).await;
+
+        assert!(result.is_ok());
+        
+        let db_path = data_dir.join("semantic_index.db");
+        assert!(db_path.exists());
+    }
 }

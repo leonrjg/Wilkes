@@ -154,16 +154,6 @@ pub struct FastEmbedder {
 }
 
 impl FastEmbedder {
-    /// Returns (query_prefix, passage_prefix) for models that require them.
-    fn prefixes(&self) -> (&'static str, &'static str) {
-        // E5 family requires explicit prefixes; without them retrieval is unreliable.
-        if self.model_id.contains("/multilingual-e5") || self.model_id.contains("/e5-") {
-            ("query: ", "passage: ")
-        } else {
-            ("", "")
-        }
-    }
-
     fn embed_with_prefix(&self, texts: &[&str], prefix: &str) -> anyhow::Result<Vec<Vec<f32>>> {
         let total = texts.len();
         debug!("[fastembed] embed: {total} texts, batch_size={:?}", self.preferred_batch_size);
@@ -204,15 +194,6 @@ impl Embedder for FastEmbedder {
         self.preferred_batch_size
     }
 
-    fn embed_query(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let (query_prefix, _) = self.prefixes();
-        self.embed_with_prefix(texts, query_prefix)
-    }
-
-    fn embed_passages(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let (_, passage_prefix) = self.prefixes();
-        self.embed_with_prefix(texts, passage_prefix)
-    }
 }
 
 // ── FastembedInstaller ────────────────────────────────────────────────────────
@@ -294,6 +275,14 @@ impl EmbedderInstaller for FastembedInstaller {
         .await?
         .map_err(|e| anyhow::anyhow!("fastembed install: {e}"))?;
 
+        // Fetch auxiliary config files (e.g. config_sentence_transformers.json) so that
+        // build() can read prefix configuration without a network call. Best-effort.
+        let aux_model_id = self.model.0.clone();
+        let aux_cache_dir = data_dir.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || {
+            super::aux_config::fetch_aux_configs(&aux_cache_dir, &aux_model_id);
+        }).await;
+
         let _ = tx
             .send(EmbedProgress::Download(DownloadProgress {
                 bytes_received: 0,
@@ -311,6 +300,7 @@ impl EmbedderInstaller for FastembedInstaller {
 
     fn build(&self, data_dir: &Path) -> anyhow::Result<Arc<dyn Embedder>> {
         let info = find_model_info(&self.model.0)?;
+        let prefixes = super::aux_config::load_prefixes(data_dir, &self.model.0);
         Ok(Arc::new(super::sbert::WorkerEmbedder::new(
             self.manager.clone(),
             self.model.0.clone(),
@@ -318,6 +308,8 @@ impl EmbedderInstaller for FastembedInstaller {
             self.device.clone(),
             crate::types::EmbeddingEngine::Fastembed,
             data_dir.to_path_buf(),
+            prefixes.query_prefix,
+            prefixes.passage_prefix,
         )))
     }
 }

@@ -20,11 +20,13 @@ describe("UploadZone", () => {
     onRootChange: vi.fn(),
   };
 
+  let xhrMock: any;
+
   beforeEach(() => {
     vi.clearAllMocks();
     mockApi.listFiles.mockResolvedValue([]);
     // Mock XMLHttpRequest
-    const xhrMock: any = {
+    xhrMock = {
       open: vi.fn(),
       send: vi.fn(),
       setRequestHeader: vi.fn(),
@@ -36,7 +38,9 @@ describe("UploadZone", () => {
         addEventListener: vi.fn(),
       },
     };
-    vi.stubGlobal("XMLHttpRequest", vi.fn(() => xhrMock));
+    vi.stubGlobal("XMLHttpRequest", vi.fn(function(this: any) {
+      return xhrMock;
+    }));
   });
 
   it("renders upload triggers", () => {
@@ -49,24 +53,107 @@ describe("UploadZone", () => {
     render(<UploadZone {...defaultProps} />);
     const filesBtn = screen.getByText("Files");
     fireEvent.click(filesBtn);
-    // Difficult to check if hidden input was clicked, but we covered the line
   });
 
-  it("handles file selection and triggers upload", async () => {
+  it("handles file selection and triggers upload success", async () => {
     render(<UploadZone {...defaultProps} />);
-    const fileInput = screen.getByTitle("Upload files").nextElementSibling?.nextElementSibling as HTMLInputElement; 
-    // Actually the inputs are hidden, but we can find them by their type
     const inputs = document.querySelectorAll('input[type="file"]');
     const fileInputReal = inputs[0];
 
     const file = new File(["test"], "test.txt", { type: "text/plain" });
     
+    // Capture the load event listener
+    let loadListener: Function | undefined;
+    xhrMock.addEventListener.mockImplementation((event: string, listener: Function) => {
+      if (event === "load") loadListener = listener;
+    });
+
     await act(async () => {
       fireEvent.change(fileInputReal, { target: { files: [file] } });
     });
 
-    // The uploadWithProgress uses XMLHttpRequest which we mocked.
-    // In a real test we'd need to trigger the 'load' event on the mock.
+    expect(xhrMock.open).toHaveBeenCalledWith("POST", "/api/upload");
+    expect(xhrMock.send).toHaveBeenCalledWith(expect.any(FormData));
+
+    // Simulate upload success
+    await act(async () => {
+      if (loadListener) loadListener();
+    });
+
+    expect(defaultProps.onRootChange).toHaveBeenCalledWith("/new/root");
+    expect(mockApi.listFiles).toHaveBeenCalledWith("/new/root");
+  });
+
+  it("handles upload progress", async () => {
+    render(<UploadZone {...defaultProps} />);
+    const inputs = document.querySelectorAll('input[type="file"]');
+    const fileInputReal = inputs[0];
+    const file = new File(["test"], "test.txt");
+
+    let progressListener: Function | undefined;
+    xhrMock.upload.addEventListener.mockImplementation((event: string, listener: Function) => {
+      if (event === "progress") progressListener = listener;
+    });
+
+    await act(async () => {
+      fireEvent.change(fileInputReal, { target: { files: [file] } });
+    });
+
+    // Simulate progress
+    await act(async () => {
+      if (progressListener) {
+        progressListener({ lengthComputable: true, loaded: 50, total: 100 });
+      }
+    });
+
+    expect(screen.getByText("Uploading 50%…")).toBeInTheDocument();
+  });
+
+  it("handles upload failure", async () => {
+    render(<UploadZone {...defaultProps} />);
+    const inputs = document.querySelectorAll('input[type="file"]');
+    const fileInputReal = inputs[0];
+    const file = new File(["test"], "test.txt");
+
+    let loadListener: Function | undefined;
+    xhrMock.addEventListener.mockImplementation((event: string, listener: Function) => {
+      if (event === "load") loadListener = listener;
+    });
+
+    await act(async () => {
+      fireEvent.change(fileInputReal, { target: { files: [file] } });
+    });
+
+    // Simulate upload failure
+    xhrMock.status = 500;
+    await act(async () => {
+      if (loadListener) loadListener();
+    });
+
+    expect(screen.getByText("Upload failed: 500")).toBeInTheDocument();
+  });
+
+  it("handles upload network error", async () => {
+    render(<UploadZone {...defaultProps} />);
+    const inputs = document.querySelectorAll('input[type="file"]');
+    const fileInputReal = inputs[0];
+    const file = new File(["test"], "test.txt");
+
+    let errorListener: Function | undefined;
+    xhrMock.addEventListener.mockImplementation((event: string, listener: Function) => {
+      if (event === "error") errorListener = listener;
+    });
+
+    await act(async () => {
+      fireEvent.change(fileInputReal, { target: { files: [file] } });
+    });
+
+    // Simulate network error
+    await act(async () => {
+      if (errorListener) errorListener();
+    });
+
+    expect(screen.getByText("Upload network error")).toBeInTheDocument();
   });
 
   it("calls deleteAll when Clear all is clicked", async () => {
