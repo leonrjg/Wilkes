@@ -7,13 +7,13 @@ use notify_debouncer_mini::new_debouncer;
 use tracing::{error, info};
 
 use crate::extract::ExtractorRegistry;
-use super::Embedder;
-use super::index::SemanticIndex;
+use super::super::Embedder;
+use super::SemanticIndex;
 
 // ── IndexWatcher ──────────────────────────────────────────────────────────────
 
 pub struct WatcherConfig {
-    pub manager: crate::embed::worker_manager::WorkerManager,
+    pub manager: crate::embed::worker::manager::WorkerManager,
     pub model_id: String,
     pub data_dir: PathBuf,
     pub device: String,
@@ -135,7 +135,7 @@ fn spawn_sbert_worker(
     chunk_size: usize,
     chunk_overlap: usize,
 ) -> anyhow::Result<()> {
-    use crate::embed::worker_ipc::WorkerRequest;
+    use crate::embed::worker::ipc::WorkerRequest;
     use crate::types::EmbeddingEngine;
 
     let request = WorkerRequest {
@@ -153,19 +153,19 @@ fn spawn_sbert_worker(
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-    let cmd = crate::embed::worker_manager::ManagerCommand::Submit {
+    let cmd = crate::embed::worker::manager::ManagerCommand::Submit {
         req: request,
         reply: tx,
     };
 
-    cfg.manager.sender().blocking_send(cmd)
+    cfg.manager.blocking_send(cmd)
         .map_err(|e| anyhow::anyhow!("Failed to send to worker manager: {e}"))?;
 
     // Wait for worker to finish (incremental updates should be fast)
     while let Some(event) = rx.blocking_recv() {
         match event {
-            crate::embed::worker_ipc::WorkerEvent::Done => break,
-            crate::embed::worker_ipc::WorkerEvent::Error(e) => anyhow::bail!("SBERT worker error: {e}"),
+            crate::embed::worker::ipc::WorkerEvent::Done => break,
+            crate::embed::worker::ipc::WorkerEvent::Error(e) => anyhow::bail!("SBERT worker error: {e}"),
             _ => {}
         }
     }
@@ -245,4 +245,32 @@ fn try_open_exclusive(path: &std::path::Path, max_attempts: u32, base_delay: Dur
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_index_watcher_start_stop() {
+        let dir = tempdir().unwrap();
+        let index = Arc::new(Mutex::new(None));
+        let registry = Arc::new(ExtractorRegistry::new());
+        
+        let mut watcher = IndexWatcher::start(
+            dir.path().to_path_buf(),
+            index,
+            registry,
+            None,
+            None,
+            100,
+            10,
+            vec!["txt".to_string()],
+            || {},
+            || {},
+        ).unwrap();
+
+        watcher.stop();
+    }
 }

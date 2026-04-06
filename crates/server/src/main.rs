@@ -1,7 +1,6 @@
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Multipart, Query, State};
@@ -17,8 +16,8 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info};
 use wilkes_api::context::{AppContext, EventEmitter};
-use wilkes_core::embed::worker_manager::WorkerPaths;
 use wilkes_core::path::is_under;
+use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::types::{EmbedderModel, EmbeddingEngine, MatchRef, ModelDescriptor, SearchQuery, SearchStats};
 
 const MAX_UPLOAD_BYTES: u64 = 500 * 1024 * 1024;
@@ -69,7 +68,7 @@ async fn search_handler(
     let ctx = Arc::clone(&state.ctx);
 
     tokio::spawn(async move {
-        let mut handle = match Arc::clone(&ctx).start_search(query).await {
+        let handle = match Arc::clone(&ctx).start_search(query).await {
             Ok(h) => h,
             Err(e) => {
                 let event = Event::default().event("error").data(e);
@@ -78,29 +77,17 @@ async fn search_handler(
             }
         };
 
-        let started = Instant::now();
-        let mut total_matches = 0usize;
-        let mut files_scanned = 0usize;
-
-        while let Some(fm) = handle.next().await {
-            total_matches += fm.matches.len();
-            files_scanned += 1;
-            let data = match serde_json::to_string(&fm) {
-                Ok(s) => s,
-                Err(e) => { error!("search serialize: {e}"); continue; }
-            };
-            if tx.send(Ok(Event::default().event("result").data(data))).await.is_err() {
-                return;
+        let stats = handle.run(|fm| {
+            let tx = tx.clone();
+            async move {
+                let data = match serde_json::to_string(&fm) {
+                    Ok(s) => s,
+                    Err(e) => { error!("search serialize: {e}"); return true; }
+                };
+                tx.send(Ok(Event::default().event("result").data(data))).await.is_ok()
             }
-        }
+        }).await;
 
-        let errors = handle.finish().await;
-        let stats = SearchStats {
-            files_scanned,
-            total_matches,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            errors,
-        };
         let data = serde_json::to_string(&stats).unwrap_or_default();
         let _ = tx.send(Ok(Event::default().event("complete").data(data))).await;
     });
@@ -130,12 +117,25 @@ async fn clear_logs_handler() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+async fn get_data_paths_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let app_data = state.ctx.data_dir.display().to_string();
+    let hf_cache = wilkes_core::embed::models::hf_cache::get_hf_cache_root().display().to_string();
+    Json(wilkes_core::types::DataPaths { hf_cache, app_data })
+}
+
+async fn get_python_info_handler() -> impl IntoResponse {
+    match wilkes_core::path::resolve_python() {
+        Ok(p) => Json(p.display().to_string()),
+        Err(e) => Json(format!("Not found: {}", e)),
+    }
+}
+
 async fn get_settings_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let settings = wilkes_api::commands::settings::get_settings(&state.ctx.settings_path)
-        .await
-        .map_err(|e| server_err(e.to_string()))?;
+    let settings = state.ctx.get_settings().await;
     Ok(Json(settings))
 }
 
@@ -143,10 +143,16 @@ async fn update_settings_handler(
     State(state): State<Arc<AppState>>,
     Json(patch): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let settings = wilkes_api::commands::settings::update_settings(&state.ctx.settings_path, patch)
+    let settings = state.ctx.update_settings(patch)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(settings))
+}
+
+async fn is_semantic_ready_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<bool> {
+    Json(state.ctx.is_semantic_ready())
 }
 
 // ── File listing / open ───────────────────────────────────────────────────────
@@ -161,13 +167,7 @@ async fn list_files_handler(
     Query(params): Query<FilesQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     let root = PathBuf::from(&params.root);
-    if !is_under(&root, &state.ctx.data_dir) {
-        return Err(err("Path outside data directory"));
-    }
-    let settings = wilkes_api::commands::settings::get_settings(&state.ctx.settings_path)
-        .await
-        .map_err(|e| server_err(e.to_string()))?;
-    let files = wilkes_api::commands::files::list_files(root, settings.supported_extensions)
+    let files = state.ctx.list_files(root)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(files))
@@ -183,13 +183,7 @@ async fn open_file_handler(
     Json(body): Json<OpenFileBody>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     let path = PathBuf::from(&body.path);
-    if !is_under(&path, &state.ctx.data_dir) {
-        return Err(err("Path outside data directory"));
-    }
-    let settings = wilkes_api::commands::settings::get_settings(&state.ctx.settings_path)
-        .await
-        .map_err(|e| server_err(e.to_string()))?;
-    let data = wilkes_api::commands::files::open_file(path, settings.supported_extensions)
+    let data = state.ctx.open_file(path)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(data))
@@ -527,20 +521,7 @@ async fn main() -> anyhow::Result<()> {
     let settings_path = config.data_dir.join("settings.json");
     tokio::fs::create_dir_all(&uploads_dir).await?;
 
-    let worker_bin = std::env::current_exe()?.with_file_name("wilkes-rust-worker");
-    if !worker_bin.exists() {
-        error!("Worker binary NOT FOUND at {}", worker_bin.display());
-    }
-
-    // WorkerPaths: Python fields are unused when only fastembed/candle engines
-    // are active, but WorkerManager requires them to be present.
-    let paths = WorkerPaths {
-        python_path: PathBuf::new(),
-        python_package_dir: PathBuf::new(),
-        requirements_path: PathBuf::new(),
-        venv_dir: config.data_dir.join("sbert_venv"),
-        worker_bin,
-    };
+    let paths = WorkerPaths::resolve(&config.data_dir);
 
     let (events_tx, _) = broadcast::channel::<(String, serde_json::Value)>(1024);
     let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
@@ -551,11 +532,7 @@ async fn main() -> anyhow::Result<()> {
         emitter,
     );
 
-    tokio::spawn(loop_fut);
-    let ctx1 = Arc::clone(&ctx);
-    tokio::spawn(async move { ctx1.run_event_forwarder(event_rx).await; });
-    let ctx2 = Arc::clone(&ctx);
-    tokio::spawn(async move { ctx2.restore_state().await; });
+    ctx.spawn_background_tasks(event_rx, loop_fut);
 
     let state = Arc::new(AppState { ctx, uploads_dir, events_tx });
     let index_html = config.dist_dir.join("index.html");
@@ -566,8 +543,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/preview", post(preview_handler))
         .route("/api/settings", get(get_settings_handler))
         .route("/api/settings", patch(update_settings_handler))
+        .route("/api/embed/ready", get(is_semantic_ready_handler))
         .route("/api/logs", get(get_logs_handler))
         .route("/api/logs", delete(clear_logs_handler))
+        .route("/api/data/paths", get(get_data_paths_handler))
+        .route("/api/worker/python-info", get(get_python_info_handler))
         .route("/api/files", get(list_files_handler))
         .route("/api/file", post(open_file_handler))
         // Upload (server-only: desktop uses native file picker)
@@ -589,6 +569,21 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/worker/status", get(get_worker_status_handler))
         .route("/api/worker/kill", post(kill_worker_handler))
         .route("/api/worker/timeout", patch(set_worker_timeout_handler))
+        // Static assets
+        .fallback_service(
+            ServeDir::new(&config.dist_dir).not_found_service(ServeFile::new(index_html)),
+        )
+        .layer(CorsLayer::permissive())
+        .with_state(state);
+
+    let addr = format!("0.0.0.0:{}", config.port);
+    info!("wilkes-server listening on {addr}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+/worker/timeout", patch(set_worker_timeout_handler))
         // Static assets
         .fallback_service(
             ServeDir::new(&config.dist_dir).not_found_service(ServeFile::new(index_html)),

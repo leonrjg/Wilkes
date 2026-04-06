@@ -53,11 +53,13 @@ export interface SearchApi {
   buildIndex(root: string, model: EmbedderModel, engine: EmbeddingEngine): Promise<void>;
   cancelEmbed(): Promise<void>;
   getIndexStatus(): Promise<IndexStatus>;
+  isSemanticReady(): Promise<boolean>;
   deleteIndex(): Promise<void>;
 
   onEmbedProgress(handler: (progress: EmbedProgress) => void): Promise<() => void>;
   onEmbedDone(handler: (done: EmbedDone) => void): Promise<() => void>;
   onEmbedError(handler: (err: EmbedError) => void): Promise<() => void>;
+  onManagerEvent(handler: (event: string) => void): Promise<() => void>;
 }
 
 // Desktop: native directory picker.

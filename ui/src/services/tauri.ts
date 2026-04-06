@@ -140,6 +140,10 @@ export class TauriSearchApi implements SearchApi {
     return invoke<IndexStatus>("get_index_status");
   }
 
+  async isSemanticReady(): Promise<boolean> {
+    return invoke<boolean>("is_semantic_ready");
+  }
+
   async deleteIndex(): Promise<void> {
     return invoke("delete_index");
   }
@@ -158,6 +162,10 @@ export class TauriSearchApi implements SearchApi {
     handler: (err: EmbedError) => void,
   ): Promise<() => void> {
     return listen<EmbedError>("embed-error", (e) => handler(e.payload));
+  }
+
+  async onManagerEvent(handler: (event: string) => void): Promise<() => void> {
+    return listen<string>("manager-event", (e) => handler(e.payload));
   }
 }
 

@@ -1,3 +1,5 @@
+@AGENTS.md
+
 # Rules
 - Do not modify aspects that were not requested explicitly, e.g. no UI redesign of existing elements.
 - Do as told concisely and atomically; no extras.

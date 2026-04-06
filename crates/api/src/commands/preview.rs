@@ -102,3 +102,71 @@ fn line_range(content: &str, line: u32) -> ByteRange {
     }
     ByteRange { start: 0, end: 0 }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use tempfile::NamedTempFile;
+    use std::io::Write;
+
+    #[test]
+    fn test_detect_language() {
+        assert_eq!(detect_language(Path::new("test.rs")), Some("rust".to_string()));
+        assert_eq!(detect_language(Path::new("test.py")), Some("python".to_string()));
+        assert_eq!(detect_language(Path::new("test.unknown")), None);
+    }
+
+    #[test]
+    fn test_line_range() {
+        let content = "line 1\nline 2\nline 3";
+        let range = line_range(content, 1);
+        assert_eq!(range.start, 0);
+        assert_eq!(range.end, 6);
+
+        let range = line_range(content, 2);
+        assert_eq!(range.start, 7);
+        assert_eq!(range.end, 13);
+    }
+
+    #[tokio::test]
+    async fn test_preview_text() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "line 1\nline 2\nline 3").unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let match_ref = MatchRef {
+            path: path.clone(),
+            origin: SourceOrigin::TextFile { line: 2, col: 2 },
+            text_range: Some(ByteRange { start: 8, end: 13 }),
+        };
+
+        let preview = preview_text(&match_ref).await.unwrap();
+        if let PreviewData::Text { content, highlight_line, .. } = preview {
+            assert!(content.contains("line 2"));
+            assert_eq!(highlight_line, 2);
+        } else {
+            panic!("Expected Text preview");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preview_pdf() {
+        let match_ref = MatchRef {
+            path: PathBuf::from("test.pdf"),
+            origin: SourceOrigin::PdfPage { 
+                page: 5, 
+                bbox: Some(wilkes_core::types::BoundingBox { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }) 
+            },
+            text_range: None,
+        };
+
+        let res = preview(match_ref).await.unwrap();
+        if let PreviewData::Pdf { page, highlight_bbox } = res {
+            assert_eq!(page, 5);
+            assert!(highlight_bbox.is_some());
+        } else {
+            panic!("Expected Pdf preview");
+        }
+    }
+}

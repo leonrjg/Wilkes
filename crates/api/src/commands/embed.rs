@@ -13,7 +13,7 @@ use wilkes_core::types::IndexStatus;
 pub async fn download_model(
     engine: wilkes_core::types::EmbeddingEngine,
     model: wilkes_core::types::EmbedderModel,
-    manager: wilkes_core::embed::worker_manager::WorkerManager,
+    manager: wilkes_core::embed::worker::manager::WorkerManager,
     device: String,
     data_dir: PathBuf,
     tx: ProgressTx,
@@ -82,7 +82,7 @@ pub async fn build_index(
     root: PathBuf,
     engine: wilkes_core::types::EmbeddingEngine,
     model: wilkes_core::types::EmbedderModel,
-    manager: wilkes_core::embed::worker_manager::WorkerManager,
+    manager: wilkes_core::embed::worker::manager::WorkerManager,
     device: String,
     data_dir: PathBuf,
     tx: ProgressTx,
@@ -127,4 +127,27 @@ pub async fn get_index_status(data_dir: &Path) -> anyhow::Result<IndexStatus> {
 pub async fn delete_index(data_dir: &Path) -> anyhow::Result<()> {
     let path = data_dir.join("semantic_index.db");
     tokio::fs::remove_file(&path).await.map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_get_index_status_missing() {
+        let dir = tempdir().unwrap();
+        let res = get_index_status(dir.path()).await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete_index() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("semantic_index.db");
+        std::fs::write(&db_path, "fake db").unwrap();
+
+        delete_index(dir.path()).await.unwrap();
+        assert!(!db_path.exists());
+    }
 }

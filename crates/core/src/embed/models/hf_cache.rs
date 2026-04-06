@@ -153,3 +153,42 @@ fn calculate_dir_size(path: &Path) -> u64 {
     }
     total_size
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use std::fs;
+
+    #[test]
+    fn test_calculate_dir_size() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        
+        fs::write(root.join("f1.txt"), "abc").unwrap(); // 3 bytes
+        fs::write(root.join("f2.txt"), "de").unwrap();  // 2 bytes
+        
+        let sub = root.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("f3.txt"), "f").unwrap();    // 1 byte
+        
+        assert_eq!(calculate_dir_size(root), 6);
+    }
+
+    #[test]
+    fn test_get_model_descriptor_from_path() {
+        let dir = tempdir().unwrap();
+        let model_dir = dir.path();
+        let snapshots = model_dir.join("snapshots");
+        let snapshot = snapshots.join("12345");
+        fs::create_dir_all(&snapshot).unwrap();
+        
+        fs::write(snapshot.join("config.json"), r#"{"hidden_size": 384}"#).unwrap();
+        fs::write(snapshot.join("model.bin"), "fake weights").unwrap();
+
+        let desc = get_model_descriptor_from_path(model_dir, "org/repo").unwrap();
+        assert_eq!(desc.model_id, "org/repo");
+        assert_eq!(desc.dimension, 384);
+        assert!(desc.size_bytes.unwrap() > 0);
+    }
+}

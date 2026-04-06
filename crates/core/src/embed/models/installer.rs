@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 
 use async_trait::async_trait;
 
-use super::Embedder;
+use super::super::Embedder;
 
 // ── Progress types ────────────────────────────────────────────────────────────
 

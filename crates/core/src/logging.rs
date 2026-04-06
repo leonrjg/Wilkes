@@ -9,7 +9,7 @@ static LOG_BUFFER: LazyLock<Mutex<VecDeque<String>>> = LazyLock::new(|| {
     Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES))
 });
 
-struct BufferLayer;
+pub struct BufferLayer;
 
 impl<S> Layer<S> for BufferLayer
 where
@@ -59,7 +59,7 @@ pub fn init_logging() {
         .with_thread_names(false);
 
     let filter_layer = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info"))
+        .or_else(|_| EnvFilter::try_new("info,hf_hub=warn"))
         .unwrap();
 
     tracing_subscriber::registry()
@@ -67,6 +67,12 @@ pub fn init_logging() {
         .with(fmt_layer)
         .with(BufferLayer)
         .init();
+
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("PANIC: {info}");
+        default_hook(info);
+    }));
 }
 
 /// Like `init_logging`, but writes to stderr instead of stdout.
@@ -79,7 +85,7 @@ pub fn init_logging_stderr() {
         .with_thread_names(false);
 
     let filter_layer = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info"))
+        .or_else(|_| EnvFilter::try_new("info,hf_hub=warn"))
         .unwrap();
 
     tracing_subscriber::registry()
@@ -94,4 +100,30 @@ pub fn get_logs() -> Vec<String> {
 
 pub fn clear_logs() {
     LOG_BUFFER.lock().clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing::{info, subscriber};
+
+    #[test]
+    fn test_logging_buffer() {
+        // Since we can't easily re-init global logging in tests if it was already inited,
+        // we can at least test the buffer and layer logic.
+        let layer = BufferLayer;
+        
+        // Use a local subscriber with our layer for testing
+        let subscriber = tracing_subscriber::registry().with(layer);
+        
+        subscriber::with_default(subscriber, || {
+            info!("test message 123");
+        });
+
+        let logs = get_logs();
+        assert!(logs.iter().any(|l| l.contains("test message 123")));
+
+        clear_logs();
+        assert_eq!(get_logs().len(), 0);
+    }
 }

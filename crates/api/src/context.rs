@@ -9,11 +9,15 @@ use tracing::{error, info};
 use wilkes_core::embed::{dispatch, Embedder};
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::installer::EmbedProgress;
-use wilkes_core::embed::watcher::{IndexWatcher, WatcherConfig};
-use wilkes_core::embed::worker_manager::{ManagerCommand, ManagerEvent, WorkerManager, WorkerPaths, WorkerStatus};
+use wilkes_core::embed::index::watcher::{IndexWatcher, WatcherConfig};
+use wilkes_core::path::is_under;
+use wilkes_core::embed::worker::manager::{ManagerCommand, ManagerEvent, WorkerManager, WorkerPaths, WorkerStatus};
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
-use wilkes_core::types::{EmbedderModel, EmbeddingEngine, IndexStatus, SemanticSettings, SearchMode, SearchQuery};
+use wilkes_core::types::{
+    EmbedderModel, EmbeddingEngine, FileEntry, IndexStatus, PreviewData, SearchMode, SearchQuery,
+    SemanticSettings, Settings,
+};
 
 use crate::commands::search::{start_search, SearchHandle};
 use crate::commands::settings::{get_settings, update_settings};
@@ -47,6 +51,7 @@ pub struct AppContext {
     embed_task: Mutex<Option<EmbedTaskHandle>>,
     pub worker_manager: WorkerManager,
     events: Arc<dyn EventEmitter>,
+    settings_lock: tokio::sync::Mutex<()>,
 }
 
 impl AppContext {
@@ -66,8 +71,24 @@ impl AppContext {
             embed_task: Mutex::new(None),
             worker_manager,
             events,
+            settings_lock: tokio::sync::Mutex::new(()),
         });
         (ctx, event_rx, loop_fut)
+    }
+
+    /// Spawns the required background tasks for the application context.
+    pub fn spawn_background_tasks(self: Arc<Self>, event_rx: mpsc::Receiver<ManagerEvent>, loop_fut: impl std::future::Future<Output = ()> + Send + 'static) {
+        tokio::spawn(loop_fut);
+        
+        let ctx1 = Arc::clone(&self);
+        tokio::spawn(async move {
+            ctx1.run_event_forwarder(event_rx).await;
+        });
+
+        let ctx2 = Arc::clone(&self);
+        tokio::spawn(async move {
+            ctx2.restore_state().await;
+        });
     }
 
     /// Forward manager-loop events through the EventEmitter. Run this as a
@@ -82,10 +103,32 @@ impl AppContext {
         }
     }
 
+    // ── Business Logic ────────────────────────────────────────────────────────
+
+    pub async fn get_settings(&self) -> Settings {
+        get_settings(&self.settings_path).await.unwrap_or_default()
+    }
+
+    pub async fn list_files(&self, root: PathBuf) -> anyhow::Result<Vec<FileEntry>> {
+        if !is_under(&root, &self.data_dir) {
+            anyhow::bail!("Access denied: path outside data directory");
+        }
+        let s = self.get_settings().await;
+        crate::commands::files::list_files(root, s.supported_extensions, s.max_file_size).await
+    }
+
+    pub async fn open_file(&self, path: PathBuf) -> anyhow::Result<PreviewData> {
+        if !is_under(&path, &self.data_dir) {
+            anyhow::bail!("Access denied: path outside data directory");
+        }
+        let s = self.get_settings().await;
+        crate::commands::files::open_file(path, s.supported_extensions).await
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
-    async fn settings(&self) -> wilkes_core::types::Settings {
-        get_settings(&self.settings_path).await.unwrap_or_default()
+    async fn settings(&self) -> Settings {
+        self.get_settings().await
     }
 
     fn stop_watcher(&self) {
@@ -100,6 +143,7 @@ impl AppContext {
     where
         F: FnOnce(SemanticSettings) -> SemanticSettings,
     {
+        let _lock = self.settings_lock.lock().await;
         let current = match get_settings(&self.settings_path).await {
             Ok(s) => s,
             Err(e) => { error!("update_semantic_settings: read: {e:#}"); return; }
@@ -111,6 +155,15 @@ impl AppContext {
         ).await {
             error!("update_semantic_settings: write: {e:#}");
         }
+    }
+
+    pub async fn update_settings(&self, patch: serde_json::Value) -> anyhow::Result<wilkes_core::types::Settings> {
+        let _lock = self.settings_lock.lock().await;
+        update_settings(&self.settings_path, patch).await
+    }
+
+    pub fn is_semantic_ready(&self) -> bool {
+        self.embedder.lock().unwrap().is_some() && self.index.lock().unwrap().lock().unwrap().is_some()
     }
 
     // ── Search ────────────────────────────────────────────────────────────────
@@ -342,11 +395,11 @@ impl AppContext {
                     }
                 }
             }
-
             *ctx.embed_task.lock().unwrap() = None;
             Ok(())
         });
 
+        let cancel = CancellationToken::new();
         *self.embed_task.lock().unwrap() = Some(EmbedTaskHandle { cancel, join });
         Ok(())
     }
@@ -468,20 +521,18 @@ impl AppContext {
 
     pub async fn get_worker_status(&self) -> anyhow::Result<WorkerStatus> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.worker_manager.sender()
-            .send(ManagerCommand::GetStatus(tx)).await
+        self.worker_manager.send(ManagerCommand::GetStatus(tx)).await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         rx.await.map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     pub fn kill_worker(&self) {
         self.worker_manager.kill_active();
-        let _ = self.worker_manager.sender().try_send(ManagerCommand::KillWorker);
+        let _ = self.worker_manager.try_send(ManagerCommand::KillWorker);
     }
 
     pub async fn set_worker_timeout(&self, secs: u64) -> anyhow::Result<()> {
-        self.worker_manager.sender()
-            .send(ManagerCommand::SetTimeout(secs)).await
+        self.worker_manager.send(ManagerCommand::SetTimeout(secs)).await
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
@@ -500,7 +551,18 @@ impl AppContext {
             move || SemanticIndex::read_status_from_path(&d)
         }).await {
             Ok(Ok(s)) => s,
-            _ => return,
+            _ => {
+                // DB missing or unreadable — clear any stale enabled/index_path so the
+                // UI doesn't think an index exists when none can be loaded.
+                if settings.semantic.enabled || settings.semantic.index_path.is_some() {
+                    self.update_semantic_settings(|s| SemanticSettings {
+                        enabled: false,
+                        index_path: None,
+                        ..s
+                    }).await;
+                }
+                return;
+            }
         };
 
         let model = settings.semantic.model.clone();
@@ -508,9 +570,14 @@ impl AppContext {
 
         if db_status.model_id != model.model_id() {
             info!(
-                "restore_state: index model '{}' != settings model '{}', skipping",
+                "restore_state: index model '{}' != settings model '{}', clearing stale index reference",
                 db_status.model_id, model.model_id()
             );
+            self.update_semantic_settings(|s| SemanticSettings {
+                enabled: false,
+                index_path: None,
+                ..s
+            }).await;
             return;
         }
 
@@ -596,5 +663,120 @@ impl AppContext {
         }).await;
 
         info!("restore_state: embedder and index restored");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use tokio::sync::mpsc;
+    use serde_json::Value;
+
+    struct MockEmitter {
+        events: Arc<Mutex<Vec<(String, Value)>>>,
+    }
+    impl EventEmitter for MockEmitter {
+        fn emit(&self, name: &str, payload: Value) {
+            self.events.lock().unwrap().push((name.to_string(), payload));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_app_context_new() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let settings_path = dir.path().join("settings.json");
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let paths = WorkerPaths { 
+            python_path: PathBuf::from("python"), 
+            python_package_dir: PathBuf::from("py_pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+        };
+
+        let (ctx, _event_rx, _loop_fut) = AppContext::new(
+            data_dir,
+            settings_path.clone(),
+            paths,
+            emitter,
+        );
+
+        ctx.update_semantic_settings(|s| SemanticSettings {
+            enabled: true,
+            chunk_size: 1234,
+            ..s
+        }).await;
+
+        let updated = get_settings(&settings_path).await.unwrap();
+        assert_eq!(updated.semantic.enabled, true);
+        assert_eq!(updated.semantic.chunk_size, 1234);
+    }
+
+    #[tokio::test]
+    async fn test_event_forwarder() {
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(MockEmitter { events: events.clone() });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"), 
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+            },
+            emitter.clone(),
+        );
+
+        let (tx, rx) = mpsc::channel(1);
+        let forwarder = tokio::spawn(ctx.run_event_forwarder(rx));
+
+        tx.send(ManagerEvent::WorkerStarting).await.unwrap();
+        drop(tx);
+        forwarder.await.unwrap();
+
+        let events_guard = events.lock().unwrap();
+        assert_eq!(events_guard.len(), 1);
+        assert_eq!(events_guard[0].0, "manager-event");
+        assert_eq!(events_guard[0].1, serde_json::json!("WorkerStarting"));
+    }
+
+    #[tokio::test]
+    async fn test_stop_watcher() {
+        let dir = tempdir().unwrap();
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"), 
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+            },
+            emitter,
+        );
+
+        let watcher = IndexWatcher::start(
+            dir.path().to_path_buf(),
+            ctx.index.lock().unwrap().clone(),
+            Arc::new(ExtractorRegistry::new()),
+            None,
+            None,
+            100,
+            10,
+            vec![],
+            || {},
+            || {},
+        ).unwrap();
+
+        *ctx.watcher.lock().unwrap() = Some(watcher);
+        ctx.stop_watcher();
+        assert!(ctx.watcher.lock().unwrap().is_none());
     }
 }

@@ -2,9 +2,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::collections::HashMap;
 use crate::types::{EmbeddingEngine, EmbedderModel, ModelDescriptor};
-use super::Embedder;
-use super::installer::EmbedderInstaller;
-use super::worker_manager::WorkerManager;
+use super::super::Embedder;
+use super::super::models::installer::EmbedderInstaller;
+use super::super::worker::manager::WorkerManager;
 
 pub fn list_models(engine: EmbeddingEngine, data_dir: &Path) -> Vec<ModelDescriptor> {
     // Each engine provides its own builtin catalog, optionally checking data_dir
@@ -31,7 +31,7 @@ pub fn list_models(engine: EmbeddingEngine, data_dir: &Path) -> Vec<ModelDescrip
         .map(|m| (m.model_id.clone(), m))
         .collect();
 
-    super::hf_cache::overlay_hf_cache(&mut by_id);
+    super::super::models::hf_cache::overlay_hf_cache(&mut by_id);
 
     let mut result: Vec<ModelDescriptor> = by_id.into_values().collect();
     result.sort_by(|a, b| {
@@ -84,10 +84,10 @@ pub fn load_embedder_local(engine: EmbeddingEngine, model: &EmbedderModel, data_
 
 pub fn fetch_model_size(engine: EmbeddingEngine, _model_id: &str) -> anyhow::Result<u64> {
     match engine {
-        EmbeddingEngine::SBERT => super::hf_hub::fetch_model_size(_model_id),
+        EmbeddingEngine::SBERT => super::super::models::hf_hub::fetch_model_size(_model_id),
 
         #[cfg(feature = "candle")]
-        EmbeddingEngine::Candle => super::hf_hub::fetch_model_size(_model_id),
+        EmbeddingEngine::Candle => super::super::models::hf_hub::fetch_model_size(_model_id),
         #[cfg(not(feature = "candle"))]
         EmbeddingEngine::Candle => anyhow::bail!("Candle feature is disabled"),
 

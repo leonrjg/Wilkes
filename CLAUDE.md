@@ -1,3 +1,5 @@
+@AGENTS.md
+
 Use Gemini MCP as a sub-agent for codebase exploration or any use case in which you need sub-agents - your own subagents are forbidden, do not use them.
 Offload any tasks whose intermediate states you don't need to Gemini. Tools such as grep do not need to be offloaded.
 - Specify model "gemini-2.5-flash-lite" or it will crash. 

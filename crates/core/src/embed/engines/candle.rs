@@ -13,8 +13,8 @@ use hf_hub::api::sync::ApiBuilder;
 use tokenizers::Tokenizer;
 
 use crate::types::{EmbedderModel, ModelDescriptor};
-use super::Embedder;
-use super::installer::{DownloadProgress, EmbedProgress, EmbedderInstaller, ProgressTx};
+use super::super::Embedder;
+use super::super::models::installer::{DownloadProgress, EmbedProgress, EmbedderInstaller, ProgressTx};
 
 // ── Static model catalog ──────────────────────────────────────────────────────
 
@@ -78,12 +78,12 @@ fn cached_size_bytes(data_dir: &Path, model_id: &str) -> Option<u64> {
 }
 
 // ── Public model list ─────────────────────────────────────────────────────────
-
 pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
     PREEXISTING_MODELS
         .iter()
         .map(|info| {
-            let is_cached = super::hf_hub::is_model_cached(data_dir, info.model_id);
+            let is_cached = super::super::models::hf_hub::is_model_cached(data_dir, info.model_id);
+
             let size_bytes = if is_cached {
                 cached_size_bytes(data_dir, info.model_id)
             } else {
@@ -360,12 +360,12 @@ impl Embedder for CandleEmbedder {
 
 pub struct CandleInstaller {
     pub model: EmbedderModel,
-    pub manager: super::worker_manager::WorkerManager,
+    pub manager: super::super::worker::manager::WorkerManager,
     pub device: String,
 }
 
 impl CandleInstaller {
-    pub fn new(model: EmbedderModel, manager: super::worker_manager::WorkerManager, device: String) -> Self {
+    pub fn new(model: EmbedderModel, manager: super::super::worker::manager::WorkerManager, device: String) -> Self {
         Self { model, manager, device }
     }
 }
@@ -373,7 +373,7 @@ impl CandleInstaller {
 #[async_trait]
 impl EmbedderInstaller for CandleInstaller {
     fn is_available(&self, data_dir: &Path) -> bool {
-        super::hf_hub::is_model_cached(data_dir, &self.model.0)
+        super::super::models::hf_hub::is_model_cached(data_dir, &self.model.0)
     }
 
     async fn install(&self, data_dir: &Path, tx: ProgressTx) -> anyhow::Result<()> {

@@ -1,15 +1,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::task::JoinHandle;
-use tracing::error;
 use wilkes_api::context::{AppContext, EventEmitter};
-use wilkes_core::embed::worker_manager::WorkerPaths;
-use wilkes_core::embed::worker_manager::WorkerStatus;
+use wilkes_core::embed::worker::manager::WorkerPaths;
+use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
-    EmbedderModel, EmbeddingEngine, FileEntry, IndexStatus, ModelDescriptor, SearchStats,
+    DataPaths, EmbedderModel, EmbeddingEngine, FileEntry, IndexStatus, ModelDescriptor,
     Settings,
 };
 
@@ -19,57 +17,6 @@ fn desktop_settings_path() -> anyhow::Result<std::path::PathBuf> {
     let config = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
     Ok(config.join("wilkes").join("settings.json"))
-}
-
-fn resolve_python() -> anyhow::Result<std::path::PathBuf> {
-    let mut attempted = Vec::new();
-
-    let exe = std::env::current_exe()?;
-    let bundled = if cfg!(target_os = "macos") {
-        exe.parent().and_then(|p| p.parent())
-            .map(|p| p.join("Resources").join("python").join("bin").join("python3"))
-    } else if cfg!(target_os = "windows") {
-        exe.parent().map(|p| p.join("python").join("python.exe"))
-    } else {
-        exe.parent().and_then(|p| p.parent())
-            .map(|p| p.join("lib").join("python").join("bin").join("python3"))
-    };
-
-    if let Some(ref p) = bundled {
-        attempted.push(p.clone());
-        if p.exists() {
-            return Ok(p.clone());
-        }
-    }
-
-    let name = if cfg!(target_os = "windows") { "python.exe" } else { "python3" };
-    let which = if cfg!(target_os = "windows") { "where" } else { "which" };
-    if let Ok(out) = std::process::Command::new(which).arg(name).output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                let p = std::path::PathBuf::from(s);
-                attempted.push(p.clone());
-                return Ok(p);
-            }
-        }
-    }
-
-    let mut msg = "Python interpreter not found. Tried:\n".to_string();
-    for p in attempted {
-        msg.push_str(&format!("- {}\n", p.display()));
-    }
-    anyhow::bail!("{}", msg);
-}
-
-fn resolve_python_package_dir(app: &AppHandle) -> anyhow::Result<std::path::PathBuf> {
-    let resource_dir = app.path().resource_dir()?;
-    let candidates = [resource_dir.clone(), resource_dir.join("_up_").join("worker")];
-    candidates.into_iter()
-        .find(|p| p.join("wilkes_python_worker").is_dir())
-        .ok_or_else(|| anyhow::anyhow!(
-            "Python worker package not found in {}", resource_dir.display()
-        ))
 }
 
 // ── Tauri EventEmitter impl ───────────────────────────────────────────────────
@@ -88,24 +35,18 @@ struct ActiveSearches(Mutex<HashMap<String, JoinHandle<()>>>);
 
 // ── Desktop-only commands ─────────────────────────────────────────────────────
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct DataPaths {
-    hf_cache: String,
-    app_data: String,
-}
-
 #[tauri::command]
 async fn get_data_paths(app: AppHandle) -> Result<DataPaths, String> {
     let app_data = app.path().app_data_dir()
         .map(|p| p.display().to_string())
         .map_err(|e| e.to_string())?;
-    let hf_cache = wilkes_core::embed::hf_cache::get_hf_cache_root().display().to_string();
+    let hf_cache = wilkes_core::embed::models::hf_cache::get_hf_cache_root().display().to_string();
     Ok(DataPaths { hf_cache, app_data })
 }
 
 #[tauri::command]
 async fn get_python_info() -> Result<String, String> {
-    resolve_python().map(|p| p.display().to_string()).map_err(|e| e.to_string())
+    wilkes_core::path::resolve_python().map(|p| p.display().to_string()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -142,30 +83,22 @@ async fn search(
     app: AppHandle,
 ) -> Result<String, String> {
     let ctx = app.state::<Arc<AppContext>>().inner().clone();
-    let mut handle = Arc::clone(&ctx).start_search(query).await?;
+    let handle = Arc::clone(&ctx).start_search(query).await?;
 
     let search_id = search_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let id = search_id.clone();
     let app_clone = app.clone();
 
     let forwarder: JoinHandle<()> = tokio::spawn(async move {
-        let started = Instant::now();
-        let mut total_matches = 0usize;
-        let mut files_scanned = 0usize;
+        let stats = handle.run(|fm| {
+            let app_clone = app_clone.clone();
+            let id = id.clone();
+            async move {
+                let _ = app_clone.emit(&format!("search-result-{}", id), &fm);
+                true
+            }
+        }).await;
 
-        while let Some(fm) = handle.next().await {
-            total_matches += fm.matches.len();
-            files_scanned += 1;
-            let _ = app_clone.emit(&format!("search-result-{}", id), &fm);
-        }
-
-        let errors = handle.finish().await;
-        let stats = SearchStats {
-            files_scanned,
-            total_matches,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            errors,
-        };
         let _ = app_clone.emit(&format!("search-complete-{}", id), &stats);
 
         app_clone.state::<ActiveSearches>().0.lock().unwrap().remove(&id);
@@ -193,33 +126,31 @@ async fn preview(match_ref: wilkes_core::types::MatchRef) -> Result<wilkes_core:
 #[tauri::command]
 async fn list_files(root: String, app: AppHandle) -> Result<Vec<FileEntry>, String> {
     let ctx = app.state::<Arc<AppContext>>().inner().clone();
-    let settings = wilkes_api::commands::settings::get_settings(&ctx.settings_path)
-        .await.unwrap_or_default();
-    wilkes_api::commands::files::list_files(root.into(), settings.supported_extensions)
-        .await.map_err(|e| e.to_string())
+    ctx.list_files(root.into()).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn open_file(path: String, app: AppHandle) -> Result<wilkes_core::types::PreviewData, String> {
     let ctx = app.state::<Arc<AppContext>>().inner().clone();
-    let settings = wilkes_api::commands::settings::get_settings(&ctx.settings_path)
-        .await.unwrap_or_default();
-    wilkes_api::commands::files::open_file(path.into(), settings.supported_extensions)
-        .await.map_err(|e| e.to_string())
+    ctx.open_file(path.into()).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn get_settings(app: AppHandle) -> Result<Settings, String> {
     let ctx = app.state::<Arc<AppContext>>().inner().clone();
-    wilkes_api::commands::settings::get_settings(&ctx.settings_path)
-        .await.map_err(|e| e.to_string())
+    Ok(ctx.get_settings().await)
 }
 
 #[tauri::command]
 async fn update_settings(patch: serde_json::Value, app: AppHandle) -> Result<Settings, String> {
     let ctx = app.state::<Arc<AppContext>>().inner().clone();
-    wilkes_api::commands::settings::update_settings(&ctx.settings_path, patch)
-        .await.map_err(|e| e.to_string())
+    ctx.update_settings(patch).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn is_semantic_ready(app: AppHandle) -> bool {
+    let ctx = app.state::<Arc<AppContext>>().inner().clone();
+    ctx.is_semantic_ready()
 }
 
 #[tauri::command]
@@ -314,26 +245,7 @@ pub fn run() {
 
             let data_dir = handle.path().app_data_dir()?;
             let settings_path = desktop_settings_path()?;
-
-            let python_path = resolve_python().unwrap_or_default();
-            let python_package_dir = resolve_python_package_dir(&handle).unwrap_or_default();
-            let requirements_path = python_package_dir.join("requirements.txt");
-            let venv_dir = data_dir.join("sbert_venv");
-            let worker_bin = std::env::current_exe()
-                .unwrap_or_default()
-                .with_file_name("wilkes-rust-worker");
-
-            if !worker_bin.exists() {
-                error!("Worker binary NOT FOUND at {}", worker_bin.display());
-            }
-
-            let paths = WorkerPaths {
-                python_path,
-                python_package_dir,
-                requirements_path,
-                venv_dir,
-                worker_bin,
-            };
+            let paths = WorkerPaths::resolve(&data_dir);
 
             let emitter = Arc::new(TauriEmitter(handle.clone()));
             let (ctx, event_rx, loop_fut) = AppContext::new(data_dir, settings_path, paths, emitter);
@@ -341,15 +253,9 @@ pub fn run() {
             app.manage(Arc::clone(&ctx));
             app.manage(ActiveSearches(Mutex::new(HashMap::new())));
 
-            tauri::async_runtime::spawn(loop_fut);
-
-            let ctx1 = Arc::clone(&ctx);
+            let ctx_c = Arc::clone(&ctx);
             tauri::async_runtime::spawn(async move {
-                ctx1.run_event_forwarder(event_rx).await;
-            });
-
-            tauri::async_runtime::spawn(async move {
-                ctx.restore_state().await;
+                ctx_c.spawn_background_tasks(event_rx, loop_fut);
             });
 
             Ok(())
@@ -376,6 +282,7 @@ pub fn run() {
             clear_logs,
             get_data_paths,
             open_path,
+            is_semantic_ready,
             get_worker_status,
             kill_worker,
             set_worker_timeout,

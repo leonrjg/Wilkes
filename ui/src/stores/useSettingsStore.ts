@@ -40,6 +40,7 @@ interface SettingsStore {
   setPreferSemantic: (active: boolean) => void;
   setIndexing: (indexing: boolean) => void;
   refreshSemanticReady: () => Promise<void>;
+  startSemanticIndex: () => Promise<void>;
   applySettingsPatch: (patch: { theme?: Theme; supported_extensions?: string[] }) => void;
 }
 
@@ -77,10 +78,17 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       respectGitignore: s.respect_gitignore,
       maxFileSize: s.max_file_size,
       supportedExtensions: s.supported_extensions || [],
-      semanticIndexBuilt: s.semantic.enabled && s.semantic.index_path !== null,
+      semanticIndexBuilt: false, // will be confirmed below
       preferSemantic: s.search_prefer_semantic,
       theme: s.theme,
     });
+
+    const ready = await api.isSemanticReady();
+    set({ semanticIndexBuilt: ready });
+
+    if (!ready && s.search_prefer_semantic) {
+      get().startSemanticIndex().catch(console.error);
+    }
 
     if (s.last_directory) {
       api
@@ -126,12 +134,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   refreshSemanticReady: async () => {
-    try {
-      const s = await api.getSettings();
-      set({ semanticIndexBuilt: s.semantic.enabled && s.semantic.index_path !== null });
-    } catch (e) {
-      console.error("getSettings failed in refreshSemanticReady:", e);
-    }
+    const ready = await api.isSemanticReady();
+    set({ semanticIndexBuilt: ready });
+  },
+
+  startSemanticIndex: async () => {
+    const { directory } = get();
+    const s = await api.getSettings();
+    await api.buildIndex(directory, s.semantic.model, s.semantic.engine);
   },
 
   applySettingsPatch: (patch) => {

@@ -8,9 +8,9 @@ use tracing::error;
 use crate::extract::ExtractorRegistry;
 use crate::types::{ByteRange, EmbeddingEngine, IndexStatus, SourceOrigin};
 
-use super::Embedder;
+use super::super::Embedder;
 use super::chunk::{Chunk, chunk_content};
-use super::installer::{EmbedProgress, IndexBuildProgress, ProgressTx};
+use super::super::models::installer::{EmbedProgress, IndexBuildProgress, ProgressTx};
 
 // ── sqlite-vec extension loading ──────────────────────────────────────────────
 
@@ -30,6 +30,67 @@ fn load_sqlite_vec() {
 
 fn db_path(data_dir: &Path) -> PathBuf {
     data_dir.join("semantic_index.db")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_db_path() {
+        let p = db_path(Path::new("/tmp/data"));
+        assert_eq!(p, PathBuf::from("/tmp/data/semantic_index.db"));
+    }
+
+    #[test]
+    fn test_status_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(db_path(dir.path())).unwrap();
+        
+        conn.execute_batch("
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO meta VALUES ('model_id', 'test-model');
+            INSERT INTO meta VALUES ('dimension', '128');
+            INSERT INTO meta VALUES ('engine', 'fastembed');
+            CREATE TABLE vec_chunks (id INTEGER PRIMARY KEY);
+        ").unwrap();
+
+        let index = SemanticIndex {
+            conn,
+            model_id: "test-model".to_string(),
+            dimension: 128,
+            _root_path: None,
+        };
+
+        let status = index.status();
+        assert_eq!(status.model_id, "test-model");
+        assert_eq!(status.dimension, 128);
+    }
+
+    #[test]
+    fn test_read_status_from_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(db_path(dir.path())).unwrap();
+        conn.execute_batch("
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO meta VALUES ('model_id', 'm1');
+            INSERT INTO meta VALUES ('dimension', '512');
+            INSERT INTO meta VALUES ('engine', 'sbert');
+            CREATE TABLE vec_chunks (id INTEGER PRIMARY KEY);
+        ").unwrap();
+        drop(conn);
+
+        let status = SemanticIndex::read_status_from_path(dir.path()).unwrap();
+        assert_eq!(status.model_id, "m1");
+        assert_eq!(status.dimension, 512);
+    }
+
+    #[test]
+    fn test_open_missing_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let res = SemanticIndex::open(dir.path(), "any", 0);
+        assert!(res.is_err());
+    }
 }
 
 // ── Prepared file (ready to write) ───────────────────────────────────────────
@@ -57,7 +118,7 @@ pub struct SemanticIndex {
     conn: Connection,
     model_id: String,
     dimension: usize,
-    root_path: Option<PathBuf>,
+    _root_path: Option<PathBuf>,
 }
 
 impl SemanticIndex {
@@ -136,7 +197,7 @@ impl SemanticIndex {
             conn,
             model_id: stored_model_id,
             dimension: stored_dimension,
-            root_path,
+            _root_path: root_path,
         })
     }
 
@@ -180,7 +241,7 @@ impl SemanticIndex {
             conn,
             model_id: model_id.to_string(),
             dimension,
-            root_path: None,
+            _root_path: None,
         })
     }
 
@@ -507,7 +568,7 @@ impl SemanticIndex {
 
         let results: Vec<IndexedChunk> = raw_rows.into_iter()
             .flatten()
-            .inspect(|(distance, file_path, ..)| {
+            .inspect(|(_distance, _file_path, ..)| {
                 // tracing::info!("[query] candidate: distance={distance:.4}, file={file_path}");
             })
             .filter_map(|(distance, file_path, byte_start, byte_end, origin_json, chunk_text)| {

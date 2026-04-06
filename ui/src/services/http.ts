@@ -150,67 +150,129 @@ export class HttpSearchApi implements SearchApi {
   }
 
   async getPythonInfo(): Promise<string> {
-    throw new Error("getPythonInfo is not available in web mode");
+    const res = await fetch("/api/worker/python-info");
+    if (!res.ok) throw new Error(`getPythonInfo failed: ${res.status}`);
+    return res.json() as Promise<string>;
   }
 
   async getSupportedEngines(): Promise<EmbeddingEngine[]> {
-    return ["SBERT"]; // Or fetch from an endpoint if applicable
+    const res = await fetch("/api/embed/engines");
+    if (!res.ok) throw new Error(`getSupportedEngines failed: ${res.status}`);
+    return res.json() as Promise<EmbeddingEngine[]>;
   }
 
   async getDataPaths(): Promise<any> {
-    throw new Error("getDataPaths is not available in web mode");
+    const res = await fetch("/api/data/paths");
+    if (!res.ok) throw new Error(`getDataPaths failed: ${res.status}`);
+    return res.json();
   }
 
   async openPath(_path: string): Promise<void> {
-    throw new Error("openPath is not available in web mode");
+    // Opening paths in the OS's file manager is not possible in browser mode.
+    // No endpoint exists for this in the server, so we just return.
+    return;
   }
 
   // ── Worker Management ────────────────────────────────────────────────────────
 
   async getWorkerStatus(): Promise<import("../lib/types").WorkerStatus> {
-    throw new Error("Worker management is not available in web mode");
+    const res = await fetch("/api/worker/status");
+    if (!res.ok) throw new Error(`getWorkerStatus failed: ${res.status}`);
+    return res.json() as Promise<import("../lib/types").WorkerStatus>;
   }
 
   async killWorker(): Promise<void> {
-    throw new Error("Worker management is not available in web mode");
+    const res = await fetch("/api/worker/kill", { method: "POST" });
+    if (!res.ok && res.status !== 204) throw new Error(`killWorker failed: ${res.status}`);
   }
 
-  async setWorkerTimeout(_secs: number): Promise<void> {
-    throw new Error("Worker management is not available in web mode");
+  async setWorkerTimeout(secs: number): Promise<void> {
+    const res = await fetch("/api/worker/timeout", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ secs }),
+    });
+    if (!res.ok && res.status !== 204) throw new Error(`setWorkerTimeout failed: ${res.status}`);
   }
 
   // ── Semantic / embed commands ──────────────────────────────────────────────
 
-  async listModels(_engine: EmbeddingEngine): Promise<ModelDescriptor[]> {
-    return [];
+  async listModels(engine: EmbeddingEngine): Promise<ModelDescriptor[]> {
+    const res = await fetch(`/api/embed/models?engine=${encodeURIComponent(engine)}`);
+    if (!res.ok) throw new Error(`listModels failed: ${res.status}`);
+    return res.json() as Promise<ModelDescriptor[]>;
   }
 
-  async getModelSize(_engine: EmbeddingEngine, _modelId: string): Promise<number> {
-    return 0;
+  async getModelSize(engine: EmbeddingEngine, modelId: string): Promise<number> {
+    const res = await fetch(`/api/embed/model-size?engine=${encodeURIComponent(engine)}&model_id=${encodeURIComponent(modelId)}`);
+    if (!res.ok) throw new Error(`getModelSize failed: ${res.status}`);
+    return res.json() as Promise<number>;
   }
 
-  async downloadModel(_model: EmbedderModel, _engine: EmbeddingEngine): Promise<void> {}
+  async downloadModel(model: EmbedderModel, engine: EmbeddingEngine): Promise<void> {
+    const res = await fetch("/api/embed/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, engine }),
+    });
+    if (!res.ok && res.status !== 202) throw new Error(`downloadModel failed: ${res.status}`);
+  }
 
-  async buildIndex(_root: string, _model: EmbedderModel, _engine: EmbeddingEngine): Promise<void> {}
+  async buildIndex(root: string, model: EmbedderModel, engine: EmbeddingEngine): Promise<void> {
+    const res = await fetch("/api/embed/build", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root, model, engine }),
+    });
+    if (!res.ok && res.status !== 202) throw new Error(`buildIndex failed: ${res.status}`);
+  }
 
-  async cancelEmbed(): Promise<void> {}
+  async cancelEmbed(): Promise<void> {
+    const res = await fetch("/api/embed/cancel", { method: "DELETE" });
+    if (!res.ok && res.status !== 204) throw new Error(`cancelEmbed failed: ${res.status}`);
+  }
 
   async getIndexStatus(): Promise<IndexStatus> {
-    throw new Error("Semantic search not available on web");
+    const res = await fetch("/api/embed/status");
+    if (!res.ok) throw new Error(`getIndexStatus failed: ${res.status}`);
+    return res.json() as Promise<IndexStatus>;
   }
 
-  async deleteIndex(): Promise<void> {}
-
-  async onEmbedProgress(_handler: (p: EmbedProgress) => void): Promise<() => void> {
-    return Promise.resolve(() => {});
+  async deleteIndex(): Promise<void> {
+    const res = await fetch("/api/embed/index", { method: "DELETE" });
+    if (!res.ok && res.status !== 204) throw new Error(`deleteIndex failed: ${res.status}`);
   }
 
-  async onEmbedDone(_handler: (d: EmbedDone) => void): Promise<() => void> {
-    return Promise.resolve(() => {});
+  async onEmbedProgress(handler: (p: EmbedProgress) => void): Promise<() => void> {
+    const eventSource = new EventSource("/api/embed/events");
+    eventSource.addEventListener("embed-progress", (e: any) => {
+      handler(JSON.parse(e.data));
+    });
+    return () => eventSource.close();
   }
 
-  async onEmbedError(_handler: (e: EmbedError) => void): Promise<() => void> {
-    return Promise.resolve(() => {});
+  async onEmbedDone(handler: (d: EmbedDone) => void): Promise<() => void> {
+    const eventSource = new EventSource("/api/embed/events");
+    eventSource.addEventListener("embed-done", (e: any) => {
+      handler(JSON.parse(e.data));
+    });
+    return () => eventSource.close();
+  }
+
+  async onEmbedError(handler: (e: EmbedError) => void): Promise<() => void> {
+    const eventSource = new EventSource("/api/embed/events");
+    eventSource.addEventListener("embed-error", (e: any) => {
+      handler(JSON.parse(e.data));
+    });
+    return () => eventSource.close();
+  }
+
+  async onManagerEvent(handler: (event: string) => void): Promise<() => void> {
+    const eventSource = new EventSource("/api/embed/events");
+    eventSource.addEventListener("manager-event", (e: any) => {
+      handler(JSON.parse(e.data));
+    });
+    return () => eventSource.close();
   }
 }
 

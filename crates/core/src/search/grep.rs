@@ -300,3 +300,74 @@ fn extract_context_after(text: &str, byte_pos: usize, max_chars: usize) -> Strin
     let end = chars.len().min(max_chars);
     chars[..end].iter().collect::<String>().trim_end().to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use std::fs;
+
+    #[test]
+    fn test_build_matcher() {
+        let mut query = SearchQuery {
+            pattern: "hello".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: Path::new(".").to_path_buf(),
+            file_type_filters: vec![],
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            supported_extensions: vec![],
+        };
+
+        let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
+        assert!(matcher.is_match("Hello".as_bytes()).unwrap());
+
+        query.case_sensitive = true;
+        let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
+        assert!(!matcher.is_match("Hello".as_bytes()).unwrap());
+    }
+
+    #[test]
+    fn test_context_extraction() {
+        let text = "The quick brown fox jumps over the lazy dog";
+        // fox starts at index 16
+        // "brown " is before "fox" (from index 10 to 16)
+        assert_eq!(extract_context_before(text, 16, 6), "brown ");
+        assert_eq!(extract_context_after(text, 19, 6), " jumps");
+    }
+
+    #[test]
+    fn test_search_text_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        fs::write(&path, "line 1\nmatch this\nline 3").unwrap();
+
+        let query = SearchQuery {
+            pattern: "match".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            file_type_filters: vec![],
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
+        let matches = search_text_file(&path, &matcher, 0).unwrap();
+        
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].matched_text, "match");
+        match matches[0].origin {
+            SourceOrigin::TextFile { line, .. } => assert_eq!(line, 2),
+            _ => panic!("Expected TextFile origin"),
+        }
+    }
+}

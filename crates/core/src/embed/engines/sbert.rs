@@ -3,10 +3,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
-use super::Embedder;
-use super::installer::{EmbedderInstaller, ProgressTx};
-use super::worker_manager::{WorkerManager, ManagerCommand};
-use super::worker_ipc::{WorkerRequest, WorkerEvent};
+use super::super::Embedder;
+use super::super::models::installer::{EmbedderInstaller, ProgressTx};
+use super::super::worker::manager::{WorkerManager, ManagerCommand};
+use super::super::worker::ipc::{WorkerRequest, WorkerEvent};
 
 // ── Static model catalog ──────────────────────────────────────────────────────
 
@@ -166,7 +166,7 @@ impl WorkerEmbedder {
 
         let handle = tokio::runtime::Handle::current();
         handle.block_on(async move {
-            self.manager.sender().send(cmd).await
+            self.manager.send(cmd).await
                 .map_err(|e| anyhow::anyhow!("Failed to send command to manager: {e}"))?;
 
             while let Some(event) = rx.recv().await {
@@ -275,7 +275,7 @@ impl EmbedderInstaller for SBERTInstaller {
             reply: tx,
         };
 
-        self.manager.sender().send(cmd).await
+        self.manager.send(cmd).await
             .map_err(|e| anyhow::anyhow!("Failed to send info command to manager: {e}"))?;
 
         let timeout_duration = std::time::Duration::from_secs(30);

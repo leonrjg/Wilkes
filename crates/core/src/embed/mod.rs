@@ -1,20 +1,12 @@
-pub mod chunk;
-pub mod dispatch;
-pub mod downloader;
-pub mod hf_cache;
-pub mod hf_hub;
+pub mod engines;
+pub mod models;
 pub mod index;
-pub mod sbert;
-pub mod installer;
-pub mod watcher;
-pub mod worker_ipc;
-pub mod worker_manager;
+pub mod worker;
 
-#[cfg(feature = "fastembed")]
-pub mod fastembed;
-
-#[cfg(feature = "candle")]
-pub mod candle;
+pub use engines::dispatch;
+pub use models::installer;
+pub use worker::ipc as worker_ipc;
+pub use worker::manager as worker_manager;
 
 use std::sync::Arc;
 

@@ -6,14 +6,16 @@ import PreviewPane from "./components/PreviewPane";
 import DirectoryPicker from "./components/DirectoryPicker";
 import UploadZone from "./components/UploadZone";
 import SettingsModal from "./components/SettingsModal";
+import { useToasts } from "./components/Toast";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useHistory } from "./hooks/useHistory";
-import { useTauriEvents } from "./hooks/useTauriEvents";
+import { useGlobalEvents } from "./hooks/useGlobalEvents";
 import { api, source, isTauri } from "./services";
 import type { DesktopSourceApi, WebSourceApi } from "./services/api";
 
 export default function App() {
-  useTauriEvents();
+  useGlobalEvents();
+  const { addToast } = useToasts();
 
   const loadSettings = useSettingsStore((s) => s.load);
   const directory = useSettingsStore((s) => s.directory);
@@ -50,13 +52,19 @@ export default function App() {
         else u1();
 
         const u2 = await api.onEmbedDone(() => {
-          if (mounted) setIndexing(false);
+          if (mounted) {
+            setIndexing(false);
+            refreshSemanticReady();
+          }
         });
         if (mounted) unlisteners.push(u2);
         else u2();
 
-        const u3 = await api.onEmbedError(() => {
-          if (mounted) setIndexing(false);
+        const u3 = await api.onEmbedError((err) => {
+          if (mounted) {
+            setIndexing(false);
+            addToast(`${err.operation} failed: ${err.message}`, { type: "error" });
+          }
         });
         if (mounted) unlisteners.push(u3);
         else u3();
@@ -129,7 +137,7 @@ export default function App() {
       />
     );
 
-  const settingsSlot = isTauri ? (
+  const settingsSlot = (
     <>
       <button
         onClick={() => setSettingsOpen(true)}
@@ -147,7 +155,7 @@ export default function App() {
         onSettingsUpdate={applySettingsPatch}
       />
     </>
-  ) : null;
+  );
 
   return (
     <div className="flex flex-col h-screen bg-[var(--bg-app)] text-[var(--text-main)]">
@@ -178,3 +186,4 @@ export default function App() {
     </div>
   );
 }
+

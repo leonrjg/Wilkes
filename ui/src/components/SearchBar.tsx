@@ -24,12 +24,14 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const semanticReady = useSettingsStore((s) => s.semanticIndexBuilt);
   const preferSemantic = useSettingsStore((s) => s.preferSemantic);
   const setPreferSemantic = useSettingsStore((s) => s.setPreferSemantic);
+  const startSemanticIndex = useSettingsStore((s) => s.startSemanticIndex);
 
   const [pattern, setPattern] = useState("");
   const [isRegex, setIsRegex] = useState(false);
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [isSemanticMode, setIsSemanticMode] = useState(preferSemantic);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const prevSemanticReady = useRef(semanticReady);
 
   // Sync semantic mode when the setting is loaded from the backend
   useEffect(() => {
@@ -75,9 +77,11 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const triggerSearch = useCallback(
     (pat: string, opts?: { isRegex?: boolean; caseSensitive?: boolean; isSemanticMode?: boolean }) => {
       if (!pat.trim()) return;
+      const semantic = opts?.isSemanticMode ?? isSemanticMode;
+      if (semantic && !semanticReady) return;
       search(buildQuery(pat, opts));
     },
-    [search, buildQuery],
+    [search, buildQuery, isSemanticMode, semanticReady],
   );
 
   // Notify store when query presence changes
@@ -99,6 +103,14 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     if (pattern.trim()) triggerSearch(pattern);
   }, [directory, excluded]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Auto-retry search once the index finishes building
+  useEffect(() => {
+    if (!prevSemanticReady.current && semanticReady && isSemanticMode && pattern.trim()) {
+      triggerSearch(pattern);
+    }
+    prevSemanticReady.current = semanticReady;
+  }, [semanticReady]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleToggleRegex = () => {
     const next = !isRegex;
     setIsRegex(next);
@@ -115,7 +127,11 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     const next = !isSemanticMode;
     setIsSemanticMode(next);
     setPreferSemantic(next);
-    triggerSearch(pattern, { isSemanticMode: next });
+    if (next && !semanticReady) {
+      startSemanticIndex().catch(console.error);
+    } else {
+      triggerSearch(pattern, { isSemanticMode: next });
+    }
   };
 
   return (

@@ -41,3 +41,27 @@ impl Default for ExtractorRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockExtractor;
+    impl ContentExtractor for MockExtractor {
+        fn can_handle(&self, path: &Path, _mime: Option<&str>) -> bool {
+            path.extension().and_then(|e| e.to_str()) == Some("mock")
+        }
+        fn extract(&self, _path: &Path) -> anyhow::Result<ExtractedContent> {
+            anyhow::bail!("mock")
+        }
+    }
+
+    #[test]
+    fn test_extractor_registry() {
+        let mut registry = ExtractorRegistry::new();
+        registry.register(Box::new(MockExtractor));
+
+        assert!(registry.find(Path::new("test.mock"), None).is_some());
+        assert!(registry.find(Path::new("test.txt"), None).is_none());
+    }
+}

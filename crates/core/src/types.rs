@@ -82,27 +82,29 @@ pub enum FileType {
 
 impl FileType {
     pub fn detect(path: &std::path::Path, supported_extensions: &[String]) -> Option<Self> {
-        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        let ext = path.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
 
-        if !supported_extensions.iter().any(|s| s.to_ascii_lowercase() == ext) {
-            // Special case: check well-known filenames if no extension or unknown extension
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                let name_lc = name.to_ascii_lowercase();
-                if ["makefile", "dockerfile", "jenkinsfile", "procfile", "gemfile",
-                    "rakefile", "vagrantfile", "podfile", "brewfile"]
-                    .contains(&name_lc.as_str())
-                {
+        if let Some(ext) = &ext {
+            if supported_extensions.iter().any(|s| s.to_ascii_lowercase() == *ext) {
+                if ext == "pdf" {
+                    return Some(FileType::Pdf);
+                } else {
                     return Some(FileType::PlainText);
                 }
             }
-            return None;
         }
 
-        if ext == "pdf" {
-            Some(FileType::Pdf)
-        } else {
-            Some(FileType::PlainText)
+        // Special case: check well-known filenames if no extension or unknown extension
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            let name_lc = name.to_ascii_lowercase();
+            if ["makefile", "dockerfile", "jenkinsfile", "procfile", "gemfile",
+                "rakefile", "vagrantfile", "podfile", "brewfile"]
+                .contains(&name_lc.as_str())
+            {
+                return Some(FileType::PlainText);
+            }
         }
+        None
     }
 }
 
@@ -531,6 +533,14 @@ pub struct FileEntry {
     pub extension: String,
 }
 
+// ── Paths ────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DataPaths {
+    pub hf_cache: String,
+    pub app_data: String,
+}
+
 // ── Capabilities ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -559,4 +569,93 @@ pub struct SearchStats {
     pub elapsed_ms: u64,
     #[serde(default)]
     pub errors: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_file_type_detect() {
+        let extensions = vec!["txt".to_string(), "pdf".to_string()];
+        
+        assert_eq!(FileType::detect(Path::new("test.txt"), &extensions), Some(FileType::PlainText));
+        assert_eq!(FileType::detect(Path::new("test.pdf"), &extensions), Some(FileType::Pdf));
+        assert_eq!(FileType::detect(Path::new("Makefile"), &extensions), Some(FileType::PlainText));
+        assert_eq!(FileType::detect(Path::new("test.exe"), &extensions), None);
+    }
+
+    #[test]
+    fn test_bounding_box_merge() {
+        let b1 = BoundingBox { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
+        let b2 = BoundingBox { x: 5.0, y: 5.0, width: 10.0, height: 10.0 };
+        let merged = b1.merge(&b2);
+        
+        assert_eq!(merged.x, 0.0);
+        assert_eq!(merged.y, 0.0);
+        assert_eq!(merged.width, 15.0);
+        assert_eq!(merged.height, 15.0);
+    }
+
+    #[test]
+    fn test_source_map_resolve() {
+        let map = SourceMap {
+            segments: vec![
+                SourceSegment {
+                    text_range: ByteRange { start: 0, end: 10 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                SourceSegment {
+                    text_range: ByteRange { start: 10, end: 20 },
+                    origin: SourceOrigin::TextFile { line: 2, col: 1 },
+                },
+            ],
+        };
+
+        match map.resolve(5).unwrap() {
+            SourceOrigin::TextFile { line, .. } => assert_eq!(line, 1),
+            _ => panic!("Expected TextFile origin"),
+        }
+
+        match map.resolve(15).unwrap() {
+            SourceOrigin::TextFile { line, .. } => assert_eq!(line, 2),
+            _ => panic!("Expected TextFile origin"),
+        }
+    }
+
+    #[test]
+    fn test_source_map_resolve_range_pdf() {
+        let map = SourceMap {
+            segments: vec![
+                SourceSegment {
+                    text_range: ByteRange { start: 0, end: 10 },
+                    origin: SourceOrigin::PdfPage { 
+                        page: 1, 
+                        bbox: Some(BoundingBox { x: 0.0, y: 0.0, width: 10.0, height: 10.0 })
+                    },
+                },
+                SourceSegment {
+                    text_range: ByteRange { start: 10, end: 20 },
+                    origin: SourceOrigin::PdfPage { 
+                        page: 1, 
+                        bbox: Some(BoundingBox { x: 5.0, y: 5.0, width: 10.0, height: 10.0 })
+                    },
+                },
+            ],
+        };
+
+        let origin = map.resolve_range(ByteRange { start: 5, end: 15 }).unwrap();
+        match origin {
+            SourceOrigin::PdfPage { page, bbox } => {
+                assert_eq!(page, 1);
+                let b = bbox.unwrap();
+                assert_eq!(b.x, 0.0);
+                assert_eq!(b.y, 0.0);
+                assert_eq!(b.width, 15.0);
+                assert_eq!(b.height, 15.0);
+            }
+            _ => panic!("Expected PdfPage origin"),
+        }
+    }
 }

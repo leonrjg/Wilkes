@@ -9,7 +9,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use crate::embed::worker_ipc::{WorkerEvent, WorkerRequest};
+use super::ipc::{WorkerEvent, WorkerRequest};
 use crate::types::EmbeddingEngine;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -29,6 +29,35 @@ pub struct WorkerPaths {
     pub worker_bin: PathBuf,
 }
 
+impl WorkerPaths {
+    /// Attempt to resolve all paths automatically.
+    pub fn resolve(data_dir: &Path) -> Self {
+        use crate::path::{resolve_python, resolve_python_package_dir};
+
+        let python_path = resolve_python().unwrap_or_default();
+        let python_package_dir = resolve_python_package_dir().unwrap_or_default();
+        let requirements_path = if python_package_dir.exists() {
+            python_package_dir.join("requirements.txt")
+        } else {
+            PathBuf::new()
+        };
+        let venv_dir = data_dir.join("sbert_venv");
+        let worker_bin = std::env::current_exe()
+            .unwrap_or_default()
+            .with_file_name("wilkes-rust-worker");
+
+        Self {
+            python_path,
+            python_package_dir,
+            requirements_path,
+            venv_dir,
+            worker_bin,
+        }
+    }
+}
+
+type SenderSlot = Arc<std::sync::Mutex<mpsc::Sender<ManagerCommand>>>;
+
 pub enum ManagerCommand {
     Submit {
         req: WorkerRequest,
@@ -47,7 +76,7 @@ pub enum ManagerEvent {
 
 #[derive(Clone)]
 pub struct WorkerManager {
-    sender: mpsc::Sender<ManagerCommand>,
+    sender: SenderSlot,
     /// PID of the active worker process. 0 = no active worker.
     active_pid: Arc<AtomicU32>,
 }
@@ -57,12 +86,22 @@ impl WorkerManager {
         let (tx, rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::channel(32);
         let active_pid = Arc::new(AtomicU32::new(0));
-        let fut = manager_loop(paths, rx, event_tx, Arc::clone(&active_pid));
-        (Self { sender: tx, active_pid }, event_rx, fut)
+        let sender: SenderSlot = Arc::new(std::sync::Mutex::new(tx));
+        let fut = supervised_manager_loop(paths, rx, event_tx, Arc::clone(&active_pid), Arc::clone(&sender));
+        (Self { sender, active_pid }, event_rx, fut)
     }
 
-    pub fn sender(&self) -> &mpsc::Sender<ManagerCommand> {
-        &self.sender
+    pub async fn send(&self, cmd: ManagerCommand) -> Result<(), mpsc::error::SendError<ManagerCommand>> {
+        let sender = self.sender.lock().unwrap().clone();
+        sender.send(cmd).await
+    }
+
+    pub fn try_send(&self, cmd: ManagerCommand) -> Result<(), mpsc::error::TrySendError<ManagerCommand>> {
+        self.sender.lock().unwrap().try_send(cmd)
+    }
+
+    pub fn blocking_send(&self, cmd: ManagerCommand) -> Result<(), mpsc::error::SendError<ManagerCommand>> {
+        self.sender.lock().unwrap().blocking_send(cmd)
     }
 
     /// Kill the active worker process immediately via SIGKILL.
@@ -74,6 +113,33 @@ impl WorkerManager {
             #[cfg(unix)]
             unsafe { libc::kill(pid as i32, libc::SIGKILL); }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn test_worker_manager_status_inactive() {
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("python"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+        };
+
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let _loop_handle = tokio::spawn(loop_fut);
+
+        let (tx, rx) = oneshot::channel();
+        manager.send(ManagerCommand::GetStatus(tx)).await.unwrap();
+        
+        let status = rx.await.unwrap();
+        assert_eq!(status.active, false);
+        assert_eq!(status.timeout_secs, 300);
     }
 }
 
@@ -200,6 +266,38 @@ async fn setup_python_env(paths: &WorkerPaths) -> Result<PathBuf, String> {
     Ok(python)
 }
 
+async fn supervised_manager_loop(
+    paths: WorkerPaths,
+    initial_rx: mpsc::Receiver<ManagerCommand>,
+    event_tx: mpsc::Sender<ManagerEvent>,
+    active_pid: Arc<AtomicU32>,
+    sender_slot: SenderSlot,
+) {
+    let mut rx = initial_rx;
+    loop {
+        let handle = tokio::task::spawn(manager_loop(
+            paths.clone(),
+            rx,
+            event_tx.clone(),
+            Arc::clone(&active_pid),
+        ));
+        match handle.await {
+            Ok(()) => break, // channel closed normally, exit supervisor
+            Err(e) if e.is_panic() => {
+                tracing::error!("WorkerManager: loop panicked, restarting: {e:?}");
+                active_pid.store(0, Ordering::Relaxed);
+                let (new_tx, new_rx) = mpsc::channel(32);
+                *sender_slot.lock().unwrap() = new_tx;
+                rx = new_rx;
+            }
+            Err(e) => {
+                tracing::error!("WorkerManager: loop task cancelled: {e:?}");
+                break;
+            }
+        }
+    }
+}
+
 async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>, event_tx: mpsc::Sender<ManagerEvent>, active_pid: Arc<AtomicU32>) {
     let mut active_process: Option<ActiveProcess> = None;
     let mut active_engine = None;
@@ -263,12 +361,9 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
                     }
                 };
 
-                let log_req = if req_json.len() > 200 {
-                    format!("{}...", &req_json[..200])
-                } else {
-                    req_json.clone()
-                };
-                tracing::info!("WorkerManager: sending request: {}", log_req);
+                let mut log_req = req.clone();
+                log_req.texts = None;
+                tracing::info!("WorkerManager: sending request: {:?}", serde_json::to_string(&log_req).unwrap_or_default());
 
                 let needs_restart = active_process.is_none()
                     || active_engine != Some(req.engine.clone())

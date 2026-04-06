@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use wilkes_core::embed::dispatch;
 use wilkes_core::embed::installer::EmbedProgress;
-use wilkes_core::embed::worker_ipc::{WorkerEvent, WorkerRequest};
+use wilkes_core::embed::worker::ipc::{WorkerEvent, WorkerRequest};
 use wilkes_core::types::EmbedderModel;
 
 #[tokio::main]
@@ -22,12 +22,6 @@ async fn main() -> anyhow::Result<()> {
         }
 
         let trimmed = line.trim();
-        let log_line = if trimmed.len() > 300 {
-            format!("{}...", &trimmed[..300])
-        } else {
-            trimmed.to_string()
-        };
-        tracing::info!("[worker] received request: {}", log_line);
 
         let req: WorkerRequest = match serde_json::from_str(trimmed) {
             Ok(r) => r,
@@ -36,6 +30,10 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
         };
+
+        let mut log_req = req.clone();
+        log_req.texts = None;
+        tracing::info!("[worker] received request: {}", serde_json::to_string(&log_req).unwrap_or_default());
 
         match req.mode.as_str() {
             "build" => {

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::types::{EmbeddingEngine};
-use super::installer::EmbedProgress;
+use super::super::models::installer::EmbedProgress;
 
 /// Sent once from the desktop to the worker on stdin to configure the build.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]

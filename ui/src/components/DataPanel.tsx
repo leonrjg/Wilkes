@@ -118,12 +118,14 @@ export default function DataPanel({ api }: Props) {
               </div>
 
               <div className="flex gap-2 mt-1">
-                <button
-                  onClick={() => onOpen(paths.app_data)}
-                  className="px-3 py-1.5 bg-[var(--bg-app)] hover:bg-[var(--bg-active)] text-[var(--text-main)] text-[10px] font-bold uppercase tracking-wider rounded border border-[var(--border-main)] transition-colors"
-                >
-                  Open in File Manager
-                </button>
+                {isTauri && (
+                  <button
+                    onClick={() => onOpen(paths.app_data)}
+                    className="px-3 py-1.5 bg-[var(--bg-app)] hover:bg-[var(--bg-active)] text-[var(--text-main)] text-[10px] font-bold uppercase tracking-wider rounded border border-[var(--border-main)] transition-colors"
+                  >
+                    Open in File Manager
+                  </button>
+                )}
                 <button
                   onClick={onDeleteIndex}
                   disabled={isDeleting}
@@ -192,3 +194,4 @@ export default function DataPanel({ api }: Props) {
     </div>
   );
 }
+

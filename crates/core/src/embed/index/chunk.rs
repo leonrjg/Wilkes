@@ -76,3 +76,60 @@ pub fn chunk_content(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{FileMetadata, SourceMap, SourceSegment};
+
+    #[test]
+    fn test_chunk_content_simple() {
+        let content = ExtractedContent {
+            text: "Hello world. This is a test string for chunking. It should be split.".to_string(),
+            source_map: SourceMap {
+                segments: vec![SourceSegment {
+                    text_range: ByteRange { start: 0, end: 70 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                }],
+            },
+            metadata: FileMetadata {
+                path: PathBuf::from("test.txt"),
+                size_bytes: 70,
+                mime: None,
+                title: None,
+                page_count: None,
+            },
+        };
+
+        // window_chars = 20, overlap = 5
+        let chunks = chunk_content(&content, PathBuf::from("test.txt"), 20, 5);
+        
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(!chunk.text.is_empty());
+            assert_eq!(chunk.file_path, PathBuf::from("test.txt"));
+            match chunk.origin {
+                SourceOrigin::TextFile { line, .. } => assert_eq!(line, 1),
+                _ => panic!("Expected TextFile origin"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_chunk_empty_content() {
+        let content = ExtractedContent {
+            text: "".to_string(),
+            source_map: SourceMap { segments: vec![] },
+            metadata: FileMetadata {
+                path: PathBuf::from("test.txt"),
+                size_bytes: 0,
+                mime: None,
+                title: None,
+                page_count: None,
+            },
+        };
+
+        let chunks = chunk_content(&content, PathBuf::from("test.txt"), 100, 10);
+        assert!(chunks.is_empty());
+    }
+}

@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 
 use crate::types::{EmbedderModel, ModelDescriptor};
-use super::Embedder;
-use super::installer::{EmbedProgress, DownloadProgress, EmbedderInstaller, ProgressTx};
+use super::super::Embedder;
+use super::super::models::installer::{EmbedProgress, DownloadProgress, EmbedderInstaller, ProgressTx};
 
 // ── Model lookup ──────────────────────────────────────────────────────────────
 
@@ -219,12 +219,12 @@ impl Embedder for FastEmbedder {
 
 pub struct FastembedInstaller {
     pub model: EmbedderModel,
-    pub manager: super::worker_manager::WorkerManager,
+    pub manager: super::super::worker::manager::WorkerManager,
     pub device: String,
 }
 
 impl FastembedInstaller {
-    pub fn new(model: EmbedderModel, manager: super::worker_manager::WorkerManager, device: String) -> Self {
+    pub fn new(model: EmbedderModel, manager: super::super::worker::manager::WorkerManager, device: String) -> Self {
         Self { model, manager, device }
     }
 }
