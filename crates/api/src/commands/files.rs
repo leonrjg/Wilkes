@@ -119,4 +119,19 @@ mod tests {
         let result = open_file(path, extensions).await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn test_open_file_pdf() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.pdf");
+        fs::write(&path, "fake pdf").unwrap();
+
+        let extensions = vec!["pdf".to_string()];
+        let preview = open_file(path, extensions).await.unwrap();
+
+        match preview {
+            PreviewData::Pdf { page, .. } => assert_eq!(page, 1),
+            _ => panic!("Expected Pdf preview"),
+        }
+    }
 }

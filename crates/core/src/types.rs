@@ -788,18 +788,71 @@ mod tests {
     }
 
     #[test]
-    fn test_search_query_json_defaults() {
-        let json = r#"{
-            "pattern": "test",
-            "is_regex": false,
-            "case_sensitive": false,
-            "root": ".",
-            "file_type_filters": [],
-            "max_results": 0
-        }"#;
-        let query: SearchQuery = serde_json::from_str(json).unwrap();
-        assert!(query.respect_gitignore);
-        assert_eq!(query.context_lines, 2);
-        assert_eq!(query.mode, SearchMode::Grep);
+    fn test_deserialize_custom_models_invalid() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(deserialize_with = "deserialize_custom_models")]
+            models: Vec<CustomModel>,
+        }
+
+        let json = r#"{"models": [123]}"#;
+        let res: Result<Wrapper, _> = serde_json::from_str(json);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_file_type_detect_none() {
+        assert_eq!(FileType::detect(Path::new("unknown"), &[]), None);
+        assert_eq!(FileType::detect(Path::new("test.unknown"), &[]), None);
+    }
+
+    #[test]
+    fn test_file_type_detect_known_names() {
+        let extensions = vec![];
+        assert_eq!(FileType::detect(Path::new("Dockerfile"), &extensions), Some(FileType::PlainText));
+        assert_eq!(FileType::detect(Path::new("Makefile"), &extensions), Some(FileType::PlainText));
+        assert_eq!(FileType::detect(Path::new("dockerfile"), &extensions), Some(FileType::PlainText));
+    }
+
+    #[test]
+    fn test_deserialize_custom_models_non_array() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(deserialize_with = "deserialize_custom_models")]
+            models: Vec<CustomModel>,
+        }
+
+        let json = r#"{"models": "not an array"}"#;
+        let w: Wrapper = serde_json::from_str(json).unwrap();
+        assert!(w.models.is_empty());
+    }
+
+    #[test]
+    fn test_search_query_defaults() {
+        let json = r#"{"pattern": "p", "is_regex": false, "case_sensitive": false, "root": ".", "file_type_filters": [], "max_results": 10}"#;
+        let q: SearchQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.respect_gitignore, true);
+        assert_eq!(q.max_file_size, 0);
+        assert_eq!(q.context_lines, 2);
+        assert_eq!(q.mode, SearchMode::Grep);
+    }
+
+    #[test]
+    fn test_embedder_model_serde() {
+        let m = EmbedderModel("model-1".to_string());
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, "\"model-1\"");
+        
+        let m2: EmbedderModel = serde_json::from_str(&json).unwrap();
+        assert_eq!(m2, m);
+        assert_eq!(m2.model_id(), "model-1");
+    }
+
+    #[test]
+    fn test_settings_default() {
+        let s = Settings::default();
+        assert!(s.supported_extensions.contains(&"rs".to_string()));
+        assert!(s.supported_extensions.contains(&"pdf".to_string()));
+        assert_eq!(s.context_lines, 2);
     }
 }

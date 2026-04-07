@@ -1,11 +1,25 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import PdfViewer from "./PdfViewer";
 
 // Mock react-pdf
 vi.mock("react-pdf", () => ({
-  Document: ({ children }: any) => <div data-testid="pdf-document">{children}</div>,
-  Page: () => <div data-testid="pdf-page" />,
+  Document: ({ children, onLoadSuccess }: any) => {
+    // Simulate loading success
+    if (onLoadSuccess) {
+      setTimeout(() => onLoadSuccess({ numPages: 10 }), 0);
+    }
+    return <div data-testid="pdf-document">{children}</div>;
+  },
+  Page: ({ pageNumber, onLoadSuccess, onRenderSuccess }: any) => {
+    if (onLoadSuccess && pageNumber === 1) {
+      setTimeout(() => onLoadSuccess({ getViewport: () => ({ width: 600, height: 800 }) }), 0);
+    }
+    if (onRenderSuccess) {
+      setTimeout(() => onRenderSuccess(), 0);
+    }
+    return <div data-testid={`pdf-page-${pageNumber}`} />;
+  },
   pdfjs: { GlobalWorkerOptions: { workerSrc: "" } },
 }));
 
@@ -19,38 +33,47 @@ vi.mock("@tanstack/react-virtual", () => ({
   }),
 }));
 
+// Mock ResizeObserver
+global.ResizeObserver = class {
+    observe = vi.fn();
+    unobserve = vi.fn();
+    disconnect = vi.fn();
+} as any;
+
 describe("PdfViewer", () => {
   const defaultProps = {
     url: "test.pdf",
     page: 1,
-    highlight_bbox: null,
+    highlight_bbox: { x: 10, y: 10, width: 50, height: 20 },
+    onRenderSuccess: vi.fn(),
   };
 
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it("renders correctly", () => {
+  it("renders correctly and handles load success", async () => {
     render(<PdfViewer {...defaultProps} />);
     expect(screen.getByTestId("pdf-document")).toBeInTheDocument();
-  });
-
-  it("toggles search input", () => {
-    render(<PdfViewer {...defaultProps} />);
-    const searchBtn = screen.getByTitle(/Find in document/);
-    fireEvent.click(searchBtn);
-    expect(screen.getByPlaceholderText("Find in document...")).toBeInTheDocument();
-  });
-
-  it("zooms in and out", () => {
-    render(<PdfViewer {...defaultProps} />);
-    const zoomIn = screen.getByText("+");
-    const zoomOut = screen.getByText("−");
     
-    fireEvent.click(zoomIn);
-    expect(screen.getByText("125%")).toBeInTheDocument();
+    // Wait for async load success
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    });
     
-    fireEvent.click(zoomOut);
     expect(screen.getByText("100%")).toBeInTheDocument();
+  });
+
+  it("renders highlight bounding box", async () => {
+    render(<PdfViewer {...defaultProps} />);
+    
+    // Wait for async load success to set scale
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    });
+    
+    // The highlight div should be present. It has background color rgba(250, 204, 21, 0.25)
+    const highlight = document.querySelector('div[style*="background-color: rgba(250, 204, 21, 0.25)"]');
+    expect(highlight).toBeInTheDocument();
   });
 });

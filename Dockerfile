@@ -76,6 +76,7 @@ FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
     libstdc++6 \
     libssl3 \
     libfontconfig1 \
@@ -84,17 +85,19 @@ RUN apt-get update && apt-get install -y \
     python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /app/dist /data
+RUN useradd -r -u 1001 -s /bin/false wilkes \
+    && mkdir -p /app/dist /data \
+    && chown -R wilkes:wilkes /app /data
 
 COPY --from=rust-builder /wilkes-server /app/wilkes-server
 COPY --from=rust-builder /wilkes-rust-worker /app/wilkes-rust-worker
 COPY --from=ui-builder /build/ui/dist /app/dist
 COPY crates/worker/wilkes_python_worker /app/worker/wilkes_python_worker
 COPY crates/worker/requirements.txt /app/worker/requirements.txt
-
-ENV RUST_LOG=info,hf_hub=warn
+ENV RUST_LOG=info, hf_hub=warn
 
 VOLUME /data
-EXPOSE 3000
+EXPOSE 2000
 
-CMD ["/app/wilkes-server", "--data-dir", "/data", "--dist-dir", "/app/dist", "--port", "3000"]
+USER wilkes
+CMD ["/app/wilkes-server", "--data-dir", "/data", "--dist-dir", "/app/dist", "--port", "2000"]

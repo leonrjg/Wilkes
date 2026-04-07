@@ -1,11 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { FileEntry } from "../lib/types";
-import type { SearchApi, WebSourceApi } from "../services/api";
+import { useCallback, useRef, useState } from "react";
+import { File, Folder } from "react-feather";
+import type { WebSourceApi } from "../services/api";
+import { useSettingsStore } from "../stores/useSettingsStore";
 
 interface Props {
   source: WebSourceApi;
-  api: SearchApi;
-  root: string;
   onRootChange: (root: string) => void;
 }
 
@@ -56,20 +55,15 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export default function UploadZone({ source, api, root, onRootChange }: Props) {
-  const [fileList, setFileList] = useState<FileEntry[]>([]);
+export default function UploadZone({ source, onRootChange }: Props) {
+  const fileList = useSettingsStore((s) => s.fileList);
+  const refreshFileList = useSettingsStore((s) => s.refreshFileList);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState<UploadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dirInputRef = useRef<HTMLInputElement>(null);
-
-  // Load existing files if root is already set
-  useEffect(() => {
-    if (!root) return;
-    api.listFiles(root).then(setFileList).catch((e) => console.error("listFiles error:", e));
-  }, [root, api]);
 
   const handleUpload = useCallback(async (files: File[]) => {
     if (files.length === 0) return;
@@ -80,8 +74,6 @@ export default function UploadZone({ source, api, root, onRootChange }: Props) {
     try {
       const result = await uploadWithProgress(files, setProgress);
       onRootChange(result.root);
-      const updated = await api.listFiles(result.root);
-      setFileList(updated);
     } catch (e) {
       console.error("Upload error:", e);
       setError(e instanceof Error ? e.message : "Upload failed");
@@ -89,7 +81,7 @@ export default function UploadZone({ source, api, root, onRootChange }: Props) {
       setUploading(false);
       setProgress(null);
     }
-  }, [api, onRootChange]);
+  }, [onRootChange]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -101,20 +93,20 @@ export default function UploadZone({ source, api, root, onRootChange }: Props) {
   const handleDeleteFile = useCallback(async (filePath: string) => {
     try {
       await source.deleteFile(filePath);
-      setFileList((prev) => prev.filter((f) => f.path !== filePath));
+      refreshFileList();
     } catch (e) {
       console.error("Delete error:", e);
     }
-  }, [source]);
+  }, [source, refreshFileList]);
 
   const handleDeleteAll = useCallback(async () => {
     try {
       await source.deleteAll();
-      setFileList([]);
+      refreshFileList();
     } catch (e) {
       console.error("Delete all error:", e);
     }
-  }, [source]);
+  }, [source, refreshFileList]);
 
   const pct = progress && progress.total > 0
     ? Math.round((progress.loaded / progress.total) * 100)
@@ -123,43 +115,35 @@ export default function UploadZone({ source, api, root, onRootChange }: Props) {
   return (
     <div className="flex items-center gap-2 min-w-0">
       {/* Drop zone / upload trigger */}
-      <div
-        onDrop={handleDrop}
-        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-        onDragLeave={() => setDragOver(false)}
-        className={`flex items-center gap-1 text-xs rounded px-2 py-1 border transition-colors cursor-pointer ${
-          dragOver
-            ? "border-blue-500 bg-blue-950 text-blue-300"
-            : "border-neutral-700 bg-neutral-800 text-neutral-400 hover:text-neutral-100 hover:border-neutral-500"
-        }`}
-      >
-        {uploading ? (
-          <span className="animate-pulse">
-            {pct !== null ? `Uploading ${pct}%…` : "Uploading…"}
-          </span>
-        ) : (
-          <>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              title="Upload files"
-              className="hover:text-white"
-            >
-              Files
-            </button>
-            <span className="text-neutral-600">/</span>
-            <button
-              onClick={() => dirInputRef.current?.click()}
-              title="Upload directory"
-              className="hover:text-white"
-            >
-              Folder
-            </button>
-            {fileList.length > 0 && (
-              <span className="text-neutral-500 ml-1">{fileList.length} files</span>
-            )}
-          </>
-        )}
-      </div>
+      {uploading ? (
+        <span className="text-xs text-[var(--text-muted)] animate-pulse">
+          {pct !== null ? `Uploading ${pct}%…` : "Uploading…"}
+        </span>
+      ) : (
+        <div
+          onDrop={handleDrop}
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          className={`flex items-center gap-0.5 rounded transition-colors ${dragOver ? "ring-1 ring-[var(--accent-blue)]" : ""}`}
+        >
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            title="Upload files"
+            className="flex items-center gap-1.5 text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] px-2 py-1 rounded-l border border-[var(--border-main)] hover:border-[var(--border-strong)] transition-colors"
+          >
+            <File size={11} />
+            <span>Files</span>
+          </button>
+          <button
+            onClick={() => dirInputRef.current?.click()}
+            title="Upload folder"
+            className="flex items-center gap-1.5 text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] px-2 py-1 rounded-r border border-l-0 border-[var(--border-main)] hover:border-[var(--border-strong)] transition-colors"
+          >
+            <Folder size={11} />
+            <span>Folder</span>
+          </button>
+        </div>
+      )}
 
       <input
         ref={fileInputRef}

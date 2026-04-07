@@ -4,7 +4,7 @@ use crate::types::{EmbeddingEngine};
 use super::super::models::installer::EmbedProgress;
 
 /// Sent once from the desktop to the worker on stdin to configure the build.
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct WorkerRequest {
     #[serde(default = "default_mode")]
     pub mode: String, // "build" or "embed"
@@ -34,7 +34,7 @@ fn default_device() -> String {
 }
 
 /// Lines emitted by the worker to stdout.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub enum WorkerEvent {
     /// Forwarded from the index build progress channel.
     Progress(EmbedProgress),
@@ -46,4 +46,45 @@ pub enum WorkerEvent {
     Done,
     /// Index build failed.
     Error(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::EmbeddingEngine;
+
+    #[test]
+    fn test_worker_request_serialization() {
+        let req = WorkerRequest {
+            mode: "build".to_string(),
+            root: PathBuf::from("root"),
+            engine: EmbeddingEngine::Fastembed,
+            model: "model".to_string(),
+            data_dir: PathBuf::from("data"),
+            chunk_size: Some(100),
+            chunk_overlap: Some(10),
+            device: "cpu".to_string(),
+            paths: None,
+            texts: None,
+            supported_extensions: vec!["txt".to_string()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let de: WorkerRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.mode, "build");
+        assert_eq!(de.model, "model");
+    }
+
+    #[test]
+    fn test_worker_event_serialization() {
+        let events = vec![
+            WorkerEvent::Done,
+            WorkerEvent::Error("fail".to_string()),
+            WorkerEvent::Info { dimension: 384, max_seq_length: 512 },
+            WorkerEvent::Embeddings(vec![vec![1.0]]),
+        ];
+        for e in events {
+            let json = serde_json::to_string(&e).unwrap();
+            let _: WorkerEvent = serde_json::from_str(&json).unwrap();
+        }
+    }
 }

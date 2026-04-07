@@ -1,33 +1,33 @@
 use std::path::Path;
 
-/// Fetch total download size for `model_id` from the HuggingFace API.
-pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {
-    #[derive(serde::Deserialize)]
-    struct Sibling {
-        #[allow(dead_code)]
-        rfilename: String,
-        size: Option<u64>,
-    }
+#[derive(serde::Deserialize)]
+pub struct HfSibling {
+    pub rfilename: String,
+    pub size: Option<u64>,
+}
+
+/// Fetch the sibling file list for `model_id` from the HuggingFace API.
+pub fn fetch_hf_siblings(model_id: &str) -> anyhow::Result<Vec<HfSibling>> {
     #[derive(serde::Deserialize)]
     struct HfModelInfo {
-        siblings: Vec<Sibling>,
+        siblings: Vec<HfSibling>,
     }
 
     let url = format!("https://huggingface.co/api/models/{model_id}?blobs=true");
-    let hf_info: HfModelInfo = ureq::get(&url)
+    let info: HfModelInfo = ureq::get(&url)
         .call()
         .map_err(|e| anyhow::anyhow!("HF API request failed: {e}"))?
         .into_json()
         .map_err(|e| anyhow::anyhow!("HF API response parse failed: {e}"))?;
 
-    // We sum up everything in the repo. For SBERT/Python, this is accurate as it 
-    // downloads the whole repo. For Candle, it's an upper bound but close enough.
-    let total: u64 = hf_info
-        .siblings
-        .iter()
-        .filter_map(|s| s.size)
-        .sum();
+    Ok(info.siblings)
+}
 
+/// Fetch total download size for `model_id` from the HuggingFace API.
+/// Sums all files in the repo — accurate for SBERT, an upper bound for Candle.
+pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {
+    let siblings = fetch_hf_siblings(model_id)?;
+    let total: u64 = siblings.iter().filter_map(|s| s.size).sum();
     anyhow::ensure!(total > 0, "No model files found in HF repo for '{model_id}'");
     Ok(total)
 }
@@ -81,5 +81,12 @@ mod tests {
         // Because symlinks can be tricky in tests, we just check if it returns what we expect
         // If it doesn't work, at least we exercised the function
         let _ = is_model_cached(dir.path(), "test/repo");
+    }
+
+    #[test]
+    fn test_fetch_model_size_invalid() {
+        // This will likely fail or return error due to no network in some environments,
+        // but it exercises the code.
+        let _ = fetch_model_size("invalid/model/id/12345");
     }
 }

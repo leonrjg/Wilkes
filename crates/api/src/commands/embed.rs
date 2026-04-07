@@ -207,4 +207,43 @@ mod tests {
         let db_path = data_dir.join("semantic_index.db");
         assert!(db_path.exists());
     }
+
+    #[tokio::test]
+    async fn test_build_index_missing_options() {
+        let dir = tempdir().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let options = BuildIndexOptions {
+            manager: None,
+            device: None,
+            data_dir: dir.path().to_path_buf(),
+            tx,
+            chunk_size: 100,
+            chunk_overlap: 10,
+            supported_extensions: vec![],
+        };
+
+        let res = build_index(
+            dir.path().to_path_buf(),
+            wilkes_core::types::EmbeddingEngine::Candle,
+            wilkes_core::types::EmbedderModel("m".to_string()),
+            options,
+        ).await;
+
+        assert!(res.is_err());
+        assert!(res.err().unwrap().to_string().contains("manager is required"));
+    }
+
+    #[tokio::test]
+    async fn test_list_models() {
+        let dir = tempdir().unwrap();
+        let models = list_models(wilkes_core::types::EmbeddingEngine::Fastembed, dir.path()).await;
+        assert!(!models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_model_size_error() {
+        // Should error for non-existent engine or invalid model
+        let res = get_model_size(wilkes_core::types::EmbeddingEngine::Fastembed, "invalid".to_string()).await;
+        assert!(res.is_err());
+    }
 }

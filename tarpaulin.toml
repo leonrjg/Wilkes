@@ -2,17 +2,6 @@
 workspace = true
 target-dir = "target/tarpaulin"
 exclude-files = [
-    # External engine wrappers
-    "crates/core/src/embed/engines/fastembed.rs",
-    "crates/core/src/embed/engines/sbert.rs",
-    "crates/core/src/embed/engines/candle.rs",
-    "crates/core/src/embed/engines/dispatch.rs",
-    # MuPDF wrapper
-    "crates/core/src/extract/pdf/mupdf.rs",
-    # IPC/Worker management
-    "crates/core/src/embed/worker/manager.rs",
-    "crates/core/src/embed/worker/ipc.rs",
-    "crates/worker/src/main.rs",
     "target/*",
 ]
 ignore-tests = true

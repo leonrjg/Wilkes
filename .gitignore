@@ -3,8 +3,11 @@
 **/data
 **/coverage
 **/lcov.info
+**/*tarpaulin*
+ui/coverage/
 
 # OS
+.DS_Store
 **/.DS_Store
 
 # Frontend

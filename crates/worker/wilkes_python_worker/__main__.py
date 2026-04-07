@@ -15,6 +15,15 @@ def configure_logging():
         stream=sys.stderr
     )
 
+    # Disable info logs from huggingface_hub and its underlying http client
+    logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    try:
+        from huggingface_hub.utils import logging as hf_logging
+        hf_logging.set_verbosity_warning()
+    except ImportError:
+        pass
+
     # Ensure transformers is also verbose enough
     try:
         from transformers.utils import logging as tf_logging

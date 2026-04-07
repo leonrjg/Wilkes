@@ -1,5 +1,6 @@
 import { useMemo } from "react";
-import { Folder, Bookmark } from "react-feather";
+import { confirmDialog } from "../lib/utils/dialog";
+import { Folder, Bookmark, X } from "react-feather";
 
 interface Props {
   directory: string;
@@ -9,6 +10,7 @@ interface Props {
   onPickDirectory: () => void;
   onBookmarkAdd?: (dir: string) => void;
   onBookmarkRemove?: (dir: string) => void;
+  onForgetDirectory?: (dir: string) => void;
 }
 
 function shortPath(p: string): string {
@@ -25,6 +27,7 @@ export default function DirectoryPicker({
   onPickDirectory,
   onBookmarkAdd,
   onBookmarkRemove,
+  onForgetDirectory,
 }: Props) {
   const isBookmarked = (dir: string) => bookmarks.includes(dir);
 
@@ -69,6 +72,19 @@ export default function DirectoryPicker({
                 key={b}
                 className={`flex items-center gap-0.5 rounded transition-colors group bg-[var(--bg-active)]`}
               >
+                {onForgetDirectory && (
+                  <button
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      const confirmed = await confirmDialog(`Remove "${shortPath(b)}" from your history?`);
+                      if (confirmed) onForgetDirectory(b);
+                    }}
+                    title="Remove from history"
+                    className="text-[10px] pl-1.5 py-1 text-[var(--text-dim)] hover:text-[var(--text-error)] transition-colors"
+                  >
+                    <X size={12} />
+                  </button>
+                )}
                 <button
                   onClick={() => onChange(b)}
                   title={b}
@@ -87,7 +103,7 @@ export default function DirectoryPicker({
                       bookmarked ? onBookmarkRemove(b) : onBookmarkAdd(b);
                     }}
                     title={bookmarked ? "Remove bookmark" : "Bookmark this directory"}
-                    className={`text-[10px] pr-1.5 py-1 transition-colors ${
+                    className={`text-[10px] px-1 py-1 transition-colors ${
                       bookmarked
                         ? "text-[var(--accent-blue)]"
                         : "text-[var(--text-dim)] hover:text-[var(--accent-blue)]"

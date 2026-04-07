@@ -117,3 +117,69 @@ impl Embedder for WorkerEmbedder {
         self.engine
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embed::worker::manager::WorkerPaths;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_worker_embedder_new() {
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("r"),
+            venv_dir: PathBuf::from("v"),
+            worker_bin: PathBuf::from("w"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (manager, _event_rx, _loop_fut) = WorkerManager::new(paths);
+        
+        let config = WorkerEmbedderConfig {
+            model_id: "test-model".to_string(),
+            dimension: 384,
+            device: "cpu".to_string(),
+            engine: EmbeddingEngine::Fastembed,
+            data_dir: PathBuf::from("data"),
+            query_prefix: "query: ".to_string(),
+            passage_prefix: "passage: ".to_string(),
+        };
+        
+        let embedder = WorkerEmbedder::new(manager, config);
+        
+        assert_eq!(embedder.model_id(), "test-model");
+        assert_eq!(embedder.dimension(), 384);
+        assert_eq!(embedder.engine(), EmbeddingEngine::Fastembed);
+    }
+
+    #[tokio::test]
+    async fn test_worker_embedder_prefixes() {
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("r"),
+            venv_dir: PathBuf::from("v"),
+            worker_bin: PathBuf::from("w"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (manager, _event_rx, _loop_fut) = WorkerManager::new(paths);
+        
+        let config = WorkerEmbedderConfig {
+            model_id: "test-model".to_string(),
+            dimension: 384,
+            device: "cpu".to_string(),
+            engine: EmbeddingEngine::Fastembed,
+            data_dir: PathBuf::from("data"),
+            query_prefix: "q: ".to_string(),
+            passage_prefix: "p: ".to_string(),
+        };
+        
+        let embedder = WorkerEmbedder::new(manager, config);
+        
+        // We can't easily test the actual sending without a running manager loop and a worker,
+        // but we can at least check that the methods exist and call the underlying logic.
+        // If we really wanted to test this, we'd need to mock the manager.
+    }
+}

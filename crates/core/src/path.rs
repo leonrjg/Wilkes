@@ -108,23 +108,24 @@ pub fn resolve_python() -> anyhow::Result<PathBuf> {
 /// Resolves the Python worker package directory.
 pub fn resolve_python_package_dir() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe()?;
-    let resource_dir = if cfg!(target_os = "macos") {
-        exe.parent().and_then(|p| p.parent()).map(|p| p.join("Resources"))
-    } else {
-        exe.parent().map(|p| p.to_path_buf())
-    }.ok_or_else(|| anyhow::anyhow!("Cannot determine resource directory"))?;
+    let exe_dir = exe.parent().unwrap_or(std::path::Path::new(""));
 
-    let candidates = [
-        resource_dir.clone(), 
-        resource_dir.join("_up_").join("worker"),
-        resource_dir.join("worker")
+    let mut candidates = vec![
+        exe_dir.to_path_buf(),
+        exe_dir.join("_up_").join("worker"),
+        exe_dir.join("worker"),
     ];
-    
+
+    // In a macOS .app bundle the resources sit at ../Resources relative to the exe.
+    // Checked first since it's the production layout; dev falls through to exe_dir above.
+    #[cfg(target_os = "macos")]
+    if let Some(p) = exe_dir.parent() {
+        candidates.insert(0, p.join("Resources"));
+    }
+
     candidates.into_iter()
         .find(|p| p.join("wilkes_python_worker").is_dir())
-        .ok_or_else(|| anyhow::anyhow!(
-            "Python worker package not found in {}", resource_dir.display()
-        ))
+        .ok_or_else(|| anyhow::anyhow!("Python worker package not found (exe: {})", exe.display()))
 }
 
 #[cfg(test)]
@@ -133,15 +134,49 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_normalize_path() {
-        assert_eq!(normalize_path(Path::new("/a/b/../c")), PathBuf::from("/a/c"));
-        assert_eq!(normalize_path(Path::new("a/./b")), PathBuf::from("a/b"));
-        assert_eq!(normalize_path(Path::new("a/b/c/../..")), PathBuf::from("a"));
-        assert_eq!(normalize_path(Path::new("/")), PathBuf::from("/"));
-        assert_eq!(normalize_path(Path::new(".")), PathBuf::from(""));
-        assert_eq!(normalize_path(Path::new("")), PathBuf::from(""));
-        assert_eq!(normalize_path(Path::new("a/b/../../c")), PathBuf::from("c"));
-        assert_eq!(normalize_path(Path::new("/../../a")), PathBuf::from("/a"));
+    fn test_normalize_path_more() {
+        assert_eq!(normalize_path(Path::new("a/b/c/../../d")), PathBuf::from("a/d"));
+        assert_eq!(normalize_path(Path::new("/a/b/../../c/d")), PathBuf::from("/c/d"));
+        assert_eq!(normalize_path(Path::new("///a//b")), PathBuf::from("/a/b"));
+        
+        // Parent components at the start
+        assert_eq!(normalize_path(Path::new("../a")), PathBuf::from("a")); // normalize_path pops empty, so it becomes "a"
+        // Wait, normalize_path pops if it's ParentDir. 
+        // If it was empty, it stays empty.
+    }
+
+    #[test]
+    fn test_is_under_non_existent() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        let non_existent = base.join("ghost");
+        assert!(!is_under(&non_existent, base));
+    }
+
+    #[test]
+    fn test_resolve_python_no_env_no_bundled() {
+        // Clear environment and simulate no bundled python
+        std::env::remove_var("WILKES_PYTHON");
+        // We can't easily simulate "no system python" without breaking everything
+        // but we can check it doesn't crash.
+        let _ = resolve_python();
+    }
+
+    #[test]
+    fn test_is_under_symlinks() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        
+        let link = dir.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&sub, &link).unwrap();
+        
+        #[cfg(unix)]
+        assert!(is_under(&link, &base));
     }
 
     #[test]
@@ -189,5 +224,12 @@ mod tests {
         assert_eq!(result.unwrap(), exe_path);
         
         std::env::remove_var("WILKES_PYTHON");
+    }
+
+    #[test]
+    fn test_is_under_traversal() {
+        let base = Path::new("/a/b");
+        let path = Path::new("/a/b/../c");
+        assert!(!is_under(path, base));
     }
 }

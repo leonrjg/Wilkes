@@ -157,8 +157,6 @@ export default function SettingsModal({
     }
   }, [isOpen, api]);
 
-  if (!isOpen) return null;
-
   const handleUpdateSettings = async (patch: Partial<Settings>) => {
     try {
       const newSettings = await api.updateSettings(patch);
@@ -185,7 +183,7 @@ export default function SettingsModal({
   );
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+    <div className={`fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4${isOpen ? "" : " hidden"}`}>
       <div className="bg-[var(--bg-app)] border border-[var(--border-main)] rounded-xl shadow-2xl w-full max-w-2xl h-[800px] max-h-[90vh] flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200">
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-[var(--border-main)]">
           <h2 className="text-base font-semibold text-[var(--text-main)] flex items-center gap-2">
@@ -200,7 +198,7 @@ export default function SettingsModal({
         </div>
 
 
-        <div className="flex flex-1 overflow-hidden">
+        <div className="flex flex-1 overflow-hidden" data-demo-readonly>
           {/* Sidebar */}
           <div className="w-40 border-r border-[var(--border-main)] bg-[var(--bg-sidebar)] p-2 flex flex-col gap-3">
             <div className="flex flex-col gap-0.5">

@@ -190,21 +190,14 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use crate::types::EmbeddingEngine;
-
-    struct StubEmbedder;
-    impl Embedder for StubEmbedder {
-        fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![]) }
-        fn model_id(&self) -> &str { "stub" }
-        fn dimension(&self) -> usize { 1 }
-        fn engine(&self) -> EmbeddingEngine { EmbeddingEngine::Candle }
-    }
+    use crate::embed::MockEmbedder;
 
     #[test]
     fn test_index_watcher_start_stop() {
         let dir = tempdir().unwrap();
         let index = Arc::new(Mutex::new(None));
         let registry = Arc::new(ExtractorRegistry::new());
-        let embedder = Arc::new(StubEmbedder);
+        let embedder = Arc::new(MockEmbedder::default());
         let config = IndexingConfig {
             chunk_size: 100,
             chunk_overlap: 10,
@@ -228,7 +221,7 @@ mod tests {
     fn test_index_watcher_invalid_path() {
         let index = Arc::new(Mutex::new(None));
         let registry = Arc::new(ExtractorRegistry::new());
-        let embedder = Arc::new(StubEmbedder);
+        let embedder = Arc::new(MockEmbedder::default());
         let config = IndexingConfig {
             chunk_size: 100,
             chunk_overlap: 10,
@@ -267,7 +260,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let index = Arc::new(Mutex::new(None));
         let registry = Arc::new(ExtractorRegistry::new());
-        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
         
         let path = dir.path().join("test.txt");
         
@@ -284,6 +277,195 @@ mod tests {
         // 3. Actual file (prepare_file will fail if no extractor or embedder returns nothing)
         std::fs::write(&path, "hello").unwrap();
         handle_event(&path, &index, &registry, &embedder, 100, 10);
-        // Should log error but not panic (prepare_file fails because StubEmbedder returns 0 vectors)
+        // Should log error but not panic
+    }
+
+    #[test]
+    fn test_handle_event_with_index() {
+        let dir = tempdir().unwrap();
+        let idx_dir = dir.path().join("idx");
+        std::fs::create_dir(&idx_dir).unwrap();
+        
+        let mut idx = SemanticIndex::create(&idx_dir, "mock-model", 384, EmbeddingEngine::Candle, None).unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "content").unwrap();
+        
+        // Add file to index manually first
+        idx.write_file(crate::embed::index::db::PreparedFile {
+            path: file_path.clone(),
+            chunks: vec![(
+                crate::embed::index::chunk::Chunk {
+                    file_path: file_path.clone(),
+                    text: "content".to_string(),
+                    byte_range: crate::types::ByteRange { start: 0, end: 7 },
+                    origin: crate::types::SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![0.0; 384],
+            )],
+        }).unwrap();
+        
+        let index = Arc::new(Mutex::new(Some(idx)));
+        let registry = Arc::new(ExtractorRegistry::new());
+        
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+
+        // 1. Update file
+        std::fs::write(&file_path, "new content").unwrap();
+        handle_event(&file_path, &index, &registry, &embedder, 100, 10);
+        
+        // 2. Remove file
+        std::fs::remove_file(&file_path).unwrap();
+        handle_event(&file_path, &index, &registry, &embedder, 100, 10);
+        
+        let guard = index.lock().unwrap();
+        let idx_final = guard.as_ref().unwrap();
+        assert_eq!(idx_final.status().total_chunks, 0);
+    }
+
+    #[test]
+    fn test_index_watcher_stop() {
+        let dir = tempdir().unwrap();
+        let index = Arc::new(Mutex::new(None));
+        let registry = Arc::new(ExtractorRegistry::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+        
+        let mut watcher = IndexWatcher::start(
+            dir.path().to_path_buf(), 
+            index, 
+            registry, 
+            embedder, 
+            crate::types::IndexingConfig {
+                chunk_size: 100,
+                chunk_overlap: 10,
+                supported_extensions: vec!["txt".to_string()],
+            },
+            || {}, // on_reindex
+            || {}  // on_reindex_done
+        ).unwrap();
+        watcher.stop();
+    }
+
+    #[test]
+    fn test_index_watcher_background_processing() {
+        let dir = tempdir().unwrap();
+        let idx_dir = dir.path().join("idx");
+        std::fs::create_dir(&idx_dir).unwrap();
+        
+        let idx = SemanticIndex::create(&idx_dir, "mock-model", 384, EmbeddingEngine::Candle, None).unwrap();
+        let index = Arc::new(Mutex::new(Some(idx)));
+        let registry = Arc::new(ExtractorRegistry::new());
+        
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+
+        let reindex_called = Arc::new(Mutex::new(false));
+        let reindex_done_called = Arc::new(Mutex::new(false));
+        
+        let rc1 = Arc::clone(&reindex_called);
+        let rd1 = Arc::clone(&reindex_done_called);
+
+        let mut watcher = IndexWatcher::start(
+            dir.path().to_path_buf(),
+            Arc::clone(&index),
+            registry,
+            embedder,
+            IndexingConfig {
+                chunk_size: 100,
+                chunk_overlap: 10,
+                supported_extensions: vec!["txt".to_string()],
+            },
+            move || { *rc1.lock().unwrap() = true; },
+            move || { *rd1.lock().unwrap() = true; },
+        ).unwrap();
+
+        // Create a file to trigger watcher
+        let file_path = dir.path().join("watch_me.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        // Wait for debouncer (500ms + some buffer)
+        std::thread::sleep(Duration::from_millis(1500));
+
+        assert!(*reindex_called.lock().unwrap(), "on_reindex should have been called");
+        assert!(*reindex_done_called.lock().unwrap(), "on_reindex_done should have been called");
+
+        {
+            let guard = index.lock().unwrap();
+            let idx_final = guard.as_ref().unwrap();
+            assert_eq!(idx_final.status().total_chunks, 1, "File should have been indexed");
+        }
+
+        // Test removal
+        std::fs::remove_file(&file_path).unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+
+        {
+            let guard = index.lock().unwrap();
+            let idx_final = guard.as_ref().unwrap();
+            assert_eq!(idx_final.status().total_chunks, 0, "File should have been removed from index");
+        }
+
+        watcher.stop();
+    }
+
+    #[test]
+    fn test_index_watcher_rename() {
+        let dir = tempdir().unwrap();
+        let index_path = dir.path().join("idx");
+        std::fs::create_dir_all(&index_path).unwrap();
+        let mut idx = crate::embed::index::db::SemanticIndex::create(&index_path, "m", 3, EmbeddingEngine::Candle, None).unwrap();
+        
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "test content").unwrap();
+        
+        // Manual prepare and write
+        let prepared = crate::embed::index::db::PreparedFile {
+            path: file_path.clone(),
+            chunks: vec![(crate::embed::index::chunk::Chunk {
+                text: "test".to_string(),
+                byte_range: crate::types::ByteRange { start: 0, end: 4 },
+                origin: crate::types::SourceOrigin::TextFile { line: 1, col: 1 },
+                file_path: file_path.clone(),
+            }, vec![0.1, 0.2, 0.3])],
+        };
+        idx.write_file(prepared).unwrap();
+        assert_eq!(idx.status().total_chunks, 1);
+
+        let index = Arc::new(Mutex::new(Some(idx)));
+        let registry = Arc::new(ExtractorRegistry::new());
+        let (_manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let embedder: Arc<dyn crate::embed::Embedder> = Arc::new(crate::embed::MockEmbedder {
+            model_id: "m".to_string(),
+            dimension: 3,
+            engine: EmbeddingEngine::Candle,
+        });
+        
+        let mut watcher = IndexWatcher::start(
+            dir.path().to_path_buf(),
+            index.clone(),
+            registry,
+            embedder,
+            crate::types::IndexingConfig {
+                chunk_size: 100,
+                chunk_overlap: 0,
+                supported_extensions: vec!["txt".to_string()],
+            },
+            || {},
+            || {},
+        ).unwrap();
+
+        // Rename file (notify mini debouncer should see this)
+        let new_path = dir.path().join("renamed.txt");
+        std::fs::rename(&file_path, &new_path).unwrap();
+
+        // Wait for debouncer
+        std::thread::sleep(Duration::from_millis(500));
+
+        {
+            let guard = index.lock().unwrap();
+            let idx_final = guard.as_ref().unwrap();
+            // It should have removed the old path and added the new one
+            assert!(idx_final.status().indexed_files >= 1);
+        }
+
+        watcher.stop();
     }
 }

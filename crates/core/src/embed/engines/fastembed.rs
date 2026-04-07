@@ -77,17 +77,8 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
 }
 
 /// Fetch the total download size (in bytes) for `model_id` by querying the HuggingFace API.
+/// Only counts the specific files fastembed downloads, not the whole repo.
 pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {
-    #[derive(serde::Deserialize)]
-    struct Sibling {
-        rfilename: String,
-        size: Option<u64>,
-    }
-    #[derive(serde::Deserialize)]
-    struct HfModelInfo {
-        siblings: Vec<Sibling>,
-    }
-
     let info = find_model_info(model_id)?;
 
     // fastembed stores bare filenames (e.g. "model.onnx") but some HF repos place
@@ -99,21 +90,11 @@ pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {
 
     let matches_relevant = |rfilename: &str| -> bool {
         relevant.contains(rfilename)
-            || relevant
-                .iter()
-                .any(|f| rfilename.ends_with(&format!("/{f}")))
+            || relevant.iter().any(|f| rfilename.ends_with(&format!("/{f}")))
     };
 
-    // ?blobs=true makes HF include actual byte sizes in the siblings listing.
-    let url = format!("https://huggingface.co/api/models/{}?blobs=true", info.model_code);
-    let hf_info: HfModelInfo = ureq::get(&url)
-        .call()
-        .map_err(|e| anyhow::anyhow!("HF API request failed: {e}"))?
-        .into_json()
-        .map_err(|e| anyhow::anyhow!("HF API response parse failed: {e}"))?;
-
-    let total: u64 = hf_info
-        .siblings
+    let siblings = super::super::models::hf_hub::fetch_hf_siblings(&info.model_code)?;
+    let total: u64 = siblings
         .iter()
         .filter(|s| matches_relevant(&s.rfilename))
         .filter_map(|s| s.size)
@@ -361,4 +342,105 @@ pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> an
         dimension,
         preferred_batch_size,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_list_supported_models() {
+        let dir = tempdir().unwrap();
+        let models = list_supported_models(dir.path());
+        assert!(!models.is_empty());
+        let bge = models.iter().find(|m| m.model_id == "BGEBaseENV15").unwrap();
+        assert_eq!(bge.display_name, "bge-base-en-v1.5");
+    }
+
+    #[test]
+    fn test_get_preferred_batch_size() {
+        assert_eq!(get_preferred_batch_size("normal-model", "description"), Some(32));
+        assert_eq!(get_preferred_batch_size("quantized-model", "description"), None);
+        assert_eq!(get_preferred_batch_size("model-q4", "description"), None);
+        assert_eq!(get_preferred_batch_size("model", "quantized weights"), None);
+    }
+
+    #[test]
+    fn test_find_model_info() {
+        let info = find_model_info("BGEBaseENV15").unwrap();
+        assert_eq!(info.model_code, "Xenova/bge-base-en-v1.5");
+        
+        let err = find_model_info("NonExistentModel");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_fastembed_installer_new() {
+        let dir = tempdir().unwrap();
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let installer = FastembedInstaller::new(
+            EmbedderModel("BGEBaseENV15".to_string()),
+            manager,
+            "cpu".to_string()
+        );
+        assert_eq!(installer.model.0, "BGEBaseENV15");
+        
+        assert_eq!(installer.uninstall(dir.path()).is_ok(), true);
+    }
+
+    #[test]
+    fn test_get_preferred_batch_size_detailed() {
+        assert_eq!(get_preferred_batch_size("-int8-model", ""), None);
+        assert_eq!(get_preferred_batch_size("model", "quantized model"), None);
+        assert_eq!(get_preferred_batch_size("normal", "high quality"), Some(32));
+    }
+
+    #[test]
+    fn test_find_model_info_invalid() {
+        assert!(find_model_info("NonExistent").is_err());
+    }
+
+    #[test]
+    fn test_is_available_not_cached() {
+        let dir = tempdir().unwrap();
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let installer = FastembedInstaller::new(
+            EmbedderModel("BGEBaseENV15".to_string()),
+            manager,
+            "cpu".to_string()
+        );
+        assert!(!installer.is_available(dir.path()));
+    }
+
+    #[test]
+    fn test_is_available_cached() {
+        let dir = tempdir().unwrap();
+        let info = find_model_info("BGEBaseENV15").unwrap();
+        
+        let repo_dir = dir.path().join(format!("models--{}", info.model_code.replace("/", "--")));
+        let snapshots = repo_dir.join("snapshots").join("main");
+        
+        let model_file_path = snapshots.join(&info.model_file);
+        if let Some(parent) = model_file_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&model_file_path, "fake onnx").unwrap();
+        
+        // Also write config.json at the root of the snapshot
+        std::fs::write(snapshots.join("config.json"), "{}").unwrap();
+        
+        let refs = repo_dir.join("refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("main"), "main").unwrap();
+
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let installer = FastembedInstaller::new(
+            EmbedderModel("BGEBaseENV15".to_string()),
+            manager,
+            "cpu".to_string()
+        );
+        let avail = installer.is_available(dir.path());
+        assert!(avail);
+    }
 }

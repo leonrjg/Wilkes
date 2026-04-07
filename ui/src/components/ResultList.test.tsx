@@ -154,4 +154,33 @@ describe("ResultList", () => {
     fireEvent.change(filterInput, { target: { value: "my-filter" } });
     expect(setFilterTextMock).toHaveBeenCalledWith("my-filter");
   });
+
+  it("displays search stats", () => {
+    useSearchStore.setState({
+      hasQuery: true,
+      stats: {
+        total_matches: 42,
+        files_scanned: 10,
+        elapsed_ms: 123,
+        errors: ["Permission denied in /root/restricted"],
+      },
+    });
+
+    render(<ResultList onMatchClick={mockOnMatchClick} onFileClick={mockOnFileClick} />);
+    expect(screen.getByText(/42 matches in 10 files/)).toBeInTheDocument();
+    expect(screen.getByText(/1 file failed/)).toBeInTheDocument();
+  });
+
+  it("handles empty results and searching state", () => {
+    useSearchStore.setState({
+      hasQuery: true,
+      results: [],
+      searching: true,
+    });
+
+    const { container } = render(<ResultList onMatchClick={mockOnMatchClick} onFileClick={mockOnFileClick} />);
+    expect(screen.getByText("0 matches…")).toBeInTheDocument();
+    // Shimmer element
+    expect(container.querySelector(".animate-shimmer")).toBeDefined();
+  });
 });

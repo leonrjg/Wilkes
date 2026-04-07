@@ -66,7 +66,7 @@ export function useHistory() {
       const isPdf = path.toLowerCase().endsWith(".pdf");
       const origin: MatchRef["origin"] = isPdf
         ? { PdfPage: { page: 1, bbox: null } }
-        : { TextFile: { line: 1, col: 0 } };
+        : { TextFile: { line: 0, col: 0 } };
       const matchRef: MatchRef = { path, origin };
       addToHistory(matchRef);
       selectMatch(matchRef);

@@ -26,13 +26,10 @@ impl SearchHandle {
     /// Wait for the worker to finish and return any non-fatal errors it collected.
     /// Must only be called after `next()` has returned `None`.
     pub async fn finish(self) -> Vec<String> {
-        match self.worker.await {
-            Ok(errors) => errors,
-            Err(e) => {
-                error!("search worker panicked: {e}");
-                vec![format!("search worker panicked: {e}")]
-            }
-        }
+        self.worker.await.unwrap_or_else(|e| {
+            error!("search worker panicked: {e}");
+            vec![format!("search worker panicked: {e}")]
+        })
     }
 
     /// Consumes the search stream, executing `on_result` for each match.
@@ -93,10 +90,7 @@ pub fn start_search(
             SearchMode::Grep => Box::new(GrepSearchProvider::new()),
         };
 
-        match provider.search(&query, &registry, tx) {
-            Ok(errors) => errors,
-            Err(e) => vec![format!("search failed: {e:#}")],
-        }
+        provider.search(&query, &registry, tx).unwrap_or_else(|e| vec![format!("search failed: {e:#}")])
     });
 
     SearchHandle { rx, worker }
@@ -197,5 +191,74 @@ mod tests {
         assert_eq!(stats.files_scanned, 2);
         assert_eq!(stats.total_matches, 2);
         assert!(stats.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_handle_run_abort() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::write(root.join("test1.txt"), "hello first").unwrap();
+        fs::write(root.join("test2.txt"), "hello second").unwrap();
+
+        let query = SearchQuery {
+            pattern: "hello".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: root.clone(),
+            file_type_filters: vec![],
+            max_results: 10,
+            respect_gitignore: true,
+            max_file_size: 1024 * 1024,
+            context_lines: 0,
+            mode: SearchMode::Grep,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let handle = start_search(query, None, None);
+        
+        let stats = handle.run(|_fm| async move {
+            false // Abort immediately
+        }).await;
+
+        assert_eq!(stats.files_scanned, 1);
+        assert!(stats.total_matches >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_start_search_provider_error() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        
+        // Invalid regex will cause GrepSearchProvider to fail
+        let query = SearchQuery {
+            pattern: "[".to_string(),
+            is_regex: true,
+            case_sensitive: false,
+            root: root.clone(),
+            file_type_filters: vec![],
+            max_results: 10,
+            respect_gitignore: true,
+            max_file_size: 1024 * 1024,
+            context_lines: 0,
+            mode: SearchMode::Grep,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let handle = start_search(query, None, None);
+        let errors = handle.finish().await;
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("search failed"));
+    }
+
+    #[tokio::test]
+    async fn test_search_handle_worker_panic() {
+        let (tx, rx) = mpsc::channel(1);
+        let worker = tokio::task::spawn_blocking(|| {
+            panic!("test panic");
+        });
+        let handle = SearchHandle { rx, worker };
+        let errors = handle.finish().await;
+        assert!(!errors.is_empty());
+        assert!(errors[0].contains("search worker panicked"));
     }
 }

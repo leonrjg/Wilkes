@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use parking_lot::Mutex as PLMutex;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -45,10 +46,10 @@ pub struct EmbedTaskHandle {
 pub struct AppContext {
     pub data_dir: PathBuf,
     pub settings_path: PathBuf,
-    embedder: Mutex<Option<Arc<dyn Embedder>>>,
-    index: Mutex<Arc<Mutex<Option<SemanticIndex>>>>,
-    watcher: Mutex<Option<IndexWatcher>>,
-    embed_task: Mutex<Option<EmbedTaskHandle>>,
+    embedder: PLMutex<Option<Arc<dyn Embedder>>>,
+    index: PLMutex<Arc<Mutex<Option<SemanticIndex>>>>,
+    watcher: PLMutex<Option<IndexWatcher>>,
+    embed_task: PLMutex<Option<EmbedTaskHandle>>,
     pub worker_manager: WorkerManager,
     events: Arc<dyn EventEmitter>,
     settings_lock: tokio::sync::Mutex<()>,
@@ -65,10 +66,10 @@ impl AppContext {
         let ctx = Arc::new(Self {
             data_dir,
             settings_path,
-            embedder: Mutex::new(None),
-            index: Mutex::new(Arc::new(Mutex::new(None))),
-            watcher: Mutex::new(None),
-            embed_task: Mutex::new(None),
+            embedder: PLMutex::new(None),
+            index: PLMutex::new(Arc::new(Mutex::new(None))),
+            watcher: PLMutex::new(None),
+            embed_task: PLMutex::new(None),
             worker_manager,
             events,
             settings_lock: tokio::sync::Mutex::new(()),
@@ -129,7 +130,7 @@ impl AppContext {
     }
 
     fn stop_watcher(&self) {
-        if let Some(mut w) = self.watcher.lock().unwrap().take() {
+        if let Some(mut w) = self.watcher.lock().take() {
             w.stop();
         }
     }
@@ -160,7 +161,8 @@ impl AppContext {
     }
 
     pub fn is_semantic_ready(&self) -> bool {
-        self.embedder.lock().unwrap().is_some() && self.index.lock().unwrap().lock().unwrap().is_some()
+        self.embedder.lock().is_some()
+            && self.index.lock().lock().unwrap_or_else(|p| p.into_inner()).is_some()
     }
 
     // ── Search ────────────────────────────────────────────────────────────────
@@ -174,7 +176,7 @@ impl AppContext {
         let (embedder, index) = if query.mode == SearchMode::Semantic {
             // Block if a build task is currently running.
             {
-                let mut guard = self.embed_task.lock().unwrap();
+                let mut guard = self.embed_task.lock();
                 if let Some(task) = guard.as_ref() {
                     if !task.join.is_finished() {
                         return Err("Semantic index is currently being built. Please wait.".into());
@@ -183,17 +185,17 @@ impl AppContext {
                 }
             }
 
-            let embedder = self.embedder.lock().unwrap().clone()
+            let embedder = self.embedder.lock().clone()
                 .ok_or_else(|| "No semantic index found. Build the index first.".to_string())?;
 
-            let index_arc = self.index.lock().unwrap().clone();
+            let index_arc = self.index.lock().clone();
 
             // If the query root differs from the indexed root, trigger a
             // background reindex and continue with the current index.
             let query_root_canonical =
                 std::fs::canonicalize(&query.root).unwrap_or_else(|_| query.root.clone());
             let root_mismatch = {
-                let guard = index_arc.lock().unwrap();
+                let guard = index_arc.lock().unwrap_or_else(|p| p.into_inner());
                 match guard.as_ref() {
                     Some(idx) => match idx.status().root_path {
                         Some(p) => std::fs::canonicalize(&p).unwrap_or(p) != query_root_canonical,
@@ -204,7 +206,7 @@ impl AppContext {
             };
             if root_mismatch {
                 let already_building = {
-                    let guard = self.embed_task.lock().unwrap();
+                    let guard = self.embed_task.lock();
                     guard.as_ref().is_some_and(|t| !t.join.is_finished())
                 };
                 if already_building {
@@ -213,7 +215,7 @@ impl AppContext {
                     info!("start_search: root changed, triggering background reindex");
                     let model = EmbedderModel(embedder.model_id().to_string());
                     let engine = {
-                        let guard = index_arc.lock().unwrap();
+                        let guard = index_arc.lock().unwrap_or_else(|p| p.into_inner());
                         guard.as_ref().map(|idx| idx.status().engine).unwrap_or_default()
                     };
                     let ctx = Arc::clone(&self);
@@ -246,7 +248,7 @@ impl AppContext {
         engine: EmbeddingEngine,
     ) -> Result<(), String> {
         {
-            let guard = self.embed_task.lock().unwrap();
+            let guard = self.embed_task.lock();
             if guard.as_ref().is_some_and(|t| !t.join.is_finished()) {
                 return Err("A build is already in progress.".into());
             }
@@ -315,7 +317,7 @@ impl AppContext {
                         match res {
                             Ok(embedder) => {
                                 let dim = embedder.dimension();
-                                *ctx.embedder.lock().unwrap() = Some(Arc::clone(&embedder));
+                                *ctx.embedder.lock() = Some(Arc::clone(&embedder));
 
                                 let data_dir_c = data_dir.clone();
                                 let m = model_clone.model_id().to_string();
@@ -325,7 +327,7 @@ impl AppContext {
                                     Ok(Ok(idx)) => {
                                         let actual_dim = idx.status().dimension;
                                         let index_arc = Arc::new(Mutex::new(Some(idx)));
-                                        *ctx.index.lock().unwrap() = Arc::clone(&index_arc);
+                                        *ctx.index.lock() = Arc::clone(&index_arc);
 
                                         let mut registry = ExtractorRegistry::new();
                                         registry.register(Box::new(PdfExtractor::new()));
@@ -346,7 +348,7 @@ impl AppContext {
                                             move || ev1.emit("manager-event", serde_json::json!("Reindexing")),
                                             move || ev2.emit("manager-event", serde_json::json!("ReindexingDone")),
                                         ) {
-                                            Ok(w) => *ctx.watcher.lock().unwrap() = Some(w),
+                                            Ok(w) => *ctx.watcher.lock() = Some(w),
                                             Err(e) => error!("watcher start failed: {e:#}"),
                                         }
 
@@ -385,12 +387,12 @@ impl AppContext {
                     }
                 }
             }
-            *ctx.embed_task.lock().unwrap() = None;
+            *ctx.embed_task.lock() = None;
             Ok(())
         });
 
         let cancel = CancellationToken::new();
-        *self.embed_task.lock().unwrap() = Some(EmbedTaskHandle { cancel, join });
+        *self.embed_task.lock() = Some(EmbedTaskHandle { cancel, join });
         Ok(())
     }
 
@@ -403,7 +405,7 @@ impl AppContext {
         engine: EmbeddingEngine,
     ) -> Result<(), String> {
         {
-            let guard = self.embed_task.lock().unwrap();
+            let guard = self.embed_task.lock();
             if guard.as_ref().is_some_and(|t| !t.join.is_finished()) {
                 return Err("A build is already in progress.".into());
             }
@@ -441,19 +443,19 @@ impl AppContext {
             match result {
                 Ok(()) => {
                     // Probe model dimensions by running install again (no-op if cached).
-                    let (probe_tx, _) = tokio::sync::mpsc::channel(1);
+                    let (probe_tx, _) = mpsc::channel(1);
                     let installer = dispatch::get_installer(engine, model_clone.clone(), manager, device);
                     if let Err(e) = installer.install(&data_dir, probe_tx).await {
                         ctx.events.emit("embed-error", serde_json::json!({
                             "operation": "Download",
                             "message": format!("Failed to probe model dimensions: {e:#}")
                         }));
-                        *ctx.embed_task.lock().unwrap() = None;
+                        *ctx.embed_task.lock() = None;
                         return Ok(());
                     }
                     match installer.build(&data_dir) {
                         Ok(embedder) => {
-                            *ctx.embedder.lock().unwrap() = Some(embedder);
+                            *ctx.embedder.lock() = Some(embedder);
                             ctx.update_semantic_settings(|s| SemanticSettings {
                                 enabled: true,
                                 engine,
@@ -476,12 +478,12 @@ impl AppContext {
                 }
             }
 
-            *ctx.embed_task.lock().unwrap() = None;
+            *ctx.embed_task.lock() = None;
             Ok(())
         });
 
         let cancel = CancellationToken::new();
-        *self.embed_task.lock().unwrap() = Some(EmbedTaskHandle { cancel, join });
+        *self.embed_task.lock() = Some(EmbedTaskHandle { cancel, join });
         Ok(())
     }
 
@@ -489,15 +491,15 @@ impl AppContext {
 
     pub fn cancel_embed(&self) {
         self.worker_manager.kill_active();
-        if let Some(task) = self.embed_task.lock().unwrap().take() {
+        if let Some(task) = self.embed_task.lock().take() {
             task.cancel.cancel();
         }
     }
 
     pub async fn delete_index(&self) -> anyhow::Result<()> {
         self.stop_watcher();
-        *self.index.lock().unwrap() = Arc::new(Mutex::new(None));
-        *self.embedder.lock().unwrap() = None;
+        *self.index.lock() = Arc::new(Mutex::new(None));
+        *self.embedder.lock() = None;
         crate::commands::embed::delete_index(&self.data_dir).await?;
         self.update_semantic_settings(|s| SemanticSettings { index_path: None, ..s }).await;
         Ok(())
@@ -606,9 +608,9 @@ impl AppContext {
             Err(e) => { error!("restore_state: open index panicked: {e}"); return; }
         };
 
-        *self.embedder.lock().unwrap() = Some(Arc::clone(&embedder));
+        *self.embedder.lock() = Some(Arc::clone(&embedder));
         let index_arc = Arc::new(Mutex::new(Some(index)));
-        *self.index.lock().unwrap() = Arc::clone(&index_arc);
+        *self.index.lock() = Arc::clone(&index_arc);
 
         if let Some(root) = settings.last_directory {
             let mut registry = ExtractorRegistry::new();
@@ -630,7 +632,7 @@ impl AppContext {
                 move || ev1.emit("manager-event", serde_json::json!("Reindexing")),
                 move || ev2.emit("manager-event", serde_json::json!("ReindexingDone")),
             ) {
-                Ok(w) => *self.watcher.lock().unwrap() = Some(w),
+                Ok(w) => *self.watcher.lock() = Some(w),
                 Err(e) => error!("restore_state: watcher: {e:#}"),
             }
         }
@@ -654,6 +656,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::mpsc;
     use serde_json::Value;
+    use wilkes_core::embed::MockEmbedder;
 
     struct MockEmitter {
         events: Arc<Mutex<Vec<(String, Value)>>>,
@@ -720,13 +723,15 @@ mod tests {
         let forwarder = tokio::spawn(ctx.run_event_forwarder(rx));
 
         tx.send(ManagerEvent::WorkerStarting).await.unwrap();
+        tx.send(ManagerEvent::ReindexingDone).await.unwrap();
         drop(tx);
         forwarder.await.unwrap();
 
         let events_guard = events.lock().unwrap();
-        assert_eq!(events_guard.len(), 1);
+        assert_eq!(events_guard.len(), 2);
         assert_eq!(events_guard[0].0, "manager-event");
         assert_eq!(events_guard[0].1, serde_json::json!("WorkerStarting"));
+        assert_eq!(events_guard[1].1, serde_json::json!("ReindexingDone"));
     }
 
     #[tokio::test]
@@ -747,28 +752,19 @@ mod tests {
             emitter,
         );
 
-        use wilkes_core::types::{EmbeddingEngine, IndexingConfig};
-        use wilkes_core::embed::Embedder;
-        struct StubEmbedder;
-        impl Embedder for StubEmbedder {
-            fn embed(&self, _: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![]) }
-            fn model_id(&self) -> &str { "stub" }
-            fn dimension(&self) -> usize { 1 }
-            fn engine(&self) -> EmbeddingEngine { EmbeddingEngine::Candle }
-        }
         let watcher = IndexWatcher::start(
             dir.path().to_path_buf(),
-            ctx.index.lock().unwrap().clone(),
+            ctx.index.lock().clone(),
             Arc::new(ExtractorRegistry::new()),
-            Arc::new(StubEmbedder),
+            Arc::new(MockEmbedder::default()),
             IndexingConfig { chunk_size: 100, chunk_overlap: 10, supported_extensions: vec![] },
             || {},
             || {},
         ).unwrap();
 
-        *ctx.watcher.lock().unwrap() = Some(watcher);
+        *ctx.watcher.lock() = Some(watcher);
         ctx.stop_watcher();
-        assert!(ctx.watcher.lock().unwrap().is_none());
+        assert!(ctx.watcher.lock().is_none());
     }
 
     #[tokio::test]
@@ -1137,7 +1133,7 @@ mod tests {
         // Mock a task in progress
         let cancel = CancellationToken::new();
         let join = tokio::spawn(async { Ok(()) });
-        *ctx.embed_task.lock().unwrap() = Some(EmbedTaskHandle { cancel, join });
+        *ctx.embed_task.lock() = Some(EmbedTaskHandle { cancel, join });
 
         let res = ctx.start_build_index(
             "root".to_string(),
@@ -1147,6 +1143,76 @@ mod tests {
 
         assert!(res.is_err());
         assert_eq!(res.unwrap_err(), "A build is already in progress.");
+    }
+
+    #[tokio::test]
+    async fn test_start_build_index_root_not_found() {
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(MockEmitter { events: events.clone() });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("s.json"),
+            WorkerPaths::resolve(dir.path()),
+            emitter,
+        );
+
+        let res = ctx.start_build_index(
+            "/non/existent/path/for/sure/12345".to_string(),
+            EmbedderModel("m".to_string()),
+            EmbeddingEngine::Candle
+        ).await;
+
+        // The call itself is Ok because it spawns a task
+        assert!(res.is_ok());
+        
+        // But it should eventually emit an error
+        let mut found = false;
+        for _ in 0..20 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            let events_guard = events.lock().unwrap();
+            if events_guard.iter().any(|e| e.0 == "embed-error") {
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
+    }
+
+    #[tokio::test]
+    async fn test_start_search_semantic_build_in_progress() {
+        let dir = tempdir().unwrap();
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("s.json"),
+            WorkerPaths::resolve(dir.path()),
+            Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) }),
+        );
+
+        // Mock a task in progress
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(async { Ok(()) });
+        *ctx.embed_task.lock() = Some(EmbedTaskHandle { cancel, join });
+
+        let query = SearchQuery {
+            mode: SearchMode::Semantic,
+            root: dir.path().to_path_buf(),
+            pattern: "test".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            file_type_filters: vec![],
+            max_results: 10,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            supported_extensions: vec![],
+        };
+
+        let res = ctx.start_search(query).await;
+        match res {
+            Err(e) => assert!(e.contains("Semantic index is currently being built")),
+            Ok(_) => panic!("Expected error but got Ok"),
+        }
     }
 
     #[tokio::test]
@@ -1170,7 +1236,7 @@ mod tests {
         // Mock a task in progress
         let cancel = CancellationToken::new();
         let join = tokio::spawn(async { Ok(()) });
-        *ctx.embed_task.lock().unwrap() = Some(EmbedTaskHandle { cancel, join });
+        *ctx.embed_task.lock() = Some(EmbedTaskHandle { cancel, join });
 
         let res = ctx.start_download_model(
             EmbedderModel("m".to_string()),
@@ -1231,23 +1297,18 @@ mod tests {
             emitter,
         );
 
-        use wilkes_core::embed::Embedder;
-        struct StubEmbedder;
-        impl Embedder for StubEmbedder {
-            fn embed(&self, _: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![]) }
-            fn model_id(&self) -> &str { "stub" }
-            fn dimension(&self) -> usize { 1 }
-            fn engine(&self) -> EmbeddingEngine { EmbeddingEngine::Candle }
-        }
-
+        let embedder = Arc::new(MockEmbedder::default());
+        let model_id = embedder.model_id().to_string();
+        let dimension = embedder.dimension();
+        
         // Mock an embedder and index
-        *ctx.embedder.lock().unwrap() = Some(Arc::new(StubEmbedder));
+        *ctx.embedder.lock() = Some(embedder);
         
         // Create an index on disk so we can open it
         let root1 = dir.path().join("root1");
         std::fs::create_dir_all(&root1).unwrap();
-        let idx = SemanticIndex::create(&data_dir, "stub", 1, EmbeddingEngine::Candle, Some(&root1)).unwrap();
-        *ctx.index.lock().unwrap() = Arc::new(Mutex::new(Some(idx)));
+        let idx = SemanticIndex::create(&data_dir, &model_id, dimension, EmbeddingEngine::Candle, Some(&root1)).unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(idx)));
 
         // Search in a different root
         let root2 = dir.path().join("root2");
@@ -1271,7 +1332,7 @@ mod tests {
         
         // Check if embed_task was set (reindex triggered)
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        assert!(ctx.embed_task.lock().unwrap().is_some());
+        assert!(ctx.embed_task.lock().is_some());
     }
 
     #[tokio::test]
@@ -1315,5 +1376,382 @@ mod tests {
         let updated_settings = ctx.get_settings().await;
         assert_eq!(updated_settings.semantic.enabled, false);
         assert!(updated_settings.semantic.index_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_semantic_settings_error() {
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join("invalid.json");
+        std::fs::write(&settings_path, "{ broken }").unwrap();
+        
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            settings_path,
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
+            },
+            emitter,
+        );
+
+        ctx.update_semantic_settings(|s| s).await;
+    }
+
+    #[tokio::test]
+    async fn test_restore_state_model_mismatch_clears_settings() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let settings_path = dir.path().join("settings.json");
+        
+        let settings = Settings {
+            semantic: SemanticSettings {
+                model: EmbedderModel("model-A".to_string()),
+                enabled: true,
+                index_path: Some(data_dir.join("semantic_index.db")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        std::fs::write(&settings_path, serde_json::to_string(&settings).unwrap()).unwrap();
+
+        wilkes_core::embed::index::SemanticIndex::create(&data_dir, "model-B", 1, EmbeddingEngine::Candle, None).unwrap();
+
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, _rx, _loop) = AppContext::new(
+            data_dir.clone(),
+            settings_path,
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: data_dir.clone(),
+            },
+            emitter,
+        );
+
+        ctx.clone().restore_state().await;
+        let updated = ctx.get_settings().await;
+        assert_eq!(updated.semantic.enabled, false);
+        assert!(updated.semantic.index_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_worker_operations() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let settings_path = dir.path().join("settings.json");
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, _rx, _loop) = AppContext::new(
+            data_dir.clone(),
+            settings_path,
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: data_dir.clone(),
+            },
+            emitter,
+        );
+
+        let status = ctx.get_worker_status();
+        assert!(!status.active);
+
+        ctx.kill_worker();
+        
+        // set_worker_timeout sends to the manager loop, which is running, so it should succeed.
+        let res = ctx.set_worker_timeout(10).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_delete_index_operation() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, _rx, _loop) = AppContext::new(
+            data_dir.clone(),
+            settings_path,
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: data_dir.clone(),
+            },
+            emitter,
+        );
+
+        // Create a fake index
+        std::fs::write(data_dir.join("semantic_index.db"), "fake db").unwrap();
+        // Note: delete_index currently only removes the .db file.
+        std::fs::write(data_dir.join("semantic_index.status.json"), r#"{"model_id": "m", "dimension": 1, "engine": "Candle"}"#).unwrap();
+
+        ctx.delete_index().await.unwrap();
+        assert!(!data_dir.join("semantic_index.db").exists());
+        
+        let settings = ctx.get_settings().await;
+        assert!(settings.semantic.index_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_index_status_not_found() {
+        let dir = tempdir().unwrap();
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("s.json"),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: dir.path().to_path_buf(),
+            },
+            Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) }),
+        );
+
+        let res = ctx.get_index_status().await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_settings_patch() {
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            settings_path.clone(),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: dir.path().to_path_buf(),
+            },
+            Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) }),
+        );
+
+        let patch = serde_json::json!({
+            "supported_extensions": ["rs", "txt"]
+        });
+        ctx.update_settings(patch).await.unwrap();
+        
+        let settings = ctx.get_settings().await;
+        assert_eq!(settings.supported_extensions, vec!["rs", "txt"]);
+    }
+
+    #[tokio::test]
+    async fn test_update_semantic_settings_patch() {
+        let dir = tempdir().unwrap();
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths::resolve(dir.path()),
+            Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) }),
+        );
+
+        ctx.update_semantic_settings(|mut s| {
+            s.chunk_size = 1234;
+            s
+        }).await;
+        
+        let settings = ctx.get_settings().await;
+        assert_eq!(settings.semantic.chunk_size, 1234);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_embed_operation() {
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(MockEmitter { events: events.clone() });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: dir.path().to_path_buf(),
+            },
+            emitter,
+        );
+
+        // Start a fake build index
+        ctx.clone().start_build_index(
+            dir.path().to_string_lossy().to_string(),
+            EmbedderModel("m".to_string()),
+            EmbeddingEngine::Candle
+        ).await.unwrap();
+
+        // Immediately cancel
+        ctx.cancel_embed();
+        
+        // Give it some time to process
+        let mut success = false;
+        for _ in 0..20 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            let events_guard = events.lock().unwrap();
+            if events_guard.iter().any(|e| 
+                e.0 == "embed-error" || 
+                e.0 == "embed-done" ||
+                (e.0 == "manager-event" && e.1 == serde_json::json!("ReindexingDone"))
+            ) {
+                success = true;
+                break;
+            }
+        }
+        assert!(success);
+    }
+
+    #[tokio::test]
+    async fn test_start_download_model_error() {
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(MockEmitter { events: events.clone() });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: dir.path().to_path_buf(),
+            },
+            emitter,
+        );
+
+        // Requesting download of non-existent model should eventually emit error
+        ctx.clone().start_download_model(
+            EmbedderModel("invalid-model".to_string()),
+            EmbeddingEngine::Fastembed
+        ).await.unwrap();
+        
+        // Wait for task to fail
+        let mut found = false;
+        for _ in 0..10 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            let events_guard = events.lock().unwrap();
+            if events_guard.iter().any(|e| e.0 == "embed-error") {
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
+    }
+
+    #[tokio::test]
+    async fn test_restore_state_complex() {
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        
+        // Seed settings.json with a different model
+        let mut initial_settings = wilkes_core::types::Settings::default();
+        initial_settings.semantic.model = EmbedderModel("m1".to_string());
+        std::fs::write(&settings_path, serde_json::to_string(&initial_settings).unwrap()).unwrap();
+
+        // Create an index status file matching that model
+        let index_dir = dir.path().join("index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let status = wilkes_core::types::IndexStatus {
+            model_id: "m1".to_string(),
+            engine: EmbeddingEngine::Candle,
+            dimension: 128,
+            indexed_files: 1,
+            total_chunks: 10,
+            built_at: Some(12345678),
+            build_duration_ms: Some(1000),
+            root_path: Some(dir.path().to_path_buf()),
+            db_size_bytes: Some(1024),
+        };
+        std::fs::write(index_dir.join("status.json"), serde_json::to_string(&status).unwrap()).unwrap();
+
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            settings_path,
+            WorkerPaths::resolve(dir.path()),
+            Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) }),
+        );
+
+        // AppContext::new might have already called restore_state internally,
+        // but let's be explicit and check if it sticks.
+        ctx.clone().restore_state().await;
+        
+        let s = ctx.get_settings().await;
+        assert_eq!(s.semantic.model.0, "m1");
+    }
+
+    #[tokio::test]
+    async fn test_restore_state_open_index_fail() {
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Create a corrupted index path (a directory where a file should be)
+        let index_path = data_dir.join("semantic_index.db");
+        std::fs::create_dir(&index_path).unwrap();
+
+        let settings = Settings {
+            semantic: SemanticSettings {
+                enabled: true,
+                index_path: Some(index_path),
+                model: EmbedderModel("m".to_string()),
+                engine: EmbeddingEngine::Candle,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        std::fs::write(&settings_path, serde_json::to_string(&settings).unwrap()).unwrap();
+
+        let (ctx, _rx, _loop) = AppContext::new(
+            data_dir.clone(),
+            settings_path,
+            WorkerPaths::resolve(dir.path()),
+            Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) }),
+        );
+
+        ctx.clone().restore_state().await;
+        
+        let updated = ctx.get_settings().await;
+        assert_eq!(updated.semantic.enabled, false);
+    }
+
+    #[tokio::test]
+    async fn test_update_semantic_settings_success() {
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join("s.json");
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            settings_path.clone(),
+            WorkerPaths::resolve(dir.path()),
+            Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) }),
+        );
+
+        ctx.update_semantic_settings(|s| SemanticSettings {
+            enabled: true,
+            ..s
+        }).await;
+
+        let s = ctx.get_settings().await;
+        assert_eq!(s.semantic.enabled, true);
+        assert!(settings_path.exists());
     }
 }

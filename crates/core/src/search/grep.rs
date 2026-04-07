@@ -623,4 +623,133 @@ mod tests {
         // extract_context_after will find the boundary at 4.
         assert_eq!(extract_context_after(emoji, 1, 10), "🦀");
     }
+
+    #[test]
+    fn test_grep_capabilities() {
+        let provider = GrepSearchProvider::new();
+        let caps = provider.capabilities();
+        assert!(caps.supports_regex);
+        assert!(!caps.is_indexed);
+    }
+
+    #[test]
+    fn test_search_cancellation() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("test.txt"), "content").unwrap();
+
+        let query = SearchQuery {
+            pattern: "content".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            file_type_filters: vec![],
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let provider = GrepSearchProvider::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        drop(rx); // Close receiver immediately
+
+        let extractors = ExtractorRegistry::new();
+        let res = provider.search(&query, &extractors, tx);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_search_pdf_mock() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.pdf");
+        fs::write(&path, "pdf binary data").unwrap();
+
+        let query = SearchQuery {
+            pattern: "pdf".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            file_type_filters: vec![],
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            supported_extensions: vec!["pdf".to_string()],
+        };
+
+        use crate::extract::ContentExtractor;
+        use crate::types::ExtractedContent;
+        use crate::types::SourceMap;
+        use crate::types::FileMetadata;
+        
+        struct MockPdfExtractor;
+        impl ContentExtractor for MockPdfExtractor {
+            fn can_handle(&self, _: &Path, _: Option<&str>) -> bool { true }
+            fn extract(&self, path: &Path) -> anyhow::Result<ExtractedContent> {
+                Ok(ExtractedContent {
+                    text: "this is extracted pdf content".to_string(),
+                    source_map: SourceMap { segments: vec![] },
+                    metadata: FileMetadata {
+                        path: path.to_path_buf(),
+                        size_bytes: 0,
+                        mime: None,
+                        title: None,
+                        page_count: None,
+                    },
+                })
+            }
+        }
+
+        let mut registry = ExtractorRegistry::new();
+        registry.register(Box::new(MockPdfExtractor));
+
+        let provider = GrepSearchProvider::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        
+        provider.search(&query, &registry, tx).unwrap();
+        
+        let mut results = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            results.push(m);
+        }
+        
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file_type, FileType::Pdf);
+    }
+
+    #[test]
+    fn test_search_binary_skip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.png");
+        // PNG header to trigger 'infer' as binary
+        fs::write(&path, &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+
+        let query = SearchQuery {
+            pattern: "match".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            file_type_filters: vec![],
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            supported_extensions: vec![],
+        };
+
+        let provider = GrepSearchProvider::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let extractors = ExtractorRegistry::new();
+        provider.search(&query, &extractors, tx).unwrap();
+
+        let mut results = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            results.push(m);
+        }
+        assert!(results.is_empty());
+    }
 }

@@ -541,3 +541,227 @@ pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> an
         passage_prefix,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use std::fs;
+
+    #[test]
+    fn test_list_supported_models() {
+        let dir = tempdir().unwrap();
+        let models = list_supported_models(dir.path());
+        assert!(!models.is_empty());
+        let default_model = models.iter().find(|m| m.is_default).unwrap();
+        assert_eq!(default_model.model_id, "sentence-transformers/all-MiniLM-L12-v2");
+    }
+
+    #[test]
+    fn test_select_device() {
+        assert!(matches!(select_device("cpu"), Device::Cpu));
+        // On non-metal systems or without feature, it should fallback to Cpu
+        assert!(matches!(select_device("metal"), Device::Cpu | Device::Metal(_)));
+    }
+
+    #[test]
+    fn test_read_dimension_static() {
+        let dir = tempdir().unwrap();
+        let dim = read_dimension(dir.path(), "sentence-transformers/all-MiniLM-L12-v2").unwrap();
+        assert_eq!(dim, 384);
+    }
+
+    #[test]
+    fn test_load_pooling_strategy_default() {
+        let dir = tempdir().unwrap();
+        let strategy = load_pooling_strategy(dir.path(), "non-existent");
+        assert!(matches!(strategy, PoolingStrategy::Mean));
+    }
+
+    #[test]
+    fn test_l2_normalize() {
+        let device = Device::Cpu;
+        let t = Tensor::new(&[[3.0f32, 4.0f32]], &device).unwrap();
+        let norm = l2_normalize(&t).unwrap();
+        let expected = vec![vec![0.6f32, 0.8f32]];
+        assert_eq!(norm.to_vec2::<f32>().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_select_dtype() {
+        assert_eq!(select_dtype(&Device::Cpu), DType::F32);
+    }
+
+    #[test]
+    fn test_read_dimension_from_config_hidden_size() {
+        let dir = tempdir().unwrap();
+        let model_id = "custom/model";
+        let repo_dir = dir.path().join("models--custom--model");
+        let snapshots = repo_dir.join("snapshots").join("main");
+        fs::create_dir_all(&snapshots).unwrap();
+        fs::write(snapshots.join("config.json"), r#"{"hidden_size": 1024}"#).unwrap();
+        
+        let refs = repo_dir.join("refs");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("main"), "main").unwrap();
+
+        let dim = read_dimension(dir.path(), model_id).unwrap();
+        assert_eq!(dim, 1024);
+    }
+
+    #[test]
+    fn test_read_dimension_missing_config() {
+        let dir = tempdir().unwrap();
+        let res = read_dimension(dir.path(), "non-existent");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_read_dimension_invalid_json() {
+        let dir = tempdir().unwrap();
+        let model_id = "bad/json";
+        let repo_dir = dir.path().join("models--bad--json");
+        let snapshots = repo_dir.join("snapshots").join("main");
+        fs::create_dir_all(&snapshots).unwrap();
+        fs::write(snapshots.join("config.json"), r#"{"hidden_size": "#).unwrap();
+        
+        let refs = repo_dir.join("refs");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("main"), "main").unwrap();
+
+        let res = read_dimension(dir.path(), model_id);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_load_pooling_strategy_cls_works() {
+        let dir = tempdir().unwrap();
+        let model_id = "cls/model";
+        let repo_dir = dir.path().join("models--cls--model");
+        let snapshots = repo_dir.join("snapshots").join("main");
+        fs::create_dir_all(snapshots.join("1_Pooling")).unwrap();
+        fs::write(snapshots.join("1_Pooling/config.json"), r#"{"pooling_mode_cls_token": true}"#).unwrap();
+        
+        let refs = repo_dir.join("refs");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("main"), "main").unwrap();
+
+        let strategy = load_pooling_strategy(dir.path(), model_id);
+        assert!(matches!(strategy, PoolingStrategy::Cls));
+    }
+
+    #[test]
+    fn test_load_pooling_strategy_max_works() {
+        let dir = tempdir().unwrap();
+        let model_id = "max/model";
+        let repo_dir = dir.path().join("models--max--model");
+        let snapshots = repo_dir.join("snapshots").join("main");
+        fs::create_dir_all(snapshots.join("1_Pooling")).unwrap();
+        fs::write(snapshots.join("1_Pooling/config.json"), r#"{"pooling_mode_max_tokens": true}"#).unwrap();
+        
+        let refs = repo_dir.join("refs");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("main"), "main").unwrap();
+
+        let strategy = load_pooling_strategy(dir.path(), model_id);
+        assert!(matches!(strategy, PoolingStrategy::Max));
+    }
+
+    #[test]
+    fn test_load_pooling_strategy_invalid_json() {
+        let dir = tempdir().unwrap();
+        let model_id = "bad/pooling";
+        let repo_dir = dir.path().join("models--bad--pooling");
+        let snapshots = repo_dir.join("snapshots").join("main");
+        fs::create_dir_all(snapshots.join("1_Pooling")).unwrap();
+        fs::write(snapshots.join("1_Pooling/config.json"), r#"{"pooling_mode_cls_token": "#).unwrap();
+        
+        let refs = repo_dir.join("refs");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("main"), "main").unwrap();
+
+        let strategy = load_pooling_strategy(dir.path(), model_id);
+        assert!(matches!(strategy, PoolingStrategy::Mean));
+    }
+
+    #[test]
+    fn test_cached_size_bytes() {
+        let dir = tempdir().unwrap();
+        let model_id = "size/model";
+        let repo_dir = dir.path().join("models--size--model");
+        let snapshots = repo_dir.join("snapshots").join("main");
+        fs::create_dir_all(&snapshots).unwrap();
+        
+        fs::write(snapshots.join("config.json"), "abc").unwrap(); // 3 bytes
+        fs::write(snapshots.join("tokenizer.json"), "defg").unwrap(); // 4 bytes
+        fs::write(snapshots.join("model.safetensors"), "h").unwrap(); // 1 byte
+        
+        let refs = repo_dir.join("refs");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("main"), "main").unwrap();
+
+        let size = cached_size_bytes(dir.path(), model_id).unwrap();
+        assert_eq!(size, 8);
+    }
+
+    #[test]
+    fn test_candle_installer_basics() {
+        let dir = tempdir().unwrap();
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let installer = CandleInstaller::new(
+            EmbedderModel("m1".to_string()),
+            manager,
+            "cpu".to_string()
+        );
+        assert_eq!(installer.model.0, "m1");
+
+        assert!(!installer.is_available(dir.path()));
+
+        // Mock it
+        let repo_dir = dir.path().join("models--m1");
+        let snapshots = repo_dir.join("snapshots").join("main");
+        fs::create_dir_all(&snapshots).unwrap();
+        fs::write(snapshots.join("config.json"), "{}").unwrap();
+        fs::write(snapshots.join("tokenizer.json"), "{}").unwrap();
+        fs::write(snapshots.join("model.safetensors"), "{}").unwrap();
+        let refs = repo_dir.join("refs");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("main"), "main").unwrap();
+
+        assert!(installer.is_available(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn test_candle_installer_install_skip() {
+        std::env::set_var("HF_HUB_OFFLINE", "1");
+        let dir = tempdir().unwrap();
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let installer = CandleInstaller::new(
+            EmbedderModel("m1".to_string()),
+            manager,
+            "cpu".to_string()
+        );
+
+        // Mock it so it skips download
+        let repo_dir = dir.path().join("models--m1");
+        let snapshots = repo_dir.join("snapshots").join("main");
+        fs::create_dir_all(&snapshots).unwrap();
+        fs::write(snapshots.join("config.json"), "{}").unwrap();
+        fs::write(snapshots.join("tokenizer.json"), "{}").unwrap();
+        fs::write(snapshots.join("model.safetensors"), "{}").unwrap();
+        let refs = repo_dir.join("refs");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("main"), "main").unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        installer.install(dir.path(), tx).await.unwrap();
+        std::env::remove_var("HF_HUB_OFFLINE");
+    }
+
+    #[test]
+    fn test_cached_size_bytes_none() {
+        let dir = tempdir().unwrap();
+        let size = cached_size_bytes(dir.path(), "non-existent");
+        assert!(size.is_none());
+    }
+}

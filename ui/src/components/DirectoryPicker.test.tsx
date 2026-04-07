@@ -2,6 +2,10 @@ import { render, screen, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import DirectoryPicker from "./DirectoryPicker";
 
+vi.mock("../lib/utils/dialog", () => ({
+  confirmDialog: vi.fn().mockResolvedValue(true),
+}));
+
 describe("DirectoryPicker", () => {
   const defaultProps = {
     directory: "/home/user/project",
@@ -51,5 +55,21 @@ describe("DirectoryPicker", () => {
     const bookmarkBtns = screen.getAllByTitle("Bookmark this directory");
     fireEvent.click(bookmarkBtns[0]); // Click the first one
     expect(defaultProps.onBookmarkAdd).toHaveBeenCalledWith("/home/user/recent");
+  });
+
+  it("calls onForgetDirectory when remove from history button is clicked", async () => {
+    const onForgetDirectory = vi.fn();
+    const { confirmDialog } = await import("../lib/utils/dialog");
+
+    render(<DirectoryPicker {...defaultProps} onForgetDirectory={onForgetDirectory} />);
+
+    const removeBtns = screen.getAllByTitle("Remove from history");
+    expect(removeBtns).toHaveLength(3); // one for each directory
+
+    fireEvent.click(removeBtns[1]); // Click the second one (recent)
+    await Promise.resolve();
+
+    expect(confirmDialog).toHaveBeenCalledWith('Remove "~/recent" from your history?');
+    expect(onForgetDirectory).toHaveBeenCalledWith("/home/user/recent");
   });
 });

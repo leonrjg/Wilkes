@@ -55,6 +55,8 @@ describe("useSettingsStore", () => {
     (api.listFiles as any).mockResolvedValue([{ path: "/path/1/file.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" }]);
 
     await useSettingsStore.getState().load();
+    // Allow the directory-change subscription to resolve its async listFiles call
+    await Promise.resolve();
 
     const state = useSettingsStore.getState();
     expect(state.bookmarks).toEqual(["/path/1"]);
@@ -94,6 +96,28 @@ describe("useSettingsStore", () => {
     expect(api.updateSettings).toHaveBeenCalled();
   });
 
+  it("should load file list reactively when directory changes", async () => {
+    const mockFile = { path: "/dir/file.ts", size_bytes: 10, file_type: "PlainText", extension: "ts" };
+    (api.updateSettings as any).mockResolvedValue({});
+    (api.listFiles as any).mockResolvedValue([mockFile]);
+
+    useSettingsStore.getState().setDirectory("/dir");
+    await Promise.resolve();
+
+    expect(api.listFiles).toHaveBeenCalledWith("/dir");
+    expect(useSettingsStore.getState().fileList).toEqual([mockFile]);
+  });
+
+  it("should clear file list reactively when directory is removed", async () => {
+    useSettingsStore.setState({ directory: "/some/dir", fileList: [{ path: "/some/dir/f.ts", size_bytes: 1, file_type: "PlainText", extension: "ts" }] });
+    (api.updateSettings as any).mockResolvedValue({});
+
+    useSettingsStore.getState().forgetDirectory("/some/dir");
+
+    expect(useSettingsStore.getState().directory).toBe("");
+    expect(useSettingsStore.getState().fileList).toEqual([]);
+  });
+
   it("should add a bookmark", async () => {
     (api.updateSettings as any).mockResolvedValue({});
 
@@ -120,6 +144,27 @@ describe("useSettingsStore", () => {
     const state = useSettingsStore.getState();
     expect(state.bookmarks).not.toContain("/path/1");
     expect(api.updateSettings).toHaveBeenCalled();
+  });
+
+  it("should forget a directory", async () => {
+    useSettingsStore.setState({
+      bookmarks: ["/path/1", "/path/2"],
+      recentDirs: ["/path/1", "/path/3"],
+      directory: "/path/1",
+    });
+    (api.updateSettings as any).mockResolvedValue({});
+
+    useSettingsStore.getState().forgetDirectory("/path/1");
+
+    const state = useSettingsStore.getState();
+    expect(state.bookmarks).toEqual(["/path/2"]);
+    expect(state.recentDirs).toEqual(["/path/3"]);
+    expect(state.directory).toBe("");
+    expect(api.updateSettings).toHaveBeenCalledWith({
+      bookmarked_dirs: ["/path/2"],
+      recent_dirs: ["/path/3"],
+      last_directory: null,
+    });
   });
 
   it("should apply settings patch", () => {

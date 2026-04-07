@@ -18,6 +18,7 @@ interface SearchStore {
   setHasQuery: (hasQuery: boolean) => void;
   selectMatch: (matchRef: MatchRef) => void;
   clearPreview: () => void;
+  clearResults: () => void;
 }
 
 export const useSearchStore = create<SearchStore>((set, get) => ({
@@ -56,7 +57,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
             set((state) => ({ results: [...state.results, fm] }));
           }
         },
-        (s) => set({ stats: s, searching: false, currentSearchId: null }),
+        (s) => set({ results: firstResult ? [] : get().results, stats: s, searching: false, currentSearchId: null }),
       );
       set({ currentSearchId: searchId });
     } catch (e: any) {
@@ -88,4 +89,5 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
   },
 
   clearPreview: () => set({ selectedMatch: null, previewData: null }),
+  clearResults: () => set({ results: [], stats: null, selectedMatch: null, previewData: null }),
 }));

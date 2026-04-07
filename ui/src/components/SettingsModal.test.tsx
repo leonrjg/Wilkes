@@ -53,6 +53,16 @@ describe("SettingsModal", () => {
     expect(screen.getByText("Settings")).toBeInTheDocument();
   });
 
+  it("remains mounted but hidden when isOpen is false", async () => {
+    let testContainer;
+    await act(async () => {
+      const { container } = render(<SettingsModal {...defaultProps} isOpen={false} />);
+      testContainer = container;
+    });
+    expect(testContainer.firstChild).toHaveClass("hidden");
+    expect(screen.getByText("Settings")).toBeInTheDocument();
+  });
+
   it("switches tabs", async () => {
     await act(async () => {
       render(<SettingsModal {...defaultProps} />);

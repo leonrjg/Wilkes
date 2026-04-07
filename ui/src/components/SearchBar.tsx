@@ -13,6 +13,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const search = useSearchStore((s) => s.search);
   const searching = useSearchStore((s) => s.searching);
   const setHasQuery = useSearchStore((s) => s.setHasQuery);
+  const clearResults = useSearchStore((s) => s.clearResults);
 
   const directory = useSettingsStore((s) => s.directory);
   const respectGitignore = useSettingsStore((s) => s.respectGitignore);
@@ -100,7 +101,11 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
 
   // Re-trigger when externally-driven settings change (directory, excluded)
   useEffect(() => {
-    if (pattern.trim()) triggerSearch(pattern);
+    if (!directory) {
+      clearResults();
+    } else if (pattern.trim()) {
+      triggerSearch(pattern);
+    }
   }, [directory, excluded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-retry search once the index finishes building

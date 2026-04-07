@@ -81,6 +81,19 @@ describe("useSearchStore", () => {
     expect(state.lastQuery).toEqual(mockQuery);
   });
 
+  it("should clear stale results when new search returns no results", async () => {
+    useSearchStore.setState({ results: [{ path: "/old.ts", file_type: "PlainText", matches: [] }] });
+
+    (api.search as any).mockImplementation((_q: any, _onResult: any, onDone: any) => {
+      onDone({ files_scanned: 5, total_matches: 0, elapsed_ms: 10, errors: [] });
+      return Promise.resolve("search-id-456");
+    });
+
+    await useSearchStore.getState().search({ pattern: "nomatch" } as any);
+
+    expect(useSearchStore.getState().results).toEqual([]);
+  });
+
   it("should handle search errors", async () => {
     (api.search as any).mockRejectedValue(new Error("Network Error"));
 
@@ -139,6 +152,23 @@ describe("useSearchStore", () => {
 
     await useSearchStore.getState().replaySearch();
     expect(searchMock).toHaveBeenCalledWith(mockQuery);
+  });
+
+  it("should clear results", () => {
+    useSearchStore.setState({
+      results: [{ path: "/f.ts", file_type: "PlainText", matches: [] }],
+      stats: { files_scanned: 1, total_matches: 1, elapsed_ms: 10, errors: [] },
+      selectedMatch: { path: "/f.ts", origin: { TextFile: { line: 1, col: 1 } } } as any,
+      previewData: { Text: { content: "", language: "text", highlight_line: 1, highlight_range: { start: 0, end: 0 } } },
+    });
+
+    useSearchStore.getState().clearResults();
+
+    const state = useSearchStore.getState();
+    expect(state.results).toEqual([]);
+    expect(state.stats).toBeNull();
+    expect(state.selectedMatch).toBeNull();
+    expect(state.previewData).toBeNull();
   });
 
   it("should handle search cancellation by user", async () => {

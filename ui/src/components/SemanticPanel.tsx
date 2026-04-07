@@ -270,6 +270,7 @@ interface Props {
 export default function SemanticPanel({ api, directory, refreshSemanticReady }: Props) {
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
   const [modelFilter, setModelFilter] = useState("");
+  const [pendingModel, setPendingModel] = useState<string | null>(null);
   const [sizeFetchingFor, setSizeFetchingFor] = useState<string | null>(null);
   const [customModelInput, setCustomModelInput] = useState("");
   const [isAddingCustom, setIsAddingCustom] = useState(false);
@@ -278,8 +279,9 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   // Bumped to re-trigger model + index fetches after async ops (download, build, etc.)
   const [fetchEpoch, setFetchEpoch] = useState(0);
 
-  const phase = derivePhase(state);
   const { settings, indexStatus, isEngineAvailable, backendModels, supportedEngines } = state;
+  const effectiveModel = pendingModel ?? settings?.model;
+  const phase = derivePhase({ ...state, settings: state.settings ? { ...state.settings, model: effectiveModel ?? state.settings.model } : null });
   const isActive = phase === "downloading" || phase === "building";
 
   const invalidate = useCallback(() => setFetchEpoch((e) => e + 1), []);
@@ -458,6 +460,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   const handleEngineChange = async (engine: EmbeddingEngine) => {
     if (!settings) return;
     setModelFilter("");
+    setPendingModel(null);
     const next = { ...settings, engine, enabled: false, index_path: null };
     // Optimistic local update — triggers model + index effects via settings.engine change
     dispatch({ type: "settings_updated", settings: next });
@@ -467,14 +470,9 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   const handleModelChange = useCallback(
     async (modelId: EmbedderModel) => {
       if (!settings) return;
-      const next = { ...settings, model: modelId };
-      // Optimistic local update — triggers index status effect via settings.model change
-      dispatch({ type: "settings_updated", settings: next });
+      setPendingModel(modelId);
 
       const descriptor = backendModels.find((m) => m.model_id === modelId);
-      const updatePatch: Partial<SemanticSettings> = { ...next, enabled: descriptor?.is_cached ?? false };
-      await api.updateSettings({ semantic: updatePatch as SemanticSettings });
-
       if (descriptor && !descriptor.is_cached && descriptor.size_bytes === null) {
         setSizeFetchingFor(modelId);
         try {
@@ -494,23 +492,37 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     dispatch({ type: "clear_error" });
     if (!settings) return;
 
-    if (phase === "not_downloaded") {
-      api.downloadModel(settings.model, settings.engine).catch((e) => console.error("downloadModel failed:", e));
-    } else if (phase === "downloading" || phase === "building") {
+    if (phase === "downloading" || phase === "building") {
       dispatch({ type: "cancel_started" });
       api.cancelEmbed().catch((e) => {
         dispatch({ type: "cancel_failed" });
         console.error("cancelEmbed failed:", e);
       });
+      return;
+    }
+
+    // Persist pending model selection before acting.
+    let effectiveSettings = settings;
+    if (pendingModel && pendingModel !== settings.model) {
+      const descriptor = backendModels.find((m) => m.model_id === pendingModel);
+      const next = { ...settings, model: pendingModel, enabled: descriptor?.is_cached ?? false };
+      dispatch({ type: "settings_updated", settings: next });
+      await api.updateSettings({ semantic: next });
+      effectiveSettings = next;
+      setPendingModel(null);
+    }
+
+    if (phase === "not_downloaded") {
+      api.downloadModel(effectiveSettings.model, effectiveSettings.engine).catch((e) => console.error("downloadModel failed:", e));
     } else if (phase === "ready" || phase === "engine_mismatch") {
-      api.buildIndex(directory, settings.model, settings.engine).catch((e) => console.error("buildIndex failed:", e));
+      api.buildIndex(directory, effectiveSettings.model, effectiveSettings.engine).catch((e) => console.error("buildIndex failed:", e));
     } else if (phase === "indexed") {
       api.deleteIndex().then(() => {
         dispatch({ type: "index_deleted" });
         refreshSemanticReady();
       }).catch((e) => console.error("deleteIndex failed:", e));
     }
-  }, [phase, settings, api, directory, refreshSemanticReady]);
+  }, [phase, pendingModel, settings, backendModels, api, directory, refreshSemanticReady]);
 
   const handleAddCustomModel = async () => {
     if (!settings || !customModelInput.trim()) return;
@@ -542,6 +554,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     dispatch({ type: "clear_error" });
     setCustomModelInput("");
     setIsAddingCustom(false);
+    setPendingModel(null);
 
     await api.updateSettings({ semantic: next });
     invalidate();
@@ -660,7 +673,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
             models={mergedModels}
             engine={settings.engine}
             filter={modelFilter}
-            selectedModelId={settings.model}
+            selectedModelId={effectiveModel}
             activeModelId={indexStatus?.model_id}
             sizeFetchingFor={sizeFetchingFor}
             disabled={isActive || !isEngineAvailable}

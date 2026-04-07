@@ -190,6 +190,14 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_non_existent() {
+        let dir = tempdir().unwrap();
+        let idx = SemanticIndex::create(dir.path(), "m", 3, EmbeddingEngine::Candle, None).unwrap();
+        fs::remove_file(dir.path().join("semantic_index.db")).unwrap();
+        assert!(idx.delete(dir.path()).is_ok());
+    }
+
+    #[test]
     fn test_open_legacy_schema() {
         let dir = tempdir().unwrap();
         let path = db_path(dir.path());
@@ -261,6 +269,114 @@ mod tests {
             Err(e) => assert!(e.to_string().contains("schema version 2 is not supported")),
             Ok(_) => panic!("Expected schema version error"),
         }
+    }
+
+    #[test]
+    fn test_to_rel_abs_path() {
+        let root = Path::new("/search/root");
+        let index = SemanticIndex {
+            conn: Connection::open_in_memory().unwrap(),
+            model_id: "m".to_string(),
+            dimension: 1,
+            root_path: Some(root.to_path_buf()),
+        };
+
+        let abs = root.join("subdir/file.txt");
+        let rel = index.to_rel_path(&abs);
+        assert_eq!(rel, Path::new("subdir/file.txt"));
+
+        let abs2 = index.to_abs_path("subdir/file.txt");
+        assert_eq!(abs2, abs);
+        
+        // Path outside root
+        let outside = Path::new("/other/file.txt");
+        let rel_outside = index.to_rel_path(outside);
+        assert_eq!(rel_outside, outside);
+    }
+
+    #[test]
+    fn test_write_file_pdf_origin() {
+        let dir = tempdir().unwrap();
+        let mut idx = SemanticIndex::create(dir.path(), "m", 1, EmbeddingEngine::Candle, None).unwrap();
+        
+        let path = PathBuf::from("test.pdf");
+        let prepared = PreparedFile {
+            path: path.clone(),
+            chunks: vec![
+                (
+                    Chunk {
+                        file_path: path.clone(),
+                        text: "page content".to_string(),
+                        byte_range: ByteRange { start: 0, end: 12 },
+                        origin: SourceOrigin::PdfPage { 
+                            page: 5, 
+                            bbox: Some(BoundingBox { x: 1.0, y: 2.0, width: 3.0, height: 4.0 })
+                        },
+                    },
+                    vec![1.0],
+                ),
+            ],
+        };
+
+        idx.write_file(prepared).unwrap();
+        
+        let results = idx.query(&[1.0], 1).unwrap();
+        assert_eq!(results.len(), 1);
+        match &results[0].origin {
+            SourceOrigin::PdfPage { page, bbox } => {
+                assert_eq!(*page, 5);
+                let b = bbox.as_ref().unwrap();
+                assert_eq!(b.x, 1.0);
+                assert_eq!(b.y, 2.0);
+            }
+            _ => panic!("Expected PdfPage origin"),
+        }
+    }
+
+    #[test]
+    fn test_build_full() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("test.txt"), "build test content").unwrap();
+
+        let data_dir = dir.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+
+        let registry = ExtractorRegistry::new();
+        struct MockEmbedder;
+        impl Embedder for MockEmbedder {
+            fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![vec![1.0]]) }
+            fn model_id(&self) -> &str { "mock" }
+            fn dimension(&self) -> usize { 1 }
+            fn engine(&self) -> EmbeddingEngine { EmbeddingEngine::Candle }
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let indexing = IndexingConfig {
+            chunk_size: 100,
+            chunk_overlap: 0,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let idx = SemanticIndex::build(
+            &data_dir,
+            &root,
+            &[root.join("test.txt")],
+            &registry,
+            &MockEmbedder,
+            tx,
+            &indexing,
+        ).unwrap();
+
+        assert_eq!(idx.status().total_chunks, 1);
+        
+        // Check progress messages
+        let mut progress_count = 0;
+        while let Ok(_p) = rx.try_recv() {
+            progress_count += 1;
+        }
+        assert!(progress_count >= 2);
     }
 }
 
@@ -406,10 +522,11 @@ impl SemanticIndex {
             std::fs::remove_file(path)?;
         }
 
-        // Remove orphaned WAL/SHM files if any.
-        let data_dir = path.parent().unwrap_or(Path::new("."));
-        let _ = std::fs::remove_file(data_dir.join("semantic_index.db-wal"));
-        let _ = std::fs::remove_file(data_dir.join("semantic_index.db-shm"));
+        // Remove orphaned WAL/SHM files for this specific path.
+        let mut wal = path.as_os_str().to_owned(); wal.push("-wal");
+        let mut shm = path.as_os_str().to_owned(); shm.push("-shm");
+        let _ = std::fs::remove_file(wal);
+        let _ = std::fs::remove_file(shm);
 
         let conn = Connection::open(path)
             .with_context(|| format!("Failed to create index at {}", path.display()))?;
@@ -428,7 +545,7 @@ impl SemanticIndex {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('built_at', ?1)",
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('built_at', ?1)",
             params![built_at.to_string()],
         )?;
 

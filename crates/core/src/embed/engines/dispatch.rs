@@ -84,3 +84,60 @@ pub fn fetch_model_size(engine: EmbeddingEngine, _model_id: &str) -> anyhow::Res
         EmbeddingEngine::Fastembed => anyhow::bail!("Fastembed feature is disabled"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use crate::embed::worker::manager::{WorkerManager, WorkerPaths};
+
+    #[test]
+    fn test_list_models_dispatch() {
+        let dir = tempdir().unwrap();
+        let sbert_models = list_models(EmbeddingEngine::SBERT, dir.path());
+        assert!(!sbert_models.is_empty());
+
+        #[cfg(feature = "candle")]
+        {
+            let candle_models = list_models(EmbeddingEngine::Candle, dir.path());
+            assert!(!candle_models.is_empty());
+        }
+
+        #[cfg(feature = "fastembed")]
+        {
+            let fastembed_models = list_models(EmbeddingEngine::Fastembed, dir.path());
+            assert!(!fastembed_models.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_get_installer_dispatch() {
+        let dir = tempdir().unwrap();
+        let (manager, _, _) = WorkerManager::new(WorkerPaths::resolve(dir.path()));
+        
+        let installer = get_installer(EmbeddingEngine::SBERT, EmbedderModel("intfloat/e5-small-v2".to_string()), manager.clone(), "cpu".to_string());
+        assert!(installer.is_available(dir.path()));
+
+        #[cfg(feature = "candle")]
+        {
+            let installer = get_installer(EmbeddingEngine::Candle, EmbedderModel("m".to_string()), manager.clone(), "cpu".to_string());
+            assert!(!installer.is_available(dir.path()));
+        }
+    }
+
+    #[test]
+    fn test_load_embedder_local_dispatch() {
+        let dir = tempdir().unwrap();
+        let res = load_embedder_local(EmbeddingEngine::SBERT, &EmbedderModel("m".to_string()), dir.path(), "cpu");
+        match res {
+            Err(e) => assert_eq!(e.to_string(), "SBERT has no local embedder; it always runs in the Python worker"),
+            _ => panic!("Expected error"),
+        }
+    }
+
+    #[test]
+    fn test_fetch_model_size_dispatch() {
+        // Just verify it doesn't panic and reaches the SBERT branch
+        let _ = fetch_model_size(EmbeddingEngine::SBERT, "invalid/model");
+    }
+}

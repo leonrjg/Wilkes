@@ -95,11 +95,20 @@ describe("SemanticPanel", () => {
       render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
     });
 
+    // Clicking a model only sets the pending selection — no API call yet.
     const newModelBtn = screen.getByText("New Model");
     await act(async () => {
       fireEvent.click(newModelBtn);
     });
+    expect(mockApi.updateSettings).not.toHaveBeenCalledWith(expect.objectContaining({
+      semantic: expect.objectContaining({ model: "new-id" })
+    }));
 
+    // Pressing the action button saves the pending model.
+    const actionBtn = screen.getByRole("button", { name: /build semantic index/i });
+    await act(async () => {
+      fireEvent.click(actionBtn);
+    });
     expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({
       semantic: expect.objectContaining({ model: "new-id" })
     }));
@@ -191,6 +200,87 @@ describe("SemanticPanel", () => {
       errorHandler({ message: "Something went wrong", operation: "Build" });
     });
 
-    expect(screen.getByText("Something went wrong")).toBeInTheDocument();
+    expect(await screen.findByText("Something went wrong")).toBeInTheDocument();
+  });
+
+  it("toggles advanced settings and handles device change", async () => {
+    await act(async () => {
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+    });
+
+    const advancedBtn = screen.getByText(/Advanced/i);
+    await act(async () => {
+      fireEvent.click(advancedBtn);
+    });
+
+    const checkbox = screen.getByLabelText(/Disable hardware acceleration/i);
+    expect(checkbox).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(checkbox);
+    });
+
+    expect(mockApi.updateSettings).toHaveBeenCalled();
+  });
+
+  it("handles adding a custom model", async () => {
+    await act(async () => {
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+    });
+
+    const addCustomBtn = screen.getByText(/Add Custom/i);
+    await act(async () => {
+      fireEvent.click(addCustomBtn);
+    });
+
+    const input = screen.getByPlaceholderText(/e.g. org\/repo-name/i);
+    await act(async () => {
+      fireEvent.change(input, { target: { value: "org/custom-model" } });
+      fireEvent.click(screen.getByText(/^Add$/));
+    });
+
+    expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({
+      semantic: expect.objectContaining({
+        custom_models: expect.arrayContaining([{ engine: "Candle", model_id: "org/custom-model" }])
+      })
+    }));
+  });
+
+  it("filters models by search text", async () => {
+    mockApi.listModels.mockResolvedValue([
+      { model_id: "model-a", display_name: "Apple", is_cached: true, description: "" },
+      { model_id: "model-b", display_name: "Banana", is_cached: true, description: "" },
+    ]);
+
+    await act(async () => {
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+    });
+
+    const searchInput = screen.getByPlaceholderText(/Search models…/i);
+    await act(async () => {
+      fireEvent.change(searchInput, { target: { value: "apple" } });
+    });
+
+    expect(screen.getByText("Apple")).toBeInTheDocument();
+    expect(screen.queryByText("Banana")).not.toBeInTheDocument();
+  });
+
+  it("displays index stats when indexed", async () => {
+    mockApi.getIndexStatus.mockResolvedValue({
+      engine: "Candle",
+      model_id: "initial-id",
+      indexed_files: 100,
+      total_chunks: 500,
+      built_at: Math.floor(Date.now() / 1000),
+      build_duration_ms: 5000,
+    });
+
+    await act(async () => {
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+    });
+
+    expect(screen.getByText("100")).toBeInTheDocument();
+    expect(screen.getByText("500")).toBeInTheDocument();
+    expect(screen.getByText(/Delete Index/i)).toBeInTheDocument();
   });
 });

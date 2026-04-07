@@ -145,6 +145,46 @@ mod tests {
         let status = manager.status();
         assert_eq!(status.active, false);
         assert_eq!(status.timeout_secs, 300);
+        assert!(!status.active);
+    }
+
+    #[tokio::test]
+    async fn test_worker_manager_lifecycle_no_process() {
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("r"),
+            venv_dir: PathBuf::from("v"),
+            worker_bin: PathBuf::from("w"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let _loop_handle = tokio::spawn(loop_fut);
+        
+        manager.kill_active();
+    }
+
+    #[tokio::test]
+    async fn test_worker_manager_commands() {
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("r"),
+            venv_dir: PathBuf::from("v"),
+            worker_bin: PathBuf::from("w"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let _loop_handle = tokio::spawn(loop_fut);
+        
+        manager.send(ManagerCommand::SetTimeout(100)).await.unwrap();
+        manager.send(ManagerCommand::KillWorker).await.unwrap();
+        
+        // Wait a bit for the loop to process
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        let status = manager.status();
+        assert_eq!(status.timeout_secs, 100);
     }
 }
 
@@ -153,10 +193,15 @@ struct ActiveProcess {
     stdout: BufReader<tokio::process::ChildStdout>,
 }
 
-/// Kill the child, wait for it to exit, and clear the shared PID slot.
+/// Shut down the child process and clear the shared PID slot.
+/// Closes stdin first so the worker can exit cleanly via its natural EOF condition,
+/// then falls back to SIGKILL if it hasn't exited within the grace period.
 async fn kill_and_reap(proc: &mut ActiveProcess, pid_slot: &AtomicU32) {
-    let _ = proc.child.kill().await;
-    let _ = proc.child.wait().await;
+    drop(proc.child.stdin.take());
+    if timeout(Duration::from_secs(2), proc.child.wait()).await.is_err() {
+        let _ = proc.child.kill().await;
+        let _ = proc.child.wait().await;
+    }
     pid_slot.store(0, Ordering::Relaxed);
 }
 
@@ -390,9 +435,7 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
                 tracing::info!("WorkerManager: sending request: {:?}", serde_json::to_string(&log_req).unwrap_or_default());
 
                 let needs_restart = active_process.is_none()
-                    || active_engine != Some(req.engine)
-                    || active_model != Some(req.model.clone())
-                    || active_device != Some(req.device.clone());
+                    || active_engine != Some(req.engine);
 
                 if needs_restart {
                     if let Some(mut proc) = active_process.take() {
@@ -469,6 +512,23 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
                             let _ = reply.send(WorkerEvent::Error(format!("Failed to spawn worker: {e}"))).await;
                             continue;
                         }
+                    }
+                }
+
+                // Same engine: the worker process can handle model/device changes in-process.
+                // Update tracking so the next restart check reflects the current configuration.
+                if !needs_restart
+                    && (active_model.as_deref() != Some(req.model.as_str())
+                        || active_device.as_deref() != Some(req.device.as_str()))
+                {
+                    tracing::info!(
+                        "WorkerManager: hot-swapping model (model: {:?} -> {:?}, device: {:?} -> {:?})",
+                        active_model, req.model, active_device, req.device
+                    );
+                    active_model = Some(req.model.clone());
+                    active_device = Some(req.device.clone());
+                    if let Some(engine) = active_engine {
+                        set_status!(active: engine, req.model);
                     }
                 }
 

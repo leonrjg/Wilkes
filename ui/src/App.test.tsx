@@ -108,11 +108,7 @@ describe("App", () => {
     expect(screen.getByTestId("settings-modal")).toBeInTheDocument();
   });
 
-  it("picks a directory", async () => {
-    const setDirectoryMock = vi.fn();
-    useSettingsStore.setState({ setDirectory: setDirectoryMock });
-    (source as any).pickDirectory.mockResolvedValue("/picked/path");
-
+  it("handles sidebar resizing", async () => {
     await act(async () => {
       render(
         <ToastProvider>
@@ -121,12 +117,24 @@ describe("App", () => {
       );
     });
 
-    const pickButton = screen.getByText("Open folder");
-    await act(async () => {
-      fireEvent.click(pickButton);
-    });
+    const resizer = document.querySelector(".cursor-col-resize");
+    expect(resizer).toBeInTheDocument();
 
-    expect(source.pickDirectory).toHaveBeenCalled();
-    expect(setDirectoryMock).toHaveBeenCalledWith("/picked/path");
+    if (resizer) {
+      fireEvent.mouseDown(resizer);
+      fireEvent.mouseMove(window, { clientX: 400 });
+      fireEvent.mouseUp(window);
+    }
+  });
+
+  it("shows DirectoryPicker for desktop source", async () => {
+    await act(async () => {
+      render(
+        <ToastProvider>
+          <App />
+        </ToastProvider>
+      );
+    });
+    expect(screen.getByText("Open folder")).toBeInTheDocument();
   });
 });

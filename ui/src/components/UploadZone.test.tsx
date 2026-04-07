@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import UploadZone from "./UploadZone";
+import { useSettingsStore } from "../stores/useSettingsStore";
 
 describe("UploadZone", () => {
   const mockSource = {
@@ -9,14 +10,8 @@ describe("UploadZone", () => {
     type: "web",
   } as any;
 
-  const mockApi = {
-    listFiles: vi.fn(),
-  } as any;
-
   const defaultProps = {
     source: mockSource,
-    api: mockApi,
-    root: "",
     onRootChange: vi.fn(),
   };
 
@@ -24,7 +19,7 @@ describe("UploadZone", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mockApi.listFiles.mockResolvedValue([]);
+    useSettingsStore.setState({ fileList: [], refreshFileList: vi.fn() } as any);
     // Mock XMLHttpRequest
     xhrMock = {
       open: vi.fn(),
@@ -61,7 +56,7 @@ describe("UploadZone", () => {
     const fileInputReal = inputs[0];
 
     const file = new File(["test"], "test.txt", { type: "text/plain" });
-    
+
     // Capture the load event listener
     let loadListener: Function | undefined;
     xhrMock.addEventListener.mockImplementation((event: string, listener: Function) => {
@@ -81,7 +76,6 @@ describe("UploadZone", () => {
     });
 
     expect(defaultProps.onRootChange).toHaveBeenCalledWith("/new/root");
-    expect(mockApi.listFiles).toHaveBeenCalledWith("/new/root");
   });
 
   it("handles upload progress", async () => {
@@ -157,41 +151,33 @@ describe("UploadZone", () => {
   });
 
   it("calls deleteAll when Clear all is clicked", async () => {
-    mockApi.listFiles.mockResolvedValue([{ path: "test.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" }]);
-    
-    const { rerender } = render(<UploadZone {...defaultProps} root="/some/root" />);
-    
-    // Wait for listFiles to resolve
-    await act(async () => {
-      await Promise.resolve();
-    });
-    
-    rerender(<UploadZone {...defaultProps} root="/some/root" />);
+    useSettingsStore.setState({
+      fileList: [{ path: "test.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" }],
+      refreshFileList: vi.fn(),
+    } as any);
+    mockSource.deleteAll.mockResolvedValue(undefined);
+
+    render(<UploadZone {...defaultProps} root="/some/root" />);
 
     const clearAll = screen.getByText("Clear all");
-    fireEvent.click(clearAll);
+    await act(async () => { fireEvent.click(clearAll); });
 
     expect(mockSource.deleteAll).toHaveBeenCalled();
+    expect(useSettingsStore.getState().refreshFileList).toHaveBeenCalled();
   });
 
   it("calls deleteFile when remove button is clicked", async () => {
     const file = { path: "test.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" };
-    mockApi.listFiles.mockResolvedValue([file]);
-    
-    const { rerender } = render(<UploadZone {...defaultProps} root="/some/root" />);
-    
-    await act(async () => {
-      await Promise.resolve();
-    });
-    
-    rerender(<UploadZone {...defaultProps} root="/some/root" />);
+    useSettingsStore.setState({ fileList: [file], refreshFileList: vi.fn() } as any);
+    mockSource.deleteFile.mockResolvedValue(undefined);
+
+    render(<UploadZone {...defaultProps} root="/some/root" />);
 
     const removeBtn = screen.getByTitle("Remove file");
-    await act(async () => {
-      fireEvent.click(removeBtn);
-    });
+    await act(async () => { fireEvent.click(removeBtn); });
 
     expect(mockSource.deleteFile).toHaveBeenCalledWith("test.txt");
+    expect(useSettingsStore.getState().refreshFileList).toHaveBeenCalled();
   });
 
   it("handles folder selection", async () => {

@@ -101,9 +101,74 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_st_config_unrecognized_key() {
+        let content = r#"{
+            "prompts": {
+                "unknown": "value"
+            }
+        }"#;
+        let mut config = EmbedderConfig::default();
+        parse_st_config(content, &mut config);
+        assert!(config.query_prefix.is_empty());
+    }
+
+    #[test]
     fn test_fetch_aux_configs_invalid_path() {
         // Should not panic, just log debug
         fetch_aux_configs(Path::new("/non/existent/path/12345"), "test/model");
+    }
+
+    #[test]
+    fn test_parse_st_config_invalid_json() {
+        let mut config = EmbedderConfig::default();
+        parse_st_config("invalid json", &mut config);
+        assert!(config.query_prefix.is_empty());
+    }
+
+    #[test]
+    fn test_parse_st_config_no_prompts() {
+        let mut config = EmbedderConfig::default();
+        parse_st_config("{}", &mut config);
+        assert!(config.query_prefix.is_empty());
+    }
+
+    #[test]
+    fn test_load_prefixes_non_existent() {
+        let dir = tempdir().unwrap();
+        let config = load_prefixes(dir.path(), "non/existent");
+        assert!(config.query_prefix.is_empty());
+    }
+
+    #[test]
+    fn test_load_prefixes_with_file() {
+        let dir = tempdir().unwrap();
+        let model_id = "test/model";
+        
+        // Let's just test that it returns default config when files are missing.
+        let config = load_prefixes(dir.path(), model_id);
+        assert!(config.query_prefix.is_empty());
+    }
+
+    #[test]
+    fn test_load_prefixes_read_error() {
+        let dir = tempdir().unwrap();
+        let model_id = "test/model";
+        
+        // Create a directory where a file should be to cause a read error
+        let folder = format!("models--{}", model_id.replace('/', "--"));
+        let snapshots = dir.path().join(folder).join("snapshots").join("main");
+        fs::create_dir_all(&snapshots).unwrap();
+        
+        // Mock Repo::get by setting the refs
+        let refs = dir.path().join(format!("models--{}", model_id.replace('/', "--"))).join("refs");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("main"), "main").unwrap();
+
+        // Create a directory with the name of the file to trigger read_to_string error
+        fs::create_dir(snapshots.join("config_sentence_transformers.json")).unwrap();
+
+        let config = load_prefixes(dir.path(), model_id);
+        assert!(config.query_prefix.is_empty());
     }
 }
 

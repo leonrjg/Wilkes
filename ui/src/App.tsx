@@ -24,6 +24,7 @@ export default function App() {
   const setDirectory = useSettingsStore((s) => s.setDirectory);
   const addBookmark = useSettingsStore((s) => s.addBookmark);
   const removeBookmark = useSettingsStore((s) => s.removeBookmark);
+  const forgetDirectory = useSettingsStore((s) => s.forgetDirectory);
   const refreshSemanticReady = useSettingsStore((s) => s.refreshSemanticReady);
   const applySettingsPatch = useSettingsStore((s) => s.applySettingsPatch);
   const setIndexing = useSettingsStore((s) => s.setIndexing);
@@ -127,12 +128,11 @@ export default function App() {
         onPickDirectory={handlePickDirectory}
         onBookmarkAdd={addBookmark}
         onBookmarkRemove={removeBookmark}
+        onForgetDirectory={forgetDirectory}
       />
     ) : (
       <UploadZone
         source={source as WebSourceApi}
-        api={api}
-        root={directory}
         onRootChange={setDirectory}
       />
     );

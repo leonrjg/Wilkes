@@ -150,6 +150,7 @@ export interface Settings {
   search_prefer_semantic: boolean;
   semantic: SemanticSettings;
   supported_extensions: string[];
+  is_demo?: boolean;
 }
 
 export type Theme = "System" | "Light" | "Dark";

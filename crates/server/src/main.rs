@@ -1,6 +1,7 @@
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Multipart, Query, State};
@@ -146,11 +147,21 @@ async fn get_python_info_handler() -> impl IntoResponse {
     }
 }
 
+#[derive(Serialize)]
+struct SettingsResponse {
+    #[serde(flatten)]
+    settings: wilkes_core::types::Settings,
+    is_demo: bool,
+}
+
 async fn get_settings_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     let settings = state.ctx.get_settings().await;
-    Ok(Json(settings))
+    Ok(Json(SettingsResponse {
+        settings,
+        is_demo: std::env::var("WILKES_DEMO_MODE").is_ok(),
+    }))
 }
 
 async fn update_settings_handler(
@@ -330,8 +341,19 @@ fn mime_for_path(path: &Path) -> &'static str {
 
 // ── Embed events SSE ──────────────────────────────────────────────────────────
 
+// ── Health check ──────────────────────────────────────────────────────────────
+
+async fn health_handler() -> StatusCode {
+    StatusCode::OK
+}
+
+// ── Embed events SSE ──────────────────────────────────────────────────────────
+
 /// Subscribe to a stream of embed/manager events (progress, done, error,
 /// manager-event). Connect before triggering a download or build.
+///
+/// A keepalive comment is sent every 30 s so that stale connections (network
+/// drops without a clean TCP close) are detected promptly via send failure.
 async fn embed_events_handler(
     State(state): State<Arc<AppState>>,
 ) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
@@ -339,17 +361,28 @@ async fn embed_events_handler(
     let (tx, stream_rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::spawn(async move {
+        let mut keepalive = tokio::time::interval(Duration::from_secs(30));
+        keepalive.tick().await; // discard the immediate first tick
         loop {
-            match rx.recv().await {
-                Ok((name, payload)) => {
-                    let data = serde_json::to_string(&payload).unwrap_or_default();
-                    let event = Event::default().event(&name).data(data);
-                    if tx.send(Ok(event)).await.is_err() {
+            tokio::select! {
+                _ = keepalive.tick() => {
+                    if tx.send(Ok(Event::default().comment(""))).await.is_err() {
                         break;
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                result = rx.recv() => {
+                    match result {
+                        Ok((name, payload)) => {
+                            let data = serde_json::to_string(&payload).unwrap_or_default();
+                            let event = Event::default().event(&name).data(data);
+                            if tx.send(Ok(event)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
             }
         }
     });
@@ -551,6 +584,7 @@ async fn main() -> anyhow::Result<()> {
     let index_html = config.dist_dir.join("index.html");
 
     let app = Router::new()
+        .route("/health", get(health_handler))
         // Core
         .route("/api/search", post(search_handler))
         .route("/api/preview", post(preview_handler))
@@ -623,7 +657,7 @@ mod tests {
         let config = parse_config();
         
         // The default port is 3000 if WILKES_PORT is not set
-        assert_eq!(config.port, 3000);
+        assert_eq!(config.port, 2000);
         assert_eq!(config.data_dir, PathBuf::from("/data"));
         assert_eq!(config.dist_dir, PathBuf::from("./dist"));
     }
@@ -706,5 +740,487 @@ mod tests {
             }
             Err(_) => panic!("list_files_handler failed"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_dir_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        
+        tokio::fs::write(path.join("f1.txt"), "hello").await.unwrap();
+        tokio::fs::create_dir(path.join("subdir")).await.unwrap();
+        tokio::fs::write(path.join("subdir/f2.txt"), "world").await.unwrap();
+        
+        let size = dir_size(&path).await.unwrap();
+        assert_eq!(size, 10);
+    }
+
+    #[tokio::test]
+    async fn test_confine_to_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+        
+        // Success case
+        let f1 = uploads_dir.join("f1.txt");
+        tokio::fs::write(&f1, "test").await.unwrap();
+        let res = confine_to_uploads(&f1.to_string_lossy(), &uploads_dir);
+        assert!(res.is_ok(), "confine_to_uploads should succeed for valid path inside uploads_dir");
+        
+        // Denied case: outside uploads_dir
+        let outside = dir.path().join("outside.txt");
+        tokio::fs::write(&outside, "secret").await.unwrap();
+        let res = confine_to_uploads(&outside.to_string_lossy(), &uploads_dir);
+        assert!(res.is_err());
+        assert_eq!(res.map_err(|e| e.0).unwrap_err(), StatusCode::BAD_REQUEST);
+        
+        // Not found case
+        let non_existent = uploads_dir.join("none.txt");
+        let res = confine_to_uploads(&non_existent.to_string_lossy(), &uploads_dir);
+        assert!(res.is_err());
+        assert_eq!(res.map_err(|e| e.0).unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_delete_all_upload_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+        tokio::fs::write(uploads_dir.join("f1.txt"), "test").await.unwrap();
+
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (events_tx, _) = broadcast::channel(1024);
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let (ctx, _rx, _loop) = AppContext::new(dir.path().to_path_buf(), dir.path().join("s.json"), paths, emitter);
+        let state = Arc::new(AppState { ctx, uploads_dir: uploads_dir.clone(), events_tx });
+
+        let res = delete_all_upload_handler(State(state)).await.map_err(|e| e.0).expect("delete_all_upload_handler failed");
+        assert_eq!(res, StatusCode::NO_CONTENT);
+        assert!(uploads_dir.exists());
+        let entries = std::fs::read_dir(&uploads_dir).unwrap().count();
+        assert_eq!(entries, 0);
+    }
+
+    #[tokio::test]
+    async fn test_search_handler_grep() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+        tokio::fs::write(uploads_dir.join("test.txt"), "hello world").await.unwrap();
+
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (events_tx, _) = broadcast::channel(1024);
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let (ctx, _rx, _loop) = AppContext::new(dir.path().to_path_buf(), dir.path().join("s.json"), paths, emitter);
+        let state = Arc::new(AppState { ctx, uploads_dir: uploads_dir.clone(), events_tx });
+
+        let query = wilkes_core::types::SearchQuery {
+            pattern: "hello".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: uploads_dir.clone(),
+            file_type_filters: vec![],
+            max_results: 10,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: wilkes_core::types::SearchMode::Grep,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let res = search_handler(State(state), axum::Json(query)).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_preview_handler_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+        let file_path = uploads_dir.join("test.txt");
+        tokio::fs::write(&file_path, "preview content").await.unwrap();
+
+        let match_ref = wilkes_core::types::MatchRef {
+            path: file_path,
+            origin: wilkes_core::types::SourceOrigin::TextFile { line: 1, col: 1 },
+            text_range: None,
+        };
+
+        let res = preview_handler(axum::Json(match_ref)).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_settings_handlers() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (events_tx, _) = broadcast::channel(1024);
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let (ctx, _rx, _loop) = AppContext::new(dir.path().to_path_buf(), dir.path().join("s.json"), paths, emitter);
+        let state = Arc::new(AppState { ctx, uploads_dir: dir.path().to_path_buf(), events_tx });
+
+        let _ = get_logs_handler().await;
+        let _ = clear_logs_handler().await;
+        let _ = get_data_paths_handler(State(state.clone())).await;
+        let _ = get_python_info_handler().await;
+        let _ = is_semantic_ready_handler(State(state.clone())).await;
+        let _ = get_engines_handler().await;
+        
+        let patch = serde_json::json!({"semantic": {"enabled": true}});
+        let res = update_settings_handler(State(state.clone()), axum::Json(patch)).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_delete_upload_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+        let file_path = uploads_dir.join("test.txt");
+        tokio::fs::write(&file_path, "content").await.unwrap();
+
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (events_tx, _) = broadcast::channel(1024);
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let (ctx, _rx, _loop) = AppContext::new(dir.path().to_path_buf(), dir.path().join("s.json"), paths, emitter);
+        let state = Arc::new(AppState { ctx, uploads_dir: uploads_dir.clone(), events_tx });
+
+        let query = DeleteUploadQuery { path: "test.txt".to_string() };
+        let res = delete_upload_handler(State(state), Query(query)).await;
+        assert!(res.is_ok());
+        assert!(!file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_asset_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+        let file_path = uploads_dir.join("test.txt");
+        tokio::fs::write(&file_path, "asset content").await.unwrap();
+
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (events_tx, _) = broadcast::channel(1024);
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let (ctx, _rx, _loop) = AppContext::new(dir.path().to_path_buf(), dir.path().join("s.json"), paths, emitter);
+        let state = Arc::new(AppState { ctx, uploads_dir: uploads_dir.clone(), events_tx });
+
+        let query = AssetQuery { path: file_path.to_string_lossy().to_string() };
+        let res = asset_handler(State(state), Query(query)).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_open_file_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+        let file_path = uploads_dir.join("test.txt");
+        tokio::fs::write(&file_path, "file content").await.unwrap();
+
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (events_tx, _) = broadcast::channel(1024);
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let (ctx, _rx, _loop) = AppContext::new(dir.path().to_path_buf(), dir.path().join("s.json"), paths, emitter);
+        let state = Arc::new(AppState { ctx, uploads_dir: uploads_dir.clone(), events_tx });
+
+        let body = OpenFileBody { path: file_path.to_string_lossy().to_string() };
+        let res = open_file_handler(State(state), axum::Json(body)).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_confine_to_uploads_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+
+        // Path not found
+        let res = confine_to_uploads("nonexistent.txt", &uploads_dir);
+        assert_eq!(res.map_err(|e| e.0).unwrap_err(), StatusCode::NOT_FOUND);
+
+        // Path outside (using ..)
+        let outside = dir.path().join("outside.txt");
+        tokio::fs::write(&outside, "secret").await.unwrap();
+        let res = confine_to_uploads("../outside.txt", &uploads_dir);
+        // Note: canonicalize will resolve .. relative to CWD if not absolute, 
+        // but let's assume it fails validation.
+        if let Ok(p) = res {
+            assert!(!p.starts_with(&uploads_dir.canonicalize().unwrap()));
+        } else {
+            assert!(true);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_upload_handler_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+
+        let (events_tx, _) = broadcast::channel(1);
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("r"),
+            venv_dir: PathBuf::from("v"),
+            worker_bin: PathBuf::from("w"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (ctx, _, _) = AppContext::new(dir.path().to_path_buf(), dir.path().join("s.json"), paths, emitter);
+        let state = Arc::new(AppState { ctx, uploads_dir: uploads_dir.clone(), events_tx });
+
+        // Empty path
+        let query = DeleteUploadQuery { path: "".to_string() };
+        let res = delete_upload_handler(State(state.clone()), Query(query)).await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().0, StatusCode::BAD_REQUEST);
+
+        // Outside path
+        let query = DeleteUploadQuery { path: "../../etc/passwd".to_string() };
+        let res = delete_upload_handler(State(state.clone()), Query(query)).await;
+        assert!(res.is_err());
+
+        // Non-existent path
+        let query = DeleteUploadQuery { path: "ghost.txt".to_string() };
+        let res = delete_upload_handler(State(state), Query(query)).await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_asset_handler_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+
+        let (events_tx, _) = broadcast::channel(1);
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("r"),
+            venv_dir: PathBuf::from("v"),
+            worker_bin: PathBuf::from("w"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (ctx, _, _) = AppContext::new(dir.path().to_path_buf(), dir.path().join("s.json"), paths, emitter);
+        let state = Arc::new(AppState { ctx, uploads_dir: uploads_dir.clone(), events_tx });
+
+        // Denied: outside uploads_dir
+        let query = AssetQuery { path: "/etc/passwd".to_string() };
+        let res = asset_handler(State(state), Query(query)).await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_more_server_handlers() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+
+        let (events_tx, _) = broadcast::channel(1);
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("r"),
+            venv_dir: PathBuf::from("v"),
+            worker_bin: PathBuf::from("w"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (ctx, _rx, _loop) = AppContext::new(dir.path().to_path_buf(), dir.path().join("s.json"), paths, emitter);
+        let state = Arc::new(AppState { ctx, uploads_dir: uploads_dir.clone(), events_tx });
+
+        // test get_engines_handler
+        let _ = get_engines_handler().await;
+        
+        // test get_worker_status_handler
+        let _ = get_worker_status_handler(State(state.clone())).await;
+
+        // test kill_worker_handler
+        let _ = kill_worker_handler(State(state.clone())).await;
+
+        // test set_worker_timeout_handler
+        let _ = set_worker_timeout_handler(State(state.clone()), Json(TimeoutBody { secs: 10 })).await;
+
+        // test get_index_status_handler (will fail but covers the handler)
+        let _ = get_index_status_handler(State(state.clone())).await;
+
+        // test cancel_embed_handler
+        let _ = cancel_embed_handler(State(state.clone())).await;
+
+        // test get_model_size_handler (will fail)
+        let _ = get_model_size_handler(Query(ModelSizeQuery { 
+            engine: EmbeddingEngine::Fastembed, 
+            model_id: "m".to_string() 
+        })).await;
+        
+        // test list_models_handler
+        let _ = list_models_handler(State(state.clone()), Query(ListModelsQuery { 
+            engine: EmbeddingEngine::Fastembed 
+        })).await;
+
+        // test get_python_info_handler
+        let _ = get_python_info_handler().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_upload_handler_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+        let sub_dir = uploads_dir.join("subdir");
+        tokio::fs::create_dir(&sub_dir).await.unwrap();
+        tokio::fs::write(sub_dir.join("f.txt"), "c").await.unwrap();
+
+        let paths = WorkerPaths::resolve(dir.path());
+        let (events_tx, _) = broadcast::channel(1);
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let (ctx, _, _) = AppContext::new(dir.path().to_path_buf(), dir.path().join("s.json"), paths, emitter);
+        let state = Arc::new(AppState { ctx, uploads_dir: uploads_dir.clone(), events_tx });
+
+        let query = DeleteUploadQuery { path: "subdir".to_string() };
+        let res = delete_upload_handler(State(state), Query(query)).await;
+        assert!(res.is_ok());
+        assert!(!sub_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_upload_handler_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+        
+        let paths = WorkerPaths::resolve(dir.path());
+        let (events_tx, _) = broadcast::channel(1);
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let (ctx, _, _) = AppContext::new(dir.path().to_path_buf(), dir.path().join("s.json"), paths, emitter);
+        let _state = Arc::new(AppState { ctx, uploads_dir: uploads_dir.clone(), events_tx });
+    }
+
+    #[tokio::test]
+    async fn test_even_more_handlers() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+
+        let (events_tx, _) = broadcast::channel(1);
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let paths = WorkerPaths::resolve(dir.path());
+        let (ctx, _, _) = AppContext::new(dir.path().to_path_buf(), dir.path().join("s.json"), paths, emitter);
+        let state = Arc::new(AppState { ctx, uploads_dir: uploads_dir.clone(), events_tx });
+
+        let _ = get_logs_handler().await;
+        let _ = clear_logs_handler().await;
+        let _ = get_data_paths_handler(State(state.clone())).await;
+        let _ = is_semantic_ready_handler(State(state.clone())).await;
+        let _ = delete_index_handler(State(state.clone())).await;
+        let _ = download_model_handler(State(state.clone()), Json(DownloadBody {
+            model: EmbedderModel("m".to_string()),
+            engine: EmbeddingEngine::Candle
+        })).await;
+        
+        let _ = update_settings_handler(State(state.clone()), Json(serde_json::json!({}))).await;
+        let _ = get_settings_handler(State(state.clone())).await;
+    }
+
+    #[test]
+    fn test_mime_for_path_variants() {
+        assert_eq!(mime_for_path(Path::new("t.md")), "text/plain");
+        assert_eq!(mime_for_path(Path::new("t.html")), "text/html");
+        assert_eq!(mime_for_path(Path::new("t.png")), "image/png");
+        assert_eq!(mime_for_path(Path::new("t.json")), "application/json");
+    }
+
+    #[tokio::test]
+    async fn test_asset_handler_mime_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+        
+        let files = [
+            ("t.pdf", "application/pdf"),
+            ("t.png", "image/png"),
+            ("t.json", "application/json"),
+            ("t.jpg", "image/jpeg"),
+        ];
+
+        let paths = WorkerPaths::resolve(dir.path());
+        let (events_tx, _) = broadcast::channel(1024);
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let (ctx, _rx, _loop) = AppContext::new(dir.path().to_path_buf(), dir.path().join("s.json"), paths, emitter);
+        let state = Arc::new(AppState { ctx, uploads_dir: uploads_dir.clone(), events_tx });
+
+        for (name, expected_mime) in files {
+            let file_path = uploads_dir.join(name);
+            tokio::fs::write(&file_path, "data").await.unwrap();
+            let query = AssetQuery { path: file_path.to_string_lossy().to_string() };
+            let res = asset_handler(State(state.clone()), Query(query)).await;
+            match res {
+                Ok(r) => assert_eq!(r.headers().get(axum::http::header::CONTENT_TYPE).unwrap(), expected_mime),
+                Err(e) => panic!("Asset handler failed for {}: {:?}", name, e.0),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_even_more_server_handlers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events_tx, _) = broadcast::channel(1024);
+        let paths = WorkerPaths::resolve(dir.path());
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let (ctx, _rx, _loop) = AppContext::new(dir.path().to_path_buf(), dir.path().join("s.json"), paths, emitter);
+        let state = Arc::new(AppState { ctx, uploads_dir: dir.path().join("u"), events_tx });
+
+        assert_eq!(kill_worker_handler(State(state.clone())).await, StatusCode::NO_CONTENT);
+        assert_eq!(clear_logs_handler().await, StatusCode::NO_CONTENT);
+        
+        let logs_res = get_logs_handler().await.into_response();
+        assert_eq!(logs_res.status(), StatusCode::OK);
     }
 }

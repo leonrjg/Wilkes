@@ -245,3 +245,100 @@ impl EmbedderInstaller for SBERTInstaller {
         )))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use std::fs;
+
+    #[test]
+    fn test_list_supported_models() {
+        let dir = tempdir().unwrap();
+        let models = list_supported_models(dir.path());
+        assert!(!models.is_empty());
+        let default_model = models.iter().find(|m| m.is_default).unwrap();
+        assert_eq!(default_model.model_id, "intfloat/e5-small-v2");
+    }
+
+    #[test]
+    fn test_is_sbert_model_cached() {
+        let dir = tempdir().unwrap();
+        let model_id = "org/model";
+        assert!(!is_sbert_model_cached(dir.path(), model_id));
+
+        let folder = format!("models--{}", model_id.replace('/', "--"));
+        let snapshots = dir.path().join(folder).join("snapshots");
+        fs::create_dir_all(&snapshots).unwrap();
+        assert!(!is_sbert_model_cached(dir.path(), model_id));
+
+        fs::create_dir_all(snapshots.join("hash")).unwrap();
+        assert!(is_sbert_model_cached(dir.path(), model_id));
+    }
+
+    #[test]
+    fn test_sbert_installer_new() {
+        let dir = tempdir().unwrap();
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let installer = SBERTInstaller::new(
+            EmbedderModel("m".to_string()),
+            manager,
+            "cpu".to_string()
+        );
+        assert_eq!(installer.model.model_id(), "m");
+        assert_eq!(installer.device, "cpu");
+    }
+
+    #[tokio::test]
+    async fn test_sbert_installer_install_builtin() {
+        let dir = tempdir().unwrap();
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let installer = SBERTInstaller::new(
+            EmbedderModel("intfloat/e5-small-v2".to_string()),
+            manager,
+            "cpu".to_string()
+        );
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+        installer.install(dir.path(), tx).await.unwrap();
+        assert_eq!(*installer.dimension.lock().unwrap(), Some(384));
+    }
+
+    #[test]
+    fn test_sbert_installer_is_available() {
+        let dir = tempdir().unwrap();
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let installer = SBERTInstaller::new(
+            EmbedderModel("m".to_string()),
+            manager,
+            "cpu".to_string()
+        );
+        assert!(!installer.is_available(dir.path()));
+        
+        *installer.dimension.lock().unwrap() = Some(128);
+        assert!(installer.is_available(dir.path()));
+
+        let builtin = SBERTInstaller::new(
+            EmbedderModel("intfloat/e5-small-v2".to_string()),
+            crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path())).0,
+            "cpu".to_string()
+        );
+        assert!(builtin.is_available(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn test_sbert_installer_build() {
+        let dir = tempdir().unwrap();
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let installer = SBERTInstaller::new(
+            EmbedderModel("intfloat/e5-small-v2".to_string()),
+            manager,
+            "cpu".to_string()
+        );
+        
+        // Build should succeed for built-in models
+        let embedder = installer.build(dir.path()).unwrap();
+        assert_eq!(embedder.model_id(), "intfloat/e5-small-v2");
+        assert_eq!(embedder.dimension(), 384);
+        assert_eq!(embedder.engine(), EmbeddingEngine::SBERT);
+    }
+}

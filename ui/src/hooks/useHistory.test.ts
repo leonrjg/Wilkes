@@ -74,4 +74,26 @@ describe("useHistory", () => {
       origin: expect.objectContaining({ TextFile: expect.any(Object) }),
     }));
   });
+
+  it("should use line 0 when opening a file directly so no line is highlighted", () => {
+    const { result } = renderHook(() => useHistory());
+
+    act(() => {
+      result.current.handleFileClick("/test.txt");
+    });
+
+    const call = (useSearchStore.getState().selectMatch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(call.origin).toEqual({ TextFile: { line: 0, col: 0 } });
+  });
+
+  it("should use page 1 and no bbox when opening a PDF directly", () => {
+    const { result } = renderHook(() => useHistory());
+
+    act(() => {
+      result.current.handleFileClick("/doc.pdf");
+    });
+
+    const call = (useSearchStore.getState().selectMatch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(call.origin).toEqual({ PdfPage: { page: 1, bbox: null } });
+  });
 });

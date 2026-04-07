@@ -42,6 +42,34 @@ pub trait Embedder: Send + Sync {
 /// Only one embedder is live at a time because each model occupies significant memory.
 pub type ActiveEmbedder = std::sync::Mutex<Option<Arc<dyn Embedder>>>;
 
+#[cfg(feature = "test-utils")]
+pub struct MockEmbedder {
+    pub dimension: usize,
+    pub model_id: String,
+    pub engine: EmbeddingEngine,
+}
+
+#[cfg(feature = "test-utils")]
+impl Default for MockEmbedder {
+    fn default() -> Self {
+        Self {
+            dimension: 384,
+            model_id: "mock-model".to_string(),
+            engine: EmbeddingEngine::Candle,
+        }
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl Embedder for MockEmbedder {
+    fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(vec![vec![0.0; self.dimension]; texts.len()])
+    }
+    fn model_id(&self) -> &str { &self.model_id }
+    fn dimension(&self) -> usize { self.dimension }
+    fn engine(&self) -> EmbeddingEngine { self.engine }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

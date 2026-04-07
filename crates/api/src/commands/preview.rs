@@ -36,7 +36,11 @@ async fn preview_text(match_ref: &MatchRef) -> anyhow::Result<PreviewData> {
             SourceOrigin::TextFile { line, .. } => *line,
             _ => 1,
         };
-        (line, line_range(&content, line))
+        if line == 0 {
+            (0, ByteRange { start: 0, end: 0 })
+        } else {
+            (line, line_range(&content, line))
+        }
     };
 
     Ok(PreviewData::Text {
@@ -145,6 +149,28 @@ mod tests {
         if let PreviewData::Text { content, highlight_line, .. } = preview {
             assert!(content.contains("line 2"));
             assert_eq!(highlight_line, 2);
+        } else {
+            panic!("Expected Text preview");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preview_text_no_highlight_when_line_zero() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "line 1\nline 2\nline 3").unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let match_ref = MatchRef {
+            path: path.clone(),
+            origin: SourceOrigin::TextFile { line: 0, col: 0 },
+            text_range: None,
+        };
+
+        let preview = preview_text(&match_ref).await.unwrap();
+        if let PreviewData::Text { highlight_line, highlight_range, .. } = preview {
+            assert_eq!(highlight_line, 0, "line 0 should produce no highlight");
+            assert_eq!(highlight_range.start, 0);
+            assert_eq!(highlight_range.end, 0, "range should be empty when no highlight");
         } else {
             panic!("Expected Text preview");
         }

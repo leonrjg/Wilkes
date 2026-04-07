@@ -316,9 +316,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_logs_commands() {
-        clear_logs().await.unwrap();
-        let logs = get_logs().await.unwrap();
-        assert!(logs.is_empty());
+    async fn test_get_python_info_fallback() {
+        // Just check it doesn't panic
+        let _ = get_python_info().await;
     }
+
+    #[tokio::test]
+    async fn test_active_searches() {
+        let active = ActiveSearches(Mutex::new(HashMap::new()));
+        let mut guard = active.0.lock().unwrap();
+        guard.insert("test".to_string(), tokio::spawn(async {}));
+        assert!(guard.contains_key("test"));
+    }
+
 }

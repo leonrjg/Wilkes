@@ -55,9 +55,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   if (!selectedMatch) {
     return (
       <div className="flex flex-col items-center justify-center h-full bg-[var(--bg-app)] text-[var(--text-dim)]">
-        <div className="w-80 h-80 mb-8 opacity-20 transition-all hover:opacity-50">
-          <img src="/logo.transparent.png" alt="Wilkes" className="w-full h-full object-contain" />
-        </div>
+        <img src="/logo.transparent.png" alt="Wilkes" className="max-h-72 w-auto mb-8 opacity-20 transition-all hover:opacity-50 -translate-x-2" />
         <div className="flex flex-col items-center gap-1">
           <span className="text-sm font-medium">Select a file or perform a search</span>
           <span className="text-[11px] opacity-60">Search results and documents will appear here</span>
