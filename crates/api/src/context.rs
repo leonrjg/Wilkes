@@ -9,14 +9,14 @@ use tracing::{error, info};
 use wilkes_core::embed::{dispatch, Embedder};
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::installer::EmbedProgress;
-use wilkes_core::embed::index::watcher::{IndexWatcher, WatcherConfig};
+use wilkes_core::embed::index::watcher::IndexWatcher;
 use wilkes_core::path::is_under;
 use wilkes_core::embed::worker::manager::{ManagerCommand, ManagerEvent, WorkerManager, WorkerPaths, WorkerStatus};
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::types::{
-    EmbedderModel, EmbeddingEngine, FileEntry, IndexStatus, PreviewData, SearchMode, SearchQuery,
-    SemanticSettings, Settings,
+    EmbedderModel, EmbeddingEngine, FileEntry, IndexStatus, IndexingConfig, PreviewData, SearchMode,
+    SearchQuery, SemanticSettings, Settings,
 };
 
 use crate::commands::search::{start_search, SearchHandle};
@@ -281,17 +281,20 @@ impl AppContext {
             let _guard = DoneGuard(Arc::clone(&ctx.events));
 
             let root_path = PathBuf::from(&root);
+            let options = crate::commands::embed::BuildIndexOptions {
+                manager: Some(manager.clone()),
+                device: Some(device.clone()),
+                data_dir: data_dir.clone(),
+                tx: progress_tx,
+                chunk_size,
+                chunk_overlap,
+                supported_extensions: supported_extensions.clone(),
+            };
             let build_fut = crate::commands::embed::build_index(
                 root_path.clone(),
                 engine,
                 model_clone.clone(),
-                manager.clone(),
-                device.clone(),
-                data_dir.clone(),
-                progress_tx,
-                chunk_size,
-                chunk_overlap,
-                supported_extensions.clone(),
+                options,
             );
             tokio::pin!(build_fut);
             let mut progress_rx = progress_rx;
@@ -327,29 +330,19 @@ impl AppContext {
                                         let mut registry = ExtractorRegistry::new();
                                         registry.register(Box::new(PdfExtractor::new()));
 
-                                        let watcher_config = if engine == EmbeddingEngine::SBERT {
-                                            Some(WatcherConfig {
-                                                manager: manager.clone(),
-                                                model_id: model_clone.model_id().to_string(),
-                                                data_dir: data_dir.clone(),
-                                                device: device.clone(),
-                                                supported_extensions: supported_extensions.clone(),
-                                            })
-                                        } else {
-                                            None
-                                        };
-
                                         let ev1 = Arc::clone(&ctx.events);
                                         let ev2 = Arc::clone(&ctx.events);
+                                        let indexing = IndexingConfig {
+                                            chunk_size,
+                                            chunk_overlap,
+                                            supported_extensions: supported_extensions.clone(),
+                                        };
                                         match IndexWatcher::start(
                                             root_path,
                                             index_arc,
                                             Arc::new(registry),
-                                            Some(embedder),
-                                            watcher_config,
-                                            chunk_size,
-                                            chunk_overlap,
-                                            supported_extensions.clone(),
+                                            embedder,
+                                            indexing,
                                             move || ev1.emit("manager-event", serde_json::json!("Reindexing")),
                                             move || ev2.emit("manager-event", serde_json::json!("ReindexingDone")),
                                         ) {
@@ -516,11 +509,8 @@ impl AppContext {
 
     // ── Worker management ─────────────────────────────────────────────────────
 
-    pub async fn get_worker_status(&self) -> anyhow::Result<WorkerStatus> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.worker_manager.send(ManagerCommand::GetStatus(tx)).await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        rx.await.map_err(|e| anyhow::anyhow!("{e}"))
+    pub fn get_worker_status(&self) -> WorkerStatus {
+        self.worker_manager.status()
     }
 
     pub fn kill_worker(&self) {
@@ -548,7 +538,8 @@ impl AppContext {
             move || SemanticIndex::read_status_from_path(&d)
         }).await {
             Ok(Ok(s)) => s,
-            _ => {
+            Ok(Err(e)) => {
+                info!("restore_state: no index DB ({e:#}), nothing to restore");
                 // DB missing or unreadable — clear any stale enabled/index_path so the
                 // UI doesn't think an index exists when none can be loaded.
                 if settings.semantic.enabled || settings.semantic.index_path.is_some() {
@@ -558,6 +549,10 @@ impl AppContext {
                         ..s
                     }).await;
                 }
+                return;
+            }
+            Err(e) => {
+                error!("restore_state: spawn_blocking panicked: {e}");
                 return;
             }
         };
@@ -619,29 +614,19 @@ impl AppContext {
             let mut registry = ExtractorRegistry::new();
             registry.register(Box::new(PdfExtractor::new()));
 
-            let watcher_config = if engine == EmbeddingEngine::SBERT {
-                Some(WatcherConfig {
-                    manager: self.worker_manager.clone(),
-                    model_id: model.model_id().to_string(),
-                    data_dir: self.data_dir.clone(),
-                    device: settings.semantic.device_for(EmbeddingEngine::SBERT).to_string(),
-                    supported_extensions: settings.supported_extensions.clone(),
-                })
-            } else {
-                None
-            };
-
             let ev1 = Arc::clone(&self.events);
             let ev2 = Arc::clone(&self.events);
+            let indexing = IndexingConfig {
+                chunk_size: settings.semantic.chunk_size,
+                chunk_overlap: settings.semantic.chunk_overlap,
+                supported_extensions: settings.supported_extensions.clone(),
+            };
             match IndexWatcher::start(
                 root,
                 index_arc,
                 Arc::new(registry),
-                Some(Arc::clone(&embedder)),
-                watcher_config,
-                settings.semantic.chunk_size,
-                settings.semantic.chunk_overlap,
-                settings.supported_extensions.clone(),
+                Arc::clone(&embedder),
+                indexing,
                 move || ev1.emit("manager-event", serde_json::json!("Reindexing")),
                 move || ev2.emit("manager-event", serde_json::json!("ReindexingDone")),
             ) {
@@ -685,12 +670,13 @@ mod tests {
         let data_dir = dir.path().join("data");
         let settings_path = dir.path().join("settings.json");
         let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
-        let paths = WorkerPaths { 
-            python_path: PathBuf::from("python"), 
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("python"),
             python_package_dir: PathBuf::from("py_pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
             venv_dir: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
         };
 
         let (ctx, _event_rx, _loop_fut) = AppContext::new(
@@ -720,11 +706,12 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths { 
-                python_path: PathBuf::from("p"), 
+                python_path: PathBuf::from("p"),
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
                 venv_dir: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
             },
             emitter.clone(),
         );
@@ -750,24 +737,31 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths { 
-                python_path: PathBuf::from("p"), 
+                python_path: PathBuf::from("p"),
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
                 venv_dir: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
             },
             emitter,
         );
 
+        use wilkes_core::types::{EmbeddingEngine, IndexingConfig};
+        use wilkes_core::embed::Embedder;
+        struct StubEmbedder;
+        impl Embedder for StubEmbedder {
+            fn embed(&self, _: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![]) }
+            fn model_id(&self) -> &str { "stub" }
+            fn dimension(&self) -> usize { 1 }
+            fn engine(&self) -> EmbeddingEngine { EmbeddingEngine::Candle }
+        }
         let watcher = IndexWatcher::start(
             dir.path().to_path_buf(),
             ctx.index.lock().unwrap().clone(),
             Arc::new(ExtractorRegistry::new()),
-            None,
-            None,
-            100,
-            10,
-            vec![],
+            Arc::new(StubEmbedder),
+            IndexingConfig { chunk_size: 100, chunk_overlap: 10, supported_extensions: vec![] },
             || {},
             || {},
         ).unwrap();
@@ -785,11 +779,12 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths { 
-                python_path: PathBuf::from("p"), 
+                python_path: PathBuf::from("p"),
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
                 venv_dir: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
             },
             emitter,
         );
@@ -805,11 +800,12 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths { 
-                python_path: PathBuf::from("p"), 
+                python_path: PathBuf::from("p"),
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
                 venv_dir: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
             },
             emitter,
         );
@@ -826,11 +822,12 @@ mod tests {
             data_dir.clone(),
             dir.path().join("settings.json"),
             WorkerPaths { 
-                python_path: PathBuf::from("p"), 
+                python_path: PathBuf::from("p"),
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
                 venv_dir: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
             },
             emitter,
         );
@@ -848,11 +845,12 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths { 
-                python_path: PathBuf::from("p"), 
+                python_path: PathBuf::from("p"),
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
                 venv_dir: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
             },
             emitter,
         );
@@ -869,11 +867,12 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths { 
-                python_path: PathBuf::from("p"), 
+                python_path: PathBuf::from("p"),
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
                 venv_dir: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
             },
             emitter,
         );
@@ -889,11 +888,12 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths { 
-                python_path: PathBuf::from("p"), 
+                python_path: PathBuf::from("p"),
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
                 venv_dir: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
             },
             emitter,
         );
@@ -911,11 +911,12 @@ mod tests {
             dir.path().to_path_buf(),
             settings_path.clone(),
             WorkerPaths { 
-                python_path: PathBuf::from("p"), 
+                python_path: PathBuf::from("p"),
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
                 venv_dir: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
             },
             emitter,
         );
@@ -951,11 +952,12 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths { 
-                python_path: PathBuf::from("p"), 
+                python_path: PathBuf::from("p"),
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
                 venv_dir: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
             },
             emitter,
         );
@@ -968,5 +970,350 @@ mod tests {
             PreviewData::Text { content, .. } => assert!(content.contains("hello")),
             _ => panic!("Expected Text preview"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_start_search_grep() {
+        let dir = tempdir().unwrap();
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
+            },
+            emitter,
+        );
+
+        let query = SearchQuery {
+            pattern: "test".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: dir.path().to_path_buf(),
+            file_type_filters: vec![],
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 2,
+            mode: SearchMode::Grep,
+            supported_extensions: vec![],
+        };
+
+        let handle = ctx.clone().start_search(query).await.unwrap();
+        // SearchHandle only has rx field (mpsc::Receiver)
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn test_start_search_semantic_missing() {
+        let dir = tempdir().unwrap();
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
+            },
+            emitter,
+        );
+
+        let query = SearchQuery {
+            pattern: "test".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: dir.path().to_path_buf(),
+            file_type_filters: vec![],
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 2,
+            mode: SearchMode::Semantic,
+            supported_extensions: vec![],
+        };
+
+        let res = ctx.clone().start_search(query).await;
+        match res {
+            Err(e) => assert!(e.contains("No semantic index found")),
+            Ok(_) => panic!("Expected error but got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_worker_status() {
+        let dir = tempdir().unwrap();
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
+            },
+            emitter,
+        );
+
+        let status = ctx.get_worker_status();
+        assert_eq!(status.active, false);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_background_tasks() {
+        let dir = tempdir().unwrap();
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, rx, loop_fut) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
+            },
+            emitter,
+        );
+
+        ctx.spawn_background_tasks(rx, loop_fut);
+        // Just verify it doesn't panic and tasks are spawned
+    }
+
+    #[tokio::test]
+    async fn test_restore_state_no_index() {
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            settings_path.clone(),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
+            },
+            emitter,
+        );
+
+        // No index on disk, no settings
+        ctx.clone().restore_state().await;
+        assert!(!ctx.is_semantic_ready());
+    }
+
+    #[tokio::test]
+    async fn test_start_build_index_already_in_progress() {
+        let dir = tempdir().unwrap();
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
+            },
+            emitter,
+        );
+
+        // Mock a task in progress
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(async { Ok(()) });
+        *ctx.embed_task.lock().unwrap() = Some(EmbedTaskHandle { cancel, join });
+
+        let res = ctx.start_build_index(
+            "root".to_string(),
+            EmbedderModel("m".to_string()),
+            EmbeddingEngine::Candle
+        ).await;
+
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "A build is already in progress.");
+    }
+
+    #[tokio::test]
+    async fn test_start_download_model_already_in_progress() {
+        let dir = tempdir().unwrap();
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
+            },
+            emitter,
+        );
+
+        // Mock a task in progress
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(async { Ok(()) });
+        *ctx.embed_task.lock().unwrap() = Some(EmbedTaskHandle { cancel, join });
+
+        let res = ctx.start_download_model(
+            EmbedderModel("m".to_string()),
+            EmbeddingEngine::Candle
+        ).await;
+
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "A build is already in progress.");
+    }
+
+    #[tokio::test]
+    async fn test_open_file_denied() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, _rx, _loop) = AppContext::new(
+            data_dir.clone(),
+            dir.path().join("settings.json"),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: data_dir.clone(),
+            },
+            emitter,
+        );
+
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        
+        let res = ctx.open_file(outside).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("Access denied"));
+    }
+
+    #[tokio::test]
+    async fn test_start_search_semantic_root_mismatch() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, _rx, _loop) = AppContext::new(
+            data_dir.clone(),
+            settings_path,
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: data_dir.clone(),
+            },
+            emitter,
+        );
+
+        use wilkes_core::embed::Embedder;
+        struct StubEmbedder;
+        impl Embedder for StubEmbedder {
+            fn embed(&self, _: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![]) }
+            fn model_id(&self) -> &str { "stub" }
+            fn dimension(&self) -> usize { 1 }
+            fn engine(&self) -> EmbeddingEngine { EmbeddingEngine::Candle }
+        }
+
+        // Mock an embedder and index
+        *ctx.embedder.lock().unwrap() = Some(Arc::new(StubEmbedder));
+        
+        // Create an index on disk so we can open it
+        let root1 = dir.path().join("root1");
+        std::fs::create_dir_all(&root1).unwrap();
+        let idx = SemanticIndex::create(&data_dir, "stub", 1, EmbeddingEngine::Candle, Some(&root1)).unwrap();
+        *ctx.index.lock().unwrap() = Arc::new(Mutex::new(Some(idx)));
+
+        // Search in a different root
+        let root2 = dir.path().join("root2");
+        std::fs::create_dir_all(&root2).unwrap();
+        let query = SearchQuery {
+            pattern: "test".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: root2.clone(),
+            file_type_filters: vec![],
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 2,
+            mode: SearchMode::Semantic,
+            supported_extensions: vec![],
+        };
+
+        // This should trigger a background reindex because root2 != root1
+        let _handle = ctx.clone().start_search(query).await.unwrap();
+        
+        // Check if embed_task was set (reindex triggered)
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(ctx.embed_task.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_restore_state_model_mismatch() {
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Write settings with model A
+        let settings = Settings {
+            semantic: SemanticSettings {
+                model: EmbedderModel("model-A".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        tokio::fs::write(&settings_path, serde_json::to_string(&settings).unwrap()).await.unwrap();
+
+        // Write index status with model B
+        SemanticIndex::create(&data_dir, "model-B", 1, EmbeddingEngine::Candle, None).unwrap();
+
+        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let (ctx, _rx, _loop) = AppContext::new(
+            data_dir.clone(),
+            settings_path.clone(),
+            WorkerPaths { 
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: data_dir.clone(),
+            },
+            emitter,
+        );
+
+        ctx.clone().restore_state().await;
+        
+        // Should have cleared the stale index reference in settings
+        let updated_settings = ctx.get_settings().await;
+        assert_eq!(updated_settings.semantic.enabled, false);
+        assert!(updated_settings.semantic.index_path.is_none());
     }
 }

@@ -128,4 +128,21 @@ mod tests {
         clear_logs();
         assert_eq!(get_logs().len(), 0);
     }
+
+    #[test]
+    fn test_logging_limit() {
+        let layer = BufferLayer;
+        let subscriber = tracing_subscriber::registry().with(layer);
+        
+        subscriber::with_default(subscriber, || {
+            for i in 0..MAX_LOG_LINES + 10 {
+                info!("msg {}", i);
+            }
+        });
+
+        let logs = get_logs();
+        assert_eq!(logs.len(), MAX_LOG_LINES);
+        assert!(logs[0].contains(&format!("msg {}", 10)));
+        assert!(logs[MAX_LOG_LINES-1].contains(&format!("msg {}", MAX_LOG_LINES + 9)));
+    }
 }

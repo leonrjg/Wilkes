@@ -1,4 +1,5 @@
 import { createContext, useContext, useState, useCallback, useRef, ReactNode, useEffect } from "react";
+import { randomId } from "../lib/types";
 import { X, Info, AlertCircle, CheckCircle, Clock } from "react-feather";
 
 
@@ -55,7 +56,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       // Find and return existing ID if possible, otherwise generate new
     }
 
-    const id = crypto.randomUUID();
+    const id = randomId();
     setToasts((prev) => [...prev, { id, message, type, startTime, shimmer }]);
     recentMessages.current[key] = now;
     

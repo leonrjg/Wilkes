@@ -5,7 +5,7 @@ use tracing::debug;
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 
-use crate::types::{EmbedderModel, ModelDescriptor};
+use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
 use super::super::Embedder;
 use super::super::models::installer::{EmbedProgress, DownloadProgress, EmbedderInstaller, ProgressTx};
 
@@ -14,7 +14,7 @@ use super::super::models::installer::{EmbedProgress, DownloadProgress, EmbedderI
 fn find_model_info(model_id: &str) -> anyhow::Result<fastembed::ModelInfo<EmbeddingModel>> {
     TextEmbedding::list_supported_models()
         .into_iter()
-        .find(|m| m.model_code == model_id)
+        .find(|m| format!("{:?}", m.model) == model_id)
         .ok_or_else(|| anyhow::anyhow!("Model '{}' is not supported by fastembed", model_id))
 }
 
@@ -59,15 +59,16 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
                 .next_back()
                 .unwrap_or(&info.model_code)
                 .to_string();
+            let model_id = format!("{:?}", info.model);
 
             ModelDescriptor {
-                model_id: info.model_code.clone(),
+                model_id: model_id.clone(),
                 display_name,
                 description: info.description.clone(),
                 dimension: info.dim,
                 is_cached,
-                is_default: info.model_code == "BAAI/bge-base-en-v1.5",
-                is_recommended: info.model_code == "BAAI/bge-base-en-v1.5" || info.model_code == "sentence-transformers/all-MiniLM-L6-v2",
+                is_default: model_id == "BGEBaseENV15",
+                is_recommended: model_id == "BGEBaseENV15" || model_id == "AllMiniLML6V2",
                 size_bytes,
                 preferred_batch_size: get_preferred_batch_size(&info.model_code, &info.description),
             }
@@ -104,7 +105,7 @@ pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {
     };
 
     // ?blobs=true makes HF include actual byte sizes in the siblings listing.
-    let url = format!("https://huggingface.co/api/models/{model_id}?blobs=true");
+    let url = format!("https://huggingface.co/api/models/{}?blobs=true", info.model_code);
     let hf_info: HfModelInfo = ureq::get(&url)
         .call()
         .map_err(|e| anyhow::anyhow!("HF API request failed: {e}"))?
@@ -162,7 +163,7 @@ impl FastEmbedder {
         let mut inner = self.inner.lock().unwrap();
         let result = if prefix.is_empty() {
             inner
-                .embed(texts.to_vec(), self.preferred_batch_size)
+                .embed(texts, self.preferred_batch_size)
                 .map_err(|e| anyhow::anyhow!("fastembed error: {e}"))
         } else {
             let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
@@ -188,6 +189,10 @@ impl Embedder for FastEmbedder {
 
     fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    fn engine(&self) -> EmbeddingEngine {
+        EmbeddingEngine::Fastembed
     }
 
     fn preferred_batch_size(&self) -> Option<usize> {
@@ -301,15 +306,17 @@ impl EmbedderInstaller for FastembedInstaller {
     fn build(&self, data_dir: &Path) -> anyhow::Result<Arc<dyn Embedder>> {
         let info = find_model_info(&self.model.0)?;
         let prefixes = super::aux_config::load_prefixes(data_dir, &self.model.0);
-        Ok(Arc::new(super::sbert::WorkerEmbedder::new(
+        Ok(Arc::new(super::super::worker::embedder::WorkerEmbedder::new(
             self.manager.clone(),
-            self.model.0.clone(),
-            info.dim,
-            self.device.clone(),
-            crate::types::EmbeddingEngine::Fastembed,
-            data_dir.to_path_buf(),
-            prefixes.query_prefix,
-            prefixes.passage_prefix,
+            super::super::worker::embedder::WorkerEmbedderConfig {
+                model_id: self.model.0.clone(),
+                dimension: info.dim,
+                device: self.device.clone(),
+                engine: EmbeddingEngine::Fastembed,
+                data_dir: data_dir.to_path_buf(),
+                query_prefix: prefixes.query_prefix,
+                passage_prefix: prefixes.passage_prefix,
+            },
         )))
     }
 }

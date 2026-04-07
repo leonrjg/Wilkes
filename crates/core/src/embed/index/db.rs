@@ -6,7 +6,7 @@ use rusqlite::{Connection, params};
 use tracing::error;
 
 use crate::extract::ExtractorRegistry;
-use crate::types::{BoundingBox, ByteRange, EmbeddingEngine, IndexStatus, SourceOrigin};
+use crate::types::{BoundingBox, ByteRange, EmbeddingEngine, IndexStatus, IndexingConfig, SourceOrigin};
 
 use super::super::Embedder;
 use super::chunk::{Chunk, chunk_content};
@@ -20,9 +20,14 @@ fn load_sqlite_vec() {
         // sqlite3_vec_init is declared as fn() but sqlite3_auto_extension expects
         // the full 3-argument extension init signature. transmute bridges the gap;
         // this is the canonical pattern shown in the sqlite-vec crate's own tests.
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+            *const (),
+            unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *const std::ffi::c_char,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> i32,
+        >(sqlite_vec::sqlite3_vec_init as *const ())));
     });
 }
 
@@ -35,6 +40,8 @@ fn db_path(data_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_db_path() {
@@ -90,6 +97,170 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let res = SemanticIndex::open(dir.path(), "any", 0);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_create_and_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Path::new("/search/root");
+        let model = "test-model";
+        let dim = 128;
+        let engine = EmbeddingEngine::Candle;
+
+        // Create
+        let idx = SemanticIndex::create(dir.path(), model, dim, engine, Some(root)).unwrap();
+        assert_eq!(idx.model_id, model);
+        assert_eq!(idx.dimension, dim);
+        assert_eq!(idx.root_path, Some(root.to_path_buf()));
+        drop(idx);
+
+        // Open
+        let idx2 = SemanticIndex::open(dir.path(), model, dim).unwrap();
+        assert_eq!(idx2.model_id, model);
+        assert_eq!(idx2.dimension, dim);
+        assert_eq!(idx2.root_path, Some(root.to_path_buf()));
+    }
+
+    #[test]
+    fn test_write_and_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let model = "test-model";
+        let dim = 3;
+        let engine = EmbeddingEngine::Candle;
+
+        let mut idx = SemanticIndex::create(dir.path(), model, dim, engine, Some(root)).unwrap();
+
+        let file_path = root.join("test.txt");
+        let prepared = PreparedFile {
+            path: file_path.clone(),
+            chunks: vec![
+                (
+                    Chunk {
+                        file_path: file_path.clone(),
+                        text: "hello world".to_string(),
+                        byte_range: ByteRange { start: 0, end: 11 },
+                        origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                    },
+                    vec![1.0, 0.0, 0.0],
+                ),
+                (
+                    Chunk {
+                        file_path: file_path.clone(),
+                        text: "foo bar".to_string(),
+                        byte_range: ByteRange { start: 12, end: 19 },
+                        origin: SourceOrigin::TextFile { line: 2, col: 1 },
+                    },
+                    vec![0.0, 1.0, 0.0],
+                ),
+            ],
+        };
+
+        idx.write_file(prepared).unwrap();
+
+        // Query for "hello" (vec [1, 0, 0])
+        let results = idx.query(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk_text, "hello world");
+        assert!(results[0].score > 0.99);
+
+        // Query for "foo" (vec [0, 1, 0])
+        let results2 = idx.query(&[0.0, 1.0, 0.0], 1).unwrap();
+        assert_eq!(results2.len(), 1);
+        assert_eq!(results2[0].chunk_text, "foo bar");
+
+        // Remove file
+        idx.remove_file(&file_path).unwrap();
+        let results3 = idx.query(&[1.0, 0.0, 0.0], 10).unwrap();
+        assert_eq!(results3.len(), 0);
+    }
+
+    #[test]
+    fn test_index_delete() {
+        let dir = tempdir().unwrap();
+        let idx_dir = dir.path().join("idx");
+        fs::create_dir_all(&idx_dir).unwrap();
+
+        let idx = SemanticIndex::create(&idx_dir, "m", 3, EmbeddingEngine::Candle, None).unwrap();
+        let db_file = idx_dir.join("semantic_index.db");
+        assert!(db_file.exists());
+
+        idx.delete(&idx_dir).unwrap();
+        assert!(!db_file.exists());
+    }
+
+    #[test]
+    fn test_open_legacy_schema() {
+        let dir = tempdir().unwrap();
+        let path = db_path(dir.path());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);").unwrap();
+        // Missing vec_chunks table
+        drop(conn);
+
+        let res = SemanticIndex::open(dir.path(), "any", 0);
+        match res {
+            Err(e) => assert!(e.to_string().contains("legacy schema")),
+            Ok(_) => panic!("Expected legacy schema error"),
+        }
+    }
+
+    #[test]
+    fn test_open_dimension_mismatch() {
+        let dir = tempdir().unwrap();
+        let model = "m1";
+        let engine = EmbeddingEngine::Candle;
+        
+        // Create with dim 128
+        SemanticIndex::create(dir.path(), model, 128, engine, None).unwrap();
+        
+        // Try open with dim 256
+        let res = SemanticIndex::open(dir.path(), model, 256);
+        match res {
+            Err(e) => assert!(e.to_string().contains("dimension mismatch")),
+            Ok(_) => panic!("Expected dimension mismatch error"),
+        }
+    }
+
+    #[test]
+    fn test_extract_chunks_fallback() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        fs::write(&path, "hello world").unwrap();
+
+        let registry = ExtractorRegistry::new(); // empty registry
+        let chunks = SemanticIndex::extract_chunks(&path, &registry, 100, 10).unwrap();
+        
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "hello world");
+    }
+
+    #[test]
+    fn test_f32_slice_to_bytes() {
+        let v = vec![1.0f32, -2.5f32];
+        let bytes = f32_slice_to_bytes(&v);
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(bytes[0..4], 1.0f32.to_le_bytes());
+        assert_eq!(bytes[4..8], (-2.5f32).to_le_bytes());
+    }
+
+    #[test]
+    fn test_open_schema_version_mismatch() {
+        let dir = tempdir().unwrap();
+        let path = db_path(dir.path());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO meta VALUES ('schema_version', '2'); -- expected 1
+            CREATE TABLE vec_chunks (id INTEGER PRIMARY KEY);
+        ").unwrap();
+        drop(conn);
+
+        let res = SemanticIndex::open(dir.path(), "any", 0);
+        match res {
+            Err(e) => assert!(e.to_string().contains("schema version 2 is not supported")),
+            Ok(_) => panic!("Expected schema version error"),
+        }
     }
 }
 
@@ -289,10 +460,8 @@ impl SemanticIndex {
         paths: &[PathBuf],
         extractors: &ExtractorRegistry,
         embedder: &dyn Embedder,
-        engine: EmbeddingEngine,
         tx: ProgressTx,
-        chunk_size: usize,
-        chunk_overlap: usize,
+        indexing: &IndexingConfig,
     ) -> anyhow::Result<Self> {
         let start_time = Instant::now();
         let total_files = paths.len();
@@ -300,7 +469,7 @@ impl SemanticIndex {
         let final_path = db_path(data_dir);
         let tmp_path = data_dir.join("semantic_index.db.tmp");
 
-        let mut idx = Self::create_at_path(&tmp_path, embedder.model_id(), embedder.dimension(), engine, Some(root_path))?;
+        let mut idx = Self::create_at_path(&tmp_path, embedder.model_id(), embedder.dimension(), embedder.engine(), Some(root_path))?;
 
         // Extract, embed, and write one file at a time so peak memory is bounded
         // to a single file's chunks + embeddings on top of the model weights.
@@ -312,7 +481,7 @@ impl SemanticIndex {
                 done: false,
             }));
 
-            let chunks = match Self::extract_chunks(path, extractors, chunk_size, chunk_overlap) {
+            let chunks = match Self::extract_chunks(path, extractors, indexing.chunk_size, indexing.chunk_overlap) {
                 Ok(c) if !c.is_empty() => c,
                 _ => continue,
             };

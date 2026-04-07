@@ -12,7 +12,7 @@ use candle_transformers::models::modernbert::{ModernBert, Config as ModernBertCo
 use hf_hub::api::sync::ApiBuilder;
 use tokenizers::Tokenizer;
 
-use crate::types::{EmbedderModel, ModelDescriptor};
+use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
 use super::super::Embedder;
 use super::super::models::installer::{DownloadProgress, EmbedProgress, EmbedderInstaller, ProgressTx};
 
@@ -331,6 +331,10 @@ impl Embedder for CandleEmbedder {
         self.dimension
     }
 
+    fn engine(&self) -> EmbeddingEngine {
+        EmbeddingEngine::Candle
+    }
+
     fn preferred_batch_size(&self) -> Option<usize> {
         Some(EMBED_BATCH_SIZE)
     }
@@ -410,15 +414,17 @@ impl EmbedderInstaller for CandleInstaller {
         let model_id = &self.model.0;
         let dimension = read_dimension(data_dir, model_id)?;
         let prefixes = super::aux_config::load_prefixes(data_dir, model_id);
-        Ok(Arc::new(super::sbert::WorkerEmbedder::new(
+        Ok(Arc::new(super::super::worker::embedder::WorkerEmbedder::new(
             self.manager.clone(),
-            model_id.clone(),
-            dimension,
-            self.device.clone(),
-            crate::types::EmbeddingEngine::Candle,
-            data_dir.to_path_buf(),
-            prefixes.query_prefix,
-            prefixes.passage_prefix,
+            super::super::worker::embedder::WorkerEmbedderConfig {
+                model_id: model_id.clone(),
+                dimension,
+                device: self.device.clone(),
+                engine: EmbeddingEngine::Candle,
+                data_dir: data_dir.to_path_buf(),
+                query_prefix: prefixes.query_prefix,
+                passage_prefix: prefixes.passage_prefix,
+            },
         )))
     }
 }

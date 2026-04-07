@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -27,6 +27,7 @@ pub struct WorkerPaths {
     pub requirements_path: PathBuf,
     pub venv_dir: PathBuf,
     pub worker_bin: PathBuf,
+    pub data_dir: PathBuf,
 }
 
 impl WorkerPaths {
@@ -52,6 +53,7 @@ impl WorkerPaths {
             requirements_path,
             venv_dir,
             worker_bin,
+            data_dir: data_dir.to_path_buf(),
         }
     }
 }
@@ -60,10 +62,9 @@ type SenderSlot = Arc<std::sync::Mutex<mpsc::Sender<ManagerCommand>>>;
 
 pub enum ManagerCommand {
     Submit {
-        req: WorkerRequest,
+        req: Box<WorkerRequest>,
         reply: mpsc::Sender<WorkerEvent>,
     },
-    GetStatus(tokio::sync::oneshot::Sender<WorkerStatus>),
     KillWorker,
     SetTimeout(u64),
 }
@@ -79,6 +80,8 @@ pub struct WorkerManager {
     sender: SenderSlot,
     /// PID of the active worker process. 0 = no active worker.
     active_pid: Arc<AtomicU32>,
+    /// Status snapshot updated by the manager loop; readable without going through the loop.
+    status: Arc<RwLock<WorkerStatus>>,
 }
 
 impl WorkerManager {
@@ -86,9 +89,14 @@ impl WorkerManager {
         let (tx, rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::channel(32);
         let active_pid = Arc::new(AtomicU32::new(0));
+        let status = Arc::new(RwLock::new(WorkerStatus { active: false, engine: None, model: None, timeout_secs: 300 }));
         let sender: SenderSlot = Arc::new(std::sync::Mutex::new(tx));
-        let fut = supervised_manager_loop(paths, rx, event_tx, Arc::clone(&active_pid), Arc::clone(&sender));
-        (Self { sender, active_pid }, event_rx, fut)
+        let fut = supervised_manager_loop(paths, rx, event_tx, Arc::clone(&active_pid), Arc::clone(&sender), Arc::clone(&status));
+        (Self { sender, active_pid, status }, event_rx, fut)
+    }
+
+    pub fn status(&self) -> WorkerStatus {
+        self.status.read().unwrap().clone()
     }
 
     pub async fn send(&self, cmd: ManagerCommand) -> Result<(), mpsc::error::SendError<ManagerCommand>> {
@@ -119,7 +127,6 @@ impl WorkerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::oneshot;
 
     #[tokio::test]
     async fn test_worker_manager_status_inactive() {
@@ -129,15 +136,13 @@ mod tests {
             requirements_path: PathBuf::from("reqs.txt"),
             venv_dir: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
         };
 
         let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
         let _loop_handle = tokio::spawn(loop_fut);
 
-        let (tx, rx) = oneshot::channel();
-        manager.send(ManagerCommand::GetStatus(tx)).await.unwrap();
-        
-        let status = rx.await.unwrap();
+        let status = manager.status();
         assert_eq!(status.active, false);
         assert_eq!(status.timeout_secs, 300);
     }
@@ -272,6 +277,7 @@ async fn supervised_manager_loop(
     event_tx: mpsc::Sender<ManagerEvent>,
     active_pid: Arc<AtomicU32>,
     sender_slot: SenderSlot,
+    status: Arc<RwLock<WorkerStatus>>,
 ) {
     let mut rx = initial_rx;
     loop {
@@ -280,12 +286,14 @@ async fn supervised_manager_loop(
             rx,
             event_tx.clone(),
             Arc::clone(&active_pid),
+            Arc::clone(&status),
         ));
         match handle.await {
             Ok(()) => break, // channel closed normally, exit supervisor
             Err(e) if e.is_panic() => {
                 tracing::error!("WorkerManager: loop panicked, restarting: {e:?}");
                 active_pid.store(0, Ordering::Relaxed);
+                if let Ok(mut s) = status.write() { s.active = false; s.engine = None; s.model = None; }
                 let (new_tx, new_rx) = mpsc::channel(32);
                 *sender_slot.lock().unwrap() = new_tx;
                 rx = new_rx;
@@ -298,14 +306,36 @@ async fn supervised_manager_loop(
     }
 }
 
-async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>, event_tx: mpsc::Sender<ManagerEvent>, active_pid: Arc<AtomicU32>) {
+async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>, event_tx: mpsc::Sender<ManagerEvent>, active_pid: Arc<AtomicU32>, status: Arc<RwLock<WorkerStatus>>) {
     let mut active_process: Option<ActiveProcess> = None;
-    let mut active_engine = None;
-    let mut active_model = None;
-    let mut active_device = None;
+    let mut active_engine: Option<EmbeddingEngine> = None;
+    let mut active_model: Option<String> = None;
+    let mut active_device: Option<String> = None;
 
     // Default 5 minute idle timeout
     let mut idle_timeout = Duration::from_secs(300);
+
+    macro_rules! set_status {
+        (active: $eng:expr, $mdl:expr) => {
+            if let Ok(mut s) = status.write() {
+                s.active = true;
+                s.engine = Some($eng.as_str().to_string());
+                s.model = Some($mdl.clone());
+            }
+        };
+        (idle) => {
+            if let Ok(mut s) = status.write() {
+                s.active = false;
+                s.engine = None;
+                s.model = None;
+            }
+        };
+        (timeout: $secs:expr) => {
+            if let Ok(mut s) = status.write() {
+                s.timeout_secs = $secs;
+            }
+        };
+    }
 
     loop {
         let cmd = match timeout(idle_timeout, rx.recv()).await {
@@ -324,21 +354,13 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
                     active_engine = None;
                     active_model = None;
                     active_device = None;
+                    set_status!(idle);
                 }
                 continue;
             }
         };
 
         match cmd {
-            ManagerCommand::GetStatus(reply) => {
-                let status = WorkerStatus {
-                    active: active_process.is_some(),
-                    engine: active_engine.as_ref().map(|e: &EmbeddingEngine| e.as_str().to_string()),
-                    model: active_model.clone(),
-                    timeout_secs: idle_timeout.as_secs(),
-                };
-                let _ = reply.send(status);
-            }
             ManagerCommand::KillWorker => {
                 if let Some(mut proc) = active_process.take() {
                     tracing::info!("WorkerManager: Killing worker process per user request.");
@@ -346,10 +368,12 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
                     active_engine = None;
                     active_model = None;
                     active_device = None;
+                    set_status!(idle);
                 }
             }
             ManagerCommand::SetTimeout(secs) => {
                 idle_timeout = Duration::from_secs(secs);
+                set_status!(timeout: secs);
                 tracing::info!("WorkerManager: Idle timeout updated to {} seconds.", secs);
             }
             ManagerCommand::Submit { req, reply } => {
@@ -366,7 +390,7 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
                 tracing::info!("WorkerManager: sending request: {:?}", serde_json::to_string(&log_req).unwrap_or_default());
 
                 let needs_restart = active_process.is_none()
-                    || active_engine != Some(req.engine.clone())
+                    || active_engine != Some(req.engine)
                     || active_model != Some(req.model.clone())
                     || active_device != Some(req.device.clone());
 
@@ -396,6 +420,7 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
                             };
                             let mut c = Command::new(&python);
                             c.env("PYTHONPATH", &paths.python_package_dir);
+                            c.env("HF_HUB_CACHE", &paths.data_dir);
                             c.arg("-m");
                             c.arg("wilkes_python_worker");
                             c
@@ -431,13 +456,14 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
                                 });
                             }
 
+                            active_engine = Some(req.engine);
+                            active_model = Some(req.model.clone());
+                            active_device = Some(req.device.clone());
+                            set_status!(active: req.engine, req.model);
                             active_process = Some(ActiveProcess {
                                 child,
                                 stdout: BufReader::new(stdout),
                             });
-                            active_engine = Some(req.engine.clone());
-                            active_model = Some(req.model.clone());
-                            active_device = Some(req.device.clone());
                         }
                         Err(e) => {
                             let _ = reply.send(WorkerEvent::Error(format!("Failed to spawn worker: {e}"))).await;
@@ -450,12 +476,11 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
                 if let Some(proc) = active_process.as_mut() {
                     let mut success = false;
                     if let Some(stdin) = proc.child.stdin.as_mut() {
-                        if stdin.write_all(req_json.as_bytes()).await.is_ok() {
-                            if stdin.write_all(b"\n").await.is_ok() {
-                                if stdin.flush().await.is_ok() {
-                                    success = true;
-                                }
-                            }
+                        if stdin.write_all(req_json.as_bytes()).await.is_ok()
+                            && stdin.write_all(b"\n").await.is_ok()
+                            && stdin.flush().await.is_ok()
+                        {
+                            success = true;
                         }
                     }
 
@@ -463,6 +488,7 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
                         let _ = reply.send(WorkerEvent::Error("Failed to write to worker stdin".to_string())).await;
                         kill_and_reap(proc, &active_pid).await;
                         active_process = None;
+                        set_status!(idle);
                         continue;
                     }
 
@@ -474,6 +500,7 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
                                 let _ = reply.send(WorkerEvent::Error("Worker process closed stdout unexpectedly".to_string())).await;
                                 kill_and_reap(proc, &active_pid).await;
                                 active_process = None;
+                                set_status!(idle);
                                 break;
                             }
                             Ok(_) => {
@@ -498,6 +525,7 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
                                 let _ = reply.send(WorkerEvent::Error(format!("Failed to read from worker: {e}"))).await;
                                 kill_and_reap(proc, &active_pid).await;
                                 active_process = None;
+                                set_status!(idle);
                                 break;
                             }
                         }

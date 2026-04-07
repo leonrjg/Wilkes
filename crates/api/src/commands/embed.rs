@@ -9,6 +9,16 @@ use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::types::IndexStatus;
 
+pub struct BuildIndexOptions {
+    pub manager: Option<wilkes_core::embed::worker::manager::WorkerManager>,
+    pub device: Option<String>,
+    pub data_dir: PathBuf,
+    pub tx: ProgressTx,
+    pub chunk_size: usize,
+    pub chunk_overlap: usize,
+    pub supported_extensions: Vec<String>,
+}
+
 /// Download and install the model. Reports progress via `tx`.
 pub async fn download_model(
     engine: wilkes_core::types::EmbeddingEngine,
@@ -26,13 +36,8 @@ pub async fn download_model(
 /// at `data_dir`. The embedder is returned so callers can cache it without reloading.
 pub async fn build_index_with_embedder(
     root: PathBuf,
-    engine: wilkes_core::types::EmbeddingEngine,
     embedder: Arc<dyn Embedder>,
-    data_dir: PathBuf,
-    tx: ProgressTx,
-    chunk_size: usize,
-    chunk_overlap: usize,
-    supported_extensions: Vec<String>,
+    options: BuildIndexOptions,
 ) -> anyhow::Result<Arc<dyn Embedder>> {
     let embedder_clone = Arc::clone(&embedder);
 
@@ -42,13 +47,18 @@ pub async fn build_index_with_embedder(
         .build()
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.path().is_file() && wilkes_core::types::FileType::detect(e.path(), &supported_extensions).is_some()
+            e.path().is_file() && wilkes_core::types::FileType::detect(e.path(), &options.supported_extensions).is_some()
         })
         .map(|e| e.path().to_path_buf())
         .collect();
 
-    let data_dir_clone = data_dir.clone();
+    let data_dir_clone = options.data_dir.clone();
     let root_clone = root.clone();
+    let indexing = wilkes_core::types::IndexingConfig {
+        chunk_size: options.chunk_size,
+        chunk_overlap: options.chunk_overlap,
+        supported_extensions: options.supported_extensions.clone(),
+    };
 
     tokio::task::spawn_blocking(move || {
         let mut registry = ExtractorRegistry::new();
@@ -60,10 +70,8 @@ pub async fn build_index_with_embedder(
             &paths,
             &registry,
             embedder_clone.as_ref(),
-            engine,
-            tx,
-            chunk_size,
-            chunk_overlap,
+            options.tx,
+            &indexing,
         )?;
         anyhow::Ok(())
     })
@@ -82,21 +90,24 @@ pub async fn build_index(
     root: PathBuf,
     engine: wilkes_core::types::EmbeddingEngine,
     model: wilkes_core::types::EmbedderModel,
-    manager: wilkes_core::embed::worker::manager::WorkerManager,
-    device: String,
-    data_dir: PathBuf,
-    tx: ProgressTx,
-    chunk_size: usize,
-    chunk_overlap: usize,
-    supported_extensions: Vec<String>,
+    options: BuildIndexOptions,
 ) -> anyhow::Result<Arc<dyn Embedder>> {
+    let manager = options
+        .manager
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("manager is required for build_index"))?;
+    let device = options
+        .device
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("device is required for build_index"))?;
+
     let installer = wilkes_core::embed::dispatch::get_installer(engine, model, manager, device);
 
     // Ensure model is ready (probes dimension for SBERT, no-op for others if already cached)
-    installer.install(&data_dir, tx.clone()).await?;
+    installer.install(&options.data_dir, options.tx.clone()).await?;
 
-    let embedder = installer.build(&data_dir)?;
-    build_index_with_embedder(root, engine, embedder, data_dir, tx, chunk_size, chunk_overlap, supported_extensions).await
+    let embedder = installer.build(&options.data_dir)?;
+    build_index_with_embedder(root, embedder, options).await
 }
 
 /// Fetch the total download size for `model_id` from the HuggingFace API.
@@ -158,6 +169,7 @@ mod tests {
         }
         fn model_id(&self) -> &str { "mock" }
         fn dimension(&self) -> usize { 768 }
+        fn engine(&self) -> wilkes_core::types::EmbeddingEngine { wilkes_core::types::EmbeddingEngine::Candle }
     }
 
     #[tokio::test]
@@ -174,15 +186,20 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(10);
         let supported_extensions = vec!["txt".to_string()];
 
+        let options = BuildIndexOptions {
+            manager: None,
+            device: None,
+            data_dir: data_dir.clone(),
+            tx,
+            chunk_size: 600,
+            chunk_overlap: 128,
+            supported_extensions,
+        };
+
         let result = build_index_with_embedder(
             root,
-            wilkes_core::types::EmbeddingEngine::SBERT,
             embedder,
-            data_dir.clone(),
-            tx,
-            600,
-            128,
-            supported_extensions,
+            options,
         ).await;
 
         assert!(result.is_ok());

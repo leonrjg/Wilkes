@@ -50,7 +50,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
         pattern: pat,
         is_regex: opts.isRegex ?? isRegex,
         case_sensitive: opts.caseSensitive ?? caseSensitive,
-        root: directory || ".",
+        root: directory,
         file_type_filters,
         max_results: 0,
         respect_gitignore: respectGitignore,
@@ -76,7 +76,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
 
   const triggerSearch = useCallback(
     (pat: string, opts?: { isRegex?: boolean; caseSensitive?: boolean; isSemanticMode?: boolean }) => {
-      if (!pat.trim()) return;
+      if (!pat.trim() || !directory) return;
       const semantic = opts?.isSemanticMode ?? isSemanticMode;
       if (semantic && !semanticReady) return;
       search(buildQuery(pat, opts));

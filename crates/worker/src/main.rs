@@ -54,27 +54,32 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
 
-                let result = wilkes_api::commands::embed::build_index_with_embedder(
-                    req.root,
-                    req.engine,
-                    embedder,
-                    req.data_dir,
+                let options = wilkes_api::commands::embed::BuildIndexOptions {
+                    manager: None,
+                    device: None,
+                    data_dir: req.data_dir,
                     tx,
-                    match req.chunk_size {
+                    chunk_size: match req.chunk_size {
                         Some(v) => v,
                         None => {
                             emit(WorkerEvent::Error("build request missing chunk_size".into()));
                             continue;
                         }
                     },
-                    match req.chunk_overlap {
+                    chunk_overlap: match req.chunk_overlap {
                         Some(v) => v,
                         None => {
                             emit(WorkerEvent::Error("build request missing chunk_overlap".into()));
                             continue;
                         }
                     },
-                    req.supported_extensions,
+                    supported_extensions: req.supported_extensions,
+                };
+
+                let result = wilkes_api::commands::embed::build_index_with_embedder(
+                    req.root,
+                    embedder,
+                    options,
                 )
                 .await;
 

@@ -134,6 +134,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
           />
         ) : (
           <PdfViewer
+            key={api.resolvePdfUrl(selectedMatch.path)}
             url={api.resolvePdfUrl(selectedMatch.path)}
             page={displayData.Pdf.page}
             highlight_bbox={displayData.Pdf.highlight_bbox}

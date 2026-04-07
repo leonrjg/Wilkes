@@ -14,6 +14,7 @@ import type {
   SearchStats,
   Settings,
 } from "../lib/types";
+import { randomId } from "../lib/types";
 import type { SearchApi, WebSourceApi } from "./api";
 
 export class HttpSearchApi implements SearchApi {
@@ -24,7 +25,7 @@ export class HttpSearchApi implements SearchApi {
     onResult: (fm: FileMatches) => void,
     onComplete: (stats: SearchStats) => void,
   ): Promise<string> {
-    const searchId = crypto.randomUUID();
+    const searchId = randomId();
     const controller = new AbortController();
     this.controllers.set(searchId, controller);
 
@@ -249,36 +250,57 @@ export class HttpSearchApi implements SearchApi {
     if (!res.ok && res.status !== 204) throw new Error(`deleteIndex failed: ${res.status}`);
   }
 
+  // All four embed-event subscriptions share one EventSource. A refcount tracks
+  // active subscribers; the connection is opened on the first and closed on the last.
+  private embedEventSource: EventSource | null = null;
+  private embedEventSourceRefs = 0;
+
+  private acquireEmbedEventSource(): EventSource {
+    if (!this.embedEventSource) {
+      this.embedEventSource = new EventSource("/api/embed/events");
+    }
+    this.embedEventSourceRefs++;
+    return this.embedEventSource;
+  }
+
+  private releaseEmbedEventSource(eventName: string, listener: (e: any) => void): void {
+    if (this.embedEventSource) {
+      this.embedEventSource.removeEventListener(eventName, listener);
+    }
+    this.embedEventSourceRefs--;
+    if (this.embedEventSourceRefs <= 0) {
+      this.embedEventSource?.close();
+      this.embedEventSource = null;
+      this.embedEventSourceRefs = 0;
+    }
+  }
+
   async onEmbedProgress(handler: (p: EmbedProgress) => void): Promise<() => void> {
-    const eventSource = new EventSource("/api/embed/events");
-    eventSource.addEventListener("embed-progress", (e: any) => {
-      handler(JSON.parse(e.data));
-    });
-    return () => eventSource.close();
+    const es = this.acquireEmbedEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("embed-progress", listener);
+    return () => this.releaseEmbedEventSource("embed-progress", listener);
   }
 
   async onEmbedDone(handler: (d: EmbedDone) => void): Promise<() => void> {
-    const eventSource = new EventSource("/api/embed/events");
-    eventSource.addEventListener("embed-done", (e: any) => {
-      handler(JSON.parse(e.data));
-    });
-    return () => eventSource.close();
+    const es = this.acquireEmbedEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("embed-done", listener);
+    return () => this.releaseEmbedEventSource("embed-done", listener);
   }
 
   async onEmbedError(handler: (e: EmbedError) => void): Promise<() => void> {
-    const eventSource = new EventSource("/api/embed/events");
-    eventSource.addEventListener("embed-error", (e: any) => {
-      handler(JSON.parse(e.data));
-    });
-    return () => eventSource.close();
+    const es = this.acquireEmbedEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("embed-error", listener);
+    return () => this.releaseEmbedEventSource("embed-error", listener);
   }
 
   async onManagerEvent(handler: (event: string) => void): Promise<() => void> {
-    const eventSource = new EventSource("/api/embed/events");
-    eventSource.addEventListener("manager-event", (e: any) => {
-      handler(JSON.parse(e.data));
-    });
-    return () => eventSource.close();
+    const es = this.acquireEmbedEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("manager-event", listener);
+    return () => this.releaseEmbedEventSource("manager-event", listener);
   }
 }
 

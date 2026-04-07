@@ -124,10 +124,11 @@ mod tests {
     struct MockEmbedder;
     impl Embedder for MockEmbedder {
         fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-            Ok(vec![vec![0.0; 768]])
+            Ok(vec![vec![1.0; 768]])
         }
         fn model_id(&self) -> &str { "mock" }
         fn dimension(&self) -> usize { 768 }
+        fn engine(&self) -> crate::types::EmbeddingEngine { crate::types::EmbeddingEngine::Candle }
     }
 
     #[test]
@@ -173,18 +174,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_search_empty_index() {
+    async fn test_search_with_results() {
         let dir = tempfile::tempdir().unwrap();
-        let idx = SemanticIndex::create(
-            dir.path(), "mock", 768,
+        let data_dir = dir.path().to_path_buf();
+        let mut idx = SemanticIndex::create(
+            &data_dir, "mock", 768,
             crate::types::EmbeddingEngine::SBERT,
             None,
         ).unwrap();
+        
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "hello world").unwrap();
+        
+        use crate::types::{SourceOrigin, ByteRange};
+        use crate::embed::index::db::PreparedFile;
+        use crate::embed::index::chunk::Chunk;
+        
+        let chunk = Chunk {
+            file_path: path.clone(),
+            text: "hello world".to_string(),
+            byte_range: ByteRange { start: 0, end: 11 },
+            origin: SourceOrigin::TextFile { line: 1, col: 1 },
+        };
+        let prepared = PreparedFile {
+            path: path.clone(),
+            chunks: vec![(chunk, vec![1.0; 768])],
+        };
+        idx.write_file(prepared).unwrap();
+
         let embedder = Arc::new(MockEmbedder);
         let index = Arc::new(Mutex::new(Some(idx)));
-        let provider = SemanticSearchProvider::new(embedder, index, vec![]);
+        let provider = SemanticSearchProvider::new(embedder, index.clone(), vec!["txt".to_string()]);
         
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let query = SearchQuery {
             pattern: "test".to_string(),
             is_regex: false,
@@ -196,10 +218,22 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Semantic,
-            supported_extensions: vec![],
+            supported_extensions: vec!["txt".to_string()],
         };
         
-        let res = provider.search(&query, &ExtractorRegistry::new(), tx);
-        assert!(res.is_ok());
+        let provider_handle = tokio::task::spawn_blocking(move || {
+            provider.search(&query, &ExtractorRegistry::new(), tx).unwrap();
+        });
+
+        let mut results = Vec::new();
+        while let Some(fm) = rx.recv().await {
+            results.push(fm);
+        }
+        provider_handle.await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, path);
+        assert_eq!(results[0].matches.len(), 1);
+        assert_eq!(results[0].matches[0].matched_text, "hello world");
     }
 }

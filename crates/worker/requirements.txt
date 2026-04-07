@@ -1,3 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.7.0+cpu
 sentence-transformers==5.3.0
 semantic-text-splitter==0.29.0
 sqlite-vec==0.1.9

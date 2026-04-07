@@ -28,7 +28,7 @@ vi.mock("./services", () => ({
     getSupportedEngines: vi.fn(() => Promise.resolve(["SBERT"])),
     getIndexStatus: vi.fn(() => Promise.resolve(null)),
     isSemanticReady: vi.fn(() => Promise.resolve(true)),
-    getDataPaths: vi.fn(() => Promise.resolve({ app_data: "", hf_cache: "" })),
+    getDataPaths: vi.fn(() => Promise.resolve({ app_data: "" })),
     listFiles: vi.fn(() => Promise.resolve([])),
   },
   source: {

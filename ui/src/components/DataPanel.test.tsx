@@ -22,7 +22,6 @@ vi.mock("../services", () => ({
 describe("DataPanel", () => {
   const mockPaths = {
     app_data: "/app/data",
-    hf_cache: "/hf/cache",
   };
 
   const mockIndexStatus = {
@@ -48,7 +47,6 @@ describe("DataPanel", () => {
     });
     
     expect(screen.getByText("/app/data")).toBeInTheDocument();
-    expect(screen.getByText("/hf/cache")).toBeInTheDocument();
     expect(screen.getByText("Ready (10 files)")).toBeInTheDocument();
   });
 

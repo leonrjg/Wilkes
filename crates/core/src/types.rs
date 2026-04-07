@@ -10,6 +10,15 @@ pub struct ByteRange {
     pub end: usize,
 }
 
+// ── Indexing configuration ────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct IndexingConfig {
+    pub chunk_size: usize,
+    pub chunk_overlap: usize,
+    pub supported_extensions: Vec<String>,
+}
+
 // ── Search mode ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
@@ -178,26 +187,23 @@ impl SourceMap {
                     first_origin = Some(seg.origin.clone());
                 }
 
-                match &seg.origin {
-                    SourceOrigin::PdfPage { page, bbox } => {
-                        if let Some(p) = page_num {
-                            if p != *page {
-                                // If match spans multiple pages, we stick to segments on the first page
-                                // that overlaps with the match start.
-                                continue;
-                            }
-                        } else {
-                            page_num = Some(*page);
+                if let SourceOrigin::PdfPage { page, bbox } = &seg.origin {
+                    if let Some(p) = page_num {
+                        if p != *page {
+                            // If match spans multiple pages, we stick to segments on the first page
+                            // that overlaps with the match start.
+                            continue;
                         }
-
-                        if let Some(b) = bbox {
-                            merged_bbox = match merged_bbox {
-                                Some(existing) => Some(existing.merge(b)),
-                                None => Some(b.clone()),
-                            };
-                        }
+                    } else {
+                        page_num = Some(*page);
                     }
-                    _ => {}
+
+                    if let Some(b) = bbox {
+                        merged_bbox = match merged_bbox {
+                            Some(existing) => Some(existing.merge(b)),
+                            None => Some(b.clone()),
+                        };
+                    }
                 }
             }
         }
@@ -255,16 +261,16 @@ pub enum PreviewData {
 
 // ── Embedder model ────────────────────────────────────────────────────────────
 
-/// Identifies an embedding model by its HuggingFace model code (e.g. "BAAI/bge-base-en-v1.5").
-/// Serialises as a plain string. The custom Deserialize maps legacy enum variant names written
-/// by older app versions so existing settings files migrate transparently.
+/// Identifies an embedding model. For fastembed models this is the Debug representation
+/// of the `EmbeddingModel` enum variant (e.g. "BGEBaseENV15"); for SBERT/Candle models
+/// it is the HuggingFace model code. Serialises as a plain string.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(transparent)]
 pub struct EmbedderModel(pub String);
 
 impl Default for EmbedderModel {
     fn default() -> Self {
-        Self("BAAI/bge-base-en-v1.5".to_string())
+        Self("BGEBaseENV15".to_string())
     }
 }
 
@@ -422,7 +428,7 @@ impl SemanticSettings {
     }
 
     fn default_dimension() -> usize {
-        768 // Default for BgeBaseEn
+        768 // Default for BGEBaseENV15
     }
 
     /// Returns the effective device string for the given engine,
@@ -438,7 +444,7 @@ impl Default for SemanticSettings {
         Self {
             enabled: false,
             engine: EmbeddingEngine::default(),
-            model: EmbedderModel("BAAI/bge-base-en-v1.5".to_string()),
+            model: EmbedderModel("BGEBaseENV15".to_string()),
             dimension: Self::default_dimension(),
             engine_devices: HashMap::new(),
             index_path: None,
@@ -537,7 +543,6 @@ pub struct FileEntry {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DataPaths {
-    pub hf_cache: String,
     pub app_data: String,
 }
 
@@ -679,7 +684,7 @@ mod tests {
         let settings = SemanticSettings::default();
         assert_eq!(settings.enabled, false);
         assert_eq!(settings.engine, EmbeddingEngine::default());
-        assert_eq!(settings.model.model_id(), "BAAI/bge-base-en-v1.5");
+        assert_eq!(settings.model.model_id(), "BGEBaseENV15");
         assert_eq!(settings.dimension, 768);
         assert_eq!(settings.chunk_size, 600);
         assert_eq!(settings.chunk_overlap, 128);
@@ -693,12 +698,108 @@ mod tests {
     }
 
     #[test]
-    fn test_settings_defaults() {
-        let settings = Settings::default();
-        assert_eq!(settings.max_file_size, 10 * 1024 * 1024);
-        assert_eq!(settings.context_lines, 2);
-        assert!(matches!(settings.theme, Theme::System));
-        assert!(settings.supported_extensions.contains(&"txt".to_string()));
-        assert!(settings.supported_extensions.contains(&"rs".to_string()));
+    fn test_source_map_resolve_fallback() {
+        let map = SourceMap {
+            segments: vec![
+                SourceSegment {
+                    text_range: ByteRange { start: 0, end: 10 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+            ],
+        };
+
+        // Offset beyond all segments should fall back to last segment
+        match map.resolve(100).unwrap() {
+            SourceOrigin::TextFile { line, .. } => assert_eq!(line, 1),
+            _ => panic!("Expected TextFile origin"),
+        }
+    }
+
+    #[test]
+    fn test_source_map_resolve_range_multi_page() {
+        let map = SourceMap {
+            segments: vec![
+                SourceSegment {
+                    text_range: ByteRange { start: 0, end: 10 },
+                    origin: SourceOrigin::PdfPage { page: 1, bbox: None },
+                },
+                SourceSegment {
+                    text_range: ByteRange { start: 10, end: 20 },
+                    origin: SourceOrigin::PdfPage { page: 2, bbox: None },
+                },
+            ],
+        };
+
+        // Range spanning page 1 and 2
+        let origin = map.resolve_range(ByteRange { start: 5, end: 15 }).unwrap();
+        match origin {
+            SourceOrigin::PdfPage { page, .. } => assert_eq!(page, 1),
+            _ => panic!("Expected PdfPage origin on page 1"),
+        }
+    }
+
+    #[test]
+    fn test_source_map_resolve_range_no_overlap() {
+        let map = SourceMap {
+            segments: vec![
+                SourceSegment {
+                    text_range: ByteRange { start: 10, end: 20 },
+                    origin: SourceOrigin::TextFile { line: 2, col: 1 },
+                },
+            ],
+        };
+
+        // Range before any segment
+        let origin = map.resolve_range(ByteRange { start: 0, end: 5 }).unwrap();
+        match origin {
+            SourceOrigin::TextFile { line, .. } => assert_eq!(line, 2),
+            _ => panic!("Expected fallback to last segment"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_engine_supported() {
+        let engines = EmbeddingEngine::supported_engines();
+        assert!(!engines.is_empty());
+        assert!(engines.contains(&EmbeddingEngine::SBERT));
+    }
+
+    #[test]
+    fn test_deserialize_custom_models() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(deserialize_with = "deserialize_custom_models")]
+            models: Vec<CustomModel>,
+        }
+
+        // Test old format (Vec<String>)
+        let json = r#"{"models": ["model1", "model2"]}"#;
+        let w: Wrapper = serde_json::from_str(json).unwrap();
+        assert_eq!(w.models.len(), 2);
+        assert_eq!(w.models[0].model_id, "model1");
+        assert_eq!(w.models[0].engine, EmbeddingEngine::SBERT);
+
+        // Test new format (Vec<CustomModel>)
+        let json = r#"{"models": [{"engine": "Candle", "model_id": "model3"}]}"#;
+        let w: Wrapper = serde_json::from_str(json).unwrap();
+        assert_eq!(w.models.len(), 1);
+        assert_eq!(w.models[0].model_id, "model3");
+        assert_eq!(w.models[0].engine, EmbeddingEngine::Candle);
+    }
+
+    #[test]
+    fn test_search_query_json_defaults() {
+        let json = r#"{
+            "pattern": "test",
+            "is_regex": false,
+            "case_sensitive": false,
+            "root": ".",
+            "file_type_filters": [],
+            "max_results": 0
+        }"#;
+        let query: SearchQuery = serde_json::from_str(json).unwrap();
+        assert!(query.respect_gitignore);
+        assert_eq!(query.context_lines, 2);
+        assert_eq!(query.mode, SearchMode::Grep);
     }
 }

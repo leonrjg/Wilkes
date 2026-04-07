@@ -4,7 +4,8 @@ use std::path::Path;
 pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {
     #[derive(serde::Deserialize)]
     struct Sibling {
-        _rfilename: String,
+        #[allow(dead_code)]
+        rfilename: String,
         size: Option<u64>,
     }
     #[derive(serde::Deserialize)]

@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Search as SearchIcon, ChevronUp, ChevronDown, X } from "react-feather";
 import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/TextLayer.css";
 import type { BoundingBox } from "../../lib/types";
 import type { PDFDocumentProxy } from "pdfjs-dist";
+import { usePdfInnerSearch } from "./usePdfInnerSearch";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -20,27 +21,13 @@ export interface PdfViewerProps {
 
 export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }: PdfViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const searchInputRef = useRef<HTMLInputElement>(null);
   const [containerWidth, setContainerWidth] = useState(600);
   const [pageWidth, setPageWidth] = useState<number | null>(null);
   const [pageAspectRatio, setPageAspectRatio] = useState<number | null>(null);
   const [numPages, setNumPages] = useState<number | null>(null);
   const [zoom, setZoom] = useState(1.0);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
-  const hasCalledRenderSuccess = useRef(false);
-  const activeUrlRef = useRef(url);
-
-  const [isSearchOpen, setIsSearchOpen] = useState(false);
-  const [innerQuery, setInnerQuery] = useState("");
-  const [innerMatches, setInnerMatches] = useState<Array<{ page: number; bbox: BoundingBox }>>([]);
-  const [currentMatchIdx, setCurrentMatchIdx] = useState(-1);
-  const [isSearching, setIsSearching] = useState(false);
   const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
-
-  useEffect(() => {
-    activeUrlRef.current = url;
-    hasCalledRenderSuccess.current = false;
-  }, [url, page, highlight_bbox]);
 
   useEffect(() => {
     const observer = new MutationObserver(() => {
@@ -59,6 +46,24 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
     overscan: 2,
   });
 
+  const scrollToPage = useCallback(
+    (p: number) => virtualizer.scrollToIndex(p - 1, { align: "start" }),
+    [virtualizer],
+  );
+
+  const {
+    searchInputRef,
+    isSearchOpen,
+    setIsSearchOpen,
+    innerQuery,
+    setInnerQuery,
+    innerMatches,
+    currentMatchIdx,
+    isSearching,
+    handleNextMatch,
+    handlePrevMatch,
+  } = usePdfInnerSearch(pdf, scrollToPage);
+
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -74,111 +79,16 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
   }, []);
 
   useEffect(() => {
-    if (zoom) {
-      hasCalledRenderSuccess.current = false;
-      virtualizer.measure();
-    }
+    virtualizer.measure();
   }, [zoom]);
 
   useEffect(() => {
     if (numPages && !isSearchOpen) {
       virtualizer.scrollToIndex(page - 1, { align: "start" });
     }
-  }, [page, numPages, isSearchOpen]);
+  }, [page, numPages, highlight_bbox, isSearchOpen]);
 
   const scale = pageWidth ? renderedWidth / pageWidth : 1;
-
-  useEffect(() => {
-    if (!isSearchOpen || !innerQuery.trim() || !pdf) {
-      setInnerMatches([]);
-      setCurrentMatchIdx(-1);
-      return;
-    }
-
-    const abort = new AbortController();
-    const search = async () => {
-      setIsSearching(true);
-      const matches: Array<{ page: number; bbox: BoundingBox }> = [];
-      const query = innerQuery.toLowerCase();
-
-      try {
-        for (let i = 1; i <= pdf.numPages; i++) {
-          if (abort.signal.aborted) return;
-          const p = await pdf.getPage(i);
-          const textContent = await p.getTextContent();
-
-          for (const item of textContent.items) {
-            if ("str" in item) {
-              const text = item.str.toLowerCase();
-              if (text.includes(query)) {
-                const [scX, _skY, _skX, scY, tx, ty] = item.transform;
-                const vp = p.getViewport({ scale: 1 });
-
-                matches.push({
-                  page: i,
-                  bbox: {
-                    x: tx,
-                    y: vp.height - ty - scY,
-                    width: item.width || text.length * scX * 0.6,
-                    height: Math.abs(scY),
-                  },
-                });
-              }
-            }
-          }
-        }
-
-        if (!abort.signal.aborted) {
-          setInnerMatches(matches);
-          setCurrentMatchIdx(matches.length > 0 ? 0 : -1);
-          if (matches.length > 0) {
-            virtualizer.scrollToIndex(matches[0].page - 1, { align: "start" });
-          }
-        }
-      } catch (e) {
-        console.error("PDF inner search failed:", e);
-      } finally {
-        if (!abort.signal.aborted) setIsSearching(false);
-      }
-    };
-
-    const timeout = setTimeout(search, 300);
-    return () => {
-      abort.abort();
-      clearTimeout(timeout);
-    };
-  }, [innerQuery, isSearchOpen, pdf]);
-
-  useEffect(() => {
-    if (currentMatchIdx >= 0 && innerMatches[currentMatchIdx]) {
-      virtualizer.scrollToIndex(innerMatches[currentMatchIdx].page - 1, { align: "start" });
-    }
-  }, [currentMatchIdx, innerMatches]);
-
-  const handleNextMatch = () => {
-    if (innerMatches.length === 0) return;
-    setCurrentMatchIdx((prev) => (prev + 1) % innerMatches.length);
-  };
-
-  const handlePrevMatch = () => {
-    if (innerMatches.length === 0) return;
-    setCurrentMatchIdx((prev) => (prev - 1 + innerMatches.length) % innerMatches.length);
-  };
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
-        e.preventDefault();
-        setIsSearchOpen(true);
-        setTimeout(() => searchInputRef.current?.focus(), 50);
-      }
-      if (e.key === "Escape" && isSearchOpen) {
-        setIsSearchOpen(false);
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isSearchOpen]);
 
   return (
     <div className="h-full relative flex flex-col">
@@ -319,12 +229,8 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
                       renderTextLayer={true}
                       canvasBackground="transparent"
                       onRenderSuccess={() => {
-                        if (url !== activeUrlRef.current) return;
                         if (pageNum === page || (!page && pageNum === 1)) {
-                          if (!hasCalledRenderSuccess.current) {
-                            hasCalledRenderSuccess.current = true;
-                            onRenderSuccess?.();
-                          }
+                          onRenderSuccess?.();
                         }
                       }}
                       onLoadSuccess={

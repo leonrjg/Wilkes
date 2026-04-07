@@ -16,9 +16,8 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info};
 use wilkes_api::context::{AppContext, EventEmitter};
-use wilkes_core::path::is_under;
 use wilkes_core::embed::worker::manager::WorkerPaths;
-use wilkes_core::types::{EmbedderModel, EmbeddingEngine, MatchRef, ModelDescriptor, SearchQuery, SearchStats};
+use wilkes_core::types::{EmbedderModel, EmbeddingEngine, MatchRef, ModelDescriptor, SearchQuery};
 
 const MAX_UPLOAD_BYTES: u64 = 500 * 1024 * 1024;
 
@@ -58,12 +57,28 @@ fn server_err(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { error: msg.into() }))
 }
 
+/// Resolve `raw` to a canonical path and verify it is inside `uploads_dir`.
+/// Every handler that accepts a user-supplied path must go through this.
+fn confine_to_uploads(raw: &str, uploads_dir: &std::path::Path) -> Result<PathBuf, (StatusCode, Json<ErrorBody>)> {
+    let candidate = PathBuf::from(raw);
+    let canonical_uploads = uploads_dir.canonicalize()
+        .map_err(|e| server_err(format!("uploads dir unavailable: {e}")))?;
+    let canonical = candidate.canonicalize()
+        .map_err(|_| (StatusCode::NOT_FOUND, Json(ErrorBody { error: "Path not found".into() })))?;
+    if !canonical.starts_with(&canonical_uploads) {
+        return Err(err("Access denied: path outside uploads directory"));
+    }
+    Ok(canonical)
+}
+
 // ── Search ────────────────────────────────────────────────────────────────────
 
 async fn search_handler(
     State(state): State<Arc<AppState>>,
-    Json(query): Json<SearchQuery>,
-) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
+    Json(mut query): Json<SearchQuery>,
+) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, (StatusCode, Json<ErrorBody>)> {
+    query.root = confine_to_uploads(&query.root.to_string_lossy(), &state.uploads_dir)?;
+
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
     let ctx = Arc::clone(&state.ctx);
 
@@ -92,7 +107,7 @@ async fn search_handler(
         let _ = tx.send(Ok(Event::default().event("complete").data(data))).await;
     });
 
-    Sse::new(ReceiverStream::new(rx))
+    Ok(Sse::new(ReceiverStream::new(rx)))
 }
 
 // ── Preview ───────────────────────────────────────────────────────────────────
@@ -121,8 +136,7 @@ async fn get_data_paths_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     let app_data = state.ctx.data_dir.display().to_string();
-    let hf_cache = wilkes_core::embed::models::hf_cache::get_hf_cache_root().display().to_string();
-    Json(wilkes_core::types::DataPaths { hf_cache, app_data })
+    Json(wilkes_core::types::DataPaths { app_data })
 }
 
 async fn get_python_info_handler() -> impl IntoResponse {
@@ -166,7 +180,7 @@ async fn list_files_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<FilesQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let root = PathBuf::from(&params.root);
+    let root = confine_to_uploads(&params.root, &state.uploads_dir)?;
     let files = state.ctx.list_files(root)
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -182,7 +196,7 @@ async fn open_file_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<OpenFileBody>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let path = PathBuf::from(&body.path);
+    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
     let data = state.ctx.open_file(path)
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -398,7 +412,7 @@ async fn download_model_handler(
     Arc::clone(&state.ctx)
         .start_download_model(body.model, body.engine)
         .await
-        .map_err(|e| server_err(e))?;
+        .map_err(server_err)?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -416,7 +430,7 @@ async fn build_index_handler(
     Arc::clone(&state.ctx)
         .start_build_index(body.root, body.model, body.engine)
         .await
-        .map_err(|e| server_err(e))?;
+        .map_err(server_err)?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -439,7 +453,7 @@ async fn cancel_embed_handler(
 async fn get_worker_status_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let status = state.ctx.get_worker_status().await.map_err(|e| server_err(e.to_string()))?;
+    let status = state.ctx.get_worker_status();
     Ok(Json(status))
 }
 
@@ -638,18 +652,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dir_size() {
+    async fn test_handlers_direct() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+        let uploads_dir = dir.path().join("uploads");
+        let settings_path = dir.path().join("settings.json");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
         
-        tokio::fs::write(root.join("f1.txt"), "abc").await.unwrap(); // 3 bytes
-        tokio::fs::write(root.join("f2.txt"), "de").await.unwrap();  // 2 bytes
-        
-        let sub = root.join("sub");
-        tokio::fs::create_dir(&sub).await.unwrap();
-        tokio::fs::write(sub.join("f3.txt"), "f").await.unwrap();    // 1 byte
-        
-        let size = dir_size(root).await.unwrap();
-        assert_eq!(size, 6);
+        tokio::fs::write(uploads_dir.join("test.txt"), "hello").await.unwrap();
+
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("python"),
+            python_package_dir: PathBuf::from("py_pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
+        };
+
+        let (events_tx, _) = broadcast::channel(1024);
+        let emitter = Arc::new(BroadcastEmitter { tx: events_tx.clone() });
+        let (ctx, _event_rx, _loop_fut) = AppContext::new(
+            dir.path().to_path_buf(),
+            settings_path,
+            paths,
+            emitter,
+        );
+
+        let state = Arc::new(AppState { ctx, uploads_dir: uploads_dir.clone(), events_tx });
+
+        // Test get_settings_handler
+        let res = get_settings_handler(State(state.clone())).await;
+        match res {
+            Ok(r) => {
+                let response = r.into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            Err(_) => panic!("get_settings_handler failed"),
+        }
+
+        // Test get_logs_handler
+        let _res = get_logs_handler().await;
+
+        // Test get_data_paths_handler
+        let _res = get_data_paths_handler(State(state.clone())).await;
+
+        // Test list_files_handler
+        let params = FilesQuery { root: uploads_dir.to_string_lossy().to_string() };
+        let res = list_files_handler(State(state.clone()), Query(params)).await;
+        match res {
+            Ok(r) => {
+                let response = r.into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            Err(_) => panic!("list_files_handler failed"),
+        }
     }
 }

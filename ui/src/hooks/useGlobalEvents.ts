@@ -18,7 +18,7 @@ export function useGlobalEvents() {
       } else if (payload === "Reindexing") {
         if (!reindexToastId.current) {
           reindexToastId.current = addToast(
-            "Reindexing... Semantic search is temporarily unavailable",
+            "Indexing... Semantic search is temporarily unavailable",
             { type: "info", duration: 0, startTime: Date.now(), shimmer: true },
           );
         }

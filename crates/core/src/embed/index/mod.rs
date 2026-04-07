@@ -1,5 +1,5 @@
 pub mod chunk;
-pub mod index;
+pub mod db;
 pub mod watcher;
 
-pub use index::SemanticIndex;
+pub use db::SemanticIndex;

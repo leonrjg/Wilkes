@@ -199,7 +199,7 @@ function ModelList({ models, engine, filter, selectedModelId, activeModelId, siz
         </span>
       </div>
 
-      {/* Key forces DOM remount when engine or filter changes, preventing WebKit compositor staleness */}
+      {/* Key MUST be unique to avoid duplicate render issues - some engines like Fastembed return models with the same code */}
       <div key={`${engine}:${filter}`} className="flex flex-col gap-1 max-h-40 overflow-y-auto pr-1 custom-scrollbar">
         {sorted.length === 0 && (
           <span className="text-xs text-[var(--text-muted)] py-4 text-center">No models found for this engine</span>
@@ -208,7 +208,7 @@ function ModelList({ models, engine, filter, selectedModelId, activeModelId, siz
           const selected = selectedModelId === m.model_id;
           return (
             <button
-              key={`${engine}:${m.model_id}`}
+              key={`${engine}:${m.model_id}-${Math.random()}`}
               disabled={disabled}
               type="button"
               onClick={() => onSelect(m.model_id)}
@@ -673,8 +673,8 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       <section className="bg-[var(--bg-active)]/30 rounded-xl p-3 border border-[var(--border-main)] flex flex-col gap-3">
         {phase === "engine_mismatch" && (
           <div className="bg-amber-900/20 border border-amber-900/50 rounded-lg p-1">
-            <p className="text-[10px] leading-relaxed text-[var(--text-muted)]">
-              <center>Choosing this model and/or engine will trigger a reindex.</center>
+            <p className="text-center text-[10px] leading-relaxed text-[var(--text-muted)]">
+              Choosing this model and/or engine will trigger a reindex.
             </p>
           </div>
         )}

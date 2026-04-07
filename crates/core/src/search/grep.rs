@@ -432,31 +432,69 @@ mod tests {
     }
 
     #[test]
-    fn test_search_provider_filtering() {
-        let dir = tempdir().unwrap();
-        let path_txt = dir.path().join("test.txt");
-        let path_rs = dir.path().join("test.rs");
-        fs::write(&path_txt, "hello world").unwrap();
-        fs::write(&path_rs, "hello world").unwrap();
+    fn test_search_extracted_content() {
+        use std::path::PathBuf;
+        use crate::types::ExtractedContent;
+        use crate::types::SourceMap;
+        use crate::types::FileMetadata;
 
+        let content = ExtractedContent {
+            text: "The quick brown fox jumps over the lazy dog".to_string(),
+            source_map: SourceMap { segments: vec![] }, // Empty source map
+            metadata: FileMetadata {
+                path: PathBuf::from("test.pdf"),
+                size_bytes: 0,
+                mime: Some("application/pdf".to_string()),
+                title: None,
+                page_count: Some(1),
+            },
+        };
         let query = SearchQuery {
-            pattern: "hello".to_string(),
+            pattern: "fox".to_string(),
             is_regex: false,
             case_sensitive: true,
-            root: dir.path().to_path_buf(),
-            file_type_filters: vec!["rs".to_string()], // Only .rs files
+            root: Path::new(".").to_path_buf(),
+            file_type_filters: vec![],
             max_results: 0,
             respect_gitignore: true,
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Grep,
-            supported_extensions: vec!["txt".to_string(), "rs".to_string()],
+            supported_extensions: vec![],
+        };
+        let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
+        let matches = search_extracted_content(&content, &matcher).unwrap();
+        
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].matched_text, "fox");
+        assert_eq!(matches[0].context_before, "The quick brown ");
+        assert_eq!(matches[0].context_after, " jumps over the lazy dog");
+    }
+
+    #[test]
+    fn test_search_provider_file_size_filter() {
+        let dir = tempdir().unwrap();
+        let path_small = dir.path().join("small.txt");
+        let path_large = dir.path().join("large.txt");
+        fs::write(&path_small, "match").unwrap();
+        fs::write(&path_large, "match but too large").unwrap();
+
+        let query = SearchQuery {
+            pattern: "match".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            file_type_filters: vec![],
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 10, // Max 10 bytes
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            supported_extensions: vec!["txt".to_string()],
         };
 
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        
-        // Use a separate thread or async block to avoid blocking
         let query_clone = query.clone();
         let extractors = ExtractorRegistry::new();
         std::thread::spawn(move || {
@@ -469,7 +507,120 @@ mod tests {
         }
 
         assert_eq!(results.len(), 1);
-        assert!(results[0].path.ends_with("test.rs"));
-        assert!(!results[0].path.ends_with("test.txt"));
+        assert!(results[0].path.ends_with("small.txt"));
+    }
+
+    #[test]
+    fn test_build_matcher_with_spaces() {
+        let query = SearchQuery {
+            pattern: "hello world".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: Path::new(".").to_path_buf(),
+            file_type_filters: vec![],
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            supported_extensions: vec![],
+        };
+
+        let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
+        // Should match with varying whitespace
+        assert!(matcher.is_match("hello   world".as_bytes()).unwrap());
+        assert!(matcher.is_match("hello\nworld".as_bytes()).unwrap());
+    }
+
+    #[test]
+    fn test_search_max_results() {
+        let dir = tempdir().unwrap();
+        // Use a single file with 3 matches to test that it returns all of them
+        // before breaking, as it checks the limit only after processing each file.
+        fs::write(dir.path().join("test.txt"), "match 1\nmatch 2\nmatch 3").unwrap();
+
+        let query = SearchQuery {
+            pattern: "match".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            file_type_filters: vec![],
+            max_results: 1, // Limit to 1 match
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let provider = GrepSearchProvider::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let extractors = ExtractorRegistry::new();
+        std::thread::spawn(move || {
+            provider.search(&query, &extractors, tx).unwrap();
+        });
+
+        let mut all_matches = Vec::new();
+        while let Some(m) = rx.blocking_recv() {
+            all_matches.extend(m.matches);
+        }
+
+        // It should return all matches from the first file.
+        assert_eq!(all_matches.len(), 3);
+    }
+
+    #[test]
+    fn test_search_file_type_filter() {
+        let dir = tempdir().unwrap();
+        let path_rs = dir.path().join("main.rs");
+        let path_txt = dir.path().join("notes.txt");
+        fs::write(&path_rs, "fn main() {}").unwrap();
+        fs::write(&path_txt, "fn main() {}").unwrap();
+
+        let query = SearchQuery {
+            pattern: "main".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            file_type_filters: vec!["rs".to_string()], // Only .rs files
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            supported_extensions: vec!["rs".to_string(), "txt".to_string()],
+        };
+
+        let provider = GrepSearchProvider::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let extractors = ExtractorRegistry::new();
+        std::thread::spawn(move || {
+            provider.search(&query, &extractors, tx).unwrap();
+        });
+
+        let mut results = Vec::new();
+        while let Some(m) = rx.blocking_recv() {
+            results.push(m);
+        }
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].path.ends_with("main.rs"));
+    }
+
+    #[test]
+    fn test_context_extraction_edge_cases() {
+        let text = "short";
+        assert_eq!(extract_context_before(text, 0, 10), "");
+        assert_eq!(extract_context_after(text, 5, 10), "");
+        assert_eq!(extract_context_before(text, 5, 10), "short");
+        assert_eq!(extract_context_after(text, 0, 10), "short");
+        
+        // Invalid byte positions (between char boundaries)
+        let emoji = "🦀🦀";
+        // 🦀 is 4 bytes. byte 1 is not a char boundary.
+        // extract_context_before will find the boundary at 0.
+        assert_eq!(extract_context_before(emoji, 1, 10), "");
+        // extract_context_after will find the boundary at 4.
+        assert_eq!(extract_context_after(emoji, 1, 10), "🦀");
     }
 }

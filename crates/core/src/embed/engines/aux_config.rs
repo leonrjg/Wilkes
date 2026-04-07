@@ -58,6 +58,55 @@ pub fn load_prefixes(cache_root: &Path, model_id: &str) -> EmbedderConfig {
     config
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_parse_st_config() {
+        let content = r#"{
+            "prompts": {
+                "query": "query: ",
+                "passage": "passage: ",
+                "other": "ignored"
+            }
+        }"#;
+        let mut config = EmbedderConfig::default();
+        parse_st_config(content, &mut config);
+        assert_eq!(config.query_prefix, "query: ");
+        assert_eq!(config.passage_prefix, "passage: ");
+    }
+
+    #[test]
+    fn test_parse_st_config_alt_keys() {
+        let content = r#"{
+            "prompts": {
+                "search_query": "q:",
+                "doc": "d:"
+            }
+        }"#;
+        let mut config = EmbedderConfig::default();
+        parse_st_config(content, &mut config);
+        assert_eq!(config.query_prefix, "q:");
+        assert_eq!(config.passage_prefix, "d:");
+    }
+
+    #[test]
+    fn test_embedder_config_default() {
+        let config = EmbedderConfig::default();
+        assert!(config.query_prefix.is_empty());
+        assert!(config.passage_prefix.is_empty());
+    }
+
+    #[test]
+    fn test_fetch_aux_configs_invalid_path() {
+        // Should not panic, just log debug
+        fetch_aux_configs(Path::new("/non/existent/path/12345"), "test/model");
+    }
+}
+
 /// Download all auxiliary config files for `model_id` into `cache_dir`.
 /// Best-effort: individual failures are logged at debug level and never propagate.
 pub fn fetch_aux_configs(cache_dir: &Path, model_id: &str) {

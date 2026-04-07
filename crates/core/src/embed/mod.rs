@@ -10,10 +10,13 @@ pub use worker::manager as worker_manager;
 
 use std::sync::Arc;
 
+use crate::types::EmbeddingEngine;
+
 pub trait Embedder: Send + Sync {
     fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>>;
     fn model_id(&self) -> &str;
     fn dimension(&self) -> usize;
+    fn engine(&self) -> EmbeddingEngine;
 
     /// Suggested batch size for this model.
     /// `None` means the entire input should be embedded as a single batch
@@ -56,6 +59,10 @@ mod tests {
 
         fn dimension(&self) -> usize {
             2
+        }
+
+        fn engine(&self) -> EmbeddingEngine {
+            EmbeddingEngine::Candle
         }
     }
 

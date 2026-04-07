@@ -93,10 +93,11 @@ describe("HttpSearchApi", () => {
     expect(controller.abort).toHaveBeenCalled();
   });
 
-  it("onEmbedProgress sets up EventSource", async () => {
+  it("onEmbedProgress sets up EventSource and calls handler", async () => {
     const handler = vi.fn();
     const mockEventSource = {
       addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
       close: vi.fn(),
     };
     vi.stubGlobal("EventSource", vi.fn(function() { return mockEventSource; }));
@@ -105,13 +106,37 @@ describe("HttpSearchApi", () => {
     expect(EventSource).toHaveBeenCalledWith("/api/embed/events");
     expect(mockEventSource.addEventListener).toHaveBeenCalledWith("embed-progress", expect.any(Function));
 
-    // Trigger the listener
     const listener = mockEventSource.addEventListener.mock.calls[0][1];
     listener({ data: JSON.stringify({ progress: 0.5 }) });
     expect(handler).toHaveBeenCalledWith({ progress: 0.5 });
 
     close();
     expect(mockEventSource.close).toHaveBeenCalled();
+  });
+
+  it("shares one EventSource across all embed subscriptions", async () => {
+    const mockEventSource = {
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      close: vi.fn(),
+    };
+    vi.stubGlobal("EventSource", vi.fn(function() { return mockEventSource; }));
+
+    const c1 = await api.onEmbedProgress(vi.fn());
+    const c2 = await api.onEmbedDone(vi.fn());
+    const c3 = await api.onEmbedError(vi.fn());
+    const c4 = await api.onManagerEvent(vi.fn());
+
+    // Only one EventSource should have been created
+    expect(EventSource).toHaveBeenCalledTimes(1);
+
+    // Closing all but the last should not close the connection
+    c1(); c2(); c3();
+    expect(mockEventSource.close).not.toHaveBeenCalled();
+
+    // Closing the last one should close it
+    c4();
+    expect(mockEventSource.close).toHaveBeenCalledTimes(1);
   });
 });
 

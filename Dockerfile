@@ -80,6 +80,8 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     libfontconfig1 \
     libfreetype6 \
+    python3 \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /app/dist /data
@@ -87,6 +89,10 @@ RUN mkdir -p /app/dist /data
 COPY --from=rust-builder /wilkes-server /app/wilkes-server
 COPY --from=rust-builder /wilkes-rust-worker /app/wilkes-rust-worker
 COPY --from=ui-builder /build/ui/dist /app/dist
+COPY crates/worker/wilkes_python_worker /app/worker/wilkes_python_worker
+COPY crates/worker/requirements.txt /app/worker/requirements.txt
+
+ENV RUST_LOG=info,hf_hub=warn
 
 VOLUME /data
 EXPOSE 3000

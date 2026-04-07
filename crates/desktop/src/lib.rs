@@ -40,8 +40,7 @@ async fn get_data_paths(app: AppHandle) -> Result<DataPaths, String> {
     let app_data = app.path().app_data_dir()
         .map(|p| p.display().to_string())
         .map_err(|e| e.to_string())?;
-    let hf_cache = wilkes_core::embed::models::hf_cache::get_hf_cache_root().display().to_string();
-    Ok(DataPaths { hf_cache, app_data })
+    Ok(DataPaths { app_data })
 }
 
 #[tauri::command]
@@ -215,9 +214,9 @@ async fn delete_index(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn get_worker_status(app: AppHandle) -> Result<WorkerStatus, String> {
+fn get_worker_status(app: AppHandle) -> WorkerStatus {
     let ctx = app.state::<Arc<AppContext>>().inner().clone();
-    ctx.get_worker_status().await.map_err(|e| e.to_string())
+    ctx.get_worker_status()
 }
 
 #[tauri::command]

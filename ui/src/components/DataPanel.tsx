@@ -169,29 +169,6 @@ export default function DataPanel({ api }: Props) {
         </div>
       </section>
 
-      <section>
-        <div className="flex flex-col gap-1.5 mb-4">
-          <h3 className="text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">HuggingFace Cache</h3>
-          <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">
-            Where SBERT models are downloaded and stored.
-          </p>
-        </div>
-
-        <div className="p-3 bg-[var(--bg-active)] rounded-lg border border-[var(--border-main)] flex flex-col gap-3">
-          <div className="flex flex-col gap-1">
-            <span className="text-[10px] text-[var(--text-dim)] uppercase font-bold tracking-tighter">Path</span>
-            <span className="text-[10px] text-[var(--text-main)] font-mono break-all selectable">
-              {paths.hf_cache}
-            </span>
-          </div>
-          <button
-            onClick={() => onOpen(paths.hf_cache)}
-            className="w-fit px-3 py-1.5 bg-[var(--bg-app)] hover:bg-[var(--bg-active)] text-[var(--text-main)] text-[10px] font-bold uppercase tracking-wider rounded border border-[var(--border-main)] transition-colors"
-          >
-            Open in File Manager
-          </button>
-        </div>
-      </section>
     </div>
   );
 }

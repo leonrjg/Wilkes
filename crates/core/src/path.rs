@@ -25,7 +25,7 @@ pub fn is_under(path: &Path, base: &Path) -> bool {
 pub fn normalize_path(path: &Path) -> PathBuf {
     let mut components = path.components().peekable();
     let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek() {
-        let c = c.clone();
+        let c = *c;
         components.next();
         PathBuf::from(c.as_os_str())
     } else {
@@ -137,6 +137,11 @@ mod tests {
         assert_eq!(normalize_path(Path::new("/a/b/../c")), PathBuf::from("/a/c"));
         assert_eq!(normalize_path(Path::new("a/./b")), PathBuf::from("a/b"));
         assert_eq!(normalize_path(Path::new("a/b/c/../..")), PathBuf::from("a"));
+        assert_eq!(normalize_path(Path::new("/")), PathBuf::from("/"));
+        assert_eq!(normalize_path(Path::new(".")), PathBuf::from(""));
+        assert_eq!(normalize_path(Path::new("")), PathBuf::from(""));
+        assert_eq!(normalize_path(Path::new("a/b/../../c")), PathBuf::from("c"));
+        assert_eq!(normalize_path(Path::new("/../../a")), PathBuf::from("/a"));
     }
 
     #[test]
@@ -151,6 +156,21 @@ mod tests {
         
         let outside = Path::new("/tmp/some_other_dir_12345");
         assert!(!is_under(outside, base));
+
+        // Non-existent
+        assert!(!is_under(&base.join("nonexistent"), base));
+    }
+
+    #[test]
+    fn test_resolve_python_invalid_env() {
+        std::env::set_var("WILKES_PYTHON", "/tmp/nonexistent_python_12345");
+        let result = resolve_python();
+        // It might still succeed if it falls back to system path, 
+        // but we want to check that it didn't use the invalid env var immediately.
+        if let Ok(p) = result {
+            assert_ne!(p, PathBuf::from("/tmp/nonexistent_python_12345"));
+        }
+        std::env::remove_var("WILKES_PYTHON");
     }
 
     #[test]

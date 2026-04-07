@@ -7,6 +7,7 @@ use super::super::Embedder;
 use super::super::models::installer::{EmbedderInstaller, ProgressTx};
 use super::super::worker::manager::{WorkerManager, ManagerCommand};
 use super::super::worker::ipc::{WorkerRequest, WorkerEvent};
+use super::super::worker::embedder::{WorkerEmbedder, WorkerEmbedderConfig};
 use super::aux_config;
 
 // ── Static model catalog ──────────────────────────────────────────────────────
@@ -95,7 +96,18 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
     },
 ];
 
-pub fn list_supported_models() -> Vec<ModelDescriptor> {
+/// Check if a model has been downloaded into `data_dir` by looking for the
+/// HF cache snapshot directory (`models--org--repo/snapshots/<hash>/`).
+fn is_sbert_model_cached(data_dir: &Path, model_id: &str) -> bool {
+    let folder = format!("models--{}", model_id.replace('/', "--"));
+    let snapshots = data_dir.join(folder).join("snapshots");
+    snapshots.is_dir()
+        && std::fs::read_dir(&snapshots)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+}
+
+pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
     PREEXISTING_MODELS
         .iter()
         .map(|info| ModelDescriptor {
@@ -103,113 +115,13 @@ pub fn list_supported_models() -> Vec<ModelDescriptor> {
             display_name: info.display_name.to_string(),
             description: info.description.to_string(),
             dimension: info.dimension,
-            is_cached: false,
+            is_cached: is_sbert_model_cached(data_dir, info.model_id),
             is_default: info.is_default,
             is_recommended: info.is_recommended,
             size_bytes: None,
             preferred_batch_size: Some(32),
         })
         .collect()
-}
-
-// ── WorkerEmbedder ────────────────────────────────────────────────────────────
-
-/// Implements `Embedder` by dispatching to a worker subprocess via `WorkerManager`.
-/// Used by SBERT (Python worker), Fastembed, and Candle (Rust worker binary).
-pub struct WorkerEmbedder {
-    manager: WorkerManager,
-    model_id: String,
-    dimension: usize,
-    device: String,
-    engine: EmbeddingEngine,
-    /// Passed in embed requests so the worker can load the model on demand.
-    data_dir: std::path::PathBuf,
-    query_prefix: String,
-    passage_prefix: String,
-}
-
-impl WorkerEmbedder {
-    pub fn new(
-        manager: WorkerManager,
-        model_id: String,
-        dimension: usize,
-        device: String,
-        engine: EmbeddingEngine,
-        data_dir: std::path::PathBuf,
-        query_prefix: String,
-        passage_prefix: String,
-    ) -> Self {
-        Self { manager, model_id, dimension, device, engine, data_dir, query_prefix, passage_prefix }
-    }
-
-    fn send_embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let request = WorkerRequest {
-            mode: "embed".to_string(),
-            root: std::path::PathBuf::new(),
-            engine: self.engine,
-            model: self.model_id.clone(),
-            data_dir: self.data_dir.clone(),
-            chunk_size: None,
-            chunk_overlap: None,
-            device: self.device.clone(),
-            paths: None,
-            texts: Some(texts.iter().map(|s| s.to_string()).collect()),
-            supported_extensions: Vec::new(),
-        };
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let cmd = ManagerCommand::Submit { req: request, reply: tx };
-
-        let handle = tokio::runtime::Handle::current();
-        handle.block_on(async move {
-            self.manager.send(cmd).await
-                .map_err(|e| anyhow::anyhow!("Failed to send command to manager: {e}"))?;
-
-            while let Some(event) = rx.recv().await {
-                match event {
-                    WorkerEvent::Embeddings(vecs) => return Ok(vecs),
-                    WorkerEvent::Error(err) => return Err(anyhow::anyhow!("Worker error: {}", err)),
-                    WorkerEvent::Done => break,
-                    _ => {}
-                }
-            }
-            Err(anyhow::anyhow!("Worker finished without returning embeddings"))
-        })
-    }
-}
-
-impl Embedder for WorkerEmbedder {
-    fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        self.send_embed(texts)
-    }
-
-    fn embed_query(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        if self.query_prefix.is_empty() {
-            self.send_embed(texts)
-        } else {
-            let prefixed: Vec<String> = texts.iter().map(|t| format!("{}{t}", self.query_prefix)).collect();
-            let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
-            self.send_embed(&refs)
-        }
-    }
-
-    fn embed_passages(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        if self.passage_prefix.is_empty() {
-            self.send_embed(texts)
-        } else {
-            let prefixed: Vec<String> = texts.iter().map(|t| format!("{}{t}", self.passage_prefix)).collect();
-            let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
-            self.send_embed(&refs)
-        }
-    }
-
-    fn model_id(&self) -> &str {
-        &self.model_id
-    }
-
-    fn dimension(&self) -> usize {
-        self.dimension
-    }
 }
 
 // ── SBERTInstaller ───────────────────────────────────────────────────────────
@@ -263,9 +175,9 @@ impl EmbedderInstaller for SBERTInstaller {
             supported_extensions: Vec::new(),
         };
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let cmd = ManagerCommand::Submit {
-            req: request,
+            req: Box::new(request),
             reply: tx,
         };
 
@@ -317,19 +229,19 @@ impl EmbedderInstaller for SBERTInstaller {
                 model_id
             ))?;
 
-        // sentence_transformers downloads full repo snapshots to the global HF cache.
-        let hf_cache = super::super::models::hf_cache::get_hf_cache_root();
-        let prefixes = aux_config::load_prefixes(&hf_cache, model_id);
+        let prefixes = aux_config::load_prefixes(_data_dir, model_id);
 
         Ok(Arc::new(WorkerEmbedder::new(
             self.manager.clone(),
-            model_id.to_string(),
-            dimension,
-            self.device.clone(),
-            EmbeddingEngine::SBERT,
-            std::path::PathBuf::new(),
-            prefixes.query_prefix,
-            prefixes.passage_prefix,
+            WorkerEmbedderConfig {
+                model_id: model_id.to_string(),
+                dimension,
+                device: self.device.clone(),
+                engine: EmbeddingEngine::SBERT,
+                data_dir: std::path::PathBuf::new(),
+                query_prefix: prefixes.query_prefix,
+                passage_prefix: prefixes.passage_prefix,
+            },
         )))
     }
 }

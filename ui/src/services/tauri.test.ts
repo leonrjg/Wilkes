@@ -126,10 +126,10 @@ describe("TauriSearchApi", () => {
   });
 
   it("should call get_data_paths", async () => {
-    (invoke as any).mockResolvedValue({ app_data: "/app", hf_cache: "/hf" });
+    (invoke as any).mockResolvedValue({ app_data: "/app" });
     const result = await api.getDataPaths();
     expect(invoke).toHaveBeenCalledWith("get_data_paths");
-    expect(result).toEqual({ app_data: "/app", hf_cache: "/hf" });
+    expect(result).toEqual({ app_data: "/app" });
   });
 
   it("should call open_path", async () => {

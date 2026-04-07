@@ -17,6 +17,7 @@ import type {
   SearchStats,
   Settings,
 } from "../lib/types";
+import { randomId } from "../lib/types";
 import type { SearchApi, DesktopSourceApi, DataPaths } from "./api";
 
 export class TauriSearchApi implements SearchApi {
@@ -28,7 +29,7 @@ export class TauriSearchApi implements SearchApi {
     // Generate the ID here so we can register listeners before the backend
     // starts emitting, eliminating the race where search-complete fires before
     // the listener exists.
-    const searchId = crypto.randomUUID();
+    const searchId = randomId();
 
     const unlistenResult = await listen<FileMatches>(
       `search-result-${searchId}`,

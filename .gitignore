@@ -1,5 +1,8 @@
 # General
 **/*.log*
+**/data
+**/coverage
+**/lcov.info
 
 # OS
 **/.DS_Store

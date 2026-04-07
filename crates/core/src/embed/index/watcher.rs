@@ -7,18 +7,11 @@ use notify_debouncer_mini::new_debouncer;
 use tracing::{error, info};
 
 use crate::extract::ExtractorRegistry;
+use crate::types::IndexingConfig;
 use super::super::Embedder;
 use super::SemanticIndex;
 
 // ── IndexWatcher ──────────────────────────────────────────────────────────────
-
-pub struct WatcherConfig {
-    pub manager: crate::embed::worker::manager::WorkerManager,
-    pub model_id: String,
-    pub data_dir: PathBuf,
-    pub device: String,
-    pub supported_extensions: Vec<String>,
-}
 
 pub struct IndexWatcher {
     debouncer: Option<notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>>,
@@ -31,11 +24,8 @@ impl IndexWatcher {
         root: PathBuf,
         index: Arc<Mutex<Option<SemanticIndex>>>,
         extractors: Arc<ExtractorRegistry>,
-        embedder: Option<Arc<dyn Embedder>>,
-        config: Option<WatcherConfig>,
-        chunk_size: usize,
-        chunk_overlap: usize,
-        supported_extensions: Vec<String>,
+        embedder: Arc<dyn Embedder>,
+        config: IndexingConfig,
         on_reindex: impl Fn() + Send + Sync + 'static,
         on_reindex_done: impl Fn() + Send + Sync + 'static,
     ) -> anyhow::Result<Self> {
@@ -58,8 +48,7 @@ impl IndexWatcher {
                         let mut removed_paths = Vec::new();
 
                         for event in events {
-                            // Only care about supported extensions
-                            if crate::types::FileType::detect(&event.path, &supported_extensions).is_none() && event.path.exists() {
+                            if crate::types::FileType::detect(&event.path, &config.supported_extensions).is_none() && event.path.exists() {
                                 continue;
                             }
 
@@ -86,16 +75,9 @@ impl IndexWatcher {
                         // Handle additions/modifications
                         if !changed_paths.is_empty() {
                             on_reindex();
-                            if let Some(ref emb) = embedder {
-                                for path in changed_paths {
-                                    handle_event(&path, &index, &extractors, emb, chunk_size, chunk_overlap);
-                                }
-                            } else if let Some(ref cfg) = config {
-                                // SBERT engine: spawn worker for the batch
-                                info!("[IndexWatcher] Spawning SBERT worker for incremental update: {} files", changed_paths.len());
-                                if let Err(e) = spawn_sbert_worker(cfg, &changed_paths, chunk_size, chunk_overlap) {
-                                    error!("[IndexWatcher] Failed to spawn SBERT worker: {e:#}");
-                                }
+                            info!("[IndexWatcher] incremental update: {} files changed", changed_paths.len());
+                            for path in changed_paths {
+                                handle_event(&path, &index, &extractors, &embedder, config.chunk_size, config.chunk_overlap);
                             }
                             on_reindex_done();
                         }
@@ -127,50 +109,6 @@ impl Drop for IndexWatcher {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-fn spawn_sbert_worker(
-    cfg: &WatcherConfig,
-    paths: &[PathBuf],
-    chunk_size: usize,
-    chunk_overlap: usize,
-) -> anyhow::Result<()> {
-    use crate::embed::worker::ipc::WorkerRequest;
-    use crate::types::EmbeddingEngine;
-
-    let request = WorkerRequest {
-        mode: "build".to_string(),
-        root: PathBuf::new(), // Not used for incremental
-        engine: EmbeddingEngine::SBERT,
-        model: cfg.model_id.clone(),
-        data_dir: cfg.data_dir.clone(),
-        chunk_size: Some(chunk_size),
-        chunk_overlap: Some(chunk_overlap),
-        device: cfg.device.clone(),
-        paths: Some(paths.to_vec()),
-        texts: None,
-        supported_extensions: cfg.supported_extensions.clone(),
-    };
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-    let cmd = crate::embed::worker::manager::ManagerCommand::Submit {
-        req: request,
-        reply: tx,
-    };
-
-    cfg.manager.blocking_send(cmd)
-        .map_err(|e| anyhow::anyhow!("Failed to send to worker manager: {e}"))?;
-
-    // Wait for worker to finish (incremental updates should be fast)
-    while let Some(event) = rx.blocking_recv() {
-        match event {
-            crate::embed::worker::ipc::WorkerEvent::Done => break,
-            crate::embed::worker::ipc::WorkerEvent::Error(e) => anyhow::bail!("SBERT worker error: {e}"),
-            _ => {}
-        }
-    }
-
-    Ok(())
 }
 
 // ── Event handler ─────────────────────────────────────────────────────────────
@@ -251,22 +189,34 @@ fn try_open_exclusive(path: &std::path::Path, max_attempts: u32, base_delay: Dur
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use crate::types::EmbeddingEngine;
+
+    struct StubEmbedder;
+    impl Embedder for StubEmbedder {
+        fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![]) }
+        fn model_id(&self) -> &str { "stub" }
+        fn dimension(&self) -> usize { 1 }
+        fn engine(&self) -> EmbeddingEngine { EmbeddingEngine::Candle }
+    }
 
     #[test]
     fn test_index_watcher_start_stop() {
         let dir = tempdir().unwrap();
         let index = Arc::new(Mutex::new(None));
         let registry = Arc::new(ExtractorRegistry::new());
-        
+        let embedder = Arc::new(StubEmbedder);
+        let config = IndexingConfig {
+            chunk_size: 100,
+            chunk_overlap: 10,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
         let mut watcher = IndexWatcher::start(
             dir.path().to_path_buf(),
             index,
             registry,
-            None,
-            None,
-            100,
-            10,
-            vec!["txt".to_string()],
+            embedder,
+            config,
             || {},
             || {},
         ).unwrap();
@@ -278,20 +228,62 @@ mod tests {
     fn test_index_watcher_invalid_path() {
         let index = Arc::new(Mutex::new(None));
         let registry = Arc::new(ExtractorRegistry::new());
-        
+        let embedder = Arc::new(StubEmbedder);
+        let config = IndexingConfig {
+            chunk_size: 100,
+            chunk_overlap: 10,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
         let result = IndexWatcher::start(
             PathBuf::from("/non/existent/path/for/watcher"),
             index,
             registry,
-            None,
-            None,
-            100,
-            10,
-            vec!["txt".to_string()],
+            embedder,
+            config,
             || {},
             || {},
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_open_exclusive() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "test").unwrap();
+        
+        let res = try_open_exclusive(&path, 3, Duration::from_millis(1));
+        assert!(res.is_ok());
+
+        let non_existent = dir.path().join("none.txt");
+        let res2 = try_open_exclusive(&non_existent, 2, Duration::from_millis(1));
+        assert!(res2.is_err());
+    }
+
+    #[test]
+    fn test_handle_event_basics() {
+        let dir = tempdir().unwrap();
+        let index = Arc::new(Mutex::new(None));
+        let registry = Arc::new(ExtractorRegistry::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        
+        let path = dir.path().join("test.txt");
+        
+        // 1. Non-existent path (simulates removal)
+        handle_event(&path, &index, &registry, &embedder, 100, 10);
+        // Should not panic, but nothing to remove from index yet
+        
+        // 2. Directory instead of file
+        let sub_dir = dir.path().join("sub");
+        std::fs::create_dir(&sub_dir).unwrap();
+        handle_event(&sub_dir, &index, &registry, &embedder, 100, 10);
+        // Should return early
+        
+        // 3. Actual file (prepare_file will fail if no extractor or embedder returns nothing)
+        std::fs::write(&path, "hello").unwrap();
+        handle_event(&path, &index, &registry, &embedder, 100, 10);
+        // Should log error but not panic (prepare_file fails because StubEmbedder returns 0 vectors)
     }
 }

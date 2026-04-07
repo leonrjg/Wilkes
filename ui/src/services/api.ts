@@ -16,7 +16,6 @@ import type {
 } from "../lib/types";
 
 export interface DataPaths {
-  hf_cache: string;
   app_data: string;
 }
 
