@@ -127,7 +127,7 @@ describe("SemanticPanel", () => {
       render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
     });
 
-    const downloadBtn = screen.getByText(/Download Model/i);
+    const downloadBtn = screen.getByText(/Download model and index files/i);
     await act(async () => {
       fireEvent.click(downloadBtn);
     });
@@ -148,8 +148,90 @@ describe("SemanticPanel", () => {
       doneHandler({ operation: "Download" });
     });
 
-    // Should return to ready phase
-    expect(screen.queryByText(/Downloading…/)).not.toBeInTheDocument();
+    expect(mockApi.buildIndex).toHaveBeenCalledWith("/test", "not-cached", "Candle");
+    expect(screen.getByText(/Cancel build/i)).toBeInTheDocument();
+  });
+
+  it("does not start a queued build after cancelling a download", async () => {
+    mockApi.listModels.mockResolvedValue([
+      { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
+    ]);
+    mockApi.getSettings.mockResolvedValue({
+      semantic: { ...defaultSettings.semantic, model: "not-cached" }
+    });
+
+    await act(async () => {
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText(/Download model and index files/i));
+    });
+
+    await act(async () => {
+      progressHandler({ Download: { bytes_received: 25000000, total_bytes: 50000000 } });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText(/Cancel download/i));
+    });
+
+    expect(mockApi.cancelEmbed).toHaveBeenCalled();
+
+    await act(async () => {
+      doneHandler({ operation: "Download" });
+    });
+
+    expect(mockApi.buildIndex).not.toHaveBeenCalled();
+    expect(screen.getByText(/Download model and index files/i)).toBeInTheDocument();
+  });
+
+  it("clears the queued build when download emits an error", async () => {
+    mockApi.listModels.mockResolvedValue([
+      { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
+    ]);
+    mockApi.getSettings.mockResolvedValue({
+      semantic: { ...defaultSettings.semantic, model: "not-cached" }
+    });
+
+    await act(async () => {
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText(/Download model and index files/i));
+    });
+
+    await act(async () => {
+      errorHandler({ message: "Download failed", operation: "Download" });
+    });
+
+    expect(await screen.findByText("Download failed")).toBeInTheDocument();
+
+    await act(async () => {
+      doneHandler({ operation: "Download" });
+    });
+
+    expect(mockApi.buildIndex).not.toHaveBeenCalled();
+  });
+
+  it("returns to idle after a plain download completion with no queued build", async () => {
+    await act(async () => {
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+    });
+
+    await act(async () => {
+      progressHandler({ Download: { bytes_received: 25000000, total_bytes: 50000000 } });
+    });
+
+    expect(screen.getByText(/Cancel download/i)).toBeInTheDocument();
+
+    await act(async () => {
+      doneHandler({ operation: "Download" });
+    });
+
+    expect(mockApi.buildIndex).not.toHaveBeenCalled();
+    expect(screen.getByText(/Build semantic index/i)).toBeInTheDocument();
   });
 
   it("shows indexing progress via events", async () => {

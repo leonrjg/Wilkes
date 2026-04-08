@@ -24,6 +24,12 @@ interface ProgressState {
   total: number;
 }
 
+interface PendingBuild {
+  directory: string;
+  model: EmbedderModel;
+  engine: EmbeddingEngine;
+}
+
 interface PanelState {
   settings: SemanticSettings | null;
   /** Models returned by the backend — only valid for the current engine. */
@@ -39,6 +45,8 @@ interface PanelState {
   supportedEngines: EmbeddingEngine[];
   pythonPath: string | null;
   pythonError: string | null;
+  pendingBuild: PendingBuild | null;
+  buildRequest: PendingBuild | null;
 }
 
 const INITIAL_STATE: PanelState = {
@@ -54,6 +62,8 @@ const INITIAL_STATE: PanelState = {
   supportedEngines: [],
   pythonPath: null,
   pythonError: null,
+  pendingBuild: null,
+  buildRequest: null,
 };
 
 type Action =
@@ -71,7 +81,10 @@ type Action =
   | { type: "cancel_failed" }
   | { type: "index_deleted" }
   | { type: "python_info"; pythonPath: string | null; pythonError: string | null }
-  | { type: "model_size_fetched"; modelId: string; sizeBytes: number };
+  | { type: "model_size_fetched"; modelId: string; sizeBytes: number }
+  | { type: "queue_build"; build: PendingBuild }
+  | { type: "launch_pending_build" }
+  | { type: "build_request_dispatched" };
 
 function reducer(state: PanelState, action: Action): PanelState {
   switch (action.type) {
@@ -102,11 +115,21 @@ function reducer(state: PanelState, action: Action): PanelState {
         error: null,
         isCancelling: false,
         indexStatus: action.indexStatus ?? state.indexStatus,
+        pendingBuild: null,
+        buildRequest: null,
       };
     case "op_error":
-      return { ...state, activeOp: null, progress: null, isCancelling: false, error: action.message || null };
+      return {
+        ...state,
+        activeOp: null,
+        progress: null,
+        isCancelling: false,
+        error: action.message || null,
+        pendingBuild: null,
+        buildRequest: null,
+      };
     case "cancel_started":
-      return { ...state, isCancelling: true };
+      return { ...state, isCancelling: true, pendingBuild: null, buildRequest: null };
     case "cancel_failed":
       return { ...state, isCancelling: false };
     case "index_deleted":
@@ -120,6 +143,21 @@ function reducer(state: PanelState, action: Action): PanelState {
           m.model_id === action.modelId ? { ...m, size_bytes: action.sizeBytes } : m,
         ),
       };
+    case "queue_build":
+      return { ...state, pendingBuild: action.build };
+    case "launch_pending_build":
+      if (!state.pendingBuild) return state;
+      return {
+        ...state,
+        pendingBuild: null,
+        buildRequest: state.pendingBuild,
+        activeOp: "building",
+        progress: { current: 0, total: 0 },
+        error: null,
+        isCancelling: false,
+      };
+    case "build_request_dispatched":
+      return { ...state, buildRequest: null };
     default:
       return state;
   }
@@ -279,7 +317,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   // Bumped to re-trigger model + index fetches after async ops (download, build, etc.)
   const [fetchEpoch, setFetchEpoch] = useState(0);
 
-  const { settings, indexStatus, isEngineAvailable, backendModels, supportedEngines } = state;
+  const { settings, indexStatus, isEngineAvailable, backendModels, supportedEngines, pendingBuild, buildRequest } = state;
   const effectiveModel = pendingModel ?? settings?.model;
   const phase = derivePhase({ ...state, settings: state.settings ? { ...state.settings, model: effectiveModel ?? state.settings.model } : null });
   const isActive = phase === "downloading" || phase === "building";
@@ -378,8 +416,9 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     api
       .onEmbedDone((done: EmbedDone) => {
         if (done.operation === "Download") {
-          dispatch({ type: "op_done", operation: "Download" });
           invalidate();
+          if (pendingBuild) dispatch({ type: "launch_pending_build" });
+          else dispatch({ type: "op_done", operation: "Download" });
         } else if (done.operation === "Build") {
           api.getIndexStatus().then((idx) => {
             dispatch({ type: "op_done", operation: "Build", indexStatus: idx });
@@ -405,7 +444,17 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       mounted = false;
       unlisteners.forEach((u) => u());
     };
-  }, [api, invalidate, refreshSemanticReady]);
+  }, [api, invalidate, pendingBuild, refreshSemanticReady]);
+
+  useEffect(() => {
+    if (!buildRequest) return;
+
+    dispatch({ type: "build_request_dispatched" });
+    api.buildIndex(buildRequest.directory, buildRequest.model, buildRequest.engine).catch((e) => {
+      console.error("buildIndex failed after download:", e);
+      dispatch({ type: "op_error", message: e?.toString?.() ?? "Build failed", operation: "Build" });
+    });
+  }, [api, buildRequest]);
 
   // Merge custom models for current engine into the backend list.
   // Computed inline — no memoization, always fresh.
@@ -513,6 +562,14 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     }
 
     if (phase === "not_downloaded") {
+      dispatch({
+        type: "queue_build",
+        build: {
+          directory,
+          model: effectiveSettings.model,
+          engine: effectiveSettings.engine,
+        },
+      });
       api.downloadModel(effectiveSettings.model, effectiveSettings.engine).catch((e) => console.error("downloadModel failed:", e));
     } else if (phase === "ready" || phase === "engine_mismatch") {
       api.buildIndex(directory, effectiveSettings.model, effectiveSettings.engine).catch((e) => console.error("buildIndex failed:", e));
@@ -737,7 +794,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
                   : "bg-[var(--accent-blue)] hover:bg-[var(--accent-blue)] text-white"
           }`}
         >
-          {phase === "not_downloaded" && "Download Model"}
+          {phase === "not_downloaded" && "Download model and index files"}
           {phase === "downloading" && (state.isCancelling ? "Cancelling…" : "Cancel download")}
           {phase === "ready" && "Build semantic index"}
           {phase === "engine_mismatch" && "Save model"}
