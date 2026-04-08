@@ -536,7 +536,7 @@ struct Config {
 fn parse_config() -> Config {
     let args: Vec<String> = std::env::args().collect();
     let mut port: u16 = std::env::var("WILKES_PORT")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
     let mut data_dir = PathBuf::from(
         std::env::var("WILKES_DATA_DIR").unwrap_or_else(|_| "/data".into()),
     );

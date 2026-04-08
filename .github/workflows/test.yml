@@ -1,0 +1,59 @@
+name: Test
+
+on:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ubuntu-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ubuntu-cargo-registry-
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ubuntu-cargo-build-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ubuntu-cargo-build-
+
+      - name: Check
+        run: cargo check --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: ui/node_modules
+          key: ubuntu-node-${{ hashFiles('ui/package-lock.json') }}
+          restore-keys: ubuntu-node-
+
+      - name: Install dependencies
+        run: npm ci --prefix ui
+
+      - name: Test
+        run: npm test --prefix ui -- --run
