@@ -1,27 +1,36 @@
-[img]
+<p align="center">
+  <img height="300" alt="SCR-20260407-qnvr" src="https://github.com/user-attachments/assets/dfb5a41a-5d50-4af6-bb7e-554703c102ff" />
+  <img height="300" alt="SCR-20260407-qnre" src="https://github.com/user-attachments/assets/682d1cef-a2e4-480b-a5df-a5f596a48b2b" />
+</p>
 
-## Wilkes
+# Wilkes
 Perform exact or semantic search across multiple PDFs and text files, with highlights.
 This project aims to provide a plug-and-play, cross-platform solution for local document search.
 
-### Features
+## Features
 - Document viewer with highlighted matches
 - **Local semantic search**: data is embedded using open-source models, no cloud
   - You can choose from a set of predefined models or any HuggingFace model
 - Fully configurable: adjust embedding chunk size and overlap, or just use the default settings
-- Cross-platform: works on Windows, Linux, macOS
-- Desktop and web versions
+- Cross-platform: works on Windows, Linux, and macOS
+- Web version
 
-### Installation
-#### Desktop
+## Installation
+### Desktop
+TBD
 
-#### Docker
+### Docker
 Docker allows you to run software in isolation from your system.
 
-If you're concerned about security due to the project's recency, this is highly recommended.
+```shell
+git clone https://github.com/leonrjg/Wilkes
+cd Wilkes
+docker compose up
+# Now you can visit localhost:2000
+```
 
 
-### Why? | Similar software
+## Why? | Similar software
 - [Recoll](https://www.recoll.org/) is complex and has no first-party PDF support
 - [Clapgrep](https://github.com/luleyleo/clapgrep) is good but only for Linux
 - [Docfetcher](https://docfetcher.sourceforge.io/) (Free) doesn't show highlights
@@ -31,27 +40,23 @@ If you're concerned about security due to the project's recency, this is highly 
 - [Semantic](https://github.com/Bklieger/Semantic) is single-file and unmaintained
 - Most others are terminal-based
 
+## Details
 ### Engines
-This app can be run on desktop or online, thanks to [Tauri](https://tauri.app/).
-
 Because semantic search accuracy is on the eye of the beholder, it maximizes model variety by supporting multiple engines:
 - Fastembed (Default)
-- [Sentence Transformers](https://www.sbert.net/) (SBERT) through a Python sidecar
-  - This has the widest variety of models, but you need to have Python installed.
-  - The environment needed to run the models is automatically set up by the app.
+- [Sentence Transformers](https://www.sbert.net/) (SBERT) via Python
+  - This has the widest variety of models, but you need to have Python installed. The environment is automatically set up by the app.
 - Candle
 
-### Q&A
+## Q&A
 - What model should I use?
-  - The app uses `e5-small-v2` by default. Also, you will see a few models marked as "Recommended" and a brief description of them.
-    - You can also consult the [MTEB ranking](https://huggingface.co/spaces/mteb/leaderboard) and use any model from that list (through specific engines).
-      - Note: the top 10 models of the ranking are too large to run on consumer hardware.
-- 
+  - The app uses `e5-small-v2` by default. You'll also see a few models marked as "Recommended".
+    - You can also check the [MTEB ranking](https://huggingface.co/spaces/mteb/leaderboard) and use any model from that list (through specific engines). Note that the top 10 models of the ranking are too large to run on consumer hardware.
 
-### Roadmap
+## Roadmap
 Since the core functionality is in place, I'll actively focus on bug fixes and UX improvements.
 
-If you have feature requests, you're welcome to open an issue.
+If you have feature requests, feel free to open an issue.
 
 ### Contributing
 Contributions are welcome! Please fork the repository and submit a pull request with your changes.
