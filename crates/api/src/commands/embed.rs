@@ -3,9 +3,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use ignore::WalkBuilder;
-use wilkes_core::embed::Embedder;
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::installer::ProgressTx;
+use wilkes_core::embed::Embedder;
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::types::IndexStatus;
@@ -49,7 +49,9 @@ pub async fn build_index_with_embedder(
         .build()
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.path().is_file() && wilkes_core::types::FileType::detect(e.path(), &options.supported_extensions).is_some()
+            e.path().is_file()
+                && wilkes_core::types::FileType::detect(e.path(), &options.supported_extensions)
+                    .is_some()
         })
         .map(|e| e.path().to_path_buf())
         .collect();
@@ -107,14 +109,19 @@ pub async fn build_index(
     let installer = wilkes_core::embed::dispatch::get_installer(engine, model, manager, device);
 
     // Ensure model is ready (probes dimension for SBERT, no-op for others if already cached)
-    installer.install(&options.data_dir, options.tx.clone()).await?;
+    installer
+        .install(&options.data_dir, options.tx.clone())
+        .await?;
 
     let embedder = installer.build(&options.data_dir)?;
     build_index_with_embedder(root, embedder, options).await
 }
 
 /// Fetch the total download size for `model_id` from the HuggingFace API.
-pub async fn get_model_size(engine: wilkes_core::types::EmbeddingEngine, model_id: String) -> anyhow::Result<u64> {
+pub async fn get_model_size(
+    engine: wilkes_core::types::EmbeddingEngine,
+    model_id: String,
+) -> anyhow::Result<u64> {
     tokio::task::spawn_blocking(move || {
         wilkes_core::embed::dispatch::fetch_model_size(engine, &model_id)
     })
@@ -122,7 +129,10 @@ pub async fn get_model_size(engine: wilkes_core::types::EmbeddingEngine, model_i
 }
 
 /// Return all engine-supported models, annotated with local cache availability.
-pub async fn list_models(engine: wilkes_core::types::EmbeddingEngine, data_dir: &Path) -> Vec<wilkes_core::types::ModelDescriptor> {
+pub async fn list_models(
+    engine: wilkes_core::types::EmbeddingEngine,
+    data_dir: &Path,
+) -> Vec<wilkes_core::types::ModelDescriptor> {
     let data_dir = data_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
         wilkes_core::embed::dispatch::list_models(engine, &data_dir)
@@ -170,9 +180,15 @@ mod tests {
         fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
             Ok(vec![vec![0.0; 768]])
         }
-        fn model_id(&self) -> &str { "mock" }
-        fn dimension(&self) -> usize { 768 }
-        fn engine(&self) -> wilkes_core::types::EmbeddingEngine { wilkes_core::types::EmbeddingEngine::Candle }
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+        fn dimension(&self) -> usize {
+            768
+        }
+        fn engine(&self) -> wilkes_core::types::EmbeddingEngine {
+            wilkes_core::types::EmbeddingEngine::Candle
+        }
     }
 
     #[tokio::test]
@@ -200,14 +216,10 @@ mod tests {
             supported_extensions,
         };
 
-        let result = build_index_with_embedder(
-            root,
-            embedder,
-            options,
-        ).await;
+        let result = build_index_with_embedder(root, embedder, options).await;
 
         assert!(result.is_ok());
-        
+
         let db_path = data_dir.join("semantic_index.db");
         assert!(db_path.exists());
     }
@@ -232,10 +244,15 @@ mod tests {
             wilkes_core::types::EmbeddingEngine::Candle,
             wilkes_core::types::EmbedderModel("m".to_string()),
             options,
-        ).await;
+        )
+        .await;
 
         assert!(res.is_err());
-        assert!(res.err().unwrap().to_string().contains("manager is required"));
+        assert!(res
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("manager is required"));
     }
 
     #[tokio::test]
@@ -248,7 +265,11 @@ mod tests {
     #[tokio::test]
     async fn test_get_model_size_error() {
         // Should error for non-existent engine or invalid model
-        let res = get_model_size(wilkes_core::types::EmbeddingEngine::Fastembed, "invalid".to_string()).await;
+        let res = get_model_size(
+            wilkes_core::types::EmbeddingEngine::Fastembed,
+            "invalid".to_string(),
+        )
+        .await;
         assert!(res.is_err());
     }
 }

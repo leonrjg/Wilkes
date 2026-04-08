@@ -1,6 +1,6 @@
 pub mod engines;
-pub mod models;
 pub mod index;
+pub mod models;
 pub mod worker;
 
 pub use engines::dispatch;
@@ -65,9 +65,15 @@ impl Embedder for MockEmbedder {
     fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         Ok(vec![vec![0.0; self.dimension]; texts.len()])
     }
-    fn model_id(&self) -> &str { &self.model_id }
-    fn dimension(&self) -> usize { self.dimension }
-    fn engine(&self) -> EmbeddingEngine { self.engine }
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+    fn engine(&self) -> EmbeddingEngine {
+        self.engine
+    }
 }
 
 #[cfg(test)]

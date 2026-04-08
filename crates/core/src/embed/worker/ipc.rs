@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use crate::types::{EmbeddingEngine};
 use super::super::models::installer::EmbedProgress;
+use crate::types::EmbeddingEngine;
 
 /// Sent once from the desktop to the worker on stdin to configure the build.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -41,7 +41,10 @@ pub enum WorkerEvent {
     /// Embedding vectors returned by the "embed" mode.
     Embeddings(Vec<Vec<f32>>),
     /// Model metadata returned by the "info" mode.
-    Info { dimension: usize, max_seq_length: usize },
+    Info {
+        dimension: usize,
+        max_seq_length: usize,
+    },
     /// Index build completed successfully.
     Done,
     /// Index build failed.
@@ -79,7 +82,10 @@ mod tests {
         let events = vec![
             WorkerEvent::Done,
             WorkerEvent::Error("fail".to_string()),
-            WorkerEvent::Info { dimension: 384, max_seq_length: 512 },
+            WorkerEvent::Info {
+                dimension: 384,
+                max_seq_length: 512,
+            },
             WorkerEvent::Embeddings(vec![vec![1.0]]),
         ];
         for e in events {

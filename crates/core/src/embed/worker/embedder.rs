@@ -1,7 +1,7 @@
-use crate::types::EmbeddingEngine;
+use super::ipc::{WorkerEvent, WorkerRequest};
+use super::manager::{ManagerCommand, WorkerManager};
 use crate::embed::Embedder;
-use super::ipc::{WorkerRequest, WorkerEvent};
-use super::manager::{WorkerManager, ManagerCommand};
+use crate::types::EmbeddingEngine;
 
 pub struct WorkerEmbedderConfig {
     pub model_id: String,
@@ -61,21 +61,30 @@ impl WorkerEmbedder {
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let cmd = ManagerCommand::Submit { req: Box::new(request), reply: tx };
+        let cmd = ManagerCommand::Submit {
+            req: Box::new(request),
+            reply: tx,
+        };
 
         self.tokio_handle.block_on(async move {
-            self.manager.send(cmd).await
+            self.manager
+                .send(cmd)
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to send command to manager: {e}"))?;
 
             while let Some(event) = rx.recv().await {
                 match event {
                     WorkerEvent::Embeddings(vecs) => return Ok(vecs),
-                    WorkerEvent::Error(err) => return Err(anyhow::anyhow!("Worker error: {}", err)),
+                    WorkerEvent::Error(err) => {
+                        return Err(anyhow::anyhow!("Worker error: {}", err))
+                    }
                     WorkerEvent::Done => break,
                     _ => {}
                 }
             }
-            Err(anyhow::anyhow!("Worker finished without returning embeddings"))
+            Err(anyhow::anyhow!(
+                "Worker finished without returning embeddings"
+            ))
         })
     }
 }
@@ -89,7 +98,10 @@ impl Embedder for WorkerEmbedder {
         if self.query_prefix.is_empty() {
             self.send_embed(texts)
         } else {
-            let prefixed: Vec<String> = texts.iter().map(|t| format!("{}{t}", self.query_prefix)).collect();
+            let prefixed: Vec<String> = texts
+                .iter()
+                .map(|t| format!("{}{t}", self.query_prefix))
+                .collect();
             let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
             self.send_embed(&refs)
         }
@@ -99,7 +111,10 @@ impl Embedder for WorkerEmbedder {
         if self.passage_prefix.is_empty() {
             self.send_embed(texts)
         } else {
-            let prefixed: Vec<String> = texts.iter().map(|t| format!("{}{t}", self.passage_prefix)).collect();
+            let prefixed: Vec<String> = texts
+                .iter()
+                .map(|t| format!("{}{t}", self.passage_prefix))
+                .collect();
             let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
             self.send_embed(&refs)
         }
@@ -136,7 +151,7 @@ mod tests {
             data_dir: PathBuf::from("data"),
         };
         let (manager, _event_rx, _loop_fut) = WorkerManager::new(paths);
-        
+
         let config = WorkerEmbedderConfig {
             model_id: "test-model".to_string(),
             dimension: 384,
@@ -146,9 +161,9 @@ mod tests {
             query_prefix: "query: ".to_string(),
             passage_prefix: "passage: ".to_string(),
         };
-        
+
         let embedder = WorkerEmbedder::new(manager, config);
-        
+
         assert_eq!(embedder.model_id(), "test-model");
         assert_eq!(embedder.dimension(), 384);
         assert_eq!(embedder.engine(), EmbeddingEngine::Fastembed);
@@ -167,7 +182,7 @@ mod tests {
         };
         let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
         tokio::spawn(loop_fut);
-        
+
         let config = WorkerEmbedderConfig {
             model_id: "test-model".to_string(),
             dimension: 384,
@@ -177,21 +192,21 @@ mod tests {
             query_prefix: "q: ".to_string(),
             passage_prefix: "p: ".to_string(),
         };
-        
+
         let embedder = Arc::new(WorkerEmbedder::new(manager, config));
 
         // Use spawn_blocking or a separate thread to avoid "Cannot start a runtime from within a runtime"
         // because WorkerEmbedder::send_embed uses block_on.
         let embedder_c = Arc::clone(&embedder);
-        let res = tokio::task::spawn_blocking(move || {
-            embedder_c.embed_query(&["hello"])
-        }).await.unwrap();
+        let res = tokio::task::spawn_blocking(move || embedder_c.embed_query(&["hello"]))
+            .await
+            .unwrap();
         assert!(res.is_err());
-        
+
         let embedder_c2 = Arc::clone(&embedder);
-        let res2 = tokio::task::spawn_blocking(move || {
-            embedder_c2.embed_passages(&["world"])
-        }).await.unwrap();
+        let res2 = tokio::task::spawn_blocking(move || embedder_c2.embed_passages(&["world"]))
+            .await
+            .unwrap();
         assert!(res2.is_err());
     }
 
@@ -207,7 +222,7 @@ mod tests {
         };
         let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
         tokio::spawn(loop_fut);
-        
+
         let config = WorkerEmbedderConfig {
             model_id: "test-model".to_string(),
             dimension: 384,
@@ -217,12 +232,13 @@ mod tests {
             query_prefix: "".to_string(),
             passage_prefix: "".to_string(),
         };
-        
+
         let embedder = Arc::new(WorkerEmbedder::new(manager, config));
         let embedder_c = Arc::clone(&embedder);
         let _ = tokio::task::spawn_blocking(move || {
             let _ = embedder_c.embed_query(&["h"]);
             let _ = embedder_c.embed_passages(&["w"]);
-        }).await;
+        })
+        .await;
     }
 }

@@ -1,18 +1,20 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use tracing::error;
 
 use crate::extract::ExtractorRegistry;
-use crate::types::{BoundingBox, ByteRange, EmbeddingEngine, IndexStatus, IndexingConfig, SourceOrigin};
+use crate::types::{
+    BoundingBox, ByteRange, EmbeddingEngine, IndexStatus, IndexingConfig, SourceOrigin,
+};
 
-use super::super::Embedder;
-use super::chunk::{Chunk, chunk_content};
 use super::super::models::installer::{EmbedProgress, IndexBuildProgress, ProgressTx};
+use super::super::Embedder;
+use super::chunk::{chunk_content, Chunk};
 
 // ── sqlite-vec extension loading ──────────────────────────────────────────────
 
@@ -29,7 +31,9 @@ fn load_sqlite_vec() {
                 *mut *const std::ffi::c_char,
                 *const rusqlite::ffi::sqlite3_api_routines,
             ) -> i32,
-        >(sqlite_vec::sqlite3_vec_init as *const ())));
+        >(
+            sqlite_vec::sqlite3_vec_init as *const ()
+        )));
     });
 }
 
@@ -55,14 +59,17 @@ mod tests {
     fn test_status_default() {
         let dir = tempfile::tempdir().unwrap();
         let conn = Connection::open(db_path(dir.path())).unwrap();
-        
-        conn.execute_batch("
+
+        conn.execute_batch(
+            "
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
             INSERT INTO meta VALUES ('model_id', 'test-model');
             INSERT INTO meta VALUES ('dimension', '128');
             INSERT INTO meta VALUES ('engine', 'fastembed');
             CREATE TABLE vec_chunks (id INTEGER PRIMARY KEY);
-        ").unwrap();
+        ",
+        )
+        .unwrap();
 
         let index = SemanticIndex {
             conn,
@@ -80,13 +87,16 @@ mod tests {
     fn test_read_status_from_path() {
         let dir = tempfile::tempdir().unwrap();
         let conn = Connection::open(db_path(dir.path())).unwrap();
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
             INSERT INTO meta VALUES ('model_id', 'm1');
             INSERT INTO meta VALUES ('dimension', '512');
             INSERT INTO meta VALUES ('engine', 'sbert');
             CREATE TABLE vec_chunks (id INTEGER PRIMARY KEY);
-        ").unwrap();
+        ",
+        )
+        .unwrap();
         drop(conn);
 
         let status = SemanticIndex::read_status_from_path(dir.path()).unwrap();
@@ -204,7 +214,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = db_path(dir.path());
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);").unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
         // Missing vec_chunks table
         drop(conn);
 
@@ -220,10 +231,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let model = "m1";
         let engine = EmbeddingEngine::Candle;
-        
+
         // Create with dim 128
         SemanticIndex::create(dir.path(), model, 128, engine, None).unwrap();
-        
+
         // Try open with dim 256
         let res = SemanticIndex::open(dir.path(), model, 256);
         match res {
@@ -240,7 +251,7 @@ mod tests {
 
         let registry = ExtractorRegistry::new(); // empty registry
         let chunks = SemanticIndex::extract_chunks(&path, &registry, 100, 10).unwrap();
-        
+
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "hello world");
     }
@@ -259,11 +270,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = db_path(dir.path());
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
             INSERT INTO meta VALUES ('schema_version', '2'); -- expected 1
             CREATE TABLE vec_chunks (id INTEGER PRIMARY KEY);
-        ").unwrap();
+        ",
+        )
+        .unwrap();
         drop(conn);
 
         let res = SemanticIndex::open(dir.path(), "any", 0);
@@ -289,7 +303,7 @@ mod tests {
 
         let abs2 = index.to_abs_path("subdir/file.txt");
         assert_eq!(abs2, abs);
-        
+
         // Path outside root
         let outside = Path::new("/other/file.txt");
         let rel_outside = index.to_rel_path(outside);
@@ -299,29 +313,33 @@ mod tests {
     #[test]
     fn test_write_file_pdf_origin() {
         let dir = tempdir().unwrap();
-        let mut idx = SemanticIndex::create(dir.path(), "m", 1, EmbeddingEngine::Candle, None).unwrap();
-        
+        let mut idx =
+            SemanticIndex::create(dir.path(), "m", 1, EmbeddingEngine::Candle, None).unwrap();
+
         let path = PathBuf::from("test.pdf");
         let prepared = PreparedFile {
             path: path.clone(),
-            chunks: vec![
-                (
-                    Chunk {
-                        file_path: path.clone(),
-                        text: "page content".to_string(),
-                        byte_range: ByteRange { start: 0, end: 12 },
-                        origin: SourceOrigin::PdfPage { 
-                            page: 5, 
-                            bbox: Some(BoundingBox { x: 1.0, y: 2.0, width: 3.0, height: 4.0 })
-                        },
+            chunks: vec![(
+                Chunk {
+                    file_path: path.clone(),
+                    text: "page content".to_string(),
+                    byte_range: ByteRange { start: 0, end: 12 },
+                    origin: SourceOrigin::PdfPage {
+                        page: 5,
+                        bbox: Some(BoundingBox {
+                            x: 1.0,
+                            y: 2.0,
+                            width: 3.0,
+                            height: 4.0,
+                        }),
                     },
-                    vec![1.0],
-                ),
-            ],
+                },
+                vec![1.0],
+            )],
         };
 
         idx.write_file(prepared).unwrap();
-        
+
         let results = idx.query(&[1.0], 1).unwrap();
         assert_eq!(results.len(), 1);
         match &results[0].origin {
@@ -332,6 +350,19 @@ mod tests {
                 assert_eq!(b.y, 2.0);
             }
             _ => panic!("Expected PdfPage origin"),
+        }
+    }
+
+    #[test]
+    fn test_query_dimension_mismatch() {
+        let dir = tempdir().unwrap();
+        let idx = SemanticIndex::create(dir.path(), "m", 1, EmbeddingEngine::Candle, None).unwrap();
+        let res = idx.query(&[1.0, 2.0], 1);
+        match res {
+            Err(e) => assert!(e
+                .to_string()
+                .contains("Expected 1 dimensions but received 2")),
+            Ok(_) => panic!("Expected query dimension mismatch"),
         }
     }
 
@@ -348,10 +379,18 @@ mod tests {
         let registry = ExtractorRegistry::new();
         struct MockEmbedder;
         impl Embedder for MockEmbedder {
-            fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> { Ok(vec![vec![1.0]]) }
-            fn model_id(&self) -> &str { "mock" }
-            fn dimension(&self) -> usize { 1 }
-            fn engine(&self) -> EmbeddingEngine { EmbeddingEngine::Candle }
+            fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+                Ok(vec![vec![1.0]])
+            }
+            fn model_id(&self) -> &str {
+                "mock"
+            }
+            fn dimension(&self) -> usize {
+                1
+            }
+            fn engine(&self) -> EmbeddingEngine {
+                EmbeddingEngine::Candle
+            }
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
@@ -370,16 +409,70 @@ mod tests {
             tx,
             Arc::new(AtomicBool::new(false)),
             &indexing,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(idx.status().total_chunks, 1);
-        
+
         // Check progress messages
         let mut progress_count = 0;
         while let Ok(_p) = rx.try_recv() {
             progress_count += 1;
         }
         assert!(progress_count >= 2);
+    }
+
+    #[test]
+    fn test_build_fails_on_embedding_dimension_mismatch() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("test.txt"), "build test content").unwrap();
+
+        let data_dir = dir.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+
+        let registry = ExtractorRegistry::new();
+        struct WrongDimEmbedder;
+        impl Embedder for WrongDimEmbedder {
+            fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+                Ok(vec![vec![1.0, 2.0]])
+            }
+            fn model_id(&self) -> &str {
+                "mock"
+            }
+            fn dimension(&self) -> usize {
+                1
+            }
+            fn engine(&self) -> EmbeddingEngine {
+                EmbeddingEngine::Candle
+            }
+        }
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        let indexing = IndexingConfig {
+            chunk_size: 100,
+            chunk_overlap: 0,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let res = SemanticIndex::build(
+            &data_dir,
+            &root,
+            &[root.join("test.txt")],
+            &registry,
+            &WrongDimEmbedder,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            &indexing,
+        );
+
+        match res {
+            Err(e) => assert!(e
+                .to_string()
+                .contains("Failed to write index entry")),
+            Ok(_) => panic!("Expected build failure on embedding dimension mismatch"),
+        }
     }
 }
 
@@ -415,11 +508,19 @@ impl SemanticIndex {
     /// Open an existing index. Returns `Err` if no index exists at `data_dir` or
     /// if `model_id` in the stored metadata mismatches the parameter.
     /// The dimension is read from the DB; callers can inspect it via `status()`.
-    pub fn open(data_dir: &Path, model_id: &str, expected_dimension: usize) -> anyhow::Result<Self> {
+    pub fn open(
+        data_dir: &Path,
+        model_id: &str,
+        expected_dimension: usize,
+    ) -> anyhow::Result<Self> {
         load_sqlite_vec();
 
         let path = db_path(data_dir);
-        anyhow::ensure!(path.exists(), "No semantic index found at {}", path.display());
+        anyhow::ensure!(
+            path.exists(),
+            "No semantic index found at {}",
+            path.display()
+        );
 
         let conn = Connection::open(&path)
             .with_context(|| format!("Failed to open index at {}", path.display()))?;
@@ -456,11 +557,9 @@ impl SemanticIndex {
         );
 
         let stored_model_id: String = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'model_id'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT value FROM meta WHERE key = 'model_id'", [], |row| {
+                row.get(0)
+            })
             .context("Index is missing model_id metadata")?;
 
         anyhow::ensure!(
@@ -520,14 +619,16 @@ impl SemanticIndex {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        
+
         if path.exists() {
             std::fs::remove_file(path)?;
         }
 
         // Remove orphaned WAL/SHM files for this specific path.
-        let mut wal = path.as_os_str().to_owned(); wal.push("-wal");
-        let mut shm = path.as_os_str().to_owned(); shm.push("-shm");
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let mut shm = path.as_os_str().to_owned();
+        shm.push("-shm");
         let _ = std::fs::remove_file(wal);
         let _ = std::fs::remove_file(shm);
 
@@ -590,7 +691,13 @@ impl SemanticIndex {
         let final_path = db_path(data_dir);
         let tmp_path = data_dir.join("semantic_index.db.tmp");
 
-        let mut idx = Self::create_at_path(&tmp_path, embedder.model_id(), embedder.dimension(), embedder.engine(), Some(root_path))?;
+        let mut idx = Self::create_at_path(
+            &tmp_path,
+            embedder.model_id(),
+            embedder.dimension(),
+            embedder.engine(),
+            Some(root_path),
+        )?;
 
         // Extract, embed, and write one file at a time so peak memory is bounded
         // to a single file's chunks + embeddings on top of the model weights.
@@ -606,7 +713,12 @@ impl SemanticIndex {
                 done: false,
             }));
 
-            let chunks = match Self::extract_chunks(path, extractors, indexing.chunk_size, indexing.chunk_overlap) {
+            let chunks = match Self::extract_chunks(
+                path,
+                extractors,
+                indexing.chunk_size,
+                indexing.chunk_overlap,
+            ) {
                 Ok(c) if !c.is_empty() => c,
                 _ => continue,
             };
@@ -622,9 +734,8 @@ impl SemanticIndex {
                 path: path.clone(),
                 chunks: chunks.into_iter().zip(embeddings).collect(),
             };
-            if let Err(e) = idx.write_file(prepared) {
-                error!("Failed to write index entry for {}: {e:#}", path.display());
-            }
+            idx.write_file(prepared)
+                .with_context(|| format!("Failed to write index entry for {}", path.display()))?;
         }
 
         let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -643,8 +754,13 @@ impl SemanticIndex {
         let _ = std::fs::remove_file(data_dir.join("semantic_index.db-wal"));
         let _ = std::fs::remove_file(data_dir.join("semantic_index.db-shm"));
 
-        std::fs::rename(&tmp_path, &final_path)
-            .with_context(|| format!("Failed to rename {} to {}", tmp_path.display(), final_path.display()))?;
+        std::fs::rename(&tmp_path, &final_path).with_context(|| {
+            format!(
+                "Failed to rename {} to {}",
+                tmp_path.display(),
+                final_path.display()
+            )
+        })?;
 
         let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
             files_processed: total_files,
@@ -733,7 +849,9 @@ impl SemanticIndex {
                     .with_context(|| format!("Failed to read {}", path.display()))?;
                 crate::types::ExtractedContent {
                     text: text.clone(),
-                    source_map: crate::types::SourceMap { segments: Vec::new() },
+                    source_map: crate::types::SourceMap {
+                        segments: Vec::new(),
+                    },
                     metadata: crate::types::FileMetadata {
                         path: path.to_path_buf(),
                         size_bytes: 0,
@@ -744,7 +862,12 @@ impl SemanticIndex {
                 }
             }
         };
-        Ok(chunk_content(&content, path.to_path_buf(), chunk_size, chunk_overlap))
+        Ok(chunk_content(
+            &content,
+            path.to_path_buf(),
+            chunk_size,
+            chunk_overlap,
+        ))
     }
 
     /// Extract, chunk, and embed a file without holding the index lock.
@@ -757,7 +880,10 @@ impl SemanticIndex {
     ) -> anyhow::Result<PreparedFile> {
         let raw_chunks = Self::extract_chunks(path, extractors, chunk_size, chunk_overlap)?;
         if raw_chunks.is_empty() {
-            return Ok(PreparedFile { path: path.to_path_buf(), chunks: Vec::new() });
+            return Ok(PreparedFile {
+                path: path.to_path_buf(),
+                chunks: Vec::new(),
+            });
         }
 
         let texts: Vec<&str> = raw_chunks.iter().map(|c| c.text.as_str()).collect();
@@ -771,7 +897,10 @@ impl SemanticIndex {
         );
 
         let chunks = raw_chunks.into_iter().zip(embeddings).collect();
-        Ok(PreparedFile { path: path.to_path_buf(), chunks })
+        Ok(PreparedFile {
+            path: path.to_path_buf(),
+            chunks,
+        })
     }
 
     /// Convert an absolute path to a root-relative path for storage.
@@ -828,15 +957,29 @@ impl SemanticIndex {
 
         let tx = self.conn.transaction()?;
         for (i, (chunk, embedding)) in prepared.chunks.into_iter().enumerate() {
-            let (origin_type, page, line, col, bbox_x, bbox_y, bbox_w, bbox_h) = match &chunk.origin {
+            let (origin_type, page, line, col, bbox_x, bbox_y, bbox_w, bbox_h) = match &chunk.origin
+            {
                 SourceOrigin::TextFile { line, col } => (
                     "text_file",
-                    None::<i64>, Some(*line as i64), Some(*col as i64),
-                    None::<f64>, None, None, None,
+                    None::<i64>,
+                    Some(*line as i64),
+                    Some(*col as i64),
+                    None::<f64>,
+                    None,
+                    None,
+                    None,
                 ),
                 SourceOrigin::PdfPage { page, bbox } => {
-                    let (bx, by, bw, bh) = bbox.as_ref()
-                        .map(|b| (Some(b.x as f64), Some(b.y as f64), Some(b.width as f64), Some(b.height as f64)))
+                    let (bx, by, bw, bh) = bbox
+                        .as_ref()
+                        .map(|b| {
+                            (
+                                Some(b.x as f64),
+                                Some(b.y as f64),
+                                Some(b.width as f64),
+                                Some(b.height as f64),
+                            )
+                        })
                         .unwrap_or((None, None, None, None));
                     ("pdf_page", Some(*page as i64), None, None, bx, by, bw, bh)
                 }
@@ -851,8 +994,14 @@ impl SemanticIndex {
                     i as i64,
                     chunk.byte_range.start as i64,
                     chunk.byte_range.end as i64,
-                    origin_type, page, line, col,
-                    bbox_x, bbox_y, bbox_w, bbox_h,
+                    origin_type,
+                    page,
+                    line,
+                    col,
+                    bbox_x,
+                    bbox_y,
+                    bbox_w,
+                    bbox_h,
                     chunk.text,
                 ],
             )?;
@@ -888,26 +1037,39 @@ impl SemanticIndex {
             "DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE file_path = ?1)",
             params![rel_str],
         )?;
-        self.conn.execute(
-            "DELETE FROM chunks WHERE file_path = ?1",
-            params![rel_str],
-        )?;
+        self.conn
+            .execute("DELETE FROM chunks WHERE file_path = ?1", params![rel_str])?;
         Ok(())
     }
 
     /// Query the index for the top-k nearest neighbours to `embedding`.
     /// Uses cosine similarity computed in Rust (O(n) over all stored vectors).
     pub fn query(&self, embedding: &[f32], top_k: usize) -> anyhow::Result<Vec<IndexedChunk>> {
+        anyhow::ensure!(
+            embedding.len() == self.dimension,
+            "Dimension mismatch for query vector for the \"embedding\" column. Expected {} dimensions but received {}.",
+            self.dimension,
+            embedding.len()
+        );
+
         // cosine distance = 1 - cosine_similarity.
         // No hard threshold: top_k already bounds the result count, and a fixed
         // distance cutoff is model-dependent (short queries on MiniLM-style models
         // produce distances of 0.7–0.85 even for clearly relevant chunks).
 
-        let stored_count: i64 = self.conn
+        let stored_count: i64 = self
+            .conn
             .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
             .unwrap_or(0);
-        let top_k = if top_k == 0 { stored_count as usize } else { top_k };
-        tracing::info!("[query] vec_chunks rows={stored_count}, embedding_dim={}, top_k={top_k}", embedding.len());
+        let top_k = if top_k == 0 {
+            stored_count as usize
+        } else {
+            top_k
+        };
+        tracing::info!(
+            "[query] vec_chunks rows={stored_count}, embedding_dim={}, top_k={top_k}",
+            embedding.len()
+        );
 
         let blob = f32_slice_to_bytes(embedding);
 
@@ -937,53 +1099,95 @@ impl SemanticIndex {
                 let bbox_w: Option<f64> = row.get(11)?;
                 let bbox_h: Option<f64> = row.get(12)?;
                 let chunk_text: String = row.get(13)?;
-                Ok((distance, file_path, byte_start, byte_end,
-                    origin_type, page, line, col, bbox_x, bbox_y, bbox_w, bbox_h, chunk_text))
+                Ok((
+                    distance,
+                    file_path,
+                    byte_start,
+                    byte_end,
+                    origin_type,
+                    page,
+                    line,
+                    col,
+                    bbox_x,
+                    bbox_y,
+                    bbox_w,
+                    bbox_h,
+                    chunk_text,
+                ))
             })?
             .map(|r| match r {
                 Ok(v) => Some(v),
-                Err(e) => { error!("[query] row error: {e}"); None }
+                Err(e) => {
+                    error!("[query] row error: {e}");
+                    None
+                }
             })
             .collect();
 
-        tracing::info!("[query] sqlite-vec returned {} rows ({} errors)", raw_rows.iter().filter(|r| r.is_some()).count(), raw_rows.iter().filter(|r| r.is_none()).count());
+        tracing::info!(
+            "[query] sqlite-vec returned {} rows ({} errors)",
+            raw_rows.iter().filter(|r| r.is_some()).count(),
+            raw_rows.iter().filter(|r| r.is_none()).count()
+        );
 
-        let results: Vec<IndexedChunk> = raw_rows.into_iter()
+        let results: Vec<IndexedChunk> = raw_rows
+            .into_iter()
             .flatten()
-            .filter_map(|(distance, file_path, byte_start, byte_end,
-                          origin_type, page, line, col, bbox_x, bbox_y, bbox_w, bbox_h, chunk_text)| {
-                let score = 1.0 - distance;
-                let origin = match origin_type.as_str() {
-                    "text_file" => SourceOrigin::TextFile {
-                        line: line.unwrap_or(0) as u32,
-                        col: col.unwrap_or(0) as u32,
-                    },
-                    "pdf_page" => {
-                        let bbox = match (bbox_x, bbox_y, bbox_w, bbox_h) {
-                            (Some(x), Some(y), Some(w), Some(h)) => Some(BoundingBox {
-                                x: x as f32, y: y as f32, width: w as f32, height: h as f32,
-                            }),
-                            _ => None,
-                        };
-                        SourceOrigin::PdfPage { page: page.unwrap_or(0) as u32, bbox }
-                    }
-                    other => {
-                        error!("[query] unknown origin_type '{}' for {file_path}", other);
-                        return None;
-                    }
-                };
-                let abs_path = self.to_abs_path(&file_path);
-                Some(IndexedChunk {
-                    file_path: abs_path,
+            .filter_map(
+                |(
+                    distance,
+                    file_path,
+                    byte_start,
+                    byte_end,
+                    origin_type,
+                    page,
+                    line,
+                    col,
+                    bbox_x,
+                    bbox_y,
+                    bbox_w,
+                    bbox_h,
                     chunk_text,
-                    extraction_byte_range: ByteRange {
-                        start: byte_start as usize,
-                        end: byte_end as usize,
-                    },
-                    origin,
-                    score,
-                })
-            })
+                )| {
+                    let score = 1.0 - distance;
+                    let origin = match origin_type.as_str() {
+                        "text_file" => SourceOrigin::TextFile {
+                            line: line.unwrap_or(0) as u32,
+                            col: col.unwrap_or(0) as u32,
+                        },
+                        "pdf_page" => {
+                            let bbox = match (bbox_x, bbox_y, bbox_w, bbox_h) {
+                                (Some(x), Some(y), Some(w), Some(h)) => Some(BoundingBox {
+                                    x: x as f32,
+                                    y: y as f32,
+                                    width: w as f32,
+                                    height: h as f32,
+                                }),
+                                _ => None,
+                            };
+                            SourceOrigin::PdfPage {
+                                page: page.unwrap_or(0) as u32,
+                                bbox,
+                            }
+                        }
+                        other => {
+                            error!("[query] unknown origin_type '{}' for {file_path}", other);
+                            return None;
+                        }
+                    };
+                    let abs_path = self.to_abs_path(&file_path);
+                    Some(IndexedChunk {
+                        file_path: abs_path,
+                        chunk_text,
+                        extraction_byte_range: ByteRange {
+                            start: byte_start as usize,
+                            end: byte_end as usize,
+                        },
+                        origin,
+                        score,
+                    })
+                },
+            )
             .collect();
 
         tracing::info!("[query] returning {} results", results.len());
@@ -994,9 +1198,11 @@ impl SemanticIndex {
     pub fn status(&self) -> IndexStatus {
         let engine_str: String = self
             .conn
-            .query_row("SELECT value FROM meta WHERE key = 'engine'", [], |r| r.get(0))
+            .query_row("SELECT value FROM meta WHERE key = 'engine'", [], |r| {
+                r.get(0)
+            })
             .unwrap_or_else(|_| "candle".to_string());
-        
+
         let engine = match engine_str.as_str() {
             "sbert" | "python" => EmbeddingEngine::SBERT,
             "fastembed" => EmbeddingEngine::Fastembed,
@@ -1005,7 +1211,9 @@ impl SemanticIndex {
 
         let model_id = self
             .conn
-            .query_row("SELECT value FROM meta WHERE key = 'model_id'", [], |r| r.get(0))
+            .query_row("SELECT value FROM meta WHERE key = 'model_id'", [], |r| {
+                r.get(0)
+            })
             .unwrap_or_default();
 
         let dimension: usize = self
@@ -1026,15 +1234,21 @@ impl SemanticIndex {
 
         let build_duration_ms: Option<u64> = self
             .conn
-            .query_row("SELECT value FROM meta WHERE key = 'build_duration_ms'", [], |r| {
-                let s: String = r.get(0)?;
-                Ok(s.parse::<u64>().ok())
-            })
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'build_duration_ms'",
+                [],
+                |r| {
+                    let s: String = r.get(0)?;
+                    Ok(s.parse::<u64>().ok())
+                },
+            )
             .unwrap_or(None);
 
         let indexed_files: usize = self
             .conn
-            .query_row("SELECT COUNT(DISTINCT file_path) FROM chunks", [], |r| r.get(0))
+            .query_row("SELECT COUNT(DISTINCT file_path) FROM chunks", [], |r| {
+                r.get(0)
+            })
             .map(|n: i64| n as usize)
             .unwrap_or(0);
 
@@ -1075,7 +1289,9 @@ impl SemanticIndex {
         let db_size_bytes = std::fs::metadata(&path).ok().map(|m| m.len());
 
         let engine_str: String = conn
-            .query_row("SELECT value FROM meta WHERE key = 'engine'", [], |r| r.get(0))
+            .query_row("SELECT value FROM meta WHERE key = 'engine'", [], |r| {
+                r.get(0)
+            })
             .unwrap_or_else(|_| "candle".to_string());
 
         let engine = match engine_str.as_str() {
@@ -1085,7 +1301,9 @@ impl SemanticIndex {
         };
 
         let model_id: String = conn
-            .query_row("SELECT value FROM meta WHERE key = 'model_id'", [], |r| r.get(0))
+            .query_row("SELECT value FROM meta WHERE key = 'model_id'", [], |r| {
+                r.get(0)
+            })
             .unwrap_or_default();
 
         let dimension: usize = conn
@@ -1103,14 +1321,20 @@ impl SemanticIndex {
             .unwrap_or(None);
 
         let build_duration_ms: Option<u64> = conn
-            .query_row("SELECT value FROM meta WHERE key = 'build_duration_ms'", [], |r| {
-                let s: String = r.get(0)?;
-                Ok(s.parse::<u64>().ok())
-            })
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'build_duration_ms'",
+                [],
+                |r| {
+                    let s: String = r.get(0)?;
+                    Ok(s.parse::<u64>().ok())
+                },
+            )
             .unwrap_or(None);
 
         let indexed_files: usize = conn
-            .query_row("SELECT COUNT(DISTINCT file_path) FROM chunks", [], |r| r.get(0))
+            .query_row("SELECT COUNT(DISTINCT file_path) FROM chunks", [], |r| {
+                r.get(0)
+            })
             .map(|n: i64| n as usize)
             .unwrap_or(0);
 

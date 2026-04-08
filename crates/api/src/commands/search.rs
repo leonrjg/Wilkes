@@ -3,12 +3,12 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::error;
-use wilkes_core::embed::Embedder;
 use wilkes_core::embed::index::SemanticIndex;
-use wilkes_core::search::semantic::SemanticSearchProvider;
+use wilkes_core::embed::Embedder;
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::search::grep::GrepSearchProvider;
+use wilkes_core::search::semantic::SemanticSearchProvider;
 use wilkes_core::search::SearchProvider;
 use wilkes_core::types::{FileMatches, SearchMode, SearchQuery, SearchStats};
 
@@ -77,20 +77,24 @@ pub fn start_search(
         registry.register(Box::new(PdfExtractor::new()));
 
         let provider: Box<dyn SearchProvider> = match query.mode {
-            SearchMode::Semantic => {
-                match (embedder, index) {
-                    (Some(emb), Some(idx)) => {
-                        Box::new(SemanticSearchProvider::new(emb, idx, query.supported_extensions.clone()))
-                    }
-                    _ => {
-                        return vec!["Semantic search requires a loaded embedder and built index".into()];
-                    }
+            SearchMode::Semantic => match (embedder, index) {
+                (Some(emb), Some(idx)) => Box::new(SemanticSearchProvider::new(
+                    emb,
+                    idx,
+                    query.supported_extensions.clone(),
+                )),
+                _ => {
+                    return vec![
+                        "Semantic search requires a loaded embedder and built index".into()
+                    ];
                 }
-            }
+            },
             SearchMode::Grep => Box::new(GrepSearchProvider::new()),
         };
 
-        provider.search(&query, &registry, tx).unwrap_or_else(|e| vec![format!("search failed: {e:#}")])
+        provider
+            .search(&query, &registry, tx)
+            .unwrap_or_else(|e| vec![format!("search failed: {e:#}")])
     });
 
     SearchHandle { rx, worker }
@@ -99,8 +103,8 @@ pub fn start_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::fs;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_start_search_grep() {
@@ -127,7 +131,7 @@ mod tests {
         while let Some(m) = handle.rx.recv().await {
             matches.push(m);
         }
-        
+
         assert!(!matches.is_empty());
         assert_eq!(matches[0].path.file_name().unwrap(), "test.txt");
         assert_eq!(matches[0].matches.len(), 1);
@@ -182,11 +186,13 @@ mod tests {
         };
 
         let handle = start_search(query, None, None);
-        
-        let stats = handle.run(|fm| async move {
-            assert!(!fm.matches.is_empty());
-            true
-        }).await;
+
+        let stats = handle
+            .run(|fm| async move {
+                assert!(!fm.matches.is_empty());
+                true
+            })
+            .await;
 
         assert_eq!(stats.files_scanned, 2);
         assert_eq!(stats.total_matches, 2);
@@ -215,10 +221,12 @@ mod tests {
         };
 
         let handle = start_search(query, None, None);
-        
-        let stats = handle.run(|_fm| async move {
-            false // Abort immediately
-        }).await;
+
+        let stats = handle
+            .run(|_fm| async move {
+                false // Abort immediately
+            })
+            .await;
 
         assert_eq!(stats.files_scanned, 1);
         assert!(stats.total_matches >= 1);
@@ -228,7 +236,7 @@ mod tests {
     async fn test_start_search_provider_error() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        
+
         // Invalid regex will cause GrepSearchProvider to fail
         let query = SearchQuery {
             pattern: "[".to_string(),

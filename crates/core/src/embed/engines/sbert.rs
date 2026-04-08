@@ -1,14 +1,14 @@
+use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
-use async_trait::async_trait;
 
-use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
-use super::super::Embedder;
 use super::super::models::installer::{EmbedderInstaller, ProgressTx};
-use super::super::worker::manager::{WorkerManager, ManagerCommand};
-use super::super::worker::ipc::{WorkerRequest, WorkerEvent};
 use super::super::worker::embedder::{WorkerEmbedder, WorkerEmbedderConfig};
+use super::super::worker::ipc::{WorkerEvent, WorkerRequest};
+use super::super::worker::manager::{ManagerCommand, WorkerManager};
+use super::super::Embedder;
 use super::aux_config;
+use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
 
 // ── Static model catalog ──────────────────────────────────────────────────────
 
@@ -125,7 +125,12 @@ pub struct SBERTInstaller {
 
 impl SBERTInstaller {
     pub fn new(model: EmbedderModel, manager: WorkerManager, device: String) -> Self {
-        Self { model, manager, device, dimension: std::sync::Mutex::new(None) }
+        Self {
+            model,
+            manager,
+            device,
+            dimension: std::sync::Mutex::new(None),
+        }
     }
 }
 
@@ -171,7 +176,9 @@ impl EmbedderInstaller for SBERTInstaller {
             reply: tx,
         };
 
-        self.manager.send(cmd).await
+        self.manager
+            .send(cmd)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to send info command to manager: {e}"))?;
 
         let timeout_duration = std::time::Duration::from_secs(30);
@@ -181,13 +188,19 @@ impl EmbedderInstaller for SBERTInstaller {
                     WorkerEvent::Info { dimension, .. } => {
                         return Ok(dimension);
                     }
-                    WorkerEvent::Error(err) => return Err(anyhow::anyhow!("Worker error probing model: {}", err)),
+                    WorkerEvent::Error(err) => {
+                        return Err(anyhow::anyhow!("Worker error probing model: {}", err))
+                    }
                     WorkerEvent::Done => break,
                     _ => {}
                 }
             }
-            Err(anyhow::anyhow!("Worker finished without returning model info for {}", model_id))
-        }).await;
+            Err(anyhow::anyhow!(
+                "Worker finished without returning model info for {}",
+                model_id
+            ))
+        })
+        .await;
 
         match result {
             Ok(Ok(dimension)) => {
@@ -195,7 +208,10 @@ impl EmbedderInstaller for SBERTInstaller {
                 Ok(())
             }
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(anyhow::anyhow!("Timeout probing model '{}' after 30 seconds", model_id)),
+            Err(_) => Err(anyhow::anyhow!(
+                "Timeout probing model '{}' after 30 seconds",
+                model_id
+            )),
         }
     }
 
@@ -207,17 +223,22 @@ impl EmbedderInstaller for SBERTInstaller {
         let model_id = self.model.model_id();
 
         // Use the dimension discovered during install() or from the built-in list.
-        let dimension = self.dimension.lock().unwrap()
+        let dimension = self
+            .dimension
+            .lock()
+            .unwrap()
             .or_else(|| {
                 PREEXISTING_MODELS
                     .iter()
                     .find(|m| m.model_id == model_id)
                     .map(|m| m.dimension)
             })
-            .ok_or_else(|| anyhow::anyhow!(
-                "Dimension unknown for model '{}'. install() must be called before build().",
-                model_id
-            ))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Dimension unknown for model '{}'. install() must be called before build().",
+                    model_id
+                )
+            })?;
 
         let prefixes = aux_config::load_prefixes(_data_dir, model_id);
 
@@ -239,8 +260,8 @@ impl EmbedderInstaller for SBERTInstaller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_list_supported_models() {
@@ -248,8 +269,10 @@ mod tests {
         let models = list_supported_models(dir.path());
         assert!(!models.is_empty());
         let default_id = crate::types::EmbeddingEngine::SBERT.default_model();
-        assert!(models.iter().any(|m| m.model_id == default_id),
-            "Default model '{default_id}' must exist in the SBERT catalog");
+        assert!(
+            models.iter().any(|m| m.model_id == default_id),
+            "Default model '{default_id}' must exist in the SBERT catalog"
+        );
     }
 
     #[test]
@@ -270,12 +293,11 @@ mod tests {
     #[test]
     fn test_sbert_installer_new() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
-        let installer = SBERTInstaller::new(
-            EmbedderModel("m".to_string()),
-            manager,
-            "cpu".to_string()
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
+            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
         );
+        let installer =
+            SBERTInstaller::new(EmbedderModel("m".to_string()), manager, "cpu".to_string());
         assert_eq!(installer.model.model_id(), "m");
         assert_eq!(installer.device, "cpu");
     }
@@ -283,11 +305,13 @@ mod tests {
     #[tokio::test]
     async fn test_sbert_installer_install_builtin() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
+            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        );
         let installer = SBERTInstaller::new(
             EmbedderModel("intfloat/e5-small-v2".to_string()),
             manager,
-            "cpu".to_string()
+            "cpu".to_string(),
         );
         let (tx, _) = tokio::sync::mpsc::channel(1);
         installer.install(dir.path(), tx).await.unwrap();
@@ -297,21 +321,23 @@ mod tests {
     #[test]
     fn test_sbert_installer_is_available() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
-        let installer = SBERTInstaller::new(
-            EmbedderModel("m".to_string()),
-            manager,
-            "cpu".to_string()
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
+            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
         );
+        let installer =
+            SBERTInstaller::new(EmbedderModel("m".to_string()), manager, "cpu".to_string());
         assert!(!installer.is_available(dir.path()));
-        
+
         *installer.dimension.lock().unwrap() = Some(128);
         assert!(installer.is_available(dir.path()));
 
         let builtin = SBERTInstaller::new(
             EmbedderModel("intfloat/e5-small-v2".to_string()),
-            crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path())).0,
-            "cpu".to_string()
+            crate::embed::worker::manager::WorkerManager::new(
+                crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+            )
+            .0,
+            "cpu".to_string(),
         );
         assert!(builtin.is_available(dir.path()));
     }
@@ -319,13 +345,15 @@ mod tests {
     #[tokio::test]
     async fn test_sbert_installer_build() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
+            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        );
         let installer = SBERTInstaller::new(
             EmbedderModel("intfloat/e5-small-v2".to_string()),
             manager,
-            "cpu".to_string()
+            "cpu".to_string(),
         );
-        
+
         // Build should succeed for built-in models
         let embedder = installer.build(dir.path()).unwrap();
         assert_eq!(embedder.model_id(), "intfloat/e5-small-v2");

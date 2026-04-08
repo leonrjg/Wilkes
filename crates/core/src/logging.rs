@@ -1,13 +1,12 @@
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::LazyLock;
-use parking_lot::Mutex;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter, Layer};
 
 const MAX_LOG_LINES: usize = 1000;
 
-static LOG_BUFFER: LazyLock<Mutex<VecDeque<String>>> = LazyLock::new(|| {
-    Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES))
-});
+static LOG_BUFFER: LazyLock<Mutex<VecDeque<String>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES)));
 
 pub struct BufferLayer;
 
@@ -27,7 +26,7 @@ where
 
         // Format the event. For simplicity, we just use the event's metadata and fields.
         let mut msg = String::new();
-        
+
         let metadata = event.metadata();
         msg.push_str(&format!(
             "[{}] {:<5} {}: ",
@@ -112,7 +111,7 @@ mod tests {
         clear_logs();
         let layer = BufferLayer;
         let subscriber = tracing_subscriber::registry().with(layer);
-        
+
         subscriber::with_default(subscriber, || {
             for i in 0..MAX_LOG_LINES + 10 {
                 info!("msg {}", i);
@@ -121,9 +120,11 @@ mod tests {
 
         let logs = get_logs();
         assert_eq!(logs.len(), MAX_LOG_LINES);
-        // With concurrent tests, we can't guarantee exact positions, 
+        // With concurrent tests, we can't guarantee exact positions,
         // but we should at least see some of our messages.
-        assert!(logs.iter().any(|l| l.contains(&format!("msg {}", MAX_LOG_LINES + 9))));
+        assert!(logs
+            .iter()
+            .any(|l| l.contains(&format!("msg {}", MAX_LOG_LINES + 9))));
     }
 
     #[test]

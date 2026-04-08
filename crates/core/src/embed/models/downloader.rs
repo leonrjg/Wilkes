@@ -32,15 +32,20 @@ impl LocalModelManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::fs;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_local_model_manager_download_fails() {
         let dir = tempdir().unwrap();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        
-        let result = LocalModelManager::download("http://example.com/model.bin", &dir.path().join("model.bin"), tx).await;
+
+        let result = LocalModelManager::download(
+            "http://example.com/model.bin",
+            &dir.path().join("model.bin"),
+            tx,
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not implemented"));
     }
@@ -49,9 +54,9 @@ mod tests {
     fn test_local_model_manager_is_downloaded() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("model.bin");
-        
+
         assert!(!LocalModelManager::is_downloaded(&path));
-        
+
         fs::write(&path, "data").unwrap();
         assert!(LocalModelManager::is_downloaded(&path));
     }
@@ -60,13 +65,13 @@ mod tests {
     fn test_local_model_manager_delete() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("model.bin");
-        
+
         // Deleting non-existent file should be ok
         assert!(LocalModelManager::delete(&path).is_ok());
-        
+
         fs::write(&path, "data").unwrap();
         assert!(path.exists());
-        
+
         assert!(LocalModelManager::delete(&path).is_ok());
         assert!(!path.exists());
     }

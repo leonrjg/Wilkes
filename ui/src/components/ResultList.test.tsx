@@ -1,6 +1,7 @@
 import { render, screen, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import ResultList from "./ResultList";
+import { ToastProvider } from "./Toast";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 
@@ -23,6 +24,13 @@ describe("ResultList", () => {
   const mockOnMatchClick = vi.fn();
   const mockOnFileClick = vi.fn();
 
+  const renderWithToasts = () =>
+    render(
+      <ToastProvider>
+        <ResultList onMatchClick={mockOnMatchClick} onFileClick={mockOnFileClick} />
+      </ToastProvider>,
+    );
+
   beforeEach(() => {
     vi.clearAllMocks();
     useSearchStore.setState({
@@ -42,7 +50,7 @@ describe("ResultList", () => {
   });
 
   it("renders empty state when no query", () => {
-    render(<ResultList onMatchClick={mockOnMatchClick} onFileClick={mockOnFileClick} />);
+    renderWithToasts();
     expect(screen.getByPlaceholderText("Filter files...")).toBeInTheDocument();
   });
 
@@ -67,7 +75,7 @@ describe("ResultList", () => {
       searching: false,
     });
 
-    render(<ResultList onMatchClick={mockOnMatchClick} onFileClick={mockOnFileClick} />);
+    renderWithToasts();
     expect(screen.getByText("file.txt")).toBeInTheDocument();
     expect(screen.getByText("test")).toBeInTheDocument();
   });
@@ -92,7 +100,7 @@ describe("ResultList", () => {
       ],
     });
 
-    render(<ResultList onMatchClick={mockOnMatchClick} onFileClick={mockOnFileClick} />);
+    renderWithToasts();
     const matchRow = screen.getByRole("button", { name: /L1test/ });
     fireEvent.click(matchRow);
 
@@ -113,7 +121,7 @@ describe("ResultList", () => {
       ],
     });
 
-    render(<ResultList onMatchClick={mockOnMatchClick} onFileClick={mockOnFileClick} />);
+    renderWithToasts();
     const fileHeader = screen.getByText("file.txt");
     fireEvent.click(fileHeader);
 
@@ -134,7 +142,7 @@ describe("ResultList", () => {
       results: [{ path: "many.txt", file_type: "PlainText", matches: manyMatches }],
     });
 
-    render(<ResultList onMatchClick={mockOnMatchClick} onFileClick={mockOnFileClick} />);
+    renderWithToasts();
     
     const expandBtn = screen.getByText(/Show 5 more/);
     fireEvent.click(expandBtn);
@@ -148,7 +156,7 @@ describe("ResultList", () => {
     const setFilterTextMock = vi.fn();
     useSettingsStore.setState({ setFilterText: setFilterTextMock });
 
-    render(<ResultList onMatchClick={mockOnMatchClick} onFileClick={mockOnFileClick} />);
+    renderWithToasts();
     const filterInput = screen.getByPlaceholderText("Filter files...");
     
     fireEvent.change(filterInput, { target: { value: "my-filter" } });
@@ -166,7 +174,7 @@ describe("ResultList", () => {
       },
     });
 
-    render(<ResultList onMatchClick={mockOnMatchClick} onFileClick={mockOnFileClick} />);
+    renderWithToasts();
     expect(screen.getByText(/42 matches in 10 files/)).toBeInTheDocument();
     expect(screen.getByText(/1 file failed/)).toBeInTheDocument();
   });
@@ -178,7 +186,7 @@ describe("ResultList", () => {
       searching: true,
     });
 
-    const { container } = render(<ResultList onMatchClick={mockOnMatchClick} onFileClick={mockOnFileClick} />);
+    const { container } = renderWithToasts();
     expect(screen.getByText("0 matches…")).toBeInTheDocument();
     // Shimmer element
     expect(container.querySelector(".animate-shimmer")).toBeDefined();

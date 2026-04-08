@@ -10,9 +10,7 @@ pub struct EmbedderConfig {
 
 pub type AuxParser = (&'static str, fn(&str, &mut EmbedderConfig));
 
-pub const AUX_PARSERS: &[AuxParser] = &[
-    ("config_sentence_transformers.json", parse_st_config),
-];
+pub const AUX_PARSERS: &[AuxParser] = &[("config_sentence_transformers.json", parse_st_config)];
 
 fn parse_st_config(content: &str, config: &mut EmbedderConfig) {
     #[derive(serde::Deserialize)]
@@ -20,7 +18,9 @@ fn parse_st_config(content: &str, config: &mut EmbedderConfig) {
         prompts: Option<HashMap<String, String>>,
     }
 
-    let Ok(st) = serde_json::from_str::<StConfig>(content) else { return };
+    let Ok(st) = serde_json::from_str::<StConfig>(content) else {
+        return;
+    };
     let Some(prompts) = st.prompts else { return };
 
     for (key, value) in &prompts {
@@ -30,7 +30,9 @@ fn parse_st_config(content: &str, config: &mut EmbedderConfig) {
         } else if k.contains("passage") || k.contains("document") || k.contains("doc") {
             config.passage_prefix = value.clone();
         } else {
-            tracing::debug!("Unrecognized prompt key '{key}' in config_sentence_transformers.json — skipping");
+            tracing::debug!(
+                "Unrecognized prompt key '{key}' in config_sentence_transformers.json — skipping"
+            );
         }
     }
 }
@@ -143,7 +145,7 @@ mod tests {
     fn test_load_prefixes_with_file() {
         let dir = tempdir().unwrap();
         let model_id = "test/model";
-        
+
         // Let's just test that it returns default config when files are missing.
         let config = load_prefixes(dir.path(), model_id);
         assert!(config.query_prefix.is_empty());
@@ -153,14 +155,17 @@ mod tests {
     fn test_load_prefixes_read_error() {
         let dir = tempdir().unwrap();
         let model_id = "test/model";
-        
+
         // Create a directory where a file should be to cause a read error
         let folder = format!("models--{}", model_id.replace('/', "--"));
         let snapshots = dir.path().join(folder).join("snapshots").join("main");
         fs::create_dir_all(&snapshots).unwrap();
-        
+
         // Mock Repo::get by setting the refs
-        let refs = dir.path().join(format!("models--{}", model_id.replace('/', "--"))).join("refs");
+        let refs = dir
+            .path()
+            .join(format!("models--{}", model_id.replace('/', "--")))
+            .join("refs");
         fs::create_dir_all(&refs).unwrap();
         fs::write(refs.join("main"), "main").unwrap();
 

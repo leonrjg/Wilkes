@@ -83,12 +83,16 @@ mod tests {
 
         // Extension match
         assert!(registry.find(Path::new("test.mock"), None).is_some());
-        
+
         // MIME match
-        assert!(registry.find(Path::new("test.txt"), Some("text/plain")).is_some());
-        
+        assert!(registry
+            .find(Path::new("test.txt"), Some("text/plain"))
+            .is_some());
+
         // No match
-        assert!(registry.find(Path::new("test.txt"), Some("image/png")).is_none());
+        assert!(registry
+            .find(Path::new("test.txt"), Some("image/png"))
+            .is_none());
     }
 
     #[test]

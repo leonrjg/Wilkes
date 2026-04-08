@@ -5,9 +5,11 @@ use tracing::debug;
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 
-use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
+use super::super::models::installer::{
+    DownloadProgress, EmbedProgress, EmbedderInstaller, ProgressTx,
+};
 use super::super::Embedder;
-use super::super::models::installer::{EmbedProgress, DownloadProgress, EmbedderInstaller, ProgressTx};
+use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
 
 // ── Model lookup ──────────────────────────────────────────────────────────────
 
@@ -90,7 +92,9 @@ pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {
 
     let matches_relevant = |rfilename: &str| -> bool {
         relevant.contains(rfilename)
-            || relevant.iter().any(|f| rfilename.ends_with(&format!("/{f}")))
+            || relevant
+                .iter()
+                .any(|f| rfilename.ends_with(&format!("/{f}")))
     };
 
     let siblings = super::super::models::hf_hub::fetch_hf_siblings(&info.model_code)?;
@@ -138,7 +142,10 @@ pub struct FastEmbedder {
 impl FastEmbedder {
     fn embed_with_prefix(&self, texts: &[&str], prefix: &str) -> anyhow::Result<Vec<Vec<f32>>> {
         let total = texts.len();
-        debug!("[fastembed] embed: {total} texts, batch_size={:?}", self.preferred_batch_size);
+        debug!(
+            "[fastembed] embed: {total} texts, batch_size={:?}",
+            self.preferred_batch_size
+        );
         let t0 = std::time::Instant::now();
 
         let mut inner = self.inner.lock().unwrap();
@@ -154,7 +161,10 @@ impl FastEmbedder {
                 .map_err(|e| anyhow::anyhow!("fastembed error: {e}"))
         };
 
-        debug!("[fastembed] embed total: {:.1}s", t0.elapsed().as_secs_f64());
+        debug!(
+            "[fastembed] embed total: {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
         result
     }
 }
@@ -179,7 +189,6 @@ impl Embedder for FastEmbedder {
     fn preferred_batch_size(&self) -> Option<usize> {
         self.preferred_batch_size
     }
-
 }
 
 // ── FastembedInstaller ────────────────────────────────────────────────────────
@@ -191,15 +200,25 @@ pub struct FastembedInstaller {
 }
 
 impl FastembedInstaller {
-    pub fn new(model: EmbedderModel, manager: super::super::worker::manager::WorkerManager, device: String) -> Self {
-        Self { model, manager, device }
+    pub fn new(
+        model: EmbedderModel,
+        manager: super::super::worker::manager::WorkerManager,
+        device: String,
+    ) -> Self {
+        Self {
+            model,
+            manager,
+            device,
+        }
     }
 }
 
 #[async_trait]
 impl EmbedderInstaller for FastembedInstaller {
     fn is_available(&self, data_dir: &Path) -> bool {
-        let Ok(info) = find_model_info(&self.model.0) else { return false; };
+        let Ok(info) = find_model_info(&self.model.0) else {
+            return false;
+        };
         hf_hub::Cache::new(data_dir.to_path_buf())
             .repo(hf_hub::Repo::model(info.model_code))
             .get(&info.model_file)
@@ -267,7 +286,8 @@ impl EmbedderInstaller for FastembedInstaller {
         let aux_cache_dir = data_dir.to_path_buf();
         let _ = tokio::task::spawn_blocking(move || {
             super::aux_config::fetch_aux_configs(&aux_cache_dir, &aux_model_id);
-        }).await;
+        })
+        .await;
 
         let _ = tx
             .send(EmbedProgress::Download(DownloadProgress {
@@ -287,24 +307,30 @@ impl EmbedderInstaller for FastembedInstaller {
     fn build(&self, data_dir: &Path) -> anyhow::Result<Arc<dyn Embedder>> {
         let info = find_model_info(&self.model.0)?;
         let prefixes = super::aux_config::load_prefixes(data_dir, &self.model.0);
-        Ok(Arc::new(super::super::worker::embedder::WorkerEmbedder::new(
-            self.manager.clone(),
-            super::super::worker::embedder::WorkerEmbedderConfig {
-                model_id: self.model.0.clone(),
-                dimension: info.dim,
-                device: self.device.clone(),
-                engine: EmbeddingEngine::Fastembed,
-                data_dir: data_dir.to_path_buf(),
-                query_prefix: prefixes.query_prefix,
-                passage_prefix: prefixes.passage_prefix,
-            },
-        )))
+        Ok(Arc::new(
+            super::super::worker::embedder::WorkerEmbedder::new(
+                self.manager.clone(),
+                super::super::worker::embedder::WorkerEmbedderConfig {
+                    model_id: self.model.0.clone(),
+                    dimension: info.dim,
+                    device: self.device.clone(),
+                    engine: EmbeddingEngine::Fastembed,
+                    data_dir: data_dir.to_path_buf(),
+                    query_prefix: prefixes.query_prefix,
+                    passage_prefix: prefixes.passage_prefix,
+                },
+            ),
+        ))
     }
 }
 
 /// Load a `FastEmbedder` directly in the calling process.
 /// Only called from the worker subprocess, never from the main Tauri process.
-pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> anyhow::Result<Arc<dyn Embedder>> {
+pub fn load_embedder(
+    model: &EmbedderModel,
+    data_dir: &Path,
+    device: &str,
+) -> anyhow::Result<Arc<dyn Embedder>> {
     let info = find_model_info(&model.0)?;
     let dimension = info.dim;
     let model_id = model.0.clone();
@@ -313,7 +339,10 @@ pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> an
 
     let device_clean = device.trim().to_lowercase();
     let providers = if device_clean == "cpu" {
-        tracing::info!("[fastembed] forcing CPU execution provider for {}", model_id);
+        tracing::info!(
+            "[fastembed] forcing CPU execution provider for {}",
+            model_id
+        );
         vec![ort::ep::CPUExecutionProvider::default().into()]
     } else {
         #[cfg(feature = "fastembed-coreml")]
@@ -333,8 +362,8 @@ pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> an
         .with_show_download_progress(true)
         .with_execution_providers(providers);
 
-    let inner = TextEmbedding::try_new(options)
-        .map_err(|e| anyhow::anyhow!("fastembed load: {e}"))?;
+    let inner =
+        TextEmbedding::try_new(options).map_err(|e| anyhow::anyhow!("fastembed load: {e}"))?;
 
     Ok(Arc::new(FastEmbedder {
         inner: Mutex::new(inner),
@@ -354,14 +383,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let models = list_supported_models(dir.path());
         assert!(!models.is_empty());
-        let bge = models.iter().find(|m| m.model_id == "BGEBaseENV15").unwrap();
+        let bge = models
+            .iter()
+            .find(|m| m.model_id == "BGEBaseENV15")
+            .unwrap();
         assert_eq!(bge.display_name, "bge-base-en-v1.5");
     }
 
     #[test]
     fn test_get_preferred_batch_size() {
-        assert_eq!(get_preferred_batch_size("normal-model", "description"), Some(32));
-        assert_eq!(get_preferred_batch_size("quantized-model", "description"), None);
+        assert_eq!(
+            get_preferred_batch_size("normal-model", "description"),
+            Some(32)
+        );
+        assert_eq!(
+            get_preferred_batch_size("quantized-model", "description"),
+            None
+        );
         assert_eq!(get_preferred_batch_size("model-q4", "description"), None);
         assert_eq!(get_preferred_batch_size("model", "quantized weights"), None);
     }
@@ -370,7 +408,7 @@ mod tests {
     fn test_find_model_info() {
         let info = find_model_info("BGEBaseENV15").unwrap();
         assert_eq!(info.model_code, "Xenova/bge-base-en-v1.5");
-        
+
         let err = find_model_info("NonExistentModel");
         assert!(err.is_err());
     }
@@ -378,14 +416,16 @@ mod tests {
     #[test]
     fn test_fastembed_installer_new() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
+            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        );
         let installer = FastembedInstaller::new(
             EmbedderModel("BGEBaseENV15".to_string()),
             manager,
-            "cpu".to_string()
+            "cpu".to_string(),
         );
         assert_eq!(installer.model.0, "BGEBaseENV15");
-        
+
         assert_eq!(installer.uninstall(dir.path()).is_ok(), true);
     }
 
@@ -404,11 +444,13 @@ mod tests {
     #[test]
     fn test_is_available_not_cached() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
+            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        );
         let installer = FastembedInstaller::new(
             EmbedderModel("BGEBaseENV15".to_string()),
             manager,
-            "cpu".to_string()
+            "cpu".to_string(),
         );
         assert!(!installer.is_available(dir.path()));
     }
@@ -417,28 +459,32 @@ mod tests {
     fn test_is_available_cached() {
         let dir = tempdir().unwrap();
         let info = find_model_info("BGEBaseENV15").unwrap();
-        
-        let repo_dir = dir.path().join(format!("models--{}", info.model_code.replace("/", "--")));
+
+        let repo_dir = dir
+            .path()
+            .join(format!("models--{}", info.model_code.replace("/", "--")));
         let snapshots = repo_dir.join("snapshots").join("main");
-        
+
         let model_file_path = snapshots.join(&info.model_file);
         if let Some(parent) = model_file_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(&model_file_path, "fake onnx").unwrap();
-        
+
         // Also write config.json at the root of the snapshot
         std::fs::write(snapshots.join("config.json"), "{}").unwrap();
-        
+
         let refs = repo_dir.join("refs");
         std::fs::create_dir_all(&refs).unwrap();
         std::fs::write(refs.join("main"), "main").unwrap();
 
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
+            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        );
         let installer = FastembedInstaller::new(
             EmbedderModel("BGEBaseENV15".to_string()),
             manager,
-            "cpu".to_string()
+            "cpu".to_string(),
         );
         let avail = installer.is_available(dir.path());
         assert!(avail);
@@ -448,22 +494,25 @@ mod tests {
     fn test_fetch_model_size_mock() {
         use mockito::Server;
         let mut server = Server::new();
-        
+
         // Mock HF API
-        let _m = server.mock("GET", "/api/models/Xenova/bge-base-en-v1.5")
+        let _m = server
+            .mock("GET", "/api/models/Xenova/bge-base-en-v1.5")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{
+            .with_body(
+                r#"{
                 "siblings": [
                     {"rfilename": "model.onnx", "size": 1000},
                     {"rfilename": "tokenizer.json", "size": 500},
                     {"rfilename": "other.txt", "size": 100}
                 ]
-            }"#)
+            }"#,
+            )
             .create();
 
         // We need to point hf-hub or our fetch_hf_siblings to this server.
-        // fetch_hf_siblings uses ureq. 
+        // fetch_hf_siblings uses ureq.
         // If we can't easily override the URL, we might skip this or use a different approach.
     }
 }

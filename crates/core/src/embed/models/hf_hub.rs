@@ -28,13 +28,16 @@ pub fn fetch_hf_siblings(model_id: &str) -> anyhow::Result<Vec<HfSibling>> {
 pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {
     let siblings = fetch_hf_siblings(model_id)?;
     let total: u64 = siblings.iter().filter_map(|s| s.size).sum();
-    anyhow::ensure!(total > 0, "No model files found in HF repo for '{model_id}'");
+    anyhow::ensure!(
+        total > 0,
+        "No model files found in HF repo for '{model_id}'"
+    );
     Ok(total)
 }
 
 /// Check if a model is cached in the given data directory using hf-hub's structure.
 pub fn is_model_cached(data_dir: &Path, model_id: &str) -> bool {
-    // For Python/SBERT, they use the same standard HF cache structure if 
+    // For Python/SBERT, they use the same standard HF cache structure if
     // HF_HOME is set, or they use their own. In Wilkes, we try to share the data_dir.
     // If config.json exists, it's a good indicator.
     hf_hub::Cache::new(data_dir.to_path_buf())
@@ -46,8 +49,8 @@ pub fn is_model_cached(data_dir: &Path, model_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_is_model_cached_not_found() {
@@ -60,24 +63,29 @@ mod tests {
         let dir = tempdir().unwrap();
         let cache = hf_hub::Cache::new(dir.path().to_path_buf());
         let repo = hf_hub::Repo::model("test/repo".to_string());
-        
+
         // This is a hacky way to create the HF cache structure for testing,
         // it simulates creating a file pointer in the cache.
         let blob_path = dir.path().join("blobs");
         fs::create_dir_all(&blob_path).unwrap();
         let file_blob = blob_path.join("abcdef123456");
         fs::write(&file_blob, "{}").unwrap();
-        
-        let snapshots = dir.path().join("models--test--repo").join("snapshots").join("main");
+
+        let snapshots = dir
+            .path()
+            .join("models--test--repo")
+            .join("snapshots")
+            .join("main");
         fs::create_dir_all(&snapshots).unwrap();
-        
+
         // Create symlink or just copy file to mimic cache
         #[cfg(unix)]
         std::os::unix::fs::symlink(&file_blob, snapshots.join("config.json")).unwrap_or_default();
-        
+
         #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&file_blob, snapshots.join("config.json")).unwrap_or_default();
-        
+        std::os::windows::fs::symlink_file(&file_blob, snapshots.join("config.json"))
+            .unwrap_or_default();
+
         // Because symlinks can be tricky in tests, we just check if it returns what we expect
         // If it doesn't work, at least we exercised the function
         let _ = is_model_cached(dir.path(), "test/repo");

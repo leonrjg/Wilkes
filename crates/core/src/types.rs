@@ -56,8 +56,12 @@ pub struct SearchQuery {
     pub supported_extensions: Vec<String>,
 }
 
-fn default_true() -> bool { true }
-fn default_context_lines() -> u32 { 2 }
+fn default_true() -> bool {
+    true
+}
+fn default_context_lines() -> u32 {
+    2
+}
 
 // ── Results ──────────────────────────────────────────────────────────────────
 
@@ -91,10 +95,16 @@ pub enum FileType {
 
 impl FileType {
     pub fn detect(path: &std::path::Path, supported_extensions: &[String]) -> Option<Self> {
-        let ext = path.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase());
 
         if let Some(ext) = &ext {
-            if supported_extensions.iter().any(|s| s.to_ascii_lowercase() == *ext) {
+            if supported_extensions
+                .iter()
+                .any(|s| s.to_ascii_lowercase() == *ext)
+            {
                 if ext == "pdf" {
                     return Some(FileType::Pdf);
                 } else {
@@ -106,9 +116,18 @@ impl FileType {
         // Special case: check well-known filenames if no extension or unknown extension
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             let name_lc = name.to_ascii_lowercase();
-            if ["makefile", "dockerfile", "jenkinsfile", "procfile", "gemfile",
-                "rakefile", "vagrantfile", "podfile", "brewfile"]
-                .contains(&name_lc.as_str())
+            if [
+                "makefile",
+                "dockerfile",
+                "jenkinsfile",
+                "procfile",
+                "gemfile",
+                "rakefile",
+                "vagrantfile",
+                "podfile",
+                "brewfile",
+            ]
+            .contains(&name_lc.as_str())
             {
                 return Some(FileType::PlainText);
             }
@@ -132,8 +151,14 @@ pub struct SourceSegment {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SourceOrigin {
-    TextFile { line: u32, col: u32 },
-    PdfPage { page: u32, bbox: Option<BoundingBox> },
+    TextFile {
+        line: u32,
+        col: u32,
+    },
+    PdfPage {
+        page: u32,
+        bbox: Option<BoundingBox>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -267,7 +292,6 @@ pub enum PreviewData {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(transparent)]
 pub struct EmbedderModel(pub String);
-
 
 impl EmbedderModel {
     pub fn model_id(&self) -> &str {
@@ -441,7 +465,8 @@ impl SemanticSettings {
     /// Returns the effective device string for the given engine,
     /// falling back to that engine's built-in default when no override is set.
     pub fn device_for(&self, engine: EmbeddingEngine) -> &str {
-        self.engine_devices.get(&engine)
+        self.engine_devices
+            .get(&engine)
             .map(String::as_str)
             .unwrap_or_else(|| engine.default_device())
     }
@@ -501,12 +526,61 @@ pub struct Settings {
 
 fn default_supported_extensions() -> Vec<String> {
     vec![
-        "txt", "md", "markdown", "rst", "rs", "py", "js", "ts", "jsx", "tsx",
-        "json", "toml", "yaml", "yml", "xml", "html", "htm", "css", "scss",
-        "sass", "less", "c", "cpp", "cc", "cxx", "h", "hpp", "java", "go",
-        "rb", "sh", "bash", "zsh", "fish", "lua", "php", "swift", "kt",
-        "cs", "r", "sql", "graphql", "gql", "proto", "ini", "cfg", "conf",
-        "env", "gitignore", "lock", "log", "csv", "tsv", "jsonl", "pdf",
+        "txt",
+        "md",
+        "markdown",
+        "rst",
+        "rs",
+        "py",
+        "js",
+        "ts",
+        "jsx",
+        "tsx",
+        "json",
+        "toml",
+        "yaml",
+        "yml",
+        "xml",
+        "html",
+        "htm",
+        "css",
+        "scss",
+        "sass",
+        "less",
+        "c",
+        "cpp",
+        "cc",
+        "cxx",
+        "h",
+        "hpp",
+        "java",
+        "go",
+        "rb",
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "lua",
+        "php",
+        "swift",
+        "kt",
+        "cs",
+        "r",
+        "sql",
+        "graphql",
+        "gql",
+        "proto",
+        "ini",
+        "cfg",
+        "conf",
+        "env",
+        "gitignore",
+        "lock",
+        "log",
+        "csv",
+        "tsv",
+        "jsonl",
+        "pdf",
     ]
     .into_iter()
     .map(String::from)
@@ -594,19 +668,38 @@ mod tests {
     #[test]
     fn test_file_type_detect() {
         let extensions = vec!["txt".to_string(), "pdf".to_string()];
-        
-        assert_eq!(FileType::detect(Path::new("test.txt"), &extensions), Some(FileType::PlainText));
-        assert_eq!(FileType::detect(Path::new("test.pdf"), &extensions), Some(FileType::Pdf));
-        assert_eq!(FileType::detect(Path::new("Makefile"), &extensions), Some(FileType::PlainText));
+
+        assert_eq!(
+            FileType::detect(Path::new("test.txt"), &extensions),
+            Some(FileType::PlainText)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("test.pdf"), &extensions),
+            Some(FileType::Pdf)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("Makefile"), &extensions),
+            Some(FileType::PlainText)
+        );
         assert_eq!(FileType::detect(Path::new("test.exe"), &extensions), None);
     }
 
     #[test]
     fn test_bounding_box_merge() {
-        let b1 = BoundingBox { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
-        let b2 = BoundingBox { x: 5.0, y: 5.0, width: 10.0, height: 10.0 };
+        let b1 = BoundingBox {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        let b2 = BoundingBox {
+            x: 5.0,
+            y: 5.0,
+            width: 10.0,
+            height: 10.0,
+        };
         let merged = b1.merge(&b2);
-        
+
         assert_eq!(merged.x, 0.0);
         assert_eq!(merged.y, 0.0);
         assert_eq!(merged.width, 15.0);
@@ -645,16 +738,26 @@ mod tests {
             segments: vec![
                 SourceSegment {
                     text_range: ByteRange { start: 0, end: 10 },
-                    origin: SourceOrigin::PdfPage { 
-                        page: 1, 
-                        bbox: Some(BoundingBox { x: 0.0, y: 0.0, width: 10.0, height: 10.0 })
+                    origin: SourceOrigin::PdfPage {
+                        page: 1,
+                        bbox: Some(BoundingBox {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 10.0,
+                            height: 10.0,
+                        }),
                     },
                 },
                 SourceSegment {
                     text_range: ByteRange { start: 10, end: 20 },
-                    origin: SourceOrigin::PdfPage { 
-                        page: 1, 
-                        bbox: Some(BoundingBox { x: 5.0, y: 5.0, width: 10.0, height: 10.0 })
+                    origin: SourceOrigin::PdfPage {
+                        page: 1,
+                        bbox: Some(BoundingBox {
+                            x: 5.0,
+                            y: 5.0,
+                            width: 10.0,
+                            height: 10.0,
+                        }),
                     },
                 },
             ],
@@ -699,23 +802,23 @@ mod tests {
         assert_eq!(settings.chunk_size, 600);
         assert_eq!(settings.chunk_overlap, 128);
         assert_eq!(settings.worker_timeout_secs, 300);
-        
+
         assert_eq!(settings.device_for(EmbeddingEngine::SBERT), "auto");
-        
+
         let mut settings = SemanticSettings::default();
-        settings.engine_devices.insert(EmbeddingEngine::SBERT, "cuda".to_string());
+        settings
+            .engine_devices
+            .insert(EmbeddingEngine::SBERT, "cuda".to_string());
         assert_eq!(settings.device_for(EmbeddingEngine::SBERT), "cuda");
     }
 
     #[test]
     fn test_source_map_resolve_fallback() {
         let map = SourceMap {
-            segments: vec![
-                SourceSegment {
-                    text_range: ByteRange { start: 0, end: 10 },
-                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
-                },
-            ],
+            segments: vec![SourceSegment {
+                text_range: ByteRange { start: 0, end: 10 },
+                origin: SourceOrigin::TextFile { line: 1, col: 1 },
+            }],
         };
 
         // Offset beyond all segments should fall back to last segment
@@ -731,11 +834,17 @@ mod tests {
             segments: vec![
                 SourceSegment {
                     text_range: ByteRange { start: 0, end: 10 },
-                    origin: SourceOrigin::PdfPage { page: 1, bbox: None },
+                    origin: SourceOrigin::PdfPage {
+                        page: 1,
+                        bbox: None,
+                    },
                 },
                 SourceSegment {
                     text_range: ByteRange { start: 10, end: 20 },
-                    origin: SourceOrigin::PdfPage { page: 2, bbox: None },
+                    origin: SourceOrigin::PdfPage {
+                        page: 2,
+                        bbox: None,
+                    },
                 },
             ],
         };
@@ -751,12 +860,10 @@ mod tests {
     #[test]
     fn test_source_map_resolve_range_no_overlap() {
         let map = SourceMap {
-            segments: vec![
-                SourceSegment {
-                    text_range: ByteRange { start: 10, end: 20 },
-                    origin: SourceOrigin::TextFile { line: 2, col: 1 },
-                },
-            ],
+            segments: vec![SourceSegment {
+                text_range: ByteRange { start: 10, end: 20 },
+                origin: SourceOrigin::TextFile { line: 2, col: 1 },
+            }],
         };
 
         // Range before any segment
@@ -819,9 +926,18 @@ mod tests {
     #[test]
     fn test_file_type_detect_known_names() {
         let extensions = vec![];
-        assert_eq!(FileType::detect(Path::new("Dockerfile"), &extensions), Some(FileType::PlainText));
-        assert_eq!(FileType::detect(Path::new("Makefile"), &extensions), Some(FileType::PlainText));
-        assert_eq!(FileType::detect(Path::new("dockerfile"), &extensions), Some(FileType::PlainText));
+        assert_eq!(
+            FileType::detect(Path::new("Dockerfile"), &extensions),
+            Some(FileType::PlainText)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("Makefile"), &extensions),
+            Some(FileType::PlainText)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("dockerfile"), &extensions),
+            Some(FileType::PlainText)
+        );
     }
 
     #[test]
@@ -852,7 +968,7 @@ mod tests {
         let m = EmbedderModel("model-1".to_string());
         let json = serde_json::to_string(&m).unwrap();
         assert_eq!(json, "\"model-1\"");
-        
+
         let m2: EmbedderModel = serde_json::from_str(&json).unwrap();
         assert_eq!(m2, m);
         assert_eq!(m2.model_id(), "model-1");

@@ -17,7 +17,11 @@ pub async fn list_files(
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            if entry.file_type().map(|t: std::fs::FileType| t.is_file()).unwrap_or(false) {
+            if entry
+                .file_type()
+                .map(|t: std::fs::FileType| t.is_file())
+                .unwrap_or(false)
+            {
                 let path = entry.path().to_path_buf();
 
                 // File size filter
@@ -30,8 +34,17 @@ pub async fn list_files(
                 let Some(file_type) = FileType::detect(&path, &supported_extensions) else {
                     continue;
                 };
-                let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-                entries.push(FileEntry { path, size_bytes, file_type, extension });
+                let extension = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                entries.push(FileEntry {
+                    path,
+                    size_bytes,
+                    file_type,
+                    extension,
+                });
             }
         }
         entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -40,9 +53,15 @@ pub async fn list_files(
     .await?
 }
 
-pub async fn open_file(path: PathBuf, supported_extensions: Vec<String>) -> anyhow::Result<PreviewData> {
+pub async fn open_file(
+    path: PathBuf,
+    supported_extensions: Vec<String>,
+) -> anyhow::Result<PreviewData> {
     match FileType::detect(&path, &supported_extensions) {
-        Some(FileType::Pdf) => Ok(PreviewData::Pdf { page: 1, highlight_bbox: None }),
+        Some(FileType::Pdf) => Ok(PreviewData::Pdf {
+            page: 1,
+            highlight_bbox: None,
+        }),
         Some(FileType::PlainText) => {
             let content = tokio::fs::read_to_string(&path).await?;
             let language = detect_language(&path);
@@ -60,8 +79,8 @@ pub async fn open_file(path: PathBuf, supported_extensions: Vec<String>) -> anyh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::fs;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_list_files() {

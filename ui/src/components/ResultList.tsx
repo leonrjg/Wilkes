@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { buildRows, COLLAPSED_LIMIT, type Row } from "../lib/utils/flattenResults";
+import { useToasts } from "./Toast";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import type { Match, MatchRef, SourceOrigin, FileEntry } from "../lib/types";
@@ -60,6 +61,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
   const searching = useSearchStore((s) => s.searching);
   const hasQuery = useSearchStore((s) => s.hasQuery);
   const selectedMatch = useSearchStore((s) => s.selectedMatch);
+  const { addToast } = useToasts();
 
   const excluded = useSettingsStore((s) => s.excluded);
   const fileList = useSettingsStore((s) => s.fileList);
@@ -73,6 +75,11 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
   useEffect(() => {
     if (results.length === 0) setExpandedFiles(new Set());
   }, [results.length]);
+
+  useEffect(() => {
+    if (!stats || stats.errors.length === 0) return;
+    addToast(stats.errors[0], { type: "error" });
+  }, [addToast, stats]);
 
   const filteredFileList = fileList.filter((f) => !excluded.has(f.extension));
   const rows = buildRows(results, expandedFiles);

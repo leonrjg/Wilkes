@@ -4,9 +4,7 @@ use wilkes_core::types::{ByteRange, MatchRef, PreviewData, SourceOrigin};
 pub async fn preview(match_ref: MatchRef) -> anyhow::Result<PreviewData> {
     match &match_ref.origin {
         SourceOrigin::TextFile { .. } => preview_text(&match_ref).await,
-        SourceOrigin::PdfPage { page, bbox } => {
-            preview_pdf(&match_ref, *page, bbox.clone()).await
-        }
+        SourceOrigin::PdfPage { page, bbox } => preview_pdf(&match_ref, *page, bbox.clone()).await,
     }
 }
 
@@ -21,7 +19,9 @@ async fn preview_text(match_ref: &MatchRef) -> anyhow::Result<PreviewData> {
         let highlight_line = if line == 0 { 1 } else { line as u32 };
 
         // Convert byte range to UTF-16 code unit range for the frontend (JS/CodeMirror)
-        let utf16_start = content[..range.start.min(content.len())].encode_utf16().count();
+        let utf16_start = content[..range.start.min(content.len())]
+            .encode_utf16()
+            .count();
         let utf16_len = content[range.start.min(content.len())..range.end.min(content.len())]
             .encode_utf16()
             .count();
@@ -58,7 +58,10 @@ async fn preview_pdf(
 ) -> anyhow::Result<PreviewData> {
     // The frontend loads the file directly via the asset protocol (convertFileSrc).
     // No byte transfer over IPC.
-    Ok(PreviewData::Pdf { page, highlight_bbox })
+    Ok(PreviewData::Pdf {
+        page,
+        highlight_bbox,
+    })
 }
 
 /// Detect a language hint for CodeMirror syntax highlighting.
@@ -110,14 +113,20 @@ fn line_range(content: &str, line: u32) -> ByteRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use tempfile::NamedTempFile;
-    use std::io::Write;
 
     #[test]
     fn test_detect_language() {
-        assert_eq!(detect_language(Path::new("test.rs")), Some("rust".to_string()));
-        assert_eq!(detect_language(Path::new("test.py")), Some("python".to_string()));
+        assert_eq!(
+            detect_language(Path::new("test.rs")),
+            Some("rust".to_string())
+        );
+        assert_eq!(
+            detect_language(Path::new("test.py")),
+            Some("python".to_string())
+        );
         assert_eq!(detect_language(Path::new("test.unknown")), None);
     }
 
@@ -146,7 +155,12 @@ mod tests {
         };
 
         let preview = preview_text(&match_ref).await.unwrap();
-        if let PreviewData::Text { content, highlight_line, .. } = preview {
+        if let PreviewData::Text {
+            content,
+            highlight_line,
+            ..
+        } = preview
+        {
             assert!(content.contains("line 2"));
             assert_eq!(highlight_line, 2);
         } else {
@@ -167,10 +181,18 @@ mod tests {
         };
 
         let preview = preview_text(&match_ref).await.unwrap();
-        if let PreviewData::Text { highlight_line, highlight_range, .. } = preview {
+        if let PreviewData::Text {
+            highlight_line,
+            highlight_range,
+            ..
+        } = preview
+        {
             assert_eq!(highlight_line, 0, "line 0 should produce no highlight");
             assert_eq!(highlight_range.start, 0);
-            assert_eq!(highlight_range.end, 0, "range should be empty when no highlight");
+            assert_eq!(
+                highlight_range.end, 0,
+                "range should be empty when no highlight"
+            );
         } else {
             panic!("Expected Text preview");
         }
@@ -180,15 +202,24 @@ mod tests {
     async fn test_preview_pdf() {
         let match_ref = MatchRef {
             path: PathBuf::from("test.pdf"),
-            origin: SourceOrigin::PdfPage { 
-                page: 5, 
-                bbox: Some(wilkes_core::types::BoundingBox { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }) 
+            origin: SourceOrigin::PdfPage {
+                page: 5,
+                bbox: Some(wilkes_core::types::BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }),
             },
             text_range: None,
         };
 
         let res = preview(match_ref).await.unwrap();
-        if let PreviewData::Pdf { page, highlight_bbox } = res {
+        if let PreviewData::Pdf {
+            page,
+            highlight_bbox,
+        } = res
+        {
             assert_eq!(page, 5);
             assert!(highlight_bbox.is_some());
         } else {

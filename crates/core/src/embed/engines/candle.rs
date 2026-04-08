@@ -4,17 +4,21 @@ use tracing::{debug, info, warn};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use candle_core::{Device, DType, Tensor, Module};
+use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use candle_transformers::models::jina_bert::{BertModel as JinaBertModel, Config as JinaBertConfig};
-use candle_transformers::models::modernbert::{ModernBert, Config as ModernBertConfig};
+use candle_transformers::models::jina_bert::{
+    BertModel as JinaBertModel, Config as JinaBertConfig,
+};
+use candle_transformers::models::modernbert::{Config as ModernBertConfig, ModernBert};
 use hf_hub::api::sync::ApiBuilder;
 use tokenizers::Tokenizer;
 
-use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
+use super::super::models::installer::{
+    DownloadProgress, EmbedProgress, EmbedderInstaller, ProgressTx,
+};
 use super::super::Embedder;
-use super::super::models::installer::{DownloadProgress, EmbedProgress, EmbedderInstaller, ProgressTx};
+use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
 
 // ── Static model catalog ──────────────────────────────────────────────────────
 
@@ -70,7 +74,11 @@ fn cached_size_bytes(data_dir: &Path, model_id: &str) -> Option<u64> {
                 .map(|m| m.len())
         })
         .sum();
-    if total > 0 { Some(total) } else { None }
+    if total > 0 {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 // ── Public model list ─────────────────────────────────────────────────────────
@@ -185,6 +193,7 @@ pub struct CandleEmbedder {
     model_id: String,
     dimension: usize,
     pooling: PoolingStrategy,
+    query_prefix: String,
     passage_prefix: String,
 }
 
@@ -207,9 +216,16 @@ impl CandleEmbedder {
         for (i, chunk) in texts.chunks(EMBED_BATCH_SIZE).enumerate() {
             let tb = std::time::Instant::now();
             out.extend(self.embed_batch(chunk)?);
-            debug!("[candle]   batch {i}: {} texts in {:.1}s", chunk.len(), tb.elapsed().as_secs_f64());
+            debug!(
+                "[candle]   batch {i}: {} texts in {:.1}s",
+                chunk.len(),
+                tb.elapsed().as_secs_f64()
+            );
         }
-        debug!("[candle] embed_slices total: {:.1}s", t0.elapsed().as_secs_f64());
+        debug!(
+            "[candle] embed_slices total: {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
         Ok(out)
     }
 
@@ -226,7 +242,10 @@ impl CandleEmbedder {
 
         let batch_size = encodings.len();
         let seq_len = encodings[0].get_ids().len();
-        debug!("[candle]   tokenize: {batch_size}×{seq_len} in {:.3}s", t_tok.elapsed().as_secs_f64());
+        debug!(
+            "[candle]   tokenize: {batch_size}×{seq_len} in {:.3}s",
+            t_tok.elapsed().as_secs_f64()
+        );
         if seq_len == 0 {
             return Ok(vec![vec![0.0_f32; self.dimension]; batch_size]);
         }
@@ -244,22 +263,27 @@ impl CandleEmbedder {
             .flat_map(|e| e.get_type_ids().iter().copied())
             .collect();
 
-        let input_ids =
-            Tensor::from_vec(input_ids, (batch_size, seq_len), &self.device)?;
-        let attention_mask =
-            Tensor::from_vec(attention_mask, (batch_size, seq_len), &self.device)?;
-        let token_type_ids =
-            Tensor::from_vec(token_type_ids, (batch_size, seq_len), &self.device)?;
+        let input_ids = Tensor::from_vec(input_ids, (batch_size, seq_len), &self.device)?;
+        let attention_mask = Tensor::from_vec(attention_mask, (batch_size, seq_len), &self.device)?;
+        let token_type_ids = Tensor::from_vec(token_type_ids, (batch_size, seq_len), &self.device)?;
 
         let t_fwd = std::time::Instant::now();
         let token_embeddings = match &self.model {
-            LoadedModel::Bert(m) => m.forward(&input_ids, &token_type_ids, Some(&attention_mask))?,
+            LoadedModel::Bert(m) => {
+                m.forward(&input_ids, &token_type_ids, Some(&attention_mask))?
+            }
             LoadedModel::JinaBert(m) => Module::forward(m, &input_ids)?,
             LoadedModel::ModernBert(m) => m.forward(&input_ids, &attention_mask)?,
         };
         // Force GPU sync so we measure real forward time, not just command submission.
-        let _ = token_embeddings.flatten_all()?.narrow(0, 0, 1)?.to_vec1::<f32>()?;
-        debug!("[candle]   forward (synced): {:.3}s", t_fwd.elapsed().as_secs_f64());
+        let _ = token_embeddings
+            .flatten_all()?
+            .narrow(0, 0, 1)?
+            .to_vec1::<f32>()?;
+        debug!(
+            "[candle]   forward (synced): {:.3}s",
+            t_fwd.elapsed().as_secs_f64()
+        );
 
         let t_pool = std::time::Instant::now();
         let mask_f32 = attention_mask.to_dtype(self.dtype)?;
@@ -267,7 +291,10 @@ impl CandleEmbedder {
         let normalized = l2_normalize(&pooled)?;
 
         let result = normalized.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-        debug!("[candle]   pool+normalize+download: {:.3}s", t_pool.elapsed().as_secs_f64());
+        debug!(
+            "[candle]   pool+normalize+download: {:.3}s",
+            t_pool.elapsed().as_secs_f64()
+        );
         Ok(result)
     }
 
@@ -301,9 +328,7 @@ impl CandleEmbedder {
                     .ne(0.0f32)?
                     .unsqueeze(2)?
                     .broadcast_as(token_embeddings.shape())?;
-                mask_bool
-                    .where_cond(token_embeddings, &neg_inf)?
-                    .max(1)?
+                mask_bool.where_cond(token_embeddings, &neg_inf)?.max(1)?
             }
         })
     }
@@ -335,6 +360,10 @@ impl Embedder for CandleEmbedder {
         Some(EMBED_BATCH_SIZE)
     }
 
+    fn embed_query(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.embed_with_prefix(texts, &self.query_prefix)
+    }
+
     fn embed_passages(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         self.embed_with_prefix(texts, &self.passage_prefix)
     }
@@ -349,8 +378,16 @@ pub struct CandleInstaller {
 }
 
 impl CandleInstaller {
-    pub fn new(model: EmbedderModel, manager: super::super::worker::manager::WorkerManager, device: String) -> Self {
-        Self { model, manager, device }
+    pub fn new(
+        model: EmbedderModel,
+        manager: super::super::worker::manager::WorkerManager,
+        device: String,
+    ) -> Self {
+        Self {
+            model,
+            manager,
+            device,
+        }
     }
 }
 
@@ -363,6 +400,7 @@ impl EmbedderInstaller for CandleInstaller {
     async fn install(&self, data_dir: &Path, tx: ProgressTx) -> anyhow::Result<()> {
         let model_id = self.model.0.clone();
         let data_dir = data_dir.to_path_buf();
+        let download_cache_dir = data_dir.clone();
 
         let _ = tx
             .send(EmbedProgress::Download(DownloadProgress {
@@ -374,7 +412,7 @@ impl EmbedderInstaller for CandleInstaller {
 
         tokio::task::spawn_blocking(move || {
             let api = ApiBuilder::new()
-                .with_cache_dir(data_dir)
+                .with_cache_dir(download_cache_dir)
                 .build()
                 .context("Failed to initialise HF hub API")?;
             let repo = api.model(model_id.clone());
@@ -390,6 +428,13 @@ impl EmbedderInstaller for CandleInstaller {
             Ok::<_, anyhow::Error>(())
         })
         .await??;
+
+        let aux_model_id = self.model.0.clone();
+        let aux_cache_dir = data_dir.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || {
+            super::aux_config::fetch_aux_configs(&aux_cache_dir, &aux_model_id);
+        })
+        .await;
 
         let _ = tx
             .send(EmbedProgress::Download(DownloadProgress {
@@ -410,18 +455,20 @@ impl EmbedderInstaller for CandleInstaller {
         let model_id = &self.model.0;
         let dimension = read_dimension(data_dir, model_id)?;
         let prefixes = super::aux_config::load_prefixes(data_dir, model_id);
-        Ok(Arc::new(super::super::worker::embedder::WorkerEmbedder::new(
-            self.manager.clone(),
-            super::super::worker::embedder::WorkerEmbedderConfig {
-                model_id: model_id.clone(),
-                dimension,
-                device: self.device.clone(),
-                engine: EmbeddingEngine::Candle,
-                data_dir: data_dir.to_path_buf(),
-                query_prefix: prefixes.query_prefix,
-                passage_prefix: prefixes.passage_prefix,
-            },
-        )))
+        Ok(Arc::new(
+            super::super::worker::embedder::WorkerEmbedder::new(
+                self.manager.clone(),
+                super::super::worker::embedder::WorkerEmbedderConfig {
+                    model_id: model_id.clone(),
+                    dimension,
+                    device: self.device.clone(),
+                    engine: EmbeddingEngine::Candle,
+                    data_dir: data_dir.to_path_buf(),
+                    query_prefix: prefixes.query_prefix,
+                    passage_prefix: prefixes.passage_prefix,
+                },
+            ),
+        ))
     }
 }
 
@@ -445,7 +492,11 @@ fn read_dimension(data_dir: &Path, model_id: &str) -> anyhow::Result<usize> {
 
 /// Load a `CandleEmbedder` directly in the calling process.
 /// Only called from the worker subprocess, never from the main Tauri process.
-pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> anyhow::Result<Arc<dyn Embedder>> {
+pub fn load_embedder(
+    model: &EmbedderModel,
+    data_dir: &Path,
+    device: &str,
+) -> anyhow::Result<Arc<dyn Embedder>> {
     let model_id = &model.0;
 
     let config_path = cached_path(data_dir, model_id, "config.json")
@@ -475,12 +526,18 @@ pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> an
             .with_context(|| format!("Failed to load weights for '{model_id}'"))?
     };
 
-    info!("[candle] dispatching '{model_id}' with model_type='{}'", peek.model_type);
+    info!(
+        "[candle] dispatching '{model_id}' with model_type='{}'",
+        peek.model_type
+    );
 
     let (model_loaded, dimension) = match peek.model_type.as_str() {
         "jina_bert_v2" | "jina_bert" | "jina_bert_v3" | "qwen2" | "qwen" | "jina_embeddings_v5" => {
-            let config: JinaBertConfig = serde_json::from_str(&config_text)
-                .map_err(|e| anyhow::anyhow!("Failed to parse JinaBertConfig for '{model_id}': {e}. Config: {config_text}"))?;
+            let config: JinaBertConfig = serde_json::from_str(&config_text).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to parse JinaBertConfig for '{model_id}': {e}. Config: {config_text}"
+                )
+            })?;
             let dim = config.hidden_size;
             let m = JinaBertModel::new(vb, &config)
                 .with_context(|| format!("Failed to build JinaBert model for '{model_id}'"))?;
@@ -524,7 +581,7 @@ pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> an
         "[candle] loaded '{model_id}' dim={dimension} pooling={pooling:?} device={device:?} dtype={dtype:?}"
     );
 
-    let passage_prefix = super::aux_config::load_prefixes(data_dir, model_id).passage_prefix;
+    let prefixes = super::aux_config::load_prefixes(data_dir, model_id);
 
     Ok(Arc::new(CandleEmbedder {
         model: model_loaded,
@@ -534,15 +591,16 @@ pub fn load_embedder(model: &EmbedderModel, data_dir: &Path, device: &str) -> an
         model_id: model_id.clone(),
         dimension,
         pooling,
-        passage_prefix,
+        query_prefix: prefixes.query_prefix,
+        passage_prefix: prefixes.passage_prefix,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_list_supported_models() {
@@ -550,15 +608,20 @@ mod tests {
         let models = list_supported_models(dir.path());
         assert!(!models.is_empty());
         let default_id = crate::types::EmbeddingEngine::Candle.default_model();
-        assert!(models.iter().any(|m| m.model_id == default_id),
-            "Default model '{default_id}' must exist in the Candle catalog");
+        assert!(
+            models.iter().any(|m| m.model_id == default_id),
+            "Default model '{default_id}' must exist in the Candle catalog"
+        );
     }
 
     #[test]
     fn test_select_device() {
         assert!(matches!(select_device("cpu"), Device::Cpu));
         // On non-metal systems or without feature, it should fallback to Cpu
-        assert!(matches!(select_device("metal"), Device::Cpu | Device::Metal(_)));
+        assert!(matches!(
+            select_device("metal"),
+            Device::Cpu | Device::Metal(_)
+        ));
     }
 
     #[test]
@@ -597,7 +660,7 @@ mod tests {
         let snapshots = repo_dir.join("snapshots").join("main");
         fs::create_dir_all(&snapshots).unwrap();
         fs::write(snapshots.join("config.json"), r#"{"hidden_size": 1024}"#).unwrap();
-        
+
         let refs = repo_dir.join("refs");
         fs::create_dir_all(&refs).unwrap();
         fs::write(refs.join("main"), "main").unwrap();
@@ -621,7 +684,7 @@ mod tests {
         let snapshots = repo_dir.join("snapshots").join("main");
         fs::create_dir_all(&snapshots).unwrap();
         fs::write(snapshots.join("config.json"), r#"{"hidden_size": "#).unwrap();
-        
+
         let refs = repo_dir.join("refs");
         fs::create_dir_all(&refs).unwrap();
         fs::write(refs.join("main"), "main").unwrap();
@@ -637,8 +700,12 @@ mod tests {
         let repo_dir = dir.path().join("models--cls--model");
         let snapshots = repo_dir.join("snapshots").join("main");
         fs::create_dir_all(snapshots.join("1_Pooling")).unwrap();
-        fs::write(snapshots.join("1_Pooling/config.json"), r#"{"pooling_mode_cls_token": true}"#).unwrap();
-        
+        fs::write(
+            snapshots.join("1_Pooling/config.json"),
+            r#"{"pooling_mode_cls_token": true}"#,
+        )
+        .unwrap();
+
         let refs = repo_dir.join("refs");
         fs::create_dir_all(&refs).unwrap();
         fs::write(refs.join("main"), "main").unwrap();
@@ -654,8 +721,12 @@ mod tests {
         let repo_dir = dir.path().join("models--max--model");
         let snapshots = repo_dir.join("snapshots").join("main");
         fs::create_dir_all(snapshots.join("1_Pooling")).unwrap();
-        fs::write(snapshots.join("1_Pooling/config.json"), r#"{"pooling_mode_max_tokens": true}"#).unwrap();
-        
+        fs::write(
+            snapshots.join("1_Pooling/config.json"),
+            r#"{"pooling_mode_max_tokens": true}"#,
+        )
+        .unwrap();
+
         let refs = repo_dir.join("refs");
         fs::create_dir_all(&refs).unwrap();
         fs::write(refs.join("main"), "main").unwrap();
@@ -671,8 +742,12 @@ mod tests {
         let repo_dir = dir.path().join("models--bad--pooling");
         let snapshots = repo_dir.join("snapshots").join("main");
         fs::create_dir_all(snapshots.join("1_Pooling")).unwrap();
-        fs::write(snapshots.join("1_Pooling/config.json"), r#"{"pooling_mode_cls_token": "#).unwrap();
-        
+        fs::write(
+            snapshots.join("1_Pooling/config.json"),
+            r#"{"pooling_mode_cls_token": "#,
+        )
+        .unwrap();
+
         let refs = repo_dir.join("refs");
         fs::create_dir_all(&refs).unwrap();
         fs::write(refs.join("main"), "main").unwrap();
@@ -688,11 +763,11 @@ mod tests {
         let repo_dir = dir.path().join("models--size--model");
         let snapshots = repo_dir.join("snapshots").join("main");
         fs::create_dir_all(&snapshots).unwrap();
-        
+
         fs::write(snapshots.join("config.json"), "abc").unwrap(); // 3 bytes
         fs::write(snapshots.join("tokenizer.json"), "defg").unwrap(); // 4 bytes
         fs::write(snapshots.join("model.safetensors"), "h").unwrap(); // 1 byte
-        
+
         let refs = repo_dir.join("refs");
         fs::create_dir_all(&refs).unwrap();
         fs::write(refs.join("main"), "main").unwrap();
@@ -704,12 +779,11 @@ mod tests {
     #[test]
     fn test_candle_installer_basics() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
-        let installer = CandleInstaller::new(
-            EmbedderModel("m1".to_string()),
-            manager,
-            "cpu".to_string()
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
+            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
         );
+        let installer =
+            CandleInstaller::new(EmbedderModel("m1".to_string()), manager, "cpu".to_string());
         assert_eq!(installer.model.0, "m1");
 
         assert!(!installer.is_available(dir.path()));
@@ -732,12 +806,11 @@ mod tests {
     async fn test_candle_installer_install_skip() {
         std::env::set_var("HF_HUB_OFFLINE", "1");
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(crate::embed::worker::manager::WorkerPaths::resolve(dir.path()));
-        let installer = CandleInstaller::new(
-            EmbedderModel("m1".to_string()),
-            manager,
-            "cpu".to_string()
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
+            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
         );
+        let installer =
+            CandleInstaller::new(EmbedderModel("m1".to_string()), manager, "cpu".to_string());
 
         // Mock it so it skips download
         let repo_dir = dir.path().join("models--m1");
@@ -767,29 +840,48 @@ mod tests {
         let device = Device::Cpu;
         let dtype = DType::F32;
         // (B=1, S=2, H=3)
-        let embeddings_t = Tensor::new(&[[[1.0f32, 2.0f32, 3.0f32], [4.0f32, 5.0f32, 6.0f32]]], &device).unwrap();
+        let embeddings_t = Tensor::new(
+            &[[[1.0f32, 2.0f32, 3.0f32], [4.0f32, 5.0f32, 6.0f32]]],
+            &device,
+        )
+        .unwrap();
         let mask = Tensor::new(&[[1.0f32, 1.0f32]], &device).unwrap();
-        
+
         let tokenizer_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":null,"byte_fallback":null,"vocab":{},"merges":[]}}"#;
         let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes()).unwrap();
 
         // BertModel::load needs these tensors (minimal set)
         let mut tensors = std::collections::HashMap::new();
-        tensors.insert("embeddings.word_embeddings.weight".to_string(), Tensor::zeros((1, 3), dtype, &device).unwrap());
-        tensors.insert("embeddings.position_embeddings.weight".to_string(), Tensor::zeros((512, 3), dtype, &device).unwrap());
-        tensors.insert("embeddings.token_type_embeddings.weight".to_string(), Tensor::zeros((2, 3), dtype, &device).unwrap());
-        tensors.insert("embeddings.LayerNorm.weight".to_string(), Tensor::ones(3, dtype, &device).unwrap());
-        tensors.insert("embeddings.LayerNorm.bias".to_string(), Tensor::zeros(3, dtype, &device).unwrap());
-        
-        let config = BertConfig { 
-            num_hidden_layers: 0, 
-            hidden_size: 3, 
-            intermediate_size: 3, 
-            num_attention_heads: 1, 
+        tensors.insert(
+            "embeddings.word_embeddings.weight".to_string(),
+            Tensor::zeros((1, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.position_embeddings.weight".to_string(),
+            Tensor::zeros((512, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.token_type_embeddings.weight".to_string(),
+            Tensor::zeros((2, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.LayerNorm.weight".to_string(),
+            Tensor::ones(3, dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.LayerNorm.bias".to_string(),
+            Tensor::zeros(3, dtype, &device).unwrap(),
+        );
+
+        let config = BertConfig {
+            num_hidden_layers: 0,
+            hidden_size: 3,
+            intermediate_size: 3,
+            num_attention_heads: 1,
             vocab_size: 1, // MATCH the tensor shape [1, 3]
-            ..BertConfig::default() 
+            ..BertConfig::default()
         };
-        
+
         let vb = VarBuilder::from_tensors(tensors, dtype, &device);
         let model = BertModel::load(vb, &config).unwrap();
 
@@ -802,6 +894,7 @@ mod tests {
             model_id: "m".to_string(),
             dimension: 3,
             pooling: PoolingStrategy::Cls,
+            query_prefix: "".to_string(),
             passage_prefix: "".to_string(),
         };
 
@@ -815,25 +908,44 @@ mod tests {
         let device = Device::Cpu;
         let dtype = DType::F32;
         // (B=1, S=2, H=3)
-        let embeddings_t = Tensor::new(&[[[1.0f32, 2.0f32, 3.0f32], [4.0f32, 5.0f32, 6.0f32]]], &device).unwrap();
+        let embeddings_t = Tensor::new(
+            &[[[1.0f32, 2.0f32, 3.0f32], [4.0f32, 5.0f32, 6.0f32]]],
+            &device,
+        )
+        .unwrap();
         let mask = Tensor::new(&[[1.0f32, 1.0f32]], &device).unwrap();
-        
+
         let tokenizer_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":null,"byte_fallback":null,"vocab":{},"merges":[]}}"#;
         let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes()).unwrap();
 
         let mut tensors = std::collections::HashMap::new();
-        tensors.insert("embeddings.word_embeddings.weight".to_string(), Tensor::zeros((1, 3), dtype, &device).unwrap());
-        tensors.insert("embeddings.position_embeddings.weight".to_string(), Tensor::zeros((512, 3), dtype, &device).unwrap());
-        tensors.insert("embeddings.token_type_embeddings.weight".to_string(), Tensor::zeros((2, 3), dtype, &device).unwrap());
-        tensors.insert("embeddings.LayerNorm.weight".to_string(), Tensor::ones(3, dtype, &device).unwrap());
-        tensors.insert("embeddings.LayerNorm.bias".to_string(), Tensor::zeros(3, dtype, &device).unwrap());
-        let config = BertConfig { 
-            num_hidden_layers: 0, 
-            hidden_size: 3, 
-            intermediate_size: 3, 
-            num_attention_heads: 1, 
+        tensors.insert(
+            "embeddings.word_embeddings.weight".to_string(),
+            Tensor::zeros((1, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.position_embeddings.weight".to_string(),
+            Tensor::zeros((512, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.token_type_embeddings.weight".to_string(),
+            Tensor::zeros((2, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.LayerNorm.weight".to_string(),
+            Tensor::ones(3, dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.LayerNorm.bias".to_string(),
+            Tensor::zeros(3, dtype, &device).unwrap(),
+        );
+        let config = BertConfig {
+            num_hidden_layers: 0,
+            hidden_size: 3,
+            intermediate_size: 3,
+            num_attention_heads: 1,
             vocab_size: 1, // MATCH tensor [1, 3]
-            ..BertConfig::default() 
+            ..BertConfig::default()
         };
         let vb = VarBuilder::from_tensors(tensors, dtype, &device);
         let model = BertModel::load(vb, &config).unwrap();
@@ -846,6 +958,7 @@ mod tests {
             model_id: "m".to_string(),
             dimension: 3,
             pooling: PoolingStrategy::Mean,
+            query_prefix: "".to_string(),
             passage_prefix: "".to_string(),
         };
 
@@ -859,25 +972,44 @@ mod tests {
         let device = Device::Cpu;
         let dtype = DType::F32;
         // (B=1, S=2, H=3)
-        let embeddings_t = Tensor::new(&[[[1.0f32, 10.0f32, 3.0f32], [4.0f32, 5.0f32, 6.0f32]]], &device).unwrap();
+        let embeddings_t = Tensor::new(
+            &[[[1.0f32, 10.0f32, 3.0f32], [4.0f32, 5.0f32, 6.0f32]]],
+            &device,
+        )
+        .unwrap();
         let mask = Tensor::new(&[[1.0f32, 1.0f32]], &device).unwrap();
-        
+
         let tokenizer_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":null,"byte_fallback":null,"vocab":{},"merges":[]}}"#;
         let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes()).unwrap();
 
         let mut tensors = std::collections::HashMap::new();
-        tensors.insert("embeddings.word_embeddings.weight".to_string(), Tensor::zeros((1, 3), dtype, &device).unwrap());
-        tensors.insert("embeddings.position_embeddings.weight".to_string(), Tensor::zeros((512, 3), dtype, &device).unwrap());
-        tensors.insert("embeddings.token_type_embeddings.weight".to_string(), Tensor::zeros((2, 3), dtype, &device).unwrap());
-        tensors.insert("embeddings.LayerNorm.weight".to_string(), Tensor::ones(3, dtype, &device).unwrap());
-        tensors.insert("embeddings.LayerNorm.bias".to_string(), Tensor::zeros(3, dtype, &device).unwrap());
-        let config = BertConfig { 
-            num_hidden_layers: 0, 
-            hidden_size: 3, 
-            intermediate_size: 3, 
-            num_attention_heads: 1, 
+        tensors.insert(
+            "embeddings.word_embeddings.weight".to_string(),
+            Tensor::zeros((1, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.position_embeddings.weight".to_string(),
+            Tensor::zeros((512, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.token_type_embeddings.weight".to_string(),
+            Tensor::zeros((2, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.LayerNorm.weight".to_string(),
+            Tensor::ones(3, dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.LayerNorm.bias".to_string(),
+            Tensor::zeros(3, dtype, &device).unwrap(),
+        );
+        let config = BertConfig {
+            num_hidden_layers: 0,
+            hidden_size: 3,
+            intermediate_size: 3,
+            num_attention_heads: 1,
             vocab_size: 1, // MATCH tensor [1, 3]
-            ..BertConfig::default() 
+            ..BertConfig::default()
         };
         let vb = VarBuilder::from_tensors(tensors, dtype, &device);
         let model = BertModel::load(vb, &config).unwrap();
@@ -890,6 +1022,7 @@ mod tests {
             model_id: "m".to_string(),
             dimension: 3,
             pooling: PoolingStrategy::Max,
+            query_prefix: "".to_string(),
             passage_prefix: "".to_string(),
         };
 

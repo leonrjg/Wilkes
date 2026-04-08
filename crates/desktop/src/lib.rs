@@ -7,8 +7,7 @@ use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
-    DataPaths, EmbedderModel, EmbeddingEngine, FileEntry, IndexStatus, ModelDescriptor,
-    Settings,
+    DataPaths, EmbedderModel, EmbeddingEngine, FileEntry, IndexStatus, ModelDescriptor, Settings,
 };
 
 // ── Platform helpers ──────────────────────────────────────────────────────────
@@ -36,7 +35,9 @@ struct ActiveSearches(Mutex<HashMap<String, JoinHandle<()>>>);
 
 #[tauri::command]
 async fn get_data_paths(app: AppHandle) -> Result<DataPaths, String> {
-    let app_data = app.path().app_data_dir()
+    let app_data = app
+        .path()
+        .app_data_dir()
         .map(|p| p.display().to_string())
         .map_err(|e| e.to_string())?;
     Ok(DataPaths { app_data })
@@ -44,7 +45,9 @@ async fn get_data_paths(app: AppHandle) -> Result<DataPaths, String> {
 
 #[tauri::command]
 async fn get_python_info() -> Result<String, String> {
-    wilkes_core::path::resolve_python().map(|p| p.display().to_string()).map_err(|e| e.to_string())
+    wilkes_core::path::resolve_python()
+        .map(|p| p.display().to_string())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -54,11 +57,20 @@ async fn open_path(path: String) -> Result<(), String> {
         return Err("Path does not exist".into());
     }
     #[cfg(target_os = "macos")]
-    std::process::Command::new("open").arg(&p).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new("open")
+        .arg(&p)
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
-    std::process::Command::new("explorer").arg(&p).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new("explorer")
+        .arg(&p)
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(target_os = "linux")]
-    std::process::Command::new("xdg-open").arg(&p).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new("xdg-open")
+        .arg(&p)
+        .spawn()
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -88,27 +100,44 @@ async fn search(
     let app_clone = app.clone();
 
     let forwarder: JoinHandle<()> = tokio::spawn(async move {
-        let stats = handle.run(|fm| {
-            let app_clone = app_clone.clone();
-            let id = id.clone();
-            async move {
-                let _ = app_clone.emit(&format!("search-result-{}", id), &fm);
-                true
-            }
-        }).await;
+        let stats = handle
+            .run(|fm| {
+                let app_clone = app_clone.clone();
+                let id = id.clone();
+                async move {
+                    let _ = app_clone.emit(&format!("search-result-{}", id), &fm);
+                    true
+                }
+            })
+            .await;
 
         let _ = app_clone.emit(&format!("search-complete-{}", id), &stats);
 
-        app_clone.state::<ActiveSearches>().0.lock().unwrap().remove(&id);
+        app_clone
+            .state::<ActiveSearches>()
+            .0
+            .lock()
+            .unwrap()
+            .remove(&id);
     });
 
-    app.state::<ActiveSearches>().0.lock().unwrap().insert(search_id.clone(), forwarder);
+    app.state::<ActiveSearches>()
+        .0
+        .lock()
+        .unwrap()
+        .insert(search_id.clone(), forwarder);
     Ok(search_id)
 }
 
 #[tauri::command]
 async fn cancel_search(search_id: String, app: AppHandle) -> Result<(), String> {
-    if let Some(h) = app.state::<ActiveSearches>().0.lock().unwrap().remove(&search_id) {
+    if let Some(h) = app
+        .state::<ActiveSearches>()
+        .0
+        .lock()
+        .unwrap()
+        .remove(&search_id)
+    {
         h.abort();
     }
     Ok(())
@@ -117,8 +146,12 @@ async fn cancel_search(search_id: String, app: AppHandle) -> Result<(), String> 
 // ── Delegating commands ───────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn preview(match_ref: wilkes_core::types::MatchRef) -> Result<wilkes_core::types::PreviewData, String> {
-    wilkes_api::commands::preview::preview(match_ref).await.map_err(|e| e.to_string())
+async fn preview(
+    match_ref: wilkes_core::types::MatchRef,
+) -> Result<wilkes_core::types::PreviewData, String> {
+    wilkes_api::commands::preview::preview(match_ref)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -128,7 +161,10 @@ async fn list_files(root: String, app: AppHandle) -> Result<Vec<FileEntry>, Stri
 }
 
 #[tauri::command]
-async fn open_file(path: String, app: AppHandle) -> Result<wilkes_core::types::PreviewData, String> {
+async fn open_file(
+    path: String,
+    app: AppHandle,
+) -> Result<wilkes_core::types::PreviewData, String> {
     let ctx = app.state::<Arc<AppContext>>().inner().clone();
     ctx.open_file(path.into()).await.map_err(|e| e.to_string())
 }
@@ -170,19 +206,33 @@ fn get_supported_engines() -> Vec<EmbeddingEngine> {
 // ── Embed commands (delegating to AppContext) ─────────────────────────────────
 
 #[tauri::command]
-async fn download_model(model: EmbedderModel, engine: EmbeddingEngine, app: AppHandle) -> Result<(), String> {
+async fn download_model(
+    model: EmbedderModel,
+    engine: EmbeddingEngine,
+    app: AppHandle,
+) -> Result<(), String> {
     let ctx = app.state::<Arc<AppContext>>().inner().clone();
     ctx.start_download_model(model, engine).await
 }
 
 #[tauri::command]
-async fn build_index(root: String, model: EmbedderModel, engine: EmbeddingEngine, app: AppHandle) -> Result<(), String> {
+async fn build_index(
+    root: String,
+    model: EmbedderModel,
+    engine: EmbeddingEngine,
+    app: AppHandle,
+) -> Result<(), String> {
     let ctx = app.state::<Arc<AppContext>>().inner().clone();
-    Arc::clone(&ctx).start_build_index(root, model, engine).await
+    Arc::clone(&ctx)
+        .start_build_index(root, model, engine)
+        .await
 }
 
 #[tauri::command]
-async fn list_models(engine: EmbeddingEngine, app: AppHandle) -> Result<Vec<ModelDescriptor>, String> {
+async fn list_models(
+    engine: EmbeddingEngine,
+    app: AppHandle,
+) -> Result<Vec<ModelDescriptor>, String> {
     let ctx = app.state::<Arc<AppContext>>().inner().clone();
     Ok(wilkes_api::commands::embed::list_models(engine, &ctx.data_dir).await)
 }
@@ -190,7 +240,8 @@ async fn list_models(engine: EmbeddingEngine, app: AppHandle) -> Result<Vec<Mode
 #[tauri::command]
 async fn get_model_size(engine: EmbeddingEngine, model_id: String) -> Result<u64, String> {
     wilkes_api::commands::embed::get_model_size(engine, model_id)
-        .await.map_err(|e| e.to_string())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -228,7 +279,9 @@ async fn kill_worker(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 async fn set_worker_timeout(secs: u64, app: AppHandle) -> Result<(), String> {
     let ctx = app.state::<Arc<AppContext>>().inner().clone();
-    ctx.set_worker_timeout(secs).await.map_err(|e| e.to_string())
+    ctx.set_worker_timeout(secs)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -246,7 +299,8 @@ pub fn run() {
             let paths = WorkerPaths::resolve(&data_dir);
 
             let emitter = Arc::new(TauriEmitter(handle.clone()));
-            let (ctx, event_rx, loop_fut) = AppContext::new(data_dir, settings_path, paths, emitter);
+            let (ctx, event_rx, loop_fut) =
+                AppContext::new(data_dir, settings_path, paths, emitter);
 
             app.manage(Arc::clone(&ctx));
             app.manage(ActiveSearches(Mutex::new(HashMap::new())));
@@ -293,7 +347,7 @@ pub fn run() {
 mod tests {
     use super::*;
 
-#[tokio::test]
+    #[tokio::test]
     async fn test_get_python_info() {
         let result = get_python_info().await;
         assert!(result.is_ok() || result.is_err());
@@ -319,5 +373,4 @@ mod tests {
         guard.insert("test".to_string(), tokio::spawn(async {}));
         assert!(guard.contains_key("test"));
     }
-
 }

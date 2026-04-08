@@ -49,7 +49,10 @@ pub fn chunk_content(
             }
             // chunks() returns subslices of the original — pointer diff gives the byte offset.
             let offset = chunk_str.as_ptr() as usize - base;
-            let byte_range = ByteRange { start: offset, end: offset + chunk_str.len() };
+            let byte_range = ByteRange {
+                start: offset,
+                end: offset + chunk_str.len(),
+            };
             let origin = content
                 .source_map
                 .resolve_range(byte_range.clone())
@@ -57,14 +60,18 @@ pub fn chunk_content(
                     // Chunk start may land on a gap (e.g. inter-page whitespace in PDFs).
                     // Walk forward to the first byte that resolves.
                     (1..chunk_str.len()).find_map(|i| {
-                        content.source_map.resolve_range(ByteRange { 
-                            start: offset + i, 
-                            end: offset + chunk_str.len() 
+                        content.source_map.resolve_range(ByteRange {
+                            start: offset + i,
+                            end: offset + chunk_str.len(),
                         })
                     })
                 })
                 .unwrap_or_else(|| {
-                    let line = content.text[..offset].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+                    let line = content.text[..offset]
+                        .bytes()
+                        .filter(|&b| b == b'\n')
+                        .count() as u32
+                        + 1;
                     SourceOrigin::TextFile { line, col: 0 }
                 });
             Some(Chunk {
@@ -85,7 +92,8 @@ mod tests {
     #[test]
     fn test_chunk_content_simple() {
         let content = ExtractedContent {
-            text: "Hello world. This is a test string for chunking. It should be split.".to_string(),
+            text: "Hello world. This is a test string for chunking. It should be split."
+                .to_string(),
             source_map: SourceMap {
                 segments: vec![SourceSegment {
                     text_range: ByteRange { start: 0, end: 70 },
@@ -103,7 +111,7 @@ mod tests {
 
         // window_chars = 20, overlap = 5
         let chunks = chunk_content(&content, PathBuf::from("test.txt"), 20, 5);
-        
+
         assert!(!chunks.is_empty());
         for chunk in &chunks {
             assert!(!chunk.text.is_empty());

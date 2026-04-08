@@ -1,5 +1,7 @@
 use crate::extract::ExtractorRegistry;
-use crate::types::{ByteRange, FileMatches, FileType, Match, SearchCapabilities, SearchQuery, SourceOrigin};
+use crate::types::{
+    ByteRange, FileMatches, FileType, Match, SearchCapabilities, SearchQuery, SourceOrigin,
+};
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
@@ -81,7 +83,8 @@ impl SearchProvider for GrepSearchProvider {
             // File type filter
             if !query.file_type_filters.is_empty() {
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if !query.file_type_filters
+                if !query
+                    .file_type_filters
                     .iter()
                     .any(|f| f.eq_ignore_ascii_case(ext))
                 {
@@ -94,29 +97,29 @@ impl SearchProvider for GrepSearchProvider {
                 None => {
                     // Use infer for unknown types; skip if recognised binary.
                     match infer::get_from_path(path) {
-                        Ok(Some(_)) => continue, // known binary format — skip
+                        Ok(Some(_)) => continue,  // known binary format — skip
                         _ => FileType::PlainText, // assume text
                     }
                 }
             };
 
             let matches = match &file_type {
-                FileType::PlainText => search_text_file(path, &matcher, query.context_lines as u64)?,
-                FileType::Pdf => {
-                    match extractors.find(path, None) {
-                        Some(extractor) => match extractor.extract(path) {
-                            Ok(content) => search_extracted_content(&content, &matcher)?,
-                            Err(e) => {
-                                errors.push(format!("{}: {e:#}", path.display()));
-                                continue;
-                            }
-                        },
-                        None => {
-                            errors.push(format!("{}: no extractor registered", path.display()));
+                FileType::PlainText => {
+                    search_text_file(path, &matcher, query.context_lines as u64)?
+                }
+                FileType::Pdf => match extractors.find(path, None) {
+                    Some(extractor) => match extractor.extract(path) {
+                        Ok(content) => search_extracted_content(&content, &matcher)?,
+                        Err(e) => {
+                            errors.push(format!("{}: {e:#}", path.display()));
                             continue;
                         }
+                    },
+                    None => {
+                        errors.push(format!("{}: no extractor registered", path.display()));
+                        continue;
                     }
-                }
+                },
             };
 
             if !matches.is_empty() {
@@ -144,8 +147,15 @@ impl SearchProvider for GrepSearchProvider {
             supports_case_sensitivity: true,
             is_indexed: false,
             supported_file_types: vec![
-                "txt".into(), "md".into(), "rs".into(), "py".into(), "js".into(),
-                "ts".into(), "json".into(), "toml".into(), "yaml".into(),
+                "txt".into(),
+                "md".into(),
+                "rs".into(),
+                "py".into(),
+                "js".into(),
+                "ts".into(),
+                "json".into(),
+                "toml".into(),
+                "yaml".into(),
             ],
             requires_index: false,
             semantic_index_built: false,
@@ -166,11 +176,7 @@ struct CollectSink<'m> {
 impl<'m> Sink for CollectSink<'m> {
     type Error = SinkError;
 
-    fn matched(
-        &mut self,
-        _searcher: &Searcher,
-        mat: &SinkMatch<'_>,
-    ) -> Result<bool, Self::Error> {
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
         let line = mat.bytes();
         let line_num = mat.line_number().unwrap_or(0) as u32;
         let base_offset = mat.absolute_byte_offset() as usize;
@@ -182,14 +188,11 @@ impl<'m> Sink for CollectSink<'m> {
             .find_iter(line, |m| {
                 let start = m.start();
                 let end = m.end();
-                let matched_text =
-                    String::from_utf8_lossy(&line[start..end]).into_owned();
-                let context_before =
-                    String::from_utf8_lossy(&line[..start]).into_owned();
-                let context_after =
-                    String::from_utf8_lossy(&line[end..])
-                        .trim_end_matches(['\n', '\r'])
-                        .to_owned();
+                let matched_text = String::from_utf8_lossy(&line[start..end]).into_owned();
+                let context_before = String::from_utf8_lossy(&line[..start]).into_owned();
+                let context_after = String::from_utf8_lossy(&line[end..])
+                    .trim_end_matches(['\n', '\r'])
+                    .to_owned();
 
                 line_matches.push(Match {
                     text_range: Some(ByteRange {
@@ -214,7 +217,11 @@ impl<'m> Sink for CollectSink<'m> {
     }
 }
 
-fn search_text_file(path: &Path, matcher: &RegexMatcher, context_lines: u64) -> anyhow::Result<Vec<Match>> {
+fn search_text_file(
+    path: &Path,
+    matcher: &RegexMatcher,
+    context_lines: u64,
+) -> anyhow::Result<Vec<Match>> {
     let mut sink = CollectSink {
         matcher,
         matches: Vec::new(),
@@ -250,7 +257,10 @@ fn search_extracted_content(
             let origin = content
                 .source_map
                 .resolve_range(ByteRange { start, end })
-                .unwrap_or(SourceOrigin::PdfPage { page: 1, bbox: None });
+                .unwrap_or(SourceOrigin::PdfPage {
+                    page: 1,
+                    bbox: None,
+                });
 
             // Extract ~120-char context windows around the match using char
             // boundaries so we don't split UTF-8 sequences.
@@ -285,7 +295,11 @@ fn extract_context_before(text: &str, byte_pos: usize, max_chars: usize) -> Stri
     let prefix = &text[..end];
     let chars: Vec<char> = prefix.chars().collect();
     let start = chars.len().saturating_sub(max_chars);
-    chars[start..].iter().collect::<String>().trim_start().to_string()
+    chars[start..]
+        .iter()
+        .collect::<String>()
+        .trim_start()
+        .to_string()
 }
 
 /// Return up to `max_chars` characters immediately after `byte_pos`,
@@ -298,14 +312,18 @@ fn extract_context_after(text: &str, byte_pos: usize, max_chars: usize) -> Strin
         .unwrap_or(text.len());
     let chars: Vec<char> = text[start..].chars().collect();
     let end = chars.len().min(max_chars);
-    chars[..end].iter().collect::<String>().trim_end().to_string()
+    chars[..end]
+        .iter()
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_build_matcher() {
@@ -362,7 +380,7 @@ mod tests {
 
         let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
         let matches = search_text_file(&path, &matcher, 0).unwrap();
-        
+
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].matched_text, "match");
         match matches[0].origin {
@@ -393,7 +411,7 @@ mod tests {
 
         let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
         let matches = search_text_file(&path, &matcher, 0).unwrap();
-        
+
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].matched_text, "user_123");
         assert_eq!(matches[1].matched_text, "admin_456");
@@ -421,9 +439,9 @@ mod tests {
 
         let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
         let matches = search_text_file(&path, &matcher, 1).unwrap();
-        
+
         assert_eq!(matches.len(), 1);
-        // Note: CollectSink currently only captures the matched line, 
+        // Note: CollectSink currently only captures the matched line,
         // but it could be extended to capture context if needed.
         // Currently context_before/after in Match struct are from the SAME line.
         assert_eq!(matches[0].matched_text, "target");
@@ -433,10 +451,10 @@ mod tests {
 
     #[test]
     fn test_search_extracted_content() {
-        use std::path::PathBuf;
         use crate::types::ExtractedContent;
-        use crate::types::SourceMap;
         use crate::types::FileMetadata;
+        use crate::types::SourceMap;
+        use std::path::PathBuf;
 
         let content = ExtractedContent {
             text: "The quick brown fox jumps over the lazy dog".to_string(),
@@ -464,7 +482,7 @@ mod tests {
         };
         let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
         let matches = search_extracted_content(&content, &matcher).unwrap();
-        
+
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].matched_text, "fox");
         assert_eq!(matches[0].context_before, "The quick brown ");
@@ -614,7 +632,7 @@ mod tests {
         assert_eq!(extract_context_after(text, 5, 10), "");
         assert_eq!(extract_context_before(text, 5, 10), "short");
         assert_eq!(extract_context_after(text, 0, 10), "short");
-        
+
         // Invalid byte positions (between char boundaries)
         let emoji = "🦀🦀";
         // 🦀 is 4 bytes. byte 1 is not a char boundary.
@@ -682,12 +700,14 @@ mod tests {
 
         use crate::extract::ContentExtractor;
         use crate::types::ExtractedContent;
-        use crate::types::SourceMap;
         use crate::types::FileMetadata;
-        
+        use crate::types::SourceMap;
+
         struct MockPdfExtractor;
         impl ContentExtractor for MockPdfExtractor {
-            fn can_handle(&self, _: &Path, _: Option<&str>) -> bool { true }
+            fn can_handle(&self, _: &Path, _: Option<&str>) -> bool {
+                true
+            }
             fn extract(&self, path: &Path) -> anyhow::Result<ExtractedContent> {
                 Ok(ExtractedContent {
                     text: "this is extracted pdf content".to_string(),
@@ -708,14 +728,14 @@ mod tests {
 
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        
+
         provider.search(&query, &registry, tx).unwrap();
-        
+
         let mut results = Vec::new();
         while let Ok(m) = rx.try_recv() {
             results.push(m);
         }
-        
+
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file_type, FileType::Pdf);
     }

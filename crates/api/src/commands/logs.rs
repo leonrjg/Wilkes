@@ -15,7 +15,7 @@ mod tests {
     fn test_logs_api() {
         let layer = wilkes_core::logging::BufferLayer;
         let subscriber = tracing_subscriber::registry().with(layer);
-        
+
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("test log message");
         });

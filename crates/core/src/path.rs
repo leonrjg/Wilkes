@@ -1,10 +1,10 @@
-use std::path::{Path, PathBuf, Component};
+use std::path::{Component, Path, PathBuf};
 
 /// Checks if `path` is contained within `base`.
-/// 
+///
 /// This implementation uses canonicalization to resolve symlinks and '..' components,
 /// ensuring that path traversal attacks are prevented even with complex paths.
-/// 
+///
 /// If either path cannot be canonicalized (e.g. they don't exist), it returns false.
 pub fn is_under(path: &Path, base: &Path) -> bool {
     let canonical_path = match path.canonicalize() {
@@ -51,7 +51,7 @@ pub fn normalize_path(path: &Path) -> PathBuf {
 }
 
 /// Resolves the Python 3 interpreter path.
-/// 
+///
 /// It checks:
 /// 1. `WILKES_PYTHON` environment variable.
 /// 2. Common bundled paths relative to the current executable.
@@ -73,13 +73,18 @@ pub fn resolve_python() -> anyhow::Result<PathBuf> {
     // 2. Bundled paths
     let exe = std::env::current_exe()?;
     let bundled = if cfg!(target_os = "macos") {
-        exe.parent().and_then(|p| p.parent())
-            .map(|p| p.join("Resources").join("python").join("bin").join("python3"))
+        exe.parent().and_then(|p| p.parent()).map(|p| {
+            p.join("Resources")
+                .join("python")
+                .join("bin")
+                .join("python3")
+        })
     } else if cfg!(target_os = "windows") {
         exe.parent().map(|p| p.join("python").join("python.exe"))
     } else {
         // Linux / Docker
-        exe.parent().and_then(|p| p.parent())
+        exe.parent()
+            .and_then(|p| p.parent())
             .map(|p| p.join("lib").join("python").join("bin").join("python3"))
     };
 
@@ -123,7 +128,8 @@ pub fn resolve_python_package_dir() -> anyhow::Result<PathBuf> {
         candidates.insert(0, p.join("Resources"));
     }
 
-    candidates.into_iter()
+    candidates
+        .into_iter()
         .find(|p| p.join("wilkes_python_worker").is_dir())
         .ok_or_else(|| anyhow::anyhow!("Python worker package not found (exe: {})", exe.display()))
 }
@@ -135,12 +141,18 @@ mod tests {
 
     #[test]
     fn test_normalize_path_more() {
-        assert_eq!(normalize_path(Path::new("a/b/c/../../d")), PathBuf::from("a/d"));
-        assert_eq!(normalize_path(Path::new("/a/b/../../c/d")), PathBuf::from("/c/d"));
+        assert_eq!(
+            normalize_path(Path::new("a/b/c/../../d")),
+            PathBuf::from("a/d")
+        );
+        assert_eq!(
+            normalize_path(Path::new("/a/b/../../c/d")),
+            PathBuf::from("/c/d")
+        );
         assert_eq!(normalize_path(Path::new("///a//b")), PathBuf::from("/a/b"));
-        
+
         // Parent components at the start
-        // normalize_path pops if it's ParentDir. 
+        // normalize_path pops if it's ParentDir.
         // If it was empty, it stays empty.
         assert_eq!(normalize_path(Path::new("../a")), PathBuf::from("a"));
         assert_eq!(normalize_path(Path::new("/../a")), PathBuf::from("/a"));
@@ -170,14 +182,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let base = dir.path().join("base");
         std::fs::create_dir_all(&base).unwrap();
-        
+
         let sub = base.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
-        
+
         let link = dir.path().join("link");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&sub, &link).unwrap();
-        
+
         #[cfg(unix)]
         assert!(is_under(&link, &base));
     }
@@ -191,7 +203,7 @@ mod tests {
 
         assert!(is_under(&sub, base));
         assert!(is_under(base, base));
-        
+
         let outside = Path::new("/tmp/some_other_dir_12345");
         assert!(!is_under(outside, base));
 
@@ -203,7 +215,7 @@ mod tests {
     fn test_resolve_python_invalid_env() {
         std::env::set_var("WILKES_PYTHON", "/tmp/nonexistent_python_12345");
         let result = resolve_python();
-        // It might still succeed if it falls back to system path, 
+        // It might still succeed if it falls back to system path,
         // but we want to check that it didn't use the invalid env var immediately.
         if let Ok(p) = result {
             assert_ne!(p, PathBuf::from("/tmp/nonexistent_python_12345"));
@@ -221,11 +233,11 @@ mod tests {
     fn test_resolve_python_with_env_var() {
         let exe_path = std::env::current_exe().unwrap();
         std::env::set_var("WILKES_PYTHON", exe_path.to_str().unwrap());
-        
+
         let result = resolve_python();
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), exe_path);
-        
+
         std::env::remove_var("WILKES_PYTHON");
     }
 
