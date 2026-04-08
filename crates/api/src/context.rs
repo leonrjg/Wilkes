@@ -104,6 +104,19 @@ impl AppContext {
         }
     }
 
+    fn emit_embed_error(&self, operation: &str, message: impl Into<String>) {
+        let message = message.into();
+        if message.is_empty() {
+            info!("{operation} cancelled");
+        } else {
+            error!("{operation} failed: {message}");
+        }
+        self.events.emit("embed-error", serde_json::json!({
+            "operation": operation,
+            "message": message,
+        }));
+    }
+
     // ── Business Logic ────────────────────────────────────────────────────────
 
     pub async fn get_settings(&self) -> Settings {
@@ -307,9 +320,7 @@ impl AppContext {
 
                     _ = cancel_for_task.cancelled() => {
                         let _ = std::fs::remove_file(data_dir.join("semantic_index.db"));
-                        ctx.events.emit("embed-error", serde_json::json!({
-                            "operation": "Build", "message": ""
-                        }));
+                        ctx.emit_embed_error("Build", "");
                         return Ok(());
                     }
 
@@ -362,21 +373,15 @@ impl AppContext {
                                         ctx.events.emit("embed-done", serde_json::json!({ "operation": "Build" }));
                                     }
                                     Ok(Err(e)) => {
-                                        ctx.events.emit("embed-error", serde_json::json!({
-                                            "operation": "Build", "message": e.to_string()
-                                        }));
+                                        ctx.emit_embed_error("Build", e.to_string());
                                     }
                                     Err(e) => {
-                                        ctx.events.emit("embed-error", serde_json::json!({
-                                            "operation": "Build", "message": e.to_string()
-                                        }));
+                                        ctx.emit_embed_error("Build", e.to_string());
                                     }
                                 }
                             }
                             Err(e) => {
-                                ctx.events.emit("embed-error", serde_json::json!({
-                                    "operation": "Build", "message": e.to_string()
-                                }));
+                                ctx.emit_embed_error("Build", e.to_string());
                             }
                         }
                         break;
@@ -446,10 +451,7 @@ impl AppContext {
                     let (probe_tx, _) = mpsc::channel(1);
                     let installer = dispatch::get_installer(engine, model_clone.clone(), manager, device);
                     if let Err(e) = installer.install(&data_dir, probe_tx).await {
-                        ctx.events.emit("embed-error", serde_json::json!({
-                            "operation": "Download",
-                            "message": format!("Failed to probe model dimensions: {e:#}")
-                        }));
+                        ctx.emit_embed_error("Download", format!("Failed to probe model dimensions: {e:#}"));
                         *ctx.embed_task.lock() = None;
                         return Ok(());
                     }
@@ -465,16 +467,12 @@ impl AppContext {
                             ctx.events.emit("embed-done", serde_json::json!({ "operation": "Download" }));
                         }
                         Err(e) => {
-                            ctx.events.emit("embed-error", serde_json::json!({
-                                "operation": "Download", "message": e.to_string()
-                            }));
+                            ctx.emit_embed_error("Download", e.to_string());
                         }
                     }
                 }
                 Err(e) => {
-                    ctx.events.emit("embed-error", serde_json::json!({
-                        "operation": "Download", "message": e.to_string()
-                    }));
+                    ctx.emit_embed_error("Download", e.to_string());
                 }
             }
 
@@ -653,9 +651,11 @@ impl AppContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use tempfile::tempdir;
     use tokio::sync::mpsc;
-    use serde_json::Value;
+    use tracing::subscriber;
+    use tracing_subscriber::prelude::*;
     use wilkes_core::embed::MockEmbedder;
 
     struct MockEmitter {
@@ -665,6 +665,36 @@ mod tests {
         fn emit(&self, name: &str, payload: Value) {
             self.events.lock().unwrap().push((name.to_string(), payload));
         }
+    }
+
+    #[test]
+    fn test_emit_embed_error_logs_and_emits() {
+        wilkes_core::logging::clear_logs();
+
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(MockEmitter { events: events.clone() });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths::resolve(dir.path()),
+            emitter,
+        );
+
+        let subscriber = tracing_subscriber::registry().with(wilkes_core::logging::BufferLayer);
+        subscriber::with_default(subscriber, || {
+            ctx.emit_embed_error("Build", "Worker error");
+        });
+
+        let logs = wilkes_core::logging::get_logs();
+        assert!(logs.iter().any(|line| line.contains("Build failed: Worker error")));
+
+        let events_guard = events.lock().unwrap();
+        assert!(events_guard.iter().any(|(name, payload)| {
+            name == "embed-error"
+                && payload["operation"] == "Build"
+                && payload["message"] == "Worker error"
+        }));
     }
 
     #[tokio::test]

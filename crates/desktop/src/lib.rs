@@ -13,10 +13,9 @@ use wilkes_core::types::{
 
 // ── Platform helpers ──────────────────────────────────────────────────────────
 
-fn desktop_settings_path() -> anyhow::Result<std::path::PathBuf> {
-    let config = dirs::config_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
-    Ok(config.join("wilkes").join("settings.json"))
+fn desktop_settings_path(app: &AppHandle) -> anyhow::Result<std::path::PathBuf> {
+    let config = app.path().app_config_dir()?;
+    Ok(config.join("settings.json"))
 }
 
 // ── Tauri EventEmitter impl ───────────────────────────────────────────────────
@@ -243,7 +242,7 @@ pub fn run() {
             let handle = app.handle().clone();
 
             let data_dir = handle.path().app_data_dir()?;
-            let settings_path = desktop_settings_path()?;
+            let settings_path = desktop_settings_path(&handle)?;
             let paths = WorkerPaths::resolve(&data_dir);
 
             let emitter = Arc::new(TauriEmitter(handle.clone()));
@@ -294,15 +293,7 @@ pub fn run() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_desktop_settings_path() {
-        let result = desktop_settings_path();
-        assert!(result.is_ok());
-        let path = result.unwrap();
-        assert!(path.ends_with("wilkes/settings.json") || path.ends_with("wilkes\\settings.json"));
-    }
-
-    #[tokio::test]
+#[tokio::test]
     async fn test_get_python_info() {
         let result = get_python_info().await;
         assert!(result.is_ok() || result.is_err());

@@ -19,7 +19,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["../worker/wilkes_python_worker", "../worker/requirements.txt"]
+    "resources": {
+      "../worker/wilkes_python_worker": "wilkes_python_worker",
+      "../worker/requirements.txt": "requirements.txt"
+    }
   },
   "app": {
     "windows": [
