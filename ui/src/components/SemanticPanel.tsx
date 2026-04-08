@@ -621,6 +621,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     state.progress && state.progress.total > 0
       ? Math.round((state.progress.current / state.progress.total) * 100)
       : 0;
+  const progressLabel = phase === "downloading" ? "Downloading model" : "Indexing";
 
   // ---------------------------------------------------------------------------
   // Render
@@ -806,19 +807,24 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
           <div className="flex flex-col gap-3 mt-1 px-1">
             {isActive && (
               <div className="flex flex-col gap-1.5">
-                <div className="flex justify-between text-[10px] text-[var(--text-muted)] mb-0.5">
-                  <span>
-                    {phase === "downloading" ? "Starting engine..." : `${progressPct}%`}
-                  </span>
+                <div className="relative h-5 bg-[var(--bg-app)] rounded-full overflow-hidden border border-[var(--border-main)]/60">
+                  <div
+                    className="h-full bg-[var(--accent-blue)] transition-all duration-300 ease-out animate-shimmer rounded-full"
+                    style={{ width: `${progressPct}%` }}
+                  />
+                  <div className="absolute inset-0 flex items-center justify-between px-2 pointer-events-none">
+                    <span className="text-[9px] font-medium uppercase tracking-[0.14em] text-[var(--text-dim)]">
+                      {progressLabel}
+                    </span>
+                    <span className="rounded-full bg-black/20 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-white backdrop-blur-sm">
+                      {progressPct}%
+                    </span>
+                  </div>
+                </div>
+                <div className="flex justify-end text-[10px] text-[var(--text-muted)] min-h-[1rem]">
                   <span className="truncate max-w-[180px]">
                     {phase === "building" && state.progress && "message" in state.progress ? (state.progress as any).message : ""}
                   </span>
-                </div>
-                <div className="h-1.5 bg-[var(--bg-app)] rounded-full overflow-hidden">
-                  <div
-                    className={`h-full bg-[var(--accent-blue)] transition-all duration-300 ease-out animate-shimmer`}
-                    style={{ width: phase === "downloading" ? "100%" : `${progressPct}%` }}
-                  />
                 </div>
               </div>
             )}

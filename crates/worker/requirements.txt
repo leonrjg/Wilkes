@@ -1,9 +1,9 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.7.0+cpu ; sys_platform == "linux"
-sentence-transformers==5.3.0
-semantic-text-splitter==0.29.0
+torch==2.8.0+cpu ; sys_platform == "linux"
+sentence-transformers==5.1.2
+semantic-text-splitter==0.27.0
 sqlite-vec==0.1.9
-numpy==1.26.4
-PyMuPDF==1.27.2.2
+numpy==2.0.2
+PyMuPDF==1.26.5
 einops==0.8.2
-peft==0.18.1
+peft==0.17.1

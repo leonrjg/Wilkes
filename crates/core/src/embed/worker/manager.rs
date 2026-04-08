@@ -12,6 +12,8 @@ use tokio::time::timeout;
 use super::ipc::{WorkerEvent, WorkerRequest};
 use crate::types::EmbeddingEngine;
 
+const MINIMUM_SBERT_PYTHON: PythonVersion = PythonVersion { major: 3, minor: 9, patch: 0 };
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkerStatus {
     pub active: bool,
@@ -55,6 +57,48 @@ impl WorkerPaths {
             worker_bin,
             data_dir: data_dir.to_path_buf(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PythonVersion {
+    major: u32,
+    minor: u32,
+    patch: u32,
+}
+
+impl PythonVersion {
+    fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        let mut parts = trimmed.split('.');
+
+        let major = parts
+            .next()
+            .ok_or_else(|| format!("missing major version in '{trimmed}'"))?
+            .parse::<u32>()
+            .map_err(|e| format!("invalid major version in '{trimmed}': {e}"))?;
+        let minor = parts
+            .next()
+            .ok_or_else(|| format!("missing minor version in '{trimmed}'"))?
+            .parse::<u32>()
+            .map_err(|e| format!("invalid minor version in '{trimmed}': {e}"))?;
+        let patch = parts
+            .next()
+            .unwrap_or("0")
+            .parse::<u32>()
+            .map_err(|e| format!("invalid patch version in '{trimmed}': {e}"))?;
+
+        Ok(Self { major, minor, patch })
+    }
+
+    fn short(&self) -> String {
+        format!("{}.{}", self.major, self.minor)
+    }
+}
+
+impl std::fmt::Display for PythonVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
     }
 }
 
@@ -128,6 +172,43 @@ impl WorkerManager {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn write_fake_python(python_path: &Path, version_file: &Path, venv_counter_file: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "-c" ]; then
+    cat "{}"
+    exit 0
+fi
+
+case "$*" in
+*"-m venv"*)
+    mkdir -p "$3/bin" || mkdir -p "$3/Scripts"
+    touch "$3/bin/python3" || touch "$3/Scripts/python.exe"
+    chmod +x "$3/bin/python3" 2>/dev/null || true
+    count=0
+    if [ -f "{}" ]; then
+        count=$(cat "{}")
+    fi
+    count=$((count + 1))
+    printf "%s" "$count" > "{}"
+    ;;
+esac
+
+exit 0
+"#,
+            version_file.display(),
+            venv_counter_file.display(),
+            venv_counter_file.display(),
+            venv_counter_file.display()
+        );
+
+        std::fs::write(python_path, script).unwrap();
+        std::fs::set_permissions(python_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     #[tokio::test]
     async fn test_worker_manager_status_inactive() {
@@ -230,24 +311,12 @@ mod tests {
     async fn test_setup_python_env_mock() {
         let dir = tempfile::tempdir().unwrap();
         let python_path = dir.path().join("fake_python");
+        let version_file = dir.path().join("python-version.txt");
+        let venv_counter_file = dir.path().join("venv-count.txt");
+        std::fs::write(&version_file, "3.9.6\n").unwrap();
+        std::fs::write(&venv_counter_file, "0").unwrap();
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // A more robust mock that handles -m venv by creating the bin/python file.
-            let script = r#"#!/bin/sh
-    case "$*" in
-    *"-m venv"*)
-        # $3 is usually the venv path
-        mkdir -p "$3/bin" || mkdir -p "$3/Scripts"
-        touch "$3/bin/python3" || touch "$3/Scripts/python.exe"
-        chmod +x "$3/bin/python3" 2>/dev/null || true
-        ;;
-    esac
-    exit 0
-    "#;
-            std::fs::write(&python_path, script).unwrap();
-            std::fs::set_permissions(&python_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_fake_python(&python_path, &version_file, &venv_counter_file);
         #[cfg(windows)]
         {
             // Windows mock would need to be a .bat or similar.
@@ -275,6 +344,77 @@ mod tests {
         // Second call should skip setup because stamp exists
         let res2 = setup_python_env(&paths).await;
         assert!(res2.is_ok());
+        assert_eq!(std::fs::read_to_string(&venv_counter_file).unwrap(), "1");
+
+        let stamp = std::fs::read_to_string(paths.venv_dir.join(".requirements_installed")).unwrap();
+        assert!(stamp.starts_with("# python=3.9.6\n"));
+    }
+
+    #[tokio::test]
+    async fn test_setup_python_env_rejects_old_python() {
+        let dir = tempfile::tempdir().unwrap();
+        let python_path = dir.path().join("fake_python");
+        let version_file = dir.path().join("python-version.txt");
+        let venv_counter_file = dir.path().join("venv-count.txt");
+        std::fs::write(&version_file, "3.8.18\n").unwrap();
+        std::fs::write(&venv_counter_file, "0").unwrap();
+        #[cfg(unix)]
+        write_fake_python(&python_path, &version_file, &venv_counter_file);
+        #[cfg(windows)]
+        {
+            std::fs::write(&python_path, "@echo off\nexit 0").unwrap();
+        }
+
+        let requirements_path = dir.path().join("requirements.txt");
+        std::fs::write(&requirements_path, "torch\n").unwrap();
+
+        let paths = WorkerPaths {
+            python_path,
+            python_package_dir: dir.path().to_path_buf(),
+            requirements_path,
+            venv_dir: dir.path().join("venv"),
+            worker_bin: dir.path().join("worker"),
+            data_dir: dir.path().to_path_buf(),
+        };
+
+        let err = setup_python_env(&paths).await.unwrap_err();
+        assert!(err.contains("requires Python 3.9+"));
+        assert!(err.contains("found Python 3.8.18"));
+        assert_eq!(std::fs::read_to_string(&venv_counter_file).unwrap(), "0");
+    }
+
+    #[tokio::test]
+    async fn test_setup_python_env_reinstalls_when_python_version_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let python_path = dir.path().join("fake_python");
+        let version_file = dir.path().join("python-version.txt");
+        let venv_counter_file = dir.path().join("venv-count.txt");
+        std::fs::write(&version_file, "3.9.6\n").unwrap();
+        std::fs::write(&venv_counter_file, "0").unwrap();
+        #[cfg(unix)]
+        write_fake_python(&python_path, &version_file, &venv_counter_file);
+        #[cfg(windows)]
+        {
+            std::fs::write(&python_path, "@echo off\nexit 0").unwrap();
+        }
+
+        let requirements_path = dir.path().join("requirements.txt");
+        std::fs::write(&requirements_path, "torch\n").unwrap();
+
+        let paths = WorkerPaths {
+            python_path,
+            python_package_dir: dir.path().to_path_buf(),
+            requirements_path,
+            venv_dir: dir.path().join("venv"),
+            worker_bin: dir.path().join("worker"),
+            data_dir: dir.path().to_path_buf(),
+        };
+
+        setup_python_env(&paths).await.unwrap();
+        std::fs::write(&version_file, "3.11.9\n").unwrap();
+        setup_python_env(&paths).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&venv_counter_file).unwrap(), "2");
     }
 
     #[tokio::test]
@@ -425,6 +565,41 @@ async fn run_setup_step(program: &Path, args: Vec<OsString>, label: &str) -> Res
     Ok(())
 }
 
+async fn read_python_version(python_path: &Path) -> Result<PythonVersion, String> {
+    let output = Command::new(python_path)
+        .args(["-c", "import sys; print('.'.join(str(part) for part in sys.version_info[:3]))"])
+        .output()
+        .await
+        .map_err(|e| format!("[python-setup] Failed to query Python version from {}: {e}", python_path.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("exit code {:?}", output.status.code())
+        } else {
+            stderr
+        };
+        return Err(format!(
+            "[python-setup] Failed to query Python version from {}: {}",
+            python_path.display(),
+            detail
+        ));
+    }
+
+    let version_text = String::from_utf8_lossy(&output.stdout);
+    PythonVersion::parse(&version_text).map_err(|e| {
+        format!(
+            "[python-setup] Failed to parse Python version from {}: {}",
+            python_path.display(),
+            e
+        )
+    })
+}
+
+fn build_requirements_stamp(requirements: &str, python_version: PythonVersion) -> String {
+    format!("# python={python_version}\n{requirements}")
+}
+
 /// Ensures the Python virtualenv exists and has the correct packages installed.
 /// Returns the path to the venv's Python interpreter on success.
 async fn setup_python_env(paths: &WorkerPaths) -> Result<PathBuf, String> {
@@ -434,10 +609,20 @@ async fn setup_python_env(paths: &WorkerPaths) -> Result<PathBuf, String> {
     // Check if setup can be skipped.
     let current_requirements = std::fs::read_to_string(&paths.requirements_path)
         .map_err(|e| format!("[python-setup] Cannot read requirements.txt: {e}"))?;
+    let python_version = read_python_version(&paths.python_path).await?;
+    if python_version < MINIMUM_SBERT_PYTHON {
+        return Err(format!(
+            "[python-setup] SBERT worker requires Python {}+; found Python {} at {}",
+            MINIMUM_SBERT_PYTHON.short(),
+            python_version,
+            paths.python_path.display()
+        ));
+    }
+    let current_stamp = build_requirements_stamp(&current_requirements, python_version);
 
     if python.exists() && stamp.exists() {
         let installed = std::fs::read_to_string(&stamp).unwrap_or_default();
-        if installed == current_requirements {
+        if installed == current_stamp {
             tracing::info!("[python-setup] Virtualenv up to date, skipping setup.");
             return Ok(python);
         }
@@ -468,7 +653,7 @@ async fn setup_python_env(paths: &WorkerPaths) -> Result<PathBuf, String> {
     ).await?;
 
     // Write stamp so we can skip next time.
-    if let Err(e) = std::fs::write(&stamp, &current_requirements) {
+    if let Err(e) = std::fs::write(&stamp, &current_stamp) {
         tracing::warn!("[python-setup] Failed to write requirements stamp: {e}");
     }
 
@@ -755,5 +940,3 @@ async fn manager_loop(paths: WorkerPaths, mut rx: mpsc::Receiver<ManagerCommand>
         }
     }
 }
-
-

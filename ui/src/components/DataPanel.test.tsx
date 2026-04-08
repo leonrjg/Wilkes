@@ -66,7 +66,7 @@ describe("DataPanel", () => {
       render(<DataPanel api={mockApi as any} />);
     });
     
-    const deleteButton = screen.getByText("Delete Database");
+    const deleteButton = screen.getByText("Delete current index");
     await act(async () => {
       fireEvent.click(deleteButton);
     });
@@ -81,7 +81,7 @@ describe("DataPanel", () => {
     });
     
     vi.stubGlobal("confirm", vi.fn(() => false));
-    const deleteButton = screen.getByText("Delete Database");
+    const deleteButton = screen.getByText("Delete current index");
     await act(async () => {
       fireEvent.click(deleteButton);
     });

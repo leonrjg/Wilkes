@@ -132,7 +132,7 @@ export default function DataPanel({ api }: Props) {
                   disabled={isDeleting}
                   className="px-3 py-1.5 bg-red-900/20 hover:bg-red-900/40 text-red-400 text-[10px] font-bold uppercase tracking-wider rounded border border-red-900/50 transition-colors disabled:opacity-50"
                 >
-                  {isDeleting ? "Deleting..." : "Delete Database"}
+                  {isDeleting ? "Deleting..." : "Delete current index"}
                 </button>
               </div>
             </>

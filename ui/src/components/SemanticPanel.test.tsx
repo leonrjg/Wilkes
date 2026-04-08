@@ -139,9 +139,10 @@ describe("SemanticPanel", () => {
       progressHandler({ Download: { bytes_received: 25000000, total_bytes: 50000000 } });
     });
 
-    // Now it should show "Cancel download" and "Starting engine..." (as per current implementation)
+    // Now it should show the active download state with the compact in-bar percentage.
     expect(screen.getByText(/Cancel download/i)).toBeInTheDocument();
-    expect(screen.getByText(/Starting engine.../i)).toBeInTheDocument();
+    expect(screen.getByText(/Downloading model/i)).toBeInTheDocument();
+    expect(screen.getByText(/50%/i)).toBeInTheDocument();
 
     // Trigger done
     await act(async () => {
