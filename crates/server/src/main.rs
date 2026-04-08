@@ -458,8 +458,11 @@ struct BuildBody {
 
 async fn build_index_handler(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<BuildBody>,
+    Json(mut body): Json<BuildBody>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    body.root = confine_to_uploads(&body.root, &state.uploads_dir)?
+        .to_string_lossy()
+        .into_owned();
     Arc::clone(&state.ctx)
         .start_build_index(body.root, body.model, body.engine)
         .await
@@ -528,6 +531,7 @@ async fn dir_size(path: &Path) -> anyhow::Result<u64> {
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 struct Config {
+    host: String,
     port: u16,
     data_dir: PathBuf,
     dist_dir: PathBuf,
@@ -535,6 +539,7 @@ struct Config {
 
 fn parse_config() -> Config {
     let args: Vec<String> = std::env::args().collect();
+    let mut host = std::env::var("WILKES_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let mut port: u16 = std::env::var("WILKES_PORT")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
     let mut data_dir = PathBuf::from(
@@ -546,6 +551,7 @@ fn parse_config() -> Config {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--host" => { if let Some(v) = args.get(i + 1) { host = v.clone(); i += 1; } }
             "--port" => { if let Some(v) = args.get(i + 1) { if let Ok(p) = v.parse() { port = p; } i += 1; } }
             "--data-dir" => { if let Some(v) = args.get(i + 1) { data_dir = PathBuf::from(v); i += 1; } }
             "--dist-dir" => { if let Some(v) = args.get(i + 1) { dist_dir = PathBuf::from(v); i += 1; } }
@@ -553,7 +559,7 @@ fn parse_config() -> Config {
         }
         i += 1;
     }
-    Config { port, data_dir, dist_dir }
+    Config { host, port, data_dir, dist_dir }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -623,7 +629,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let addr = format!("0.0.0.0:{}", config.port);
+    let addr = format!("{}:{}", config.host, config.port);
     info!("wilkes-server listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

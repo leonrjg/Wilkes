@@ -1,4 +1,5 @@
 use std::io::BufRead;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use wilkes_core::embed::dispatch;
@@ -74,6 +75,7 @@ async fn handle_worker_request(
                 device: None,
                 data_dir: req.data_dir,
                 tx,
+                cancel_flag: Arc::new(AtomicBool::new(false)),
                 chunk_size: req.chunk_size.ok_or_else(|| anyhow::anyhow!("build request missing chunk_size"))?,
                 chunk_overlap: req.chunk_overlap.ok_or_else(|| anyhow::anyhow!("build request missing chunk_overlap"))?,
                 supported_extensions: req.supported_extensions,

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use ignore::WalkBuilder;
@@ -14,6 +15,7 @@ pub struct BuildIndexOptions {
     pub device: Option<String>,
     pub data_dir: PathBuf,
     pub tx: ProgressTx,
+    pub cancel_flag: Arc<AtomicBool>,
     pub chunk_size: usize,
     pub chunk_overlap: usize,
     pub supported_extensions: Vec<String>,
@@ -71,6 +73,7 @@ pub async fn build_index_with_embedder(
             &registry,
             embedder_clone.as_ref(),
             options.tx,
+            options.cancel_flag,
             &indexing,
         )?;
         anyhow::Ok(())
@@ -191,6 +194,7 @@ mod tests {
             device: None,
             data_dir: data_dir.clone(),
             tx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
             chunk_size: 600,
             chunk_overlap: 128,
             supported_extensions,
@@ -217,6 +221,7 @@ mod tests {
             device: None,
             data_dir: dir.path().to_path_buf(),
             tx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
             chunk_size: 100,
             chunk_overlap: 10,
             supported_extensions: vec![],

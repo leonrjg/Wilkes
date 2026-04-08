@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use parking_lot::Mutex as PLMutex;
 
@@ -35,6 +36,7 @@ pub trait EventEmitter: Send + Sync + 'static {
 
 pub struct EmbedTaskHandle {
     pub cancel: CancellationToken,
+    pub cancel_flag: Arc<AtomicBool>,
     pub join: JoinHandle<anyhow::Result<()>>,
 }
 
@@ -267,6 +269,14 @@ impl AppContext {
             }
         }
 
+        let root_path = PathBuf::from(&root);
+        if !root_path.exists() {
+            return Err(format!("Index root not found: {}", root_path.display()));
+        }
+        if !root_path.is_dir() {
+            return Err(format!("Index root is not a directory: {}", root_path.display()));
+        }
+
         let settings = self.settings().await;
         let device = settings.semantic.device_for(engine).to_string();
         let chunk_size = settings.semantic.chunk_size;
@@ -284,6 +294,8 @@ impl AppContext {
         let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<EmbedProgress>(128);
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_flag_for_task = Arc::clone(&cancel_flag);
 
         let join: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
             // Always emit ReindexingDone when this task exits.
@@ -295,12 +307,12 @@ impl AppContext {
             }
             let _guard = DoneGuard(Arc::clone(&ctx.events));
 
-            let root_path = PathBuf::from(&root);
             let options = crate::commands::embed::BuildIndexOptions {
                 manager: Some(manager.clone()),
                 device: Some(device.clone()),
                 data_dir: data_dir.clone(),
                 tx: progress_tx,
+                cancel_flag: Arc::clone(&cancel_flag_for_task),
                 chunk_size,
                 chunk_overlap,
                 supported_extensions: supported_extensions.clone(),
@@ -319,7 +331,10 @@ impl AppContext {
                     biased;
 
                     _ = cancel_for_task.cancelled() => {
-                        let _ = std::fs::remove_file(data_dir.join("semantic_index.db"));
+                        cancel_flag_for_task.store(true, Ordering::Relaxed);
+                        let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp"));
+                        let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp-wal"));
+                        let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp-shm"));
                         ctx.emit_embed_error("Build", "");
                         return Ok(());
                     }
@@ -396,8 +411,7 @@ impl AppContext {
             Ok(())
         });
 
-        let cancel = CancellationToken::new();
-        *self.embed_task.lock() = Some(EmbedTaskHandle { cancel, join });
+        *self.embed_task.lock() = Some(EmbedTaskHandle { cancel, cancel_flag, join });
         Ok(())
     }
 
@@ -481,7 +495,11 @@ impl AppContext {
         });
 
         let cancel = CancellationToken::new();
-        *self.embed_task.lock() = Some(EmbedTaskHandle { cancel, join });
+        *self.embed_task.lock() = Some(EmbedTaskHandle {
+            cancel,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            join,
+        });
         Ok(())
     }
 
@@ -490,6 +508,7 @@ impl AppContext {
     pub fn cancel_embed(&self) {
         self.worker_manager.kill_active();
         if let Some(task) = self.embed_task.lock().take() {
+            task.cancel_flag.store(true, Ordering::Relaxed);
             task.cancel.cancel();
         }
     }
@@ -1163,7 +1182,11 @@ mod tests {
         // Mock a task in progress
         let cancel = CancellationToken::new();
         let join = tokio::spawn(async { Ok(()) });
-        *ctx.embed_task.lock() = Some(EmbedTaskHandle { cancel, join });
+        *ctx.embed_task.lock() = Some(EmbedTaskHandle {
+            cancel,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            join,
+        });
 
         let res = ctx.start_build_index(
             "root".to_string(),
@@ -1193,20 +1216,9 @@ mod tests {
             EmbeddingEngine::Candle
         ).await;
 
-        // The call itself is Ok because it spawns a task
-        assert!(res.is_ok());
-        
-        // But it should eventually emit an error
-        let mut found = false;
-        for _ in 0..20 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            let events_guard = events.lock().unwrap();
-            if events_guard.iter().any(|e| e.0 == "embed-error") {
-                found = true;
-                break;
-            }
-        }
-        assert!(found);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Index root not found"));
+        assert!(events.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1222,7 +1234,11 @@ mod tests {
         // Mock a task in progress
         let cancel = CancellationToken::new();
         let join = tokio::spawn(async { Ok(()) });
-        *ctx.embed_task.lock() = Some(EmbedTaskHandle { cancel, join });
+        *ctx.embed_task.lock() = Some(EmbedTaskHandle {
+            cancel,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            join,
+        });
 
         let query = SearchQuery {
             mode: SearchMode::Semantic,
@@ -1266,7 +1282,11 @@ mod tests {
         // Mock a task in progress
         let cancel = CancellationToken::new();
         let join = tokio::spawn(async { Ok(()) });
-        *ctx.embed_task.lock() = Some(EmbedTaskHandle { cancel, join });
+        *ctx.embed_task.lock() = Some(EmbedTaskHandle {
+            cancel,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            join,
+        });
 
         let res = ctx.start_download_model(
             EmbedderModel("m".to_string()),
@@ -1312,7 +1332,8 @@ mod tests {
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
         let settings_path = dir.path().join("settings.json");
-        let emitter = Arc::new(MockEmitter { events: Arc::new(Mutex::new(Vec::new())) });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(MockEmitter { events: events.clone() });
         let (ctx, _rx, _loop) = AppContext::new(
             data_dir.clone(),
             settings_path,
@@ -1359,10 +1380,17 @@ mod tests {
 
         // This should trigger a background reindex because root2 != root1
         let _handle = ctx.clone().start_search(query).await.unwrap();
-        
-        // Check if embed_task was set (reindex triggered)
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        assert!(ctx.embed_task.lock().is_some());
+
+        let mut saw_reindex = false;
+        for _ in 0..20 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+            let events_guard = events.lock().unwrap();
+            if events_guard.iter().any(|e| e.0 == "manager-event" && e.1 == serde_json::json!("Reindexing")) {
+                saw_reindex = true;
+                break;
+            }
+        }
+        assert!(saw_reindex);
     }
 
     #[tokio::test]

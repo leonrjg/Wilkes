@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 
 use anyhow::Context;
@@ -366,6 +368,7 @@ mod tests {
             &registry,
             &MockEmbedder,
             tx,
+            Arc::new(AtomicBool::new(false)),
             &indexing,
         ).unwrap();
 
@@ -578,6 +581,7 @@ impl SemanticIndex {
         extractors: &ExtractorRegistry,
         embedder: &dyn Embedder,
         tx: ProgressTx,
+        cancel_flag: Arc<AtomicBool>,
         indexing: &IndexingConfig,
     ) -> anyhow::Result<Self> {
         let start_time = Instant::now();
@@ -591,6 +595,10 @@ impl SemanticIndex {
         // Extract, embed, and write one file at a time so peak memory is bounded
         // to a single file's chunks + embeddings on top of the model weights.
         for (i, path) in paths.iter().enumerate() {
+            anyhow::ensure!(
+                !cancel_flag.load(Ordering::Relaxed),
+                "Index build cancelled"
+            );
             let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
                 files_processed: i,
                 total_files,
@@ -605,6 +613,10 @@ impl SemanticIndex {
 
             let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
             let embeddings = embedder.embed_passages(&texts)?;
+            anyhow::ensure!(
+                !cancel_flag.load(Ordering::Relaxed),
+                "Index build cancelled"
+            );
 
             let prepared = PreparedFile {
                 path: path.clone(),
