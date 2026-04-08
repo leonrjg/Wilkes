@@ -17,7 +17,6 @@ struct ModelInfo {
     display_name: &'static str,
     description: &'static str,
     dimension: usize,
-    is_default: bool,
     is_recommended: bool,
 }
 
@@ -27,7 +26,6 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
         display_name: "e5-small-v2",
         description: "Speed: high, accuracy: medium-high (English only)",
         dimension: 384,
-        is_default: true,
         is_recommended: false,
     },
     ModelInfo {
@@ -35,7 +33,6 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
         display_name: "nomic-embed-text-v1",
         description: "Speed: high, accuracy: medium-high (English only)",
         dimension: 384,
-        is_default: false,
         is_recommended: false,
     },
     ModelInfo {
@@ -43,7 +40,6 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
         display_name: "nomic-embed-text-v1.5",
         description: "Speed: medium, accuracy: medium-high (English only)",
         dimension: 768,
-        is_default: false,
         is_recommended: false,
     },
     ModelInfo {
@@ -51,7 +47,6 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
         display_name: "all-MiniLM-L12-v2",
         description: "Speed: high, accuracy: medium (English)",
         dimension: 384,
-        is_default: false,
         is_recommended: false,
     },
     ModelInfo {
@@ -59,7 +54,6 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
         display_name: "jina-embeddings-v5-text-small",
         description: "Speed: slow, accuracy: high (English only)",
         dimension: 1024,
-        is_default: false,
         is_recommended: false,
     },
     ModelInfo {
@@ -67,7 +61,6 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
         display_name: "jina-embeddings-v5-text-nano",
         description: "Speed: slow, accuracy: medium (English only)",
         dimension: 768,
-        is_default: false,
         is_recommended: false,
     },
     ModelInfo {
@@ -75,7 +68,6 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
         display_name: "all-mpnet-base-v2",
         description: "Speed: medium, accuracy: medium (English only)",
         dimension: 768,
-        is_default: false,
         is_recommended: false,
     },
     ModelInfo {
@@ -83,7 +75,6 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
         display_name: "potion-multilingual-128M",
         description: "Speed: highest, accuracy: low",
         dimension: 256,
-        is_default: false,
         is_recommended: false,
     },
     ModelInfo {
@@ -91,7 +82,6 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
         display_name: "gte-small",
         description: "Speed: medium, accuracy: low (English only)",
         dimension: 384,
-        is_default: false,
         is_recommended: false,
     },
 ];
@@ -116,7 +106,7 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
             description: info.description.to_string(),
             dimension: info.dimension,
             is_cached: is_sbert_model_cached(data_dir, info.model_id),
-            is_default: info.is_default,
+            is_default: false,
             is_recommended: info.is_recommended,
             size_bytes: None,
             preferred_batch_size: Some(32),
@@ -257,8 +247,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let models = list_supported_models(dir.path());
         assert!(!models.is_empty());
-        let default_model = models.iter().find(|m| m.is_default).unwrap();
-        assert_eq!(default_model.model_id, "intfloat/e5-small-v2");
+        let default_id = crate::types::EmbeddingEngine::SBERT.default_model();
+        assert!(models.iter().any(|m| m.model_id == default_id),
+            "Default model '{default_id}' must exist in the SBERT catalog");
     }
 
     #[test]

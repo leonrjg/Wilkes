@@ -13,10 +13,13 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
+            extra_args: --config tauri.macos.conf.json
           - os: macos-13
             target: x86_64-apple-darwin
+            extra_args: --config tauri.macos.conf.json
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            extra_args: ""
 
     runs-on: ${{ matrix.os }}
 
@@ -67,8 +70,31 @@ jobs:
         run: npm ci --prefix ui
 
       - name: Build
+        if: runner.os != 'Windows'
         working-directory: crates/desktop
-        run: ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }}
+        run: ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }} ${{ matrix.extra_args }}
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: crates/desktop
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+        run: |
+          if ($env:CERTIFICATE_BASE64) {
+            $bytes = [Convert]::FromBase64String($env:CERTIFICATE_BASE64)
+            $pfxPath = Join-Path $env:TEMP certificate.pfx
+            [IO.File]::WriteAllBytes($pfxPath, $bytes)
+            Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My `
+              -Password (ConvertTo-SecureString $env:CERTIFICATE_PASSWORD -AsPlainText -Force)
+            Remove-Item $pfxPath
+            $configJson = '{"bundle":{"windows":{"certificateThumbprint":"' + $env:THUMBPRINT + '","timestampUrl":"http://timestamp.digicert.com"}}}'
+            ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }} --config $configJson
+          } else {
+            ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }}
+          }
 
       - name: Upload macOS artifact
         if: runner.os == 'macOS'

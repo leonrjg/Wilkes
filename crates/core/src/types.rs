@@ -268,11 +268,6 @@ pub enum PreviewData {
 #[serde(transparent)]
 pub struct EmbedderModel(pub String);
 
-impl Default for EmbedderModel {
-    fn default() -> Self {
-        Self("BGEBaseENV15".to_string())
-    }
-}
 
 impl EmbedderModel {
     pub fn model_id(&self) -> &str {
@@ -334,6 +329,14 @@ impl EmbeddingEngine {
         }
     }
 
+    pub fn default_model(&self) -> &'static str {
+        match self {
+            EmbeddingEngine::SBERT => "intfloat/e5-small-v2",
+            EmbeddingEngine::Candle => "sentence-transformers/all-MiniLM-L12-v2",
+            EmbeddingEngine::Fastembed => "BGEBaseENV15",
+        }
+    }
+
     pub fn supports_custom_models(&self) -> bool {
         match self {
             EmbeddingEngine::SBERT => true,
@@ -364,7 +367,7 @@ pub struct SemanticSettings {
     pub enabled: bool,
     #[serde(default)]
     pub engine: EmbeddingEngine,
-    #[serde(default)]
+    #[serde(default = "SemanticSettings::default_model")]
     pub model: EmbedderModel,
     /// Embedding dimension for the current model.
     #[serde(default = "SemanticSettings::default_dimension")]
@@ -415,6 +418,10 @@ where
 }
 
 impl SemanticSettings {
+    fn default_model() -> EmbedderModel {
+        EmbedderModel(EmbeddingEngine::default().default_model().to_string())
+    }
+
     fn default_chunk_size() -> usize {
         600
     }
@@ -444,7 +451,7 @@ impl Default for SemanticSettings {
         Self {
             enabled: false,
             engine: EmbeddingEngine::default(),
-            model: EmbedderModel("BGEBaseENV15".to_string()),
+            model: SemanticSettings::default_model(),
             dimension: Self::default_dimension(),
             engine_devices: HashMap::new(),
             index_path: None,
@@ -488,6 +495,8 @@ pub struct Settings {
     pub semantic: SemanticSettings,
     #[serde(default = "default_supported_extensions")]
     pub supported_extensions: Vec<String>,
+    #[serde(default)]
+    pub max_results: usize,
 }
 
 fn default_supported_extensions() -> Vec<String> {
@@ -517,6 +526,7 @@ impl Default for Settings {
             search_prefer_semantic: false,
             semantic: SemanticSettings::default(),
             supported_extensions: default_supported_extensions(),
+            max_results: 50,
         }
     }
 }

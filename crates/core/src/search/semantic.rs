@@ -47,7 +47,7 @@ impl SearchProvider for SemanticSearchProvider {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Semantic index is not built yet"))?;
 
-        let top_k = if query.max_results == 0 { 20 } else { query.max_results };
+        let top_k = query.max_results;
         let results = idx.query(&query_vec, top_k)?;
         drop(guard);
 

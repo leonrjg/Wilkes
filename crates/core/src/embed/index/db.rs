@@ -894,6 +894,7 @@ impl SemanticIndex {
         let stored_count: i64 = self.conn
             .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
             .unwrap_or(0);
+        let top_k = if top_k == 0 { stored_count as usize } else { top_k };
         tracing::info!("[query] vec_chunks rows={stored_count}, embedding_dim={}, top_k={top_k}", embedding.len());
 
         let blob = f32_slice_to_bytes(embedding);

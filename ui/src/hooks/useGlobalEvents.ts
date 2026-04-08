@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { useToasts } from "../components/Toast";
 import { api } from "../services";
 import { useSearchStore } from "../stores/useSearchStore";
+import { useSettingsStore } from "../stores/useSettingsStore";
 
 export function useGlobalEvents() {
   const { addToast, removeToast } = useToasts();
@@ -16,6 +17,7 @@ export function useGlobalEvents() {
       if (payload === "WorkerStarting") {
         addToast("Starting worker... Next queries will be faster", { type: "info" });
       } else if (payload === "Reindexing") {
+        useSettingsStore.getState().refreshFileList();
         if (!reindexToastId.current) {
           reindexToastId.current = addToast(
             "Indexing... Semantic search is temporarily unavailable",

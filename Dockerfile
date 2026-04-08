@@ -86,8 +86,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -r -u 1001 -s /bin/false wilkes \
-    && mkdir -p /app/dist /data \
-    && chown -R wilkes:wilkes /app /data
+    && mkdir -p /app/dist /data /var/cache/fontconfig \
+    && chown -R wilkes:wilkes /app /data /var/cache/fontconfig
 
 COPY --from=rust-builder /wilkes-server /app/wilkes-server
 COPY --from=rust-builder /wilkes-rust-worker /app/wilkes-rust-worker

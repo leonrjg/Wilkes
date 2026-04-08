@@ -150,6 +150,8 @@ export interface Settings {
   search_prefer_semantic: boolean;
   semantic: SemanticSettings;
   supported_extensions: string[];
+  /** 0 = unlimited */
+  max_results: number;
   is_demo?: boolean;
 }
 

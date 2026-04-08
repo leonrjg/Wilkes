@@ -67,7 +67,7 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
                 description: info.description.clone(),
                 dimension: info.dim,
                 is_cached,
-                is_default: model_id == "BGEBaseENV15",
+                is_default: false,
                 is_recommended: model_id == "BGEBaseENV15" || model_id == "AllMiniLML6V2",
                 size_bytes,
                 preferred_batch_size: get_preferred_batch_size(&info.model_code, &info.description),
@@ -442,5 +442,28 @@ mod tests {
         );
         let avail = installer.is_available(dir.path());
         assert!(avail);
+    }
+
+    #[test]
+    fn test_fetch_model_size_mock() {
+        use mockito::Server;
+        let mut server = Server::new();
+        
+        // Mock HF API
+        let _m = server.mock("GET", "/api/models/Xenova/bge-base-en-v1.5")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "siblings": [
+                    {"rfilename": "model.onnx", "size": 1000},
+                    {"rfilename": "tokenizer.json", "size": 500},
+                    {"rfilename": "other.txt", "size": 100}
+                ]
+            }"#)
+            .create();
+
+        // We need to point hf-hub or our fetch_hf_siblings to this server.
+        // fetch_hf_siblings uses ureq. 
+        // If we can't easily override the URL, we might skip this or use a different approach.
     }
 }

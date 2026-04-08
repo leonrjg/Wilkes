@@ -4,6 +4,7 @@ import { useGlobalEvents } from "./useGlobalEvents";
 import { api } from "../services";
 import { useToasts } from "../components/Toast";
 import { useSearchStore } from "../stores/useSearchStore";
+import { useSettingsStore } from "../stores/useSettingsStore";
 
 vi.mock("../services", () => ({
   api: {
@@ -21,15 +22,23 @@ vi.mock("../stores/useSearchStore", () => ({
   },
 }));
 
+vi.mock("../stores/useSettingsStore", () => ({
+  useSettingsStore: {
+    getState: vi.fn(),
+  },
+}));
+
 describe("useGlobalEvents", () => {
   const addToast = vi.fn().mockReturnValue("toast-id");
   const removeToast = vi.fn();
   const replaySearch = vi.fn();
+  const refreshFileList = vi.fn();
 
   beforeEach(() => {
     vi.clearAllMocks();
     (useToasts as any).mockReturnValue({ addToast, removeToast });
     (useSearchStore.getState as any).mockReturnValue({ replaySearch });
+    (useSettingsStore.getState as any).mockReturnValue({ refreshFileList });
   });
 
   it("handles WorkerStarting event", async () => {
@@ -69,6 +78,7 @@ describe("useGlobalEvents", () => {
     act(() => {
       handler("Reindexing");
     });
+    expect(refreshFileList).toHaveBeenCalled();
     expect(addToast).toHaveBeenCalledWith(expect.stringContaining("Indexing..."), expect.any(Object));
 
     act(() => {

@@ -21,6 +21,16 @@ pub fn list_models(engine: EmbeddingEngine, data_dir: &Path) -> Vec<ModelDescrip
         EmbeddingEngine::Fastembed => vec![],
     };
 
+    let default_model = engine.default_model();
+    let mut found_default = false;
+    for m in &mut models {
+        m.is_default = m.model_id == default_model;
+        if m.is_default { found_default = true; }
+    }
+    if !found_default {
+        tracing::warn!("Default model '{}' for engine {:?} not found in model catalog", default_model, engine);
+    }
+
     models.sort_by(|a, b| {
         b.is_default.cmp(&a.is_default)
             .then(b.is_cached.cmp(&a.is_cached))

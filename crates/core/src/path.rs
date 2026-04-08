@@ -140,9 +140,12 @@ mod tests {
         assert_eq!(normalize_path(Path::new("///a//b")), PathBuf::from("/a/b"));
         
         // Parent components at the start
-        assert_eq!(normalize_path(Path::new("../a")), PathBuf::from("a")); // normalize_path pops empty, so it becomes "a"
-        // Wait, normalize_path pops if it's ParentDir. 
+        // normalize_path pops if it's ParentDir. 
         // If it was empty, it stays empty.
+        assert_eq!(normalize_path(Path::new("../a")), PathBuf::from("a"));
+        assert_eq!(normalize_path(Path::new("/../a")), PathBuf::from("/a"));
+        assert_eq!(normalize_path(Path::new(".")), PathBuf::from(""));
+        assert_eq!(normalize_path(Path::new("./a/./b")), PathBuf::from("a/b"));
     }
 
     #[test]

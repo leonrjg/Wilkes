@@ -25,6 +25,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const semanticReady = useSettingsStore((s) => s.semanticIndexBuilt);
   const preferSemantic = useSettingsStore((s) => s.preferSemantic);
   const setPreferSemantic = useSettingsStore((s) => s.setPreferSemantic);
+  const maxResults = useSettingsStore((s) => s.maxResults);
   const startSemanticIndex = useSettingsStore((s) => s.startSemanticIndex);
 
   const [pattern, setPattern] = useState("");
@@ -53,7 +54,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
         case_sensitive: opts.caseSensitive ?? caseSensitive,
         root: directory,
         file_type_filters,
-        max_results: 0,
+        max_results: maxResults,
         respect_gitignore: respectGitignore,
         max_file_size: maxFileSize,
         context_lines: contextLines,
@@ -72,6 +73,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
       contextLines,
       isSemanticMode,
       supportedExtensions,
+      maxResults,
     ],
   );
 

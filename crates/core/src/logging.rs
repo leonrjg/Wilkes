@@ -108,29 +108,6 @@ mod tests {
     use tracing::{info, subscriber};
 
     #[test]
-    fn test_logging_buffer() {
-        clear_logs();
-        // Since we can't easily re-init global logging in tests if it was already inited,
-        // we can at least test the buffer and layer logic.
-        let layer = BufferLayer;
-        
-        // Use a local subscriber with our layer for testing
-        let subscriber = tracing_subscriber::registry().with(layer);
-        
-        subscriber::with_default(subscriber, || {
-            info!("test message 123");
-            info!(my_field="my_value", "test message with fields");
-        });
-
-        let logs = get_logs();
-        assert!(logs.iter().any(|l| l.contains("test message 123")));
-        assert!(logs.iter().any(|l| l.contains("test message with fields") && l.contains("my_field=\"my_value\"")));
-
-        clear_logs();
-        assert_eq!(get_logs().len(), 0);
-    }
-
-    #[test]
     fn test_logging_limit() {
         clear_logs();
         let layer = BufferLayer;

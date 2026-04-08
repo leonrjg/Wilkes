@@ -31,6 +31,7 @@ interface SettingsStore {
   preferSemantic: boolean;
   indexing: boolean;
   theme: Theme;
+  maxResults: number;
 
   load: () => Promise<void>;
   setDirectory: (dir: string) => void;
@@ -44,7 +45,7 @@ interface SettingsStore {
   setIndexing: (indexing: boolean) => void;
   refreshSemanticReady: () => Promise<void>;
   startSemanticIndex: () => Promise<void>;
-  applySettingsPatch: (patch: { theme?: Theme; supported_extensions?: string[] }) => void;
+  applySettingsPatch: (patch: { theme?: Theme; supported_extensions?: string[]; max_results?: number }) => void;
 }
 
 export const useSettingsStore = create<SettingsStore>()(
@@ -63,6 +64,7 @@ export const useSettingsStore = create<SettingsStore>()(
     preferSemantic: false,
     indexing: false,
     theme: "System",
+    maxResults: 50,
 
     load: async () => {
       const s = await api.getSettings();
@@ -86,6 +88,7 @@ export const useSettingsStore = create<SettingsStore>()(
         semanticIndexBuilt: false, // will be confirmed below
         preferSemantic: s.search_prefer_semantic,
         theme: s.theme,
+        maxResults: s.max_results ?? 0,
       });
 
       const ready = await api.isSemanticReady();
@@ -173,6 +176,9 @@ export const useSettingsStore = create<SettingsStore>()(
       }
       if (patch.supported_extensions) {
         set({ supportedExtensions: patch.supported_extensions });
+      }
+      if (patch.max_results !== undefined) {
+        set({ maxResults: patch.max_results });
       }
     },
   }))

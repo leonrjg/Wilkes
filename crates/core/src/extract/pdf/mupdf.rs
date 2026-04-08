@@ -225,4 +225,25 @@ mod tests {
         let result = backend.extract(path);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_mupdf_backend_extract_valid_pdf() {
+        let backend = MuPdfBackend;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("valid.pdf");
+
+        // Minimal valid PDF with "Hello World"
+        let pdf_base64 = "JVBERi0xLjQKMSAwIG9iago8PAovVHlwZSAvQ2F0YWxvZwovUGFnZXMgMiAwIFIKPj4KZW5kb2JqCjIgMCBvYmoKPDwKL1R5cGUgL1BhZ2VzCi9LaWRzIFszIDAgUl0KL0NvdW50IDEKPj4KZW5kb2JqCjMgMCBvYmoKPDwKL1R5cGUgL1BhZ2UKL1BhcmVudCAyIDAgUgovTWVkaWFCb3ggWzAgMCAzMDAgMTQ0XQovQ29udGVudHMgNCAwIFIKL1Jlc291cmNlcyA8PAovRm9udCA8PAovRjEgPDwKL1R5cGUgL0ZvbnQKL1N1YnR5cGUgL1R5cGUxCi9CYXNlRm9udCAvSGVsdmV0aWNhCj4+Cj4+Cj4+Cj4+CjBlbmRvYmoKNCAwIG9iago8PAovTGVuZ3RoIDQxCj4+CnN0cmVhbQpCVAovRjEgMTggVGYKMCBldAo1MCA1MCBUZAooSGVsbG8gV29ybGQpIFRqCkVUCmVuZHN0cmVhbQplbmRvYmoKeHJlZgowIDUKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTYgMDAwMDAgbiAKMDAwMDAwMDExMSAwMDAwMCBuIAowMDAwMDAwMjgyIDAwMDAwIG4gCnRyYWlsZXIKPDwKL1NpemUgNQovUm9vdCAxIDAgUgo+PgpzdGFydHhyZWYKMzcyCiUlRU9GCg==";
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let pdf_bytes = STANDARD.decode(pdf_base64).unwrap();
+        fs::write(&path, &pdf_bytes).unwrap();
+        
+        let content = backend.extract(&path).expect("Should extract valid PDF");
+        
+        assert!(content.text.contains("Hello"));
+        assert!(content.text.contains("World"));
+        assert_eq!(content.metadata.page_count, Some(1));
+        assert_eq!(content.metadata.mime.as_deref(), Some("application/pdf"));
+        assert!(!content.source_map.segments.is_empty());
+    }
 }

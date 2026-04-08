@@ -127,6 +127,7 @@ impl WorkerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_worker_manager_status_inactive() {
@@ -185,6 +186,165 @@ mod tests {
         
         let status = manager.status();
         assert_eq!(status.timeout_secs, 100);
+    }
+
+    #[tokio::test]
+    async fn test_worker_manager_submit() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_bin = dir.path().join("fake_worker");
+        std::fs::write(&worker_bin, "").unwrap(); // just an empty file
+        
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("r"),
+            venv_dir: PathBuf::from("v"),
+            worker_bin,
+            data_dir: PathBuf::from("data"),
+        };
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let _loop_handle = tokio::spawn(loop_fut);
+
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
+        let req = Box::new(WorkerRequest {
+            mode: "test".to_string(),
+            engine: EmbeddingEngine::Fastembed,
+            model: "test_model".to_string(),
+            data_dir: PathBuf::from("data"),
+            device: "cpu".to_string(),
+            root: PathBuf::from("root"),
+            chunk_size: None,
+            chunk_overlap: None,
+            paths: None,
+            supported_extensions: vec![],
+            texts: None,
+        });
+
+        manager.send(ManagerCommand::Submit { req, reply: reply_tx }).await.unwrap();
+
+        // Let the loop run
+        let _ = reply_rx.recv().await;
+    }
+
+    #[tokio::test]
+    async fn test_setup_python_env_mock() {
+        let dir = tempfile::tempdir().unwrap();
+        let python_path = dir.path().join("fake_python");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // A more robust mock that handles -m venv by creating the bin/python file.
+            let script = r#"#!/bin/sh
+    case "$*" in
+    *"-m venv"*)
+        # $3 is usually the venv path
+        mkdir -p "$3/bin" || mkdir -p "$3/Scripts"
+        touch "$3/bin/python3" || touch "$3/Scripts/python.exe"
+        chmod +x "$3/bin/python3" 2>/dev/null || true
+        ;;
+    esac
+    exit 0
+    "#;
+            std::fs::write(&python_path, script).unwrap();
+            std::fs::set_permissions(&python_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            // Windows mock would need to be a .bat or similar.
+            std::fs::write(&python_path, "@echo off\nexit 0").unwrap();
+        }
+
+
+        let requirements_path = dir.path().join("requirements.txt");
+        std::fs::write(&requirements_path, "torch\n").unwrap();
+
+        let paths = WorkerPaths {
+            python_path: python_path.clone(),
+            python_package_dir: dir.path().to_path_buf(),
+            requirements_path: requirements_path.clone(),
+            venv_dir: dir.path().join("venv"),
+            worker_bin: dir.path().join("worker"),
+            data_dir: dir.path().to_path_buf(),
+        };
+
+        // This will try to run "python -m venv", etc. 
+        // Since our fake python returns 0 for everything, it should "succeed" setting up.
+        let res = setup_python_env(&paths).await;
+        assert!(res.is_ok());
+        
+        // Second call should skip setup because stamp exists
+        let res2 = setup_python_env(&paths).await;
+        assert!(res2.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_run_setup_step_fail() {
+        let dir = tempdir().unwrap();
+        let bad_path = dir.path().join("non_existent");
+        let res = run_setup_step(&bad_path, vec![], "test").await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_worker_manager_idle_timeout() {
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("r"),
+            venv_dir: PathBuf::from("v"),
+            worker_bin: PathBuf::from("w"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let _loop_handle = tokio::spawn(loop_fut);
+
+        manager.send(ManagerCommand::SetTimeout(1)).await.unwrap();
+        
+        // Let it time out
+        tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+        
+        let status = manager.status();
+        assert!(!status.active);
+    }
+
+    #[tokio::test]
+    async fn test_worker_manager_spawn_fail() {
+        let dir = tempdir().unwrap();
+        // A path that definitely doesn't exist
+        let worker_bin = dir.path().join("this_does_not_exist");
+        
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("r"),
+            venv_dir: PathBuf::from("v"),
+            worker_bin,
+            data_dir: PathBuf::from("data"),
+        };
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let _loop_handle = tokio::spawn(loop_fut);
+
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
+        let req = Box::new(WorkerRequest {
+            mode: "test".to_string(),
+            engine: EmbeddingEngine::Candle,
+            model: "m".to_string(),
+            data_dir: PathBuf::from("data"),
+            device: "cpu".to_string(),
+            root: PathBuf::from("root"),
+            chunk_size: None,
+            chunk_overlap: None,
+            paths: None,
+            supported_extensions: vec![],
+            texts: None,
+        });
+
+        manager.send(ManagerCommand::Submit { req, reply: reply_tx }).await.unwrap();
+
+        match reply_rx.recv().await {
+            Some(WorkerEvent::Error(e)) => assert!(e.contains("Failed to spawn worker")),
+            _ => panic!("Expected spawn error"),
+        }
     }
 }
 

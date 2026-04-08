@@ -251,6 +251,20 @@ export default function SettingsModal({
                           className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
                         />
                       </div>
+
+                      <div className="space-y-1">
+                        <div className="flex justify-between items-baseline">
+                          <label className="text-xs text-[var(--text-muted)]">Max results</label>
+                          <p className="text-[10px] text-[var(--text-dim)] italic">0 = unlimited</p>
+                        </div>
+                        <input
+                          type="number"
+                          min={0}
+                          value={settings.max_results}
+                          onChange={(e) => handleUpdateSettings({ max_results: parseInt(e.target.value) || 0 })}
+                          className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
+                        />
+                      </div>
                     </div>
                   </section>
 

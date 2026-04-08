@@ -23,7 +23,6 @@ struct ModelInfo {
     display_name: &'static str,
     description: &'static str,
     dimension: usize,
-    is_default: bool,
     is_recommended: bool,
 }
 
@@ -33,7 +32,6 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
         display_name: "bge-base-en-v1.5",
         description: "BGE base English embeddings (768-dim)",
         dimension: 768,
-        is_default: false,
         is_recommended: false,
     },
     ModelInfo {
@@ -41,7 +39,6 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
         display_name: "all-MiniLM-L12-v2",
         description: "Speed: high, accuracy: medium (English)",
         dimension: 384,
-        is_default: true,
         is_recommended: false,
     },
     ModelInfo {
@@ -49,7 +46,6 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
         display_name: "multilingual-e5-large-instruct",
         description: "Multilingual instruction-tuned E5 (1024-dim)",
         dimension: 1024,
-        is_default: false,
         is_recommended: false,
     },
 ];
@@ -95,7 +91,7 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
                 description: info.description.to_string(),
                 dimension: info.dimension,
                 is_cached,
-                is_default: info.is_default,
+                is_default: false,
                 is_recommended: info.is_recommended,
                 size_bytes,
                 preferred_batch_size: Some(EMBED_BATCH_SIZE),
@@ -553,8 +549,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let models = list_supported_models(dir.path());
         assert!(!models.is_empty());
-        let default_model = models.iter().find(|m| m.is_default).unwrap();
-        assert_eq!(default_model.model_id, "sentence-transformers/all-MiniLM-L12-v2");
+        let default_id = crate::types::EmbeddingEngine::Candle.default_model();
+        assert!(models.iter().any(|m| m.model_id == default_id),
+            "Default model '{default_id}' must exist in the Candle catalog");
     }
 
     #[test]
@@ -763,5 +760,141 @@ mod tests {
         let dir = tempdir().unwrap();
         let size = cached_size_bytes(dir.path(), "non-existent");
         assert!(size.is_none());
+    }
+
+    #[test]
+    fn test_pool_cls() {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        // (B=1, S=2, H=3)
+        let embeddings_t = Tensor::new(&[[[1.0f32, 2.0f32, 3.0f32], [4.0f32, 5.0f32, 6.0f32]]], &device).unwrap();
+        let mask = Tensor::new(&[[1.0f32, 1.0f32]], &device).unwrap();
+        
+        let tokenizer_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":null,"byte_fallback":null,"vocab":{},"merges":[]}}"#;
+        let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes()).unwrap();
+
+        // BertModel::load needs these tensors (minimal set)
+        let mut tensors = std::collections::HashMap::new();
+        tensors.insert("embeddings.word_embeddings.weight".to_string(), Tensor::zeros((1, 3), dtype, &device).unwrap());
+        tensors.insert("embeddings.position_embeddings.weight".to_string(), Tensor::zeros((512, 3), dtype, &device).unwrap());
+        tensors.insert("embeddings.token_type_embeddings.weight".to_string(), Tensor::zeros((2, 3), dtype, &device).unwrap());
+        tensors.insert("embeddings.LayerNorm.weight".to_string(), Tensor::ones(3, dtype, &device).unwrap());
+        tensors.insert("embeddings.LayerNorm.bias".to_string(), Tensor::zeros(3, dtype, &device).unwrap());
+        
+        let config = BertConfig { 
+            num_hidden_layers: 0, 
+            hidden_size: 3, 
+            intermediate_size: 3, 
+            num_attention_heads: 1, 
+            vocab_size: 1, // MATCH the tensor shape [1, 3]
+            ..BertConfig::default() 
+        };
+        
+        let vb = VarBuilder::from_tensors(tensors, dtype, &device);
+        let model = BertModel::load(vb, &config).unwrap();
+
+        // Mock embedder enough to call pool
+        let embedder = CandleEmbedder {
+            model: LoadedModel::Bert(model),
+            tokenizer,
+            device: device.clone(),
+            dtype,
+            model_id: "m".to_string(),
+            dimension: 3,
+            pooling: PoolingStrategy::Cls,
+            passage_prefix: "".to_string(),
+        };
+
+        let pooled = embedder.pool(&embeddings_t, &mask).unwrap();
+        // Should take the first token: [1, 2, 3]
+        assert_eq!(pooled.to_vec2::<f32>().unwrap(), vec![vec![1.0, 2.0, 3.0]]);
+    }
+
+    #[test]
+    fn test_pool_mean() {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        // (B=1, S=2, H=3)
+        let embeddings_t = Tensor::new(&[[[1.0f32, 2.0f32, 3.0f32], [4.0f32, 5.0f32, 6.0f32]]], &device).unwrap();
+        let mask = Tensor::new(&[[1.0f32, 1.0f32]], &device).unwrap();
+        
+        let tokenizer_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":null,"byte_fallback":null,"vocab":{},"merges":[]}}"#;
+        let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes()).unwrap();
+
+        let mut tensors = std::collections::HashMap::new();
+        tensors.insert("embeddings.word_embeddings.weight".to_string(), Tensor::zeros((1, 3), dtype, &device).unwrap());
+        tensors.insert("embeddings.position_embeddings.weight".to_string(), Tensor::zeros((512, 3), dtype, &device).unwrap());
+        tensors.insert("embeddings.token_type_embeddings.weight".to_string(), Tensor::zeros((2, 3), dtype, &device).unwrap());
+        tensors.insert("embeddings.LayerNorm.weight".to_string(), Tensor::ones(3, dtype, &device).unwrap());
+        tensors.insert("embeddings.LayerNorm.bias".to_string(), Tensor::zeros(3, dtype, &device).unwrap());
+        let config = BertConfig { 
+            num_hidden_layers: 0, 
+            hidden_size: 3, 
+            intermediate_size: 3, 
+            num_attention_heads: 1, 
+            vocab_size: 1, // MATCH tensor [1, 3]
+            ..BertConfig::default() 
+        };
+        let vb = VarBuilder::from_tensors(tensors, dtype, &device);
+        let model = BertModel::load(vb, &config).unwrap();
+
+        let embedder = CandleEmbedder {
+            model: LoadedModel::Bert(model),
+            tokenizer,
+            device: device.clone(),
+            dtype,
+            model_id: "m".to_string(),
+            dimension: 3,
+            pooling: PoolingStrategy::Mean,
+            passage_prefix: "".to_string(),
+        };
+
+        let pooled = embedder.pool(&embeddings_t, &mask).unwrap();
+        // Mean of [1,2,3] and [4,5,6] is [2.5, 3.5, 4.5]
+        assert_eq!(pooled.to_vec2::<f32>().unwrap(), vec![vec![2.5, 3.5, 4.5]]);
+    }
+
+    #[test]
+    fn test_pool_max() {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        // (B=1, S=2, H=3)
+        let embeddings_t = Tensor::new(&[[[1.0f32, 10.0f32, 3.0f32], [4.0f32, 5.0f32, 6.0f32]]], &device).unwrap();
+        let mask = Tensor::new(&[[1.0f32, 1.0f32]], &device).unwrap();
+        
+        let tokenizer_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":null,"byte_fallback":null,"vocab":{},"merges":[]}}"#;
+        let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes()).unwrap();
+
+        let mut tensors = std::collections::HashMap::new();
+        tensors.insert("embeddings.word_embeddings.weight".to_string(), Tensor::zeros((1, 3), dtype, &device).unwrap());
+        tensors.insert("embeddings.position_embeddings.weight".to_string(), Tensor::zeros((512, 3), dtype, &device).unwrap());
+        tensors.insert("embeddings.token_type_embeddings.weight".to_string(), Tensor::zeros((2, 3), dtype, &device).unwrap());
+        tensors.insert("embeddings.LayerNorm.weight".to_string(), Tensor::ones(3, dtype, &device).unwrap());
+        tensors.insert("embeddings.LayerNorm.bias".to_string(), Tensor::zeros(3, dtype, &device).unwrap());
+        let config = BertConfig { 
+            num_hidden_layers: 0, 
+            hidden_size: 3, 
+            intermediate_size: 3, 
+            num_attention_heads: 1, 
+            vocab_size: 1, // MATCH tensor [1, 3]
+            ..BertConfig::default() 
+        };
+        let vb = VarBuilder::from_tensors(tensors, dtype, &device);
+        let model = BertModel::load(vb, &config).unwrap();
+
+        let embedder = CandleEmbedder {
+            model: LoadedModel::Bert(model),
+            tokenizer,
+            device: device.clone(),
+            dtype,
+            model_id: "m".to_string(),
+            dimension: 3,
+            pooling: PoolingStrategy::Max,
+            passage_prefix: "".to_string(),
+        };
+
+        let pooled = embedder.pool(&embeddings_t, &mask).unwrap();
+        // Max of [1,10,3] and [4,5,6] is [4, 10, 6]
+        assert_eq!(pooled.to_vec2::<f32>().unwrap(), vec![vec![4.0, 10.0, 6.0]]);
     }
 }

@@ -156,6 +156,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_embedder_prefixes() {
+        use std::sync::Arc;
         let paths = WorkerPaths {
             python_path: PathBuf::from("p"),
             python_package_dir: PathBuf::from("pkg"),
@@ -164,7 +165,8 @@ mod tests {
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
-        let (manager, _event_rx, _loop_fut) = WorkerManager::new(paths);
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        tokio::spawn(loop_fut);
         
         let config = WorkerEmbedderConfig {
             model_id: "test-model".to_string(),
@@ -176,10 +178,51 @@ mod tests {
             passage_prefix: "p: ".to_string(),
         };
         
-        let embedder = WorkerEmbedder::new(manager, config);
+        let embedder = Arc::new(WorkerEmbedder::new(manager, config));
+
+        // Use spawn_blocking or a separate thread to avoid "Cannot start a runtime from within a runtime"
+        // because WorkerEmbedder::send_embed uses block_on.
+        let embedder_c = Arc::clone(&embedder);
+        let res = tokio::task::spawn_blocking(move || {
+            embedder_c.embed_query(&["hello"])
+        }).await.unwrap();
+        assert!(res.is_err());
         
-        // We can't easily test the actual sending without a running manager loop and a worker,
-        // but we can at least check that the methods exist and call the underlying logic.
-        // If we really wanted to test this, we'd need to mock the manager.
+        let embedder_c2 = Arc::clone(&embedder);
+        let res2 = tokio::task::spawn_blocking(move || {
+            embedder_c2.embed_passages(&["world"])
+        }).await.unwrap();
+        assert!(res2.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_worker_embedder_no_prefix() {
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("r"),
+            venv_dir: PathBuf::from("v"),
+            worker_bin: PathBuf::from("w"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        tokio::spawn(loop_fut);
+        
+        let config = WorkerEmbedderConfig {
+            model_id: "test-model".to_string(),
+            dimension: 384,
+            device: "cpu".to_string(),
+            engine: EmbeddingEngine::Fastembed,
+            data_dir: PathBuf::from("data"),
+            query_prefix: "".to_string(),
+            passage_prefix: "".to_string(),
+        };
+        
+        let embedder = Arc::new(WorkerEmbedder::new(manager, config));
+        let embedder_c = Arc::clone(&embedder);
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = embedder_c.embed_query(&["h"]);
+            let _ = embedder_c.embed_passages(&["w"]);
+        }).await;
     }
 }
