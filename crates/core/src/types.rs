@@ -357,7 +357,7 @@ impl EmbeddingEngine {
         match self {
             EmbeddingEngine::SBERT => "intfloat/e5-small-v2",
             EmbeddingEngine::Candle => "sentence-transformers/all-MiniLM-L12-v2",
-            EmbeddingEngine::Fastembed => "BGEBaseENV15",
+            EmbeddingEngine::Fastembed => "AllMiniLML6V2",
         }
     }
 
@@ -459,7 +459,7 @@ impl SemanticSettings {
     }
 
     fn default_dimension() -> usize {
-        768 // Default for BGEBaseENV15
+        384 // Default for AllMiniLML6V2
     }
 
     /// Returns the effective device string for the given engine,
@@ -797,8 +797,8 @@ mod tests {
         let settings = SemanticSettings::default();
         assert_eq!(settings.enabled, false);
         assert_eq!(settings.engine, EmbeddingEngine::default());
-        assert_eq!(settings.model.model_id(), "BGEBaseENV15");
-        assert_eq!(settings.dimension, 768);
+        assert_eq!(settings.model.model_id(), "AllMiniLML6V2");
+        assert_eq!(settings.dimension, 384);
         assert_eq!(settings.chunk_size, 600);
         assert_eq!(settings.chunk_overlap, 128);
         assert_eq!(settings.worker_timeout_secs, 300);

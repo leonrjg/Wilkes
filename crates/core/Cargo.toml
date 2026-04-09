@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["fastembed"]
+default = ["fastembed", "candle"]
 test-utils = []
 fastembed = ["dep:fastembed", "dep:hf-hub", "dep:ureq", "dep:ort"]
 fastembed-coreml = ["fastembed", "ort/coreml"]
@@ -71,10 +71,24 @@ optional = true
 version = "0.20"
 optional = true
 
+[target.'cfg(target_os = "macos")'.dependencies.candle-core]
+version = "0.9"
+optional = true
+features = ["metal", "accelerate"]
+
+[target.'cfg(target_os = "macos")'.dependencies.candle-nn]
+version = "0.9"
+optional = true
+features = ["metal"]
+
+[target.'cfg(target_os = "macos")'.dependencies.candle-transformers]
+version = "0.9"
+optional = true
+features = ["metal"]
+
 [dev-dependencies]
 tempfile = "3.10"
 mockall = "0.13"
 mockito = "1.4"
 base64 = "0.22.1"
 wilkes-core = { path = ".", features = ["test-utils"] }
-

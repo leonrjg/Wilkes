@@ -11,7 +11,7 @@ path = "src/main.rs"
 fastembed-coreml = ["wilkes-core/fastembed-coreml"]
 
 [dependencies]
-wilkes-core = { path = "../core", features = ["fastembed"] }
+wilkes-core = { path = "../core" }
 wilkes-api = { path = "../api" }
 anyhow = "1"
 serde_json = "1"
