@@ -2,6 +2,8 @@ services:
   wilkes:
     build: .
     container_name: wilkes
+    environment:
+      WILKES_HOST: "0.0.0.0"
     ports:
       - "2000:2000"
     volumes:
