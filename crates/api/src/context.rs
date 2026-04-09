@@ -1909,6 +1909,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_restore_db_status_reads_existing_db() {
+        let (dir, ctx) = test_ctx();
+        let index = SemanticIndex::create(
+            &ctx.data_dir,
+            "restore-model",
+            384,
+            EmbeddingEngine::Candle,
+            Some(dir.path()),
+        )
+        .unwrap();
+        let settings = Settings {
+            semantic: SemanticSettings {
+                enabled: true,
+                index_path: Some(PathBuf::from("semantic_index.db")),
+                ..SemanticSettings::default()
+            },
+            ..Settings::default()
+        };
+
+        let db_status = ctx.load_restore_db_status(&settings).await;
+        let db_status = db_status.expect("expected restore db status");
+        assert_eq!(db_status.model_id, "restore-model");
+        assert_eq!(db_status.dimension, 384);
+
+        drop(index);
+    }
+
+    #[tokio::test]
     async fn test_finish_build_index_starts_watcher_and_persists_state() {
         let (dir, ctx) = test_ctx();
         let root = dir.path().join("root");
@@ -1954,6 +1982,95 @@ mod tests {
         ctx.stop_watcher();
         assert!(ctx.watcher.lock().is_none());
         drop(index);
+    }
+
+    #[tokio::test]
+    async fn test_start_build_watcher_failure_leaves_no_watcher() {
+        let (_dir, ctx) = test_ctx();
+        let index = SemanticIndex::create(
+            &ctx.data_dir,
+            "watch-model",
+            384,
+            EmbeddingEngine::Candle,
+            None,
+        )
+        .unwrap();
+        let index_arc = Arc::new(Mutex::new(Some(index)));
+        let missing_root = PathBuf::from("/definitely/missing/watcher/root");
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+
+        ctx.start_build_watcher(
+            missing_root,
+            index_arc,
+            embedder,
+            IndexingConfig {
+                chunk_size: 64,
+                chunk_overlap: 8,
+                supported_extensions: vec!["txt".to_string()],
+            },
+        );
+
+        assert!(ctx.watcher.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_build_index_task_cancellation_cleans_up_and_emits_done() {
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(MockEmitter {
+            events: Arc::clone(&events),
+        });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths {
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: dir.path().to_path_buf(),
+            },
+            emitter,
+        );
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let stale = ctx.data_dir.join("semantic_index.db.tmp");
+        std::fs::write(&stale, "stale").unwrap();
+
+        let plan = BuildIndexPlan {
+            root_path: root,
+            device: "cpu".to_string(),
+            chunk_size: 64,
+            chunk_overlap: 8,
+            supported_extensions: vec!["txt".to_string()],
+        };
+        let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+
+        let handle = Arc::clone(&ctx).spawn_build_index_task(
+            plan,
+            selected,
+            cancel,
+            Arc::clone(&cancel_flag),
+        );
+
+        handle.await.unwrap().unwrap();
+
+        assert!(cancel_flag.load(Ordering::Relaxed));
+        assert!(!stale.exists());
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|(name, payload)| {
+            name == "embed-error" && payload["operation"] == "Build" && payload["message"] == ""
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|(name, payload)| name == "manager-event" && payload == &serde_json::json!("ReindexingDone"))
+        );
     }
 
     #[tokio::test]

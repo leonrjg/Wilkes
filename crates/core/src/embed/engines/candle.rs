@@ -1461,9 +1461,16 @@ mod tests {
     #[test]
     fn test_select_device_plan_and_realize_device() {
         assert_eq!(select_device_plan("cpu"), CandleDevicePlan::Cpu);
+        assert_eq!(select_device_plan("  CPU  "), CandleDevicePlan::Cpu);
         assert_eq!(select_device_plan("gpu"), CandleDevicePlan::MetalPreferred);
         assert_eq!(select_dtype_for_plan(&CandleDevicePlan::Cpu), DType::F32);
         assert!(matches!(realize_device(CandleDevicePlan::Cpu), Device::Cpu));
+
+        let metal = realize_device(CandleDevicePlan::MetalPreferred);
+        #[cfg(not(feature = "candle-metal"))]
+        assert!(matches!(metal, Device::Cpu));
+        #[cfg(feature = "candle-metal")]
+        assert!(matches!(metal, Device::Cpu | Device::Metal(_)));
     }
 
     #[test]

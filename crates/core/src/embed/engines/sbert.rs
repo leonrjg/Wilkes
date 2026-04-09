@@ -360,4 +360,22 @@ mod tests {
         assert_eq!(embedder.dimension(), 384);
         assert_eq!(embedder.engine(), EmbeddingEngine::SBERT);
     }
+
+    #[test]
+    fn test_sbert_installer_build_without_dimension_errors() {
+        let dir = tempdir().unwrap();
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
+            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        );
+        let installer = SBERTInstaller::new(
+            EmbedderModel("custom/model".to_string()),
+            manager,
+            "cpu".to_string(),
+        );
+
+        match installer.build(dir.path()) {
+            Ok(_) => panic!("expected build to fail without a probed dimension"),
+            Err(err) => assert!(err.to_string().contains("Dimension unknown")),
+        }
+    }
 }
