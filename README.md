@@ -1,9 +1,9 @@
 <p align="center">
-  <img height="300" alt="Light mode" src="https://github.com/user-attachments/assets/8b84516f-5384-47d2-bb5e-ce2dd78e5b18" />
-  <img height="300" alt="Dark mode" src="https://github.com/user-attachments/assets/6c03a671-1a2a-42c5-b5ab-0cd6a66030bf" />
+  <img style="width:48%" alt="Light mode" src="https://github.com/user-attachments/assets/8b84516f-5384-47d2-bb5e-ce2dd78e5b18" />
+  <img style="width:48%" alt="Dark mode" src="https://github.com/user-attachments/assets/6c03a671-1a2a-42c5-b5ab-0cd6a66030bf" />
 </p>
 
-<table>
+<table align="center">
   <tr>
     <td valign="top">
       <img height="200" alt="Wilkes" src="https://github.com/user-attachments/assets/d64c15a4-4aad-4cc6-ba20-d243dbb0c21f" />
