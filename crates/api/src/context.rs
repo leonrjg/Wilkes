@@ -37,9 +37,25 @@ pub trait EventEmitter: Send + Sync + 'static {
 // ── Embed task handle ─────────────────────────────────────────────────────────
 
 pub struct EmbedTaskHandle {
+    pub operation: EmbedOperation,
     pub cancel: CancellationToken,
     pub cancel_flag: Arc<AtomicBool>,
     pub join: JoinHandle<anyhow::Result<()>>,
+}
+
+#[derive(Copy, Clone)]
+pub enum EmbedOperation {
+    Download,
+    Build,
+}
+
+impl EmbedOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Download => "Download",
+            Self::Build => "Build",
+        }
+    }
 }
 
 // ── AppContext ────────────────────────────────────────────────────────────────
@@ -54,6 +70,7 @@ pub struct AppContext {
     index: PLMutex<Arc<Mutex<Option<SemanticIndex>>>>,
     watcher: PLMutex<Option<IndexWatcher>>,
     embed_task: PLMutex<Option<EmbedTaskHandle>>,
+    shutting_down: AtomicBool,
     pub worker_manager: WorkerManager,
     events: Arc<dyn EventEmitter>,
     settings_lock: tokio::sync::Mutex<()>,
@@ -78,6 +95,7 @@ impl AppContext {
             index: PLMutex::new(Arc::new(Mutex::new(None))),
             watcher: PLMutex::new(None),
             embed_task: PLMutex::new(None),
+            shutting_down: AtomicBool::new(false),
             worker_manager,
             events,
             settings_lock: tokio::sync::Mutex::new(()),
@@ -452,6 +470,7 @@ impl AppContext {
         });
 
         *self.embed_task.lock() = Some(EmbedTaskHandle {
+            operation: EmbedOperation::Build,
             cancel,
             cancel_flag,
             join,
@@ -550,6 +569,7 @@ impl AppContext {
 
         let cancel = CancellationToken::new();
         *self.embed_task.lock() = Some(EmbedTaskHandle {
+            operation: EmbedOperation::Download,
             cancel,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             join,
@@ -564,7 +584,18 @@ impl AppContext {
         if let Some(task) = self.embed_task.lock().take() {
             task.cancel_flag.store(true, Ordering::Relaxed);
             task.cancel.cancel();
+            self.emit_embed_error(task.operation.as_str(), "");
+            task.join.abort();
         }
+    }
+
+    pub fn shutdown(&self) {
+        if self.shutting_down.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.stop_watcher();
+        self.cancel_embed();
+        self.kill_worker();
     }
 
     pub async fn delete_index(&self) -> anyhow::Result<()> {
@@ -941,6 +972,50 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_embed() {
         let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(MockEmitter {
+            events: events.clone(),
+        });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths {
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
+            },
+            emitter,
+        );
+
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(async {
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            Ok(())
+        });
+        *ctx.embed_task.lock() = Some(EmbedTaskHandle {
+            operation: EmbedOperation::Build,
+            cancel,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            join,
+        });
+
+        ctx.cancel_embed(); // Should not panic
+        assert!(ctx.embed_task.lock().is_none());
+
+        let events_guard = events.lock().unwrap();
+        assert!(events_guard.iter().any(|(name, payload)| {
+            name == "embed-error"
+                && payload["operation"] == "Build"
+                && payload["message"] == ""
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_shutdown() {
+        let dir = tempdir().unwrap();
         let emitter = Arc::new(MockEmitter {
             events: Arc::new(Mutex::new(Vec::new())),
         });
@@ -958,7 +1033,38 @@ mod tests {
             emitter,
         );
 
-        ctx.cancel_embed(); // Should not panic
+        let watcher = IndexWatcher::start(
+            dir.path().to_path_buf(),
+            ctx.index.lock().clone(),
+            Arc::new(ExtractorRegistry::new()),
+            Arc::new(MockEmbedder::default()),
+            IndexingConfig {
+                chunk_size: 100,
+                chunk_overlap: 10,
+                supported_extensions: vec![],
+            },
+            || {},
+            || {},
+        )
+        .unwrap();
+        *ctx.watcher.lock() = Some(watcher);
+
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(async {
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            Ok(())
+        });
+        *ctx.embed_task.lock() = Some(EmbedTaskHandle {
+            operation: EmbedOperation::Build,
+            cancel,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            join,
+        });
+
+        ctx.shutdown();
+
+        assert!(ctx.watcher.lock().is_none());
+        assert!(ctx.embed_task.lock().is_none());
     }
 
     #[tokio::test]
@@ -1314,6 +1420,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let join = tokio::spawn(async { Ok(()) });
         *ctx.embed_task.lock() = Some(EmbedTaskHandle {
+            operation: EmbedOperation::Build,
             cancel,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             join,
@@ -1374,6 +1481,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let join = tokio::spawn(async { Ok(()) });
         *ctx.embed_task.lock() = Some(EmbedTaskHandle {
+            operation: EmbedOperation::Build,
             cancel,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             join,
@@ -1424,6 +1532,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let join = tokio::spawn(async { Ok(()) });
         *ctx.embed_task.lock() = Some(EmbedTaskHandle {
+            operation: EmbedOperation::Build,
             cancel,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             join,
@@ -1818,9 +1927,8 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_embed_operation() {
         let dir = tempdir().unwrap();
-        let events = Arc::new(Mutex::new(Vec::new()));
         let emitter = Arc::new(MockEmitter {
-            events: events.clone(),
+            events: Arc::new(Mutex::new(Vec::new())),
         });
         let (ctx, _rx, _loop) = AppContext::new(
             dir.path().to_path_buf(),
@@ -1849,21 +1957,8 @@ mod tests {
         // Immediately cancel
         ctx.cancel_embed();
 
-        // Give it some time to process
-        let mut success = false;
-        for _ in 0..20 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            let events_guard = events.lock().unwrap();
-            if events_guard.iter().any(|e| {
-                e.0 == "embed-error"
-                    || e.0 == "embed-done"
-                    || (e.0 == "manager-event" && e.1 == serde_json::json!("ReindexingDone"))
-            }) {
-                success = true;
-                break;
-            }
-        }
-        assert!(success);
+        assert!(ctx.embed_task.lock().is_none());
+        assert!(!ctx.get_worker_status().active);
     }
 
     #[tokio::test]

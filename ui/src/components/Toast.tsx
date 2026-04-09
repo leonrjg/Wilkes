@@ -135,8 +135,15 @@ function ToastItem({ toast, onRemove }: { toast: Toast; onRemove: (id: string) =
         </button>
       </div>
       {toast.shimmer && (
-        <div className="h-[3px] w-full relative overflow-hidden bg-white/5">
-          <div className="absolute inset-0 bg-[var(--accent-blue)] animate-shimmer" />
+        <div
+          data-testid="toast-shimmer-bar"
+          className="h-1.5 w-full relative overflow-hidden bg-[var(--accent-blue-muted)]/60"
+        >
+          <div className="absolute inset-0 bg-[var(--accent-blue)]/35" />
+          <div
+            className="absolute inset-y-0 w-1/3 min-w-10 -translate-x-full bg-[linear-gradient(90deg,transparent,rgba(255,255,255,0.9),transparent)]"
+            style={{ animation: "shimmer 1.2s ease-in-out infinite" }}
+          />
         </div>
       )}
     </div>

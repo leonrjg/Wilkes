@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use rusqlite::{params, Connection};
@@ -41,6 +41,14 @@ fn load_sqlite_vec() {
 
 fn db_path(data_dir: &Path) -> PathBuf {
     data_dir.join("semantic_index.db")
+}
+
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn configure_connection(conn: &Connection, path: &Path) -> anyhow::Result<()> {
+    conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
+        .with_context(|| format!("Failed to configure busy timeout for {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -102,6 +110,39 @@ mod tests {
         let status = SemanticIndex::read_status_from_path(dir.path()).unwrap();
         assert_eq!(status.model_id, "m1");
         assert_eq!(status.dimension, 512);
+    }
+
+    #[test]
+    fn test_read_status_from_path_retries_locked_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(dir.path());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO meta VALUES ('model_id', 'm1');
+            INSERT INTO meta VALUES ('dimension', '512');
+            INSERT INTO meta VALUES ('engine', 'sbert');
+            CREATE TABLE vec_chunks (id INTEGER PRIMARY KEY);
+        ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let lock_path = path.clone();
+        let lock_handle = std::thread::spawn(move || {
+            let conn = Connection::open(&lock_path).unwrap();
+            conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        let status = SemanticIndex::read_status_from_path(dir.path()).unwrap();
+        assert_eq!(status.model_id, "m1");
+
+        lock_handle.join().unwrap();
     }
 
     #[test]
@@ -524,6 +565,7 @@ impl SemanticIndex {
 
         let conn = Connection::open(&path)
             .with_context(|| format!("Failed to open index at {}", path.display()))?;
+        configure_connection(&conn, &path)?;
 
         // Require the sqlite-vec schema. A missing vec_chunks table means the index
         // was built before this migration; the caller should rebuild.
@@ -634,6 +676,7 @@ impl SemanticIndex {
 
         let conn = Connection::open(path)
             .with_context(|| format!("Failed to create index at {}", path.display()))?;
+        configure_connection(&conn, path)?;
 
         Self::create_schema(&conn, model_id, dimension, engine)?;
 
@@ -1284,7 +1327,9 @@ impl SemanticIndex {
     pub fn read_status_from_path(data_dir: &Path) -> anyhow::Result<IndexStatus> {
         let path = db_path(data_dir);
         anyhow::ensure!(path.exists(), "No semantic index found");
-        let conn = Connection::open(&path)?;
+        let conn = Connection::open(&path)
+            .with_context(|| format!("Failed to open index at {}", path.display()))?;
+        configure_connection(&conn, &path)?;
 
         let db_size_bytes = std::fs::metadata(&path).ok().map(|m| m.len());
 

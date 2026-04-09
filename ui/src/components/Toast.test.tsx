@@ -94,4 +94,14 @@ describe("Toast", () => {
 
     expect(screen.getByText(/Elapsed:/)).toBeInTheDocument();
   });
+
+  it("renders a shimmer bar when requested", () => {
+    render(
+      <ToastProvider>
+        <TestComponent message="Indexing" options={{ startTime: Date.now(), shimmer: true }} />
+      </ToastProvider>
+    );
+
+    expect(screen.getByTestId("toast-shimmer-bar")).toBeInTheDocument();
+  });
 });

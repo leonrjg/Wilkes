@@ -289,7 +289,7 @@ async fn set_worker_timeout(secs: u64, app: AppHandle) -> Result<(), String> {
 pub fn run() {
     wilkes_core::logging::init_logging();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle().clone();
@@ -339,8 +339,15 @@ pub fn run() {
             kill_worker,
             set_worker_timeout,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+            let ctx = app_handle.state::<Arc<AppContext>>().inner().clone();
+            ctx.shutdown();
+        }
+    });
 }
 
 #[cfg(test)]

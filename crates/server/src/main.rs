@@ -43,6 +43,31 @@ impl EventEmitter for BroadcastEmitter {
     }
 }
 
+async fn shutdown_signal(ctx: Arc<AppContext>) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            sigterm.recv().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    ctx.shutdown();
+}
+
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -691,6 +716,7 @@ async fn main() -> anyhow::Result<()> {
         uploads_dir,
         events_tx,
     });
+    let shutdown_ctx = Arc::clone(&state.ctx);
     let index_html = config.dist_dir.join("index.html");
 
     let app = Router::new()
@@ -736,7 +762,9 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.host, config.port);
     info!("wilkes-server listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_ctx))
+        .await?;
 
     Ok(())
 }

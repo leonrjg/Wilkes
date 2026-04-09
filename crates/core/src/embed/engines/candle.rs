@@ -418,8 +418,12 @@ impl EmbedderInstaller for CandleInstaller {
             let repo = api.model(model_id.clone());
 
             for filename in MODEL_FILES {
-                repo.get(filename)
-                    .with_context(|| format!("Failed to download '{filename}' for '{model_id}'"))?;
+                let url = repo.url(filename);
+                repo.get(filename).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to download '{filename}' for '{model_id}' from {url}: {e:#}"
+                    )
+                })?;
             }
 
             // Pooling config is optional; ignore errors.
