@@ -7,7 +7,8 @@ vi.mock("../services", () => ({
     getSettings: vi.fn(),
     updateSettings: vi.fn(),
     listFiles: vi.fn(),
-    isSemanticReady: vi.fn().mockResolvedValue(true),
+    getIndexStatus: vi.fn(),
+    buildIndex: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -53,6 +54,17 @@ describe("useSettingsStore", () => {
 
     (api.getSettings as any).mockResolvedValue(mockSettings);
     (api.listFiles as any).mockResolvedValue([{ path: "/path/1/file.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" }]);
+    (api.getIndexStatus as any).mockResolvedValue({
+      indexed_files: 1,
+      total_chunks: 2,
+      built_at: null,
+      build_duration_ms: null,
+      engine: "SBERT",
+      model_id: "model",
+      dimension: 384,
+      root_path: "/path/1",
+      db_size_bytes: null,
+    });
 
     await useSettingsStore.getState().load();
     // Allow the directory-change subscription to resolve its async listFiles call
@@ -78,6 +90,7 @@ describe("useSettingsStore", () => {
       semantic: { enabled: false, index_path: null },
       supported_extensions: [],
     });
+    (api.getIndexStatus as any).mockRejectedValue(new Error("missing"));
 
     await useSettingsStore.getState().load();
     expect(useSettingsStore.getState().directory).toBe("");
@@ -180,11 +193,39 @@ describe("useSettingsStore", () => {
   });
 
   it("should refresh semantic ready", async () => {
-    (api.getSettings as any).mockResolvedValue({
-      semantic: { enabled: true, index_path: "/some/path" }
+    useSettingsStore.setState({ directory: "/path/1" });
+    (api.getIndexStatus as any).mockResolvedValue({
+      indexed_files: 1,
+      total_chunks: 2,
+      built_at: null,
+      build_duration_ms: null,
+      engine: "SBERT",
+      model_id: "model",
+      dimension: 384,
+      root_path: "/path/1",
+      db_size_bytes: null,
     });
     await useSettingsStore.getState().refreshSemanticReady();
     expect(useSettingsStore.getState().semanticIndexBuilt).toBe(true);
+  });
+
+  it("should treat an empty index as not ready", async () => {
+    useSettingsStore.setState({ directory: "/path/1", semanticIndexBuilt: true });
+    (api.getIndexStatus as any).mockResolvedValue({
+      indexed_files: 0,
+      total_chunks: 0,
+      built_at: null,
+      build_duration_ms: null,
+      engine: "SBERT",
+      model_id: "model",
+      dimension: 384,
+      root_path: "/path/1",
+      db_size_bytes: null,
+    });
+
+    await useSettingsStore.getState().refreshSemanticReady();
+
+    expect(useSettingsStore.getState().semanticIndexBuilt).toBe(false);
   });
 
   it("should update filter text", () => {
@@ -219,9 +260,8 @@ describe("useSettingsStore", () => {
 
   it("should handle error in refreshSemanticReady", async () => {
     useSettingsStore.setState({ semanticIndexBuilt: true });
-    (api.getSettings as any).mockRejectedValue(new Error("Failed"));
+    (api.getIndexStatus as any).mockRejectedValue(new Error("Failed"));
     await useSettingsStore.getState().refreshSemanticReady();
-    expect(useSettingsStore.getState().semanticIndexBuilt).toBe(true); // Should not change on error if it doesn't set it to false
-    // Actually the code doesn't set it to false on error, it just logs it.
+    expect(useSettingsStore.getState().semanticIndexBuilt).toBe(false);
   });
 });

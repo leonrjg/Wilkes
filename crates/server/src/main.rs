@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{Multipart, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -724,7 +724,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/files", get(list_files_handler))
         .route("/api/file", post(open_file_handler))
         // Upload (server-only: desktop uses native file picker)
-        .route("/api/upload", post(upload_handler))
+        .route(
+            "/api/upload",
+            post(upload_handler).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES as usize)),
+        )
         .route("/api/upload", delete(delete_upload_handler))
         .route("/api/upload/all", delete(delete_all_upload_handler))
         .route("/asset", get(asset_handler))

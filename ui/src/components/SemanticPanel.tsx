@@ -178,7 +178,9 @@ function derivePhase(state: PanelState): Phase {
     if (state.indexStatus.engine !== sem.engine || state.indexStatus.model_id !== sem.model) {
       return "engine_mismatch";
     }
-    return "indexed";
+    if (state.indexStatus.indexed_files > 0 && state.indexStatus.total_chunks > 0) {
+      return "indexed";
+    }
   }
 
   if (!sem) return "not_downloaded";

@@ -1,9 +1,19 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import { api } from "../services";
-import type { FileEntry, Theme } from "../lib/types";
+import type { FileEntry, IndexStatus, Theme } from "../lib/types";
 
 const EMPTY_EXCLUDED: Set<string> = new Set();
+
+function isUsableSemanticIndex(
+  indexStatus: IndexStatus | null,
+  directory: string,
+): boolean {
+  if (!indexStatus || !directory) return false;
+  if (indexStatus.indexed_files === 0 || indexStatus.total_chunks === 0) return false;
+  if (indexStatus.root_path && indexStatus.root_path !== directory) return false;
+  return true;
+}
 
 function applyTheme(theme: Theme) {
   const root = window.document.documentElement;
@@ -90,10 +100,17 @@ export const useSettingsStore = create<SettingsStore>()(
         maxResults: s.max_results ?? 0,
       });
 
-      const ready = await api.isSemanticReady();
+      const directory = s.last_directory ?? "";
+      let ready = false;
+      try {
+        const indexStatus = await api.getIndexStatus();
+        ready = isUsableSemanticIndex(indexStatus, directory);
+      } catch {
+        ready = false;
+      }
       set({ semanticIndexBuilt: ready });
 
-      if (!ready && s.search_prefer_semantic) {
+      if (!ready && s.search_prefer_semantic && directory) {
         get().startSemanticIndex().catch(console.error);
       }
     },
@@ -158,7 +175,14 @@ export const useSettingsStore = create<SettingsStore>()(
     },
 
     refreshSemanticReady: async () => {
-      const ready = await api.isSemanticReady();
+      const { directory } = get();
+      let ready = false;
+      try {
+        const indexStatus = await api.getIndexStatus();
+        ready = isUsableSemanticIndex(indexStatus, directory);
+      } catch {
+        ready = false;
+      }
       set({ semanticIndexBuilt: ready });
     },
 

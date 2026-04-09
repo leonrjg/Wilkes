@@ -19,7 +19,12 @@ describe("UploadZone", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    useSettingsStore.setState({ fileList: [], refreshFileList: vi.fn() } as any);
+    useSettingsStore.setState({
+      fileList: [],
+      refreshFileList: vi.fn(),
+      preferSemantic: false,
+      startSemanticIndex: vi.fn().mockResolvedValue(undefined),
+    } as any);
     // Mock XMLHttpRequest
     xhrMock = {
       open: vi.fn(),
@@ -120,11 +125,12 @@ describe("UploadZone", () => {
 
     // Simulate upload failure
     xhrMock.status = 500;
+    xhrMock.responseText = JSON.stringify({ error: "too large" });
     await act(async () => {
       if (loadListener) loadListener();
     });
 
-    expect(screen.getByText("Upload failed: 500")).toBeInTheDocument();
+    expect(screen.getByText("Upload failed: 500 (too large)")).toBeInTheDocument();
   });
 
   it("handles upload network error", async () => {
@@ -188,5 +194,30 @@ describe("UploadZone", () => {
     await act(async () => {
       fireEvent.change(folderInput, { target: { files: [file] } });
     });
+  });
+
+  it("triggers semantic reindex after upload when semantic is preferred", async () => {
+    const startSemanticIndex = vi.fn().mockResolvedValue(undefined);
+    useSettingsStore.setState({ preferSemantic: true, startSemanticIndex } as any);
+
+    render(<UploadZone {...defaultProps} />);
+    const fileInputReal = document.querySelectorAll('input[type="file"]')[0];
+    const file = new File(["test"], "test.txt", { type: "text/plain" });
+
+    let loadListener: Function | undefined;
+    xhrMock.addEventListener.mockImplementation((event: string, listener: Function) => {
+      if (event === "load") loadListener = listener;
+    });
+
+    await act(async () => {
+      fireEvent.change(fileInputReal, { target: { files: [file] } });
+    });
+
+    await act(async () => {
+      if (loadListener) await loadListener();
+    });
+
+    expect(defaultProps.onRootChange).toHaveBeenCalledWith("/new/root");
+    expect(startSemanticIndex).toHaveBeenCalled();
   });
 });
