@@ -1,3 +1,6 @@
+mod config;
+mod http;
+
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,35 +18,44 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::{error, info};
-use wilkes_api::context::{AppContext, EventEmitter};
+use tracing::info;
+use wilkes_api::context::AppContext;
 use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::types::{
     EmbeddingEngine, MatchRef, ModelDescriptor, SearchQuery, SelectedEmbedder,
 };
+use crate::http::errors::{err, server_err, ErrorBody};
+use crate::http::search::forward_search_results;
+use crate::http::state::{
+    asset_access_plan, sanitize_relative_upload_path, upload_write_plan, AppState, BroadcastEmitter,
+    ServerFs, TokioServerFs,
+};
+
+fn confine_to_uploads(
+    raw: &str,
+    uploads_dir: &std::path::Path,
+) -> Result<PathBuf, (StatusCode, Json<ErrorBody>)> {
+    let candidate = PathBuf::from(raw);
+    let canonical_uploads = uploads_dir
+        .canonicalize()
+        .map_err(|e| server_err(format!("uploads dir unavailable: {e}")))?;
+    let canonical = candidate.canonicalize().map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "Path not found".into(),
+            }),
+        )
+    })?;
+    if !canonical.starts_with(&canonical_uploads) {
+        return Err(err("Access denied: path outside uploads directory"));
+    }
+    Ok(canonical)
+}
 
 const MAX_UPLOAD_BYTES: u64 = 500 * 1024 * 1024;
 
 // ── AppState ──────────────────────────────────────────────────────────────────
-
-struct AppState {
-    ctx: Arc<AppContext>,
-    uploads_dir: PathBuf,
-    /// Sender used by SSE clients to subscribe to embed/manager events.
-    events_tx: broadcast::Sender<(String, serde_json::Value)>,
-}
-
-// ── EventEmitter impl ─────────────────────────────────────────────────────────
-
-struct BroadcastEmitter {
-    tx: broadcast::Sender<(String, serde_json::Value)>,
-}
-
-impl EventEmitter for BroadcastEmitter {
-    fn emit(&self, name: &str, payload: serde_json::Value) {
-        let _ = self.tx.send((name.to_string(), payload));
-    }
-}
 
 async fn shutdown_signal(ctx: Arc<AppContext>) {
     let ctrl_c = async {
@@ -70,94 +82,23 @@ async fn shutdown_signal(ctx: Arc<AppContext>) {
     ctx.shutdown();
 }
 
-// ── Error helpers ─────────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct ErrorBody {
-    error: String,
-}
-
-fn err(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorBody { error: msg.into() }),
-    )
-}
-
-fn server_err(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorBody { error: msg.into() }),
-    )
-}
-
-/// Resolve `raw` to a canonical path and verify it is inside `uploads_dir`.
-/// Every handler that accepts a user-supplied path must go through this.
-fn confine_to_uploads(
-    raw: &str,
-    uploads_dir: &std::path::Path,
-) -> Result<PathBuf, (StatusCode, Json<ErrorBody>)> {
-    let candidate = PathBuf::from(raw);
-    let canonical_uploads = uploads_dir
-        .canonicalize()
-        .map_err(|e| server_err(format!("uploads dir unavailable: {e}")))?;
-    let canonical = candidate.canonicalize().map_err(|_| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorBody {
-                error: "Path not found".into(),
-            }),
-        )
-    })?;
-    if !canonical.starts_with(&canonical_uploads) {
-        return Err(err("Access denied: path outside uploads directory"));
-    }
-    Ok(canonical)
-}
-
 // ── Search ────────────────────────────────────────────────────────────────────
 
 async fn search_handler(
     State(state): State<Arc<AppState>>,
     Json(mut query): Json<SearchQuery>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, (StatusCode, Json<ErrorBody>)> {
-    query.root = confine_to_uploads(&query.root.to_string_lossy(), &state.uploads_dir)?;
-
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+    query.root = crate::http::state::confined_root_for_search(
+        &query.root.to_string_lossy(),
+        &state.uploads_dir,
+        &TokioServerFs,
+    )
+    .await?;
+
     let ctx = Arc::clone(&state.ctx);
-
     tokio::spawn(async move {
-        let handle = match Arc::clone(&ctx).start_search(query).await {
-            Ok(h) => h,
-            Err(e) => {
-                let event = Event::default().event("error").data(e);
-                let _ = tx.send(Ok(event)).await;
-                return;
-            }
-        };
-
-        let stats = handle
-            .run(|fm| {
-                let tx = tx.clone();
-                async move {
-                    let data = match serde_json::to_string(&fm) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!("search serialize: {e}");
-                            return true;
-                        }
-                    };
-                    tx.send(Ok(Event::default().event("result").data(data)))
-                        .await
-                        .is_ok()
-                }
-            })
-            .await;
-
-        let data = serde_json::to_string(&stats).unwrap_or_default();
-        let _ = tx
-            .send(Ok(Event::default().event("complete").data(data)))
-            .await;
+        forward_search_results(ctx, query, tx).await;
     });
 
     Ok(Sse::new(ReceiverStream::new(rx)))
@@ -270,7 +211,7 @@ async fn upload_handler(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let current_size = dir_size(&state.uploads_dir).await.unwrap_or(0);
+    let current_size = TokioServerFs.dir_size(&state.uploads_dir).await.unwrap_or(0);
     if current_size >= MAX_UPLOAD_BYTES {
         return Err(err(format!(
             "Upload directory exceeds maximum size of {} MB",
@@ -286,21 +227,20 @@ async fn upload_handler(
         .map_err(|e| err(e.to_string()))?
     {
         let filename = field.file_name().unwrap_or("upload").to_string();
-        let rel: PathBuf = filename
-            .split(['/', '\\'])
-            .filter(|s| !s.is_empty() && *s != "..")
-            .collect();
+        let rel = sanitize_relative_upload_path(&filename);
         if rel.as_os_str().is_empty() {
             continue;
         }
-        let dest = state.uploads_dir.join(&rel);
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent)
+        let plan = upload_write_plan(&state.uploads_dir, &rel);
+        if let Some(parent) = plan.create_parent {
+            TokioServerFs
+                .create_dir_all(&parent)
                 .await
                 .map_err(|e| server_err(e.to_string()))?;
         }
         let data = field.bytes().await.map_err(|e| err(e.to_string()))?;
-        tokio::fs::write(&dest, data)
+        TokioServerFs
+            .write(&plan.dest, &data)
             .await
             .map_err(|e| server_err(e.to_string()))?;
         file_count += 1;
@@ -321,37 +261,39 @@ async fn delete_upload_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<DeleteUploadQuery>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    let rel: PathBuf = params
-        .path
-        .split(['/', '\\'])
-        .filter(|s| !s.is_empty() && *s != "..")
-        .collect();
+    let rel = sanitize_relative_upload_path(&params.path);
     if rel.as_os_str().is_empty() {
         return Err(err(
             "Cannot delete uploads root via this endpoint; use DELETE /api/upload/all",
         ));
     }
     let target = state.uploads_dir.join(&rel);
-    let canonical_uploads = tokio::fs::canonicalize(&state.uploads_dir)
+    let canonical_uploads = TokioServerFs
+        .canonicalize(&state.uploads_dir)
         .await
         .map_err(|e| server_err(e.to_string()))?;
-    let canonical_target = tokio::fs::canonicalize(&target).await.map_err(|_| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorBody {
-                error: "Not found".into(),
-            }),
-        )
-    })?;
+    let canonical_target = TokioServerFs
+        .canonicalize(&target)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorBody {
+                    error: "Not found".into(),
+                }),
+            )
+        })?;
     if !canonical_target.starts_with(&canonical_uploads) {
         return Err(err("Path outside uploads directory"));
     }
     if canonical_target.is_dir() {
-        tokio::fs::remove_dir_all(&canonical_target)
+        TokioServerFs
+            .remove_dir_all(&canonical_target)
             .await
             .map_err(|e| server_err(e.to_string()))?;
     } else {
-        tokio::fs::remove_file(&canonical_target)
+        TokioServerFs
+            .remove_file(&canonical_target)
             .await
             .map_err(|e| server_err(e.to_string()))?;
     }
@@ -361,10 +303,12 @@ async fn delete_upload_handler(
 async fn delete_all_upload_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    tokio::fs::remove_dir_all(&state.uploads_dir)
+    TokioServerFs
+        .remove_dir_all(&state.uploads_dir)
         .await
         .map_err(|e| server_err(e.to_string()))?;
-    tokio::fs::create_dir_all(&state.uploads_dir)
+    TokioServerFs
+        .create_dir_all(&state.uploads_dir)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
@@ -381,27 +325,18 @@ async fn asset_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AssetQuery>,
 ) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
-    let path = PathBuf::from(&params.path);
-    let canonical_uploads = tokio::fs::canonicalize(&state.uploads_dir)
-        .await
-        .map_err(|e| server_err(e.to_string()))?;
-    let canonical = tokio::fs::canonicalize(&path).await.map_err(|_| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorBody {
-                error: "File not found".into(),
-            }),
-        )
-    })?;
-    if !canonical.starts_with(&canonical_uploads) {
-        return Err(err("Access denied"));
-    }
-    let content_type = mime_for_path(&canonical);
-    let bytes = tokio::fs::read(&canonical)
+    let plan = asset_access_plan(
+        Path::new(&params.path),
+        &state.uploads_dir,
+        &TokioServerFs,
+    )
+    .await?;
+    let bytes = TokioServerFs
+        .read(&plan.canonical)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Response::builder()
-        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_TYPE, plan.content_type)
         .body(Body::from(bytes))
         .unwrap())
 }
@@ -765,6 +700,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wilkes_api::context::EventEmitter;
 
     #[test]
     fn test_mime_for_path() {

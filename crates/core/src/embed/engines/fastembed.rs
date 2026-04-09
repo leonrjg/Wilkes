@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 
+use anyhow::Context;
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 
@@ -13,11 +14,153 @@ use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
 
 // ── Model lookup ──────────────────────────────────────────────────────────────
 
-fn find_model_info(model_id: &str) -> anyhow::Result<fastembed::ModelInfo<EmbeddingModel>> {
-    TextEmbedding::list_supported_models()
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FastembedModelRecord {
+    pub model: EmbeddingModel,
+    pub model_id: String,
+    pub model_code: String,
+    pub model_file: String,
+    pub additional_files: Vec<String>,
+    pub description: String,
+    pub dimension: usize,
+}
+
+pub trait FastembedCatalog {
+    fn supported_models(&self) -> Vec<FastembedModelRecord>;
+}
+
+struct RealFastembedCatalog;
+
+impl FastembedCatalog for RealFastembedCatalog {
+    fn supported_models(&self) -> Vec<FastembedModelRecord> {
+        TextEmbedding::list_supported_models()
+            .into_iter()
+            .map(FastembedModelRecord::from)
+            .collect()
+    }
+}
+
+impl From<fastembed::ModelInfo<EmbeddingModel>> for FastembedModelRecord {
+    fn from(info: fastembed::ModelInfo<EmbeddingModel>) -> Self {
+        let model_id = format!("{:?}", info.model);
+        Self {
+            model: info.model,
+            model_id,
+            model_code: info.model_code,
+            model_file: info.model_file,
+            additional_files: info.additional_files,
+            description: info.description,
+                dimension: info.dim,
+        }
+    }
+}
+
+fn find_model_info(model_id: &str) -> anyhow::Result<FastembedModelRecord> {
+    RealFastembedCatalog
+        .supported_models()
         .into_iter()
-        .find(|m| format!("{:?}", m.model) == model_id)
+        .find(|m| m.model_id == model_id)
         .ok_or_else(|| anyhow::anyhow!("Model '{}' is not supported by fastembed", model_id))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FastembedExecutionPlan {
+    CpuOnly,
+    CoreMlThenCpu,
+}
+
+fn execution_plan_for_device(device: &str) -> FastembedExecutionPlan {
+    if device.trim().eq_ignore_ascii_case("cpu") {
+        FastembedExecutionPlan::CpuOnly
+    } else {
+        #[cfg(feature = "fastembed-coreml")]
+        {
+            FastembedExecutionPlan::CoreMlThenCpu
+        }
+        #[cfg(not(feature = "fastembed-coreml"))]
+        {
+            FastembedExecutionPlan::CpuOnly
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FastembedInitRequest {
+    pub model: FastembedModelRecord,
+    pub cache_dir: std::path::PathBuf,
+    pub show_download_progress: bool,
+    pub execution_plan: FastembedExecutionPlan,
+}
+
+fn build_text_init_request(
+    model: FastembedModelRecord,
+    cache_dir: std::path::PathBuf,
+    device: &str,
+) -> FastembedInitRequest {
+    FastembedInitRequest {
+        model,
+        cache_dir,
+        show_download_progress: true,
+        execution_plan: execution_plan_for_device(device),
+    }
+}
+
+pub trait FastembedRuntimeFactory {
+    fn try_new(&self, request: FastembedInitRequest) -> anyhow::Result<TextEmbedding>;
+}
+
+struct RealFastembedRuntimeFactory;
+
+impl FastembedRuntimeFactory for RealFastembedRuntimeFactory {
+    fn try_new(&self, request: FastembedInitRequest) -> anyhow::Result<TextEmbedding> {
+        let providers = match request.execution_plan {
+            FastembedExecutionPlan::CpuOnly => vec![ort::ep::CPUExecutionProvider::default().into()],
+            FastembedExecutionPlan::CoreMlThenCpu => {
+                #[cfg(feature = "fastembed-coreml")]
+                {
+                    vec![
+                        ort::ep::CoreMLExecutionProvider::default().into(),
+                        ort::ep::CPUExecutionProvider::default().into(),
+                    ]
+                }
+                #[cfg(not(feature = "fastembed-coreml"))]
+                {
+                    vec![ort::ep::CPUExecutionProvider::default().into()]
+                }
+            }
+        };
+        let options = TextInitOptions::new(request.model.model)
+            .with_cache_dir(request.cache_dir)
+            .with_show_download_progress(request.show_download_progress)
+            .with_execution_providers(providers);
+        TextEmbedding::try_new(options).map_err(|e| anyhow::anyhow!("fastembed runtime: {e}"))
+    }
+}
+
+fn relevant_hf_filenames(record: &FastembedModelRecord) -> std::collections::HashSet<String> {
+    std::iter::once(record.model_file.clone())
+        .chain(record.additional_files.iter().cloned())
+        .collect()
+}
+
+fn hf_sibling_matches_relevant(filename: &str, relevant: &std::collections::HashSet<String>) -> bool {
+    relevant.contains(filename)
+        || relevant
+            .iter()
+            .any(|f| filename.ends_with(&format!("/{f}")))
+}
+
+fn sum_matching_hf_sizes(
+    siblings: &[(String, Option<u64>)],
+    relevant: &std::collections::HashSet<String>,
+) -> anyhow::Result<u64> {
+    let total: u64 = siblings
+        .iter()
+        .filter(|(name, _)| hf_sibling_matches_relevant(name, relevant))
+        .filter_map(|(_, size)| *size)
+        .sum();
+    anyhow::ensure!(total > 0, "No model files found in HF repo");
+    Ok(total)
 }
 
 // ── Public list helper ────────────────────────────────────────────────────────
@@ -26,7 +169,8 @@ fn find_model_info(model_id: &str) -> anyhow::Result<fastembed::ModelInfo<Embedd
 /// For cached models `size_bytes` is computed from disk; for uncached models it is `None`
 /// and should be fetched on demand via [`fetch_model_size`].
 pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
-    TextEmbedding::list_supported_models()
+    RealFastembedCatalog
+        .supported_models()
         .into_iter()
         .map(|info| {
             let all_files: Vec<&str> = std::iter::once(info.model_file.as_str())
@@ -61,16 +205,15 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
                 .next_back()
                 .unwrap_or(&info.model_code)
                 .to_string();
-            let model_id = format!("{:?}", info.model);
 
             ModelDescriptor {
-                model_id: model_id.clone(),
+                model_id: info.model_id.clone(),
                 display_name,
                 description: info.description.clone(),
-                dimension: info.dim,
+                dimension: info.dimension,
                 is_cached,
                 is_default: false,
-                is_recommended: model_id == "BGEBaseENV15" || model_id == "AllMiniLML6V2",
+                is_recommended: info.model_id == "BGEBaseENV15" || info.model_id == "AllMiniLML6V2",
                 size_bytes,
                 preferred_batch_size: get_preferred_batch_size(&info.model_code, &info.description),
             }
@@ -82,30 +225,14 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
 /// Only counts the specific files fastembed downloads, not the whole repo.
 pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {
     let info = find_model_info(model_id)?;
-
-    // fastembed stores bare filenames (e.g. "model.onnx") but some HF repos place
-    // them in subdirectories (e.g. "onnx/model.onnx"). Match by the final path
-    // component so both layouts are handled.
-    let relevant: std::collections::HashSet<&str> = std::iter::once(info.model_file.as_str())
-        .chain(info.additional_files.iter().map(String::as_str))
-        .collect();
-
-    let matches_relevant = |rfilename: &str| -> bool {
-        relevant.contains(rfilename)
-            || relevant
-                .iter()
-                .any(|f| rfilename.ends_with(&format!("/{f}")))
-    };
-
+    let relevant = relevant_hf_filenames(&info);
     let siblings = super::super::models::hf_hub::fetch_hf_siblings(&info.model_code)?;
-    let total: u64 = siblings
-        .iter()
-        .filter(|s| matches_relevant(&s.rfilename))
-        .filter_map(|s| s.size)
-        .sum();
-
-    anyhow::ensure!(total > 0, "No model files found in HF repo for {model_id}");
-    Ok(total)
+    let sibling_sizes: Vec<(String, Option<u64>)> = siblings
+        .into_iter()
+        .map(|s| (s.rfilename, s.size))
+        .collect();
+    sum_matching_hf_sizes(&sibling_sizes, &relevant)
+        .with_context(|| format!("No model files found in HF repo for {model_id}"))
 }
 
 // ── FastEmbedder ──────────────────────────────────────────────────────────────
@@ -227,23 +354,15 @@ impl EmbedderInstaller for FastembedInstaller {
 
     async fn install(&self, data_dir: &Path, tx: ProgressTx) -> anyhow::Result<()> {
         let info = find_model_info(&self.model.0)?;
-
-        // If the main model file is already cached, skip re-initialisation.
-        // Calling TextEmbedding::try_new for an already-present model only
-        // loads the ONNX runtime (and potentially CoreML), which can crash the
-        // process on some configurations. The download step is the only reason
-        // to call try_new here.
-        if hf_hub::Cache::new(data_dir.to_path_buf())
+        let cached = hf_hub::Cache::new(data_dir.to_path_buf())
             .repo(hf_hub::Repo::model(info.model_code.clone()))
             .get(&info.model_file)
-            .is_some()
-        {
+            .is_some();
+        if cached {
             return Ok(());
         }
 
-        let fm = info.model;
-        let cache_dir = data_dir.to_path_buf();
-        let device = self.device.clone();
+        let request = build_text_init_request(info.clone(), data_dir.to_path_buf(), &self.device);
 
         let _ = tx
             .send(EmbedProgress::Download(DownloadProgress {
@@ -253,32 +372,10 @@ impl EmbedderInstaller for FastembedInstaller {
             }))
             .await;
 
-        tokio::task::spawn_blocking(move || {
-            let device_clean = device.trim().to_lowercase();
-            let providers = if device_clean == "cpu" {
-                tracing::info!("[fastembed] install: forcing CPU execution provider");
-                vec![ort::ep::CPUExecutionProvider::default().into()]
-            } else {
-                #[cfg(feature = "fastembed-coreml")]
-                {
-                    vec![
-                        ort::ep::CoreMLExecutionProvider::default().into(),
-                        ort::ep::CPUExecutionProvider::default().into(),
-                    ]
-                }
-                #[cfg(not(feature = "fastembed-coreml"))]
-                {
-                    vec![ort::ep::CPUExecutionProvider::default().into()]
-                }
-            };
-            let options = TextInitOptions::new(fm)
-                .with_cache_dir(cache_dir)
-                .with_show_download_progress(true)
-                .with_execution_providers(providers);
-            TextEmbedding::try_new(options)
-        })
-        .await?
-        .map_err(|e| anyhow::anyhow!("fastembed install: {e}"))?;
+        let factory = RealFastembedRuntimeFactory;
+        tokio::task::spawn_blocking(move || factory.try_new(request))
+            .await?
+            .map_err(|e| anyhow::anyhow!("fastembed install: {e}"))?;
 
         // Fetch auxiliary config files (e.g. config_sentence_transformers.json) so that
         // build() can read prefix configuration without a network call. Best-effort.
@@ -312,7 +409,7 @@ impl EmbedderInstaller for FastembedInstaller {
                 self.manager.clone(),
                 super::super::worker::embedder::WorkerEmbedderConfig {
                     model_id: self.model.0.clone(),
-                    dimension: info.dim,
+                    dimension: info.dimension,
                     device: self.device.clone(),
                     engine: EmbeddingEngine::Fastembed,
                     data_dir: data_dir.to_path_buf(),
@@ -332,38 +429,13 @@ pub fn load_embedder(
     device: &str,
 ) -> anyhow::Result<Arc<dyn Embedder>> {
     let info = find_model_info(&model.0)?;
-    let dimension = info.dim;
+    let dimension = info.dimension;
     let model_id = model.0.clone();
-    let cache_dir = data_dir.to_path_buf();
     let preferred_batch_size = get_preferred_batch_size(&model_id, &info.description);
-
-    let device_clean = device.trim().to_lowercase();
-    let providers = if device_clean == "cpu" {
-        tracing::info!(
-            "[fastembed] forcing CPU execution provider for {}",
-            model_id
-        );
-        vec![ort::ep::CPUExecutionProvider::default().into()]
-    } else {
-        #[cfg(feature = "fastembed-coreml")]
-        {
-            vec![
-                ort::ep::CoreMLExecutionProvider::default().into(),
-                ort::ep::CPUExecutionProvider::default().into(),
-            ]
-        }
-        #[cfg(not(feature = "fastembed-coreml"))]
-        {
-            vec![ort::ep::CPUExecutionProvider::default().into()]
-        }
-    };
-    let options = TextInitOptions::new(info.model)
-        .with_cache_dir(cache_dir)
-        .with_show_download_progress(true)
-        .with_execution_providers(providers);
-
-    let inner =
-        TextEmbedding::try_new(options).map_err(|e| anyhow::anyhow!("fastembed load: {e}"))?;
+    let request = build_text_init_request(info, data_dir.to_path_buf(), device);
+    let inner = RealFastembedRuntimeFactory
+        .try_new(request)
+        .map_err(|e| anyhow::anyhow!("fastembed load: {e}"))?;
 
     Ok(Arc::new(FastEmbedder {
         inner: Mutex::new(inner),

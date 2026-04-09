@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
+#[cfg(feature = "candle-metal")]
+use tracing::warn;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -81,6 +83,248 @@ fn cached_size_bytes(data_dir: &Path, model_id: &str) -> Option<u64> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandleArtifacts {
+    pub config_path: PathBuf,
+    pub tokenizer_path: PathBuf,
+    pub weights_path: PathBuf,
+    pub pooling_config_path: Option<PathBuf>,
+}
+
+pub fn resolve_cached_artifacts(
+    data_dir: &Path,
+    model_id: &str,
+) -> anyhow::Result<CandleArtifacts> {
+    Ok(CandleArtifacts {
+        config_path: cached_path(data_dir, model_id, "config.json")
+            .ok_or_else(|| anyhow::anyhow!("config.json not cached for '{model_id}'"))?,
+        tokenizer_path: cached_path(data_dir, model_id, "tokenizer.json")
+            .ok_or_else(|| anyhow::anyhow!("tokenizer.json not cached for '{model_id}'"))?,
+        weights_path: cached_path(data_dir, model_id, "model.safetensors")
+            .ok_or_else(|| anyhow::anyhow!("model.safetensors not cached for '{model_id}'"))?,
+        pooling_config_path: cached_path(data_dir, model_id, "1_Pooling/config.json"),
+    })
+}
+
+pub fn read_config_text(path: &Path) -> anyhow::Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+pub struct ModelTypePeek {
+    pub model_type: String,
+}
+
+pub fn parse_model_type(config_text: &str) -> anyhow::Result<ModelTypePeek> {
+    Ok(serde_json::from_str(config_text)?)
+}
+
+pub fn parse_dimension_from_config(config_text: &str) -> anyhow::Result<usize> {
+    let v: serde_json::Value = serde_json::from_str(config_text)?;
+    v.get("hidden_size")
+        .and_then(|v| v.as_u64())
+        .map(|d| d as usize)
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine embedding dimension from config"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandleDevicePlan {
+    Cpu,
+    MetalPreferred,
+}
+
+pub fn select_device_plan(device: &str) -> CandleDevicePlan {
+    if device.trim().eq_ignore_ascii_case("cpu") {
+        CandleDevicePlan::Cpu
+    } else {
+        CandleDevicePlan::MetalPreferred
+    }
+}
+
+pub fn select_dtype_for_plan(_plan: &CandleDevicePlan) -> DType {
+    DType::F32
+}
+
+pub fn realize_device(plan: CandleDevicePlan) -> Device {
+    match plan {
+        CandleDevicePlan::Cpu => Device::Cpu,
+        CandleDevicePlan::MetalPreferred => {
+            #[cfg(feature = "candle-metal")]
+            {
+                if candle_core::utils::metal_is_available() {
+                    match Device::new_metal(0) {
+                        Ok(d) => return d,
+                        Err(e) => warn!("Metal device init failed ({e:#}), falling back to CPU"),
+                    }
+                }
+            }
+            Device::Cpu
+        }
+    }
+}
+
+pub type CandleVarBuilder<'a> = VarBuilder<'a>;
+
+pub(crate) trait CandleRuntimeFactory {
+    fn load_var_builder<'a>(
+        &self,
+        weights_path: &'a Path,
+        dtype: DType,
+        device: &'a Device,
+    ) -> anyhow::Result<CandleVarBuilder<'a>>;
+
+    fn build_loaded_model<'a>(
+        &self,
+        model_type: &str,
+        config_text: &str,
+        vb: CandleVarBuilder<'a>,
+    ) -> anyhow::Result<(LoadedModel, usize)>;
+
+    fn load_tokenizer(&self, tokenizer_path: &Path) -> anyhow::Result<Tokenizer>;
+}
+
+struct RealCandleRuntimeFactory;
+
+impl CandleRuntimeFactory for RealCandleRuntimeFactory {
+    fn load_var_builder<'a>(
+        &self,
+        weights_path: &'a Path,
+        dtype: DType,
+        device: &'a Device,
+    ) -> anyhow::Result<CandleVarBuilder<'a>> {
+        // Safety: memory-mapping model weights from a local path we own.
+        Ok(unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, device)? })
+    }
+
+    fn build_loaded_model<'a>(
+        &self,
+        model_type: &str,
+        config_text: &str,
+        vb: CandleVarBuilder<'a>,
+    ) -> anyhow::Result<(LoadedModel, usize)> {
+        match model_type {
+            "jina_bert_v2" | "jina_bert" | "jina_bert_v3" | "qwen2" | "qwen" | "jina_embeddings_v5" => {
+                let config: JinaBertConfig = serde_json::from_str(config_text)
+                    .with_context(|| format!("Failed to parse JinaBertConfig: {config_text}"))?;
+                let dim = config.hidden_size;
+                let m = JinaBertModel::new(vb, &config).context("Failed to build JinaBert model")?;
+                Ok((LoadedModel::JinaBert(m), dim))
+            }
+            "modern_bert" => {
+                let config: ModernBertConfig = serde_json::from_str(config_text)
+                    .with_context(|| format!("Failed to parse ModernBertConfig: {config_text}"))?;
+                let dim = config.hidden_size;
+                let m = ModernBert::load(vb, &config).context("Failed to build ModernBert model")?;
+                Ok((LoadedModel::ModernBert(m), dim))
+            }
+            _ => {
+                let config: BertConfig = serde_json::from_str(config_text)
+                    .with_context(|| format!("Failed to parse BertConfig: {config_text}"))?;
+                let dim = config.hidden_size;
+                let m = BertModel::load(vb, &config).context("Failed to build BERT model")?;
+                Ok((LoadedModel::Bert(m), dim))
+            }
+        }
+    }
+
+    fn load_tokenizer(&self, tokenizer_path: &Path) -> anyhow::Result<Tokenizer> {
+        Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer from {}: {e}", tokenizer_path.display()))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CandleEmbedderBuildPlan {
+    pub model_id: String,
+    pub dimension: usize,
+    pub(crate) pooling: PoolingStrategy,
+    pub query_prefix: String,
+    pub passage_prefix: String,
+    pub device_plan: CandleDevicePlan,
+    pub dtype: DType,
+}
+
+pub(crate) fn build_embedder_plan(
+    data_dir: &Path,
+    model_id: &str,
+    config_text: &str,
+    device: &str,
+) -> anyhow::Result<CandleEmbedderBuildPlan> {
+    let dimension = parse_dimension_from_config(config_text)?;
+    let pooling = load_pooling_strategy(data_dir, model_id);
+    let prefixes = super::aux_config::load_prefixes(data_dir, model_id);
+    let device_plan = select_device_plan(device);
+    let dtype = select_dtype_for_plan(&device_plan);
+    Ok(CandleEmbedderBuildPlan {
+        model_id: model_id.to_string(),
+        dimension,
+        pooling,
+        query_prefix: prefixes.query_prefix,
+        passage_prefix: prefixes.passage_prefix,
+        device_plan,
+        dtype,
+    })
+}
+
+pub(crate) fn assemble_candle_embedder(
+    plan: CandleEmbedderBuildPlan,
+    model: LoadedModel,
+    tokenizer: Tokenizer,
+    device: Device,
+) -> CandleEmbedder {
+    CandleEmbedder {
+        model,
+        tokenizer,
+        device,
+        dtype: plan.dtype,
+        model_id: plan.model_id,
+        dimension: plan.dimension,
+        pooling: plan.pooling,
+        query_prefix: plan.query_prefix,
+        passage_prefix: plan.passage_prefix,
+    }
+}
+
+pub(crate) trait HfModelFetcher {
+    fn download_required_files(&self, model_id: &str, files: &[&str]) -> anyhow::Result<()>;
+    fn fetch_optional_files(&self, model_id: &str, files: &[&str]) -> anyhow::Result<()>;
+}
+
+struct RealHfModelFetcher {
+    cache_dir: PathBuf,
+}
+
+impl HfModelFetcher for RealHfModelFetcher {
+    fn download_required_files(&self, model_id: &str, files: &[&str]) -> anyhow::Result<()> {
+        let api = ApiBuilder::new()
+            .with_cache_dir(self.cache_dir.clone())
+            .build()
+            .context("Failed to initialise HF hub API")?;
+        let repo = api.model(model_id.to_string());
+        for filename in files {
+            let url = repo.url(filename);
+            repo.get(filename).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to download '{filename}' for '{model_id}' from {url}: {e:#}"
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn fetch_optional_files(&self, model_id: &str, files: &[&str]) -> anyhow::Result<()> {
+        let api = ApiBuilder::new()
+            .with_cache_dir(self.cache_dir.clone())
+            .build()
+            .context("Failed to initialise HF hub API")?;
+        let repo = api.model(model_id.to_string());
+        for filename in files {
+            let _ = repo.get(filename);
+        }
+        Ok(())
+    }
+}
+
 // ── Public model list ─────────────────────────────────────────────────────────
 pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
     PREEXISTING_MODELS
@@ -111,7 +355,7 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
 // ── Pooling strategy ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
-enum PoolingStrategy {
+pub(crate) enum PoolingStrategy {
     Mean,
     Cls,
     Max,
@@ -145,17 +389,7 @@ fn load_pooling_strategy(data_dir: &Path, model_id: &str) -> PoolingStrategy {
 // ── Device / dtype selection ──────────────────────────────────────────────────
 
 fn select_device(device: &str) -> Device {
-    if device == "cpu" {
-        return Device::Cpu;
-    }
-    #[cfg(feature = "candle-metal")]
-    if candle_core::utils::metal_is_available() {
-        match Device::new_metal(0) {
-            Ok(d) => return d,
-            Err(e) => warn!("Metal device init failed ({e:#}), falling back to CPU"),
-        }
-    }
-    Device::Cpu
+    realize_device(select_device_plan(device))
 }
 
 /// F32 everywhere. Candle 0.9's Metal backend lacks F16 kernels for several ops
@@ -163,7 +397,7 @@ fn select_device(device: &str) -> Device {
 /// dominate runtime. F32 has full Metal kernel coverage, keeping all operations
 /// on the GPU. The 2× memory increase is negligible for embedding-sized models.
 fn select_dtype(_device: &Device) -> DType {
-    DType::F32
+    select_dtype_for_plan(&CandleDevicePlan::Cpu)
 }
 
 // ── CandleEmbedder ────────────────────────────────────────────────────────────
@@ -178,11 +412,6 @@ enum LoadedModel {
     Bert(BertModel),
     JinaBert(JinaBertModel),
     ModernBert(ModernBert),
-}
-
-#[derive(serde::Deserialize)]
-struct ModelTypePeek {
-    model_type: String,
 }
 
 pub struct CandleEmbedder {
@@ -400,7 +629,6 @@ impl EmbedderInstaller for CandleInstaller {
     async fn install(&self, data_dir: &Path, tx: ProgressTx) -> anyhow::Result<()> {
         let model_id = self.model.0.clone();
         let data_dir = data_dir.to_path_buf();
-        let download_cache_dir = data_dir.clone();
 
         let _ = tx
             .send(EmbedProgress::Download(DownloadProgress {
@@ -410,28 +638,19 @@ impl EmbedderInstaller for CandleInstaller {
             }))
             .await;
 
-        tokio::task::spawn_blocking(move || {
-            let api = ApiBuilder::new()
-                .with_cache_dir(download_cache_dir)
-                .build()
-                .context("Failed to initialise HF hub API")?;
-            let repo = api.model(model_id.clone());
+        let fetcher = RealHfModelFetcher {
+            cache_dir: data_dir.clone(),
+        };
+        let model_id_required = model_id.clone();
+        tokio::task::spawn_blocking(move || fetcher.download_required_files(&model_id_required, MODEL_FILES))
+            .await??;
 
-            for filename in MODEL_FILES {
-                let url = repo.url(filename);
-                repo.get(filename).map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to download '{filename}' for '{model_id}' from {url}: {e:#}"
-                    )
-                })?;
-            }
-
-            // Pooling config is optional; ignore errors.
-            let _ = repo.get("1_Pooling/config.json");
-
-            Ok::<_, anyhow::Error>(())
-        })
-        .await??;
+        let fetcher = RealHfModelFetcher {
+            cache_dir: data_dir.clone(),
+        };
+        let aux_model_id = model_id.clone();
+        tokio::task::spawn_blocking(move || fetcher.fetch_optional_files(&aux_model_id, &["1_Pooling/config.json"]))
+            .await??;
 
         let aux_model_id = self.model.0.clone();
         let aux_cache_dir = data_dir.to_path_buf();
@@ -484,14 +703,7 @@ fn read_dimension(data_dir: &Path, model_id: &str) -> anyhow::Result<usize> {
     }
     let config_path = cached_path(data_dir, model_id, "config.json")
         .ok_or_else(|| anyhow::anyhow!("config.json not cached for '{model_id}'"))?;
-    let config_text = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("Failed to read config.json for '{model_id}'"))?;
-    let v: serde_json::Value = serde_json::from_str(&config_text)
-        .with_context(|| format!("Failed to parse config.json for '{model_id}'"))?;
-    v.get("hidden_size")
-        .and_then(|v| v.as_u64())
-        .map(|d| d as usize)
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine embedding dimension for '{model_id}'"))
+    parse_dimension_from_config(&read_config_text(&config_path)?)
 }
 
 /// Load a `CandleEmbedder` directly in the calling process.
@@ -501,72 +713,29 @@ pub fn load_embedder(
     data_dir: &Path,
     device: &str,
 ) -> anyhow::Result<Arc<dyn Embedder>> {
-    let model_id = &model.0;
+    load_embedder_with_factory(&RealCandleRuntimeFactory, model, data_dir, device)
+}
 
-    let config_path = cached_path(data_dir, model_id, "config.json")
-        .ok_or_else(|| anyhow::anyhow!("config.json not cached for '{model_id}'"))?;
-    let tokenizer_path = cached_path(data_dir, model_id, "tokenizer.json")
-        .ok_or_else(|| anyhow::anyhow!("tokenizer.json not cached for '{model_id}'"))?;
-    let weights_path = cached_path(data_dir, model_id, "model.safetensors")
-        .ok_or_else(|| anyhow::anyhow!("model.safetensors not cached for '{model_id}'"))?;
+fn load_embedder_with_factory<F: CandleRuntimeFactory>(
+    factory: &F,
+    model: &EmbedderModel,
+    data_dir: &Path,
+    device: &str,
+) -> anyhow::Result<Arc<dyn Embedder>> {
+    let artifacts = resolve_cached_artifacts(data_dir, &model.0)?;
+    let config_text = read_config_text(&artifacts.config_path)?;
+    let peek = parse_model_type(&config_text)?;
+    let plan = build_embedder_plan(data_dir, &model.0, &config_text, device)?;
+    let device = realize_device(plan.device_plan);
+    let dtype = plan.dtype;
 
-    let config_text = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("Failed to read config.json for '{model_id}'"))?;
-
-    let peek: ModelTypePeek = serde_json::from_str(&config_text)
-        .with_context(|| format!("Failed to peek model_type from config.json for '{model_id}'"))?;
-
-    let device = select_device(device);
-    let dtype = select_dtype(&device);
-
-    // Safety: memory-mapping model weights from a local path we own.
-    // The `?` catches mmap() errors, but a page access on a file that is
-    // truncated or corrupted on disk after mapping succeeds will raise SIGBUS
-    // with no Rust error path. The embed_task guard prevents a concurrent
-    // download from replacing this file while it is mapped; disk corruption
-    // remains an unrecoverable crash risk.
-    let vb = unsafe {
-        VarBuilder::from_mmaped_safetensors(&[&weights_path], dtype, &device)
-            .with_context(|| format!("Failed to load weights for '{model_id}'"))?
-    };
-
+    let vb = factory.load_var_builder(&artifacts.weights_path, dtype, &device)?;
     info!(
-        "[candle] dispatching '{model_id}' with model_type='{}'",
-        peek.model_type
+        "[candle] dispatching '{}' with model_type='{}'",
+        model.0, peek.model_type
     );
-
-    let (model_loaded, dimension) = match peek.model_type.as_str() {
-        "jina_bert_v2" | "jina_bert" | "jina_bert_v3" | "qwen2" | "qwen" | "jina_embeddings_v5" => {
-            let config: JinaBertConfig = serde_json::from_str(&config_text).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to parse JinaBertConfig for '{model_id}': {e}. Config: {config_text}"
-                )
-            })?;
-            let dim = config.hidden_size;
-            let m = JinaBertModel::new(vb, &config)
-                .with_context(|| format!("Failed to build JinaBert model for '{model_id}'"))?;
-            (LoadedModel::JinaBert(m), dim)
-        }
-        "modern_bert" => {
-            let config: ModernBertConfig = serde_json::from_str(&config_text)
-                .with_context(|| format!("Failed to parse ModernBertConfig for '{model_id}'"))?;
-            let dim = config.hidden_size;
-            let m = ModernBert::load(vb, &config)
-                .with_context(|| format!("Failed to build ModernBert model for '{model_id}'"))?;
-            (LoadedModel::ModernBert(m), dim)
-        }
-        _ => {
-            let config: BertConfig = serde_json::from_str(&config_text)
-                .with_context(|| format!("Failed to parse BertConfig for '{model_id}'"))?;
-            let dim = config.hidden_size;
-            let m = BertModel::load(vb, &config)
-                .with_context(|| format!("Failed to build BERT model for '{model_id}'"))?;
-            (LoadedModel::Bert(m), dim)
-        }
-    };
-
-    let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load tokenizer for '{model_id}': {e}"))?;
+    let (model_loaded, dimension) = factory.build_loaded_model(&peek.model_type, &config_text, vb)?;
+    let mut tokenizer = factory.load_tokenizer(&artifacts.tokenizer_path)?;
 
     tokenizer.with_padding(Some(tokenizers::PaddingParams {
         strategy: tokenizers::PaddingStrategy::BatchLongest,
@@ -577,27 +746,19 @@ pub fn load_embedder(
             max_length: MAX_SEQUENCE_LENGTH,
             ..Default::default()
         }))
-        .map_err(|e| anyhow::anyhow!("Failed to configure truncation for '{model_id}': {e}"))?;
-
-    let pooling = load_pooling_strategy(data_dir, model_id);
+        .map_err(|e| anyhow::anyhow!("Failed to configure truncation for '{}': {e}", model.0))?;
 
     info!(
-        "[candle] loaded '{model_id}' dim={dimension} pooling={pooling:?} device={device:?} dtype={dtype:?}"
+        "[candle] loaded '{}' dim={dimension} pooling={:?} device={device:?} dtype={dtype:?}",
+        model.0,
+        plan.pooling
     );
-
-    let prefixes = super::aux_config::load_prefixes(data_dir, model_id);
-
-    Ok(Arc::new(CandleEmbedder {
-        model: model_loaded,
+    Ok(Arc::new(assemble_candle_embedder(
+        CandleEmbedderBuildPlan { dimension, ..plan },
+        model_loaded,
         tokenizer,
         device,
-        dtype,
-        model_id: model_id.clone(),
-        dimension,
-        pooling,
-        query_prefix: prefixes.query_prefix,
-        passage_prefix: prefixes.passage_prefix,
-    }))
+    )))
 }
 
 #[cfg(test)]

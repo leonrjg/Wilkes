@@ -3,13 +3,41 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use notify::RecursiveMode;
-use notify_debouncer_mini::new_debouncer;
+use notify_debouncer_mini::{new_debouncer, DebouncedEvent};
 use tracing::{error, info};
 
 use super::super::Embedder;
 use super::SemanticIndex;
 use crate::extract::ExtractorRegistry;
 use crate::types::IndexingConfig;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClassifiedPaths {
+    pub changed: Vec<PathBuf>,
+    pub removed: Vec<PathBuf>,
+}
+
+pub fn should_consider_path(path: &std::path::Path, supported_extensions: &[String]) -> bool {
+    crate::types::FileType::detect(path, supported_extensions).is_some() || !path.exists()
+}
+
+pub fn classify_event_paths(
+    events: &[DebouncedEvent],
+    supported_extensions: &[String],
+) -> ClassifiedPaths {
+    let mut classified = ClassifiedPaths::default();
+    for event in events {
+        if !should_consider_path(&event.path, supported_extensions) && event.path.exists() {
+            continue;
+        }
+        if event.path.exists() && event.path.is_file() {
+            classified.changed.push(event.path.clone());
+        } else if !event.path.exists() {
+            classified.removed.push(event.path.clone());
+        }
+    }
+    classified
+}
 
 // ── IndexWatcher ──────────────────────────────────────────────────────────────
 
@@ -44,26 +72,9 @@ impl IndexWatcher {
             for result in &rx_events {
                 match result {
                     Ok(events) => {
-                        let mut changed_paths = Vec::new();
-                        let mut removed_paths = Vec::new();
-
-                        for event in events {
-                            if crate::types::FileType::detect(
-                                &event.path,
-                                &config.supported_extensions,
-                            )
-                            .is_none()
-                                && event.path.exists()
-                            {
-                                continue;
-                            }
-
-                            if event.path.exists() && event.path.is_file() {
-                                changed_paths.push(event.path.clone());
-                            } else if !event.path.exists() {
-                                removed_paths.push(event.path.clone());
-                            }
-                        }
+                        let classified = classify_event_paths(&events, &config.supported_extensions);
+                        let changed_paths = classified.changed;
+                        let removed_paths = classified.removed;
 
                         // Handle removals
                         if !removed_paths.is_empty() {
