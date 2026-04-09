@@ -1,6 +1,6 @@
 use std::path::Path;
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 pub struct HfSibling {
     pub rfilename: String,
     pub size: Option<u64>,
@@ -8,16 +8,31 @@ pub struct HfSibling {
 
 /// Fetch the sibling file list for `model_id` from the HuggingFace API.
 pub fn fetch_hf_siblings(model_id: &str) -> anyhow::Result<Vec<HfSibling>> {
+    fetch_hf_siblings_from_response(model_id, |url| {
+        let body = ureq::get(url)
+            .call()
+            .map_err(|e| anyhow::anyhow!("HF API request failed: {e}"))?
+            .into_string()
+            .map_err(|e| anyhow::anyhow!("HF API response read failed: {e}"))?;
+        Ok(body)
+    })
+}
+
+pub(crate) fn fetch_hf_siblings_from_response<F>(
+    model_id: &str,
+    request: F,
+) -> anyhow::Result<Vec<HfSibling>>
+where
+    F: FnOnce(&str) -> anyhow::Result<String>,
+{
     #[derive(serde::Deserialize)]
     struct HfModelInfo {
         siblings: Vec<HfSibling>,
     }
 
     let url = format!("https://huggingface.co/api/models/{model_id}?blobs=true");
-    let info: HfModelInfo = ureq::get(&url)
-        .call()
-        .map_err(|e| anyhow::anyhow!("HF API request failed: {e}"))?
-        .into_json()
+    let body = request(&url)?;
+    let info: HfModelInfo = serde_json::from_str(&body)
         .map_err(|e| anyhow::anyhow!("HF API response parse failed: {e}"))?;
 
     Ok(info.siblings)
@@ -26,7 +41,14 @@ pub fn fetch_hf_siblings(model_id: &str) -> anyhow::Result<Vec<HfSibling>> {
 /// Fetch total download size for `model_id` from the HuggingFace API.
 /// Sums all files in the repo — accurate for SBERT, an upper bound for Candle.
 pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {
-    let siblings = fetch_hf_siblings(model_id)?;
+    fetch_model_size_with(model_id, fetch_hf_siblings)
+}
+
+pub(crate) fn fetch_model_size_with<F>(model_id: &str, fetch: F) -> anyhow::Result<u64>
+where
+    F: FnOnce(&str) -> anyhow::Result<Vec<HfSibling>>,
+{
+    let siblings = fetch(model_id)?;
     let total: u64 = siblings.iter().filter_map(|s| s.size).sum();
     anyhow::ensure!(
         total > 0,
@@ -61,9 +83,6 @@ mod tests {
     #[test]
     fn test_is_model_cached_found() {
         let dir = tempdir().unwrap();
-        let cache = hf_hub::Cache::new(dir.path().to_path_buf());
-        let repo = hf_hub::Repo::model("test/repo".to_string());
-
         // This is a hacky way to create the HF cache structure for testing,
         // it simulates creating a file pointer in the cache.
         let blob_path = dir.path().join("blobs");
@@ -92,9 +111,68 @@ mod tests {
     }
 
     #[test]
-    fn test_fetch_model_size_invalid() {
-        // This will likely fail or return error due to no network in some environments,
-        // but it exercises the code.
-        let _ = fetch_model_size("invalid/model/id/12345");
+    fn test_fetch_model_size_with_injected_siblings() {
+        let size = fetch_model_size_with("test/repo", |_model_id| {
+            Ok(vec![
+                HfSibling {
+                    rfilename: "a.bin".to_string(),
+                    size: Some(10),
+                },
+                HfSibling {
+                    rfilename: "b.bin".to_string(),
+                    size: Some(20),
+                },
+                HfSibling {
+                    rfilename: "ignored".to_string(),
+                    size: None,
+                },
+            ])
+        })
+        .unwrap();
+
+        assert_eq!(size, 30);
+    }
+
+    #[test]
+    fn test_fetch_model_size_with_empty_result() {
+        let err = fetch_model_size_with("test/repo", |_model_id| {
+            Ok(vec![HfSibling {
+                rfilename: "a.bin".to_string(),
+                size: None,
+            }])
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("No model files found"));
+    }
+
+    #[test]
+    fn test_fetch_hf_siblings_from_response_parses_json() {
+        let siblings = fetch_hf_siblings_from_response("test/repo", |_url| {
+            Ok(r#"{"siblings":[{"rfilename":"a.bin","size":10}]}"#.to_string())
+        })
+        .unwrap();
+
+        assert_eq!(siblings.len(), 1);
+        assert_eq!(siblings[0].rfilename, "a.bin");
+        assert_eq!(siblings[0].size, Some(10));
+    }
+
+    #[test]
+    fn test_fetch_hf_siblings_from_response_request_error() {
+        let err = fetch_hf_siblings_from_response("test/repo", |_url| {
+            Err(anyhow::anyhow!("request failed"))
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("request failed"));
+    }
+
+    #[test]
+    fn test_fetch_hf_siblings_from_response_parse_error() {
+        let err = fetch_hf_siblings_from_response("test/repo", |_url| Ok("not json".to_string()))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("HF API response parse failed"));
     }
 }

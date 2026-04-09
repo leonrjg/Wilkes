@@ -7793,6 +7793,7 @@ name = "wilkes-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "ignore",
  "parking_lot",
  "serde",

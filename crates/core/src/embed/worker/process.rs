@@ -278,7 +278,9 @@ exit 0
         };
 
         let active_pid = AtomicU32::new(0);
-        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid).await.unwrap();
+        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+            .await
+            .unwrap();
         let (reply_tx, mut reply_rx) = mpsc::channel(8);
         let req_json = serde_json::to_string(&req).unwrap();
         proc.send_request(&req_json, &reply_tx).await.unwrap();
@@ -324,7 +326,9 @@ exit 0
         };
 
         let active_pid = AtomicU32::new(0);
-        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid).await.unwrap();
+        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+            .await
+            .unwrap();
         let (reply_tx, mut reply_rx) = mpsc::channel(8);
         let req_json = serde_json::to_string(&req).unwrap();
         let res = proc.send_request(&req_json, &reply_tx).await;
@@ -369,7 +373,9 @@ exit 0
         };
 
         let active_pid = AtomicU32::new(0);
-        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid).await.unwrap();
+        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+            .await
+            .unwrap();
         let (reply_tx, mut reply_rx) = mpsc::channel(8);
         let req_json = serde_json::to_string(&req).unwrap();
         proc.send_request(&req_json, &reply_tx).await.unwrap();

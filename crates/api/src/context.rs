@@ -1,5 +1,5 @@
 use parking_lot::Mutex as PLMutex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -11,6 +11,7 @@ use tracing::{error, info};
 use wilkes_core::embed::index::watcher::IndexWatcher;
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::installer::EmbedProgress;
+use wilkes_core::embed::models::installer::EmbedderInstaller;
 use wilkes_core::embed::worker::manager::{
     ManagerCommand, ManagerEvent, WorkerManager, WorkerPaths, WorkerStatus,
 };
@@ -56,6 +57,36 @@ impl EmbedOperation {
             Self::Build => "Build",
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct BuildIndexPlan {
+    root_path: PathBuf,
+    device: String,
+    chunk_size: usize,
+    chunk_overlap: usize,
+    supported_extensions: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DownloadModelPlan {
+    device: String,
+}
+
+#[derive(Clone, Debug)]
+struct RestoreStatePlan {
+    settings: Settings,
+    db_status: IndexStatus,
+    selected: SelectedEmbedder,
+    device: String,
+}
+
+enum RestoreStatePreparation {
+    Ready(RestoreStatePlan),
+    ResetStaleSelection {
+        db_status: IndexStatus,
+        selected: SelectedEmbedder,
+    },
 }
 
 // ── AppContext ────────────────────────────────────────────────────────────────
@@ -179,6 +210,15 @@ impl AppContext {
         if let Some(mut w) = self.watcher.lock().take() {
             w.stop();
         }
+    }
+
+    fn embed_task_is_running(&self) -> bool {
+        let guard = self.embed_task.lock();
+        guard.as_ref().is_some_and(|task| !task.join.is_finished())
+    }
+
+    fn clear_embed_task(&self) {
+        *self.embed_task.lock() = None;
     }
 
     // ── Settings ──────────────────────────────────────────────────────────────
@@ -318,161 +358,20 @@ impl AppContext {
         root: String,
         selected: SelectedEmbedder,
     ) -> Result<(), String> {
-        {
-            let guard = self.embed_task.lock();
-            if guard.as_ref().is_some_and(|t| !t.join.is_finished()) {
-                return Err("A build is already in progress.".into());
-            }
-        }
-
-        let root_path = PathBuf::from(&root);
-        if !root_path.exists() {
-            return Err(format!("Index root not found: {}", root_path.display()));
-        }
-        if !root_path.is_dir() {
-            return Err(format!(
-                "Index root is not a directory: {}",
-                root_path.display()
-            ));
-        }
-
-        let settings = self.settings().await;
-        let device = settings.semantic.device_for(selected.engine).to_string();
-        let chunk_size = settings.semantic.chunk_size;
-        let chunk_overlap = settings.semantic.chunk_overlap;
-        let supported_extensions = settings.supported_extensions.clone();
+        let plan = self.prepare_build_index(&root, &selected).await?;
 
         self.stop_watcher();
         self.events
             .emit("manager-event", serde_json::json!("Reindexing"));
 
-        let manager = self.worker_manager.clone();
-        let data_dir = self.data_dir.clone();
-        let ctx = Arc::clone(&self);
-        let selected_clone = selected.clone();
-
-        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<EmbedProgress>(128);
         let cancel = CancellationToken::new();
-        let cancel_for_task = cancel.clone();
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        let cancel_flag_for_task = Arc::clone(&cancel_flag);
-
-        let join: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-            // Always emit ReindexingDone when this task exits.
-            struct DoneGuard(Arc<dyn EventEmitter>);
-            impl Drop for DoneGuard {
-                fn drop(&mut self) {
-                    self.0
-                        .emit("manager-event", serde_json::json!("ReindexingDone"));
-                }
-            }
-            let _guard = DoneGuard(Arc::clone(&ctx.events));
-
-            let options = crate::commands::embed::BuildIndexOptions {
-                manager: Some(manager.clone()),
-                device: Some(device.clone()),
-                data_dir: data_dir.clone(),
-                tx: progress_tx,
-                cancel_flag: Arc::clone(&cancel_flag_for_task),
-                chunk_size,
-                chunk_overlap,
-                supported_extensions: supported_extensions.clone(),
-            };
-            let build_fut = crate::commands::embed::build_index(
-                root_path.clone(),
-                selected_clone.clone(),
-                options,
-            );
-            tokio::pin!(build_fut);
-            let mut progress_rx = progress_rx;
-
-            loop {
-                tokio::select! {
-                    biased;
-
-                    _ = cancel_for_task.cancelled() => {
-                        cancel_flag_for_task.store(true, Ordering::Relaxed);
-                        let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp"));
-                        let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp-wal"));
-                        let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp-shm"));
-                        ctx.emit_embed_error("Build", "");
-                        return Ok(());
-                    }
-
-                    res = &mut build_fut => {
-                        match res {
-                            Ok(embedder) => {
-                                let dim = embedder.dimension();
-                                *ctx.embedder.lock() = Some(Arc::clone(&embedder));
-
-                                let data_dir_c = data_dir.clone();
-                                let m = selected_clone.model.model_id().to_string();
-                                match tokio::task::spawn_blocking(move || {
-                                    SemanticIndex::open(&data_dir_c, &m, dim)
-                                }).await {
-                                    Ok(Ok(idx)) => {
-                                        let actual_dim = idx.status().dimension;
-                                        let index_arc = Arc::new(Mutex::new(Some(idx)));
-                                        *ctx.index.lock() = Arc::clone(&index_arc);
-
-                                        let mut registry = ExtractorRegistry::new();
-                                        registry.register(Box::new(PdfExtractor::new()));
-
-                                        let ev1 = Arc::clone(&ctx.events);
-                                        let ev2 = Arc::clone(&ctx.events);
-                                        let indexing = IndexingConfig {
-                                            chunk_size,
-                                            chunk_overlap,
-                                            supported_extensions: supported_extensions.clone(),
-                                        };
-                                        match IndexWatcher::start(
-                                            root_path,
-                                            index_arc,
-                                            Arc::new(registry),
-                                            embedder,
-                                            indexing,
-                                            move || ev1.emit("manager-event", serde_json::json!("Reindexing")),
-                                            move || ev2.emit("manager-event", serde_json::json!("ReindexingDone")),
-                                        ) {
-                                            Ok(w) => *ctx.watcher.lock() = Some(w),
-                                            Err(e) => error!("watcher start failed: {e:#}"),
-                                        }
-
-                                        ctx.update_semantic_settings(|s| SemanticSettings {
-                                            index_path: Some(data_dir.join("semantic_index.db")),
-                                            selected: SelectedEmbedder {
-                                                dimension: actual_dim,
-                                                ..selected_clone.clone()
-                                            },
-                                            enabled: true,
-                                            ..s
-                                        }).await;
-
-                                        ctx.events.emit("embed-done", serde_json::json!({ "operation": "Build" }));
-                                    }
-                                    Ok(Err(e)) => {
-                                        ctx.emit_embed_error("Build", e.to_string());
-                                    }
-                                    Err(e) => {
-                                        ctx.emit_embed_error("Build", e.to_string());
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                ctx.emit_embed_error("Build", e.to_string());
-                            }
-                        }
-                        break;
-                    }
-
-                    Some(p) = progress_rx.recv() => {
-                        ctx.events.emit("embed-progress", serde_json::to_value(&p).unwrap_or_default());
-                    }
-                }
-            }
-            *ctx.embed_task.lock() = None;
-            Ok(())
-        });
+        let join = Arc::clone(&self).spawn_build_index_task(
+            plan,
+            selected,
+            cancel.clone(),
+            Arc::clone(&cancel_flag),
+        );
 
         *self.embed_task.lock() = Some(EmbedTaskHandle {
             operation: EmbedOperation::Build,
@@ -490,82 +389,8 @@ impl AppContext {
         self: Arc<Self>,
         selected: SelectedEmbedder,
     ) -> Result<(), String> {
-        {
-            let guard = self.embed_task.lock();
-            if guard.as_ref().is_some_and(|t| !t.join.is_finished()) {
-                return Err("A build is already in progress.".into());
-            }
-        }
-
-        let settings = self.settings().await;
-        let device = settings.semantic.device_for(selected.engine).to_string();
-        let data_dir = self.data_dir.clone();
-        let manager = self.worker_manager.clone();
-        let ctx = Arc::clone(&self);
-        let selected_clone = selected.clone();
-
-        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<EmbedProgress>(64);
-
-        let join: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-            let ev = Arc::clone(&ctx.events);
-            let forward = tokio::spawn(async move {
-                let mut rx = progress_rx;
-                while let Some(p) = rx.recv().await {
-                    ev.emit(
-                        "embed-progress",
-                        serde_json::to_value(&p).unwrap_or_default(),
-                    );
-                }
-            });
-
-            let result = crate::commands::embed::download_model(
-                selected_clone.clone(),
-                manager.clone(),
-                device.clone(),
-                data_dir.clone(),
-                progress_tx,
-            )
-            .await;
-
-            let _ = forward.await;
-
-            match result {
-                Ok(()) => {
-                    // Probe model dimensions by running install again (no-op if cached).
-                    let (probe_tx, _) = mpsc::channel(1);
-                    let installer = dispatch::get_installer(
-                        selected_clone.engine,
-                        selected_clone.model.clone(),
-                        manager,
-                        device,
-                    );
-                    if let Err(e) = installer.install(&data_dir, probe_tx).await {
-                        ctx.emit_embed_error(
-                            "Download",
-                            format!("Failed to probe model dimensions: {e:#}"),
-                        );
-                        *ctx.embed_task.lock() = None;
-                        return Ok(());
-                    }
-                    match installer.build(&data_dir) {
-                        Ok(embedder) => {
-                            *ctx.embedder.lock() = Some(embedder);
-                            ctx.events
-                                .emit("embed-done", serde_json::json!({ "operation": "Download" }));
-                        }
-                        Err(e) => {
-                            ctx.emit_embed_error("Download", e.to_string());
-                        }
-                    }
-                }
-                Err(e) => {
-                    ctx.emit_embed_error("Download", e.to_string());
-                }
-            }
-
-            *ctx.embed_task.lock() = None;
-            Ok(())
-        });
+        let plan = self.prepare_download_model(&selected).await?;
+        let join = Arc::clone(&self).spawn_download_model_task(plan, selected);
 
         let cancel = CancellationToken::new();
         *self.embed_task.lock() = Some(EmbedTaskHandle {
@@ -575,6 +400,340 @@ impl AppContext {
             join,
         });
         Ok(())
+    }
+
+    async fn prepare_build_index(
+        &self,
+        root: &str,
+        selected: &SelectedEmbedder,
+    ) -> Result<BuildIndexPlan, String> {
+        if self.embed_task_is_running() {
+            return Err("A build is already in progress.".into());
+        }
+
+        let root_path = PathBuf::from(root);
+        if !root_path.exists() {
+            return Err(format!("Index root not found: {}", root_path.display()));
+        }
+        if !root_path.is_dir() {
+            return Err(format!(
+                "Index root is not a directory: {}",
+                root_path.display()
+            ));
+        }
+
+        let settings = self.settings().await;
+        Ok(BuildIndexPlan {
+            root_path,
+            device: settings.semantic.device_for(selected.engine).to_string(),
+            chunk_size: settings.semantic.chunk_size,
+            chunk_overlap: settings.semantic.chunk_overlap,
+            supported_extensions: settings.supported_extensions.clone(),
+        })
+    }
+
+    async fn prepare_download_model(
+        &self,
+        selected: &SelectedEmbedder,
+    ) -> Result<DownloadModelPlan, String> {
+        if self.embed_task_is_running() {
+            return Err("A build is already in progress.".into());
+        }
+
+        let settings = self.settings().await;
+        Ok(DownloadModelPlan {
+            device: settings.semantic.device_for(selected.engine).to_string(),
+        })
+    }
+
+    fn build_index_options(
+        manager: WorkerManager,
+        data_dir: PathBuf,
+        plan: &BuildIndexPlan,
+        progress_tx: tokio::sync::mpsc::Sender<EmbedProgress>,
+        cancel_flag: Arc<AtomicBool>,
+    ) -> crate::commands::embed::BuildIndexOptions {
+        crate::commands::embed::BuildIndexOptions {
+            manager: Some(manager),
+            device: Some(plan.device.clone()),
+            data_dir,
+            tx: progress_tx,
+            cancel_flag,
+            chunk_size: plan.chunk_size,
+            chunk_overlap: plan.chunk_overlap,
+            supported_extensions: plan.supported_extensions.clone(),
+        }
+    }
+
+    fn cleanup_partial_index_files(data_dir: &Path) {
+        let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp"));
+        let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp-wal"));
+        let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp-shm"));
+    }
+
+    fn emit_progress_event(&self, progress: &EmbedProgress) {
+        self.events.emit(
+            "embed-progress",
+            serde_json::to_value(progress).unwrap_or_default(),
+        );
+    }
+
+    async fn open_built_index(
+        &self,
+        data_dir: PathBuf,
+        model_id: String,
+        dim: usize,
+    ) -> Result<SemanticIndex, String> {
+        match tokio::task::spawn_blocking(move || SemanticIndex::open(&data_dir, &model_id, dim))
+            .await
+        {
+            Ok(Ok(index)) => Ok(index),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    fn start_build_watcher(
+        &self,
+        root_path: PathBuf,
+        index_arc: Arc<Mutex<Option<SemanticIndex>>>,
+        embedder: Arc<dyn Embedder>,
+        indexing: IndexingConfig,
+    ) {
+        let mut registry = ExtractorRegistry::new();
+        registry.register(Box::new(PdfExtractor::new()));
+
+        let ev1 = Arc::clone(&self.events);
+        let ev2 = Arc::clone(&self.events);
+        match IndexWatcher::start(
+            root_path,
+            index_arc,
+            Arc::new(registry),
+            embedder,
+            indexing,
+            move || ev1.emit("manager-event", serde_json::json!("Reindexing")),
+            move || ev2.emit("manager-event", serde_json::json!("ReindexingDone")),
+        ) {
+            Ok(watcher) => *self.watcher.lock() = Some(watcher),
+            Err(err) => error!("watcher start failed: {err:#}"),
+        }
+    }
+
+    async fn finish_build_index(
+        self: &Arc<Self>,
+        plan: &BuildIndexPlan,
+        selected: &SelectedEmbedder,
+        data_dir: &Path,
+        embedder: Arc<dyn Embedder>,
+    ) -> Result<(), String> {
+        let dim = embedder.dimension();
+        let model_id = selected.model.model_id().to_string();
+        let index = self
+            .open_built_index(data_dir.to_path_buf(), model_id, dim)
+            .await?;
+        let actual_dim = index.status().dimension;
+        let index_arc = Arc::new(Mutex::new(Some(index)));
+
+        *self.embedder.lock() = Some(Arc::clone(&embedder));
+        *self.index.lock() = Arc::clone(&index_arc);
+
+        self.start_build_watcher(
+            plan.root_path.clone(),
+            index_arc,
+            embedder,
+            IndexingConfig {
+                chunk_size: plan.chunk_size,
+                chunk_overlap: plan.chunk_overlap,
+                supported_extensions: plan.supported_extensions.clone(),
+            },
+        );
+
+        self.update_semantic_settings(|s| SemanticSettings {
+            index_path: Some(data_dir.join("semantic_index.db")),
+            selected: SelectedEmbedder {
+                dimension: actual_dim,
+                ..selected.clone()
+            },
+            enabled: true,
+            ..s
+        })
+        .await;
+
+        self.events
+            .emit("embed-done", serde_json::json!({ "operation": "Build" }));
+        Ok(())
+    }
+
+    async fn forward_embed_progress(
+        events: Arc<dyn EventEmitter>,
+        mut progress_rx: mpsc::Receiver<EmbedProgress>,
+    ) {
+        while let Some(progress) = progress_rx.recv().await {
+            events.emit(
+                "embed-progress",
+                serde_json::to_value(&progress).unwrap_or_default(),
+            );
+        }
+    }
+
+    fn spawn_build_index_task(
+        self: Arc<Self>,
+        plan: BuildIndexPlan,
+        selected: SelectedEmbedder,
+        cancel: CancellationToken,
+        cancel_flag: Arc<AtomicBool>,
+    ) -> JoinHandle<anyhow::Result<()>> {
+        let manager = self.worker_manager.clone();
+        let data_dir = self.data_dir.clone();
+        let ctx = Arc::clone(&self);
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<EmbedProgress>(128);
+        let cancel_for_task = cancel.clone();
+
+        tokio::spawn(async move {
+            // Always emit ReindexingDone when this task exits.
+            struct DoneGuard(Arc<dyn EventEmitter>);
+            impl Drop for DoneGuard {
+                fn drop(&mut self) {
+                    self.0
+                        .emit("manager-event", serde_json::json!("ReindexingDone"));
+                }
+            }
+            let _guard = DoneGuard(Arc::clone(&ctx.events));
+
+            let options = Self::build_index_options(
+                manager.clone(),
+                data_dir.clone(),
+                &plan,
+                progress_tx,
+                Arc::clone(&cancel_flag),
+            );
+            let build_fut = crate::commands::embed::build_index(
+                plan.root_path.clone(),
+                selected.clone(),
+                options,
+            );
+            tokio::pin!(build_fut);
+            let mut progress_rx = progress_rx;
+
+            loop {
+                tokio::select! {
+                    biased;
+
+                    _ = cancel_for_task.cancelled() => {
+                        cancel_flag.store(true, Ordering::Relaxed);
+                        Self::cleanup_partial_index_files(&data_dir);
+                        ctx.emit_embed_error("Build", "");
+                        return Ok(());
+                    }
+
+                    res = &mut build_fut => {
+                        match res {
+                            Ok(embedder) => {
+                                if let Err(err) = ctx
+                                    .finish_build_index(&plan, &selected, &data_dir, embedder)
+                                    .await
+                                {
+                                    ctx.emit_embed_error("Build", err);
+                                }
+                            }
+                            Err(e) => {
+                                ctx.emit_embed_error("Build", e.to_string());
+                            }
+                        }
+                        break;
+                    }
+
+                    Some(p) = progress_rx.recv() => {
+                        ctx.emit_progress_event(&p);
+                    }
+                }
+            }
+            ctx.clear_embed_task();
+            Ok(())
+        })
+    }
+
+    fn spawn_download_model_task(
+        self: Arc<Self>,
+        plan: DownloadModelPlan,
+        selected: SelectedEmbedder,
+    ) -> JoinHandle<anyhow::Result<()>> {
+        let data_dir = self.data_dir.clone();
+        let manager = self.worker_manager.clone();
+        let ctx = Arc::clone(&self);
+        let (progress_tx, progress_rx) = mpsc::channel::<EmbedProgress>(64);
+
+        tokio::spawn(async move {
+            let forward = tokio::spawn(Self::forward_embed_progress(
+                Arc::clone(&ctx.events),
+                progress_rx,
+            ));
+
+            let result = crate::commands::embed::download_model(
+                selected.clone(),
+                manager.clone(),
+                plan.device.clone(),
+                data_dir.clone(),
+                progress_tx,
+            )
+            .await;
+
+            let _ = forward.await;
+
+            match result {
+                Ok(()) => {
+                    if let Err(e) = ctx
+                        .probe_and_load_downloaded_model(
+                            selected.clone(),
+                            manager,
+                            plan.device.clone(),
+                        )
+                        .await
+                    {
+                        ctx.emit_embed_error("Download", e);
+                    } else {
+                        ctx.events
+                            .emit("embed-done", serde_json::json!({ "operation": "Download" }));
+                    }
+                }
+                Err(e) => {
+                    ctx.emit_embed_error("Download", e.to_string());
+                }
+            }
+
+            ctx.clear_embed_task();
+            Ok(())
+        })
+    }
+
+    async fn probe_and_load_downloaded_model(
+        self: &Arc<Self>,
+        selected: SelectedEmbedder,
+        manager: WorkerManager,
+        device: String,
+    ) -> Result<(), String> {
+        let installer =
+            dispatch::get_installer(selected.engine, selected.model.clone(), manager, device);
+        self.probe_and_load_downloaded_model_with(installer).await
+    }
+
+    async fn probe_and_load_downloaded_model_with(
+        self: &Arc<Self>,
+        installer: Arc<dyn EmbedderInstaller>,
+    ) -> Result<(), String> {
+        // Probe model dimensions by running install again (no-op if cached).
+        let (probe_tx, _) = mpsc::channel(1);
+        if let Err(e) = installer.install(&self.data_dir, probe_tx).await {
+            return Err(format!("Failed to probe model dimensions: {e:#}"));
+        }
+
+        match installer.build(&self.data_dir) {
+            Ok(embedder) => {
+                *self.embedder.lock() = Some(embedder);
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     // ── Embed lifecycle ───────────────────────────────────────────────────────
@@ -635,6 +794,266 @@ impl AppContext {
 
     // ── Startup restore ───────────────────────────────────────────────────────
 
+    fn restore_state_needs_reset(settings: &Settings, db_status: Option<&IndexStatus>) -> bool {
+        match db_status {
+            None => settings.semantic.enabled || settings.semantic.index_path.is_some(),
+            Some(db_status) => {
+                let selected = &settings.semantic.selected;
+                db_status.engine != selected.engine
+                    || db_status.model_id != selected.model.model_id()
+            }
+        }
+    }
+
+    fn restore_state_indexing_config(settings: &Settings) -> IndexingConfig {
+        IndexingConfig {
+            chunk_size: settings.semantic.chunk_size,
+            chunk_overlap: settings.semantic.chunk_overlap,
+            supported_extensions: settings.supported_extensions.clone(),
+        }
+    }
+
+    fn restore_state_enabled_settings(
+        current: SemanticSettings,
+        db_path: PathBuf,
+        selected: SelectedEmbedder,
+        dim: usize,
+    ) -> SemanticSettings {
+        SemanticSettings {
+            enabled: true,
+            index_path: Some(db_path),
+            selected: SelectedEmbedder {
+                dimension: dim,
+                ..selected
+            },
+            ..current
+        }
+    }
+
+    fn open_semantic_index_with<F>(
+        data_dir: &PathBuf,
+        model_id: &str,
+        expected_dim: usize,
+        open: F,
+    ) -> anyhow::Result<SemanticIndex>
+    where
+        F: FnOnce(&PathBuf, &str, usize) -> anyhow::Result<SemanticIndex>,
+    {
+        open(data_dir, model_id, expected_dim)
+    }
+
+    fn start_index_watcher_with<F>(
+        root: PathBuf,
+        index_arc: Arc<Mutex<Option<SemanticIndex>>>,
+        registry: Arc<ExtractorRegistry>,
+        embedder: Arc<dyn Embedder>,
+        indexing: IndexingConfig,
+        start: F,
+    ) -> anyhow::Result<IndexWatcher>
+    where
+        F: FnOnce(
+            PathBuf,
+            Arc<Mutex<Option<SemanticIndex>>>,
+            Arc<ExtractorRegistry>,
+            Arc<dyn Embedder>,
+            IndexingConfig,
+            Box<dyn Fn() + Send + Sync>,
+            Box<dyn Fn() + Send + Sync>,
+        ) -> anyhow::Result<IndexWatcher>,
+    {
+        let ev1: Box<dyn Fn() + Send + Sync> = Box::new(|| {});
+        let ev2: Box<dyn Fn() + Send + Sync> = Box::new(|| {});
+        start(root, index_arc, registry, embedder, indexing, ev1, ev2)
+    }
+
+    fn prepare_restore_state_plan(
+        settings: Settings,
+        db_status: IndexStatus,
+    ) -> RestoreStatePreparation {
+        let selected = settings.semantic.selected.clone();
+        if Self::restore_state_needs_reset(&settings, Some(&db_status)) {
+            RestoreStatePreparation::ResetStaleSelection {
+                db_status,
+                selected,
+            }
+        } else {
+            RestoreStatePreparation::Ready(RestoreStatePlan {
+                device: settings.semantic.device_for(selected.engine).to_string(),
+                settings,
+                db_status,
+                selected,
+            })
+        }
+    }
+
+    async fn clear_restore_state_settings(&self) {
+        self.update_semantic_settings(|s| SemanticSettings {
+            enabled: false,
+            index_path: None,
+            ..s
+        })
+        .await;
+    }
+
+    async fn load_restore_db_status(&self, settings: &Settings) -> Option<IndexStatus> {
+        match tokio::task::spawn_blocking({
+            let d = self.data_dir.clone();
+            move || SemanticIndex::read_status_from_path(&d)
+        })
+        .await
+        {
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(err)) => {
+                info!("restore_state: no index DB ({err:#}), nothing to restore");
+                if Self::restore_state_needs_reset(settings, None) {
+                    self.clear_restore_state_settings().await;
+                }
+                None
+            }
+            Err(err) => {
+                error!("restore_state: spawn_blocking panicked: {err}");
+                None
+            }
+        }
+    }
+
+    async fn restore_embedder(
+        &self,
+        selected: &SelectedEmbedder,
+        device: String,
+    ) -> Option<Arc<dyn Embedder>> {
+        let installer = dispatch::get_installer(
+            selected.engine,
+            selected.model.clone(),
+            self.worker_manager.clone(),
+            device,
+        );
+        self.restore_embedder_with(installer).await
+    }
+
+    async fn restore_embedder_with(
+        &self,
+        installer: Arc<dyn EmbedderInstaller>,
+    ) -> Option<Arc<dyn Embedder>> {
+        let (probe_tx, _) = tokio::sync::mpsc::channel(1);
+        if let Err(err) = installer.install(&self.data_dir, probe_tx).await {
+            error!("restore_state: install probe failed: {err:#}");
+            return None;
+        }
+        if !installer.is_available(&self.data_dir) {
+            info!("restore_state: model files absent, skipping");
+            return None;
+        }
+
+        let data_dir = self.data_dir.clone();
+        match tokio::task::spawn_blocking(move || installer.build(&data_dir)).await {
+            Ok(Ok(embedder)) => Some(embedder),
+            Ok(Err(err)) => {
+                error!("restore_state: build embedder: {err:#}");
+                None
+            }
+            Err(err) => {
+                error!("restore_state: build embedder panicked: {err}");
+                None
+            }
+        }
+    }
+
+    async fn restore_index(
+        &self,
+        selected: &SelectedEmbedder,
+        expected_dim: usize,
+    ) -> Option<SemanticIndex> {
+        let data_dir = self.data_dir.clone();
+        let model_id = selected.model.model_id().to_string();
+        match tokio::task::spawn_blocking(move || {
+            Self::open_semantic_index_with(&data_dir, &model_id, expected_dim, |dir, model, dim| {
+                SemanticIndex::open(dir, model, dim)
+            })
+        })
+        .await
+        {
+            Ok(Ok(index)) => Some(index),
+            Ok(Err(err)) => {
+                error!("restore_state: open index: {err:#}");
+                None
+            }
+            Err(err) => {
+                error!("restore_state: open index panicked: {err}");
+                None
+            }
+        }
+    }
+
+    fn restore_store_loaded_state(
+        &self,
+        embedder: Arc<dyn Embedder>,
+        index: SemanticIndex,
+    ) -> Arc<Mutex<Option<SemanticIndex>>> {
+        *self.embedder.lock() = Some(Arc::clone(&embedder));
+        let index_arc = Arc::new(Mutex::new(Some(index)));
+        *self.index.lock() = Arc::clone(&index_arc);
+        index_arc
+    }
+
+    fn maybe_restore_watcher(
+        &self,
+        settings: &Settings,
+        index_arc: Arc<Mutex<Option<SemanticIndex>>>,
+        embedder: Arc<dyn Embedder>,
+    ) {
+        if let Some(root) = settings.last_directory.clone() {
+            let mut registry = ExtractorRegistry::new();
+            registry.register(Box::new(PdfExtractor::new()));
+            let indexing = Self::restore_state_indexing_config(settings);
+            match Self::start_index_watcher_with(
+                root,
+                index_arc,
+                Arc::new(registry),
+                embedder,
+                indexing,
+                |root, index_arc, registry, embedder, indexing, on_reindex, on_done| {
+                    let ev1 = Arc::clone(&self.events);
+                    let ev2 = Arc::clone(&self.events);
+                    let on_reindex = move || {
+                        on_reindex();
+                        ev1.emit("manager-event", serde_json::json!("Reindexing"))
+                    };
+                    let on_done = move || {
+                        on_done();
+                        ev2.emit("manager-event", serde_json::json!("ReindexingDone"))
+                    };
+                    IndexWatcher::start(
+                        root, index_arc, registry, embedder, indexing, on_reindex, on_done,
+                    )
+                    .map_err(Into::into)
+                },
+            ) {
+                Ok(watcher) => *self.watcher.lock() = Some(watcher),
+                Err(err) => error!("restore_state: watcher: {err:#}"),
+            }
+        }
+    }
+
+    async fn finish_restore_state(
+        &self,
+        plan: &RestoreStatePlan,
+        embedder: Arc<dyn Embedder>,
+        index: SemanticIndex,
+    ) {
+        let index_arc = self.restore_store_loaded_state(Arc::clone(&embedder), index);
+        self.maybe_restore_watcher(&plan.settings, index_arc, embedder);
+
+        let db_path = self.data_dir.join("semantic_index.db");
+        let dim = plan.db_status.dimension;
+        self.update_semantic_settings(|s| {
+            Self::restore_state_enabled_settings(s, db_path.clone(), plan.selected.clone(), dim)
+        })
+        .await;
+
+        info!("restore_state: embedder and index restored");
+    }
+
     /// Reload the embedder and index from disk if they were previously built,
     /// and restart the filesystem watcher. Run this once after `new`.
     pub async fn restore_state(self: Arc<Self>) {
@@ -646,141 +1065,40 @@ impl AppContext {
             }
         };
 
-        let db_status = match tokio::task::spawn_blocking({
-            let d = self.data_dir.clone();
-            move || SemanticIndex::read_status_from_path(&d)
-        })
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                info!("restore_state: no index DB ({e:#}), nothing to restore");
-                // DB missing or unreadable — clear any stale enabled/index_path so the
-                // UI doesn't think an index exists when none can be loaded.
-                if settings.semantic.enabled || settings.semantic.index_path.is_some() {
-                    self.update_semantic_settings(|s| SemanticSettings {
-                        enabled: false,
-                        index_path: None,
-                        ..s
-                    })
-                    .await;
-                }
-                return;
-            }
-            Err(e) => {
-                error!("restore_state: spawn_blocking panicked: {e}");
+        let Some(db_status) = self.load_restore_db_status(&settings).await else {
+            return;
+        };
+
+        let plan = match Self::prepare_restore_state_plan(settings, db_status) {
+            RestoreStatePreparation::Ready(plan) => plan,
+            RestoreStatePreparation::ResetStaleSelection {
+                db_status,
+                selected,
+            } => {
+                info!(
+                    "restore_state: index selection '{:?}/{}' != settings selection '{:?}/{}', clearing stale index reference",
+                    db_status.engine, db_status.model_id, selected.engine, selected.model.model_id()
+                );
+                self.clear_restore_state_settings().await;
                 return;
             }
         };
 
-        let selected = settings.semantic.selected.clone();
-
-        if db_status.engine != selected.engine || db_status.model_id != selected.model.model_id() {
-            info!(
-                "restore_state: index selection '{:?}/{}' != settings selection '{:?}/{}', clearing stale index reference",
-                db_status.engine, db_status.model_id, selected.engine, selected.model.model_id()
-            );
-            self.update_semantic_settings(|s| SemanticSettings {
-                enabled: false,
-                index_path: None,
-                ..s
-            })
-            .await;
+        let Some(embedder) = self
+            .restore_embedder(&plan.selected, plan.device.clone())
+            .await
+        else {
             return;
-        }
-
-        let installer = dispatch::get_installer(
-            selected.engine,
-            selected.model.clone(),
-            self.worker_manager.clone(),
-            settings.semantic.device_for(selected.engine).to_string(),
-        );
-
-        let (probe_tx, _) = tokio::sync::mpsc::channel(1);
-        if let Err(e) = installer.install(&self.data_dir, probe_tx).await {
-            error!("restore_state: install probe failed: {e:#}");
-            return;
-        }
-        if !installer.is_available(&self.data_dir) {
-            info!("restore_state: model files absent, skipping");
-            return;
-        }
-
-        let data_dir = self.data_dir.clone();
-        let embedder = match tokio::task::spawn_blocking(move || installer.build(&data_dir)).await {
-            Ok(Ok(e)) => e,
-            Ok(Err(e)) => {
-                error!("restore_state: build embedder: {e:#}");
-                return;
-            }
-            Err(e) => {
-                error!("restore_state: build embedder panicked: {e}");
-                return;
-            }
         };
 
-        let data_dir = self.data_dir.clone();
-        let m = selected.model.model_id().to_string();
-        let expected_dim = embedder.dimension();
-        let index = match tokio::task::spawn_blocking(move || {
-            SemanticIndex::open(&data_dir, &m, expected_dim)
-        })
-        .await
-        {
-            Ok(Ok(idx)) => idx,
-            Ok(Err(e)) => {
-                error!("restore_state: open index: {e:#}");
-                return;
-            }
-            Err(e) => {
-                error!("restore_state: open index panicked: {e}");
-                return;
-            }
+        let Some(index) = self
+            .restore_index(&plan.selected, embedder.dimension())
+            .await
+        else {
+            return;
         };
 
-        *self.embedder.lock() = Some(Arc::clone(&embedder));
-        let index_arc = Arc::new(Mutex::new(Some(index)));
-        *self.index.lock() = Arc::clone(&index_arc);
-
-        if let Some(root) = settings.last_directory {
-            let mut registry = ExtractorRegistry::new();
-            registry.register(Box::new(PdfExtractor::new()));
-
-            let ev1 = Arc::clone(&self.events);
-            let ev2 = Arc::clone(&self.events);
-            let indexing = IndexingConfig {
-                chunk_size: settings.semantic.chunk_size,
-                chunk_overlap: settings.semantic.chunk_overlap,
-                supported_extensions: settings.supported_extensions.clone(),
-            };
-            match IndexWatcher::start(
-                root,
-                index_arc,
-                Arc::new(registry),
-                Arc::clone(&embedder),
-                indexing,
-                move || ev1.emit("manager-event", serde_json::json!("Reindexing")),
-                move || ev2.emit("manager-event", serde_json::json!("ReindexingDone")),
-            ) {
-                Ok(w) => *self.watcher.lock() = Some(w),
-                Err(e) => error!("restore_state: watcher: {e:#}"),
-            }
-        }
-
-        let db_path = self.data_dir.join("semantic_index.db");
-        let dim = db_status.dimension;
-        self.update_semantic_settings(|s| SemanticSettings {
-            enabled: true,
-            index_path: Some(db_path),
-            selected: SelectedEmbedder {
-                dimension: dim,
-                ..selected.clone()
-            },
-            ..s
-        })
-        .await;
-
-        info!("restore_state: embedder and index restored");
+        self.finish_restore_state(&plan, embedder, index).await;
     }
 }
 
@@ -788,12 +1106,17 @@ impl AppContext {
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
     use tempfile::tempdir;
     use tokio::sync::mpsc;
-    use wilkes_core::types::EmbeddingEngine;
     use tracing::subscriber;
     use tracing_subscriber::prelude::*;
     use wilkes_core::embed::MockEmbedder;
+    use wilkes_core::types::EmbeddingEngine;
+    use wilkes_core::types::{
+        EmbedderModel, IndexStatus, SearchMode, SelectedEmbedder, SemanticSettings, Settings, Theme,
+    };
 
     struct MockEmitter {
         events: Arc<Mutex<Vec<(String, Value)>>>,
@@ -805,6 +1128,66 @@ mod tests {
                 .unwrap()
                 .push((name.to_string(), payload));
         }
+    }
+
+    struct FakeInstaller {
+        install_calls: Arc<AtomicUsize>,
+        build_calls: Arc<AtomicUsize>,
+        available: bool,
+        install_should_fail: bool,
+        build_should_fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbedderInstaller for FakeInstaller {
+        fn is_available(&self, _data_dir: &Path) -> bool {
+            self.available
+        }
+
+        async fn install(
+            &self,
+            _data_dir: &Path,
+            _tx: mpsc::Sender<EmbedProgress>,
+        ) -> anyhow::Result<()> {
+            self.install_calls.fetch_add(1, Ordering::Relaxed);
+            if self.install_should_fail {
+                Err(anyhow::anyhow!("install failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn uninstall(&self, _data_dir: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn build(&self, _data_dir: &Path) -> anyhow::Result<Arc<dyn Embedder>> {
+            self.build_calls.fetch_add(1, Ordering::Relaxed);
+            if self.build_should_fail {
+                Err(anyhow::anyhow!("build failed"))
+            } else {
+                Ok(Arc::new(MockEmbedder::default()))
+            }
+        }
+    }
+
+    fn test_ctx() -> (tempfile::TempDir, Arc<AppContext>) {
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let emitter = Arc::new(MockEmitter {
+            events: Arc::new(Mutex::new(Vec::new())),
+        });
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("python"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: dir.path().to_path_buf(),
+        };
+        let (ctx, _rx, _loop) =
+            AppContext::new(dir.path().to_path_buf(), settings_path, paths, emitter);
+        (dir, ctx)
     }
 
     #[test]
@@ -839,6 +1222,651 @@ mod tests {
                 && payload["operation"] == "Build"
                 && payload["message"] == "Worker error"
         }));
+    }
+
+    #[test]
+    fn test_embed_operation_as_str() {
+        assert_eq!(EmbedOperation::Download.as_str(), "Download");
+        assert_eq!(EmbedOperation::Build.as_str(), "Build");
+    }
+
+    #[test]
+    fn test_restore_state_needs_reset_on_missing_db() {
+        let settings = Settings {
+            bookmarked_dirs: vec![],
+            recent_dirs: vec![],
+            last_directory: None,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 2,
+            theme: Theme::default(),
+            search_prefer_semantic: false,
+            semantic: SemanticSettings {
+                enabled: true,
+                selected: SelectedEmbedder::default_for(EmbeddingEngine::Candle),
+                index_path: Some(PathBuf::from("semantic_index.db")),
+                ..SemanticSettings::default()
+            },
+            supported_extensions: vec![],
+            max_results: 0,
+        };
+
+        assert!(AppContext::restore_state_needs_reset(&settings, None));
+    }
+
+    #[test]
+    fn test_restore_state_needs_reset_on_mismatch() {
+        let settings = Settings {
+            bookmarked_dirs: vec![],
+            recent_dirs: vec![],
+            last_directory: None,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 2,
+            theme: Theme::default(),
+            search_prefer_semantic: false,
+            semantic: SemanticSettings {
+                enabled: true,
+                selected: SelectedEmbedder {
+                    engine: EmbeddingEngine::Fastembed,
+                    model: EmbedderModel("model-a".to_string()),
+                    dimension: 384,
+                },
+                index_path: Some(PathBuf::from("semantic_index.db")),
+                ..SemanticSettings::default()
+            },
+            supported_extensions: vec![],
+            max_results: 0,
+        };
+        let db_status = IndexStatus {
+            indexed_files: 1,
+            total_chunks: 1,
+            built_at: None,
+            build_duration_ms: None,
+            engine: EmbeddingEngine::Candle,
+            model_id: "model-b".to_string(),
+            dimension: 384,
+            root_path: None,
+            db_size_bytes: None,
+        };
+
+        assert!(AppContext::restore_state_needs_reset(
+            &settings,
+            Some(&db_status)
+        ));
+    }
+
+    #[test]
+    fn test_restore_state_needs_reset_false_when_matching() {
+        let settings = Settings {
+            bookmarked_dirs: vec![],
+            recent_dirs: vec![],
+            last_directory: None,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 2,
+            theme: Theme::default(),
+            search_prefer_semantic: false,
+            semantic: SemanticSettings {
+                enabled: true,
+                selected: SelectedEmbedder {
+                    engine: EmbeddingEngine::Fastembed,
+                    model: EmbedderModel("model-a".to_string()),
+                    dimension: 384,
+                },
+                index_path: Some(PathBuf::from("semantic_index.db")),
+                ..SemanticSettings::default()
+            },
+            supported_extensions: vec![],
+            max_results: 0,
+        };
+        let db_status = IndexStatus {
+            indexed_files: 1,
+            total_chunks: 1,
+            built_at: None,
+            build_duration_ms: None,
+            engine: EmbeddingEngine::Fastembed,
+            model_id: "model-a".to_string(),
+            dimension: 384,
+            root_path: None,
+            db_size_bytes: None,
+        };
+
+        assert!(!AppContext::restore_state_needs_reset(
+            &settings,
+            Some(&db_status)
+        ));
+    }
+
+    #[test]
+    fn test_restore_state_indexing_config() {
+        let settings = Settings {
+            supported_extensions: vec!["txt".to_string(), "md".to_string()],
+            semantic: SemanticSettings {
+                chunk_size: 128,
+                chunk_overlap: 32,
+                ..SemanticSettings::default()
+            },
+            ..Settings::default()
+        };
+
+        let indexing = AppContext::restore_state_indexing_config(&settings);
+        assert_eq!(indexing.chunk_size, 128);
+        assert_eq!(indexing.chunk_overlap, 32);
+        assert_eq!(indexing.supported_extensions, vec!["txt", "md"]);
+    }
+
+    #[test]
+    fn test_restore_state_enabled_settings() {
+        let current = SemanticSettings {
+            enabled: false,
+            index_path: None,
+            ..SemanticSettings::default()
+        };
+        let selected = SelectedEmbedder {
+            engine: EmbeddingEngine::Fastembed,
+            model: EmbedderModel("model-a".to_string()),
+            dimension: 384,
+        };
+        let updated = AppContext::restore_state_enabled_settings(
+            current,
+            PathBuf::from("semantic_index.db"),
+            selected,
+            768,
+        );
+
+        assert!(updated.enabled);
+        assert_eq!(updated.index_path, Some(PathBuf::from("semantic_index.db")));
+        assert_eq!(updated.selected.dimension, 768);
+    }
+
+    #[test]
+    fn test_open_semantic_index_with_error() {
+        let dir = tempdir().unwrap();
+        let result = AppContext::open_semantic_index_with(
+            &dir.path().to_path_buf(),
+            "model-a",
+            384,
+            |_dir, _model_id, _dim| Err(anyhow::anyhow!("open failed")),
+        );
+
+        match result {
+            Ok(_) => panic!("expected open error"),
+            Err(err) => assert!(err.to_string().contains("open failed")),
+        }
+    }
+
+    #[test]
+    fn test_start_index_watcher_with_error() {
+        let dir = tempdir().unwrap();
+        let index_arc = Arc::new(Mutex::new(None));
+        let registry = Arc::new(ExtractorRegistry::new());
+        let embedder = Arc::new(MockEmbedder::default());
+
+        let result = AppContext::start_index_watcher_with(
+            dir.path().to_path_buf(),
+            index_arc,
+            registry,
+            embedder,
+            IndexingConfig {
+                chunk_size: 64,
+                chunk_overlap: 16,
+                supported_extensions: vec!["txt".to_string()],
+            },
+            |_root, _index_arc, _registry, _embedder, _indexing, _on_reindex, _on_done| {
+                Err(anyhow::anyhow!("watcher failed"))
+            },
+        );
+
+        match result {
+            Ok(_) => panic!("expected watcher error"),
+            Err(err) => assert!(err.to_string().contains("watcher failed")),
+        }
+    }
+
+    fn running_embed_task() -> EmbedTaskHandle {
+        EmbedTaskHandle {
+            operation: EmbedOperation::Build,
+            cancel: CancellationToken::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            join: tokio::spawn(async {
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                Ok(())
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_embed_task_helpers_track_state() {
+        let (_dir, ctx) = test_ctx();
+        assert!(!ctx.embed_task_is_running());
+
+        *ctx.embed_task.lock() = Some(running_embed_task());
+        assert!(ctx.embed_task_is_running());
+
+        ctx.clear_embed_task();
+        assert!(!ctx.embed_task_is_running());
+        assert!(ctx.embed_task.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_build_index_happy_path() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
+        let plan = ctx
+            .prepare_build_index(&root.to_string_lossy(), &selected)
+            .await
+            .unwrap();
+
+        assert_eq!(plan.root_path, root);
+        assert_eq!(
+            plan.chunk_size,
+            ctx.get_settings().await.semantic.chunk_size
+        );
+        assert_eq!(
+            plan.chunk_overlap,
+            ctx.get_settings().await.semantic.chunk_overlap
+        );
+        assert_eq!(
+            plan.supported_extensions,
+            ctx.get_settings().await.supported_extensions
+        );
+        assert_eq!(
+            plan.device,
+            ctx.get_settings()
+                .await
+                .semantic
+                .device_for(EmbeddingEngine::Candle)
+                .to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_build_index_rejects_running_task() {
+        let (_dir, ctx) = test_ctx();
+        *ctx.embed_task.lock() = Some(running_embed_task());
+
+        let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
+        let err = ctx
+            .prepare_build_index("/tmp", &selected)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("already in progress"));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_build_index_validates_root_path() {
+        let (_dir, ctx) = test_ctx();
+        let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
+
+        let missing = ctx
+            .prepare_build_index("/definitely/missing/path", &selected)
+            .await
+            .unwrap_err();
+        assert!(missing.contains("Index root not found"));
+
+        let file_dir = tempdir().unwrap();
+        let file_path = file_dir.path().join("not_a_dir");
+        std::fs::write(&file_path, "hello").unwrap();
+        let not_dir = ctx
+            .prepare_build_index(&file_path.to_string_lossy(), &selected)
+            .await
+            .unwrap_err();
+        assert!(not_dir.contains("not a directory"));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_download_model_happy_path_and_running_guard() {
+        let (_dir, ctx) = test_ctx();
+        let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
+
+        let plan = ctx.prepare_download_model(&selected).await.unwrap();
+        assert_eq!(
+            plan.device,
+            ctx.get_settings()
+                .await
+                .semantic
+                .device_for(EmbeddingEngine::Candle)
+                .to_string()
+        );
+
+        *ctx.embed_task.lock() = Some(running_embed_task());
+        let err = ctx.prepare_download_model(&selected).await.unwrap_err();
+        assert!(err.contains("already in progress"));
+    }
+
+    #[test]
+    fn test_build_index_options_and_cleanup_partial_files() {
+        let dir = tempdir().unwrap();
+        let plan = BuildIndexPlan {
+            root_path: dir.path().join("root"),
+            device: "cpu".to_string(),
+            chunk_size: 123,
+            chunk_overlap: 45,
+            supported_extensions: vec!["rs".to_string(), "txt".to_string()],
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        let options = AppContext::build_index_options(
+            WorkerManager::new(WorkerPaths {
+                python_path: PathBuf::from("python"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("reqs.txt"),
+                venv_dir: PathBuf::from("venv"),
+                worker_bin: PathBuf::from("worker"),
+                data_dir: dir.path().to_path_buf(),
+            })
+            .0,
+            dir.path().to_path_buf(),
+            &plan,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(options.device.as_deref(), Some("cpu"));
+        assert_eq!(options.chunk_size, 123);
+        assert_eq!(options.chunk_overlap, 45);
+        assert_eq!(options.supported_extensions, vec!["rs", "txt"]);
+
+        for suffix in [".tmp", ".tmp-wal", ".tmp-shm"] {
+            std::fs::write(dir.path().join(format!("semantic_index.db{suffix}")), "x").unwrap();
+        }
+        AppContext::cleanup_partial_index_files(dir.path());
+        for suffix in [".tmp", ".tmp-wal", ".tmp-shm"] {
+            assert!(!dir
+                .path()
+                .join(format!("semantic_index.db{suffix}"))
+                .exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_emit_progress_helpers() {
+        let dir = tempdir().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(MockEmitter {
+            events: Arc::clone(&captured),
+        });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths::resolve(dir.path()),
+            emitter,
+        );
+        let progress = EmbedProgress::Build(wilkes_core::embed::installer::IndexBuildProgress {
+            files_processed: 1,
+            total_files: 2,
+            message: "building".to_string(),
+            done: false,
+        });
+        ctx.emit_progress_event(&progress);
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "embed-progress");
+    }
+
+    #[tokio::test]
+    async fn test_forward_embed_progress_emits_events() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let emitter: Arc<dyn EventEmitter> = Arc::new(MockEmitter {
+            events: Arc::clone(&captured),
+        });
+        let (tx, rx) = mpsc::channel(2);
+
+        let forward = tokio::spawn(AppContext::forward_embed_progress(Arc::clone(&emitter), rx));
+        tx.send(EmbedProgress::Download(
+            wilkes_core::embed::installer::DownloadProgress {
+                bytes_received: 3,
+                total_bytes: 9,
+                done: false,
+            },
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        forward.await.unwrap();
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "embed-progress");
+    }
+
+    #[tokio::test]
+    async fn test_open_built_index_error_and_store_loaded_state() {
+        let (dir, ctx) = test_ctx();
+        let err = match ctx
+            .open_built_index(dir.path().to_path_buf(), "missing-model".to_string(), 384)
+            .await
+        {
+            Ok(_) => panic!("expected open_built_index to fail"),
+            Err(err) => err,
+        };
+        assert!(!err.is_empty());
+
+        let data_dir = ctx.data_dir.clone();
+        let index = SemanticIndex::create(
+            &data_dir,
+            "mock-model",
+            384,
+            EmbeddingEngine::Candle,
+            Some(dir.path()),
+        )
+        .unwrap();
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+        let index_arc = ctx.restore_store_loaded_state(Arc::clone(&embedder), index);
+
+        assert!(ctx.embedder.lock().is_some());
+        assert!(ctx.index.lock().lock().unwrap().is_some());
+        assert!(index_arc.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn test_prepare_restore_state_plan_variants() {
+        let matching = Settings {
+            semantic: SemanticSettings {
+                selected: SelectedEmbedder {
+                    engine: EmbeddingEngine::Candle,
+                    model: EmbedderModel("model-a".to_string()),
+                    dimension: 384,
+                },
+                ..SemanticSettings::default()
+            },
+            ..Settings::default()
+        };
+        let db_status = IndexStatus {
+            indexed_files: 1,
+            total_chunks: 1,
+            built_at: None,
+            build_duration_ms: None,
+            engine: EmbeddingEngine::Candle,
+            model_id: "model-a".to_string(),
+            dimension: 384,
+            root_path: None,
+            db_size_bytes: None,
+        };
+
+        match AppContext::prepare_restore_state_plan(matching.clone(), db_status.clone()) {
+            RestoreStatePreparation::Ready(plan) => {
+                assert_eq!(plan.selected.model.model_id(), "model-a");
+                assert_eq!(plan.db_status.model_id, "model-a");
+            }
+            RestoreStatePreparation::ResetStaleSelection { .. } => panic!("expected ready plan"),
+        }
+
+        let mismatched = Settings {
+            semantic: SemanticSettings {
+                selected: SelectedEmbedder {
+                    engine: EmbeddingEngine::Fastembed,
+                    model: EmbedderModel("model-b".to_string()),
+                    dimension: 384,
+                },
+                ..SemanticSettings::default()
+            },
+            ..Settings::default()
+        };
+        match AppContext::prepare_restore_state_plan(mismatched, db_status) {
+            RestoreStatePreparation::ResetStaleSelection {
+                db_status,
+                selected,
+            } => {
+                assert_eq!(db_status.model_id, "model-a");
+                assert_eq!(selected.model.model_id(), "model-b");
+            }
+            RestoreStatePreparation::Ready(_) => panic!("expected stale-selection reset"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_embedder_with_installer_branches() {
+        let (_dir, ctx) = test_ctx();
+
+        let install_fail: Arc<dyn EmbedderInstaller> = Arc::new(FakeInstaller {
+            install_calls: Arc::new(AtomicUsize::new(0)),
+            build_calls: Arc::new(AtomicUsize::new(0)),
+            available: true,
+            install_should_fail: true,
+            build_should_fail: false,
+        });
+        assert!(ctx.restore_embedder_with(install_fail).await.is_none());
+
+        let unavailable: Arc<dyn EmbedderInstaller> = Arc::new(FakeInstaller {
+            install_calls: Arc::new(AtomicUsize::new(0)),
+            build_calls: Arc::new(AtomicUsize::new(0)),
+            available: false,
+            install_should_fail: false,
+            build_should_fail: false,
+        });
+        assert!(ctx.restore_embedder_with(unavailable).await.is_none());
+
+        let build_fail: Arc<dyn EmbedderInstaller> = Arc::new(FakeInstaller {
+            install_calls: Arc::new(AtomicUsize::new(0)),
+            build_calls: Arc::new(AtomicUsize::new(0)),
+            available: true,
+            install_should_fail: false,
+            build_should_fail: true,
+        });
+        assert!(ctx.restore_embedder_with(build_fail).await.is_none());
+
+        let ok: Arc<dyn EmbedderInstaller> = Arc::new(FakeInstaller {
+            install_calls: Arc::new(AtomicUsize::new(0)),
+            build_calls: Arc::new(AtomicUsize::new(0)),
+            available: true,
+            install_should_fail: false,
+            build_should_fail: false,
+        });
+        assert!(ctx.restore_embedder_with(ok).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_probe_and_load_downloaded_model_with_installer_branches() {
+        let (_dir, ctx) = test_ctx();
+
+        let install_fail: Arc<dyn EmbedderInstaller> = Arc::new(FakeInstaller {
+            install_calls: Arc::new(AtomicUsize::new(0)),
+            build_calls: Arc::new(AtomicUsize::new(0)),
+            available: true,
+            install_should_fail: true,
+            build_should_fail: false,
+        });
+        let err = ctx
+            .probe_and_load_downloaded_model_with(install_fail)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Failed to probe model dimensions"));
+
+        let build_fail: Arc<dyn EmbedderInstaller> = Arc::new(FakeInstaller {
+            install_calls: Arc::new(AtomicUsize::new(0)),
+            build_calls: Arc::new(AtomicUsize::new(0)),
+            available: true,
+            install_should_fail: false,
+            build_should_fail: true,
+        });
+        let err = ctx
+            .probe_and_load_downloaded_model_with(build_fail)
+            .await
+            .unwrap_err();
+        assert!(err.contains("build failed"));
+
+        let ok: Arc<dyn EmbedderInstaller> = Arc::new(FakeInstaller {
+            install_calls: Arc::new(AtomicUsize::new(0)),
+            build_calls: Arc::new(AtomicUsize::new(0)),
+            available: true,
+            install_should_fail: false,
+            build_should_fail: false,
+        });
+        ctx.probe_and_load_downloaded_model_with(ok).await.unwrap();
+        assert!(ctx.embedder.lock().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_maybe_restore_watcher_and_finish_restore_state() {
+        let (dir, ctx) = test_ctx();
+        let data_dir = ctx.data_dir.clone();
+        let index = SemanticIndex::create(
+            &data_dir,
+            "restore-model",
+            384,
+            EmbeddingEngine::Candle,
+            Some(dir.path()),
+        )
+        .unwrap();
+        let index_arc = Arc::new(Mutex::new(Some(index)));
+        let bad_root = dir.path().join("not-a-dir.txt");
+        std::fs::write(&bad_root, "nope").unwrap();
+        let settings = Settings {
+            last_directory: Some(bad_root),
+            supported_extensions: vec!["txt".to_string()],
+            semantic: SemanticSettings {
+                chunk_size: 64,
+                chunk_overlap: 8,
+                ..SemanticSettings::default()
+            },
+            ..Settings::default()
+        };
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+        ctx.maybe_restore_watcher(&settings, index_arc, Arc::clone(&embedder));
+        ctx.stop_watcher();
+        assert!(ctx.watcher.lock().is_none());
+
+        let (_dir2, ctx2) = test_ctx();
+        let data_dir2 = ctx2.data_dir.clone();
+        let index = SemanticIndex::create(
+            &data_dir2,
+            "restore-model",
+            384,
+            EmbeddingEngine::Candle,
+            None,
+        )
+        .unwrap();
+        let plan = RestoreStatePlan {
+            settings: Settings::default(),
+            db_status: IndexStatus {
+                indexed_files: 1,
+                total_chunks: 1,
+                built_at: None,
+                build_duration_ms: None,
+                engine: EmbeddingEngine::Candle,
+                model_id: "restore-model".to_string(),
+                dimension: 384,
+                root_path: None,
+                db_size_bytes: None,
+            },
+            selected: SelectedEmbedder {
+                engine: EmbeddingEngine::Candle,
+                model: EmbedderModel("restore-model".to_string()),
+                dimension: 1,
+            },
+            device: "cpu".to_string(),
+        };
+        ctx2.finish_restore_state(&plan, embedder, index).await;
+
+        let settings = ctx2.get_settings().await;
+        assert!(settings.semantic.enabled);
+        assert_eq!(settings.semantic.selected.dimension, 384);
     }
 
     #[tokio::test]
@@ -970,6 +1998,19 @@ mod tests {
         );
 
         assert!(!ctx.is_semantic_ready());
+
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+        *ctx.embedder.lock() = Some(embedder);
+        let index = SemanticIndex::create(
+            &ctx.data_dir,
+            "semantic-ready",
+            384,
+            EmbeddingEngine::Candle,
+            None,
+        )
+        .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
+        assert!(ctx.is_semantic_ready());
     }
 
     #[tokio::test]

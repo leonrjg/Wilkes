@@ -5,6 +5,7 @@ use std::sync::Arc;
 use ignore::WalkBuilder;
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::installer::ProgressTx;
+use wilkes_core::embed::models::installer::EmbedderInstaller;
 use wilkes_core::embed::Embedder;
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
@@ -116,6 +117,14 @@ pub async fn build_index(
         device,
     );
 
+    build_index_with_installer(root, installer, options).await
+}
+
+pub async fn build_index_with_installer(
+    root: PathBuf,
+    installer: Arc<dyn EmbedderInstaller>,
+    options: BuildIndexOptions,
+) -> anyhow::Result<Arc<dyn Embedder>> {
     // Ensure model is ready (probes dimension for SBERT, no-op for others if already cached)
     installer
         .install(&options.data_dir, options.tx.clone())
@@ -164,6 +173,7 @@ pub async fn delete_index(data_dir: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -183,8 +193,8 @@ mod tests {
         assert!(!db_path.exists());
     }
 
-    struct MockEmbedder;
-    impl Embedder for MockEmbedder {
+    struct TestEmbedder;
+    impl Embedder for TestEmbedder {
         fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
             Ok(vec![vec![0.0; 768]])
         }
@@ -199,6 +209,36 @@ mod tests {
         }
     }
 
+    struct FakeInstaller {
+        install_calls: Arc<AtomicUsize>,
+        build_calls: Arc<AtomicUsize>,
+        install_should_fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbedderInstaller for FakeInstaller {
+        fn is_available(&self, _data_dir: &Path) -> bool {
+            true
+        }
+
+        async fn install(&self, _data_dir: &Path, _tx: ProgressTx) -> anyhow::Result<()> {
+            self.install_calls.fetch_add(1, Ordering::Relaxed);
+            if self.install_should_fail {
+                anyhow::bail!("install failed")
+            }
+            Ok(())
+        }
+
+        fn uninstall(&self, _data_dir: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn build(&self, _data_dir: &Path) -> anyhow::Result<Arc<dyn Embedder>> {
+            self.build_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Arc::new(TestEmbedder))
+        }
+    }
+
     #[tokio::test]
     async fn test_build_index_with_embedder() {
         let dir = tempdir().unwrap();
@@ -209,7 +249,7 @@ mod tests {
         let data_dir = dir.path().join("data");
         std::fs::create_dir(&data_dir).unwrap();
 
-        let embedder = Arc::new(MockEmbedder);
+        let embedder = Arc::new(TestEmbedder);
         let (tx, _rx) = tokio::sync::mpsc::channel(10);
         let supported_extensions = vec!["txt".to_string()];
 
@@ -230,6 +270,44 @@ mod tests {
 
         let db_path = data_dir.join("semantic_index.db");
         assert!(db_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_build_index_with_installer() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("files");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("test.txt"), "hello world").unwrap();
+
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+
+        let install_calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = Arc::new(AtomicUsize::new(0));
+        let installer = Arc::new(FakeInstaller {
+            install_calls: Arc::clone(&install_calls),
+            build_calls: Arc::clone(&build_calls),
+            install_should_fail: false,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+
+        let options = BuildIndexOptions {
+            manager: None,
+            device: None,
+            data_dir: data_dir.clone(),
+            tx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            chunk_size: 600,
+            chunk_overlap: 128,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let result = build_index_with_installer(root, installer, options).await;
+
+        assert!(result.is_ok());
+        assert_eq!(install_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(build_calls.load(Ordering::Relaxed), 1);
+        assert!(data_dir.join("semantic_index.db").exists());
     }
 
     #[tokio::test]

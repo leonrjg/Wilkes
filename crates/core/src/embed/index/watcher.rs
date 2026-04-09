@@ -393,14 +393,7 @@ mod tests {
         std::fs::write(&file_path, "hello").unwrap();
 
         let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
-        handle_event(
-            &file_path,
-            &index,
-            &registry,
-            &embedder,
-            100,
-            10,
-        );
+        handle_event(&file_path, &index, &registry, &embedder, 100, 10);
 
         assert_eq!(
             index

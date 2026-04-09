@@ -5,6 +5,7 @@
 **/lcov.info
 **/*tarpaulin*
 ui/coverage/
+cobertura.xml
 
 # OS
 .DS_Store
