@@ -78,6 +78,36 @@ mod tests {
     }
 
     #[test]
+    fn test_worker_request_defaults_on_missing_fields() {
+        let req = WorkerRequest {
+            mode: "build".to_string(),
+            root: PathBuf::from("root"),
+            engine: EmbeddingEngine::Fastembed,
+            model: "model".to_string(),
+            data_dir: PathBuf::from("data"),
+            chunk_size: Some(100),
+            chunk_overlap: Some(10),
+            device: "cpu".to_string(),
+            paths: None,
+            texts: None,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let mut json = serde_json::to_value(&req).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("mode");
+        obj.remove("device");
+        obj.remove("chunk_size");
+        obj.remove("chunk_overlap");
+
+        let de: WorkerRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(de.mode, "build");
+        assert_eq!(de.device, "auto");
+        assert_eq!(de.chunk_size, None);
+        assert_eq!(de.chunk_overlap, None);
+    }
+
+    #[test]
     fn test_worker_event_serialization() {
         let events = vec![
             WorkerEvent::Done,

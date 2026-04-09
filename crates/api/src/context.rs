@@ -2137,4 +2137,51 @@ mod tests {
         assert_eq!(s.semantic.enabled, true);
         assert!(settings_path.exists());
     }
+
+    #[tokio::test]
+    async fn test_worker_status_timeout_and_delete_index_wrapper() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let emitter = Arc::new(MockEmitter {
+            events: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        let (ctx, _event_rx, loop_fut) = AppContext::new(
+            data_dir.clone(),
+            settings_path,
+            WorkerPaths::resolve(dir.path()),
+            emitter,
+        );
+        let _loop_handle = tokio::spawn(loop_fut);
+
+        let status = ctx.get_worker_status();
+        assert!(!status.active);
+        assert_eq!(status.timeout_secs, 300);
+
+        ctx.set_worker_timeout(123).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let status = ctx.get_worker_status();
+        assert_eq!(status.timeout_secs, 123);
+
+        let index = SemanticIndex::create(
+            &data_dir,
+            "test-model",
+            3,
+            EmbeddingEngine::Candle,
+            Some(dir.path()),
+        )
+        .unwrap();
+        drop(index);
+
+        let index_path = data_dir.join("semantic_index.db");
+        assert!(index_path.exists());
+
+        let status = ctx.get_index_status().await.unwrap();
+        assert_eq!(status.model_id, "test-model");
+
+        ctx.delete_index().await.unwrap();
+        assert!(!index_path.exists());
+    }
 }

@@ -1034,4 +1034,42 @@ mod tests {
         // Max of [1,10,3] and [4,5,6] is [4, 10, 6]
         assert_eq!(pooled.to_vec2::<f32>().unwrap(), vec![vec![4.0, 10.0, 6.0]]);
     }
+
+    #[test]
+    fn test_list_supported_models_cached_size() {
+        let dir = tempdir().unwrap();
+        let model_id = "BAAI/bge-base-en-v1.5";
+        let repo_dir = dir
+            .path()
+            .join(format!("models--{}", model_id.replace('/', "--")));
+        let snapshots = repo_dir.join("snapshots").join("main");
+        std::fs::create_dir_all(&snapshots).unwrap();
+
+        let files = [
+            ("config.json", r#"{"hidden_size": 768}"#),
+            ("tokenizer.json", r#"{"dummy":true}"#),
+            ("model.safetensors", "weights"),
+        ];
+        let mut expected_size = 0u64;
+        for (name, content) in files {
+            let path = snapshots.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, content).unwrap();
+            expected_size += content.len() as u64;
+        }
+
+        let refs = repo_dir.join("refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("main"), "main").unwrap();
+
+        let models = list_supported_models(dir.path());
+        let model = models
+            .iter()
+            .find(|m| m.model_id == model_id)
+            .expect("expected cached Candle model");
+        assert!(model.is_cached);
+        assert_eq!(model.size_bytes, Some(expected_size));
+    }
 }

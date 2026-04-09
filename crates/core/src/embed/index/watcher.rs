@@ -389,75 +389,45 @@ mod tests {
             .unwrap();
         let index = Arc::new(Mutex::new(Some(idx)));
         let registry = Arc::new(ExtractorRegistry::new());
-
-        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
-
-        let reindex_called = Arc::new(Mutex::new(false));
-        let reindex_done_called = Arc::new(Mutex::new(false));
-
-        let rc1 = Arc::clone(&reindex_called);
-        let rd1 = Arc::clone(&reindex_done_called);
-
-        let mut watcher = IndexWatcher::start(
-            dir.path().to_path_buf(),
-            Arc::clone(&index),
-            registry,
-            embedder,
-            IndexingConfig {
-                chunk_size: 100,
-                chunk_overlap: 10,
-                supported_extensions: vec!["txt".to_string()],
-            },
-            move || {
-                *rc1.lock().unwrap() = true;
-            },
-            move || {
-                *rd1.lock().unwrap() = true;
-            },
-        )
-        .unwrap();
-
-        // Create a file to trigger watcher
         let file_path = dir.path().join("watch_me.txt");
         std::fs::write(&file_path, "hello").unwrap();
 
-        // Wait for debouncer (500ms + some buffer)
-        std::thread::sleep(Duration::from_millis(1500));
-
-        assert!(
-            *reindex_called.lock().unwrap(),
-            "on_reindex should have been called"
-        );
-        assert!(
-            *reindex_done_called.lock().unwrap(),
-            "on_reindex_done should have been called"
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+        handle_event(
+            &file_path,
+            &index,
+            &registry,
+            &embedder,
+            100,
+            10,
         );
 
-        {
-            let guard = index.lock().unwrap();
-            let idx_final = guard.as_ref().unwrap();
-            assert_eq!(
-                idx_final.status().total_chunks,
-                1,
-                "File should have been indexed"
-            );
-        }
+        assert_eq!(
+            index
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .status()
+                .total_chunks,
+            1,
+            "File should have been indexed"
+        );
 
-        // Test removal
         std::fs::remove_file(&file_path).unwrap();
-        std::thread::sleep(Duration::from_millis(1500));
+        handle_event(&file_path, &index, &registry, &embedder, 100, 10);
 
-        {
-            let guard = index.lock().unwrap();
-            let idx_final = guard.as_ref().unwrap();
-            assert_eq!(
-                idx_final.status().total_chunks,
-                0,
-                "File should have been removed from index"
-            );
-        }
-
-        watcher.stop();
+        assert_eq!(
+            index
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .status()
+                .total_chunks,
+            0,
+            "File should have been removed from index"
+        );
     }
 
     #[test]

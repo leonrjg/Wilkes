@@ -183,3 +183,201 @@ async fn build_command(paths: &WorkerPaths, req: &WorkerRequest) -> Result<Comma
 
 #[allow(dead_code)]
 fn _assert_path(_: &Path) {}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
+
+    fn write_executable(path: &Path, content: &str) {
+        std::fs::write(path, content).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn write_candle_worker_script(path: &Path, output_protocol: bool) {
+        let body = if output_protocol {
+            r#"#!/bin/sh
+read req
+echo noise-line
+echo '{"Embeddings":[[1.0,2.0]]}'
+echo '"Done"'
+exit 0
+"#
+        } else {
+            r#"#!/bin/sh
+read req
+exit 0
+"#
+        };
+        write_executable(path, body);
+    }
+
+    fn write_fake_python_suite(path: &Path, venv_dir: &Path) {
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "-c" ]; then
+    printf '%s\n' "3.9.6"
+    exit 0
+fi
+
+case "$*" in
+*"-m venv"*)
+    mkdir -p "{venv}/bin"
+    cat > "{venv}/bin/python3" <<'EOF'
+#!/bin/sh
+if [ "$1" = "-m" ] && [ "$2" = "wilkes_python_worker" ]; then
+  read req
+  echo noise-line
+  echo '{{"Embeddings":[[1.0,2.0]]}}'
+  echo '"Done"'
+  exit 0
+fi
+exit 0
+EOF
+    chmod +x "{venv}/bin/python3"
+    exit 0
+    ;;
+esac
+
+exit 0
+"#,
+            venv = venv_dir.display()
+        );
+        write_executable(path, &script);
+    }
+
+    #[tokio::test]
+    async fn test_worker_process_send_request_protocol() {
+        let dir = tempdir().unwrap();
+        let worker_bin = dir.path().join("worker.sh");
+        write_candle_worker_script(&worker_bin, true);
+
+        let paths = WorkerPaths {
+            python_path: dir.path().join("python"),
+            python_package_dir: dir.path().to_path_buf(),
+            requirements_path: dir.path().join("requirements.txt"),
+            venv_dir: dir.path().join("venv"),
+            worker_bin: worker_bin.clone(),
+            data_dir: dir.path().to_path_buf(),
+        };
+        std::fs::write(&paths.requirements_path, "torch\n").unwrap();
+
+        let req = WorkerRequest {
+            mode: "embed".to_string(),
+            root: dir.path().to_path_buf(),
+            engine: EmbeddingEngine::Candle,
+            model: "m".to_string(),
+            data_dir: dir.path().to_path_buf(),
+            chunk_size: None,
+            chunk_overlap: None,
+            device: "cpu".to_string(),
+            paths: None,
+            texts: Some(vec!["hello".to_string()]),
+            supported_extensions: vec![],
+        };
+
+        let active_pid = AtomicU32::new(0);
+        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid).await.unwrap();
+        let (reply_tx, mut reply_rx) = mpsc::channel(8);
+        let req_json = serde_json::to_string(&req).unwrap();
+        proc.send_request(&req_json, &reply_tx).await.unwrap();
+
+        match reply_rx.recv().await.unwrap() {
+            WorkerEvent::Embeddings(v) => assert_eq!(v, vec![vec![1.0, 2.0]]),
+            other => panic!("expected embeddings, got {other:?}"),
+        }
+        assert!(matches!(reply_rx.recv().await.unwrap(), WorkerEvent::Done));
+
+        proc.shutdown(&active_pid).await;
+        assert_eq!(active_pid.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_worker_process_send_request_closed_stdout() {
+        let dir = tempdir().unwrap();
+        let worker_bin = dir.path().join("worker.sh");
+        write_candle_worker_script(&worker_bin, false);
+
+        let paths = WorkerPaths {
+            python_path: dir.path().join("python"),
+            python_package_dir: dir.path().to_path_buf(),
+            requirements_path: dir.path().join("requirements.txt"),
+            venv_dir: dir.path().join("venv"),
+            worker_bin: worker_bin.clone(),
+            data_dir: dir.path().to_path_buf(),
+        };
+        std::fs::write(&paths.requirements_path, "torch\n").unwrap();
+
+        let req = WorkerRequest {
+            mode: "embed".to_string(),
+            root: dir.path().to_path_buf(),
+            engine: EmbeddingEngine::Candle,
+            model: "m".to_string(),
+            data_dir: dir.path().to_path_buf(),
+            chunk_size: None,
+            chunk_overlap: None,
+            device: "cpu".to_string(),
+            paths: None,
+            texts: Some(vec!["hello".to_string()]),
+            supported_extensions: vec![],
+        };
+
+        let active_pid = AtomicU32::new(0);
+        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid).await.unwrap();
+        let (reply_tx, mut reply_rx) = mpsc::channel(8);
+        let req_json = serde_json::to_string(&req).unwrap();
+        let res = proc.send_request(&req_json, &reply_tx).await;
+        assert!(res.is_err());
+        match reply_rx.recv().await.unwrap() {
+            WorkerEvent::Error(msg) => assert!(msg.contains("closed stdout")),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_process_spawn_sbert_build_command() {
+        let dir = tempdir().unwrap();
+        let python_path = dir.path().join("python");
+        let venv_dir = dir.path().join("venv");
+        write_fake_python_suite(&python_path, &venv_dir);
+
+        let requirements_path = dir.path().join("requirements.txt");
+        std::fs::write(&requirements_path, "torch\n").unwrap();
+
+        let paths = WorkerPaths {
+            python_path,
+            python_package_dir: dir.path().to_path_buf(),
+            requirements_path,
+            venv_dir,
+            worker_bin: dir.path().join("unused-worker"),
+            data_dir: dir.path().to_path_buf(),
+        };
+
+        let req = WorkerRequest {
+            mode: "embed".to_string(),
+            root: dir.path().to_path_buf(),
+            engine: EmbeddingEngine::SBERT,
+            model: "intfloat/e5-small-v2".to_string(),
+            data_dir: dir.path().to_path_buf(),
+            chunk_size: None,
+            chunk_overlap: None,
+            device: "cpu".to_string(),
+            paths: None,
+            texts: Some(vec!["hello".to_string()]),
+            supported_extensions: vec![],
+        };
+
+        let active_pid = AtomicU32::new(0);
+        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid).await.unwrap();
+        let (reply_tx, mut reply_rx) = mpsc::channel(8);
+        let req_json = serde_json::to_string(&req).unwrap();
+        proc.send_request(&req_json, &reply_tx).await.unwrap();
+
+        match reply_rx.recv().await.unwrap() {
+            WorkerEvent::Embeddings(v) => assert_eq!(v, vec![vec![1.0, 2.0]]),
+            other => panic!("expected embeddings, got {other:?}"),
+        }
+        assert!(matches!(reply_rx.recv().await.unwrap(), WorkerEvent::Done));
+    }
+}

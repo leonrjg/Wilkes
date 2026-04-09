@@ -262,9 +262,14 @@ mod tests {
     use tempfile::tempdir;
 
     #[cfg(unix)]
-    fn write_fake_python(python_path: &Path, version_file: &Path, venv_counter_file: &Path) {
+    fn write_executable(path: &Path, content: &str) {
         use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, content).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
+    #[cfg(unix)]
+    fn write_fake_python(python_path: &Path, version_file: &Path, venv_counter_file: &Path) {
         let script = format!(
             r#"#!/bin/sh
 if [ "$1" = "-c" ]; then
@@ -294,8 +299,37 @@ exit 0
             venv_counter_file.display()
         );
 
-        std::fs::write(python_path, script).unwrap();
-        std::fs::set_permissions(python_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(python_path, &script);
+    }
+
+    #[cfg(unix)]
+    fn write_fake_python_with_output(python_path: &Path, version: &str, worker_body: &str) {
+        let script = r#"#!/bin/sh
+if [ "$1" = "-c" ]; then
+    printf '%s\n' "__VERSION__"
+    exit 0
+fi
+
+case "$*" in
+*"-m venv"*)
+    mkdir -p "$3/bin"
+    cat > "$3/bin/python3" <<'EOF'
+#!/bin/sh
+if [ "$1" = "-m" ] && [ "$2" = "wilkes_python_worker" ]; then
+__WORKER__
+fi
+exit 0
+EOF
+    chmod +x "$3/bin/python3"
+    ;;
+esac
+
+exit 0
+"#
+        .replace("__VERSION__", version)
+        .replace("__WORKER__", worker_body);
+
+        write_executable(python_path, &script);
     }
 
     #[tokio::test]
@@ -410,5 +444,94 @@ exit 0
         let bad_path = dir.path().join("non_existent");
         let res = run_setup_step(&bad_path, vec![], "test").await;
         assert!(res.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_setup_step_captures_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("echo.sh");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+echo stdout-line
+echo stderr-line 1>&2
+exit 0
+"#,
+        );
+
+        run_setup_step(&script, vec![], "echo-step").await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_setup_step_non_zero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fail.sh");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+echo failing
+exit 7
+"#,
+        );
+
+        let err = run_setup_step(&script, vec![], "fail-step")
+            .await
+            .unwrap_err();
+        assert!(err.contains("exit code Some(7)"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_setup_python_env_rejects_bad_version_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let python_path = dir.path().join("fake_python");
+        write_fake_python_with_output(&python_path, "not-a-version", "echo worker");
+
+        let requirements_path = dir.path().join("requirements.txt");
+        std::fs::write(&requirements_path, "torch\n").unwrap();
+
+        let paths = WorkerPaths {
+            python_path,
+            python_package_dir: dir.path().to_path_buf(),
+            requirements_path,
+            venv_dir: dir.path().join("venv"),
+            worker_bin: dir.path().join("worker"),
+            data_dir: dir.path().to_path_buf(),
+        };
+
+        let err = setup_python_env(&paths).await.unwrap_err();
+        assert!(err.contains("Failed to parse Python version"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_setup_python_env_version_query_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let python_path = dir.path().join("fake_python");
+        write_executable(
+            &python_path,
+            r#"#!/bin/sh
+echo version-query-error 1>&2
+exit 2
+"#,
+        );
+
+        let requirements_path = dir.path().join("requirements.txt");
+        std::fs::write(&requirements_path, "torch\n").unwrap();
+
+        let paths = WorkerPaths {
+            python_path,
+            python_package_dir: dir.path().to_path_buf(),
+            requirements_path,
+            venv_dir: dir.path().join("venv"),
+            worker_bin: dir.path().join("worker"),
+            data_dir: dir.path().to_path_buf(),
+        };
+
+        let err = setup_python_env(&paths).await.unwrap_err();
+        assert!(err.contains("Failed to query Python version"));
+        assert!(err.contains("version-query-error"));
     }
 }

@@ -491,28 +491,42 @@ mod tests {
     }
 
     #[test]
-    fn test_fetch_model_size_mock() {
-        use mockito::Server;
-        let mut server = Server::new();
+    fn test_list_supported_models_cached_size() {
+        let dir = tempdir().unwrap();
+        let info = TextEmbedding::list_supported_models()
+            .into_iter()
+            .find(|m| format!("{:?}", m.model) == "BGEBaseENV15")
+            .expect("expected built-in fastembed model");
 
-        // Mock HF API
-        let _m = server
-            .mock("GET", "/api/models/Xenova/bge-base-en-v1.5")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                r#"{
-                "siblings": [
-                    {"rfilename": "model.onnx", "size": 1000},
-                    {"rfilename": "tokenizer.json", "size": 500},
-                    {"rfilename": "other.txt", "size": 100}
-                ]
-            }"#,
-            )
-            .create();
+        let repo_dir = dir
+            .path()
+            .join(format!("models--{}", info.model_code.replace('/', "--")));
+        let snapshots = repo_dir.join("snapshots").join("main");
+        std::fs::create_dir_all(&snapshots).unwrap();
 
-        // We need to point hf-hub or our fetch_hf_siblings to this server.
-        // fetch_hf_siblings uses ureq.
-        // If we can't easily override the URL, we might skip this or use a different approach.
+        let mut expected_size = 0u64;
+        for name in std::iter::once(info.model_file.as_str())
+            .chain(info.additional_files.iter().map(String::as_str))
+        {
+            let content = format!("cached-{name}");
+            let file_path = snapshots.join(name);
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&file_path, content.as_bytes()).unwrap();
+            expected_size += content.len() as u64;
+        }
+
+        let refs = repo_dir.join("refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("main"), "main").unwrap();
+
+        let models = list_supported_models(dir.path());
+        let model = models
+            .iter()
+            .find(|m| m.model_id == "BGEBaseENV15")
+            .expect("expected cached model descriptor");
+        assert!(model.is_cached);
+        assert_eq!(model.size_bytes, Some(expected_size));
     }
 }

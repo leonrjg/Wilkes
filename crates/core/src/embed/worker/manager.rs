@@ -184,6 +184,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_worker_paths_resolve_shapes_paths() {
+        let dir = tempdir().unwrap();
+        let paths = WorkerPaths::resolve(dir.path());
+
+        assert_eq!(paths.data_dir, dir.path());
+        assert_eq!(paths.venv_dir, dir.path().join("sbert_venv"));
+        assert_eq!(
+            paths.worker_bin.file_name().and_then(|s| s.to_str()),
+            Some("wilkes-rust-worker")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_worker_manager_try_send_and_blocking_send() {
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("r"),
+            venv_dir: PathBuf::from("v"),
+            worker_bin: PathBuf::from("w"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let _loop_handle = tokio::spawn(loop_fut);
+
+        manager.try_send(ManagerCommand::SetTimeout(55)).unwrap();
+        let manager_for_blocking = manager.clone();
+        tokio::task::spawn_blocking(move || {
+            manager_for_blocking
+                .blocking_send(ManagerCommand::SetTimeout(77))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let status = manager.status();
+        assert_eq!(status.timeout_secs, 77);
+    }
+
+    #[tokio::test]
     async fn test_worker_manager_lifecycle_no_process() {
         let paths = WorkerPaths {
             python_path: PathBuf::from("p"),
