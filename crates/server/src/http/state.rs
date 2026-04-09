@@ -205,5 +205,178 @@ pub fn mime_for_path(path: &Path) -> &'static str {
 pub fn upload_write_plan(uploads_dir: &Path, rel: &Path) -> UploadWritePlan {
     let dest = uploads_dir.join(rel);
     let create_parent = dest.parent().map(PathBuf::from);
-    UploadWritePlan { dest, create_parent }
+    UploadWritePlan {
+        dest,
+        create_parent,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use tempfile::tempdir;
+
+    struct FakeFs {
+        canonical: HashMap<PathBuf, PathBuf>,
+    }
+
+    #[async_trait]
+    impl ServerFs for FakeFs {
+        async fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            self.canonical
+                .get(path)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing"))
+        }
+
+        async fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        async fn write(&self, _path: &Path, _data: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn create_dir_all(&self, _path: &Path) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn remove_file(&self, _path: &Path) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn remove_dir_all(&self, _path: &Path) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn dir_size(&self, _path: &Path) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn sanitize_relative_upload_path_strips_traversal_and_separators() {
+        let path = sanitize_relative_upload_path("../foo//bar\\..\\baz");
+        assert_eq!(path, PathBuf::from("foo/bar/baz"));
+    }
+
+    #[test]
+    fn validate_delete_target_rejects_root_and_accepts_file_targets() {
+        let err = validate_delete_target(Path::new("")).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let target = match validate_delete_target(Path::new("nested/file.txt")) {
+            Ok(target) => target,
+            Err(_) => panic!("expected delete target validation to succeed"),
+        };
+        assert_eq!(target.canonical, PathBuf::from("nested/file.txt"));
+        assert_eq!(target.kind, DeleteKind::File);
+    }
+
+    #[test]
+    fn upload_write_plan_sets_destination_and_parent() {
+        let plan = upload_write_plan(Path::new("/uploads"), Path::new("dir/file.txt"));
+        assert_eq!(plan.dest, PathBuf::from("/uploads/dir/file.txt"));
+        assert_eq!(plan.create_parent, Some(PathBuf::from("/uploads/dir")));
+    }
+
+    #[test]
+    fn mime_for_path_covers_common_variants() {
+        assert_eq!(mime_for_path(Path::new("a.pdf")), "application/pdf");
+        assert_eq!(mime_for_path(Path::new("a.md")), "text/plain");
+        assert_eq!(mime_for_path(Path::new("a.html")), "text/html");
+        assert_eq!(mime_for_path(Path::new("a.json")), "application/json");
+        assert_eq!(mime_for_path(Path::new("a.png")), "image/png");
+        assert_eq!(mime_for_path(Path::new("a.jpg")), "image/jpeg");
+        assert_eq!(
+            mime_for_path(Path::new("a.bin")),
+            "application/octet-stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_and_search_plans_enforce_upload_boundaries() {
+        let dir = tempdir().unwrap();
+        let uploads = dir.path().join("uploads");
+        let file = uploads.join("docs/note.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "hello").unwrap();
+
+        let fake = FakeFs {
+            canonical: HashMap::from([
+                (uploads.clone(), uploads.canonicalize().unwrap()),
+                (file.clone(), file.canonicalize().unwrap()),
+            ]),
+        };
+
+        let asset = match asset_access_plan(&file, &uploads, &fake).await {
+            Ok(asset) => asset,
+            Err(_) => panic!("expected asset access to succeed"),
+        };
+        assert_eq!(asset.canonical, file.canonicalize().unwrap());
+        assert_eq!(asset.content_type, "text/plain");
+
+        let outside = dir.path().join("outside.txt");
+        let denied = match asset_access_plan(&outside, &uploads, &fake).await {
+            Ok(_) => panic!("expected asset access to fail"),
+            Err(err) => err,
+        };
+        assert_eq!(denied.0, StatusCode::NOT_FOUND);
+
+        let search_root =
+            match confined_root_for_search(&uploads.to_string_lossy(), &uploads, &fake).await {
+                Ok(path) => path,
+                Err(_) => panic!("expected search root confinement to succeed"),
+            };
+        assert_eq!(search_root, uploads.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn asset_and_search_plans_reject_outside_roots() {
+        let dir = tempdir().unwrap();
+        let uploads = dir.path().join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        let file = uploads.join("docs/note.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "hello").unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+
+        let fake = FakeFs {
+            canonical: HashMap::from([
+                (uploads.clone(), uploads.canonicalize().unwrap()),
+                (file.clone(), file.canonicalize().unwrap()),
+                (outside.clone(), outside.canonicalize().unwrap()),
+            ]),
+        };
+
+        let err = confined_root_for_search(&outside.to_string_lossy(), &uploads, &fake)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn asset_and_search_plans_reject_missing_paths() {
+        let dir = tempdir().unwrap();
+        let uploads = dir.path().join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        let missing = uploads.join("missing.txt");
+
+        let fake = FakeFs {
+            canonical: HashMap::from([(uploads.clone(), uploads.canonicalize().unwrap())]),
+        };
+
+        let asset_err = asset_access_plan(&missing, &uploads, &fake)
+            .await
+            .unwrap_err();
+        assert_eq!(asset_err.0, StatusCode::NOT_FOUND);
+
+        let search_err = confined_root_for_search(&missing.to_string_lossy(), &uploads, &fake)
+            .await
+            .unwrap_err();
+        assert_eq!(search_err.0, StatusCode::NOT_FOUND);
+    }
 }

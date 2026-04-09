@@ -20,6 +20,53 @@ struct LoadedEmbedder {
     embedder: Arc<dyn wilkes_core::embed::Embedder>,
 }
 
+#[derive(Debug)]
+enum WorkerLoopAction {
+    Stop,
+    ParseError(String),
+    Dispatch(WorkerRequest),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerRequestKind {
+    Build,
+    Embed,
+    Info,
+    Unknown(String),
+}
+
+trait WorkerEventSink {
+    fn emit(&self, event: WorkerEvent);
+}
+
+#[derive(Clone, Copy)]
+struct StdoutEventSink;
+
+impl WorkerEventSink for StdoutEventSink {
+    fn emit(&self, event: WorkerEvent) {
+        emit(event);
+    }
+}
+
+trait LocalEmbedderLoader: Send + Sync {
+    fn load(
+        &self,
+        key: &LoadedEmbedderKey,
+    ) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>>;
+}
+
+struct RealLocalEmbedderLoader;
+
+impl LocalEmbedderLoader for RealLocalEmbedderLoader {
+    fn load(
+        &self,
+        key: &LoadedEmbedderKey,
+    ) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
+        let model = EmbedderModel(key.model.clone());
+        dispatch::load_embedder_local(key.engine, &model, &key.data_dir, &key.device)
+    }
+}
+
 impl LoadedEmbedderKey {
     fn from_request(req: &WorkerRequest) -> Self {
         Self {
@@ -31,6 +78,27 @@ impl LoadedEmbedderKey {
     }
 }
 
+fn classify_input_line(line: &str) -> WorkerLoopAction {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return WorkerLoopAction::Stop;
+    }
+
+    match serde_json::from_str::<WorkerRequest>(trimmed) {
+        Ok(req) => WorkerLoopAction::Dispatch(req),
+        Err(e) => WorkerLoopAction::ParseError(format!("Failed to parse worker config: {e}")),
+    }
+}
+
+fn classify_worker_request(req: &WorkerRequest) -> WorkerRequestKind {
+    match req.mode.as_str() {
+        "build" => WorkerRequestKind::Build,
+        "embed" => WorkerRequestKind::Embed,
+        "info" => WorkerRequestKind::Info,
+        other => WorkerRequestKind::Unknown(other.to_string()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     wilkes_core::logging::init_logging_stderr();
@@ -39,43 +107,38 @@ async fn main() -> anyhow::Result<()> {
 
     let stdin = std::io::stdin();
     let mut active_embedder: Option<LoadedEmbedder> = None;
+    let loader = RealLocalEmbedderLoader;
+    let sink = StdoutEventSink;
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<WorkerEvent>(128);
 
     // Background task to print events to stdout
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
-            emit(event);
+            sink.emit(event);
         }
     });
 
     for line in stdin.lock().lines() {
         let line = line?;
-        if line.trim().is_empty() {
-            break;
-        }
+        match classify_input_line(&line) {
+            WorkerLoopAction::Stop => break,
+            WorkerLoopAction::ParseError(message) => sink.emit(WorkerEvent::Error(message)),
+            WorkerLoopAction::Dispatch(req) => {
+                let mut log_req = req.clone();
+                log_req.texts = None;
+                tracing::info!(
+                    "[worker] received request: {}",
+                    serde_json::to_string(&log_req).unwrap_or_default()
+                );
 
-        let trimmed = line.trim();
-
-        let req: WorkerRequest = match serde_json::from_str(trimmed) {
-            Ok(r) => r,
-            Err(e) => {
-                emit(WorkerEvent::Error(format!(
-                    "Failed to parse worker config: {e}"
-                )));
-                continue;
+                if let Err(e) =
+                    handle_worker_request(req, &mut active_embedder, event_tx.clone(), &loader)
+                        .await
+                {
+                    sink.emit(WorkerEvent::Error(e.to_string()));
+                }
             }
-        };
-
-        let mut log_req = req.clone();
-        log_req.texts = None;
-        tracing::info!(
-            "[worker] received request: {}",
-            serde_json::to_string(&log_req).unwrap_or_default()
-        );
-
-        if let Err(e) = handle_worker_request(req, &mut active_embedder, event_tx.clone()).await {
-            emit(WorkerEvent::Error(e.to_string()));
         }
     }
 
@@ -86,79 +149,19 @@ async fn handle_worker_request(
     req: WorkerRequest,
     active_embedder: &mut Option<LoadedEmbedder>,
     event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
+    loader: &dyn LocalEmbedderLoader,
 ) -> anyhow::Result<()> {
-    match req.mode.as_str() {
-        "build" => {
-            let embedder = get_or_load_embedder(active_embedder, &req)?;
-
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<EmbedProgress>(64);
-            let tx_c = event_tx.clone();
-            let forward = tokio::spawn(async move {
-                while let Some(progress) = rx.recv().await {
-                    let _ = tx_c.send(WorkerEvent::Progress(progress)).await;
-                }
-            });
-
-            let options = wilkes_api::commands::embed::BuildIndexOptions {
-                manager: None,
-                device: None,
-                data_dir: req.data_dir,
-                tx,
-                cancel_flag: Arc::new(AtomicBool::new(false)),
-                chunk_size: req
-                    .chunk_size
-                    .ok_or_else(|| anyhow::anyhow!("build request missing chunk_size"))?,
-                chunk_overlap: req
-                    .chunk_overlap
-                    .ok_or_else(|| anyhow::anyhow!("build request missing chunk_overlap"))?,
-                supported_extensions: req.supported_extensions,
-            };
-
-            let result =
-                wilkes_api::commands::embed::build_index_with_embedder(req.root, embedder, options)
-                    .await;
-
-            forward.await?;
-
-            match result {
-                Ok(_) => {
-                    let _ = event_tx.send(WorkerEvent::Done).await;
-                }
-                Err(e) => {
-                    let _ = event_tx.send(WorkerEvent::Error(e.to_string())).await;
-                }
-            }
+    match classify_worker_request(&req) {
+        WorkerRequestKind::Build => {
+            handle_build_plan(req, active_embedder, event_tx, loader).await?;
         }
-
-        "embed" => {
-            let embedder = get_or_load_embedder(active_embedder, &req)?;
-            let texts = req.texts.unwrap_or_default();
-            let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-            match embedder.embed(&text_refs) {
-                Ok(embeddings) => {
-                    let _ = event_tx.send(WorkerEvent::Embeddings(embeddings)).await;
-                    let _ = event_tx.send(WorkerEvent::Done).await;
-                }
-                Err(e) => {
-                    let _ = event_tx
-                        .send(WorkerEvent::Error(format!("Embed error: {e}")))
-                        .await;
-                }
-            }
+        WorkerRequestKind::Embed => {
+            handle_embed_plan(req, active_embedder, event_tx, loader).await?;
         }
-
-        "info" => {
-            let embedder = get_or_load_embedder(active_embedder, &req)?;
-            let _ = event_tx
-                .send(WorkerEvent::Info {
-                    dimension: embedder.dimension(),
-                    max_seq_length: 512,
-                })
-                .await;
-            let _ = event_tx.send(WorkerEvent::Done).await;
+        WorkerRequestKind::Info => {
+            handle_info_plan(req, active_embedder, event_tx, loader).await?;
         }
-
-        other => {
+        WorkerRequestKind::Unknown(other) => {
             let _ = event_tx
                 .send(WorkerEvent::Error(format!("Unknown mode: {other}")))
                 .await;
@@ -167,9 +170,97 @@ async fn handle_worker_request(
     Ok(())
 }
 
+async fn handle_build_plan(
+    req: WorkerRequest,
+    active_embedder: &mut Option<LoadedEmbedder>,
+    event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
+    loader: &dyn LocalEmbedderLoader,
+) -> anyhow::Result<()> {
+    let embedder = get_or_load_embedder(active_embedder, &req, loader)?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<EmbedProgress>(64);
+    let tx_c = event_tx.clone();
+    let forward = tokio::spawn(async move {
+        while let Some(progress) = rx.recv().await {
+            let _ = tx_c.send(WorkerEvent::Progress(progress)).await;
+        }
+    });
+
+    let options = wilkes_api::commands::embed::BuildIndexOptions {
+        manager: None,
+        device: None,
+        data_dir: req.data_dir,
+        tx,
+        cancel_flag: Arc::new(AtomicBool::new(false)),
+        chunk_size: req
+            .chunk_size
+            .ok_or_else(|| anyhow::anyhow!("build request missing chunk_size"))?,
+        chunk_overlap: req
+            .chunk_overlap
+            .ok_or_else(|| anyhow::anyhow!("build request missing chunk_overlap"))?,
+        supported_extensions: req.supported_extensions,
+    };
+
+    let result =
+        wilkes_api::commands::embed::build_index_with_embedder(req.root, embedder, options).await;
+
+    forward.await?;
+
+    match result {
+        Ok(_) => {
+            let _ = event_tx.send(WorkerEvent::Done).await;
+        }
+        Err(e) => {
+            let _ = event_tx.send(WorkerEvent::Error(e.to_string())).await;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_embed_plan(
+    req: WorkerRequest,
+    active_embedder: &mut Option<LoadedEmbedder>,
+    event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
+    loader: &dyn LocalEmbedderLoader,
+) -> anyhow::Result<()> {
+    let embedder = get_or_load_embedder(active_embedder, &req, loader)?;
+    let texts = req.texts.unwrap_or_default();
+    let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    match embedder.embed(&text_refs) {
+        Ok(embeddings) => {
+            let _ = event_tx.send(WorkerEvent::Embeddings(embeddings)).await;
+            let _ = event_tx.send(WorkerEvent::Done).await;
+        }
+        Err(e) => {
+            let _ = event_tx
+                .send(WorkerEvent::Error(format!("Embed error: {e}")))
+                .await;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_info_plan(
+    req: WorkerRequest,
+    active_embedder: &mut Option<LoadedEmbedder>,
+    event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
+    loader: &dyn LocalEmbedderLoader,
+) -> anyhow::Result<()> {
+    let embedder = get_or_load_embedder(active_embedder, &req, loader)?;
+    let _ = event_tx
+        .send(WorkerEvent::Info {
+            dimension: embedder.dimension(),
+            max_seq_length: 512,
+        })
+        .await;
+    let _ = event_tx.send(WorkerEvent::Done).await;
+    Ok(())
+}
+
 fn get_or_load_embedder(
     active: &mut Option<LoadedEmbedder>,
     req: &WorkerRequest,
+    loader: &dyn LocalEmbedderLoader,
 ) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
     let key = LoadedEmbedderKey::from_request(req);
 
@@ -191,8 +282,7 @@ fn get_or_load_embedder(
         );
     }
 
-    let model = EmbedderModel(key.model.clone());
-    let embedder = dispatch::load_embedder_local(key.engine, &model, &key.data_dir, &key.device)?;
+    let embedder = loader.load(&key)?;
     *active = Some(LoadedEmbedder {
         key,
         embedder: Arc::clone(&embedder),
@@ -213,6 +303,89 @@ mod tests {
     use wilkes_core::embed::worker::ipc::WorkerRequest;
     use wilkes_core::embed::MockEmbedder;
     use wilkes_core::types::EmbeddingEngine;
+
+    struct SuccessLoader;
+
+    impl LocalEmbedderLoader for SuccessLoader {
+        fn load(
+            &self,
+            _key: &LoadedEmbedderKey,
+        ) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
+            Ok(Arc::new(MockEmbedder::default()))
+        }
+    }
+
+    struct FailLoader;
+
+    impl LocalEmbedderLoader for FailLoader {
+        fn load(
+            &self,
+            _key: &LoadedEmbedderKey,
+        ) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
+            Err(anyhow::anyhow!("load failed"))
+        }
+    }
+
+    fn sample_request(mode: &str) -> WorkerRequest {
+        let dir = tempdir().unwrap();
+        WorkerRequest {
+            mode: mode.to_string(),
+            root: PathBuf::from("."),
+            engine: EmbeddingEngine::Candle,
+            model: "model-a".to_string(),
+            data_dir: dir.path().to_path_buf(),
+            chunk_size: Some(32),
+            chunk_overlap: Some(8),
+            device: "cpu".to_string(),
+            paths: None,
+            texts: Some(vec!["hello".to_string()]),
+            supported_extensions: vec!["txt".to_string()],
+        }
+    }
+
+    #[test]
+    fn test_classify_input_line_variants() {
+        match classify_input_line("") {
+            WorkerLoopAction::Stop => {}
+            other => panic!("expected Stop, got {other:?}"),
+        }
+
+        match classify_input_line("not-json") {
+            WorkerLoopAction::ParseError(message) => {
+                assert!(message.contains("Failed to parse worker config"));
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+
+        match classify_input_line(&serde_json::to_string(&sample_request("embed")).unwrap()) {
+            WorkerLoopAction::Dispatch(req) => {
+                assert_eq!(req.mode, "embed");
+                assert_eq!(req.model, "model-a");
+            }
+            other => panic!("expected Dispatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_worker_request_variants() {
+        assert_eq!(
+            classify_worker_request(&sample_request("build")),
+            WorkerRequestKind::Build
+        );
+        assert_eq!(
+            classify_worker_request(&sample_request("embed")),
+            WorkerRequestKind::Embed
+        );
+        assert_eq!(
+            classify_worker_request(&sample_request("info")),
+            WorkerRequestKind::Info
+        );
+
+        match classify_worker_request(&sample_request("unknown")) {
+            WorkerRequestKind::Unknown(value) => assert_eq!(value, "unknown"),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_get_or_load_embedder_caching() {
@@ -241,7 +414,7 @@ mod tests {
         };
 
         // Should return the cached MockEmbedder immediately
-        let res = get_or_load_embedder(&mut active, &req).unwrap();
+        let res = get_or_load_embedder(&mut active, &req, &SuccessLoader).unwrap();
         assert_eq!(res.model_id(), "mock-model");
     }
 
@@ -271,7 +444,7 @@ mod tests {
             supported_extensions: vec![],
         };
 
-        let res = get_or_load_embedder(&mut active, &req);
+        let res = get_or_load_embedder(&mut active, &req, &FailLoader);
         assert!(res.is_err());
         assert!(
             active.is_some(),
@@ -298,7 +471,7 @@ mod tests {
         };
 
         // Should fail to load non-existent model from empty temp dir
-        let res = get_or_load_embedder(&mut active, &req);
+        let res = get_or_load_embedder(&mut active, &req, &FailLoader);
         assert!(res.is_err());
     }
 
@@ -330,7 +503,9 @@ mod tests {
             supported_extensions: vec![],
         };
 
-        handle_worker_request(req, &mut active, tx).await.unwrap();
+        handle_worker_request(req, &mut active, tx, &SuccessLoader)
+            .await
+            .unwrap();
 
         let ev1 = rx.recv().await.unwrap();
         if let WorkerEvent::Info { dimension, .. } = ev1 {
@@ -371,7 +546,9 @@ mod tests {
             supported_extensions: vec![],
         };
 
-        handle_worker_request(req, &mut active, tx).await.unwrap();
+        handle_worker_request(req, &mut active, tx, &SuccessLoader)
+            .await
+            .unwrap();
 
         let ev1 = rx.recv().await.unwrap();
         assert!(matches!(ev1, WorkerEvent::Embeddings(_)));
@@ -400,7 +577,9 @@ mod tests {
             supported_extensions: vec![],
         };
 
-        handle_worker_request(req, &mut active, tx).await.unwrap();
+        handle_worker_request(req, &mut active, tx, &FailLoader)
+            .await
+            .unwrap();
 
         let ev = rx.recv().await.unwrap();
         assert!(matches!(ev, WorkerEvent::Error(_)));
@@ -434,7 +613,9 @@ mod tests {
             supported_extensions: vec!["rs".to_string()],
         };
 
-        handle_worker_request(req, &mut active, tx).await.unwrap();
+        handle_worker_request(req, &mut active, tx, &SuccessLoader)
+            .await
+            .unwrap();
 
         // Should eventually get Done
         let mut found_done = false;
@@ -475,7 +656,7 @@ mod tests {
             supported_extensions: vec![],
         };
 
-        let res = handle_worker_request(req, &mut active, tx).await;
+        let res = handle_worker_request(req, &mut active, tx, &SuccessLoader).await;
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("missing chunk_size"));
     }

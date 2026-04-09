@@ -199,6 +199,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_preview_text_falls_back_for_non_text_origin_without_range() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "line 1\nline 2").unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let match_ref = MatchRef {
+            path,
+            origin: SourceOrigin::PdfPage {
+                page: 3,
+                bbox: None,
+            },
+            text_range: None,
+        };
+
+        let preview = preview_text(&match_ref).await.unwrap();
+        if let PreviewData::Text {
+            highlight_line,
+            highlight_range,
+            ..
+        } = preview
+        {
+            assert_eq!(highlight_line, 1);
+            assert_eq!(highlight_range.start, 0);
+            assert_eq!(highlight_range.end, 6);
+        } else {
+            panic!("Expected Text preview");
+        }
+    }
+
+    #[tokio::test]
     async fn test_preview_pdf() {
         let match_ref = MatchRef {
             path: PathBuf::from("test.pdf"),

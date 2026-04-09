@@ -260,4 +260,126 @@ mod tests {
         assert_eq!(results[0].matches.len(), 1);
         assert_eq!(results[0].matches[0].matched_text, "hello world");
     }
+
+    struct TinyMockEmbedder;
+
+    impl Embedder for TinyMockEmbedder {
+        fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![1.0, 0.0]])
+        }
+
+        fn model_id(&self) -> &str {
+            "tiny-mock"
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+
+        fn engine(&self) -> crate::types::EmbeddingEngine {
+            crate::types::EmbeddingEngine::Candle
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_groups_results_and_skips_unsupported_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let mut idx = SemanticIndex::create(
+            &data_dir,
+            "tiny-mock",
+            2,
+            crate::types::EmbeddingEngine::Candle,
+            None,
+        )
+        .unwrap();
+
+        let file_a = dir.path().join("a.txt");
+        let file_b = dir.path().join("b.bin");
+        let file_c = dir.path().join("c.txt");
+        std::fs::write(&file_a, "alpha").unwrap();
+        std::fs::write(&file_b, "beta").unwrap();
+        std::fs::write(&file_c, "gamma").unwrap();
+
+        use crate::embed::index::chunk::Chunk;
+        use crate::embed::index::db::PreparedFile;
+        use crate::types::{ByteRange, SourceOrigin};
+
+        idx.write_file(PreparedFile {
+            path: file_a.clone(),
+            chunks: vec![(
+                Chunk {
+                    file_path: file_a.clone(),
+                    text: "alpha".to_string(),
+                    byte_range: ByteRange { start: 0, end: 5 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![1.0, 0.0],
+            )],
+        })
+        .unwrap();
+        idx.write_file(PreparedFile {
+            path: file_b.clone(),
+            chunks: vec![(
+                Chunk {
+                    file_path: file_b.clone(),
+                    text: "beta".to_string(),
+                    byte_range: ByteRange { start: 0, end: 4 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![0.8, 0.2],
+            )],
+        })
+        .unwrap();
+        idx.write_file(PreparedFile {
+            path: file_c.clone(),
+            chunks: vec![(
+                Chunk {
+                    file_path: file_c.clone(),
+                    text: "gamma".to_string(),
+                    byte_range: ByteRange { start: 0, end: 5 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![0.0, 1.0],
+            )],
+        })
+        .unwrap();
+
+        let embedder = Arc::new(TinyMockEmbedder);
+        let index = Arc::new(Mutex::new(Some(idx)));
+        let provider = SemanticSearchProvider::new(embedder, index, vec!["txt".to_string()]);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let query = SearchQuery {
+            pattern: "alpha".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: std::path::PathBuf::from("/"),
+            file_type_filters: vec![],
+            max_results: 10,
+            respect_gitignore: false,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Semantic,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let provider_handle = tokio::task::spawn_blocking(move || {
+            provider
+                .search(&query, &ExtractorRegistry::new(), tx)
+                .unwrap();
+        });
+
+        let mut results = Vec::new();
+        while let Some(fm) = rx.recv().await {
+            results.push(fm);
+        }
+        provider_handle.await.unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].path, file_a);
+        assert_eq!(results[1].path, file_c);
+        assert_eq!(results[0].matches[0].matched_text, "alpha");
+        assert_eq!(results[1].matches[0].matched_text, "gamma");
+    }
 }

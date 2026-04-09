@@ -50,7 +50,7 @@ impl From<fastembed::ModelInfo<EmbeddingModel>> for FastembedModelRecord {
             model_file: info.model_file,
             additional_files: info.additional_files,
             description: info.description,
-                dimension: info.dim,
+            dimension: info.dim,
         }
     }
 }
@@ -114,7 +114,9 @@ struct RealFastembedRuntimeFactory;
 impl FastembedRuntimeFactory for RealFastembedRuntimeFactory {
     fn try_new(&self, request: FastembedInitRequest) -> anyhow::Result<TextEmbedding> {
         let providers = match request.execution_plan {
-            FastembedExecutionPlan::CpuOnly => vec![ort::ep::CPUExecutionProvider::default().into()],
+            FastembedExecutionPlan::CpuOnly => {
+                vec![ort::ep::CPUExecutionProvider::default().into()]
+            }
             FastembedExecutionPlan::CoreMlThenCpu => {
                 #[cfg(feature = "fastembed-coreml")]
                 {
@@ -143,7 +145,10 @@ fn relevant_hf_filenames(record: &FastembedModelRecord) -> std::collections::Has
         .collect()
 }
 
-fn hf_sibling_matches_relevant(filename: &str, relevant: &std::collections::HashSet<String>) -> bool {
+fn hf_sibling_matches_relevant(
+    filename: &str,
+    relevant: &std::collections::HashSet<String>,
+) -> bool {
     relevant.contains(filename)
         || relevant
             .iter()
@@ -600,5 +605,70 @@ mod tests {
             .expect("expected cached model descriptor");
         assert!(model.is_cached);
         assert_eq!(model.size_bytes, Some(expected_size));
+    }
+
+    #[test]
+    fn test_execution_plan_and_init_request_helpers() {
+        let model = FastembedModelRecord {
+            model: EmbeddingModel::BGEBaseENV15,
+            model_id: "BGEBaseENV15".to_string(),
+            model_code: "Xenova/bge-base-en-v1.5".to_string(),
+            model_file: "model.onnx".to_string(),
+            additional_files: vec!["config.json".to_string()],
+            description: "desc".to_string(),
+            dimension: 768,
+        };
+
+        assert_eq!(
+            execution_plan_for_device("cpu"),
+            FastembedExecutionPlan::CpuOnly
+        );
+
+        let gpu_plan = execution_plan_for_device("gpu");
+        if cfg!(feature = "fastembed-coreml") {
+            assert_eq!(gpu_plan, FastembedExecutionPlan::CoreMlThenCpu);
+        } else {
+            assert_eq!(gpu_plan, FastembedExecutionPlan::CpuOnly);
+        }
+
+        let init = build_text_init_request(
+            model.clone(),
+            tempdir().unwrap().path().to_path_buf(),
+            "cpu",
+        );
+        assert!(init.show_download_progress);
+        assert_eq!(init.model, model);
+        assert_eq!(init.execution_plan, FastembedExecutionPlan::CpuOnly);
+    }
+
+    #[test]
+    fn test_relevant_hf_filenames_and_matching_sizes() {
+        let record = FastembedModelRecord {
+            model: EmbeddingModel::BGEBaseENV15,
+            model_id: "BGEBaseENV15".to_string(),
+            model_code: "Xenova/bge-base-en-v1.5".to_string(),
+            model_file: "model.onnx".to_string(),
+            additional_files: vec!["tokenizer.json".to_string(), "config.json".to_string()],
+            description: "desc".to_string(),
+            dimension: 768,
+        };
+        let relevant = relevant_hf_filenames(&record);
+        assert!(hf_sibling_matches_relevant("model.onnx", &relevant));
+        assert!(hf_sibling_matches_relevant("nested/model.onnx", &relevant));
+        assert!(!hf_sibling_matches_relevant("other.txt", &relevant));
+
+        let siblings = vec![
+            ("model.onnx".to_string(), Some(5)),
+            ("nested/tokenizer.json".to_string(), Some(7)),
+            ("other.txt".to_string(), Some(11)),
+        ];
+        assert_eq!(sum_matching_hf_sizes(&siblings, &relevant).unwrap(), 12);
+    }
+
+    #[test]
+    fn test_sum_matching_hf_sizes_errors_when_nothing_matches() {
+        let relevant = std::collections::HashSet::from(["missing.onnx".to_string()]);
+        let siblings = vec![("other.txt".to_string(), Some(11))];
+        assert!(sum_matching_hf_sizes(&siblings, &relevant).is_err());
     }
 }

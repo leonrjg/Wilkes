@@ -6,6 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::http::errors::{err, server_err, ErrorBody};
+use crate::http::search::forward_search_results;
+use crate::http::state::{
+    asset_access_plan, sanitize_relative_upload_path, upload_write_plan, AppState,
+    BroadcastEmitter, ServerFs, TokioServerFs,
+};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
 use axum::http::{header, StatusCode};
@@ -23,12 +29,6 @@ use wilkes_api::context::AppContext;
 use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::types::{
     EmbeddingEngine, MatchRef, ModelDescriptor, SearchQuery, SelectedEmbedder,
-};
-use crate::http::errors::{err, server_err, ErrorBody};
-use crate::http::search::forward_search_results;
-use crate::http::state::{
-    asset_access_plan, sanitize_relative_upload_path, upload_write_plan, AppState, BroadcastEmitter,
-    ServerFs, TokioServerFs,
 };
 
 fn confine_to_uploads(
@@ -211,7 +211,10 @@ async fn upload_handler(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let current_size = TokioServerFs.dir_size(&state.uploads_dir).await.unwrap_or(0);
+    let current_size = TokioServerFs
+        .dir_size(&state.uploads_dir)
+        .await
+        .unwrap_or(0);
     if current_size >= MAX_UPLOAD_BYTES {
         return Err(err(format!(
             "Upload directory exceeds maximum size of {} MB",
@@ -272,17 +275,14 @@ async fn delete_upload_handler(
         .canonicalize(&state.uploads_dir)
         .await
         .map_err(|e| server_err(e.to_string()))?;
-    let canonical_target = TokioServerFs
-        .canonicalize(&target)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorBody {
-                    error: "Not found".into(),
-                }),
-            )
-        })?;
+    let canonical_target = TokioServerFs.canonicalize(&target).await.map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "Not found".into(),
+            }),
+        )
+    })?;
     if !canonical_target.starts_with(&canonical_uploads) {
         return Err(err("Path outside uploads directory"));
     }
@@ -325,12 +325,8 @@ async fn asset_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AssetQuery>,
 ) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
-    let plan = asset_access_plan(
-        Path::new(&params.path),
-        &state.uploads_dir,
-        &TokioServerFs,
-    )
-    .await?;
+    let plan =
+        asset_access_plan(Path::new(&params.path), &state.uploads_dir, &TokioServerFs).await?;
     let bytes = TokioServerFs
         .read(&plan.canonical)
         .await

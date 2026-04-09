@@ -153,4 +153,29 @@ mod tests {
             _ => panic!("Expected Pdf preview"),
         }
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_list_files_skips_walk_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let bad_dir = root.join("nope");
+        fs::create_dir(&bad_dir).unwrap();
+        fs::write(root.join("ok.txt"), "hello").unwrap();
+
+        let mut perms = fs::metadata(&bad_dir).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&bad_dir, perms).unwrap();
+
+        let extensions = vec!["txt".to_string()];
+        let files = list_files(root.to_path_buf(), extensions, 0).await.unwrap();
+
+        assert!(files.iter().any(|entry| entry.path.ends_with("ok.txt")));
+
+        let mut perms = fs::metadata(&bad_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bad_dir, perms).unwrap();
+    }
 }

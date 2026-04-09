@@ -39,6 +39,63 @@ pub fn classify_event_paths(
     classified
 }
 
+fn process_watcher_result<F1, F2>(
+    result: notify_debouncer_mini::DebounceEventResult,
+    index: &Arc<Mutex<Option<SemanticIndex>>>,
+    extractors: &Arc<ExtractorRegistry>,
+    embedder: &Arc<dyn Embedder>,
+    config: &IndexingConfig,
+    on_reindex: &F1,
+    on_reindex_done: &F2,
+) where
+    F1: Fn(),
+    F2: Fn(),
+{
+    match result {
+        Ok(events) => {
+            let classified = classify_event_paths(&events, &config.supported_extensions);
+            let changed_paths = classified.changed;
+            let removed_paths = classified.removed;
+
+            // Handle removals
+            if !removed_paths.is_empty() {
+                if let Ok(mut guard) = index.lock() {
+                    if let Some(idx) = guard.as_mut() {
+                        for path in removed_paths {
+                            if let Err(e) = idx.remove_file(&path) {
+                                error!("[IndexWatcher] remove_file {}: {e:#}", path.display());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Handle additions/modifications
+            if !changed_paths.is_empty() {
+                on_reindex();
+                info!(
+                    "[IndexWatcher] incremental update: {} files changed",
+                    changed_paths.len()
+                );
+                for path in changed_paths {
+                    handle_event(
+                        &path,
+                        index,
+                        extractors,
+                        embedder,
+                        config.chunk_size,
+                        config.chunk_overlap,
+                    );
+                }
+                on_reindex_done();
+            }
+        }
+        Err(e) => {
+            error!("[IndexWatcher] watch error: {e}");
+        }
+    }
+}
+
 // ── IndexWatcher ──────────────────────────────────────────────────────────────
 
 pub struct IndexWatcher {
@@ -70,52 +127,7 @@ impl IndexWatcher {
 
         let thread = std::thread::spawn(move || {
             for result in &rx_events {
-                match result {
-                    Ok(events) => {
-                        let classified = classify_event_paths(&events, &config.supported_extensions);
-                        let changed_paths = classified.changed;
-                        let removed_paths = classified.removed;
-
-                        // Handle removals
-                        if !removed_paths.is_empty() {
-                            if let Ok(mut guard) = index.lock() {
-                                if let Some(idx) = guard.as_mut() {
-                                    for path in removed_paths {
-                                        if let Err(e) = idx.remove_file(&path) {
-                                            error!(
-                                                "[IndexWatcher] remove_file {}: {e:#}",
-                                                path.display()
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Handle additions/modifications
-                        if !changed_paths.is_empty() {
-                            on_reindex();
-                            info!(
-                                "[IndexWatcher] incremental update: {} files changed",
-                                changed_paths.len()
-                            );
-                            for path in changed_paths {
-                                handle_event(
-                                    &path,
-                                    &index,
-                                    &extractors,
-                                    &embedder,
-                                    config.chunk_size,
-                                    config.chunk_overlap,
-                                );
-                            }
-                            on_reindex_done();
-                        }
-                    }
-                    Err(e) => {
-                        error!("[IndexWatcher] watch error: {e}");
-                    }
-                }
+                process_watcher_result(result, &index, &extractors, &embedder, &config, &on_reindex, &on_reindex_done);
             }
         });
 
@@ -230,6 +242,8 @@ mod tests {
     use super::*;
     use crate::embed::MockEmbedder;
     use crate::types::EmbeddingEngine;
+    use notify_debouncer_mini::DebouncedEventKind;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     #[test]
@@ -256,6 +270,60 @@ mod tests {
         .unwrap();
 
         watcher.stop();
+    }
+
+    #[test]
+    fn test_should_consider_path_accepts_supported_or_missing_paths() {
+        let dir = tempdir().unwrap();
+        let supported = vec!["txt".to_string()];
+        let supported_file = dir.path().join("note.txt");
+        let unsupported_file = dir.path().join("note.md");
+        let missing_file = dir.path().join("gone.md");
+
+        std::fs::write(&supported_file, "hello").unwrap();
+        std::fs::write(&unsupported_file, "hello").unwrap();
+
+        assert!(should_consider_path(&supported_file, &supported));
+        assert!(!should_consider_path(&unsupported_file, &supported));
+        assert!(should_consider_path(&missing_file, &supported));
+    }
+
+    #[test]
+    fn test_classify_event_paths_splits_changed_and_removed() {
+        let dir = tempdir().unwrap();
+        let supported = vec!["txt".to_string()];
+        let changed_file = dir.path().join("changed.txt");
+        let ignored_file = dir.path().join("ignored.rs");
+        let removed_file = dir.path().join("removed.txt");
+        let directory = dir.path().join("folder");
+
+        std::fs::write(&changed_file, "hello").unwrap();
+        std::fs::write(&ignored_file, "hello").unwrap();
+        std::fs::create_dir(&directory).unwrap();
+
+        let events = vec![
+            DebouncedEvent {
+                path: changed_file.clone(),
+                kind: DebouncedEventKind::Any,
+            },
+            DebouncedEvent {
+                path: ignored_file.clone(),
+                kind: DebouncedEventKind::Any,
+            },
+            DebouncedEvent {
+                path: removed_file.clone(),
+                kind: DebouncedEventKind::Any,
+            },
+            DebouncedEvent {
+                path: directory.clone(),
+                kind: DebouncedEventKind::Any,
+            },
+        ];
+
+        let classified = classify_event_paths(&events, &supported);
+
+        assert_eq!(classified.changed, vec![changed_file]);
+        assert_eq!(classified.removed, vec![removed_file]);
     }
 
     #[test]
@@ -364,6 +432,155 @@ mod tests {
         let guard = index.lock().unwrap();
         let idx_final = guard.as_ref().unwrap();
         assert_eq!(idx_final.status().total_chunks, 0);
+    }
+
+    #[test]
+    fn test_handle_event_missing_path_twice_hits_remove_error_branch() {
+        let dir = tempdir().unwrap();
+        let idx_dir = dir.path().join("idx");
+        std::fs::create_dir(&idx_dir).unwrap();
+
+        let mut idx =
+            SemanticIndex::create(&idx_dir, "mock-model", 384, EmbeddingEngine::Candle, None)
+                .unwrap();
+        let file_path = dir.path().join("missing.txt");
+        std::fs::write(&file_path, "content").unwrap();
+
+        idx.write_file(crate::embed::index::db::PreparedFile {
+            path: file_path.clone(),
+            chunks: vec![(
+                crate::embed::index::chunk::Chunk {
+                    file_path: file_path.clone(),
+                    text: "content".to_string(),
+                    byte_range: crate::types::ByteRange { start: 0, end: 7 },
+                    origin: crate::types::SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![0.0; 384],
+            )],
+        })
+        .unwrap();
+
+        let index = Arc::new(Mutex::new(Some(idx)));
+        let registry = Arc::new(ExtractorRegistry::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+
+        std::fs::remove_file(&file_path).unwrap();
+        handle_event(&file_path, &index, &registry, &embedder, 100, 10);
+        handle_event(&file_path, &index, &registry, &embedder, 100, 10);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_handle_event_unreadable_path_hits_retry_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let index = Arc::new(Mutex::new(None));
+        let registry = Arc::new(ExtractorRegistry::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+        let path = dir.path().join("blocked.txt");
+        std::fs::write(&path, "content").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        handle_event(&path, &index, &registry, &embedder, 100, 10);
+    }
+
+    #[test]
+    fn test_handle_event_prepare_file_error_for_invalid_utf8() {
+        let dir = tempdir().unwrap();
+        let index = Arc::new(Mutex::new(None));
+        let registry = Arc::new(ExtractorRegistry::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+        let path = dir.path().join("invalid.txt");
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        handle_event(&path, &index, &registry, &embedder, 100, 10);
+    }
+
+    #[test]
+    fn test_try_open_exclusive_zero_attempts_returns_ok() {
+        let res = try_open_exclusive(std::path::Path::new("/definitely/missing"), 0, Duration::from_millis(1));
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_process_watcher_result_invokes_callbacks_and_handles_errors() {
+        let dir = tempdir().unwrap();
+        let idx_dir = dir.path().join("idx");
+        std::fs::create_dir(&idx_dir).unwrap();
+
+        let mut idx =
+            SemanticIndex::create(&idx_dir, "mock-model", 384, EmbeddingEngine::Candle, None)
+                .unwrap();
+        let changed_path = dir.path().join("changed.txt");
+        let removed_path = dir.path().join("removed.txt");
+        std::fs::write(&changed_path, "hello").unwrap();
+        std::fs::write(&removed_path, "world").unwrap();
+
+        idx.write_file(crate::embed::index::db::PreparedFile {
+            path: removed_path.clone(),
+            chunks: vec![(
+                crate::embed::index::chunk::Chunk {
+                    file_path: removed_path.clone(),
+                    text: "world".to_string(),
+                    byte_range: crate::types::ByteRange { start: 0, end: 5 },
+                    origin: crate::types::SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![0.0; 384],
+            )],
+        })
+        .unwrap();
+
+        let index = Arc::new(Mutex::new(Some(idx)));
+        let registry = Arc::new(ExtractorRegistry::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+        let reindex_calls = Arc::new(AtomicUsize::new(0));
+        let reindex_done_calls = Arc::new(AtomicUsize::new(0));
+        let config = IndexingConfig {
+            chunk_size: 100,
+            chunk_overlap: 10,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let events = vec![
+            DebouncedEvent {
+                path: changed_path.clone(),
+                kind: DebouncedEventKind::Any,
+            },
+            DebouncedEvent {
+                path: removed_path.clone(),
+                kind: DebouncedEventKind::Any,
+            },
+        ];
+
+        process_watcher_result(
+            Ok(events),
+            &index,
+            &registry,
+            &embedder,
+            &config,
+            &|| {
+                reindex_calls.fetch_add(1, Ordering::Relaxed);
+            },
+            &|| {
+                reindex_done_calls.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+
+        process_watcher_result(
+            Err(notify::Error::generic("watch failed")),
+            &index,
+            &registry,
+            &embedder,
+            &config,
+            &|| {},
+            &|| {},
+        );
+
+        assert_eq!(reindex_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(reindex_done_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

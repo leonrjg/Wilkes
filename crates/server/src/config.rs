@@ -107,4 +107,48 @@ mod tests {
         assert_eq!(config.data_dir, PathBuf::from("/data"));
         assert_eq!(config.dist_dir, PathBuf::from("./dist"));
     }
+
+    #[test]
+    fn parse_config_prefers_cli_over_env_and_ignores_bad_port() {
+        let mut env_map = std::collections::HashMap::new();
+        env_map.insert("WILKES_HOST".to_string(), "0.0.0.0".to_string());
+        env_map.insert("WILKES_PORT".to_string(), "9000".to_string());
+        env_map.insert("WILKES_DATA_DIR".to_string(), "/env-data".to_string());
+        env_map.insert("WILKES_DIST_DIR".to_string(), "/env-dist".to_string());
+        let env = TestEnv(env_map);
+        let args = vec![
+            "bin".to_string(),
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            "not-a-port".to_string(),
+            "--data-dir".to_string(),
+            "/cli-data".to_string(),
+            "--dist-dir".to_string(),
+            "/cli-dist".to_string(),
+        ];
+
+        let config = parse_config_from(&args, &env);
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 9000);
+        assert_eq!(config.data_dir, PathBuf::from("/cli-data"));
+        assert_eq!(config.dist_dir, PathBuf::from("/cli-dist"));
+    }
+
+    #[test]
+    fn parse_config_uses_env_when_cli_missing() {
+        let mut env_map = std::collections::HashMap::new();
+        env_map.insert("WILKES_HOST".to_string(), "10.0.0.1".to_string());
+        env_map.insert("WILKES_PORT".to_string(), "8088".to_string());
+        env_map.insert("WILKES_DATA_DIR".to_string(), "/env-data".to_string());
+        env_map.insert("WILKES_DIST_DIR".to_string(), "/env-dist".to_string());
+        let env = TestEnv(env_map);
+        let args = vec!["bin".to_string()];
+
+        let config = parse_config_from(&args, &env);
+        assert_eq!(config.host, "10.0.0.1");
+        assert_eq!(config.port, 8088);
+        assert_eq!(config.data_dir, PathBuf::from("/env-data"));
+        assert_eq!(config.dist_dir, PathBuf::from("/env-dist"));
+    }
 }

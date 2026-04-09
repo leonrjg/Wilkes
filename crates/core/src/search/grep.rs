@@ -322,6 +322,8 @@ fn extract_context_after(text: &str, byte_pos: usize, max_chars: usize) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extract::{ContentExtractor, ExtractorRegistry};
+    use crate::types::ExtractedContent;
     use std::fs;
     use tempfile::tempdir;
 
@@ -526,6 +528,56 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].path.ends_with("small.txt"));
+    }
+
+    struct FailingPdfExtractor;
+
+    impl ContentExtractor for FailingPdfExtractor {
+        fn can_handle(&self, path: &Path, _mime: Option<&str>) -> bool {
+            path.extension().and_then(|e| e.to_str()) == Some("pdf")
+        }
+
+        fn extract(&self, path: &Path) -> anyhow::Result<ExtractedContent> {
+            anyhow::bail!("failed to extract {}", path.display());
+        }
+    }
+
+    #[test]
+    fn test_search_provider_collects_pdf_extraction_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("broken.pdf");
+        fs::write(&path, "%PDF-1.7 fake").unwrap();
+
+        let query = SearchQuery {
+            pattern: "missing".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            file_type_filters: vec![],
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            supported_extensions: vec!["pdf".to_string()],
+        };
+
+        let provider = GrepSearchProvider::new();
+        let mut extractors = ExtractorRegistry::new();
+        extractors.register(Box::new(FailingPdfExtractor));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let query_clone = query.clone();
+
+        let handle = std::thread::spawn(move || {
+            provider.search(&query_clone, &extractors, tx).unwrap()
+        });
+
+        assert!(rx.blocking_recv().is_none());
+        let errors = handle.join().unwrap();
+
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("broken.pdf"));
+        assert!(errors[0].contains("failed to extract"));
     }
 
     #[test]

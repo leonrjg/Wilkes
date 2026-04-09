@@ -81,6 +81,12 @@ struct RestoreStatePlan {
     device: String,
 }
 
+struct RestoreLoadedState {
+    plan: RestoreStatePlan,
+    embedder: Arc<dyn Embedder>,
+    index: SemanticIndex,
+}
+
 enum RestoreStatePreparation {
     Ready(RestoreStatePlan),
     ResetStaleSelection {
@@ -917,6 +923,40 @@ impl AppContext {
         }
     }
 
+    async fn load_restore_state(
+        self: &Arc<Self>,
+        settings: Settings,
+    ) -> Option<RestoreLoadedState> {
+        let db_status = self.load_restore_db_status(&settings).await?;
+        let plan = match Self::prepare_restore_state_plan(settings, db_status) {
+            RestoreStatePreparation::Ready(plan) => plan,
+            RestoreStatePreparation::ResetStaleSelection {
+                db_status,
+                selected,
+            } => {
+                info!(
+                    "restore_state: index selection '{:?}/{}' != settings selection '{:?}/{}', clearing stale index reference",
+                    db_status.engine, db_status.model_id, selected.engine, selected.model.model_id()
+                );
+                self.clear_restore_state_settings().await;
+                return None;
+            }
+        };
+
+        let embedder = self
+            .restore_embedder(&plan.selected, plan.device.clone())
+            .await?;
+        let index = self
+            .restore_index(&plan.selected, embedder.dimension())
+            .await?;
+
+        Some(RestoreLoadedState {
+            plan,
+            embedder,
+            index,
+        })
+    }
+
     async fn restore_embedder(
         &self,
         selected: &SelectedEmbedder,
@@ -1064,41 +1104,12 @@ impl AppContext {
                 return;
             }
         };
-
-        let Some(db_status) = self.load_restore_db_status(&settings).await else {
+        let Some(loaded) = self.load_restore_state(settings).await else {
             return;
         };
 
-        let plan = match Self::prepare_restore_state_plan(settings, db_status) {
-            RestoreStatePreparation::Ready(plan) => plan,
-            RestoreStatePreparation::ResetStaleSelection {
-                db_status,
-                selected,
-            } => {
-                info!(
-                    "restore_state: index selection '{:?}/{}' != settings selection '{:?}/{}', clearing stale index reference",
-                    db_status.engine, db_status.model_id, selected.engine, selected.model.model_id()
-                );
-                self.clear_restore_state_settings().await;
-                return;
-            }
-        };
-
-        let Some(embedder) = self
-            .restore_embedder(&plan.selected, plan.device.clone())
-            .await
-        else {
-            return;
-        };
-
-        let Some(index) = self
-            .restore_index(&plan.selected, embedder.dimension())
-            .await
-        else {
-            return;
-        };
-
-        self.finish_restore_state(&plan, embedder, index).await;
+        self.finish_restore_state(&loaded.plan, loaded.embedder, loaded.index)
+            .await;
     }
 }
 
@@ -1870,6 +1881,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_restore_db_status_clears_stale_settings_when_missing_db() {
+        let (_dir, ctx) = test_ctx();
+        let settings = Settings {
+            semantic: SemanticSettings {
+                enabled: true,
+                index_path: Some(PathBuf::from("semantic_index.db")),
+                ..SemanticSettings::default()
+            },
+            ..Settings::default()
+        };
+        ctx.update_settings(serde_json::json!({
+            "semantic": {
+                "enabled": true,
+                "index_path": "semantic_index.db"
+            }
+        }))
+        .await
+        .unwrap();
+
+        let db_status = ctx.load_restore_db_status(&settings).await;
+        assert!(db_status.is_none());
+
+        let updated = ctx.get_settings().await;
+        assert!(!updated.semantic.enabled);
+        assert!(updated.semantic.index_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_finish_build_index_starts_watcher_and_persists_state() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let data_dir = ctx.data_dir.clone();
+        let index = SemanticIndex::create(
+            &data_dir,
+            "build-model",
+            384,
+            EmbeddingEngine::Candle,
+            Some(&root),
+        )
+        .unwrap();
+        let plan = BuildIndexPlan {
+            root_path: root.clone(),
+            device: "cpu".to_string(),
+            chunk_size: 64,
+            chunk_overlap: 8,
+            supported_extensions: vec!["txt".to_string()],
+        };
+        let selected = SelectedEmbedder {
+            engine: EmbeddingEngine::Candle,
+            model: EmbedderModel("build-model".to_string()),
+            dimension: 384,
+        };
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+
+        ctx.finish_build_index(&plan, &selected, &data_dir, embedder)
+            .await
+            .unwrap();
+
+        assert!(ctx.embedder.lock().is_some());
+        assert!(ctx.index.lock().lock().unwrap().is_some());
+        assert!(ctx.watcher.lock().is_some());
+
+        let settings = ctx.get_settings().await;
+        assert!(settings.semantic.enabled);
+        assert_eq!(
+            settings.semantic.index_path,
+            Some(data_dir.join("semantic_index.db"))
+        );
+
+        ctx.stop_watcher();
+        assert!(ctx.watcher.lock().is_none());
+        drop(index);
+    }
+
+    #[tokio::test]
     async fn test_app_context_new() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().join("data");
@@ -2439,6 +2526,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_restore_state_invalid_settings_json_returns_early() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let settings_path = dir.path().join("settings.json");
+        std::fs::write(&settings_path, "{not valid json").unwrap();
+
+        let emitter = Arc::new(MockEmitter {
+            events: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (ctx, _rx, _loop) = AppContext::new(
+            data_dir.clone(),
+            settings_path,
+            WorkerPaths {
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir,
+            },
+            emitter,
+        );
+
+        ctx.clone().restore_state().await;
+
+        assert!(ctx.embedder.lock().is_none());
+        assert!(ctx.index.lock().lock().unwrap().is_none());
+        assert!(ctx.watcher.lock().is_none());
+    }
+
+    #[tokio::test]
     async fn test_start_build_index_already_in_progress() {
         let dir = tempdir().unwrap();
         let emitter = Arc::new(MockEmitter {
@@ -2706,6 +2825,87 @@ mod tests {
             }
         }
         assert!(saw_reindex);
+    }
+
+    #[tokio::test]
+    async fn test_start_search_semantic_root_mismatch_without_indexed_root_reindexes() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(MockEmitter {
+            events: events.clone(),
+        });
+        let (ctx, _rx, _loop) = AppContext::new(
+            data_dir.clone(),
+            settings_path,
+            WorkerPaths {
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: data_dir.clone(),
+            },
+            emitter,
+        );
+
+        let embedder = Arc::new(MockEmbedder::default());
+        let model_id = embedder.model_id().to_string();
+        let dimension = embedder.dimension();
+        *ctx.embedder.lock() = Some(embedder);
+
+        let idx = SemanticIndex::create(
+            &data_dir,
+            &model_id,
+            dimension,
+            EmbeddingEngine::Candle,
+            None,
+        )
+        .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(idx)));
+
+        let root2 = dir.path().join("root2");
+        std::fs::create_dir_all(&root2).unwrap();
+        let query = SearchQuery {
+            pattern: "test".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: root2.clone(),
+            file_type_filters: vec![],
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 2,
+            mode: SearchMode::Semantic,
+            supported_extensions: vec![],
+        };
+
+        let _handle = ctx.clone().start_search(query).await.unwrap();
+
+        let mut saw_reindex = false;
+        for _ in 0..20 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+            let events_guard = events.lock().unwrap();
+            if events_guard
+                .iter()
+                .any(|e| e.0 == "manager-event" && e.1 == serde_json::json!("Reindexing"))
+            {
+                saw_reindex = true;
+                break;
+            }
+        }
+        assert!(saw_reindex);
+
+        let events_guard = events.lock().unwrap();
+        assert!(
+            events_guard
+                .iter()
+                .filter(|e| e.0 == "manager-event" && e.1 == serde_json::json!("Reindexing"))
+                .count()
+                >= 1
+        );
     }
 
     #[tokio::test]

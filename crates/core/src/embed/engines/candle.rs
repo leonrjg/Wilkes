@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, info};
 #[cfg(feature = "candle-metal")]
 use tracing::warn;
+use tracing::{debug, info};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -203,18 +203,21 @@ impl CandleRuntimeFactory for RealCandleRuntimeFactory {
         vb: CandleVarBuilder<'a>,
     ) -> anyhow::Result<(LoadedModel, usize)> {
         match model_type {
-            "jina_bert_v2" | "jina_bert" | "jina_bert_v3" | "qwen2" | "qwen" | "jina_embeddings_v5" => {
+            "jina_bert_v2" | "jina_bert" | "jina_bert_v3" | "qwen2" | "qwen"
+            | "jina_embeddings_v5" => {
                 let config: JinaBertConfig = serde_json::from_str(config_text)
                     .with_context(|| format!("Failed to parse JinaBertConfig: {config_text}"))?;
                 let dim = config.hidden_size;
-                let m = JinaBertModel::new(vb, &config).context("Failed to build JinaBert model")?;
+                let m =
+                    JinaBertModel::new(vb, &config).context("Failed to build JinaBert model")?;
                 Ok((LoadedModel::JinaBert(m), dim))
             }
             "modern_bert" => {
                 let config: ModernBertConfig = serde_json::from_str(config_text)
                     .with_context(|| format!("Failed to parse ModernBertConfig: {config_text}"))?;
                 let dim = config.hidden_size;
-                let m = ModernBert::load(vb, &config).context("Failed to build ModernBert model")?;
+                let m =
+                    ModernBert::load(vb, &config).context("Failed to build ModernBert model")?;
                 Ok((LoadedModel::ModernBert(m), dim))
             }
             _ => {
@@ -228,8 +231,12 @@ impl CandleRuntimeFactory for RealCandleRuntimeFactory {
     }
 
     fn load_tokenizer(&self, tokenizer_path: &Path) -> anyhow::Result<Tokenizer> {
-        Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer from {}: {e}", tokenizer_path.display()))
+        Tokenizer::from_file(tokenizer_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load tokenizer from {}: {e}",
+                tokenizer_path.display()
+            )
+        })
     }
 }
 
@@ -642,15 +649,19 @@ impl EmbedderInstaller for CandleInstaller {
             cache_dir: data_dir.clone(),
         };
         let model_id_required = model_id.clone();
-        tokio::task::spawn_blocking(move || fetcher.download_required_files(&model_id_required, MODEL_FILES))
-            .await??;
+        tokio::task::spawn_blocking(move || {
+            fetcher.download_required_files(&model_id_required, MODEL_FILES)
+        })
+        .await??;
 
         let fetcher = RealHfModelFetcher {
             cache_dir: data_dir.clone(),
         };
         let aux_model_id = model_id.clone();
-        tokio::task::spawn_blocking(move || fetcher.fetch_optional_files(&aux_model_id, &["1_Pooling/config.json"]))
-            .await??;
+        tokio::task::spawn_blocking(move || {
+            fetcher.fetch_optional_files(&aux_model_id, &["1_Pooling/config.json"])
+        })
+        .await??;
 
         let aux_model_id = self.model.0.clone();
         let aux_cache_dir = data_dir.to_path_buf();
@@ -734,7 +745,8 @@ fn load_embedder_with_factory<F: CandleRuntimeFactory>(
         "[candle] dispatching '{}' with model_type='{}'",
         model.0, peek.model_type
     );
-    let (model_loaded, dimension) = factory.build_loaded_model(&peek.model_type, &config_text, vb)?;
+    let (model_loaded, dimension) =
+        factory.build_loaded_model(&peek.model_type, &config_text, vb)?;
     let mut tokenizer = factory.load_tokenizer(&artifacts.tokenizer_path)?;
 
     tokenizer.with_padding(Some(tokenizers::PaddingParams {
@@ -750,8 +762,7 @@ fn load_embedder_with_factory<F: CandleRuntimeFactory>(
 
     info!(
         "[candle] loaded '{}' dim={dimension} pooling={:?} device={device:?} dtype={dtype:?}",
-        model.0,
-        plan.pooling
+        model.0, plan.pooling
     );
     Ok(Arc::new(assemble_candle_embedder(
         CandleEmbedderBuildPlan { dimension, ..plan },
@@ -764,8 +775,145 @@ fn load_embedder_with_factory<F: CandleRuntimeFactory>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::fs;
     use tempfile::tempdir;
+
+    fn minimal_bert_config_json() -> &'static str {
+        r#"{
+            "vocab_size": 1,
+            "hidden_size": 3,
+            "num_hidden_layers": 0,
+            "num_attention_heads": 1,
+            "intermediate_size": 3,
+            "hidden_act": "gelu",
+            "hidden_dropout_prob": 0.1,
+            "max_position_embeddings": 512,
+            "type_vocab_size": 2,
+            "initializer_range": 0.02,
+            "layer_norm_eps": 1e-12,
+            "pad_token_id": 0,
+            "position_embedding_type": "absolute",
+            "use_cache": false,
+            "classifier_dropout": null,
+            "model_type": "bert"
+        }"#
+    }
+
+    fn minimal_jina_config_json() -> &'static str {
+        r#"{
+            "vocab_size": 1,
+            "hidden_size": 3,
+            "num_hidden_layers": 0,
+            "num_attention_heads": 1,
+            "intermediate_size": 3,
+            "hidden_act": "gelu",
+            "max_position_embeddings": 4,
+            "type_vocab_size": 2,
+            "initializer_range": 0.02,
+            "layer_norm_eps": 1e-12,
+            "pad_token_id": 0,
+            "position_embedding_type": "absolute"
+        }"#
+    }
+
+    fn minimal_modern_config_json() -> &'static str {
+        r#"{
+            "vocab_size": 1,
+            "hidden_size": 3,
+            "num_hidden_layers": 0,
+            "num_attention_heads": 1,
+            "intermediate_size": 3,
+            "max_position_embeddings": 4,
+            "layer_norm_eps": 1e-12,
+            "pad_token_id": 0,
+            "global_attn_every_n_layers": 1,
+            "global_rope_theta": 1.0,
+            "local_attention": 1,
+            "local_rope_theta": 1.0
+        }"#
+    }
+
+    fn minimal_bert_tensors(dtype: DType, device: &Device) -> HashMap<String, Tensor> {
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "embeddings.word_embeddings.weight".to_string(),
+            Tensor::zeros((1, 3), dtype, device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.position_embeddings.weight".to_string(),
+            Tensor::zeros((512, 3), dtype, device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.token_type_embeddings.weight".to_string(),
+            Tensor::zeros((2, 3), dtype, device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.LayerNorm.weight".to_string(),
+            Tensor::ones(3, dtype, device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.LayerNorm.bias".to_string(),
+            Tensor::zeros(3, dtype, device).unwrap(),
+        );
+        tensors
+    }
+
+    fn write_cached_candle_artifacts(dir: &tempfile::TempDir, model_id: &str, config: &str) {
+        let repo_dir = dir
+            .path()
+            .join(format!("models--{}", model_id.replace('/', "--")));
+        let snapshots = repo_dir.join("snapshots").join("main");
+        fs::create_dir_all(&snapshots).unwrap();
+        fs::write(snapshots.join("config.json"), config).unwrap();
+        fs::write(
+            snapshots.join("tokenizer.json"),
+            r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":null,"byte_fallback":null,"vocab":{},"merges":[]}}"#,
+        )
+        .unwrap();
+        fs::write(snapshots.join("model.safetensors"), "weights").unwrap();
+        let refs = repo_dir.join("refs");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("main"), "main").unwrap();
+    }
+
+    struct MockCandleRuntimeFactory;
+
+    impl CandleRuntimeFactory for MockCandleRuntimeFactory {
+        fn load_var_builder<'a>(
+            &self,
+            _weights_path: &'a Path,
+            dtype: DType,
+            device: &'a Device,
+        ) -> anyhow::Result<CandleVarBuilder<'a>> {
+            Ok(VarBuilder::from_tensors(
+                minimal_bert_tensors(dtype, device),
+                dtype,
+                device,
+            ))
+        }
+
+        fn build_loaded_model<'a>(
+            &self,
+            _model_type: &str,
+            config_text: &str,
+            vb: CandleVarBuilder<'a>,
+        ) -> anyhow::Result<(LoadedModel, usize)> {
+            let config: BertConfig = serde_json::from_str(config_text)?;
+            let dim = config.hidden_size;
+            let model = BertModel::load(vb, &config)?;
+            Ok((LoadedModel::Bert(model), dim))
+        }
+
+        fn load_tokenizer(&self, tokenizer_path: &Path) -> anyhow::Result<Tokenizer> {
+            Tokenizer::from_file(tokenizer_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to load tokenizer from {}: {e}",
+                    tokenizer_path.display()
+                )
+            })
+        }
+    }
 
     #[test]
     fn test_list_supported_models() {
@@ -1232,5 +1380,202 @@ mod tests {
             .expect("expected cached Candle model");
         assert!(model.is_cached);
         assert_eq!(model.size_bytes, Some(expected_size));
+    }
+
+    #[test]
+    fn test_resolve_cached_artifacts_and_build_embedder_plan() {
+        let dir = tempdir().unwrap();
+        let model_id = "custom/model";
+        let repo_dir = dir.path().join("models--custom--model");
+        let snapshots = repo_dir.join("snapshots").join("main");
+        fs::create_dir_all(snapshots.join("1_Pooling")).unwrap();
+        fs::write(snapshots.join("config.json"), r#"{"hidden_size": 1024}"#).unwrap();
+        fs::write(snapshots.join("tokenizer.json"), "{}").unwrap();
+        fs::write(snapshots.join("model.safetensors"), "weights").unwrap();
+        fs::write(
+            snapshots.join("1_Pooling/config.json"),
+            r#"{"pooling_mode_cls_token": true}"#,
+        )
+        .unwrap();
+        let refs = repo_dir.join("refs");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("main"), "main").unwrap();
+
+        let artifacts = resolve_cached_artifacts(dir.path(), model_id).unwrap();
+        assert!(artifacts.config_path.ends_with("config.json"));
+        assert!(artifacts.pooling_config_path.is_some());
+
+        let plan =
+            build_embedder_plan(dir.path(), model_id, r#"{"hidden_size":1024}"#, "cpu").unwrap();
+        assert_eq!(plan.model_id, model_id);
+        assert_eq!(plan.dimension, 1024);
+        assert_eq!(plan.device_plan, CandleDevicePlan::Cpu);
+        assert_eq!(plan.dtype, DType::F32);
+    }
+
+    #[test]
+    fn test_resolve_cached_artifacts_missing_files() {
+        let dir = tempdir().unwrap();
+        let model_id = "custom/model";
+        let repo_dir = dir.path().join("models--custom--model");
+        let snapshots = repo_dir.join("snapshots").join("main");
+        fs::create_dir_all(&snapshots).unwrap();
+        fs::write(snapshots.join("config.json"), "{}").unwrap();
+        fs::write(snapshots.join("tokenizer.json"), "{}").unwrap();
+        fs::write(snapshots.join("model.safetensors"), "{}").unwrap();
+        let refs = repo_dir.join("refs");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("main"), "main").unwrap();
+
+        fs::remove_file(snapshots.join("config.json")).unwrap();
+        assert!(resolve_cached_artifacts(dir.path(), model_id).is_err());
+
+        fs::write(snapshots.join("config.json"), "{}").unwrap();
+        fs::remove_file(snapshots.join("tokenizer.json")).unwrap();
+        assert!(resolve_cached_artifacts(dir.path(), model_id).is_err());
+
+        fs::write(snapshots.join("tokenizer.json"), "{}").unwrap();
+        fs::remove_file(snapshots.join("model.safetensors")).unwrap();
+        assert!(resolve_cached_artifacts(dir.path(), model_id).is_err());
+    }
+
+    #[test]
+    fn test_read_config_text_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing.json");
+        let err = read_config_text(&path).unwrap_err();
+        assert!(err.to_string().contains("Failed to read"));
+    }
+
+    #[test]
+    fn test_parse_model_type_and_dimension_helpers() {
+        let peek = parse_model_type(r#"{"model_type":"bert"}"#).unwrap();
+        assert_eq!(peek.model_type, "bert");
+        assert_eq!(
+            parse_dimension_from_config(r#"{"hidden_size":384}"#).unwrap(),
+            384
+        );
+        assert!(parse_dimension_from_config(r#"{"no_hidden_size":true}"#).is_err());
+    }
+
+    #[test]
+    fn test_select_device_plan_and_realize_device() {
+        assert_eq!(select_device_plan("cpu"), CandleDevicePlan::Cpu);
+        assert_eq!(select_device_plan("gpu"), CandleDevicePlan::MetalPreferred);
+        assert_eq!(select_dtype_for_plan(&CandleDevicePlan::Cpu), DType::F32);
+        assert!(matches!(realize_device(CandleDevicePlan::Cpu), Device::Cpu));
+    }
+
+    #[test]
+    fn test_real_candle_runtime_factory_dispatches_model_variants() {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        let factory = RealCandleRuntimeFactory;
+
+        let bert_vb =
+            VarBuilder::from_tensors(minimal_bert_tensors(dtype, &device), dtype, &device);
+        let (model, dim) = factory
+            .build_loaded_model("bert", minimal_bert_config_json(), bert_vb)
+            .unwrap();
+        assert_eq!(dim, 3);
+        match model {
+            LoadedModel::Bert(_) => {}
+            _ => panic!("expected Bert model"),
+        }
+
+        let jina_vb = VarBuilder::from_tensors(HashMap::new(), dtype, &device);
+        assert!(factory
+            .build_loaded_model("jina_bert_v2", minimal_jina_config_json(), jina_vb)
+            .is_err());
+
+        let modern_vb = VarBuilder::from_tensors(HashMap::new(), dtype, &device);
+        assert!(factory
+            .build_loaded_model("modern_bert", minimal_modern_config_json(), modern_vb)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_load_embedder_with_factory_happy_path() {
+        let dir = tempdir().unwrap();
+        let model_id = "custom/model";
+        write_cached_candle_artifacts(&dir, model_id, minimal_bert_config_json());
+
+        let model = EmbedderModel(model_id.to_string());
+        let embedder =
+            load_embedder_with_factory(&MockCandleRuntimeFactory, &model, dir.path(), "cpu")
+                .unwrap();
+
+        assert_eq!(embedder.model_id(), model_id);
+        assert_eq!(embedder.dimension(), 3);
+        assert!(matches!(embedder.engine(), EmbeddingEngine::Candle));
+    }
+
+    #[tokio::test]
+    async fn test_load_embedder_with_factory_reports_tokenizer_error() {
+        struct FailingTokenizerFactory;
+
+        impl CandleRuntimeFactory for FailingTokenizerFactory {
+            fn load_var_builder<'a>(
+                &self,
+                _weights_path: &'a Path,
+                dtype: DType,
+                device: &'a Device,
+            ) -> anyhow::Result<CandleVarBuilder<'a>> {
+                Ok(VarBuilder::from_tensors(
+                    minimal_bert_tensors(dtype, device),
+                    dtype,
+                    device,
+                ))
+            }
+
+            fn build_loaded_model<'a>(
+                &self,
+                _model_type: &str,
+                _config_text: &str,
+                _vb: CandleVarBuilder<'a>,
+            ) -> anyhow::Result<(LoadedModel, usize)> {
+                let device = Device::Cpu;
+                let dtype = DType::F32;
+                let tensors = minimal_bert_tensors(dtype, &device);
+                let vb = VarBuilder::from_tensors(tensors, dtype, &device);
+                let config = BertConfig {
+                    vocab_size: 1,
+                    hidden_size: 3,
+                    num_hidden_layers: 0,
+                    num_attention_heads: 1,
+                    intermediate_size: 3,
+                    hidden_act: candle_transformers::models::bert::HiddenAct::Gelu,
+                    hidden_dropout_prob: 0.1,
+                    max_position_embeddings: 512,
+                    type_vocab_size: 2,
+                    initializer_range: 0.02,
+                    layer_norm_eps: 1e-12,
+                    pad_token_id: 0,
+                    position_embedding_type:
+                        candle_transformers::models::bert::PositionEmbeddingType::Absolute,
+                    use_cache: false,
+                    classifier_dropout: None,
+                    model_type: Some("bert".to_string()),
+                };
+                let model = BertModel::load(vb, &config)?;
+                Ok((LoadedModel::Bert(model), 3))
+            }
+
+            fn load_tokenizer(&self, _tokenizer_path: &Path) -> anyhow::Result<Tokenizer> {
+                anyhow::bail!("tokenizer exploded")
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let model_id = "custom/tokenizer-failure";
+        write_cached_candle_artifacts(&dir, model_id, minimal_bert_config_json());
+
+        let model = EmbedderModel(model_id.to_string());
+        let err =
+            match load_embedder_with_factory(&FailingTokenizerFactory, &model, dir.path(), "cpu") {
+                Ok(_) => panic!("expected tokenizer failure"),
+                Err(err) => err,
+            };
+        assert!(err.to_string().contains("tokenizer exploded"));
     }
 }

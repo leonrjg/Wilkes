@@ -86,7 +86,7 @@ pub(super) async fn supervised_manager_loop(
             Ok(()) => break,
             Err(e) if e.is_panic() => {
                 tracing::error!("WorkerManager: loop panicked, restarting: {e:?}");
-                rx = reset_after_runtime_panic(&active_pid, &status, &sender_slot);
+                rx = restart_runtime_after_panic(&active_pid, &status, &sender_slot);
             }
             Err(e) => {
                 tracing::error!("WorkerManager: loop task cancelled: {e:?}");
@@ -134,6 +134,26 @@ enum NextCommand {
     Received(ManagerCommand),
     ChannelClosed,
     IdleTimeout,
+}
+
+fn serialize_request_for_worker(req: &WorkerRequest) -> Result<String, String> {
+    serde_json::to_string(req).map_err(|e| format!("Serialize error: {e}"))
+}
+
+fn should_restart_worker(
+    active_process: bool,
+    active_engine: Option<EmbeddingEngine>,
+    req_engine: EmbeddingEngine,
+) -> bool {
+    !active_process || active_engine != Some(req_engine)
+}
+
+fn restart_runtime_after_panic(
+    active_pid: &Arc<AtomicU32>,
+    status: &Arc<RwLock<WorkerStatus>>,
+    sender_slot: &Arc<std::sync::Mutex<mpsc::Sender<ManagerCommand>>>,
+) -> mpsc::Receiver<ManagerCommand> {
+    reset_after_runtime_panic(active_pid, status, sender_slot)
 }
 
 impl WorkerRuntime {
@@ -215,7 +235,7 @@ impl WorkerRuntime {
     }
 
     async fn handle_submit(&mut self, req: Box<WorkerRequest>, reply: mpsc::Sender<WorkerEvent>) {
-        let req_json = match serde_json::to_string(&req) {
+        let req_json = match serialize_request_for_worker(&req) {
             Ok(json) => json,
             Err(e) => {
                 let _ = reply
@@ -252,7 +272,11 @@ impl WorkerRuntime {
         req: &WorkerRequest,
         reply: &mpsc::Sender<WorkerEvent>,
     ) -> Result<(), ()> {
-        let needs_restart = self.active_process.is_none() || self.active_engine != Some(req.engine);
+        let needs_restart = should_restart_worker(
+            self.active_process.is_some(),
+            self.active_engine,
+            req.engine,
+        );
 
         if !needs_restart {
             return Ok(());
@@ -489,6 +513,66 @@ mod tests {
         assert!(!status.active);
         assert!(status.engine.is_none());
         assert!(status.model.is_none());
+    }
+
+    #[test]
+    fn test_restart_runtime_after_panic_resets_state() {
+        let active_pid = Arc::new(AtomicU32::new(12));
+        let status = Arc::new(RwLock::new(WorkerStatus {
+            active: true,
+            engine: Some("candle".to_string()),
+            model: Some("model-a".to_string()),
+            timeout_secs: 300,
+        }));
+        let (old_tx, _old_rx) = mpsc::channel(1);
+        let sender_slot = Arc::new(std::sync::Mutex::new(old_tx));
+
+        let _new_rx = restart_runtime_after_panic(&active_pid, &status, &sender_slot);
+
+        assert_eq!(active_pid.load(Ordering::Relaxed), 0);
+        let status = status.read().unwrap();
+        assert!(!status.active);
+        assert!(status.engine.is_none());
+        assert!(status.model.is_none());
+    }
+
+    #[test]
+    fn test_should_restart_worker_uses_active_session_and_engine() {
+        assert!(should_restart_worker(false, None, EmbeddingEngine::Candle));
+        assert!(should_restart_worker(
+            true,
+            Some(EmbeddingEngine::Candle),
+            EmbeddingEngine::SBERT
+        ));
+        assert!(!should_restart_worker(
+            true,
+            Some(EmbeddingEngine::Candle),
+            EmbeddingEngine::Candle
+        ));
+    }
+
+    #[test]
+    fn test_serialize_request_for_worker_round_trips_json() {
+        let req = WorkerRequest {
+            engine: EmbeddingEngine::Candle,
+            model: "model-a".to_string(),
+            device: "cpu".to_string(),
+            texts: Some(vec!["hello".to_string()]),
+            mode: "embed".to_string(),
+            root: std::path::PathBuf::from("root"),
+            data_dir: std::path::PathBuf::from("data"),
+            chunk_size: Some(16),
+            chunk_overlap: Some(4),
+            paths: None,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let json = serialize_request_for_worker(&req).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["mode"], "embed");
+        assert_eq!(value["model"], "model-a");
+        assert_eq!(value["device"], "cpu");
+        assert_eq!(value["chunk_size"], 16);
     }
 
     #[tokio::test]

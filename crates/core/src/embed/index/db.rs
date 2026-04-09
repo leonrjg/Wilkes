@@ -408,6 +408,35 @@ mod tests {
     }
 
     #[test]
+    fn test_query_skips_unknown_origin_types() {
+        let dir = tempdir().unwrap();
+        let mut idx = SemanticIndex::create(dir.path(), "m", 1, EmbeddingEngine::Candle, None)
+            .unwrap();
+
+        let path = dir.path().join("mystery.txt");
+        let prepared = PreparedFile {
+            path: path.clone(),
+            chunks: vec![(
+                Chunk {
+                    file_path: path.clone(),
+                    text: "mystery".to_string(),
+                    byte_range: ByteRange { start: 0, end: 7 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![1.0],
+            )],
+        };
+        idx.write_file(prepared).unwrap();
+
+        idx.conn
+            .execute("UPDATE chunks SET origin_type = 'mystery'", [])
+            .unwrap();
+
+        let results = idx.query(&[1.0], 1).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
     fn test_build_full() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("root");

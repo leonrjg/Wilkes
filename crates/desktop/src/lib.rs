@@ -10,16 +10,12 @@ use wilkes_core::types::{
     DataPaths, EmbeddingEngine, FileEntry, IndexStatus, ModelDescriptor, SelectedEmbedder, Settings,
 };
 
-// ── Platform helpers ──────────────────────────────────────────────────────────
+mod platform;
 
-fn desktop_settings_path_from(config_dir: std::path::PathBuf) -> std::path::PathBuf {
-    config_dir.join("settings.json")
-}
-
-fn desktop_settings_path(app: &AppHandle) -> anyhow::Result<std::path::PathBuf> {
-    let config = app.path().app_config_dir()?;
-    Ok(desktop_settings_path_from(config))
-}
+use platform::{
+    build_startup_plan, validate_open_path, DesktopPlatform, DesktopStartupPlan,
+    SystemDesktopPlatform, TauriPlatform,
+};
 
 fn app_context(app: &AppHandle) -> Arc<AppContext> {
     app.state::<Arc<AppContext>>().inner().clone()
@@ -31,36 +27,6 @@ fn active_searches_state(app: &AppHandle) -> Arc<ActiveSearches> {
 
 fn data_paths_from(app_data: String) -> DataPaths {
     DataPaths { app_data }
-}
-
-fn validate_open_path(path: &std::path::Path) -> Result<(), String> {
-    if !path.exists() {
-        return Err("Path does not exist".into());
-    }
-    Ok(())
-}
-
-fn opener_command() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "open"
-    }
-    #[cfg(target_os = "windows")]
-    {
-        "explorer"
-    }
-    #[cfg(target_os = "linux")]
-    {
-        "xdg-open"
-    }
-}
-
-fn spawn_open_path(path: &std::path::Path) -> Result<(), String> {
-    std::process::Command::new(opener_command())
-        .arg(path)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 async fn list_files_for_ctx(ctx: Arc<AppContext>, root: String) -> Result<Vec<FileEntry>, String> {
@@ -139,13 +105,24 @@ async fn set_worker_timeout_for_ctx(ctx: Arc<AppContext>, secs: u64) -> Result<(
         .map_err(|e| e.to_string())
 }
 
+fn handle_exit_event(app_handle: &AppHandle, event: tauri::RunEvent) {
+    if matches!(
+        event,
+        tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+    ) {
+        let ctx = app_handle.state::<Arc<AppContext>>().inner().clone();
+        ctx.shutdown();
+    }
+}
+
 // ── Tauri EventEmitter impl ───────────────────────────────────────────────────
 
 struct TauriEmitter(AppHandle);
 
 impl EventEmitter for TauriEmitter {
     fn emit(&self, name: &str, payload: serde_json::Value) {
-        let _ = Emitter::emit(&self.0, name, &payload);
+        let platform = TauriPlatform(self.0.clone());
+        platform.emit(name, payload);
     }
 }
 
@@ -251,7 +228,7 @@ async fn get_python_info() -> Result<String, String> {
 async fn open_path(path: String) -> Result<(), String> {
     let p = std::path::PathBuf::from(&path);
     validate_open_path(&p)?;
-    spawn_open_path(&p)?;
+    SystemDesktopPlatform.open_path(&p)?;
     Ok(())
 }
 
@@ -410,10 +387,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle().clone();
-
-            let data_dir = handle.path().app_data_dir()?;
-            let settings_path = desktop_settings_path(&handle)?;
-            let paths = WorkerPaths::resolve(&data_dir);
+            let platform = TauriPlatform(handle.clone());
+            let DesktopStartupPlan {
+                data_dir,
+                settings_path,
+                worker_paths: paths,
+            } = build_startup_plan(&platform)?;
 
             let emitter = Arc::new(TauriEmitter(handle.clone()));
             let (ctx, event_rx, loop_fut) =
@@ -459,15 +438,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    app.run(|app_handle, event| {
-        if matches!(
-            event,
-            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-        ) {
-            let ctx = app_handle.state::<Arc<AppContext>>().inner().clone();
-            ctx.shutdown();
-        }
-    });
+    app.run(|app_handle, event| handle_exit_event(&app_handle, event));
 }
 
 #[cfg(test)]
@@ -475,6 +446,8 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use wilkes_api::context::EventEmitter;
+
+    static OPEN_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct MockEmitter;
 
@@ -521,19 +494,6 @@ mod tests {
         let mut guard = active.0.lock().unwrap();
         guard.insert("test".to_string(), tokio::spawn(async {}));
         assert!(guard.contains_key("test"));
-    }
-
-    #[test]
-    fn test_desktop_settings_path_from() {
-        let dir = tempdir().unwrap();
-        let settings = desktop_settings_path_from(dir.path().to_path_buf());
-        assert_eq!(settings, dir.path().join("settings.json"));
-    }
-
-    #[test]
-    fn test_data_paths_from() {
-        let paths = data_paths_from("app-data".to_string());
-        assert_eq!(paths.app_data, "app-data");
     }
 
     #[tokio::test]
@@ -601,6 +561,37 @@ mod tests {
             validate_open_path(&dir.path().join("missing")),
             Err("Path does not exist".into())
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_open_path_uses_spawned_opener() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = OPEN_PATH_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let opener_name = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let opener = dir.path().join(opener_name);
+        std::fs::write(&opener, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&opener).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&opener, perms).unwrap();
+
+        let path = dir.path().join("folder");
+        std::fs::create_dir(&path).unwrap();
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", dir.path().display(), original_path);
+        std::env::set_var("PATH", &new_path);
+
+        let res = open_path(path.display().to_string()).await;
+        std::env::set_var("PATH", original_path);
+
+        assert!(res.is_ok());
     }
 
     #[tokio::test]
