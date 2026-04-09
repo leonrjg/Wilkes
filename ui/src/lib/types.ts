@@ -152,7 +152,6 @@ export interface Settings {
   supported_extensions: string[];
   /** 0 = unlimited */
   max_results: number;
-  is_demo?: boolean;
 }
 
 export type Theme = "System" | "Light" | "Dark";

@@ -197,8 +197,7 @@ export default function SettingsModal({
           </button>
         </div>
 
-
-        <div className="flex flex-1 overflow-hidden" data-demo-readonly>
+        <div className="flex flex-1 overflow-hidden">
           {/* Sidebar */}
           <div className="w-40 border-r border-[var(--border-main)] bg-[var(--bg-sidebar)] p-2 flex flex-col gap-3">
             <div className="flex flex-col gap-0.5">

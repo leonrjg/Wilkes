@@ -195,21 +195,11 @@ async fn get_python_info_handler() -> impl IntoResponse {
     }
 }
 
-#[derive(Serialize)]
-struct SettingsResponse {
-    #[serde(flatten)]
-    settings: wilkes_core::types::Settings,
-    is_demo: bool,
-}
-
 async fn get_settings_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     let settings = state.ctx.get_settings().await;
-    Ok(Json(SettingsResponse {
-        settings,
-        is_demo: std::env::var("WILKES_DEMO_MODE").is_ok(),
-    }))
+    Ok(Json(settings))
 }
 
 async fn update_settings_handler(

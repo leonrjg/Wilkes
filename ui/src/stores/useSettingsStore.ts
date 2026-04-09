@@ -68,7 +68,6 @@ export const useSettingsStore = create<SettingsStore>()(
 
     load: async () => {
       const s = await api.getSettings();
-      document.body.classList.toggle("demo-mode", !!s.is_demo);
       applyTheme(s.theme);
 
       // Set up system theme listener if needed
