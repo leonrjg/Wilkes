@@ -3,11 +3,18 @@
   <img height="300" alt="Dark mode" src="https://github.com/user-attachments/assets/6c03a671-1a2a-42c5-b5ab-0cd6a66030bf" />
 </p>
 
-<img height="200" src="https://github.com/user-attachments/assets/d64c15a4-4aad-4cc6-ba20-d243dbb0c21f" />
-
-# Wilkes
-Perform exact or semantic search across multiple PDFs and text files, with highlights.
-This project aims to provide a **plug-and-play**, cross-platform solution for local semantic search.
+<table>
+  <tr>
+    <td valign="top">
+      <img height="200" alt="Wilkes" src="https://github.com/user-attachments/assets/d64c15a4-4aad-4cc6-ba20-d243dbb0c21f" />
+    </td>
+    <td valign="top">
+      <h1>Wilkes</h1>
+      <p>Perform exact or semantic search across multiple PDFs and text files, with highlights.</p>
+      <p>This project aims to provide a <strong>plug-and-play</strong>, cross-platform solution for local semantic search.</p>
+    </td>
+  </tr>
+</table>
 
 ## Features
 - Document viewer with highlighted matches
