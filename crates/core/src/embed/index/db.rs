@@ -464,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_fails_on_embedding_dimension_mismatch() {
+    fn test_build_skips_file_on_embedding_dimension_mismatch() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("root");
         fs::create_dir(&root).unwrap();
@@ -497,7 +497,7 @@ mod tests {
             supported_extensions: vec!["txt".to_string()],
         };
 
-        let res = SemanticIndex::build(
+        let idx = SemanticIndex::build(
             &data_dir,
             &root,
             &[root.join("test.txt")],
@@ -506,14 +506,50 @@ mod tests {
             tx,
             Arc::new(AtomicBool::new(false)),
             &indexing,
-        );
+        )
+        .unwrap();
 
-        match res {
-            Err(e) => assert!(e
-                .to_string()
-                .contains("Failed to write index entry")),
-            Ok(_) => panic!("Expected build failure on embedding dimension mismatch"),
-        }
+        assert_eq!(idx.status().total_chunks, 0);
+    }
+
+    #[test]
+    fn test_write_file_is_atomic_on_failure() {
+        let dir = tempdir().unwrap();
+        let mut idx =
+            SemanticIndex::create(dir.path(), "m", 1, EmbeddingEngine::Candle, None).unwrap();
+
+        let path = dir.path().join("test.txt");
+        let original = PreparedFile {
+            path: path.clone(),
+            chunks: vec![(
+                Chunk {
+                    file_path: path.clone(),
+                    text: "original".to_string(),
+                    byte_range: ByteRange { start: 0, end: 8 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![1.0],
+            )],
+        };
+        idx.write_file(original).unwrap();
+
+        let replacement = PreparedFile {
+            path: path.clone(),
+            chunks: vec![(
+                Chunk {
+                    file_path: path.clone(),
+                    text: "replacement".to_string(),
+                    byte_range: ByteRange { start: 0, end: 11 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![1.0, 2.0],
+            )],
+        };
+        assert!(idx.write_file(replacement).is_err());
+
+        let results = idx.query(&[1.0], 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk_text, "original");
     }
 }
 
@@ -767,7 +803,25 @@ impl SemanticIndex {
             };
 
             let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-            let embeddings = embedder.embed_passages(&texts)?;
+            let embeddings = match embedder.embed_passages(&texts) {
+                Ok(embeddings) => embeddings,
+                Err(e) => {
+                    error!(
+                        "[SemanticIndex::build] skipping {}: embed_passages failed: {e:#}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            if embeddings.len() != chunks.len() {
+                error!(
+                    "[SemanticIndex::build] skipping {}: embedder returned {} embeddings for {} chunks",
+                    path.display(),
+                    embeddings.len(),
+                    chunks.len()
+                );
+                continue;
+            }
             anyhow::ensure!(
                 !cancel_flag.load(Ordering::Relaxed),
                 "Index build cancelled"
@@ -777,8 +831,12 @@ impl SemanticIndex {
                 path: path.clone(),
                 chunks: chunks.into_iter().zip(embeddings).collect(),
             };
-            idx.write_file(prepared)
-                .with_context(|| format!("Failed to write index entry for {}", path.display()))?;
+            if let Err(e) = idx.write_file(prepared) {
+                error!(
+                    "[SemanticIndex::build] skipping {}: failed to write index entry: {e:#}",
+                    path.display()
+                );
+            }
         }
 
         let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -988,17 +1046,17 @@ impl SemanticIndex {
             );
         }
 
+        let tx = self.conn.transaction()?;
+
         // Delete vectors first (vec0 has no FK cascade), then the chunk rows.
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE file_path = ?1)",
             params![rel_path_str],
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM chunks WHERE file_path = ?1",
             params![rel_path_str],
         )?;
-
-        let tx = self.conn.transaction()?;
         for (i, (chunk, embedding)) in prepared.chunks.into_iter().enumerate() {
             let (origin_type, page, line, col, bbox_x, bbox_y, bbox_w, bbox_h) = match &chunk.origin
             {
