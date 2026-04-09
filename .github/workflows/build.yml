@@ -107,6 +107,36 @@ jobs:
             ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }}
           }
 
+      - name: Create portable Windows bundle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $releaseDir = "target/${{ matrix.target }}/release"
+          $bundleDir = Join-Path $releaseDir "bundle/portable"
+          $portableRoot = Join-Path $bundleDir "Wilkes"
+          $zipPath = Join-Path $bundleDir "Wilkes_${{ matrix.target }}_portable.zip"
+
+          if (Test-Path $portableRoot) {
+            Remove-Item $portableRoot -Recurse -Force
+          }
+          if (Test-Path $zipPath) {
+            Remove-Item $zipPath -Force
+          }
+
+          New-Item -ItemType Directory -Path $portableRoot | Out-Null
+
+          Copy-Item (Join-Path $releaseDir "wilkes-desktop.exe") (Join-Path $portableRoot "Wilkes.exe")
+          Copy-Item (Join-Path $releaseDir "wilkes-rust-worker.exe") (Join-Path $portableRoot "wilkes-rust-worker.exe")
+          Copy-Item "crates/worker/requirements.txt" (Join-Path $portableRoot "requirements.txt")
+          Copy-Item "crates/worker/wilkes_python_worker" (Join-Path $portableRoot "wilkes_python_worker") -Recurse
+
+          $webViewLoader = Join-Path $releaseDir "WebView2Loader.dll"
+          if (Test-Path $webViewLoader) {
+            Copy-Item $webViewLoader (Join-Path $portableRoot "WebView2Loader.dll")
+          }
+
+          Compress-Archive -Path (Join-Path $portableRoot "*") -DestinationPath $zipPath
+
       - name: Upload macOS artifact
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
@@ -119,7 +149,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wilkes-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/bundle/deb/*.deb
+          path: |
+            target/${{ matrix.target }}/release/bundle/deb/*.deb
+            target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
 
       - name: Upload Windows artifact
         if: runner.os == 'Windows'
@@ -129,6 +161,7 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/bundle/nsis/*.exe
             target/${{ matrix.target }}/release/bundle/msi/*.msi
+            target/${{ matrix.target }}/release/bundle/portable/*.zip
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

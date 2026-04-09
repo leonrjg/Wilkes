@@ -124,10 +124,12 @@ impl WorkerProcess {
                         }
                     }
                     Err(e) => {
-                        tracing::error!(
-                            "Failed to parse worker event: {e}, raw line: {}",
-                            line.trim()
-                        );
+                        let raw = line.trim();
+                        if !raw.is_empty() {
+                            tracing::warn!(
+                                "Ignoring non-protocol worker stdout line: {e}, raw line: {raw}"
+                            );
+                        }
                     }
                 },
                 Err(e) => {
@@ -147,10 +149,30 @@ async fn build_command(paths: &WorkerPaths, req: &WorkerRequest) -> Result<Comma
     Ok(match req.engine {
         EmbeddingEngine::SBERT => {
             let python = setup_python_env(paths).await?;
+            let cache_root = paths.data_dir.join("huggingface");
+            let xdg_cache_root = paths.data_dir.join(".cache");
+            std::fs::create_dir_all(&cache_root).map_err(|e| {
+                format!(
+                    "Failed to create Hugging Face cache directory {}: {e}",
+                    cache_root.display()
+                )
+            })?;
+            std::fs::create_dir_all(&xdg_cache_root).map_err(|e| {
+                format!(
+                    "Failed to create XDG cache directory {}: {e}",
+                    xdg_cache_root.display()
+                )
+            })?;
             let mut command = Command::new(&python);
             command.env("PYTORCH_ENABLE_MPS_FALLBACK", "1");
             command.env("PYTHONPATH", &paths.python_package_dir);
-            command.env("HF_HUB_CACHE", &paths.data_dir);
+            command.env("HOME", &paths.data_dir);
+            command.env("XDG_CACHE_HOME", &xdg_cache_root);
+            command.env("HF_HOME", &cache_root);
+            command.env("HF_HUB_CACHE", cache_root.join("hub"));
+            command.env("HF_ASSETS_CACHE", cache_root.join("assets"));
+            command.env("HF_XET_CACHE", cache_root.join("xet"));
+            command.env("HF_HUB_DISABLE_XET", "1");
             command.arg("-m");
             command.arg("wilkes_python_worker");
             command

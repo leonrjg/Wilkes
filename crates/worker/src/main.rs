@@ -273,7 +273,10 @@ mod tests {
 
         let res = get_or_load_embedder(&mut active, &req);
         assert!(res.is_err());
-        assert!(active.is_some(), "cached embedder should remain available on reload failure");
+        assert!(
+            active.is_some(),
+            "cached embedder should remain available on reload failure"
+        );
     }
 
     #[test]

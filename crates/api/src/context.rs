@@ -1007,9 +1007,7 @@ mod tests {
 
         let events_guard = events.lock().unwrap();
         assert!(events_guard.iter().any(|(name, payload)| {
-            name == "embed-error"
-                && payload["operation"] == "Build"
-                && payload["message"] == ""
+            name == "embed-error" && payload["operation"] == "Build" && payload["message"] == ""
         }));
     }
 

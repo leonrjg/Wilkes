@@ -343,7 +343,10 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
-        if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
             let ctx = app_handle.state::<Arc<AppContext>>().inner().clone();
             ctx.shutdown();
         }

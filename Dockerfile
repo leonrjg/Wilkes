@@ -94,7 +94,14 @@ COPY --from=rust-builder /wilkes-rust-worker /app/wilkes-rust-worker
 COPY --from=ui-builder /build/ui/dist /app/dist
 COPY crates/worker/wilkes_python_worker /app/worker/wilkes_python_worker
 COPY crates/worker/requirements.txt /app/worker/requirements.txt
-ENV RUST_LOG=info, hf_hub=warn
+ENV RUST_LOG=info,hf_hub=warn \
+    HOME=/data \
+    XDG_CACHE_HOME=/data/.cache \
+    HF_HOME=/data/huggingface \
+    HF_HUB_CACHE=/data/huggingface/hub \
+    HF_ASSETS_CACHE=/data/huggingface/assets \
+    HF_XET_CACHE=/data/huggingface/xet \
+    HF_HUB_DISABLE_XET=1
 
 VOLUME /data
 EXPOSE 2000
