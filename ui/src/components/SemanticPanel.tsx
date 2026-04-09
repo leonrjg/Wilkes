@@ -7,11 +7,13 @@ import {
   type EmbedError,
   type ModelDescriptor,
   type SemanticSettings,
+  type SelectedEmbedder,
   type IndexStatus,
   type EmbeddingEngine,
 } from "../lib/types";
 import type { SearchApi } from "../services/api";
 import LogsPanel from "./LogsPanel";
+import {CornerLeftDown, CornerRightUp} from "react-feather";
 
 // ---------------------------------------------------------------------------
 // State & reducer
@@ -26,8 +28,7 @@ interface ProgressState {
 
 interface PendingBuild {
   directory: string;
-  model: EmbedderModel;
-  engine: EmbeddingEngine;
+  selected: SelectedEmbedder;
 }
 
 interface PanelState {
@@ -93,11 +94,8 @@ function reducer(state: PanelState, action: Action): PanelState {
     case "settings_updated":
       return { ...state, settings: action.settings };
     case "models_loaded":
-      // Reject if response is for a stale engine
-      if (action.engine !== state.settings?.engine) return state;
       return { ...state, backendModels: action.models, modelsEngine: action.engine, isEngineAvailable: true, error: null };
     case "models_failed":
-      if (action.engine !== state.settings?.engine) return state;
       return { ...state, backendModels: [], modelsEngine: action.engine, isEngineAvailable: false, error: action.error };
     case "index_loaded":
       return { ...state, indexStatus: action.indexStatus };
@@ -175,7 +173,10 @@ function derivePhase(state: PanelState): Phase {
 
   const sem = state.settings;
   if (state.indexStatus && sem) {
-    if (state.indexStatus.engine !== sem.engine || state.indexStatus.model_id !== sem.model) {
+    if (
+      state.indexStatus.engine !== sem.selected.engine ||
+      state.indexStatus.model_id !== sem.selected.model
+    ) {
       return "engine_mismatch";
     }
     if (state.indexStatus.indexed_files > 0 && state.indexStatus.total_chunks > 0) {
@@ -184,9 +185,9 @@ function derivePhase(state: PanelState): Phase {
   }
 
   if (!sem) return "not_downloaded";
-  if (sem.engine === "SBERT") return "ready";
+  if (sem.selected.engine === "SBERT") return "ready";
 
-  const selected = state.backendModels.find((m) => m.model_id === sem.model);
+  const selected = state.backendModels.find((m) => m.model_id === sem.selected.model);
   if (selected?.is_cached) return "ready";
   return "not_downloaded";
 }
@@ -310,7 +311,7 @@ interface Props {
 export default function SemanticPanel({ api, directory, refreshSemanticReady }: Props) {
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
   const [modelFilter, setModelFilter] = useState("");
-  const [pendingModel, setPendingModel] = useState<string | null>(null);
+  const [draftSelected, setDraftSelected] = useState<SelectedEmbedder | null>(null);
   const [sizeFetchingFor, setSizeFetchingFor] = useState<string | null>(null);
   const [customModelInput, setCustomModelInput] = useState("");
   const [isAddingCustom, setIsAddingCustom] = useState(false);
@@ -320,9 +321,15 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   const [fetchEpoch, setFetchEpoch] = useState(0);
 
   const { settings, indexStatus, isEngineAvailable, backendModels, supportedEngines, pendingBuild, buildRequest } = state;
-  const effectiveModel = pendingModel ?? settings?.model;
-  const phase = derivePhase({ ...state, settings: state.settings ? { ...state.settings, model: effectiveModel ?? state.settings.model } : null });
+  const effectiveSelected = draftSelected ?? settings?.selected;
+  const phase = derivePhase({
+    ...state,
+    settings: state.settings && effectiveSelected
+      ? { ...state.settings, selected: effectiveSelected }
+      : null,
+  });
   const isActive = phase === "downloading" || phase === "building";
+  const currentEngine = effectiveSelected?.engine;
 
   const invalidate = useCallback(() => setFetchEpoch((e) => e + 1), []);
 
@@ -342,7 +349,10 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       api.getSettings(),
       api.getSupportedEngines().catch(() => ["SBERT"] as EmbeddingEngine[]),
     ]).then(([s, engines]) => {
-      if (!cancelled) dispatch({ type: "init_loaded", settings: s.semantic, supportedEngines: engines });
+      if (!cancelled) {
+        dispatch({ type: "init_loaded", settings: s.semantic, supportedEngines: engines });
+        setDraftSelected(null);
+      }
     });
     return () => { cancelled = true; };
   }, [api]);
@@ -354,14 +364,14 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   useEffect(() => {
     if (!settings) return;
     let cancelled = false;
-    const engine = settings.engine;
+    const engine = currentEngine ?? settings.selected.engine;
     api.listModels(engine).then((models) => {
       if (!cancelled) dispatch({ type: "models_loaded", models, engine });
     }).catch((e: any) => {
       if (!cancelled) dispatch({ type: "models_failed", engine, error: e.toString() });
     });
     return () => { cancelled = true; };
-  }, [api, settings?.engine, fetchEpoch]);
+  }, [api, currentEngine, settings?.selected.engine, fetchEpoch]);
 
   // ---------------------------------------------------------------------------
   // Effect: fetch index status when engine/model changes (or after invalidate)
@@ -376,14 +386,14 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       if (!cancelled) dispatch({ type: "index_loaded", indexStatus: null });
     });
     return () => { cancelled = true; };
-  }, [api, settings?.engine, settings?.model, fetchEpoch]);
+  }, [api, effectiveSelected?.engine, effectiveSelected?.model, fetchEpoch]);
 
   // ---------------------------------------------------------------------------
   // Effect: python info (only for SBERT)
   // ---------------------------------------------------------------------------
 
   useEffect(() => {
-    if (settings?.engine !== "SBERT") {
+    if (currentEngine !== "SBERT") {
       dispatch({ type: "python_info", pythonPath: null, pythonError: null });
       return;
     }
@@ -394,7 +404,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       if (!cancelled) dispatch({ type: "python_info", pythonPath: null, pythonError: e.toString() });
     });
     return () => { cancelled = true; };
-  }, [api, settings?.engine]);
+  }, [api, currentEngine]);
 
   // ---------------------------------------------------------------------------
   // Effect: embed event subscriptions
@@ -425,9 +435,11 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
           api.getIndexStatus().then((idx) => {
             dispatch({ type: "op_done", operation: "Build", indexStatus: idx });
             refreshSemanticReady();
+            setDraftSelected(null);
           }).catch(() => {
             dispatch({ type: "op_done", operation: "Build" });
             refreshSemanticReady();
+            setDraftSelected(null);
           });
         }
       })
@@ -452,7 +464,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     if (!buildRequest) return;
 
     dispatch({ type: "build_request_dispatched" });
-    api.buildIndex(buildRequest.directory, buildRequest.model, buildRequest.engine).catch((e) => {
+    api.buildIndex(buildRequest.directory, buildRequest.selected).catch((e) => {
       console.error("buildIndex failed after download:", e);
       dispatch({ type: "op_error", message: e?.toString?.() ?? "Build failed", operation: "Build" });
     });
@@ -462,7 +474,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   // Computed inline — no memoization, always fresh.
   const mergedModels: ModelDescriptor[] = (() => {
     const customs: ModelDescriptor[] = (settings?.custom_models ?? [])
-      .filter((m) => m.engine === settings?.engine)
+      .filter((m) => m.engine === currentEngine)
       .map((m) => ({
         model_id: m.model_id,
         display_name: m.model_id.split("/").pop() || m.model_id,
@@ -490,6 +502,11 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     Candle: "auto",
     Fastembed: "cpu",
   };
+  const ENGINE_DEFAULT_MODELS: Record<EmbeddingEngine, EmbedderModel> = {
+    SBERT: "intfloat/e5-small-v2",
+    Candle: "sentence-transformers/all-MiniLM-L12-v2",
+    Fastembed: "AllMiniLML6V2",
+  };
 
   const isForceCpu = (engine: EmbeddingEngine) => {
     const override = settings?.engine_devices?.[engine];
@@ -511,23 +528,26 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   const handleEngineChange = async (engine: EmbeddingEngine) => {
     if (!settings) return;
     setModelFilter("");
-    setPendingModel(null);
-    const next = { ...settings, engine, enabled: false, index_path: null };
-    // Optimistic local update — triggers model + index effects via settings.engine change
-    dispatch({ type: "settings_updated", settings: next });
-    await api.updateSettings({ semantic: next });
+    setDraftSelected({
+      engine,
+      model: ENGINE_DEFAULT_MODELS[engine],
+      dimension: 384,
+    });
   };
 
   const handleModelChange = useCallback(
     async (modelId: EmbedderModel) => {
-      if (!settings) return;
-      setPendingModel(modelId);
+      if (!effectiveSelected) return;
+      setDraftSelected({
+        ...effectiveSelected,
+        model: modelId,
+      });
 
       const descriptor = backendModels.find((m) => m.model_id === modelId);
       if (descriptor && !descriptor.is_cached && descriptor.size_bytes === null) {
         setSizeFetchingFor(modelId);
         try {
-          const size = await api.getModelSize(settings.engine, modelId);
+          const size = await api.getModelSize(effectiveSelected.engine, modelId);
           dispatch({ type: "model_size_fetched", modelId, sizeBytes: size });
         } catch (e) {
           console.error(`getModelSize(${modelId}) failed:`, e);
@@ -536,7 +556,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
         }
       }
     },
-    [settings, backendModels, api],
+    [effectiveSelected, backendModels, api],
   );
 
   const handleAction = useCallback(async () => {
@@ -552,36 +572,26 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       return;
     }
 
-    // Persist pending model selection before acting.
-    let effectiveSettings = settings;
-    if (pendingModel && pendingModel !== settings.model) {
-      const descriptor = backendModels.find((m) => m.model_id === pendingModel);
-      const next = { ...settings, model: pendingModel, enabled: descriptor?.is_cached ?? false };
-      dispatch({ type: "settings_updated", settings: next });
-      await api.updateSettings({ semantic: next });
-      effectiveSettings = next;
-      setPendingModel(null);
-    }
+    if (!effectiveSelected) return;
 
     if (phase === "not_downloaded") {
       dispatch({
         type: "queue_build",
         build: {
           directory,
-          model: effectiveSettings.model,
-          engine: effectiveSettings.engine,
+          selected: effectiveSelected,
         },
       });
-      api.downloadModel(effectiveSettings.model, effectiveSettings.engine).catch((e) => console.error("downloadModel failed:", e));
+      api.downloadModel(effectiveSelected).catch((e) => console.error("downloadModel failed:", e));
     } else if (phase === "ready" || phase === "engine_mismatch") {
-      api.buildIndex(directory, effectiveSettings.model, effectiveSettings.engine).catch((e) => console.error("buildIndex failed:", e));
+      api.buildIndex(directory, effectiveSelected).catch((e) => console.error("buildIndex failed:", e));
     } else if (phase === "indexed") {
       api.deleteIndex().then(() => {
         dispatch({ type: "index_deleted" });
         refreshSemanticReady();
       }).catch((e) => console.error("deleteIndex failed:", e));
     }
-  }, [phase, pendingModel, settings, backendModels, api, directory, refreshSemanticReady]);
+  }, [phase, settings, effectiveSelected, api, directory, refreshSemanticReady]);
 
   const handleAddCustomModel = async () => {
     if (!settings || !customModelInput.trim()) return;
@@ -598,22 +608,26 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       return;
     }
 
-    if (settings.custom_models.find((m) => m.model_id === modelId && m.engine === settings.engine)) {
+    const targetEngine = currentEngine ?? settings.selected.engine;
+    if (settings.custom_models.find((m) => m.model_id === modelId && m.engine === targetEngine)) {
       dispatch({ type: "error", error: "Model already added for this engine" });
       return;
     }
 
     const next = {
       ...settings,
-      custom_models: [...(settings.custom_models || []), { engine: settings.engine, model_id: modelId }],
-      model: modelId,
+      custom_models: [...(settings.custom_models || []), { engine: targetEngine, model_id: modelId }],
     };
 
     dispatch({ type: "settings_updated", settings: next });
     dispatch({ type: "clear_error" });
     setCustomModelInput("");
     setIsAddingCustom(false);
-    setPendingModel(null);
+    setDraftSelected({
+      engine: targetEngine,
+      model: modelId,
+      dimension: effectiveSelected?.dimension ?? settings.selected.dimension,
+    });
 
     await api.updateSettings({ semantic: next });
     invalidate();
@@ -641,11 +655,11 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
             <button
               key={e}
               type="button"
-              disabled={isActive || (!isEngineAvailable && settings?.engine === e) || !isSupported}
+              disabled={isActive || (!isEngineAvailable && currentEngine === e) || !isSupported}
               onClick={() => handleEngineChange(e)}
               title={!isSupported ? "Feature disabled in this build" : undefined}
               className={`flex-1 px-3 py-1 rounded-md text-xs transition-all ${
-                settings?.engine === e
+                currentEngine === e
                   ? "bg-[var(--bg-app)] text-[var(--text-main)] shadow-sm"
                   : !isSupported
                     ? "text-[var(--text-muted)]/50 opacity-50 cursor-not-allowed"
@@ -658,13 +672,13 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
           })}
         </div>
         <p className="text-[10px] text-[var(--text-dim)] mt-1.5 px-1 selectable">
-          {settings?.engine === "SBERT"
+          {currentEngine === "SBERT"
             ? "Sentence-Transformers via Python. Supports almost any model. Good performance. Uses GPU via MPS (Apple Silicon) if available."
-            : settings?.engine === "Candle"
+            : currentEngine === "Candle"
               ? "Medium performance. Uses GPU via Metal (Apple Silicon) if available."
               : "For ONNX models. Good performance on CPU."}
         </p>
-        {settings?.engine === "SBERT" && (
+        {currentEngine === "SBERT" && (
           <div className="mt-1.5 px-2 py-1.5 rounded bg-[var(--bg-active)] flex items-start gap-1.5">
             <span className="text-[10px] text-[var(--text-dim)] shrink-0 mt-px uppercase font-bold tracking-tighter">python runtime</span>
             {state.pythonPath ? (
@@ -689,7 +703,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
             disabled={isActive || !isEngineAvailable}
             className="flex-1 text-xs bg-[var(--bg-input)] border border-[var(--border-main)] rounded-lg px-2.5 py-1.5 text-[var(--text-main)] placeholder-[var(--text-dim)] focus:outline-none focus:border-[var(--accent-blue)] disabled:opacity-50 transition-colors"
           />
-          {settings && supportsCustomModels(settings.engine) && (
+          {settings && currentEngine && supportsCustomModels(currentEngine) && (
             <button
               type="button"
               onClick={() => setIsAddingCustom(!isAddingCustom)}
@@ -731,10 +745,10 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
         {settings && (
           <ModelList
             models={mergedModels}
-            engine={settings.engine}
+            engine={currentEngine ?? settings.selected.engine}
             filter={modelFilter}
-            selectedModelId={effectiveModel}
-            activeModelId={indexStatus?.model_id}
+            selectedModelId={effectiveSelected?.model}
+            activeModelId={settings.selected.model}
             sizeFetchingFor={sizeFetchingFor}
             disabled={isActive || !isEngineAvailable}
             onSelect={handleModelChange}
@@ -847,7 +861,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
           onClick={() => setShowAdvanced(!showAdvanced)}
           className="flex items-center gap-2 text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider hover:text-[var(--text-muted)] transition-colors w-full text-left"
         >
-          <span className="w-2">{showAdvanced ? "▼" : "▶"}</span>
+          <span className="w-2 mr-2">{showAdvanced ? <CornerRightUp /> : <CornerLeftDown />}</span>
           Advanced
         </button>
         {showAdvanced && settings && (
@@ -855,9 +869,9 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
             <label className="flex items-center gap-2.5 cursor-pointer group">
               <input
                 type="checkbox"
-                checked={isForceCpu(settings.engine)}
+                checked={isForceCpu(currentEngine ?? settings.selected.engine)}
                 disabled={isActive}
-                onChange={(e) => handleDeviceChange(settings.engine, e.target.checked)}
+                onChange={(e) => handleDeviceChange(currentEngine ?? settings.selected.engine, e.target.checked)}
                 className="w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)] disabled:opacity-50"
               />
               <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Disable hardware acceleration</span>

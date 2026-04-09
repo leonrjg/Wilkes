@@ -307,21 +307,21 @@ describe("HttpSearchApi", () => {
 
   it("downloadModel calls fetch with POST", async () => {
     (fetch as any).mockResolvedValue({ ok: true, status: 202 });
-    const model = { id: "m1", name: "m1", size_bytes: 1 };
-    await api.downloadModel(model as any, "SBERT" as any);
+    const selected = { model: "m1", engine: "SBERT", dimension: 384 };
+    await api.downloadModel(selected as any);
     expect(fetch).toHaveBeenCalledWith("/api/embed/download", expect.objectContaining({
       method: "POST",
-      body: JSON.stringify({ model, engine: "SBERT" }),
+      body: JSON.stringify({ selected }),
     }));
   });
 
   it("buildIndex calls fetch with POST", async () => {
     (fetch as any).mockResolvedValue({ ok: true, status: 202 });
-    const model = { id: "m1", name: "m1", size_bytes: 1 };
-    await api.buildIndex("/root", model as any, "SBERT" as any);
+    const selected = { model: "m1", engine: "SBERT", dimension: 384 };
+    await api.buildIndex("/root", selected as any);
     expect(fetch).toHaveBeenCalledWith("/api/embed/build", expect.objectContaining({
       method: "POST",
-      body: JSON.stringify({ root: "/root", model, engine: "SBERT" }),
+      body: JSON.stringify({ root: "/root", selected }),
     }));
   });
 
@@ -371,8 +371,8 @@ describe("HttpSearchApi", () => {
     await expect(api.setWorkerTimeout(1)).rejects.toThrow("setWorkerTimeout failed: 500");
     await expect(api.listModels("SBERT" as any)).rejects.toThrow("listModels failed: 500");
     await expect(api.getModelSize("SBERT" as any, "m")).rejects.toThrow("getModelSize failed: 500");
-    await expect(api.downloadModel({} as any, "SBERT" as any)).rejects.toThrow("downloadModel failed: 500");
-    await expect(api.buildIndex("/", {} as any, "SBERT" as any)).rejects.toThrow("buildIndex failed: 500");
+    await expect(api.downloadModel({} as any)).rejects.toThrow("downloadModel failed: 500");
+    await expect(api.buildIndex("/", {} as any)).rejects.toThrow("buildIndex failed: 500");
     await expect(api.cancelEmbed()).rejects.toThrow("cancelEmbed failed: 500");
     await expect(api.getIndexStatus()).rejects.toThrow("getIndexStatus failed: 500");
     await expect(api.deleteIndex()).rejects.toThrow("deleteIndex failed: 500");

@@ -1,5 +1,4 @@
 import type {
-  EmbedderModel,
   EmbedDone,
   EmbedError,
   EmbedProgress,
@@ -10,6 +9,7 @@ import type {
   MatchRef,
   ModelDescriptor,
   PreviewData,
+  SelectedEmbedder,
   SearchQuery,
   SearchStats,
   Settings,
@@ -216,20 +216,20 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<number>;
   }
 
-  async downloadModel(model: EmbedderModel, engine: EmbeddingEngine): Promise<void> {
+  async downloadModel(selected: SelectedEmbedder): Promise<void> {
     const res = await fetch("/api/embed/download", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model, engine }),
+      body: JSON.stringify({ selected }),
     });
     if (!res.ok && res.status !== 202) throw new Error(`downloadModel failed: ${res.status}`);
   }
 
-  async buildIndex(root: string, model: EmbedderModel, engine: EmbeddingEngine): Promise<void> {
+  async buildIndex(root: string, selected: SelectedEmbedder): Promise<void> {
     const res = await fetch("/api/embed/build", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ root, model, engine }),
+      body: JSON.stringify({ root, selected }),
     });
     if (!res.ok && res.status !== 202) throw new Error(`buildIndex failed: ${res.status}`);
   }

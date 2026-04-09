@@ -40,9 +40,11 @@ describe("SemanticPanel", () => {
   const defaultSettings = {
     semantic: {
       enabled: false,
-      engine: "Candle",
-      model: "initial-id",
-      dimension: 384,
+      selected: {
+        engine: "Candle",
+        model: "initial-id",
+        dimension: 384,
+      },
       engine_devices: { SBERT: "cpu", Candle: "cpu" },
       custom_models: [],
     },
@@ -71,7 +73,7 @@ describe("SemanticPanel", () => {
 
   it("switches to Candle engine", async () => {
     mockApi.getSettings.mockResolvedValue({
-        semantic: { ...defaultSettings.semantic, engine: "SBERT" }
+        semantic: { ...defaultSettings.semantic, selected: { ...defaultSettings.semantic.selected, engine: "SBERT" } }
     });
     await act(async () => {
       render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
@@ -80,9 +82,39 @@ describe("SemanticPanel", () => {
     await act(async () => {
       fireEvent.click(candleBtn);
     });
-    expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({
-      semantic: expect.objectContaining({ engine: "Candle" })
-    }));
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+  });
+
+  it("keeps engine changes as draft until action", async () => {
+    mockApi.getSettings.mockResolvedValue({
+      semantic: { ...defaultSettings.semantic, selected: { ...defaultSettings.semantic.selected, engine: "SBERT", model: "initial-id" } }
+    });
+    mockApi.listModels.mockImplementation(async (engine: string) => {
+      if (engine === "Candle") {
+        return [{ model_id: "candle-default", display_name: "Candle Default", is_cached: true, description: "" }];
+      }
+      return [{ model_id: "initial-id", display_name: "Initial", is_cached: true, description: "" }];
+    });
+
+    await act(async () => {
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Candle"));
+    });
+
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /download model and index files/i }));
+    });
+
+    expect(mockApi.downloadModel).toHaveBeenCalledWith({
+      engine: "Candle",
+      model: "sentence-transformers/all-MiniLM-L12-v2",
+      dimension: 384,
+    });
   });
 
   it("handles model selection", async () => {
@@ -104,14 +136,12 @@ describe("SemanticPanel", () => {
       semantic: expect.objectContaining({ model: "new-id" })
     }));
 
-    // Pressing the action button saves the pending model.
+    // Pressing the action button uses the draft selection without persisting settings first.
     const actionBtn = screen.getByRole("button", { name: /build semantic index/i });
     await act(async () => {
       fireEvent.click(actionBtn);
     });
-    expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({
-      semantic: expect.objectContaining({ model: "new-id" })
-    }));
+    expect(mockApi.buildIndex).toHaveBeenCalledWith("/test", expect.objectContaining({ model: "new-id" }));
   });
 
   it("handles model download and triggering progress", async () => {
@@ -120,7 +150,7 @@ describe("SemanticPanel", () => {
       { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
     ]);
     mockApi.getSettings.mockResolvedValue({
-      semantic: { ...defaultSettings.semantic, model: "not-cached" }
+      semantic: { ...defaultSettings.semantic, selected: { ...defaultSettings.semantic.selected, model: "not-cached" } }
     });
 
     await act(async () => {
@@ -149,7 +179,12 @@ describe("SemanticPanel", () => {
       doneHandler({ operation: "Download" });
     });
 
-    expect(mockApi.buildIndex).toHaveBeenCalledWith("/test", "not-cached", "Candle");
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+    expect(mockApi.buildIndex).toHaveBeenCalledWith("/test", {
+      engine: "Candle",
+      model: "not-cached",
+      dimension: 384,
+    });
     expect(screen.getByText(/Cancel build/i)).toBeInTheDocument();
   });
 
@@ -158,7 +193,7 @@ describe("SemanticPanel", () => {
       { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
     ]);
     mockApi.getSettings.mockResolvedValue({
-      semantic: { ...defaultSettings.semantic, model: "not-cached" }
+      semantic: { ...defaultSettings.semantic, selected: { ...defaultSettings.semantic.selected, model: "not-cached" } }
     });
 
     await act(async () => {
@@ -192,7 +227,7 @@ describe("SemanticPanel", () => {
       { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
     ]);
     mockApi.getSettings.mockResolvedValue({
-      semantic: { ...defaultSettings.semantic, model: "not-cached" }
+      semantic: { ...defaultSettings.semantic, selected: { ...defaultSettings.semantic.selected, model: "not-cached" } }
     });
 
     await act(async () => {
@@ -250,6 +285,30 @@ describe("SemanticPanel", () => {
     });
 
     expect(screen.getByText(/45%/)).toBeInTheDocument();
+  });
+
+  it("does not persist draft selection on build completion from the panel", async () => {
+    mockApi.listModels.mockResolvedValue([
+      { model_id: "initial-id", display_name: "Initial", is_cached: true, description: "" },
+      { model_id: "new-id", display_name: "New Model", is_cached: true, description: "" },
+    ]);
+
+    await act(async () => {
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("New Model"));
+      fireEvent.click(screen.getByRole("button", { name: /build semantic index/i }));
+    });
+
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+
+    await act(async () => {
+      doneHandler({ operation: "Build" });
+    });
+
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
   });
 
   it("handles cancel embedding", async () => {

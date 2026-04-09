@@ -10,6 +10,7 @@ import type {
   MatchRef,
   ModelDescriptor,
   PreviewData,
+  SelectedEmbedder,
   SearchQuery,
   SearchStats,
   Settings,
@@ -48,8 +49,8 @@ export interface SearchApi {
   // ── Semantic / embed commands ──────────────────────────────────────────────
   listModels(engine: EmbeddingEngine): Promise<ModelDescriptor[]>;
   getModelSize(engine: EmbeddingEngine, modelId: string): Promise<number>;
-  downloadModel(model: EmbedderModel, engine: EmbeddingEngine): Promise<void>;
-  buildIndex(root: string, model: EmbedderModel, engine: EmbeddingEngine): Promise<void>;
+  downloadModel(selected: SelectedEmbedder): Promise<void>;
+  buildIndex(root: string, selected: SelectedEmbedder): Promise<void>;
   cancelEmbed(): Promise<void>;
   getIndexStatus(): Promise<IndexStatus>;
   isSemanticReady(): Promise<boolean>;

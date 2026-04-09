@@ -119,11 +119,15 @@ export interface CustomModel {
   model_id: string;
 }
 
-export interface SemanticSettings {
-  enabled: boolean;
+export interface SelectedEmbedder {
   engine: EmbeddingEngine;
   model: EmbedderModel;
   dimension: number;
+}
+
+export interface SemanticSettings {
+  enabled: boolean;
+  selected: SelectedEmbedder;
   /** Per-engine device overrides. Missing entries use the engine's built-in default. */
   engine_devices: Partial<Record<EmbeddingEngine, string>>;
   index_path: string | null;

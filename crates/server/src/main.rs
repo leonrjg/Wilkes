@@ -18,7 +18,9 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info};
 use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_core::embed::worker::manager::WorkerPaths;
-use wilkes_core::types::{EmbedderModel, EmbeddingEngine, MatchRef, ModelDescriptor, SearchQuery};
+use wilkes_core::types::{
+    EmbeddingEngine, MatchRef, ModelDescriptor, SearchQuery, SelectedEmbedder,
+};
 
 const MAX_UPLOAD_BYTES: u64 = 500 * 1024 * 1024;
 
@@ -516,8 +518,7 @@ async fn get_index_status_handler(
 
 #[derive(Deserialize)]
 struct DownloadBody {
-    model: EmbedderModel,
-    engine: EmbeddingEngine,
+    selected: SelectedEmbedder,
 }
 
 async fn download_model_handler(
@@ -525,7 +526,7 @@ async fn download_model_handler(
     Json(body): Json<DownloadBody>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     Arc::clone(&state.ctx)
-        .start_download_model(body.model, body.engine)
+        .start_download_model(body.selected)
         .await
         .map_err(server_err)?;
     Ok(StatusCode::ACCEPTED)
@@ -534,8 +535,7 @@ async fn download_model_handler(
 #[derive(Deserialize)]
 struct BuildBody {
     root: String,
-    model: EmbedderModel,
-    engine: EmbeddingEngine,
+    selected: SelectedEmbedder,
 }
 
 async fn build_index_handler(
@@ -546,7 +546,7 @@ async fn build_index_handler(
         .to_string_lossy()
         .into_owned();
     Arc::clone(&state.ctx)
-        .start_build_index(body.root, body.model, body.engine)
+        .start_build_index(body.root, body.selected)
         .await
         .map_err(server_err)?;
     Ok(StatusCode::ACCEPTED)
@@ -1473,8 +1473,11 @@ mod tests {
         let _ = download_model_handler(
             State(state.clone()),
             Json(DownloadBody {
-                model: EmbedderModel("m".to_string()),
-                engine: EmbeddingEngine::Candle,
+                selected: SelectedEmbedder {
+                    engine: EmbeddingEngine::Candle,
+                    model: wilkes_core::types::EmbedderModel("m".to_string()),
+                    dimension: 384,
+                },
             }),
         )
         .await;

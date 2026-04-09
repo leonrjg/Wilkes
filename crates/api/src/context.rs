@@ -19,8 +19,8 @@ use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
-    EmbedderModel, EmbeddingEngine, FileEntry, IndexStatus, IndexingConfig, PreviewData,
-    SearchMode, SearchQuery, SemanticSettings, Settings,
+    EmbedderModel, FileEntry, IndexStatus, IndexingConfig, PreviewData, SearchMode, SearchQuery,
+    SelectedEmbedder, SemanticSettings, Settings,
 };
 
 use crate::commands::search::{start_search, SearchHandle};
@@ -278,7 +278,6 @@ impl AppContext {
                     info!("start_search: root changed but reindex already in progress, skipping");
                 } else {
                     info!("start_search: root changed, triggering background reindex");
-                    let model = EmbedderModel(embedder.model_id().to_string());
                     let engine = {
                         let guard = index_arc.lock().unwrap_or_else(|p| p.into_inner());
                         guard
@@ -286,10 +285,15 @@ impl AppContext {
                             .map(|idx| idx.status().engine)
                             .unwrap_or_default()
                     };
+                    let selected = SelectedEmbedder {
+                        engine,
+                        model: EmbedderModel(embedder.model_id().to_string()),
+                        dimension: embedder.dimension(),
+                    };
                     let ctx = Arc::clone(&self);
                     let root_str = query_root_canonical.to_string_lossy().to_string();
                     tokio::spawn(async move {
-                        if let Err(e) = ctx.start_build_index(root_str, model, engine).await {
+                        if let Err(e) = ctx.start_build_index(root_str, selected).await {
                             error!("background reindex failed: {e}");
                         }
                     });
@@ -312,8 +316,7 @@ impl AppContext {
     pub async fn start_build_index(
         self: Arc<Self>,
         root: String,
-        model: EmbedderModel,
-        engine: EmbeddingEngine,
+        selected: SelectedEmbedder,
     ) -> Result<(), String> {
         {
             let guard = self.embed_task.lock();
@@ -334,7 +337,7 @@ impl AppContext {
         }
 
         let settings = self.settings().await;
-        let device = settings.semantic.device_for(engine).to_string();
+        let device = settings.semantic.device_for(selected.engine).to_string();
         let chunk_size = settings.semantic.chunk_size;
         let chunk_overlap = settings.semantic.chunk_overlap;
         let supported_extensions = settings.supported_extensions.clone();
@@ -346,7 +349,7 @@ impl AppContext {
         let manager = self.worker_manager.clone();
         let data_dir = self.data_dir.clone();
         let ctx = Arc::clone(&self);
-        let model_clone = model.clone();
+        let selected_clone = selected.clone();
 
         let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<EmbedProgress>(128);
         let cancel = CancellationToken::new();
@@ -377,8 +380,7 @@ impl AppContext {
             };
             let build_fut = crate::commands::embed::build_index(
                 root_path.clone(),
-                engine,
-                model_clone.clone(),
+                selected_clone.clone(),
                 options,
             );
             tokio::pin!(build_fut);
@@ -404,7 +406,7 @@ impl AppContext {
                                 *ctx.embedder.lock() = Some(Arc::clone(&embedder));
 
                                 let data_dir_c = data_dir.clone();
-                                let m = model_clone.model_id().to_string();
+                                let m = selected_clone.model.model_id().to_string();
                                 match tokio::task::spawn_blocking(move || {
                                     SemanticIndex::open(&data_dir_c, &m, dim)
                                 }).await {
@@ -438,7 +440,10 @@ impl AppContext {
 
                                         ctx.update_semantic_settings(|s| SemanticSettings {
                                             index_path: Some(data_dir.join("semantic_index.db")),
-                                            dimension: actual_dim,
+                                            selected: SelectedEmbedder {
+                                                dimension: actual_dim,
+                                                ..selected_clone.clone()
+                                            },
                                             enabled: true,
                                             ..s
                                         }).await;
@@ -483,8 +488,7 @@ impl AppContext {
     /// Download a model in the background and load it into state on success.
     pub async fn start_download_model(
         self: Arc<Self>,
-        model: EmbedderModel,
-        engine: EmbeddingEngine,
+        selected: SelectedEmbedder,
     ) -> Result<(), String> {
         {
             let guard = self.embed_task.lock();
@@ -494,11 +498,11 @@ impl AppContext {
         }
 
         let settings = self.settings().await;
-        let device = settings.semantic.device_for(engine).to_string();
+        let device = settings.semantic.device_for(selected.engine).to_string();
         let data_dir = self.data_dir.clone();
         let manager = self.worker_manager.clone();
         let ctx = Arc::clone(&self);
-        let model_clone = model.clone();
+        let selected_clone = selected.clone();
 
         let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<EmbedProgress>(64);
 
@@ -515,8 +519,7 @@ impl AppContext {
             });
 
             let result = crate::commands::embed::download_model(
-                engine,
-                model_clone.clone(),
+                selected_clone.clone(),
                 manager.clone(),
                 device.clone(),
                 data_dir.clone(),
@@ -530,8 +533,12 @@ impl AppContext {
                 Ok(()) => {
                     // Probe model dimensions by running install again (no-op if cached).
                     let (probe_tx, _) = mpsc::channel(1);
-                    let installer =
-                        dispatch::get_installer(engine, model_clone.clone(), manager, device);
+                    let installer = dispatch::get_installer(
+                        selected_clone.engine,
+                        selected_clone.model.clone(),
+                        manager,
+                        device,
+                    );
                     if let Err(e) = installer.install(&data_dir, probe_tx).await {
                         ctx.emit_embed_error(
                             "Download",
@@ -543,13 +550,6 @@ impl AppContext {
                     match installer.build(&data_dir) {
                         Ok(embedder) => {
                             *ctx.embedder.lock() = Some(embedder);
-                            ctx.update_semantic_settings(|s| SemanticSettings {
-                                enabled: true,
-                                engine,
-                                model: model_clone,
-                                ..s
-                            })
-                            .await;
                             ctx.events
                                 .emit("embed-done", serde_json::json!({ "operation": "Download" }));
                         }
@@ -673,13 +673,12 @@ impl AppContext {
             }
         };
 
-        let model = settings.semantic.model.clone();
-        let engine = settings.semantic.engine;
+        let selected = settings.semantic.selected.clone();
 
-        if db_status.model_id != model.model_id() {
+        if db_status.engine != selected.engine || db_status.model_id != selected.model.model_id() {
             info!(
-                "restore_state: index model '{}' != settings model '{}', clearing stale index reference",
-                db_status.model_id, model.model_id()
+                "restore_state: index selection '{:?}/{}' != settings selection '{:?}/{}', clearing stale index reference",
+                db_status.engine, db_status.model_id, selected.engine, selected.model.model_id()
             );
             self.update_semantic_settings(|s| SemanticSettings {
                 enabled: false,
@@ -691,10 +690,10 @@ impl AppContext {
         }
 
         let installer = dispatch::get_installer(
-            engine,
-            model.clone(),
+            selected.engine,
+            selected.model.clone(),
             self.worker_manager.clone(),
-            settings.semantic.device_for(engine).to_string(),
+            settings.semantic.device_for(selected.engine).to_string(),
         );
 
         let (probe_tx, _) = tokio::sync::mpsc::channel(1);
@@ -721,7 +720,7 @@ impl AppContext {
         };
 
         let data_dir = self.data_dir.clone();
-        let m = model.model_id().to_string();
+        let m = selected.model.model_id().to_string();
         let expected_dim = embedder.dimension();
         let index = match tokio::task::spawn_blocking(move || {
             SemanticIndex::open(&data_dir, &m, expected_dim)
@@ -773,7 +772,10 @@ impl AppContext {
         self.update_semantic_settings(|s| SemanticSettings {
             enabled: true,
             index_path: Some(db_path),
-            dimension: dim,
+            selected: SelectedEmbedder {
+                dimension: dim,
+                ..selected.clone()
+            },
             ..s
         })
         .await;
@@ -788,6 +790,7 @@ mod tests {
     use serde_json::Value;
     use tempfile::tempdir;
     use tokio::sync::mpsc;
+    use wilkes_core::types::EmbeddingEngine;
     use tracing::subscriber;
     use tracing_subscriber::prelude::*;
     use wilkes_core::embed::MockEmbedder;
@@ -1427,8 +1430,11 @@ mod tests {
         let res = ctx
             .start_build_index(
                 "root".to_string(),
-                EmbedderModel("m".to_string()),
-                EmbeddingEngine::Candle,
+                SelectedEmbedder {
+                    engine: EmbeddingEngine::Candle,
+                    model: EmbedderModel("m".to_string()),
+                    dimension: 384,
+                },
             )
             .await;
 
@@ -1453,8 +1459,11 @@ mod tests {
         let res = ctx
             .start_build_index(
                 "/non/existent/path/for/sure/12345".to_string(),
-                EmbedderModel("m".to_string()),
-                EmbeddingEngine::Candle,
+                SelectedEmbedder {
+                    engine: EmbeddingEngine::Candle,
+                    model: EmbedderModel("m".to_string()),
+                    dimension: 384,
+                },
             )
             .await;
 
@@ -1537,7 +1546,11 @@ mod tests {
         });
 
         let res = ctx
-            .start_download_model(EmbedderModel("m".to_string()), EmbeddingEngine::Candle)
+            .start_download_model(SelectedEmbedder {
+                engine: EmbeddingEngine::Candle,
+                model: EmbedderModel("m".to_string()),
+                dimension: 384,
+            })
             .await;
 
         assert!(res.is_err());
@@ -1664,7 +1677,10 @@ mod tests {
         // Write settings with model A
         let settings = Settings {
             semantic: SemanticSettings {
-                model: EmbedderModel("model-A".to_string()),
+                selected: SelectedEmbedder {
+                    model: EmbedderModel("model-A".to_string()),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..Default::default()
@@ -1736,7 +1752,10 @@ mod tests {
 
         let settings = Settings {
             semantic: SemanticSettings {
-                model: EmbedderModel("model-A".to_string()),
+                selected: SelectedEmbedder {
+                    model: EmbedderModel("model-A".to_string()),
+                    ..Default::default()
+                },
                 enabled: true,
                 index_path: Some(data_dir.join("semantic_index.db")),
                 ..Default::default()
@@ -1946,8 +1965,11 @@ mod tests {
         ctx.clone()
             .start_build_index(
                 dir.path().to_string_lossy().to_string(),
-                EmbedderModel("m".to_string()),
-                EmbeddingEngine::Candle,
+                SelectedEmbedder {
+                    engine: EmbeddingEngine::Candle,
+                    model: EmbedderModel("m".to_string()),
+                    dimension: 384,
+                },
             )
             .await
             .unwrap();
@@ -1982,10 +2004,11 @@ mod tests {
 
         // Requesting download of non-existent model should eventually emit error
         ctx.clone()
-            .start_download_model(
-                EmbedderModel("invalid-model".to_string()),
-                EmbeddingEngine::Fastembed,
-            )
+            .start_download_model(SelectedEmbedder {
+                engine: EmbeddingEngine::Fastembed,
+                model: EmbedderModel("invalid-model".to_string()),
+                dimension: 384,
+            })
             .await
             .unwrap();
 
@@ -2009,7 +2032,7 @@ mod tests {
 
         // Seed settings.json with a different model
         let mut initial_settings = wilkes_core::types::Settings::default();
-        initial_settings.semantic.model = EmbedderModel("m1".to_string());
+        initial_settings.semantic.selected.model = EmbedderModel("m1".to_string());
         std::fs::write(
             &settings_path,
             serde_json::to_string(&initial_settings).unwrap(),
@@ -2050,7 +2073,7 @@ mod tests {
         ctx.clone().restore_state().await;
 
         let s = ctx.get_settings().await;
-        assert_eq!(s.semantic.model.0, "m1");
+        assert_eq!(s.semantic.selected.model.0, "m1");
     }
 
     #[tokio::test]
@@ -2068,8 +2091,11 @@ mod tests {
             semantic: SemanticSettings {
                 enabled: true,
                 index_path: Some(index_path),
-                model: EmbedderModel("m".to_string()),
-                engine: EmbeddingEngine::Candle,
+                selected: SelectedEmbedder {
+                    engine: EmbeddingEngine::Candle,
+                    model: EmbedderModel("m".to_string()),
+                    dimension: 384,
+                },
                 ..Default::default()
             },
             ..Default::default()

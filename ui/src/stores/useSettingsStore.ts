@@ -189,7 +189,7 @@ export const useSettingsStore = create<SettingsStore>()(
     startSemanticIndex: async () => {
       const { directory } = get();
       const s = await api.getSettings();
-      await api.buildIndex(directory, s.semantic.model, s.semantic.engine);
+      await api.buildIndex(directory, s.semantic.selected);
     },
 
     applySettingsPatch: (patch) => {

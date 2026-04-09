@@ -8,7 +8,7 @@ use wilkes_core::embed::installer::ProgressTx;
 use wilkes_core::embed::Embedder;
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
-use wilkes_core::types::IndexStatus;
+use wilkes_core::types::{IndexStatus, SelectedEmbedder};
 
 pub struct BuildIndexOptions {
     pub manager: Option<wilkes_core::embed::worker::manager::WorkerManager>,
@@ -23,14 +23,18 @@ pub struct BuildIndexOptions {
 
 /// Download and install the model. Reports progress via `tx`.
 pub async fn download_model(
-    engine: wilkes_core::types::EmbeddingEngine,
-    model: wilkes_core::types::EmbedderModel,
+    selected: SelectedEmbedder,
     manager: wilkes_core::embed::worker::manager::WorkerManager,
     device: String,
     data_dir: PathBuf,
     tx: ProgressTx,
 ) -> anyhow::Result<()> {
-    let installer = wilkes_core::embed::dispatch::get_installer(engine, model, manager, device);
+    let installer = wilkes_core::embed::dispatch::get_installer(
+        selected.engine,
+        selected.model,
+        manager,
+        device,
+    );
     installer.install(&data_dir, tx).await
 }
 
@@ -93,8 +97,7 @@ pub async fn build_index_with_embedder(
 /// future; this function runs to completion once started.
 pub async fn build_index(
     root: PathBuf,
-    engine: wilkes_core::types::EmbeddingEngine,
-    model: wilkes_core::types::EmbedderModel,
+    selected: SelectedEmbedder,
     options: BuildIndexOptions,
 ) -> anyhow::Result<Arc<dyn Embedder>> {
     let manager = options
@@ -106,7 +109,12 @@ pub async fn build_index(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("device is required for build_index"))?;
 
-    let installer = wilkes_core::embed::dispatch::get_installer(engine, model, manager, device);
+    let installer = wilkes_core::embed::dispatch::get_installer(
+        selected.engine,
+        selected.model,
+        manager,
+        device,
+    );
 
     // Ensure model is ready (probes dimension for SBERT, no-op for others if already cached)
     installer
@@ -241,8 +249,11 @@ mod tests {
 
         let res = build_index(
             dir.path().to_path_buf(),
-            wilkes_core::types::EmbeddingEngine::Candle,
-            wilkes_core::types::EmbedderModel("m".to_string()),
+            wilkes_core::types::SelectedEmbedder {
+                engine: wilkes_core::types::EmbeddingEngine::Candle,
+                model: wilkes_core::types::EmbedderModel("m".to_string()),
+                dimension: 384,
+            },
             options,
         )
         .await;

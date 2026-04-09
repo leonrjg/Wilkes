@@ -76,8 +76,11 @@ describe("TauriSearchApi", () => {
 
   it("should call build_index", async () => {
     (invoke as any).mockResolvedValue(undefined);
-    await api.buildIndex("/root", "model", "SBERT");
-    expect(invoke).toHaveBeenCalledWith("build_index", { root: "/root", model: "model", engine: "SBERT" });
+    await api.buildIndex("/root", { model: "model", engine: "SBERT", dimension: 384 });
+    expect(invoke).toHaveBeenCalledWith("build_index", {
+      root: "/root",
+      selected: { model: "model", engine: "SBERT", dimension: 384 },
+    });
   });
 
   it("should call get_index_status", async () => {
@@ -89,8 +92,10 @@ describe("TauriSearchApi", () => {
 
   it("should call download_model", async () => {
     (invoke as any).mockResolvedValue(undefined);
-    await api.downloadModel("model", "SBERT");
-    expect(invoke).toHaveBeenCalledWith("download_model", { model: "model", engine: "SBERT" });
+    await api.downloadModel({ model: "model", engine: "SBERT", dimension: 384 });
+    expect(invoke).toHaveBeenCalledWith("download_model", {
+      selected: { model: "model", engine: "SBERT", dimension: 384 },
+    });
   });
 
   it("should call delete_index", async () => {

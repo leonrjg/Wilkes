@@ -7,7 +7,8 @@ use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
-    DataPaths, EmbedderModel, EmbeddingEngine, FileEntry, IndexStatus, ModelDescriptor, Settings,
+    DataPaths, EmbeddingEngine, FileEntry, IndexStatus, ModelDescriptor, SelectedEmbedder,
+    Settings,
 };
 
 // ── Platform helpers ──────────────────────────────────────────────────────────
@@ -207,25 +208,21 @@ fn get_supported_engines() -> Vec<EmbeddingEngine> {
 
 #[tauri::command]
 async fn download_model(
-    model: EmbedderModel,
-    engine: EmbeddingEngine,
+    selected: SelectedEmbedder,
     app: AppHandle,
 ) -> Result<(), String> {
     let ctx = app.state::<Arc<AppContext>>().inner().clone();
-    ctx.start_download_model(model, engine).await
+    ctx.start_download_model(selected).await
 }
 
 #[tauri::command]
 async fn build_index(
     root: String,
-    model: EmbedderModel,
-    engine: EmbeddingEngine,
+    selected: SelectedEmbedder,
     app: AppHandle,
 ) -> Result<(), String> {
     let ctx = app.state::<Arc<AppContext>>().inner().clone();
-    Arc::clone(&ctx)
-        .start_build_index(root, model, engine)
-        .await
+    Arc::clone(&ctx).start_build_index(root, selected).await
 }
 
 #[tauri::command]

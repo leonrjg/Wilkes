@@ -2,7 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type {
-  EmbedderModel,
   EmbedDone,
   EmbedError,
   EmbedProgress,
@@ -13,6 +12,7 @@ import type {
   MatchRef,
   ModelDescriptor,
   PreviewData,
+  SelectedEmbedder,
   SearchQuery,
   SearchStats,
   Settings,
@@ -125,12 +125,12 @@ export class TauriSearchApi implements SearchApi {
     return invoke<number>("get_model_size", { engine, modelId });
   }
 
-  async downloadModel(model: EmbedderModel, engine: EmbeddingEngine): Promise<void> {
-    return invoke("download_model", { model, engine });
+  async downloadModel(selected: SelectedEmbedder): Promise<void> {
+    return invoke("download_model", { selected });
   }
 
-  async buildIndex(root: string, model: EmbedderModel, engine: EmbeddingEngine): Promise<void> {
-    return invoke("build_index", { root, model, engine });
+  async buildIndex(root: string, selected: SelectedEmbedder): Promise<void> {
+    return invoke("build_index", { root, selected });
   }
 
   async cancelEmbed(): Promise<void> {

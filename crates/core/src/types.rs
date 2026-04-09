@@ -306,6 +306,29 @@ impl<'de> Deserialize<'de> for EmbedderModel {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SelectedEmbedder {
+    pub engine: EmbeddingEngine,
+    pub model: EmbedderModel,
+    pub dimension: usize,
+}
+
+impl SelectedEmbedder {
+    pub fn default_for(engine: EmbeddingEngine) -> Self {
+        Self {
+            engine,
+            model: EmbedderModel(engine.default_model().to_string()),
+            dimension: 384,
+        }
+    }
+}
+
+impl Default for SelectedEmbedder {
+    fn default() -> Self {
+        Self::default_for(EmbeddingEngine::default())
+    }
+}
+
 // ── Model descriptor (returned by list_models) ────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -386,16 +409,11 @@ pub struct CustomModel {
 }
 
 // ── Semantic settings ─────────────────────────────────────────────────────────
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SemanticSettings {
     pub enabled: bool,
-    #[serde(default)]
-    pub engine: EmbeddingEngine,
-    #[serde(default = "SemanticSettings::default_model")]
-    pub model: EmbedderModel,
-    /// Embedding dimension for the current model.
-    #[serde(default = "SemanticSettings::default_dimension")]
-    pub dimension: usize,
+    #[serde(default = "SemanticSettings::default_selected")]
+    pub selected: SelectedEmbedder,
     /// Per-engine device overrides ("auto", "cpu", "mps", "cuda").
     /// Missing entries fall back to each engine's own default_device().
     #[serde(default)]
@@ -411,6 +429,46 @@ pub struct SemanticSettings {
     /// Idle timeout for worker processes in seconds.
     #[serde(default = "SemanticSettings::default_worker_timeout")]
     pub worker_timeout_secs: u64,
+}
+
+#[derive(Deserialize)]
+struct SemanticSettingsSerde {
+    enabled: bool,
+    #[serde(default = "SemanticSettings::default_selected")]
+    selected: SelectedEmbedder,
+    #[serde(default)]
+    engine_devices: HashMap<EmbeddingEngine, String>,
+    index_path: Option<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_custom_models")]
+    custom_models: Vec<CustomModel>,
+    #[serde(default = "SemanticSettings::default_chunk_size")]
+    chunk_size: usize,
+    #[serde(default = "SemanticSettings::default_chunk_overlap")]
+    chunk_overlap: usize,
+    #[serde(default = "SemanticSettings::default_worker_timeout")]
+    worker_timeout_secs: u64,
+}
+
+#[derive(Deserialize)]
+struct LegacySemanticSettingsSerde {
+    enabled: bool,
+    #[serde(default)]
+    engine: EmbeddingEngine,
+    #[serde(default = "SemanticSettings::default_model")]
+    model: EmbedderModel,
+    #[serde(default = "SemanticSettings::default_dimension")]
+    dimension: usize,
+    #[serde(default)]
+    engine_devices: HashMap<EmbeddingEngine, String>,
+    index_path: Option<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_custom_models")]
+    custom_models: Vec<CustomModel>,
+    #[serde(default = "SemanticSettings::default_chunk_size")]
+    chunk_size: usize,
+    #[serde(default = "SemanticSettings::default_chunk_overlap")]
+    chunk_overlap: usize,
+    #[serde(default = "SemanticSettings::default_worker_timeout")]
+    worker_timeout_secs: u64,
 }
 
 fn deserialize_custom_models<'de, D>(deserializer: D) -> Result<Vec<CustomModel>, D::Error>
@@ -442,6 +500,10 @@ where
 }
 
 impl SemanticSettings {
+    fn default_selected() -> SelectedEmbedder {
+        SelectedEmbedder::default_for(EmbeddingEngine::default())
+    }
+
     fn default_model() -> EmbedderModel {
         EmbedderModel(EmbeddingEngine::default().default_model().to_string())
     }
@@ -471,13 +533,49 @@ impl SemanticSettings {
             .unwrap_or_else(|| engine.default_device())
     }
 }
+
+impl<'de> Deserialize<'de> for SemanticSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("selected").is_some() {
+            let parsed = serde_json::from_value::<SemanticSettingsSerde>(value)
+                .map_err(serde::de::Error::custom)?;
+            Ok(Self {
+                enabled: parsed.enabled,
+                selected: parsed.selected,
+                engine_devices: parsed.engine_devices,
+                index_path: parsed.index_path,
+                custom_models: parsed.custom_models,
+                chunk_size: parsed.chunk_size,
+                chunk_overlap: parsed.chunk_overlap,
+                worker_timeout_secs: parsed.worker_timeout_secs,
+            })
+        } else {
+            let parsed = serde_json::from_value::<LegacySemanticSettingsSerde>(value)
+                .map_err(serde::de::Error::custom)?;
+            Ok(Self {
+                enabled: parsed.enabled,
+                selected: SelectedEmbedder {
+                    engine: parsed.engine,
+                    model: parsed.model,
+                    dimension: parsed.dimension,
+                },
+                engine_devices: parsed.engine_devices,
+                index_path: parsed.index_path,
+                custom_models: parsed.custom_models,
+                chunk_size: parsed.chunk_size,
+                chunk_overlap: parsed.chunk_overlap,
+                worker_timeout_secs: parsed.worker_timeout_secs,
+            })
+        }
+    }
+}
+
 impl Default for SemanticSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            engine: EmbeddingEngine::default(),
-            model: SemanticSettings::default_model(),
-            dimension: Self::default_dimension(),
+            selected: Self::default_selected(),
             engine_devices: HashMap::new(),
             index_path: None,
             custom_models: Vec::new(),
@@ -796,9 +894,9 @@ mod tests {
     fn test_semantic_settings_defaults() {
         let settings = SemanticSettings::default();
         assert_eq!(settings.enabled, false);
-        assert_eq!(settings.engine, EmbeddingEngine::default());
-        assert_eq!(settings.model.model_id(), "AllMiniLML6V2");
-        assert_eq!(settings.dimension, 384);
+        assert_eq!(settings.selected.engine, EmbeddingEngine::default());
+        assert_eq!(settings.selected.model.model_id(), "AllMiniLML6V2");
+        assert_eq!(settings.selected.dimension, 384);
         assert_eq!(settings.chunk_size, 600);
         assert_eq!(settings.chunk_overlap, 128);
         assert_eq!(settings.worker_timeout_secs, 300);
@@ -915,6 +1013,29 @@ mod tests {
         let json = r#"{"models": [123]}"#;
         let res: Result<Wrapper, _> = serde_json::from_str(json);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_semantic_settings_deserialize_legacy_fields() {
+        let json = r#"{
+            "enabled": true,
+            "engine": "Candle",
+            "model": "sentence-transformers/all-MiniLM-L12-v2",
+            "dimension": 384,
+            "engine_devices": {},
+            "index_path": null,
+            "custom_models": [],
+            "chunk_size": 600,
+            "chunk_overlap": 128,
+            "worker_timeout_secs": 300
+        }"#;
+        let settings: SemanticSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.selected.engine, EmbeddingEngine::Candle);
+        assert_eq!(
+            settings.selected.model.model_id(),
+            "sentence-transformers/all-MiniLM-L12-v2"
+        );
+        assert_eq!(settings.selected.dimension, 384);
     }
 
     #[test]

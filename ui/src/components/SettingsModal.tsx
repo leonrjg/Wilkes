@@ -13,6 +13,7 @@ import { basicSetup } from "codemirror";
 import { json } from "@codemirror/lang-json";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { indentWithTab } from "@codemirror/commands";
+import {Tool} from "react-feather";
 
 interface SettingsModalProps {
   api: SearchApi;
@@ -187,7 +188,7 @@ export default function SettingsModal({
       <div className="bg-[var(--bg-app)] border border-[var(--border-main)] rounded-xl shadow-2xl w-full max-w-2xl h-[800px] max-h-[90vh] flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200">
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-[var(--border-main)]">
           <h2 className="text-base font-semibold text-[var(--text-main)] flex items-center gap-2">
-            <span className="text-[var(--text-dim)] text-lg">⚙</span> Settings
+            <span className="text-[var(--text-dim)] text-lg"><Tool /></span> Settings
           </h2>
           <button
             onClick={onClose}
