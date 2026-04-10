@@ -25,6 +25,7 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
   const [pageWidth, setPageWidth] = useState<number | null>(null);
   const [pageAspectRatio, setPageAspectRatio] = useState<number | null>(null);
   const [numPages, setNumPages] = useState<number | null>(null);
+  const [currentPage, setCurrentPage] = useState(page);
   const [zoom, setZoom] = useState(1.0);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
@@ -50,6 +51,35 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
     (p: number) => virtualizer.scrollToIndex(p - 1, { align: "start" }),
     [virtualizer],
   );
+
+  const syncCurrentPageFromScroll = useCallback(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const containerRect = container.getBoundingClientRect();
+    const viewportCenter = containerRect.top + containerRect.height / 2;
+    const pageElements = Array.from(container.querySelectorAll<HTMLElement>("[data-page-number]"));
+
+    if (pageElements.length === 0) return;
+
+    let closestPage: number | null = null;
+    let closestDistance = Number.POSITIVE_INFINITY;
+
+    for (const pageElement of pageElements) {
+      const pageRect = pageElement.getBoundingClientRect();
+      const pageCenter = pageRect.top + pageRect.height / 2;
+      const distance = Math.abs(pageCenter - viewportCenter);
+
+      if (distance < closestDistance) {
+        closestDistance = distance;
+        closestPage = Number(pageElement.dataset.pageNumber);
+      }
+    }
+
+    if (closestPage !== null) {
+      setCurrentPage(closestPage);
+    }
+  }, []);
 
   const {
     searchInputRef,
@@ -85,8 +115,21 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
   useEffect(() => {
     if (numPages && !isSearchOpen) {
       virtualizer.scrollToIndex(page - 1, { align: "start" });
+      setCurrentPage(page);
     }
   }, [page, numPages, highlight_bbox, isSearchOpen]);
+
+  useEffect(() => {
+    if (numPages) {
+      setCurrentPage((prev) => Math.min(Math.max(prev, 1), numPages));
+    }
+  }, [numPages]);
+
+  useEffect(() => {
+    if (numPages) {
+      requestAnimationFrame(syncCurrentPageFromScroll);
+    }
+  }, [numPages, zoom, syncCurrentPageFromScroll]);
 
   const scale = pageWidth ? renderedWidth / pageWidth : 1;
 
@@ -152,6 +195,8 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
               <SearchIcon size={12} />
             </button>
           )}
+          {numPages && <span className="w-16 text-center font-mono">{currentPage}/{numPages}</span>}
+          {numPages && <span className="text-[var(--text-dim)]">|</span>}
           <button
             onClick={() => setZoom((z) => Math.max(0.25, +(z - 0.25).toFixed(2)))}
             className="px-1 hover:text-[var(--accent-blue)]"
@@ -171,6 +216,7 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
       <div
         ref={containerRef}
         className={`flex-1 overflow-auto bg-[var(--bg-sidebar)] pr-1 ${isDark ? "pdf-dark-mode" : ""}`}
+        onScroll={() => requestAnimationFrame(syncCurrentPageFromScroll)}
         style={{
           WebkitUserSelect: "text",
           userSelect: "text",
@@ -219,6 +265,7 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
               return (
                 <div
                   key={vItem.key}
+                  data-page-number={pageNum}
                   style={{ position: "absolute", top: vItem.start, width: "100%" }}
                 >
                   <div style={{ position: "relative", display: "inline-block" }}>
