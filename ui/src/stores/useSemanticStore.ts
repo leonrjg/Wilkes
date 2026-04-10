@@ -12,11 +12,13 @@ interface SemanticStore {
   readyForCurrentRoot: boolean;
   status: SemanticRootStatus;
   buildRoot: string | null;
+  blockedRoot: string | null;
   error: string | null;
 
   refreshCurrentRootStatus: () => Promise<boolean>;
-  ensureCurrentRootIndexed: () => Promise<boolean>;
+  ensureCurrentRootIndexed: (freshAttempt?: boolean) => Promise<boolean>;
   handleIndexUpdated: () => Promise<void>;
+  handleCurrentRootIndexRemoved: () => Promise<void>;
 }
 
 export const useSemanticStore = create<SemanticStore>((set, get) => ({
@@ -24,6 +26,7 @@ export const useSemanticStore = create<SemanticStore>((set, get) => ({
   readyForCurrentRoot: false,
   status: "idle",
   buildRoot: null,
+  blockedRoot: null,
   error: null,
 
   refreshCurrentRootStatus: async () => {
@@ -36,6 +39,7 @@ export const useSemanticStore = create<SemanticStore>((set, get) => ({
         readyForCurrentRoot: false,
         status: "idle",
         buildRoot: null,
+        blockedRoot: null,
         error: null,
       });
       return false;
@@ -49,12 +53,13 @@ export const useSemanticStore = create<SemanticStore>((set, get) => ({
     try {
       const indexStatus = await api.getIndexStatus();
       const ready = isUsableSemanticIndex(indexStatus, directory);
-      set({
+      set((state) => ({
         indexStatus,
         readyForCurrentRoot: ready,
         status: ready ? "ready" : buildRoot === directory ? "building" : "missing",
+        blockedRoot: ready ? null : state.blockedRoot,
         error: null,
-      });
+      }));
       return ready;
     } catch (e: any) {
       set({
@@ -67,7 +72,7 @@ export const useSemanticStore = create<SemanticStore>((set, get) => ({
     }
   },
 
-  ensureCurrentRootIndexed: async () => {
+  ensureCurrentRootIndexed: async (freshAttempt = false) => {
     const { directory, preferSemantic, semantic } = useSettingsStore.getState();
 
     if (!directory) {
@@ -75,9 +80,21 @@ export const useSemanticStore = create<SemanticStore>((set, get) => ({
       return false;
     }
 
+    if (get().blockedRoot === directory && !freshAttempt) {
+      return false;
+    }
+
     const ready = await get().refreshCurrentRootStatus();
     if (!preferSemantic || ready) {
       return ready;
+    }
+
+    if (get().blockedRoot === directory && !freshAttempt) {
+      return false;
+    }
+
+    if (get().blockedRoot === directory && freshAttempt) {
+      set({ blockedRoot: null });
     }
 
     if (!semantic || get().buildRoot === directory) {
@@ -87,6 +104,7 @@ export const useSemanticStore = create<SemanticStore>((set, get) => ({
     set({
       buildRoot: directory,
       status: "building",
+      blockedRoot: null,
       error: null,
     });
 
@@ -115,6 +133,23 @@ export const useSemanticStore = create<SemanticStore>((set, get) => ({
 
     if (ready) {
       await useSearchStore.getState().replaySearch();
+    }
+  },
+
+  handleCurrentRootIndexRemoved: async () => {
+    const { directory } = useSettingsStore.getState();
+
+    set({
+      indexStatus: null,
+      readyForCurrentRoot: false,
+      status: directory ? "missing" : "idle",
+      buildRoot: null,
+      blockedRoot: directory,
+      error: null,
+    });
+
+    if (directory) {
+      useSearchStore.getState().invalidateSemanticResultsForRoot(directory);
     }
   },
 }));

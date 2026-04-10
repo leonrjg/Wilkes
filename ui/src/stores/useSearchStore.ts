@@ -15,7 +15,9 @@ interface SearchStore {
   lastQuery: SearchQuery | null;
 
   search: (query: SearchQuery) => Promise<void>;
+  deferSemanticSearch: (query: SearchQuery) => void;
   replaySearch: () => Promise<void>;
+  invalidateSemanticResultsForRoot: (root: string) => void;
   setHasQuery: (hasQuery: boolean) => void;
   selectMatch: (matchRef: MatchRef) => void;
   clearPreview: () => void;
@@ -71,6 +73,17 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
     }
   },
 
+  deferSemanticSearch: (query: SearchQuery) =>
+    set({
+      lastQuery: query,
+      stats: null,
+      searching: false,
+      currentSearchId: null,
+      selectedMatch: null,
+      previewData: null,
+      previewLoading: false,
+    }),
+
   replaySearch: async () => {
     const { lastQuery, search } = get();
     if (!lastQuery) return;
@@ -89,6 +102,22 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
   },
 
   setHasQuery: (hasQuery: boolean) => set({ hasQuery }),
+
+  invalidateSemanticResultsForRoot: (root: string) =>
+    set((state) => {
+      if (state.lastQuery?.mode !== "Semantic" || state.lastQuery.root !== root) {
+        return {};
+      }
+      return {
+        results: [],
+        stats: null,
+        searching: false,
+        currentSearchId: null,
+        selectedMatch: null,
+        previewData: null,
+        previewLoading: false,
+      };
+    }),
 
   selectMatch: (matchRef: MatchRef) => {
     set({ selectedMatch: matchRef, previewLoading: true });

@@ -13,6 +13,7 @@ import {
 } from "../lib/types";
 import type { SearchApi } from "../services/api";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useSemanticStore } from "../stores/useSemanticStore";
 import LogsPanel from "./LogsPanel";
 import {CornerLeftDown, CornerRightUp} from "react-feather";
 
@@ -315,6 +316,7 @@ interface Props {
 }
 
 export default function SemanticPanel({ api, directory, refreshSemanticReady }: Props) {
+  const handleCurrentRootIndexRemoved = useSemanticStore((s) => s.handleCurrentRootIndexRemoved);
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
   const [modelFilter, setModelFilter] = useState("");
   const [draftSelected, setDraftSelected] = useState<SelectedEmbedder | null>(null);
@@ -602,10 +604,11 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     } else if (phase === "indexed") {
       api.deleteIndex().then(() => {
         dispatch({ type: "index_deleted" });
-        refreshSemanticReady();
+        handleCurrentRootIndexRemoved().catch(console.error);
+        refreshSemanticReady().catch(console.error);
       }).catch((e) => console.error("deleteIndex failed:", e));
     }
-  }, [phase, settings, effectiveSelected, api, directory, refreshSemanticReady]);
+  }, [phase, settings, effectiveSelected, api, directory, handleCurrentRootIndexRemoved, refreshSemanticReady]);
 
   const handleAddCustomModel = async () => {
     if (!settings || !customModelInput.trim()) return;

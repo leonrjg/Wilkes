@@ -189,6 +189,42 @@ describe("useSearchStore", () => {
     expect(searchMock).toHaveBeenCalledWith(mockQuery);
   });
 
+  it("should defer semantic search intent without clearing the last query", () => {
+    useSearchStore.setState({
+      results: [{ path: "/f.ts", file_type: "PlainText", matches: [] }],
+      stats: { files_scanned: 1, total_matches: 1, elapsed_ms: 10, errors: [] },
+      selectedMatch: { path: "/f.ts", origin: { TextFile: { line: 1, col: 1 } } } as any,
+      previewData: { Text: { content: "", language: "text", highlight_line: 1, highlight_range: { start: 0, end: 0 } } },
+    });
+
+    useSearchStore.getState().deferSemanticSearch({ pattern: "queued", mode: "Semantic", root: "/root" } as any);
+
+    const state = useSearchStore.getState();
+    expect(state.lastQuery).toEqual(expect.objectContaining({ pattern: "queued", mode: "Semantic", root: "/root" }));
+    expect(state.stats).toBeNull();
+    expect(state.selectedMatch).toBeNull();
+    expect(state.previewData).toBeNull();
+  });
+
+  it("should invalidate stale semantic results for the matching root", () => {
+    useSearchStore.setState({
+      lastQuery: { pattern: "queued", mode: "Semantic", root: "/root" } as any,
+      results: [{ path: "/f.ts", file_type: "PlainText", matches: [] }],
+      stats: { files_scanned: 1, total_matches: 1, elapsed_ms: 10, errors: [] },
+      selectedMatch: { path: "/f.ts", origin: { TextFile: { line: 1, col: 1 } } } as any,
+      previewData: { Text: { content: "", language: "text", highlight_line: 1, highlight_range: { start: 0, end: 0 } } },
+    });
+
+    useSearchStore.getState().invalidateSemanticResultsForRoot("/root");
+
+    const state = useSearchStore.getState();
+    expect(state.results).toEqual([]);
+    expect(state.stats).toBeNull();
+    expect(state.selectedMatch).toBeNull();
+    expect(state.previewData).toBeNull();
+    expect(state.lastQuery).toEqual(expect.objectContaining({ root: "/root" }));
+  });
+
   it("should clear results", () => {
     useSearchStore.setState({
       results: [{ path: "/f.ts", file_type: "PlainText", matches: [] }],

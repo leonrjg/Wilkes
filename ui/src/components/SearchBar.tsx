@@ -12,6 +12,7 @@ interface Props {
 
 export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const search = useSearchStore((s) => s.search);
+  const deferSemanticSearch = useSearchStore((s) => s.deferSemanticSearch);
   const searching = useSearchStore((s) => s.searching);
   const setHasQuery = useSearchStore((s) => s.setHasQuery);
   const clearResults = useSearchStore((s) => s.clearResults);
@@ -27,6 +28,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const setPreferSemantic = useSettingsStore((s) => s.setPreferSemantic);
   const maxResults = useSettingsStore((s) => s.maxResults);
   const semanticReady = useSemanticStore((s) => s.readyForCurrentRoot);
+  const ensureCurrentRootIndexed = useSemanticStore((s) => s.ensureCurrentRootIndexed);
 
   const [pattern, setPattern] = useState("");
   const [isRegex, setIsRegex] = useState(false);
@@ -78,13 +80,22 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   );
 
   const triggerSearch = useCallback(
-    (pat: string, opts?: { isRegex?: boolean; caseSensitive?: boolean; isSemanticMode?: boolean }) => {
+    (
+      pat: string,
+      opts?: { isRegex?: boolean; caseSensitive?: boolean; isSemanticMode?: boolean },
+      source: "user" | "reactive" = "reactive",
+    ) => {
       if (!pat.trim() || !directory) return;
       const semantic = opts?.isSemanticMode ?? isSemanticMode;
-      if (semantic && !semanticReady) return;
-      search(buildQuery(pat, opts));
+      const query = buildQuery(pat, opts);
+      if (semantic && !semanticReady) {
+        deferSemanticSearch(query);
+        ensureCurrentRootIndexed(source === "user").catch(console.error);
+        return;
+      }
+      search(query);
     },
-    [search, buildQuery, isSemanticMode, semanticReady],
+    [search, buildQuery, deferSemanticSearch, directory, ensureCurrentRootIndexed, isSemanticMode, semanticReady],
   );
 
   // Notify store when query presence changes
@@ -95,18 +106,18 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   // Debounce pattern changes
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => triggerSearch(pattern), 300);
+    debounceRef.current = setTimeout(() => triggerSearch(pattern, undefined, "user"), 300);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [pattern, triggerSearch]);
+  }, [pattern]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Re-trigger when externally-driven settings change (directory, excluded)
   useEffect(() => {
     if (!directory) {
       clearResults();
     } else if (pattern.trim()) {
-      triggerSearch(pattern);
+      triggerSearch(pattern, undefined, "reactive");
     }
   }, [directory, excluded]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -121,13 +132,13 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const handleToggleRegex = () => {
     const next = !isRegex;
     setIsRegex(next);
-    triggerSearch(pattern, { isRegex: next });
+    triggerSearch(pattern, { isRegex: next }, "user");
   };
 
   const handleToggleCaseSensitive = () => {
     const next = !caseSensitive;
     setCaseSensitive(next);
-    triggerSearch(pattern, { caseSensitive: next });
+    triggerSearch(pattern, { caseSensitive: next }, "user");
   };
 
   const handleToggleSemantic = () => {
@@ -135,7 +146,9 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     setIsSemanticMode(next);
     setPreferSemantic(next);
     if (!next || semanticReady) {
-      triggerSearch(pattern, { isSemanticMode: next });
+      triggerSearch(pattern, { isSemanticMode: next }, "user");
+    } else if (pattern.trim()) {
+      triggerSearch(pattern, { isSemanticMode: next }, "user");
     }
   };
 

@@ -62,6 +62,7 @@ describe("useSemanticStore", () => {
       readyForCurrentRoot: false,
       status: "idle",
       buildRoot: null,
+      blockedRoot: null,
       error: null,
     });
   });
@@ -314,5 +315,55 @@ describe("useSemanticStore", () => {
     expect(useSemanticStore.getState().readyForCurrentRoot).toBe(false);
     expect(useSemanticStore.getState().buildRoot).toBe("/new-root");
     expect(replaySearch).not.toHaveBeenCalled();
+  });
+
+  it("clears stale semantic results when the current root index is removed", async () => {
+    useSettingsStore.setState({ directory: "/project" } as any);
+    useSearchStore.setState({
+      lastQuery: { pattern: "hello", mode: "Semantic", root: "/project" } as any,
+      results: [{ path: "/project/file.txt", file_type: "PlainText", matches: [] }],
+      stats: { files_scanned: 1, total_matches: 1, elapsed_ms: 5, errors: [] },
+      selectedMatch: { path: "/project/file.txt", origin: { TextFile: { line: 1, col: 1 } } } as any,
+      previewData: { Text: { content: "hello", language: "txt", highlight_line: 1, highlight_range: { start: 0, end: 5 } } } as any,
+    } as any);
+
+    await useSemanticStore.getState().handleCurrentRootIndexRemoved();
+
+    expect(useSemanticStore.getState().readyForCurrentRoot).toBe(false);
+    expect(useSemanticStore.getState().status).toBe("missing");
+    expect(useSemanticStore.getState().blockedRoot).toBe("/project");
+    expect(useSearchStore.getState().results).toEqual([]);
+    expect(useSearchStore.getState().stats).toBeNull();
+    expect(useSearchStore.getState().lastQuery).toEqual(
+      expect.objectContaining({ pattern: "hello", mode: "Semantic", root: "/project" }),
+    );
+  });
+
+  it("does not rebuild from stale pre-delete query state until a fresh attempt happens", async () => {
+    (api.getIndexStatus as any).mockResolvedValue({
+      indexed_files: 0,
+      total_chunks: 0,
+      built_at: null,
+      build_duration_ms: null,
+      engine: "SBERT",
+      model_id: "intfloat/e5-small-v2",
+      dimension: 384,
+      root_path: "/project",
+      db_size_bytes: null,
+    });
+
+    useSettingsStore.setState({
+      directory: "/project",
+      preferSemantic: true,
+    } as any);
+    await useSemanticStore.getState().handleCurrentRootIndexRemoved();
+    (api.buildIndex as any).mockClear();
+
+    await useSemanticStore.getState().ensureCurrentRootIndexed();
+    expect(api.buildIndex).not.toHaveBeenCalled();
+
+    await useSemanticStore.getState().ensureCurrentRootIndexed(true);
+    expect(api.buildIndex).toHaveBeenCalledTimes(1);
+    expect(useSemanticStore.getState().blockedRoot).toBeNull();
   });
 });
