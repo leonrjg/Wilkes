@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import App from "./App";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useSearchStore } from "./stores/useSearchStore";
-import { api, source } from "./services";
+import { useSemanticStore } from "./stores/useSemanticStore";
 import { ToastProvider } from "./components/Toast";
 
 // Mock services and hooks at top level
@@ -54,10 +54,18 @@ describe("App", () => {
       setDirectory: vi.fn(),
       addBookmark: vi.fn(),
       removeBookmark: vi.fn(),
-      refreshSemanticReady: vi.fn(),
       applySettingsPatch: vi.fn(),
       setIndexing: vi.fn(),
     });
+    useSemanticStore.setState({
+      refreshCurrentRootStatus: vi.fn().mockResolvedValue(false),
+      handleIndexUpdated: vi.fn().mockResolvedValue(undefined),
+      readyForCurrentRoot: false,
+      status: "idle",
+      buildRoot: null,
+      indexStatus: null,
+      error: null,
+    } as any);
     useSearchStore.setState({
       results: [],
       stats: null,

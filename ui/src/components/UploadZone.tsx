@@ -72,8 +72,6 @@ function formatBytes(bytes: number): string {
 export default function UploadZone({ source, onRootChange }: Props) {
   const fileList = useSettingsStore((s) => s.fileList);
   const refreshFileList = useSettingsStore((s) => s.refreshFileList);
-  const preferSemantic = useSettingsStore((s) => s.preferSemantic);
-  const startSemanticIndex = useSettingsStore((s) => s.startSemanticIndex);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState<UploadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -90,11 +88,6 @@ export default function UploadZone({ source, onRootChange }: Props) {
     try {
       const result = await uploadWithProgress(files, setProgress);
       onRootChange(result.root);
-      if (preferSemantic) {
-        startSemanticIndex().catch((e) => {
-          console.error("Semantic reindex after upload failed:", e);
-        });
-      }
     } catch (e) {
       console.error("Upload error:", e);
       setError(e instanceof Error ? e.message : "Upload failed");
@@ -102,7 +95,7 @@ export default function UploadZone({ source, onRootChange }: Props) {
       setUploading(false);
       setProgress(null);
     }
-  }, [onRootChange, preferSemantic, startSemanticIndex]);
+  }, [onRootChange]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();

@@ -15,7 +15,7 @@ const features =
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(scriptDir);
 const desktopDir = join(repoRoot, "crates", "desktop");
-const binariesDir = join(desktopDir, "binaries");
+const sidecarsDir = join(desktopDir, "sidecars");
 
 function resolveTargetTriple() {
   if (process.env.TAURI_ENV_TARGET_TRIPLE) {
@@ -73,11 +73,11 @@ const builtBinary = join(
   `wilkes-rust-worker${extension}`,
 );
 const bundledBinary = join(
-  binariesDir,
+  sidecarsDir,
   `wilkes-rust-worker-${targetTriple}${extension}`,
 );
 
-mkdirSync(binariesDir, { recursive: true });
+mkdirSync(sidecarsDir, { recursive: true });
 copyFileSync(builtBinary, bundledBinary);
 
 console.log(`Prepared sidecar: ${bundledBinary}`);

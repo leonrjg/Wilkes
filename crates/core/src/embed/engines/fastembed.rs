@@ -505,7 +505,7 @@ mod tests {
         assert_eq!(installer.model.0, "BGEBaseENV15");
 
         assert_eq!(installer.uninstall(dir.path()).is_ok(), true);
-        
+
         // build() should work (it creates a WorkerEmbedder)
         let _ = installer.build(dir.path()).unwrap();
     }
@@ -514,21 +514,21 @@ mod tests {
     async fn test_fastembed_installer_install_cached() {
         let dir = tempdir().unwrap();
         let info = find_model_info("BGEBaseENV15").unwrap();
-        
+
         let repo_code = info.model_code.replace("/", "--");
         let repo_dir = dir.path().join(format!("models--{repo_code}"));
         let snapshots_dir = repo_dir.join("snapshots");
         std::fs::create_dir_all(&snapshots_dir).unwrap();
-        
+
         let hash_dir = snapshots_dir.join("main");
         std::fs::create_dir_all(&hash_dir).unwrap();
-        
+
         let model_file = hash_dir.join(&info.model_file);
         if let Some(parent) = model_file.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(&model_file, "{}").unwrap();
-        
+
         let refs_dir = repo_dir.join("refs");
         std::fs::create_dir_all(&refs_dir).unwrap();
         std::fs::write(refs_dir.join("main"), "main").unwrap();
@@ -541,7 +541,7 @@ mod tests {
             manager,
             "cpu".to_string(),
         );
-        
+
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         installer.install(dir.path(), tx).await.unwrap();
     }
@@ -716,7 +716,10 @@ mod tests {
     fn test_find_model_info_error() {
         let err = find_model_info("NonExistentModel");
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("is not supported by fastembed"));
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("is not supported by fastembed"));
     }
 
     #[test]

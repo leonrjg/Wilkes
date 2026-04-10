@@ -23,7 +23,6 @@ describe("UploadZone", () => {
       fileList: [],
       refreshFileList: vi.fn(),
       preferSemantic: false,
-      startSemanticIndex: vi.fn().mockResolvedValue(undefined),
     } as any);
     // Mock XMLHttpRequest
     xhrMock = {
@@ -194,30 +193,5 @@ describe("UploadZone", () => {
     await act(async () => {
       fireEvent.change(folderInput, { target: { files: [file] } });
     });
-  });
-
-  it("triggers semantic reindex after upload when semantic is preferred", async () => {
-    const startSemanticIndex = vi.fn().mockResolvedValue(undefined);
-    useSettingsStore.setState({ preferSemantic: true, startSemanticIndex } as any);
-
-    render(<UploadZone {...defaultProps} />);
-    const fileInputReal = document.querySelectorAll('input[type="file"]')[0];
-    const file = new File(["test"], "test.txt", { type: "text/plain" });
-
-    let loadListener: Function | undefined;
-    xhrMock.addEventListener.mockImplementation((event: string, listener: Function) => {
-      if (event === "load") loadListener = listener;
-    });
-
-    await act(async () => {
-      fireEvent.change(fileInputReal, { target: { files: [file] } });
-    });
-
-    await act(async () => {
-      if (loadListener) await loadListener();
-    });
-
-    expect(defaultProps.onRootChange).toHaveBeenCalledWith("/new/root");
-    expect(startSemanticIndex).toHaveBeenCalled();
   });
 });

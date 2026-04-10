@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::ipc::{WorkerEvent, WorkerRequest};
-use super::process::{roof_knock_pid, ROOF_KNOCK_TIMEOUT};
+use super::process::{kill_after_timeout, ROOF_KNOCK_TIMEOUT};
 use super::runtime::supervised_manager_loop;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -160,7 +160,7 @@ impl WorkerManager {
         if pid != 0 {
             let active_pid = Arc::clone(&self.active_pid);
             std::thread::spawn(move || {
-                roof_knock_pid(pid, timeout, "request_shutdown");
+                kill_after_timeout(pid, timeout, "request_shutdown");
                 if !super::process::pid_is_alive(pid) {
                     let _ =
                         active_pid.compare_exchange(pid, 0, Ordering::Relaxed, Ordering::Relaxed);

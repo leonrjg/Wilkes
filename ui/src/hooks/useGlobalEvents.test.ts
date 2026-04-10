@@ -3,8 +3,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { useGlobalEvents } from "./useGlobalEvents";
 import { api } from "../services";
 import { useToasts } from "../components/Toast";
-import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useSemanticStore } from "../stores/useSemanticStore";
 
 vi.mock("../services", () => ({
   api: {
@@ -16,14 +16,14 @@ vi.mock("../components/Toast", () => ({
   useToasts: vi.fn(),
 }));
 
-vi.mock("../stores/useSearchStore", () => ({
-  useSearchStore: {
+vi.mock("../stores/useSettingsStore", () => ({
+  useSettingsStore: {
     getState: vi.fn(),
   },
 }));
 
-vi.mock("../stores/useSettingsStore", () => ({
-  useSettingsStore: {
+vi.mock("../stores/useSemanticStore", () => ({
+  useSemanticStore: {
     getState: vi.fn(),
   },
 }));
@@ -31,14 +31,14 @@ vi.mock("../stores/useSettingsStore", () => ({
 describe("useGlobalEvents", () => {
   const addToast = vi.fn().mockReturnValue("toast-id");
   const removeToast = vi.fn();
-  const replaySearch = vi.fn().mockResolvedValue(undefined);
+  const handleIndexUpdated = vi.fn().mockResolvedValue(undefined);
   const refreshFileList = vi.fn();
 
   beforeEach(() => {
     vi.clearAllMocks();
     (useToasts as any).mockReturnValue({ addToast, removeToast });
-    (useSearchStore.getState as any).mockReturnValue({ replaySearch });
     (useSettingsStore.getState as any).mockReturnValue({ refreshFileList });
+    (useSemanticStore.getState as any).mockReturnValue({ handleIndexUpdated });
   });
 
   it("handles WorkerStarting event", async () => {
@@ -85,7 +85,7 @@ describe("useGlobalEvents", () => {
       handler("ReindexingDone");
     });
     expect(removeToast).toHaveBeenCalledWith("toast-id");
-    expect(replaySearch).toHaveBeenCalled();
+    expect(handleIndexUpdated).toHaveBeenCalled();
   });
 
   it("closes the reindex toast when reindexing is cancelled", async () => {
@@ -110,6 +110,6 @@ describe("useGlobalEvents", () => {
     });
 
     expect(removeToast).toHaveBeenCalledWith("toast-id");
-    expect(replaySearch).not.toHaveBeenCalled();
+    expect(handleIndexUpdated).not.toHaveBeenCalled();
   });
 });

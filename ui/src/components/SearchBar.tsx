@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import { Search, Database, Check } from "react-feather";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useSemanticStore } from "../stores/useSemanticStore";
 import type { SearchQuery } from "../lib/types";
 
 interface Props {
@@ -22,11 +23,10 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const supportedExtensions = useSettingsStore((s) => s.supportedExtensions);
   const fileList = useSettingsStore((s) => s.fileList);
   const excluded = useSettingsStore((s) => s.excluded);
-  const semanticReady = useSettingsStore((s) => s.semanticIndexBuilt);
   const preferSemantic = useSettingsStore((s) => s.preferSemantic);
   const setPreferSemantic = useSettingsStore((s) => s.setPreferSemantic);
   const maxResults = useSettingsStore((s) => s.maxResults);
-  const startSemanticIndex = useSettingsStore((s) => s.startSemanticIndex);
+  const semanticReady = useSemanticStore((s) => s.readyForCurrentRoot);
 
   const [pattern, setPattern] = useState("");
   const [isRegex, setIsRegex] = useState(false);
@@ -134,9 +134,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     const next = !isSemanticMode;
     setIsSemanticMode(next);
     setPreferSemantic(next);
-    if (next && !semanticReady) {
-      startSemanticIndex().catch(console.error);
-    } else {
+    if (!next || semanticReady) {
       triggerSearch(pattern, { isSemanticMode: next });
     }
   };

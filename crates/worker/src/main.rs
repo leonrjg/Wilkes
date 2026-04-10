@@ -701,14 +701,23 @@ mod tests {
             fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
                 Err(anyhow::anyhow!("embed failed"))
             }
-            fn model_id(&self) -> &str { "fail" }
-            fn dimension(&self) -> usize { 384 }
-            fn engine(&self) -> EmbeddingEngine { EmbeddingEngine::Candle }
+            fn model_id(&self) -> &str {
+                "fail"
+            }
+            fn dimension(&self) -> usize {
+                384
+            }
+            fn engine(&self) -> EmbeddingEngine {
+                EmbeddingEngine::Candle
+            }
         }
-        
+
         struct FailEmbedderLoader;
         impl LocalEmbedderLoader for FailEmbedderLoader {
-            fn load(&self, _key: &LoadedEmbedderKey) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
+            fn load(
+                &self,
+                _key: &LoadedEmbedderKey,
+            ) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
                 Ok(Arc::new(FailEmbedder))
             }
         }
@@ -716,9 +725,11 @@ mod tests {
         let mut active = None;
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let req = sample_request("embed");
-        
-        handle_worker_request(req, &mut active, tx, &FailEmbedderLoader).await.unwrap();
-        
+
+        handle_worker_request(req, &mut active, tx, &FailEmbedderLoader)
+            .await
+            .unwrap();
+
         let ev = rx.recv().await.unwrap();
         match ev {
             WorkerEvent::Error(e) => assert!(e.contains("Embed error")),

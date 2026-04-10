@@ -1,19 +1,9 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import { api } from "../services";
-import type { FileEntry, IndexStatus, SemanticSettings, Settings, Theme } from "../lib/types";
+import type { FileEntry, SemanticSettings, Settings, Theme } from "../lib/types";
 
 const EMPTY_EXCLUDED: Set<string> = new Set();
-
-function isUsableSemanticIndex(
-  indexStatus: IndexStatus | null,
-  directory: string,
-): boolean {
-  if (!indexStatus || !directory) return false;
-  if (indexStatus.indexed_files === 0 || indexStatus.total_chunks === 0) return false;
-  if (indexStatus.root_path && indexStatus.root_path !== directory) return false;
-  return true;
-}
 
 function applyTheme(theme: Theme) {
   const root = window.document.documentElement;
@@ -38,7 +28,6 @@ interface SettingsStore {
   fileList: FileEntry[];
   filterText: string;
   excluded: Set<string>;
-  semanticIndexBuilt: boolean;
   preferSemantic: boolean;
   indexing: boolean;
   theme: Theme;
@@ -54,8 +43,6 @@ interface SettingsStore {
   setFilterText: (text: string) => void;
   setPreferSemantic: (active: boolean) => void;
   setIndexing: (indexing: boolean) => void;
-  refreshSemanticReady: () => Promise<void>;
-  startSemanticIndex: () => Promise<void>;
   applySettingsPatch: (patch: { theme?: Theme; supported_extensions?: string[]; max_results?: number }) => void;
   replaceSettings: (settings: Settings) => void;
   refreshSettings: () => Promise<Settings>;
@@ -74,7 +61,6 @@ export const useSettingsStore = create<SettingsStore>()(
     fileList: [],
     filterText: "",
     excluded: EMPTY_EXCLUDED,
-    semanticIndexBuilt: false,
     preferSemantic: false,
     indexing: false,
     theme: "System",
@@ -99,25 +85,10 @@ export const useSettingsStore = create<SettingsStore>()(
         respectGitignore: s.respect_gitignore,
         maxFileSize: s.max_file_size,
         supportedExtensions: s.supported_extensions || [],
-        semanticIndexBuilt: false, // will be confirmed below
         preferSemantic: s.search_prefer_semantic,
         theme: s.theme,
         maxResults: s.max_results ?? 0,
       });
-
-      const directory = s.last_directory ?? "";
-      let ready = false;
-      try {
-        const indexStatus = await api.getIndexStatus();
-        ready = isUsableSemanticIndex(indexStatus, directory);
-      } catch {
-        ready = false;
-      }
-      set({ semanticIndexBuilt: ready });
-
-      if (!ready && s.search_prefer_semantic && directory) {
-        get().startSemanticIndex().catch(console.error);
-      }
     },
 
     setDirectory: (dir: string) => {
@@ -177,25 +148,6 @@ export const useSettingsStore = create<SettingsStore>()(
     setPreferSemantic: (active: boolean) => {
       set({ preferSemantic: active });
       api.updateSettings({ search_prefer_semantic: active }).catch(console.error);
-    },
-
-    refreshSemanticReady: async () => {
-      const { directory } = get();
-      let ready = false;
-      try {
-        const indexStatus = await api.getIndexStatus();
-        ready = isUsableSemanticIndex(indexStatus, directory);
-      } catch {
-        ready = false;
-      }
-      set({ semanticIndexBuilt: ready });
-    },
-
-    startSemanticIndex: async () => {
-      const { directory } = get();
-      const s = await api.getSettings();
-      set({ semantic: s.semantic });
-      await api.buildIndex(directory, s.semantic.selected);
     },
 
     applySettingsPatch: (patch) => {

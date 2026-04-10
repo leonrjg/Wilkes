@@ -7,8 +7,6 @@ vi.mock("../services", () => ({
     getSettings: vi.fn(),
     updateSettings: vi.fn(),
     listFiles: vi.fn(),
-    getIndexStatus: vi.fn(),
-    buildIndex: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -26,7 +24,6 @@ describe("useSettingsStore", () => {
       fileList: [],
       filterText: "",
       excluded: new Set(),
-      semanticIndexBuilt: false,
       preferSemantic: false,
       indexing: false,
       theme: "System",
@@ -54,18 +51,6 @@ describe("useSettingsStore", () => {
 
     (api.getSettings as any).mockResolvedValue(mockSettings);
     (api.listFiles as any).mockResolvedValue([{ path: "/path/1/file.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" }]);
-    (api.getIndexStatus as any).mockResolvedValue({
-      indexed_files: 1,
-      total_chunks: 2,
-      built_at: null,
-      build_duration_ms: null,
-      engine: "SBERT",
-      model_id: "model",
-      dimension: 384,
-      root_path: "/path/1",
-      db_size_bytes: null,
-    });
-
     await useSettingsStore.getState().load();
     // Allow the directory-change subscription to resolve its async listFiles call
     await Promise.resolve();
@@ -74,7 +59,7 @@ describe("useSettingsStore", () => {
     expect(state.bookmarks).toEqual(["/path/1"]);
     expect(state.directory).toBe("/path/1");
     expect(state.theme).toBe("Dark");
-    expect(state.semanticIndexBuilt).toBe(true);
+    expect(state.preferSemantic).toBe(true);
     expect(state.fileList.length).toBe(1);
   });
 
@@ -90,8 +75,6 @@ describe("useSettingsStore", () => {
       semantic: { enabled: false, index_path: null },
       supported_extensions: [],
     });
-    (api.getIndexStatus as any).mockRejectedValue(new Error("missing"));
-
     await useSettingsStore.getState().load();
     expect(useSettingsStore.getState().directory).toBe("");
     expect(useSettingsStore.getState().recentDirs).toEqual([]);
@@ -192,42 +175,6 @@ describe("useSettingsStore", () => {
     expect(api.updateSettings).toHaveBeenCalledWith({ search_prefer_semantic: true });
   });
 
-  it("should refresh semantic ready", async () => {
-    useSettingsStore.setState({ directory: "/path/1" });
-    (api.getIndexStatus as any).mockResolvedValue({
-      indexed_files: 1,
-      total_chunks: 2,
-      built_at: null,
-      build_duration_ms: null,
-      engine: "SBERT",
-      model_id: "model",
-      dimension: 384,
-      root_path: "/path/1",
-      db_size_bytes: null,
-    });
-    await useSettingsStore.getState().refreshSemanticReady();
-    expect(useSettingsStore.getState().semanticIndexBuilt).toBe(true);
-  });
-
-  it("should treat an empty index as not ready", async () => {
-    useSettingsStore.setState({ directory: "/path/1", semanticIndexBuilt: true });
-    (api.getIndexStatus as any).mockResolvedValue({
-      indexed_files: 0,
-      total_chunks: 0,
-      built_at: null,
-      build_duration_ms: null,
-      engine: "SBERT",
-      model_id: "model",
-      dimension: 384,
-      root_path: "/path/1",
-      db_size_bytes: null,
-    });
-
-    await useSettingsStore.getState().refreshSemanticReady();
-
-    expect(useSettingsStore.getState().semanticIndexBuilt).toBe(false);
-  });
-
   it("should update filter text", () => {
     useSettingsStore.getState().setFilterText("new filter");
     expect(useSettingsStore.getState().filterText).toBe("new filter");
@@ -256,12 +203,5 @@ describe("useSettingsStore", () => {
 
     useSettingsStore.getState().applySettingsPatch({ theme: "System" });
     expect(useSettingsStore.getState().theme).toBe("System");
-  });
-
-  it("should handle error in refreshSemanticReady", async () => {
-    useSettingsStore.setState({ semanticIndexBuilt: true });
-    (api.getIndexStatus as any).mockRejectedValue(new Error("Failed"));
-    await useSettingsStore.getState().refreshSemanticReady();
-    expect(useSettingsStore.getState().semanticIndexBuilt).toBe(false);
   });
 });

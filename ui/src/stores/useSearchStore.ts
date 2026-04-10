@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { api } from "../services";
+import { isUsableSemanticIndex } from "../lib/semantic";
 import type { FileMatches, MatchRef, PreviewData, SearchQuery, SearchStats } from "../lib/types";
 
 interface SearchStore {
@@ -77,10 +78,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
     if (lastQuery.mode === "Semantic") {
       try {
         const indexStatus = await api.getIndexStatus();
-        const usable =
-          indexStatus.indexed_files > 0 &&
-          indexStatus.total_chunks > 0 &&
-          (!indexStatus.root_path || indexStatus.root_path === lastQuery.root);
+        const usable = isUsableSemanticIndex(indexStatus, lastQuery.root);
         if (!usable) return;
       } catch {
         return;

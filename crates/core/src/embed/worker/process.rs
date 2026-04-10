@@ -40,7 +40,7 @@ pub(super) struct WorkerProcess {
     stdout: BufReader<tokio::process::ChildStdout>,
 }
 
-pub(super) const ROOF_KNOCK_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const ROOF_KNOCK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[cfg(unix)]
 pub(super) fn pid_is_alive(pid: u32) -> bool {
@@ -70,14 +70,15 @@ fn send_signal(pid: u32, signal: i32, label: &str) {
 #[cfg(not(unix))]
 fn send_signal(_pid: u32, _signal: i32, _label: &str) {}
 
-pub(super) fn roof_knock_pid(pid: u32, timeout: Duration, label: &str) {
+pub(super) fn kill_after_timeout(pid: u32, timeout: Duration, label: &str) {
     if pid == 0 {
         return;
     }
 
-    tracing::info!("WorkerProcess::{label}: roof knocking pid {pid}");
-    #[cfg(unix)]
-    send_signal(pid, libc::SIGTERM, label);
+    tracing::info!(
+        "WorkerProcess::{label}: waiting up to {:?} for pid {pid} to exit after EOF",
+        timeout
+    );
 
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
@@ -88,7 +89,9 @@ pub(super) fn roof_knock_pid(pid: u32, timeout: Duration, label: &str) {
     }
 
     if pid_is_alive(pid) {
-        tracing::warn!("WorkerProcess::{label}: pid {pid} ignored SIGTERM, sending SIGKILL");
+        tracing::warn!(
+            "WorkerProcess::{label}: pid {pid} ignored EOF grace period, sending SIGKILL"
+        );
         #[cfg(unix)]
         send_signal(pid, libc::SIGKILL, label);
     }
@@ -220,7 +223,9 @@ impl WorkerProcess {
 
     pub(super) async fn shutdown(&mut self, pid_slot: &AtomicU32) {
         if let Some(pid) = self.child.id() {
-            roof_knock_pid(pid, ROOF_KNOCK_TIMEOUT, "shutdown");
+            tracing::info!("WorkerProcess::shutdown: closing stdin for pid {pid}");
+            drop(self.child.stdin.take());
+            kill_after_timeout(pid, ROOF_KNOCK_TIMEOUT, "shutdown");
         } else {
             drop(self.child.stdin.take());
         }
@@ -670,7 +675,7 @@ exit 0
 
     #[test]
     fn test_roof_knock_pid_zero() {
-        roof_knock_pid(0, Duration::from_millis(1), "test");
+        kill_after_timeout(0, Duration::from_millis(1), "test");
     }
 
     #[tokio::test]
@@ -682,7 +687,7 @@ exit 0
         // In send_request loop:
         // ProtocolReadOutcome::ReadError(message) => { tracing::warn!("{message}"); }
         // So it continues the loop.
-        
+
         write_executable(
             &worker_bin,
             r#"#!/bin/sh

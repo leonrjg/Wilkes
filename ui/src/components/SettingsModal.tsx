@@ -20,7 +20,7 @@ interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   directory: string;
-  refreshSemanticReady: () => Promise<void>;
+  refreshSemanticReady: () => Promise<boolean>;
   onSettingsUpdate?: (patch: Partial<Settings>) => void;
 }
 

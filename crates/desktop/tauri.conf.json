@@ -19,7 +19,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/wilkes-rust-worker"],
+    "externalBin": ["sidecars/wilkes-rust-worker"],
     "resources": {
       "../worker/wilkes_python_worker": "wilkes_python_worker",
       "../worker/requirements.txt": "requirements.txt"

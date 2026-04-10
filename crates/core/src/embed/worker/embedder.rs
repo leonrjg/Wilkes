@@ -211,22 +211,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_embedder_error_path() {
-        use tempfile::tempdir;
         use std::fs;
+        use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let worker_bin = dir.path().join("worker.sh");
-        
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::write(&worker_bin, "#!/bin/sh\nread req\necho '{\"Error\":\"test error\"}'\n").unwrap();
+            fs::write(
+                &worker_bin,
+                "#!/bin/sh\nread req\necho '{\"Error\":\"test error\"}'\n",
+            )
+            .unwrap();
             let mut perms = fs::metadata(&worker_bin).unwrap().permissions();
             perms.set_mode(0o755);
             fs::set_permissions(&worker_bin, perms).unwrap();
         }
         #[cfg(windows)]
         {
-            fs::write(&worker_bin, "@echo off\nset /p req=\necho {\"Error\":\"test error\"}\n").unwrap();
+            fs::write(
+                &worker_bin,
+                "@echo off\nset /p req=\necho {\"Error\":\"test error\"}\n",
+            )
+            .unwrap();
         }
 
         let paths = WorkerPaths {
@@ -251,9 +259,14 @@ mod tests {
         };
 
         let embedder = WorkerEmbedder::new(manager, config);
-        let res = tokio::task::spawn_blocking(move || embedder.embed(&["test"])).await.unwrap();
-        
+        let res = tokio::task::spawn_blocking(move || embedder.embed(&["test"]))
+            .await
+            .unwrap();
+
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("Worker error: test error"));
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Worker error: test error"));
     }
 }

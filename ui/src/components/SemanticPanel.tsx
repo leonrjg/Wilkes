@@ -311,7 +311,7 @@ function ModelList({ models, engine, filter, selectedModelId, activeModelId, siz
 interface Props {
   api: SearchApi;
   directory: string;
-  refreshSemanticReady: () => Promise<void>;
+  refreshSemanticReady: () => Promise<boolean>;
 }
 
 export default function SemanticPanel({ api, directory, refreshSemanticReady }: Props) {

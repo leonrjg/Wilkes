@@ -1411,7 +1411,7 @@ mod tests {
         assert_eq!(q.len(), 1);
         let p = embedder.embed_passages(&["t"]).unwrap();
         assert_eq!(p.len(), 1);
-        
+
         assert_eq!(embedder.model_id(), "m");
         assert_eq!(embedder.dimension(), 3);
         assert_eq!(embedder.preferred_batch_size(), Some(32));
@@ -1425,12 +1425,34 @@ mod tests {
         let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes()).unwrap();
 
         let mut tensors = std::collections::HashMap::new();
-        tensors.insert("embeddings.word_embeddings.weight".to_string(), Tensor::zeros((1, 3), dtype, &device).unwrap());
-        tensors.insert("embeddings.position_embeddings.weight".to_string(), Tensor::zeros((512, 3), dtype, &device).unwrap());
-        tensors.insert("embeddings.token_type_embeddings.weight".to_string(), Tensor::zeros((2, 3), dtype, &device).unwrap());
-        tensors.insert("embeddings.LayerNorm.weight".to_string(), Tensor::ones(3, dtype, &device).unwrap());
-        tensors.insert("embeddings.LayerNorm.bias".to_string(), Tensor::zeros(3, dtype, &device).unwrap());
-        let config = BertConfig { num_hidden_layers: 0, hidden_size: 3, intermediate_size: 3, num_attention_heads: 1, vocab_size: 1, ..BertConfig::default() };
+        tensors.insert(
+            "embeddings.word_embeddings.weight".to_string(),
+            Tensor::zeros((1, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.position_embeddings.weight".to_string(),
+            Tensor::zeros((512, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.token_type_embeddings.weight".to_string(),
+            Tensor::zeros((2, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.LayerNorm.weight".to_string(),
+            Tensor::ones(3, dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.LayerNorm.bias".to_string(),
+            Tensor::zeros(3, dtype, &device).unwrap(),
+        );
+        let config = BertConfig {
+            num_hidden_layers: 0,
+            hidden_size: 3,
+            intermediate_size: 3,
+            num_attention_heads: 1,
+            vocab_size: 1,
+            ..BertConfig::default()
+        };
         let vb = VarBuilder::from_tensors(tensors, dtype, &device);
         let model = BertModel::load(vb, &config).unwrap();
 
@@ -1467,9 +1489,18 @@ mod tests {
     #[test]
     fn test_read_dimension_static_variants() {
         // Test a few from the static list
-        assert_eq!(read_dimension(Path::new("."), "BAAI/bge-base-en-v1.5").unwrap(), 768);
-        assert_eq!(read_dimension(Path::new("."), "sentence-transformers/all-MiniLM-L12-v2").unwrap(), 384);
-        assert_eq!(read_dimension(Path::new("."), "intfloat/multilingual-e5-large-instruct").unwrap(), 1024);
+        assert_eq!(
+            read_dimension(Path::new("."), "BAAI/bge-base-en-v1.5").unwrap(),
+            768
+        );
+        assert_eq!(
+            read_dimension(Path::new("."), "sentence-transformers/all-MiniLM-L12-v2").unwrap(),
+            384
+        );
+        assert_eq!(
+            read_dimension(Path::new("."), "intfloat/multilingual-e5-large-instruct").unwrap(),
+            1024
+        );
     }
 
     #[test]

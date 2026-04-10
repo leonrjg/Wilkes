@@ -3622,7 +3622,9 @@ mod tests {
     async fn test_spawn_download_model_error() {
         let dir = tempdir().unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
-        let emitter = Arc::new(MockEmitter { events: events.clone() });
+        let emitter = Arc::new(MockEmitter {
+            events: events.clone(),
+        });
         let (ctx, _rx, _loop) = AppContext::new(
             dir.path().to_path_buf(),
             dir.path().join("s.json"),
@@ -3630,16 +3632,18 @@ mod tests {
             emitter,
         );
 
-        let plan = DownloadModelPlan { device: "cpu".to_string() };
+        let plan = DownloadModelPlan {
+            device: "cpu".to_string(),
+        };
         let selected = SelectedEmbedder {
             engine: EmbeddingEngine::Candle,
             model: EmbedderModel("invalid".to_string()),
             dimension: 0,
         };
-        
+
         let join = ctx.spawn_download_model_task(plan, selected);
         let _ = join.await;
-        
+
         let events_guard = events.lock().unwrap();
         assert!(events_guard.iter().any(|(name, _)| name == "embed-error"));
     }

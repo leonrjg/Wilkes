@@ -1380,13 +1380,15 @@ mod tests {
         let (events_tx, _) = broadcast::channel(1024);
         let uploads_dir = dir.path().join("u");
         std::fs::create_dir_all(&uploads_dir).unwrap();
-        
+
         let paths = WorkerPaths::resolve(dir.path());
         let (ctx, _, _) = AppContext::new(
             dir.path().to_path_buf(),
             dir.path().join("s.json"),
             paths,
-            Arc::new(BroadcastEmitter { tx: events_tx.clone() }),
+            Arc::new(BroadcastEmitter {
+                tx: events_tx.clone(),
+            }),
         );
         let state = Arc::new(AppState {
             ctx,
@@ -1490,7 +1492,7 @@ mod tests {
         let (events_tx, _) = broadcast::channel(1024);
         let uploads_dir = dir.path().join("u");
         std::fs::create_dir_all(&uploads_dir).unwrap();
-        
+
         let asset_file = uploads_dir.join("test.txt");
         std::fs::write(&asset_file, "data").unwrap();
 
@@ -1500,12 +1502,16 @@ mod tests {
             events_tx,
         });
 
-        let params = AssetQuery { path: asset_file.to_string_lossy().to_string() };
+        let params = AssetQuery {
+            path: asset_file.to_string_lossy().to_string(),
+        };
         let res = asset_handler(State(state.clone()), Query(params)).await;
         assert!(res.is_ok());
 
         // Test open_file_handler
-        let body = OpenFileBody { path: asset_file.to_string_lossy().to_string() };
+        let body = OpenFileBody {
+            path: asset_file.to_string_lossy().to_string(),
+        };
         let res_open = open_file_handler(State(state.clone()), Json(body)).await;
         assert!(res_open.is_ok());
 
@@ -1551,7 +1557,9 @@ mod tests {
             dir.to_path_buf(),
             dir.join("s.json"),
             paths,
-            Arc::new(BroadcastEmitter { tx: broadcast::channel(1).0 }),
+            Arc::new(BroadcastEmitter {
+                tx: broadcast::channel(1).0,
+            }),
         );
         ctx
     }
@@ -1578,7 +1586,9 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join("s.json"),
             paths,
-            Arc::new(BroadcastEmitter { tx: events_tx.clone() }),
+            Arc::new(BroadcastEmitter {
+                tx: events_tx.clone(),
+            }),
         );
         let state = Arc::new(AppState {
             ctx,
@@ -1589,8 +1599,10 @@ mod tests {
         let sse = embed_events_handler(State(state)).await;
         // Verify it returns an Sse response
         let _ = sse.into_response();
-        
+
         // Send an event and see if it doesn't crash
-        events_tx.send(("test".to_string(), serde_json::json!({}))).unwrap();
+        events_tx
+            .send(("test".to_string(), serde_json::json!({})))
+            .unwrap();
     }
 }

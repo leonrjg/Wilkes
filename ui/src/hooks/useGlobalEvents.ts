@@ -1,8 +1,8 @@
 import { useEffect, useRef } from "react";
 import { useToasts } from "../components/Toast";
 import { api } from "../services";
-import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useSemanticStore } from "../stores/useSemanticStore";
 
 export function useGlobalEvents() {
   const { addToast, removeToast } = useToasts();
@@ -33,7 +33,7 @@ export function useGlobalEvents() {
         }
       } else if (payload === "ReindexingDone") {
         closeReindexToast();
-        void useSearchStore.getState().replaySearch();
+        void useSemanticStore.getState().handleIndexUpdated();
       } else if (payload === "ReindexingCancelled") {
         closeReindexToast();
       }

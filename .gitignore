@@ -19,6 +19,7 @@ cobertura.xml
 # Backend
 target/
 build/
+crates/desktop/sidecars/
 **/*.db
 **/wilkes-worker
 **/wilkes-rust-worker

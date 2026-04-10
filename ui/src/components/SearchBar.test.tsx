@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import SearchBar from "./SearchBar";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useSemanticStore } from "../stores/useSemanticStore";
 
 // Mock the components that might be passed as slots
 const MockSourceSlot = () => <div data-testid="source-slot">Source Slot</div>;
@@ -24,10 +25,16 @@ describe("SearchBar", () => {
       supportedExtensions: [],
       fileList: [],
       excluded: new Set(),
-      semanticIndexBuilt: true,
       preferSemantic: false,
       setPreferSemantic: vi.fn(),
     });
+    useSemanticStore.setState({
+      readyForCurrentRoot: true,
+      status: "ready",
+      buildRoot: null,
+      indexStatus: null,
+      error: null,
+    } as any);
   });
 
   afterEach(() => {

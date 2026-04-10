@@ -8,6 +8,7 @@ import UploadZone from "./components/UploadZone";
 import SettingsModal from "./components/SettingsModal";
 import { useToasts } from "./components/Toast";
 import { useSettingsStore } from "./stores/useSettingsStore";
+import { useSemanticStore } from "./stores/useSemanticStore";
 import { useHistory } from "./hooks/useHistory";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
 import { api, source } from "./services";
@@ -25,9 +26,10 @@ export default function App() {
   const addBookmark = useSettingsStore((s) => s.addBookmark);
   const removeBookmark = useSettingsStore((s) => s.removeBookmark);
   const forgetDirectory = useSettingsStore((s) => s.forgetDirectory);
-  const refreshSemanticReady = useSettingsStore((s) => s.refreshSemanticReady);
   const applySettingsPatch = useSettingsStore((s) => s.applySettingsPatch);
   const setIndexing = useSettingsStore((s) => s.setIndexing);
+  const refreshSemanticReady = useSemanticStore((s) => s.refreshCurrentRootStatus);
+  const handleIndexUpdated = useSemanticStore((s) => s.handleIndexUpdated);
 
   const { canGoBack, canGoForward, goBack, goForward, handleMatchClick, handleFileClick } =
     useHistory();
@@ -55,7 +57,7 @@ export default function App() {
         const u2 = await api.onEmbedDone(() => {
           if (mounted) {
             setIndexing(false);
-            refreshSemanticReady();
+            handleIndexUpdated().catch(console.error);
           }
         });
         if (mounted) unlisteners.push(u2);
@@ -82,7 +84,7 @@ export default function App() {
       mounted = false;
       unlisteners.forEach((u) => u());
     };
-  }, [setIndexing]);
+  }, [handleIndexUpdated, setIndexing]);
 
   const handleMouseMove = useCallback((e: MouseEvent) => {
     if (!isResizing.current) return;
