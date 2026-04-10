@@ -783,6 +783,7 @@ impl SemanticIndex {
 
     /// Full build: creates the database at `data_dir`, indexes every path, and
     /// returns the open index.
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         data_dir: &Path,
         root_path: &Path,

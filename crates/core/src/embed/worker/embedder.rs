@@ -171,7 +171,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_embedder_prefixes() {
-        use std::sync::Arc;
         let paths = WorkerPaths {
             python_path: PathBuf::from("p"),
             python_package_dir: PathBuf::from("pkg"),

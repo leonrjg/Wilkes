@@ -974,6 +974,7 @@ mod tests {
     fn test_deserialize_custom_models() {
         #[derive(Deserialize)]
         struct Wrapper {
+            #[allow(dead_code)]
             #[serde(deserialize_with = "deserialize_custom_models")]
             models: Vec<CustomModel>,
         }
@@ -997,6 +998,7 @@ mod tests {
     fn test_deserialize_custom_models_invalid() {
         #[derive(Deserialize)]
         struct Wrapper {
+            #[allow(dead_code)]
             #[serde(deserialize_with = "deserialize_custom_models")]
             models: Vec<CustomModel>,
         }
@@ -1056,6 +1058,7 @@ mod tests {
     fn test_deserialize_custom_models_non_array() {
         #[derive(Deserialize)]
         struct Wrapper {
+            #[allow(dead_code)]
             #[serde(deserialize_with = "deserialize_custom_models")]
             models: Vec<CustomModel>,
         }

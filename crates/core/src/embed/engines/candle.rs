@@ -398,6 +398,7 @@ fn load_pooling_strategy(data_dir: &Path, model_id: &str) -> PoolingStrategy {
 
 // ── Device / dtype selection ──────────────────────────────────────────────────
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn select_device(device: &str) -> Device {
     realize_device(select_device_plan(device))
 }
@@ -406,6 +407,7 @@ fn select_device(device: &str) -> Device {
 /// (layer norm, softmax, GELU), causing silent GPU→CPU→GPU roundtrips that
 /// dominate runtime. F32 has full Metal kernel coverage, keeping all operations
 /// on the GPU. The 2× memory increase is negligible for embedding-sized models.
+#[cfg_attr(not(test), allow(dead_code))]
 fn select_dtype(_device: &Device) -> DType {
     select_dtype_for_plan(&CandleDevicePlan::Cpu)
 }
@@ -418,7 +420,7 @@ fn select_dtype(_device: &Device) -> DType {
 const EMBED_BATCH_SIZE: usize = 32;
 const MAX_SEQUENCE_LENGTH: usize = 512;
 
-enum LoadedModel {
+pub(crate) enum LoadedModel {
     Bert(BertModel),
     JinaBert(JinaBertModel),
     ModernBert(ModernBert),
@@ -1470,6 +1472,7 @@ mod tests {
         assert_eq!(read_dimension(Path::new("."), "intfloat/multilingual-e5-large-instruct").unwrap(), 1024);
     }
 
+    #[test]
     fn test_list_supported_models_cached_size() {
         let dir = tempdir().unwrap();
         let model_id = "BAAI/bge-base-en-v1.5";

@@ -115,7 +115,15 @@ pub fn resolve_python_package_dir() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let exe_dir = exe.parent().unwrap_or(std::path::Path::new(""));
 
+    #[cfg(target_os = "macos")]
     let mut candidates = vec![
+        exe_dir.to_path_buf(),
+        exe_dir.join("_up_").join("worker"),
+        exe_dir.join("worker"),
+    ];
+
+    #[cfg(not(target_os = "macos"))]
+    let candidates = vec![
         exe_dir.to_path_buf(),
         exe_dir.join("_up_").join("worker"),
         exe_dir.join("worker"),
