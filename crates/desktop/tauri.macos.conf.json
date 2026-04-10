@@ -1,5 +1,5 @@
 {
   "build": {
-    "beforeBuildCommand": "node ../../scripts/prepare-sidecar.mjs --release --features fastembed-coreml && npm --prefix ../ui run build"
+    "beforeBuildCommand": "node ../scripts/prepare-sidecar.mjs --release --features fastembed-coreml && npm --prefix ../ui run build"
   }
 }

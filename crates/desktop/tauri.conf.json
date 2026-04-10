@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../../ui/dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "node ../../scripts/prepare-sidecar.mjs && npm --prefix ../ui run dev",
-    "beforeBuildCommand": "node ../../scripts/prepare-sidecar.mjs --release && npm --prefix ../ui run build"
+    "beforeDevCommand": "node ../scripts/prepare-sidecar.mjs && npm --prefix ../ui run dev",
+    "beforeBuildCommand": "node ../scripts/prepare-sidecar.mjs --release && npm --prefix ../ui run build"
   },
   "bundle": {
     "active": true,
