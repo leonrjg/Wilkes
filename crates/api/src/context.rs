@@ -666,7 +666,7 @@ impl AppContext {
                             }
                             Err(e) => {
                                 terminal_event.terminal = Some(TerminalEvent::Cancelled);
-                                ctx.emit_embed_error("Build", e.to_string());
+                                ctx.emit_embed_error("Build", format!("{e:#}"));
                             }
                         }
                         break;
@@ -726,7 +726,7 @@ impl AppContext {
                     }
                 }
                 Err(e) => {
-                    ctx.emit_embed_error("Download", e.to_string());
+                    ctx.emit_embed_error("Download", format!("{e:#}"));
                 }
             }
 
@@ -1263,6 +1263,49 @@ mod tests {
             name == "embed-error"
                 && payload["operation"] == "Build"
                 && payload["message"] == "Worker error"
+        }));
+    }
+
+    #[test]
+    fn test_emit_embed_error_preserves_error_chain() {
+        wilkes_core::logging::clear_logs();
+
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(MockEmitter {
+            events: events.clone(),
+        });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths::resolve(dir.path()),
+            emitter,
+        );
+
+        let err = anyhow::anyhow!("inner worker failure")
+            .context("Fatal embedder error while indexing /tmp/example.md");
+
+        let subscriber = tracing_subscriber::registry().with(wilkes_core::logging::BufferLayer);
+        subscriber::with_default(subscriber, || {
+            ctx.emit_embed_error("Build", format!("{err:#}"));
+        });
+
+        let logs = wilkes_core::logging::get_logs();
+        assert!(logs.iter().any(|line| {
+            line.contains("Build failed: Fatal embedder error while indexing /tmp/example.md")
+        }));
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("inner worker failure")));
+
+        let events_guard = events.lock().unwrap();
+        assert!(events_guard.iter().any(|(name, payload)| {
+            name == "embed-error"
+                && payload["operation"] == "Build"
+                && payload["message"].as_str().is_some_and(|msg| {
+                    msg.contains("Fatal embedder error while indexing /tmp/example.md")
+                        && msg.contains("inner worker failure")
+                })
         }));
     }
 

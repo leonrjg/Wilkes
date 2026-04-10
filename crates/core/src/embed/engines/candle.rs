@@ -34,6 +34,13 @@ struct ModelInfo {
 
 const PREEXISTING_MODELS: &[ModelInfo] = &[
     ModelInfo {
+        model_id: "sentence-transformers/all-MiniLM-L6-v2",
+        display_name: "all-MiniLM-L6-v2",
+        description: "Speed: high, accuracy: medium (English)",
+        dimension: 384,
+        is_recommended: false,
+    },
+    ModelInfo {
         model_id: "BAAI/bge-base-en-v1.5",
         display_name: "bge-base-en-v1.5",
         description: "BGE base English embeddings (768-dim)",
@@ -51,6 +58,41 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
         model_id: "intfloat/multilingual-e5-large-instruct",
         display_name: "multilingual-e5-large-instruct",
         description: "Multilingual instruction-tuned E5 (1024-dim)",
+        dimension: 1024,
+        is_recommended: false,
+    },
+    ModelInfo {
+        model_id: "mixedbread-ai/mxbai-embed-large-v1",
+        display_name: "mxbai-embed-large-v1",
+        description: "Large English embedding model from MixedBread.ai",
+        dimension: 1024,
+        is_recommended: false,
+    },
+    ModelInfo {
+        model_id: "snowflake/snowflake-arctic-embed-xs",
+        display_name: "snowflake-arctic-embed-xs",
+        description: "Snowflake Arctic embed model, xs",
+        dimension: 384,
+        is_recommended: false,
+    },
+    ModelInfo {
+        model_id: "snowflake/snowflake-arctic-embed-s",
+        display_name: "snowflake-arctic-embed-s",
+        description: "Snowflake Arctic embed model, small",
+        dimension: 384,
+        is_recommended: false,
+    },
+    ModelInfo {
+        model_id: "Snowflake/snowflake-arctic-embed-m",
+        display_name: "snowflake-arctic-embed-m",
+        description: "Snowflake Arctic embed model, medium",
+        dimension: 768,
+        is_recommended: false,
+    },
+    ModelInfo {
+        model_id: "snowflake/snowflake-arctic-embed-l",
+        display_name: "snowflake-arctic-embed-l",
+        description: "Snowflake Arctic embed model, large",
         dimension: 1024,
         is_recommended: false,
     },
