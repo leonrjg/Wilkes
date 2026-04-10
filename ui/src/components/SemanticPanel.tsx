@@ -444,7 +444,11 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
             api.getIndexStatus().catch(() => null),
             refreshSettings().catch(() => null),
           ]).then(([idx]) => {
-            dispatch({ type: "op_done", operation: "Build", indexStatus: idx });
+            dispatch({
+              type: "op_done",
+              operation: "Build",
+              indexStatus: idx ?? undefined,
+            });
             refreshSemanticReady();
             setDraftSelected(null);
           });

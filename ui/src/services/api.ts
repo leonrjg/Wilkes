@@ -1,5 +1,4 @@
 import type {
-  EmbedderModel,
   EmbedDone,
   EmbedError,
   EmbedProgress,
