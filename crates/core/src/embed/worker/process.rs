@@ -40,6 +40,60 @@ pub(super) struct WorkerProcess {
     stdout: BufReader<tokio::process::ChildStdout>,
 }
 
+pub(super) const ROOF_KNOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(unix)]
+pub(super) fn pid_is_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    if rc == 0 {
+        true
+    } else {
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        errno == Some(libc::EPERM)
+    }
+}
+
+#[cfg(not(unix))]
+pub(super) fn pid_is_alive(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: i32, label: &str) {
+    let rc = unsafe { libc::kill(pid as i32, signal) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!("WorkerProcess::{label}: failed to signal pid {pid}: {err}");
+    }
+}
+
+#[cfg(not(unix))]
+fn send_signal(_pid: u32, _signal: i32, _label: &str) {}
+
+pub(super) fn roof_knock_pid(pid: u32, timeout: Duration, label: &str) {
+    if pid == 0 {
+        return;
+    }
+
+    tracing::info!("WorkerProcess::{label}: roof knocking pid {pid}");
+    #[cfg(unix)]
+    send_signal(pid, libc::SIGTERM, label);
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if !pid_is_alive(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    if pid_is_alive(pid) {
+        tracing::warn!("WorkerProcess::{label}: pid {pid} ignored SIGTERM, sending SIGKILL");
+        #[cfg(unix)]
+        send_signal(pid, libc::SIGKILL, label);
+    }
+}
+
 async fn build_command_plan(
     paths: &WorkerPaths,
     req: &WorkerRequest,
@@ -165,8 +219,12 @@ impl WorkerProcess {
     }
 
     pub(super) async fn shutdown(&mut self, pid_slot: &AtomicU32) {
-        drop(self.child.stdin.take());
-        if timeout(Duration::from_secs(2), self.child.wait())
+        if let Some(pid) = self.child.id() {
+            roof_knock_pid(pid, ROOF_KNOCK_TIMEOUT, "shutdown");
+        } else {
+            drop(self.child.stdin.take());
+        }
+        if timeout(ROOF_KNOCK_TIMEOUT, self.child.wait())
             .await
             .is_err()
         {

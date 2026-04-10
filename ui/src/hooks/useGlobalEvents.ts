@@ -9,8 +9,15 @@ export function useGlobalEvents() {
   const reindexToastId = useRef<string | null>(null);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    let managerUnlisten: (() => void) | undefined;
     let mounted = true;
+
+    const closeReindexToast = () => {
+      if (reindexToastId.current) {
+        removeToast(reindexToastId.current);
+        reindexToastId.current = null;
+      }
+    };
 
     api.onManagerEvent((payload) => {
       if (!mounted) return;
@@ -25,23 +32,22 @@ export function useGlobalEvents() {
           );
         }
       } else if (payload === "ReindexingDone") {
-        if (reindexToastId.current) {
-          removeToast(reindexToastId.current);
-          reindexToastId.current = null;
-        }
-        useSearchStore.getState().replaySearch();
+        closeReindexToast();
+        void useSearchStore.getState().replaySearch();
+      } else if (payload === "ReindexingCancelled") {
+        closeReindexToast();
       }
     }).then((u) => {
       if (!mounted) {
         u();
       } else {
-        unlisten = u;
+        managerUnlisten = u;
       }
     });
 
     return () => {
       mounted = false;
-      if (unlisten) unlisten();
+      if (managerUnlisten) managerUnlisten();
     };
   }, [addToast, removeToast]);
 }

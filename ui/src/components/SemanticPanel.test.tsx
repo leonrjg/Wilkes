@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import SemanticPanel from "./SemanticPanel";
+import { useSettingsStore } from "../stores/useSettingsStore";
 
 describe("SemanticPanel", () => {
   let progressHandler: any;
@@ -28,7 +29,7 @@ describe("SemanticPanel", () => {
     onManagerEvent: vi.fn().mockImplementation(() => {
       return Promise.resolve(() => {});
     }),
-    updateSettings: vi.fn().mockResolvedValue(undefined),
+    updateSettings: vi.fn(),
     downloadModel: vi.fn().mockResolvedValue(undefined),
     buildIndex: vi.fn().mockResolvedValue(undefined),
     deleteIndex: vi.fn().mockResolvedValue(undefined),
@@ -38,6 +39,16 @@ describe("SemanticPanel", () => {
   } as any;
 
   const defaultSettings = {
+    bookmarked_dirs: [],
+    recent_dirs: [],
+    last_directory: null,
+    respect_gitignore: true,
+    max_file_size: 10 * 1024 * 1024,
+    context_lines: 2,
+    theme: "System",
+    search_prefer_semantic: false,
+    supported_extensions: [],
+    max_results: 50,
     semantic: {
       enabled: false,
       selected: {
@@ -52,6 +63,24 @@ describe("SemanticPanel", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    useSettingsStore.setState({
+      bookmarks: [],
+      recentDirs: [],
+      directory: "",
+      semantic: null,
+      respectGitignore: true,
+      maxFileSize: 10 * 1024 * 1024,
+      contextLines: 2,
+      supportedExtensions: [],
+      fileList: [],
+      filterText: "",
+      excluded: new Set(),
+      semanticIndexBuilt: false,
+      preferSemantic: false,
+      indexing: false,
+      theme: "System",
+      maxResults: 50,
+    });
     mockApi.getSettings.mockResolvedValue(defaultSettings);
     mockApi.getSupportedEngines.mockResolvedValue(["SBERT", "Candle"]);
     mockApi.listModels.mockResolvedValue([
@@ -61,6 +90,11 @@ describe("SemanticPanel", () => {
     mockApi.getPythonInfo.mockResolvedValue("/usr/bin/python3");
     mockApi.getLogs.mockResolvedValue([]);
     mockApi.getModelSize.mockResolvedValue(1024 * 1024 * 100);
+    mockApi.updateSettings.mockImplementation(async (patch: any) => ({
+      ...defaultSettings,
+      ...patch,
+      semantic: patch.semantic ?? defaultSettings.semantic,
+    }));
   });
 
   it("renders correctly and loads data", async () => {
@@ -69,6 +103,37 @@ describe("SemanticPanel", () => {
     });
     expect(screen.getByText("SBERT")).toBeInTheDocument();
     expect(screen.getByText("Initial")).toBeInTheDocument();
+  });
+
+  it("clears cancelling state after cancel succeeds", async () => {
+    mockApi.getIndexStatus.mockResolvedValue({
+      indexed_files: 0,
+      total_chunks: 0,
+      engine: "Candle",
+      model_id: "initial-id",
+      dimension: 384,
+      root_path: null,
+      built_at: null,
+      build_duration_ms: null,
+      db_size_bytes: null,
+    });
+
+    await act(async () => {
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+    });
+
+    act(() => {
+      progressHandler({ Build: { files_processed: 1, total_files: 10, message: "Indexing", done: false } });
+    });
+
+    const cancelButton = screen.getByRole("button", { name: /cancel build/i });
+    await act(async () => {
+      fireEvent.click(cancelButton);
+    });
+
+    expect(mockApi.cancelEmbed).toHaveBeenCalled();
+    expect(screen.queryByText("Cancelling…")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /build semantic index/i })).toBeInTheDocument();
   });
 
   it("switches to Candle engine", async () => {

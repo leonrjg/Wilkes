@@ -14,7 +14,7 @@ interface SearchStore {
   lastQuery: SearchQuery | null;
 
   search: (query: SearchQuery) => Promise<void>;
-  replaySearch: () => void;
+  replaySearch: () => Promise<void>;
   setHasQuery: (hasQuery: boolean) => void;
   selectMatch: (matchRef: MatchRef) => void;
   clearPreview: () => void;
@@ -70,9 +70,24 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
     }
   },
 
-  replaySearch: () => {
+  replaySearch: async () => {
     const { lastQuery, search } = get();
-    if (lastQuery) search(lastQuery);
+    if (!lastQuery) return;
+
+    if (lastQuery.mode === "Semantic") {
+      try {
+        const indexStatus = await api.getIndexStatus();
+        const usable =
+          indexStatus.indexed_files > 0 &&
+          indexStatus.total_chunks > 0 &&
+          (!indexStatus.root_path || indexStatus.root_path === lastQuery.root);
+        if (!usable) return;
+      } catch {
+        return;
+      }
+    }
+
+    await search(lastQuery);
   },
 
   setHasQuery: (hasQuery: boolean) => set({ hasQuery }),

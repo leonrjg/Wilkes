@@ -127,7 +127,15 @@ impl IndexWatcher {
 
         let thread = std::thread::spawn(move || {
             for result in &rx_events {
-                process_watcher_result(result, &index, &extractors, &embedder, &config, &on_reindex, &on_reindex_done);
+                process_watcher_result(
+                    result,
+                    &index,
+                    &extractors,
+                    &embedder,
+                    &config,
+                    &on_reindex,
+                    &on_reindex_done,
+                );
             }
         });
 
@@ -501,7 +509,11 @@ mod tests {
 
     #[test]
     fn test_try_open_exclusive_zero_attempts_returns_ok() {
-        let res = try_open_exclusive(std::path::Path::new("/definitely/missing"), 0, Duration::from_millis(1));
+        let res = try_open_exclusive(
+            std::path::Path::new("/definitely/missing"),
+            0,
+            Duration::from_millis(1),
+        );
         assert!(res.is_ok());
     }
 

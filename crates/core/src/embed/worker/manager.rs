@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 use super::ipc::{WorkerEvent, WorkerRequest};
+use super::process::{roof_knock_pid, ROOF_KNOCK_TIMEOUT};
 use super::runtime::supervised_manager_loop;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -12,6 +14,9 @@ pub struct WorkerStatus {
     pub active: bool,
     pub engine: Option<String>,
     pub model: Option<String>,
+    pub device: Option<String>,
+    pub request_mode: Option<String>,
+    pub pid: Option<u32>,
     pub timeout_secs: u64,
 }
 
@@ -58,7 +63,7 @@ pub enum ManagerCommand {
         req: Box<WorkerRequest>,
         reply: mpsc::Sender<WorkerEvent>,
     },
-    KillWorker,
+    ShutdownWorker,
     SetTimeout(u64),
 }
 
@@ -94,6 +99,9 @@ impl WorkerManager {
             active: false,
             engine: None,
             model: None,
+            device: None,
+            request_mode: None,
+            pid: None,
             timeout_secs: 300,
         }));
         let sender: SenderSlot = Arc::new(std::sync::Mutex::new(tx));
@@ -142,16 +150,22 @@ impl WorkerManager {
         self.sender.lock().unwrap().blocking_send(cmd)
     }
 
-    /// Kill the active worker process immediately via SIGKILL.
-    /// Bypasses the manager loop - goes straight to the OS.
-    pub fn kill_active(&self) {
-        let pid = self.active_pid.swap(0, Ordering::Relaxed);
+    pub fn request_shutdown(&self) {
+        let _ = self.try_send(ManagerCommand::ShutdownWorker);
+        self.roof_knock_active(ROOF_KNOCK_TIMEOUT);
+    }
+
+    pub fn roof_knock_active(&self, timeout: Duration) {
+        let pid = self.active_pid.load(Ordering::Relaxed);
         if pid != 0 {
-            tracing::info!("WorkerManager::kill_active: sending SIGKILL to pid {pid}");
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
-            }
+            let active_pid = Arc::clone(&self.active_pid);
+            std::thread::spawn(move || {
+                roof_knock_pid(pid, timeout, "request_shutdown");
+                if !super::process::pid_is_alive(pid) {
+                    let _ =
+                        active_pid.compare_exchange(pid, 0, Ordering::Relaxed, Ordering::Relaxed);
+                }
+            });
         }
     }
 }
@@ -237,7 +251,7 @@ mod tests {
         let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
         let _loop_handle = tokio::spawn(loop_fut);
 
-        manager.kill_active();
+        manager.request_shutdown();
     }
 
     #[tokio::test]
@@ -254,7 +268,7 @@ mod tests {
         let _loop_handle = tokio::spawn(loop_fut);
 
         manager.send(ManagerCommand::SetTimeout(100)).await.unwrap();
-        manager.send(ManagerCommand::KillWorker).await.unwrap();
+        manager.send(ManagerCommand::ShutdownWorker).await.unwrap();
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 

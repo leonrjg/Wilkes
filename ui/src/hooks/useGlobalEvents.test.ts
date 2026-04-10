@@ -31,7 +31,7 @@ vi.mock("../stores/useSettingsStore", () => ({
 describe("useGlobalEvents", () => {
   const addToast = vi.fn().mockReturnValue("toast-id");
   const removeToast = vi.fn();
-  const replaySearch = vi.fn();
+  const replaySearch = vi.fn().mockResolvedValue(undefined);
   const refreshFileList = vi.fn();
 
   beforeEach(() => {
@@ -86,5 +86,30 @@ describe("useGlobalEvents", () => {
     });
     expect(removeToast).toHaveBeenCalledWith("toast-id");
     expect(replaySearch).toHaveBeenCalled();
+  });
+
+  it("closes the reindex toast when reindexing is cancelled", async () => {
+    let managerHandler: any;
+    (api.onManagerEvent as any).mockImplementation((h: any) => {
+      managerHandler = h;
+      return Promise.resolve(vi.fn());
+    });
+
+    renderHook(() => useGlobalEvents());
+
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 0));
+    });
+
+    act(() => {
+      managerHandler("Reindexing");
+    });
+
+    act(() => {
+      managerHandler("ReindexingCancelled");
+    });
+
+    expect(removeToast).toHaveBeenCalledWith("toast-id");
+    expect(replaySearch).not.toHaveBeenCalled();
   });
 });

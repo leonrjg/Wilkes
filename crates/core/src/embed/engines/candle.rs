@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(feature = "candle-metal")]
+#[cfg(target_os = "macos")]
 use tracing::warn;
 use tracing::{debug, info};
 
@@ -149,12 +149,15 @@ pub fn realize_device(plan: CandleDevicePlan) -> Device {
     match plan {
         CandleDevicePlan::Cpu => Device::Cpu,
         CandleDevicePlan::MetalPreferred => {
-            #[cfg(feature = "candle-metal")]
+            #[cfg(target_os = "macos")]
             {
                 if candle_core::utils::metal_is_available() {
-                    match Device::new_metal(0) {
-                        Ok(d) => return d,
-                        Err(e) => warn!("Metal device init failed ({e:#}), falling back to CPU"),
+                    match std::panic::catch_unwind(|| Device::new_metal(0)) {
+                        Ok(Ok(d)) => return d,
+                        Ok(Err(e)) => {
+                            warn!("Metal device init failed ({e:#}), falling back to CPU")
+                        }
+                        Err(_) => warn!("Metal device init panicked, falling back to CPU"),
                     }
                 }
             }
@@ -930,7 +933,7 @@ mod tests {
     #[test]
     fn test_select_device() {
         assert!(matches!(select_device("cpu"), Device::Cpu));
-        // On non-metal systems or without feature, it should fallback to Cpu
+        // On systems without a usable Metal device, it should fallback to Cpu.
         assert!(matches!(
             select_device("metal"),
             Device::Cpu | Device::Metal(_)
@@ -1467,9 +1470,9 @@ mod tests {
         assert!(matches!(realize_device(CandleDevicePlan::Cpu), Device::Cpu));
 
         let metal = realize_device(CandleDevicePlan::MetalPreferred);
-        #[cfg(not(feature = "candle-metal"))]
+        #[cfg(not(target_os = "macos"))]
         assert!(matches!(metal, Device::Cpu));
-        #[cfg(feature = "candle-metal")]
+        #[cfg(target_os = "macos")]
         assert!(matches!(metal, Device::Cpu | Device::Metal(_)));
     }
 

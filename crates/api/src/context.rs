@@ -596,15 +596,33 @@ impl AppContext {
         let cancel_for_task = cancel.clone();
 
         tokio::spawn(async move {
-            // Always emit ReindexingDone when this task exits.
-            struct DoneGuard(Arc<dyn EventEmitter>);
-            impl Drop for DoneGuard {
+            enum TerminalEvent {
+                Done,
+                Cancelled,
+            }
+
+            struct TerminalEventGuard {
+                events: Arc<dyn EventEmitter>,
+                terminal: Option<TerminalEvent>,
+            }
+
+            impl Drop for TerminalEventGuard {
                 fn drop(&mut self) {
-                    self.0
-                        .emit("manager-event", serde_json::json!("ReindexingDone"));
+                    let Some(event) = self.terminal.take() else {
+                        return;
+                    };
+                    let name = match event {
+                        TerminalEvent::Done => "ReindexingDone",
+                        TerminalEvent::Cancelled => "ReindexingCancelled",
+                    };
+                    self.events.emit("manager-event", serde_json::json!(name));
                 }
             }
-            let _guard = DoneGuard(Arc::clone(&ctx.events));
+
+            let mut terminal_event = TerminalEventGuard {
+                events: Arc::clone(&ctx.events),
+                terminal: None,
+            };
 
             let options = Self::build_index_options(
                 manager.clone(),
@@ -628,6 +646,7 @@ impl AppContext {
                     _ = cancel_for_task.cancelled() => {
                         cancel_flag.store(true, Ordering::Relaxed);
                         Self::cleanup_partial_index_files(&data_dir);
+                        terminal_event.terminal = Some(TerminalEvent::Cancelled);
                         ctx.emit_embed_error("Build", "");
                         return Ok(());
                     }
@@ -640,6 +659,8 @@ impl AppContext {
                                     .await
                                 {
                                     ctx.emit_embed_error("Build", err);
+                                } else {
+                                    terminal_event.terminal = Some(TerminalEvent::Done);
                                 }
                             }
                             Err(e) => {
@@ -745,12 +766,21 @@ impl AppContext {
     // ── Embed lifecycle ───────────────────────────────────────────────────────
 
     pub fn cancel_embed(&self) {
-        self.worker_manager.kill_active();
+        self.worker_manager.request_shutdown();
         if let Some(task) = self.embed_task.lock().take() {
             task.cancel_flag.store(true, Ordering::Relaxed);
             task.cancel.cancel();
-            self.emit_embed_error(task.operation.as_str(), "");
-            task.join.abort();
+            match task.operation {
+                EmbedOperation::Build => {
+                    // Let the build task observe the cancellation token and run its own
+                    // cleanup path instead of aborting it mid-flight. Aborting here can
+                    // leave the blocking index build running without a chance to stop.
+                }
+                EmbedOperation::Download => {
+                    self.emit_embed_error(task.operation.as_str(), "");
+                    task.join.abort();
+                }
+            }
         }
     }
 
@@ -787,8 +817,7 @@ impl AppContext {
     }
 
     pub fn kill_worker(&self) {
-        self.worker_manager.kill_active();
-        let _ = self.worker_manager.try_send(ManagerCommand::KillWorker);
+        self.worker_manager.request_shutdown();
     }
 
     pub async fn set_worker_timeout(&self, secs: u64) -> anyhow::Result<()> {
@@ -2014,7 +2043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spawn_build_index_task_cancellation_cleans_up_and_emits_done() {
+    async fn test_spawn_build_index_task_cancellation_cleans_up_without_emitting_done() {
         let dir = tempdir().unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         let emitter = Arc::new(MockEmitter {
@@ -2066,11 +2095,11 @@ mod tests {
         assert!(events.iter().any(|(name, payload)| {
             name == "embed-error" && payload["operation"] == "Build" && payload["message"] == ""
         }));
-        assert!(
-            events
-                .iter()
-                .any(|(name, payload)| name == "manager-event" && payload == &serde_json::json!("ReindexingDone"))
-        );
+        assert!(events.iter().any(|(name, payload)| {
+            name == "manager-event" && payload == &serde_json::json!("ReindexingCancelled")
+        }));
+        assert!(events.iter().all(|(name, payload)| name != "manager-event"
+            || payload != &serde_json::json!("ReindexingDone")));
     }
 
     #[tokio::test]

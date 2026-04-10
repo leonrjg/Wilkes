@@ -101,6 +101,18 @@ export default function WorkersPanel({ api, settings, onUpdateSettings }: Worker
                     <span className="text-[var(--text-muted)] block mb-1">Model</span>
                     <span className="text-[var(--text-main)] font-mono text-[10px]">{status.model || "Unknown"}</span>
                   </div>
+                  <div>
+                    <span className="text-[var(--text-muted)] block mb-1">Device</span>
+                    <span className="text-[var(--text-main)]">{status.device || "Unknown"}</span>
+                  </div>
+                  <div>
+                    <span className="text-[var(--text-muted)] block mb-1">Request</span>
+                    <span className="text-[var(--text-main)] font-mono text-[10px]">{status.request_mode || "Unknown"}</span>
+                  </div>
+                  <div>
+                    <span className="text-[var(--text-muted)] block mb-1">PID</span>
+                    <span className="text-[var(--text-main)] font-mono text-[10px]">{status.pid ?? "Unknown"}</span>
+                  </div>
                 </div>
               )}
             </div>

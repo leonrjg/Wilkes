@@ -64,7 +64,9 @@ export default function App() {
         const u3 = await api.onEmbedError((err) => {
           if (mounted) {
             setIndexing(false);
-            addToast(`${err.operation} failed: ${err.message}`, { type: "error" });
+            if (err.message) {
+              addToast(`${err.operation} failed: ${err.message}`, { type: "error" });
+            }
           }
         });
         if (mounted) unlisteners.push(u3);
@@ -186,4 +188,3 @@ export default function App() {
     </div>
   );
 }
-

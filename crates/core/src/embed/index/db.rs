@@ -410,8 +410,8 @@ mod tests {
     #[test]
     fn test_query_skips_unknown_origin_types() {
         let dir = tempdir().unwrap();
-        let mut idx = SemanticIndex::create(dir.path(), "m", 1, EmbeddingEngine::Candle, None)
-            .unwrap();
+        let mut idx =
+            SemanticIndex::create(dir.path(), "m", 1, EmbeddingEngine::Candle, None).unwrap();
 
         let path = dir.path().join("mystery.txt");
         let prepared = PreparedFile {

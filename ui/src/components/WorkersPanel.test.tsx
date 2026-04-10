@@ -24,6 +24,10 @@ describe("WorkersPanel", () => {
       active: true,
       engine: "SBERT",
       model: "test-model",
+      device: "cpu",
+      request_mode: "embed",
+      pid: 1234,
+      timeout_secs: 300,
     });
   });
 
@@ -38,6 +42,9 @@ describe("WorkersPanel", () => {
     
     expect(screen.getByText("Active")).toBeInTheDocument();
     expect(screen.getByText("SBERT")).toBeInTheDocument();
+    expect(screen.getByText("cpu")).toBeInTheDocument();
+    expect(screen.getByText("embed")).toBeInTheDocument();
+    expect(screen.getByText("1234")).toBeInTheDocument();
   });
 
   it("kills worker", async () => {

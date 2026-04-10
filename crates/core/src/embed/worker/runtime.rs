@@ -101,6 +101,9 @@ fn reset_worker_status(status: &Arc<RwLock<WorkerStatus>>) {
         current.active = false;
         current.engine = None;
         current.model = None;
+        current.device = None;
+        current.request_mode = None;
+        current.pid = None;
     }
 }
 
@@ -217,9 +220,9 @@ impl WorkerRuntime {
 
     async fn handle_command(&mut self, cmd: ManagerCommand) {
         match cmd {
-            ManagerCommand::KillWorker => {
+            ManagerCommand::ShutdownWorker => {
                 if self.active_process.is_some() {
-                    tracing::info!("WorkerManager: Killing worker process per user request.");
+                    tracing::info!("WorkerManager: roof knocking worker process per user request.");
                     self.clear_active_worker().await;
                 }
             }
@@ -310,7 +313,7 @@ impl WorkerRuntime {
                 self.active_engine = Some(req.engine);
                 self.active_model = Some(req.model.clone());
                 self.active_device = Some(req.device.clone());
-                self.update_status_active(req.engine, &req.model);
+                self.update_status_active(req.engine, &req.model, &req.device, &req.mode);
                 Ok(())
             }
             Err(e) => {
@@ -337,7 +340,7 @@ impl WorkerRuntime {
             );
             self.active_model = Some(req.model.clone());
             self.active_device = Some(req.device.clone());
-            self.update_status_active(req.engine, &req.model);
+            self.update_status_active(req.engine, &req.model, &req.device, &req.mode);
         }
     }
 
@@ -351,11 +354,21 @@ impl WorkerRuntime {
         self.update_status_idle();
     }
 
-    fn update_status_active(&self, engine: EmbeddingEngine, model: &str) {
+    fn update_status_active(
+        &self,
+        engine: EmbeddingEngine,
+        model: &str,
+        device: &str,
+        request_mode: &str,
+    ) {
         if let Ok(mut status) = self.status.write() {
             status.active = true;
             status.engine = Some(engine.as_str().to_string());
             status.model = Some(model.to_string());
+            status.device = Some(device.to_string());
+            status.request_mode = Some(request_mode.to_string());
+            let pid = self.active_pid.load(Ordering::Relaxed);
+            status.pid = if pid == 0 { None } else { Some(pid) };
         }
     }
 
@@ -364,6 +377,9 @@ impl WorkerRuntime {
             status.active = false;
             status.engine = None;
             status.model = None;
+            status.device = None;
+            status.request_mode = None;
+            status.pid = None;
         }
     }
 
@@ -455,6 +471,9 @@ mod tests {
             active: false,
             engine: None,
             model: None,
+            device: None,
+            request_mode: None,
+            pid: None,
             timeout_secs: 300,
         }));
         let spawn_calls = Arc::new(AtomicUsize::new(0));
@@ -501,6 +520,9 @@ mod tests {
             active: true,
             engine: Some("candle".to_string()),
             model: Some("model-a".to_string()),
+            device: Some("cpu".to_string()),
+            request_mode: Some("embed".to_string()),
+            pid: Some(44),
             timeout_secs: 300,
         }));
         let (old_tx, _old_rx) = mpsc::channel(1);
@@ -522,6 +544,9 @@ mod tests {
             active: true,
             engine: Some("candle".to_string()),
             model: Some("model-a".to_string()),
+            device: Some("cpu".to_string()),
+            request_mode: Some("embed".to_string()),
+            pid: Some(12),
             timeout_secs: 300,
         }));
         let (old_tx, _old_rx) = mpsc::channel(1);
@@ -588,7 +613,7 @@ mod tests {
         runtime.active_model = Some("model-a".to_string());
         runtime.active_device = Some("cpu".to_string());
 
-        runtime.handle_command(ManagerCommand::KillWorker).await;
+        runtime.handle_command(ManagerCommand::ShutdownWorker).await;
 
         assert_eq!(shutdown_calls.load(Ordering::Relaxed), 1);
         assert!(runtime.active_process.is_none());
@@ -665,6 +690,9 @@ mod tests {
             active: false,
             engine: None,
             model: None,
+            device: None,
+            request_mode: None,
+            pid: None,
             timeout_secs: 300,
         }));
         let spawn_calls = Arc::new(AtomicUsize::new(0));
@@ -804,6 +832,9 @@ mod tests {
             active: false,
             engine: None,
             model: None,
+            device: None,
+            request_mode: None,
+            pid: None,
             timeout_secs: 300,
         }));
         let spawn_calls = Arc::new(AtomicUsize::new(0));

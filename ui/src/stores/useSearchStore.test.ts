@@ -8,6 +8,7 @@ vi.mock("../services", () => ({
     search: vi.fn(),
     cancelSearch: vi.fn(),
     preview: vi.fn(),
+    getIndexStatus: vi.fn(),
   },
 }));
 
@@ -151,6 +152,40 @@ describe("useSearchStore", () => {
     useSearchStore.setState({ search: searchMock });
 
     await useSearchStore.getState().replaySearch();
+    expect(searchMock).toHaveBeenCalledWith(mockQuery);
+  });
+
+  it("should skip replaying semantic search when the index is unusable", async () => {
+    const mockQuery: SearchQuery = { pattern: "replay", mode: "Semantic", root: "/other" } as any;
+    useSearchStore.setState({ lastQuery: mockQuery });
+
+    const searchMock = vi.fn();
+    useSearchStore.setState({ search: searchMock });
+    (api.getIndexStatus as any).mockResolvedValue({
+      indexed_files: 10,
+      total_chunks: 20,
+      root_path: "/indexed",
+    });
+
+    await useSearchStore.getState().replaySearch();
+
+    expect(searchMock).not.toHaveBeenCalled();
+  });
+
+  it("should replay semantic search when the index matches the query root", async () => {
+    const mockQuery: SearchQuery = { pattern: "replay", mode: "Semantic", root: "/indexed" } as any;
+    useSearchStore.setState({ lastQuery: mockQuery });
+
+    const searchMock = vi.fn().mockResolvedValue(undefined);
+    useSearchStore.setState({ search: searchMock });
+    (api.getIndexStatus as any).mockResolvedValue({
+      indexed_files: 10,
+      total_chunks: 20,
+      root_path: "/indexed",
+    });
+
+    await useSearchStore.getState().replaySearch();
+
     expect(searchMock).toHaveBeenCalledWith(mockQuery);
   });
 

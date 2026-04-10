@@ -568,9 +568,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let query_clone = query.clone();
 
-        let handle = std::thread::spawn(move || {
-            provider.search(&query_clone, &extractors, tx).unwrap()
-        });
+        let handle =
+            std::thread::spawn(move || provider.search(&query_clone, &extractors, tx).unwrap());
 
         assert!(rx.blocking_recv().is_none());
         let errors = handle.join().unwrap();

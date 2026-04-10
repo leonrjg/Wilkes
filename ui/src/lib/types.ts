@@ -141,6 +141,9 @@ export interface WorkerStatus {
   active: boolean;
   engine: string | null;
   model: string | null;
+  device: string | null;
+  request_mode: string | null;
+  pid: number | null;
   timeout_secs: number;
 }
 

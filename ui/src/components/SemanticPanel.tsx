@@ -12,6 +12,7 @@ import {
   type EmbeddingEngine,
 } from "../lib/types";
 import type { SearchApi } from "../services/api";
+import { useSettingsStore } from "../stores/useSettingsStore";
 import LogsPanel from "./LogsPanel";
 import {CornerLeftDown, CornerRightUp} from "react-feather";
 
@@ -32,7 +33,6 @@ interface PendingBuild {
 }
 
 interface PanelState {
-  settings: SemanticSettings | null;
   /** Models returned by the backend — only valid for the current engine. */
   backendModels: ModelDescriptor[];
   /** Engine the backendModels were fetched for. Used to reject stale loads. */
@@ -51,7 +51,6 @@ interface PanelState {
 }
 
 const INITIAL_STATE: PanelState = {
-  settings: null,
   backendModels: [],
   modelsEngine: null,
   indexStatus: null,
@@ -68,8 +67,7 @@ const INITIAL_STATE: PanelState = {
 };
 
 type Action =
-  | { type: "init_loaded"; settings: SemanticSettings; supportedEngines: EmbeddingEngine[] }
-  | { type: "settings_updated"; settings: SemanticSettings }
+  | { type: "init_loaded"; supportedEngines: EmbeddingEngine[] }
   | { type: "models_loaded"; models: ModelDescriptor[]; engine: EmbeddingEngine }
   | { type: "models_failed"; engine: EmbeddingEngine; error: string }
   | { type: "index_loaded"; indexStatus: IndexStatus | null }
@@ -79,6 +77,7 @@ type Action =
   | { type: "op_done"; operation: string; indexStatus?: IndexStatus }
   | { type: "op_error"; message: string; operation: string }
   | { type: "cancel_started" }
+  | { type: "cancel_completed" }
   | { type: "cancel_failed" }
   | { type: "index_deleted" }
   | { type: "python_info"; pythonPath: string | null; pythonError: string | null }
@@ -90,9 +89,7 @@ type Action =
 function reducer(state: PanelState, action: Action): PanelState {
   switch (action.type) {
     case "init_loaded":
-      return { ...state, settings: action.settings, supportedEngines: action.supportedEngines };
-    case "settings_updated":
-      return { ...state, settings: action.settings };
+      return { ...state, supportedEngines: action.supportedEngines };
     case "models_loaded":
       return { ...state, backendModels: action.models, modelsEngine: action.engine, isEngineAvailable: true, error: null };
     case "models_failed":
@@ -128,6 +125,16 @@ function reducer(state: PanelState, action: Action): PanelState {
       };
     case "cancel_started":
       return { ...state, isCancelling: true, pendingBuild: null, buildRequest: null };
+    case "cancel_completed":
+      return {
+        ...state,
+        activeOp: null,
+        progress: null,
+        isCancelling: false,
+        error: null,
+        pendingBuild: null,
+        buildRequest: null,
+      };
     case "cancel_failed":
       return { ...state, isCancelling: false };
     case "index_deleted":
@@ -167,11 +174,10 @@ function reducer(state: PanelState, action: Action): PanelState {
 
 type Phase = "not_downloaded" | "downloading" | "ready" | "building" | "indexed" | "engine_mismatch";
 
-function derivePhase(state: PanelState): Phase {
+function derivePhase(state: PanelState, sem: SemanticSettings | null): Phase {
   if (state.activeOp === "downloading") return "downloading";
   if (state.activeOp === "building") return "building";
 
-  const sem = state.settings;
   if (state.indexStatus && sem) {
     if (
       state.indexStatus.engine !== sem.selected.engine ||
@@ -319,15 +325,16 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   const [showAdvanced, setShowAdvanced] = useState(false);
   // Bumped to re-trigger model + index fetches after async ops (download, build, etc.)
   const [fetchEpoch, setFetchEpoch] = useState(0);
+  const settings = useSettingsStore((s) => s.semantic);
+  const replaceSettings = useSettingsStore((s) => s.replaceSettings);
+  const refreshSettings = useSettingsStore((s) => s.refreshSettings);
 
-  const { settings, indexStatus, isEngineAvailable, backendModels, supportedEngines, pendingBuild, buildRequest } = state;
+  const { indexStatus, isEngineAvailable, backendModels, supportedEngines, pendingBuild, buildRequest } = state;
   const effectiveSelected = draftSelected ?? settings?.selected;
-  const phase = derivePhase({
-    ...state,
-    settings: state.settings && effectiveSelected
-      ? { ...state.settings, selected: effectiveSelected }
-      : null,
-  });
+  const effectiveSemantic = settings && effectiveSelected
+    ? { ...settings, selected: effectiveSelected }
+    : settings;
+  const phase = derivePhase(state, effectiveSemantic);
   const isActive = phase === "downloading" || phase === "building";
   const currentEngine = effectiveSelected?.engine;
 
@@ -350,12 +357,13 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       api.getSupportedEngines().catch(() => ["SBERT"] as EmbeddingEngine[]),
     ]).then(([s, engines]) => {
       if (!cancelled) {
-        dispatch({ type: "init_loaded", settings: s.semantic, supportedEngines: engines });
+        replaceSettings(s);
+        dispatch({ type: "init_loaded", supportedEngines: engines });
         setDraftSelected(null);
       }
     });
     return () => { cancelled = true; };
-  }, [api]);
+  }, [api, replaceSettings]);
 
   // ---------------------------------------------------------------------------
   // Effect: fetch models when engine changes (or after invalidate)
@@ -432,12 +440,11 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
           if (pendingBuild) dispatch({ type: "launch_pending_build" });
           else dispatch({ type: "op_done", operation: "Download" });
         } else if (done.operation === "Build") {
-          api.getIndexStatus().then((idx) => {
+          Promise.all([
+            api.getIndexStatus().catch(() => null),
+            refreshSettings().catch(() => null),
+          ]).then(([idx]) => {
             dispatch({ type: "op_done", operation: "Build", indexStatus: idx });
-            refreshSemanticReady();
-            setDraftSelected(null);
-          }).catch(() => {
-            dispatch({ type: "op_done", operation: "Build" });
             refreshSemanticReady();
             setDraftSelected(null);
           });
@@ -458,7 +465,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       mounted = false;
       unlisteners.forEach((u) => u());
     };
-  }, [api, invalidate, pendingBuild, refreshSemanticReady]);
+  }, [api, invalidate, pendingBuild, refreshSemanticReady, refreshSettings]);
 
   useEffect(() => {
     if (!buildRequest) return;
@@ -519,8 +526,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       ...settings,
       engine_devices: { ...settings.engine_devices, [engine]: forceCpu ? "cpu" : "auto" },
     };
-    dispatch({ type: "settings_updated", settings: next });
-    await api.updateSettings({ semantic: next });
+    replaceSettings(await api.updateSettings({ semantic: next }));
   };
 
   const supportsCustomModels = (engine: EmbeddingEngine) => engine !== "Fastembed";
@@ -565,10 +571,14 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
 
     if (phase === "downloading" || phase === "building") {
       dispatch({ type: "cancel_started" });
-      api.cancelEmbed().catch((e) => {
-        dispatch({ type: "cancel_failed" });
-        console.error("cancelEmbed failed:", e);
-      });
+      api.cancelEmbed()
+        .then(() => {
+          dispatch({ type: "cancel_completed" });
+        })
+        .catch((e) => {
+          dispatch({ type: "cancel_failed" });
+          console.error("cancelEmbed failed:", e);
+        });
       return;
     }
 
@@ -619,7 +629,6 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       custom_models: [...(settings.custom_models || []), { engine: targetEngine, model_id: modelId }],
     };
 
-    dispatch({ type: "settings_updated", settings: next });
     dispatch({ type: "clear_error" });
     setCustomModelInput("");
     setIsAddingCustom(false);
@@ -629,7 +638,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       dimension: effectiveSelected?.dimension ?? settings.selected.dimension,
     });
 
-    await api.updateSettings({ semantic: next });
+    replaceSettings(await api.updateSettings({ semantic: next }));
     invalidate();
   };
 

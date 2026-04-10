@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import { api } from "../services";
-import type { FileEntry, IndexStatus, Theme } from "../lib/types";
+import type { FileEntry, IndexStatus, SemanticSettings, Settings, Theme } from "../lib/types";
 
 const EMPTY_EXCLUDED: Set<string> = new Set();
 
@@ -30,6 +30,7 @@ interface SettingsStore {
   bookmarks: string[];
   recentDirs: string[];
   directory: string;
+  semantic: SemanticSettings | null;
   respectGitignore: boolean;
   maxFileSize: number;
   contextLines: number;
@@ -56,6 +57,8 @@ interface SettingsStore {
   refreshSemanticReady: () => Promise<void>;
   startSemanticIndex: () => Promise<void>;
   applySettingsPatch: (patch: { theme?: Theme; supported_extensions?: string[]; max_results?: number }) => void;
+  replaceSettings: (settings: Settings) => void;
+  refreshSettings: () => Promise<Settings>;
 }
 
 export const useSettingsStore = create<SettingsStore>()(
@@ -63,6 +66,7 @@ export const useSettingsStore = create<SettingsStore>()(
     bookmarks: [],
     recentDirs: [],
     directory: "",
+    semantic: null,
     respectGitignore: true,
     maxFileSize: 10 * 1024 * 1024,
     contextLines: 2,
@@ -91,6 +95,7 @@ export const useSettingsStore = create<SettingsStore>()(
         bookmarks: s.bookmarked_dirs,
         recentDirs: s.recent_dirs || [],
         directory: s.last_directory ?? "",
+        semantic: s.semantic,
         respectGitignore: s.respect_gitignore,
         maxFileSize: s.max_file_size,
         supportedExtensions: s.supported_extensions || [],
@@ -189,6 +194,7 @@ export const useSettingsStore = create<SettingsStore>()(
     startSemanticIndex: async () => {
       const { directory } = get();
       const s = await api.getSettings();
+      set({ semantic: s.semantic });
       await api.buildIndex(directory, s.semantic.selected);
     },
 
@@ -203,6 +209,28 @@ export const useSettingsStore = create<SettingsStore>()(
       if (patch.max_results !== undefined) {
         set({ maxResults: patch.max_results });
       }
+    },
+
+    replaceSettings: (settings) => {
+      applyTheme(settings.theme);
+      set({
+        bookmarks: settings.bookmarked_dirs,
+        recentDirs: settings.recent_dirs || [],
+        directory: settings.last_directory ?? "",
+        semantic: settings.semantic,
+        respectGitignore: settings.respect_gitignore,
+        maxFileSize: settings.max_file_size,
+        supportedExtensions: settings.supported_extensions || [],
+        preferSemantic: settings.search_prefer_semantic,
+        theme: settings.theme,
+        maxResults: settings.max_results ?? 0,
+      });
+    },
+
+    refreshSettings: async () => {
+      const settings = await api.getSettings();
+      get().replaceSettings(settings);
+      return settings;
     },
   }))
 );
