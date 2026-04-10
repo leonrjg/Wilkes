@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../../ui/dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "cargo build --bin wilkes-rust-worker && npm --prefix ../ui run dev",
-    "beforeBuildCommand": "cargo build --release --bin wilkes-rust-worker && npm --prefix ../ui run build"
+    "beforeDevCommand": "node ../../scripts/prepare-sidecar.mjs && npm --prefix ../ui run dev",
+    "beforeBuildCommand": "node ../../scripts/prepare-sidecar.mjs --release && npm --prefix ../ui run build"
   },
   "bundle": {
     "active": true,
@@ -19,6 +19,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "externalBin": ["binaries/wilkes-rust-worker"],
     "resources": {
       "../worker/wilkes_python_worker": "wilkes_python_worker",
       "../worker/requirements.txt": "requirements.txt"
