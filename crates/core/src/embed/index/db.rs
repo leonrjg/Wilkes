@@ -542,6 +542,22 @@ mod tests {
     }
 
     #[test]
+    fn test_is_fatal_embedder_error_detects_worker_failures() {
+        assert!(SemanticIndex::is_fatal_embedder_error(&anyhow::anyhow!(
+            "Worker error: failed to spawn"
+        )));
+        assert!(SemanticIndex::is_fatal_embedder_error(&anyhow::anyhow!(
+            "Failed to send command to manager: closed"
+        )));
+        assert!(SemanticIndex::is_fatal_embedder_error(&anyhow::anyhow!(
+            "Worker finished without returning embeddings"
+        )));
+        assert!(!SemanticIndex::is_fatal_embedder_error(&anyhow::anyhow!(
+            "dimension mismatch"
+        )));
+    }
+
+    #[test]
     fn test_write_file_is_atomic_on_failure() {
         let dir = tempdir().unwrap();
         let mut idx =
@@ -611,6 +627,13 @@ pub struct SemanticIndex {
 }
 
 impl SemanticIndex {
+    fn is_fatal_embedder_error(err: &anyhow::Error) -> bool {
+        let msg = err.to_string();
+        msg.starts_with("Worker error:")
+            || msg.starts_with("Failed to send command to manager:")
+            || msg.starts_with("Worker finished without returning embeddings")
+    }
+
     /// Open an existing index. Returns `Err` if no index exists at `data_dir` or
     /// if `model_id` in the stored metadata mismatches the parameter.
     /// The dimension is read from the DB; callers can inspect it via `status()`.
@@ -836,6 +859,12 @@ impl SemanticIndex {
             let embeddings = match embedder.embed_passages(&texts) {
                 Ok(embeddings) => embeddings,
                 Err(e) => {
+                    if Self::is_fatal_embedder_error(&e) {
+                        return Err(e.context(format!(
+                            "Fatal embedder error while indexing {}",
+                            path.display()
+                        )));
+                    }
                     error!(
                         "[SemanticIndex::build] skipping {}: embed_passages failed: {e:#}",
                         path.display()

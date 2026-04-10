@@ -658,12 +658,14 @@ impl AppContext {
                                     .finish_build_index(&plan, &selected, &data_dir, embedder)
                                     .await
                                 {
+                                    terminal_event.terminal = Some(TerminalEvent::Cancelled);
                                     ctx.emit_embed_error("Build", err);
                                 } else {
                                     terminal_event.terminal = Some(TerminalEvent::Done);
                                 }
                             }
                             Err(e) => {
+                                terminal_event.terminal = Some(TerminalEvent::Cancelled);
                                 ctx.emit_embed_error("Build", e.to_string());
                             }
                         }
@@ -2100,6 +2102,71 @@ mod tests {
         }));
         assert!(events.iter().all(|(name, payload)| name != "manager-event"
             || payload != &serde_json::json!("ReindexingDone")));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_build_index_task_failure_emits_cancelled_without_done() {
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(MockEmitter {
+            events: Arc::clone(&events),
+        });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths {
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: dir.path().to_path_buf(),
+            },
+            emitter,
+        );
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let plan = BuildIndexPlan {
+            root_path: root,
+            device: "cpu".to_string(),
+            chunk_size: 64,
+            chunk_overlap: 8,
+            supported_extensions: vec!["txt".to_string()],
+        };
+        let selected = SelectedEmbedder {
+            engine: EmbeddingEngine::Fastembed,
+            model: EmbedderModel("DefinitelyNotARealFastembedModel".to_string()),
+            dimension: 384,
+        };
+        let cancel = CancellationToken::new();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+
+        let handle = Arc::clone(&ctx).spawn_build_index_task(
+            plan,
+            selected,
+            cancel,
+            Arc::clone(&cancel_flag),
+        );
+
+        handle.await.unwrap().unwrap();
+
+        assert!(!cancel_flag.load(Ordering::Relaxed));
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|(name, payload)| {
+            name == "embed-error"
+                && payload["operation"] == "Build"
+                && payload["message"]
+                    .as_str()
+                    .is_some_and(|msg| msg.contains("is not supported by fastembed"))
+        }));
+        assert!(events.iter().any(|(name, payload)| {
+            name == "manager-event" && payload == &serde_json::json!("ReindexingCancelled")
+        }));
+        assert!(events.iter().all(|(name, payload)| {
+            name != "manager-event" || payload != &serde_json::json!("ReindexingDone")
+        }));
     }
 
     #[tokio::test]
