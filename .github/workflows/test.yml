@@ -65,3 +65,6 @@ jobs:
 
       - name: Test
         run: npm test --prefix ui -- --run
+
+      - name: Build
+        run: npm run build --prefix ui
