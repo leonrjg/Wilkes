@@ -335,6 +335,23 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_ignored_files() {
+        let dir = tempdir().unwrap();
+        let supported = vec!["txt".to_string()];
+        let ignored_file = dir.path().join("ignored.rs");
+        std::fs::write(&ignored_file, "hello").unwrap();
+
+        let events = vec![DebouncedEvent {
+            path: ignored_file.clone(),
+            kind: DebouncedEventKind::Any,
+        }];
+
+        let classified = classify_event_paths(&events, &supported);
+        assert!(classified.changed.is_empty());
+        assert!(classified.removed.is_empty());
+    }
+
+    #[test]
     fn test_index_watcher_invalid_path() {
         let index = Arc::new(Mutex::new(None));
         let registry = Arc::new(ExtractorRegistry::new());
@@ -737,5 +754,17 @@ mod tests {
         }
 
         watcher.stop();
+    }
+
+    #[test]
+    fn test_handle_event_directory_skips() {
+        let dir = tempdir().unwrap();
+        let index = Arc::new(Mutex::new(None));
+        let registry = Arc::new(ExtractorRegistry::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+        let folder = dir.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+
+        handle_event(&folder, &index, &registry, &embedder, 100, 10);
     }
 }

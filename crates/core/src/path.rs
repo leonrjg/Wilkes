@@ -247,4 +247,13 @@ mod tests {
         let path = Path::new("/a/b/../c");
         assert!(!is_under(path, base));
     }
+
+    #[test]
+    fn test_is_under_base_non_existent() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("ghost_base");
+        let path = dir.path().join("some_file");
+        std::fs::write(&path, "data").unwrap();
+        assert!(!is_under(&path, &base));
+    }
 }

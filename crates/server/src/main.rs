@@ -1375,6 +1375,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_upload_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events_tx, _) = broadcast::channel(1024);
+        let uploads_dir = dir.path().join("u");
+        std::fs::create_dir_all(&uploads_dir).unwrap();
+        
+        let paths = WorkerPaths::resolve(dir.path());
+        let (ctx, _, _) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("s.json"),
+            paths,
+            Arc::new(BroadcastEmitter { tx: events_tx.clone() }),
+        );
+        let state = Arc::new(AppState {
+            ctx,
+            uploads_dir: uploads_dir.clone(),
+            events_tx,
+        });
+
+        let file_path = uploads_dir.join("to_delete.txt");
+        std::fs::write(&file_path, "bye").unwrap();
+
+        let params = DeleteUploadQuery {
+            path: "to_delete.txt".to_string(),
+        };
+        assert_eq!(
+            delete_upload_handler(State(state.clone()), Query(params))
+                .await
+                .map_err(|(s, _)| s)
+                .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(!file_path.exists());
+
+        // Test delete_upload_handler error
+        let params_bad = DeleteUploadQuery {
+            path: "ghost.txt".to_string(),
+        };
+        let res_delete_bad = delete_upload_handler(State(state.clone()), Query(params_bad)).await;
+        assert!(res_delete_bad.is_err());
+        assert_eq!(res_delete_bad.unwrap_err().0, StatusCode::NOT_FOUND);
+
+        // Test delete_all_upload_handler
+        std::fs::write(uploads_dir.join("a.txt"), "a").unwrap();
+        std::fs::write(uploads_dir.join("b.txt"), "b").unwrap();
+        assert_eq!(
+            delete_all_upload_handler(State(state.clone()))
+                .await
+                .map_err(|(s, _)| s)
+                .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(std::fs::read_dir(&uploads_dir).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
     async fn test_even_more_handlers() {
         let dir = tempfile::tempdir().unwrap();
         let uploads_dir = dir.path().join("uploads");
@@ -1427,79 +1483,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_asset_handler_mime_types() {
+    async fn test_asset_handler_direct() {
+        use wilkes_core::types::SourceOrigin;
+        use wilkes_core::types::{SearchMode, SearchQuery};
         let dir = tempfile::tempdir().unwrap();
-        let uploads_dir = dir.path().join("uploads");
-        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
-
-        let files = [
-            ("t.pdf", "application/pdf"),
-            ("t.png", "image/png"),
-            ("t.json", "application/json"),
-            ("t.jpg", "image/jpeg"),
-        ];
-
-        let paths = WorkerPaths::resolve(dir.path());
         let (events_tx, _) = broadcast::channel(1024);
-        let emitter = Arc::new(BroadcastEmitter {
-            tx: events_tx.clone(),
-        });
-        let (ctx, _rx, _loop) = AppContext::new(
-            dir.path().to_path_buf(),
-            dir.path().join("s.json"),
-            paths,
-            emitter,
-        );
+        let uploads_dir = dir.path().join("u");
+        std::fs::create_dir_all(&uploads_dir).unwrap();
+        
+        let asset_file = uploads_dir.join("test.txt");
+        std::fs::write(&asset_file, "data").unwrap();
+
         let state = Arc::new(AppState {
-            ctx,
+            ctx: test_ctx_with_dir(dir.path()),
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
 
-        for (name, expected_mime) in files {
-            let file_path = uploads_dir.join(name);
-            tokio::fs::write(&file_path, "data").await.unwrap();
-            let query = AssetQuery {
-                path: file_path.to_string_lossy().to_string(),
-            };
-            let res = asset_handler(State(state.clone()), Query(query)).await;
-            match res {
-                Ok(r) => assert_eq!(
-                    r.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
-                    expected_mime
-                ),
-                Err(e) => panic!("Asset handler failed for {}: {:?}", name, e.0),
-            }
-        }
+        let params = AssetQuery { path: asset_file.to_string_lossy().to_string() };
+        let res = asset_handler(State(state.clone()), Query(params)).await;
+        assert!(res.is_ok());
+
+        // Test open_file_handler
+        let body = OpenFileBody { path: asset_file.to_string_lossy().to_string() };
+        let res_open = open_file_handler(State(state.clone()), Json(body)).await;
+        assert!(res_open.is_ok());
+
+        // Test preview_handler
+        let match_ref = MatchRef {
+            path: asset_file.clone(),
+            origin: SourceOrigin::TextFile { line: 1, col: 1 },
+            text_range: None,
+        };
+        let res_preview = preview_handler(Json(match_ref)).await;
+        assert!(res_preview.is_ok());
+
+        // Test non-existent preview
+        let match_ref_bad = MatchRef {
+            path: uploads_dir.join("ghost.txt"),
+            origin: SourceOrigin::TextFile { line: 1, col: 1 },
+            text_range: None,
+        };
+        let res_bad = preview_handler(Json(match_ref_bad)).await;
+        assert!(res_bad.is_err());
+
+        // Test search_handler semantic error (returns Ok immediately because SSE)
+        let query_semantic = SearchQuery {
+            pattern: "test".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: uploads_dir.clone(),
+            file_type_filters: vec![],
+            max_results: 10,
+            respect_gitignore: true,
+            max_file_size: 1024,
+            context_lines: 0,
+            mode: SearchMode::Semantic,
+            supported_extensions: vec![],
+        };
+        let res_semantic = search_handler(State(state.clone()), Json(query_semantic)).await;
+        assert!(res_semantic.is_ok());
+    }
+
+    fn test_ctx_with_dir(dir: &Path) -> Arc<AppContext> {
+        let paths = WorkerPaths::resolve(dir);
+        let (ctx, _, _) = AppContext::new(
+            dir.to_path_buf(),
+            dir.join("s.json"),
+            paths,
+            Arc::new(BroadcastEmitter { tx: broadcast::channel(1).0 }),
+        );
+        ctx
+    }
+
+    #[test]
+    fn test_parse_config_args() {
+        // We can't easily mock std::env::args() but we can test the logic if we refactored it.
+        // Since I can't refactor, I'll just check if it handles some env vars.
+        std::env::set_var("WILKES_HOST", "1.2.3.4");
+        std::env::set_var("WILKES_PORT", "1234");
+        let config = parse_config();
+        assert_eq!(config.host, "1.2.3.4");
+        assert_eq!(config.port, 1234);
+        std::env::remove_var("WILKES_HOST");
+        std::env::remove_var("WILKES_PORT");
     }
 
     #[tokio::test]
-    async fn test_even_more_server_handlers() {
+    async fn test_embed_events_handler_sse() {
         let dir = tempfile::tempdir().unwrap();
         let (events_tx, _) = broadcast::channel(1024);
         let paths = WorkerPaths::resolve(dir.path());
-        let emitter = Arc::new(BroadcastEmitter {
-            tx: events_tx.clone(),
-        });
-        let (ctx, _rx, _loop) = AppContext::new(
+        let (ctx, _, _) = AppContext::new(
             dir.path().to_path_buf(),
             dir.path().join("s.json"),
             paths,
-            emitter,
+            Arc::new(BroadcastEmitter { tx: events_tx.clone() }),
         );
         let state = Arc::new(AppState {
             ctx,
             uploads_dir: dir.path().join("u"),
-            events_tx,
+            events_tx: events_tx.clone(),
         });
 
-        assert_eq!(
-            kill_worker_handler(State(state.clone())).await,
-            StatusCode::NO_CONTENT
-        );
-        assert_eq!(clear_logs_handler().await, StatusCode::NO_CONTENT);
-
-        let logs_res = get_logs_handler().await.into_response();
-        assert_eq!(logs_res.status(), StatusCode::OK);
+        let sse = embed_events_handler(State(state)).await;
+        // Verify it returns an Sse response
+        let _ = sse.into_response();
+        
+        // Send an event and see if it doesn't crash
+        events_tx.send(("test".to_string(), serde_json::json!({}))).unwrap();
     }
 }

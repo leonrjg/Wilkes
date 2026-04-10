@@ -2273,7 +2273,7 @@ mod tests {
             Ok(())
         });
         *ctx.embed_task.lock() = Some(EmbedTaskHandle {
-            operation: EmbedOperation::Build,
+            operation: EmbedOperation::Download,
             cancel,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             join,
@@ -2284,7 +2284,7 @@ mod tests {
 
         let events_guard = events.lock().unwrap();
         assert!(events_guard.iter().any(|(name, payload)| {
-            name == "embed-error" && payload["operation"] == "Build" && payload["message"] == ""
+            name == "embed-error" && payload["operation"] == "Download" && payload["message"] == ""
         }));
     }
 
@@ -3570,5 +3570,89 @@ mod tests {
 
         ctx.delete_index().await.unwrap();
         assert!(!index_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_build_index_rejects_file_root() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("file.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths::resolve(dir.path()),
+            Arc::new(MockEmitter {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+
+        let err = ctx
+            .prepare_build_index(
+                file_path.to_str().unwrap(),
+                &SelectedEmbedder::default_for(EmbeddingEngine::Candle),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("is not a directory"));
+    }
+
+    #[test]
+    fn test_restore_state_needs_reset_on_none_db() {
+        let mut settings = Settings::default();
+        settings.semantic.enabled = true;
+        assert!(AppContext::restore_state_needs_reset(&settings, None));
+
+        settings.semantic.enabled = false;
+        settings.semantic.index_path = Some(PathBuf::from("any"));
+        assert!(AppContext::restore_state_needs_reset(&settings, None));
+
+        settings.semantic.index_path = None;
+        assert!(!AppContext::restore_state_needs_reset(&settings, None));
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_twice() {
+        let (_dir, ctx) = test_ctx();
+        ctx.shutdown();
+        ctx.shutdown(); // Should return early
+    }
+
+    #[tokio::test]
+    async fn test_spawn_download_model_error() {
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(MockEmitter { events: events.clone() });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("s.json"),
+            WorkerPaths::resolve(dir.path()),
+            emitter,
+        );
+
+        let plan = DownloadModelPlan { device: "cpu".to_string() };
+        let selected = SelectedEmbedder {
+            engine: EmbeddingEngine::Candle,
+            model: EmbedderModel("invalid".to_string()),
+            dimension: 0,
+        };
+        
+        let join = ctx.spawn_download_model_task(plan, selected);
+        let _ = join.await;
+        
+        let events_guard = events.lock().unwrap();
+        assert!(events_guard.iter().any(|(name, _)| name == "embed-error"));
+    }
+
+    #[tokio::test]
+    async fn test_clear_restore_state_settings_direct() {
+        let (_dir, ctx) = test_ctx();
+        ctx.update_settings(serde_json::json!({ "semantic": { "enabled": true } }))
+            .await
+            .unwrap();
+        assert!(ctx.settings().await.semantic.enabled);
+
+        ctx.clear_restore_state_settings().await;
+        assert!(!ctx.settings().await.semantic.enabled);
     }
 }

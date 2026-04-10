@@ -384,4 +384,27 @@ mod tests {
             _ => panic!("Expected spawn error"),
         }
     }
+
+    #[tokio::test]
+    async fn test_cancel_and_kill_helpers() {
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("r"),
+            venv_dir: PathBuf::from("v"),
+            worker_bin: PathBuf::from("w"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let _loop_handle = tokio::spawn(loop_fut);
+
+        // Test roof_knock_active with pid 0 (no-op)
+        manager.roof_knock_active(Duration::from_millis(1));
+
+        // Mock an active PID
+        manager.active_pid.store(123456, Ordering::Relaxed);
+        manager.roof_knock_active(Duration::from_millis(1));
+
+        manager.request_shutdown();
+    }
 }

@@ -668,6 +668,66 @@ exit 0
         }
     }
 
+    #[test]
+    fn test_roof_knock_pid_zero() {
+        roof_knock_pid(0, Duration::from_millis(1), "test");
+    }
+
+    #[tokio::test]
+    async fn test_worker_process_send_request_read_error_variant() {
+        let dir = tempdir().unwrap();
+        let worker_bin = dir.path().join("worker.sh");
+        // Output a non-JSON line to trigger ReadError (though it's currently logged and ignored in the loop, wait)
+        // Actually, parse_worker_stdout_line returns ReadError for non-JSON.
+        // In send_request loop:
+        // ProtocolReadOutcome::ReadError(message) => { tracing::warn!("{message}"); }
+        // So it continues the loop.
+        
+        write_executable(
+            &worker_bin,
+            r#"#!/bin/sh
+read req
+echo 'not json'
+echo '"Done"'
+exit 0
+"#,
+        );
+
+        let paths = WorkerPaths {
+            python_path: dir.path().join("python"),
+            python_package_dir: dir.path().to_path_buf(),
+            requirements_path: dir.path().join("requirements.txt"),
+            venv_dir: dir.path().join("venv"),
+            worker_bin: worker_bin.clone(),
+            data_dir: dir.path().to_path_buf(),
+        };
+        std::fs::write(&paths.requirements_path, "torch\n").unwrap();
+
+        let req = WorkerRequest {
+            mode: "embed".to_string(),
+            root: dir.path().to_path_buf(),
+            engine: EmbeddingEngine::Candle,
+            model: "m".to_string(),
+            data_dir: dir.path().to_path_buf(),
+            chunk_size: None,
+            chunk_overlap: None,
+            device: "cpu".to_string(),
+            paths: None,
+            texts: Some(vec!["hello".to_string()]),
+            supported_extensions: vec![],
+        };
+
+        let active_pid = AtomicU32::new(0);
+        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+            .await
+            .unwrap();
+        let (reply_tx, mut reply_rx) = mpsc::channel(8);
+        let req_json = serde_json::to_string(&req).unwrap();
+        proc.send_request(&req_json, &reply_tx).await.unwrap();
+
+        assert!(matches!(reply_rx.recv().await.unwrap(), WorkerEvent::Done));
+    }
+
     #[tokio::test]
     async fn test_build_command_plan_worker_bin_and_sbert_paths() {
         let dir = tempdir().unwrap();

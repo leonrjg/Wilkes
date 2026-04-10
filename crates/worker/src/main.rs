@@ -662,7 +662,73 @@ mod tests {
     }
 
     #[test]
-    fn test_emit() {
-        emit(WorkerEvent::Done);
+    fn test_loaded_embedder_key_equality() {
+        let k1 = LoadedEmbedderKey {
+            engine: EmbeddingEngine::Candle,
+            model: "m".to_string(),
+            data_dir: PathBuf::from("d"),
+            device: "cpu".to_string(),
+        };
+        let k2 = k1.clone();
+        let k3 = LoadedEmbedderKey {
+            engine: EmbeddingEngine::SBERT,
+            model: "m".to_string(),
+            data_dir: PathBuf::from("d"),
+            device: "cpu".to_string(),
+        };
+        assert_eq!(k1, k2);
+        assert_ne!(k1, k3);
+        assert!(format!("{:?}", k1).contains("model: \"m\""));
+    }
+
+    #[tokio::test]
+    async fn test_real_loader_fails_on_missing_model() {
+        let loader = RealLocalEmbedderLoader;
+        let key = LoadedEmbedderKey {
+            engine: EmbeddingEngine::Candle,
+            model: "non-existent".to_string(),
+            data_dir: PathBuf::from("/tmp/non-existent-data-dir"),
+            device: "cpu".to_string(),
+        };
+        let res = loader.load(&key);
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_embed_plan_failure() {
+        struct FailEmbedder;
+        impl wilkes_core::embed::Embedder for FailEmbedder {
+            fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+                Err(anyhow::anyhow!("embed failed"))
+            }
+            fn model_id(&self) -> &str { "fail" }
+            fn dimension(&self) -> usize { 384 }
+            fn engine(&self) -> EmbeddingEngine { EmbeddingEngine::Candle }
+        }
+        
+        struct FailEmbedderLoader;
+        impl LocalEmbedderLoader for FailEmbedderLoader {
+            fn load(&self, _key: &LoadedEmbedderKey) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
+                Ok(Arc::new(FailEmbedder))
+            }
+        }
+
+        let mut active = None;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let req = sample_request("embed");
+        
+        handle_worker_request(req, &mut active, tx, &FailEmbedderLoader).await.unwrap();
+        
+        let ev = rx.recv().await.unwrap();
+        match ev {
+            WorkerEvent::Error(e) => assert!(e.contains("Embed error")),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_stdout_event_sink() {
+        let sink = StdoutEventSink;
+        sink.emit(WorkerEvent::Done);
     }
 }

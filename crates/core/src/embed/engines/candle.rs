@@ -807,16 +807,18 @@ mod tests {
         r#"{
             "vocab_size": 1,
             "hidden_size": 3,
-            "num_hidden_layers": 0,
+            "num_hidden_layers": 1,
             "num_attention_heads": 1,
             "intermediate_size": 3,
             "hidden_act": "gelu",
-            "max_position_embeddings": 4,
+            "hidden_dropout_prob": 0.1,
+            "attention_probs_dropout_prob": 0.1,
+            "max_position_embeddings": 512,
             "type_vocab_size": 2,
             "initializer_range": 0.02,
             "layer_norm_eps": 1e-12,
-            "pad_token_id": 0,
-            "position_embedding_type": "absolute"
+            "position_embedding_type": "alibi",
+            "pad_token_id": 0
         }"#
     }
 
@@ -824,11 +826,15 @@ mod tests {
         r#"{
             "vocab_size": 1,
             "hidden_size": 3,
-            "num_hidden_layers": 0,
+            "num_hidden_layers": 1,
             "num_attention_heads": 1,
             "intermediate_size": 3,
-            "max_position_embeddings": 4,
+            "hidden_act": "gelu",
+            "max_position_embeddings": 512,
+            "initializer_range": 0.02,
+            "norm_eps": 1e-12,
             "layer_norm_eps": 1e-12,
+            "model_type": "modern_bert",
             "pad_token_id": 0,
             "global_attn_every_n_layers": 1,
             "global_rope_theta": 1.0,
@@ -1348,6 +1354,122 @@ mod tests {
     }
 
     #[test]
+    fn test_candle_embedder_prefixes() {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        let tokenizer_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":null,"byte_fallback":null,"vocab":{"[PAD]":0,"[CLS]":1,"[SEP]":2,"q":3,"p":4,"t":5},"merges":[]}}"#;
+        let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes()).unwrap();
+
+        let mut tensors = std::collections::HashMap::new();
+        tensors.insert(
+            "embeddings.word_embeddings.weight".to_string(),
+            Tensor::zeros((6, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.position_embeddings.weight".to_string(),
+            Tensor::zeros((512, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.token_type_embeddings.weight".to_string(),
+            Tensor::zeros((2, 3), dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.LayerNorm.weight".to_string(),
+            Tensor::ones(3, dtype, &device).unwrap(),
+        );
+        tensors.insert(
+            "embeddings.LayerNorm.bias".to_string(),
+            Tensor::zeros(3, dtype, &device).unwrap(),
+        );
+        let config = BertConfig {
+            num_hidden_layers: 0,
+            hidden_size: 3,
+            intermediate_size: 3,
+            num_attention_heads: 1,
+            vocab_size: 6,
+            ..BertConfig::default()
+        };
+        let vb = VarBuilder::from_tensors(tensors, dtype, &device);
+        let model = BertModel::load(vb, &config).unwrap();
+
+        let embedder = CandleEmbedder {
+            model: LoadedModel::Bert(model),
+            tokenizer,
+            device: device.clone(),
+            dtype,
+            model_id: "m".to_string(),
+            dimension: 3,
+            pooling: PoolingStrategy::Mean,
+            query_prefix: "q".to_string(),
+            passage_prefix: "p".to_string(),
+        };
+
+        // These call embed_with_prefix
+        let q = embedder.embed_query(&["t"]).unwrap();
+        assert_eq!(q.len(), 1);
+        let p = embedder.embed_passages(&["t"]).unwrap();
+        assert_eq!(p.len(), 1);
+        
+        assert_eq!(embedder.model_id(), "m");
+        assert_eq!(embedder.dimension(), 3);
+        assert_eq!(embedder.preferred_batch_size(), Some(32));
+    }
+
+    #[test]
+    fn test_candle_embedder_empty_seq() {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        let tokenizer_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":null,"byte_fallback":null,"vocab":{},"merges":[]}}"#;
+        let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes()).unwrap();
+
+        let mut tensors = std::collections::HashMap::new();
+        tensors.insert("embeddings.word_embeddings.weight".to_string(), Tensor::zeros((1, 3), dtype, &device).unwrap());
+        tensors.insert("embeddings.position_embeddings.weight".to_string(), Tensor::zeros((512, 3), dtype, &device).unwrap());
+        tensors.insert("embeddings.token_type_embeddings.weight".to_string(), Tensor::zeros((2, 3), dtype, &device).unwrap());
+        tensors.insert("embeddings.LayerNorm.weight".to_string(), Tensor::ones(3, dtype, &device).unwrap());
+        tensors.insert("embeddings.LayerNorm.bias".to_string(), Tensor::zeros(3, dtype, &device).unwrap());
+        let config = BertConfig { num_hidden_layers: 0, hidden_size: 3, intermediate_size: 3, num_attention_heads: 1, vocab_size: 1, ..BertConfig::default() };
+        let vb = VarBuilder::from_tensors(tensors, dtype, &device);
+        let model = BertModel::load(vb, &config).unwrap();
+
+        let embedder = CandleEmbedder {
+            model: LoadedModel::Bert(model),
+            tokenizer,
+            device: device.clone(),
+            dtype,
+            model_id: "m".to_string(),
+            dimension: 3,
+            pooling: PoolingStrategy::Mean,
+            query_prefix: "".to_string(),
+            passage_prefix: "".to_string(),
+        };
+
+        // embed_batch should return zeros if seq_len is 0
+        let res = embedder.embed(&[]).unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn test_fetch_aux_configs_basic() {
+        let dir = tempdir().unwrap();
+        // Returns () and logs errors, just verify it doesn't panic
+        crate::embed::engines::aux_config::fetch_aux_configs(dir.path(), "non-existent");
+    }
+
+    #[test]
+    fn test_fetch_model_size_with_empty_result() {
+        let res = crate::embed::models::hf_hub::fetch_model_size("non-existent");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_read_dimension_static_variants() {
+        // Test a few from the static list
+        assert_eq!(read_dimension(Path::new("."), "BAAI/bge-base-en-v1.5").unwrap(), 768);
+        assert_eq!(read_dimension(Path::new("."), "sentence-transformers/all-MiniLM-L12-v2").unwrap(), 384);
+        assert_eq!(read_dimension(Path::new("."), "intfloat/multilingual-e5-large-instruct").unwrap(), 1024);
+    }
+
     fn test_list_supported_models_cached_size() {
         let dir = tempdir().unwrap();
         let model_id = "BAAI/bge-base-en-v1.5";
@@ -1587,5 +1709,15 @@ mod tests {
                 Err(err) => err,
             };
         assert!(err.to_string().contains("tokenizer exploded"));
+    }
+
+    #[test]
+    fn test_real_hf_model_fetcher_basic() {
+        let dir = tempdir().unwrap();
+        let fetcher = RealHfModelFetcher {
+            cache_dir: dir.path().to_path_buf(),
+        };
+        // Should not panic, might fail to download but we test the interface
+        let _ = fetcher.fetch_optional_files("BAAI/bge-small-en-v1.5", &["README.md"]);
     }
 }

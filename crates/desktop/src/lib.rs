@@ -795,4 +795,32 @@ mod tests {
         let (_dir, ctx) = test_ctx();
         assert!(!is_semantic_ready_for_ctx(ctx));
     }
+
+    #[tokio::test]
+    async fn test_cancel_embed_for_ctx() {
+        let (_dir, ctx) = test_ctx();
+        assert!(super::cancel_embed_for_ctx(ctx).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_open_path_and_model_size() {
+        let _ = super::open_path(".".to_string()).await;
+        
+        let res = super::get_model_size(EmbeddingEngine::Candle, "BAAI/bge-base-en-v1.5".to_string()).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_data_paths_and_logs_for_ctx() {
+        let (_dir, _ctx) = test_ctx();
+
+        let paths = data_paths_from("test-data".to_string());
+        assert_eq!(paths.app_data, "test-data");
+
+        let _ = super::get_python_info().await;
+
+        super::clear_logs().await.unwrap();
+        let logs = super::get_logs().await.unwrap();
+        assert!(logs.is_empty());
+    }
 }

@@ -378,4 +378,13 @@ mod tests {
             Err(err) => assert!(err.to_string().contains("Dimension unknown")),
         }
     }
+
+    #[test]
+    fn test_list_supported_models_missing_cache() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let models = list_supported_models(&missing);
+        assert!(!models.is_empty());
+        assert!(models.iter().all(|m| !m.is_cached));
+    }
 }

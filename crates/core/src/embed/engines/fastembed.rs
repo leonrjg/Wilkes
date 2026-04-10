@@ -453,6 +453,7 @@ pub fn load_embedder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     #[test]
@@ -490,8 +491,8 @@ mod tests {
         assert!(err.is_err());
     }
 
-    #[test]
-    fn test_fastembed_installer_new() {
+    #[tokio::test]
+    async fn test_fastembed_installer_new() {
         let dir = tempdir().unwrap();
         let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
             crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
@@ -504,6 +505,45 @@ mod tests {
         assert_eq!(installer.model.0, "BGEBaseENV15");
 
         assert_eq!(installer.uninstall(dir.path()).is_ok(), true);
+        
+        // build() should work (it creates a WorkerEmbedder)
+        let _ = installer.build(dir.path()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fastembed_installer_install_cached() {
+        let dir = tempdir().unwrap();
+        let info = find_model_info("BGEBaseENV15").unwrap();
+        
+        let repo_code = info.model_code.replace("/", "--");
+        let repo_dir = dir.path().join(format!("models--{repo_code}"));
+        let snapshots_dir = repo_dir.join("snapshots");
+        std::fs::create_dir_all(&snapshots_dir).unwrap();
+        
+        let hash_dir = snapshots_dir.join("main");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        
+        let model_file = hash_dir.join(&info.model_file);
+        if let Some(parent) = model_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&model_file, "{}").unwrap();
+        
+        let refs_dir = repo_dir.join("refs");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        std::fs::write(refs_dir.join("main"), "main").unwrap();
+
+        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
+            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        );
+        let installer = FastembedInstaller::new(
+            EmbedderModel("BGEBaseENV15".to_string()),
+            manager,
+            "cpu".to_string(),
+        );
+        
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        installer.install(dir.path(), tx).await.unwrap();
     }
 
     #[test]
@@ -670,5 +710,35 @@ mod tests {
         let relevant = std::collections::HashSet::from(["missing.onnx".to_string()]);
         let siblings = vec![("other.txt".to_string(), Some(11))];
         assert!(sum_matching_hf_sizes(&siblings, &relevant).is_err());
+    }
+
+    #[test]
+    fn test_find_model_info_error() {
+        let err = find_model_info("NonExistentModel");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("is not supported by fastembed"));
+    }
+
+    #[test]
+    fn test_real_fastembed_runtime_factory_error() {
+        let factory = RealFastembedRuntimeFactory;
+        let model = FastembedModelRecord {
+            model: EmbeddingModel::BGEBaseENV15,
+            model_id: "BGEBaseENV15".to_string(),
+            model_code: "Xenova/bge-base-en-v1.5".to_string(),
+            model_file: "model.onnx".to_string(),
+            additional_files: vec![],
+            description: "desc".to_string(),
+            dimension: 768,
+        };
+        let request = FastembedInitRequest {
+            model,
+            cache_dir: PathBuf::from("/non/existent/cache/dir"),
+            show_download_progress: false,
+            execution_plan: FastembedExecutionPlan::CpuOnly,
+        };
+        // This should fail because the cache dir doesn't have the model
+        let res = factory.try_new(request);
+        assert!(res.is_err());
     }
 }

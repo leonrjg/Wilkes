@@ -211,34 +211,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_worker_embedder_no_prefix() {
+    async fn test_worker_embedder_error_path() {
+        use tempfile::tempdir;
+        use std::fs;
+        let dir = tempdir().unwrap();
+        let worker_bin = dir.path().join("worker.sh");
+        
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::write(&worker_bin, "#!/bin/sh\nread req\necho '{\"Error\":\"test error\"}'\n").unwrap();
+            let mut perms = fs::metadata(&worker_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&worker_bin, perms).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            fs::write(&worker_bin, "@echo off\nset /p req=\necho {\"Error\":\"test error\"}\n").unwrap();
+        }
+
         let paths = WorkerPaths {
             python_path: PathBuf::from("p"),
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
             venv_dir: PathBuf::from("v"),
-            worker_bin: PathBuf::from("w"),
-            data_dir: PathBuf::from("data"),
+            worker_bin: worker_bin.clone(),
+            data_dir: dir.path().to_path_buf(),
         };
         let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
         tokio::spawn(loop_fut);
 
         let config = WorkerEmbedderConfig {
-            model_id: "test-model".to_string(),
+            model_id: "m".to_string(),
             dimension: 384,
             device: "cpu".to_string(),
-            engine: EmbeddingEngine::Fastembed,
-            data_dir: PathBuf::from("data"),
+            engine: EmbeddingEngine::Candle,
+            data_dir: dir.path().to_path_buf(),
             query_prefix: "".to_string(),
             passage_prefix: "".to_string(),
         };
 
-        let embedder = Arc::new(WorkerEmbedder::new(manager, config));
-        let embedder_c = Arc::clone(&embedder);
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = embedder_c.embed_query(&["h"]);
-            let _ = embedder_c.embed_passages(&["w"]);
-        })
-        .await;
+        let embedder = WorkerEmbedder::new(manager, config);
+        let res = tokio::task::spawn_blocking(move || embedder.embed(&["test"])).await.unwrap();
+        
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("Worker error: test error"));
     }
 }
