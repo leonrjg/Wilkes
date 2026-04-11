@@ -327,8 +327,8 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
                             className="animate-ping pointer-events-none"
                             style={{
                               position: "absolute",
-                              left: cx - r,
-                              top: cy - r,
+                              left: cx - r / 2,
+                              top: cy - r / 2,
                               width: r,
                               height: r,
                               borderRadius: "50%",

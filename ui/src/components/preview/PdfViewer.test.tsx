@@ -177,6 +177,24 @@ describe("PdfViewer", () => {
     expect(highlight).toBeInTheDocument();
   });
 
+  it("centers the ping animation on the highlighted match", async () => {
+    render(
+      <PdfViewer
+        {...defaultProps}
+        highlight_bbox={{ x: 10, y: 20, width: 40, height: 10 }}
+      />,
+    );
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    const ping = document.querySelector(".animate-ping") as HTMLElement | null;
+    expect(ping).toBeInTheDocument();
+    expect(ping?.style.left).toBe("10px");
+    expect(ping?.style.top).toBe("5px");
+  });
+
   it("updates the page indicator while scrolling", async () => {
     render(<PdfViewer {...defaultProps} />);
 
