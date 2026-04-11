@@ -105,6 +105,47 @@ fn build_text_init_request(
     }
 }
 
+pub fn install_local(data_dir: &Path, model: &EmbedderModel, device: &str) -> anyhow::Result<()> {
+    let info = find_model_info(&model.0)?;
+    tracing::info!(
+        "[fastembed] install_local start: model={}, device={}, data_dir={}",
+        model.model_id(),
+        device,
+        data_dir.display()
+    );
+    let cached = hf_hub::Cache::new(data_dir.to_path_buf())
+        .repo(hf_hub::Repo::model(info.model_code.clone()))
+        .get(&info.model_file)
+        .is_some();
+    if cached {
+        tracing::info!("[fastembed] install_local: model already cached");
+        return Ok(());
+    }
+
+    let request = build_text_init_request(info.clone(), data_dir.to_path_buf(), device);
+    let factory = RealFastembedRuntimeFactory;
+    tracing::info!("[fastembed] install_local: initializing runtime");
+    factory
+        .try_new(request)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("fastembed install: {e}"))?;
+    tracing::info!("[fastembed] install_local: runtime initialized");
+
+    super::aux_config::fetch_aux_configs(data_dir, &model.0);
+    tracing::info!("[fastembed] install_local: aux configs fetched");
+    Ok(())
+}
+
+pub fn is_model_available(data_dir: &Path, model: &EmbedderModel) -> bool {
+    let Ok(info) = find_model_info(&model.0) else {
+        return false;
+    };
+    hf_hub::Cache::new(data_dir.to_path_buf())
+        .repo(hf_hub::Repo::model(info.model_code))
+        .get(&info.model_file)
+        .is_some()
+}
+
 pub trait FastembedRuntimeFactory {
     fn try_new(&self, request: FastembedInitRequest) -> anyhow::Result<TextEmbedding>;
 }
@@ -348,27 +389,10 @@ impl FastembedInstaller {
 #[async_trait]
 impl EmbedderInstaller for FastembedInstaller {
     fn is_available(&self, data_dir: &Path) -> bool {
-        let Ok(info) = find_model_info(&self.model.0) else {
-            return false;
-        };
-        hf_hub::Cache::new(data_dir.to_path_buf())
-            .repo(hf_hub::Repo::model(info.model_code))
-            .get(&info.model_file)
-            .is_some()
+        is_model_available(data_dir, &self.model)
     }
 
     async fn install(&self, data_dir: &Path, tx: ProgressTx) -> anyhow::Result<()> {
-        let info = find_model_info(&self.model.0)?;
-        let cached = hf_hub::Cache::new(data_dir.to_path_buf())
-            .repo(hf_hub::Repo::model(info.model_code.clone()))
-            .get(&info.model_file)
-            .is_some();
-        if cached {
-            return Ok(());
-        }
-
-        let request = build_text_init_request(info.clone(), data_dir.to_path_buf(), &self.device);
-
         let _ = tx
             .send(EmbedProgress::Download(DownloadProgress {
                 bytes_received: 0,
@@ -377,19 +401,10 @@ impl EmbedderInstaller for FastembedInstaller {
             }))
             .await;
 
-        let factory = RealFastembedRuntimeFactory;
-        tokio::task::spawn_blocking(move || factory.try_new(request))
-            .await?
-            .map_err(|e| anyhow::anyhow!("fastembed install: {e}"))?;
-
-        // Fetch auxiliary config files (e.g. config_sentence_transformers.json) so that
-        // build() can read prefix configuration without a network call. Best-effort.
-        let aux_model_id = self.model.0.clone();
-        let aux_cache_dir = data_dir.to_path_buf();
-        let _ = tokio::task::spawn_blocking(move || {
-            super::aux_config::fetch_aux_configs(&aux_cache_dir, &aux_model_id);
-        })
-        .await;
+        let model = self.model.clone();
+        let device = self.device.clone();
+        let data_dir = data_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || install_local(&data_dir, &model, &device)).await??;
 
         let _ = tx
             .send(EmbedProgress::Download(DownloadProgress {
@@ -433,14 +448,22 @@ pub fn load_embedder(
     data_dir: &Path,
     device: &str,
 ) -> anyhow::Result<Arc<dyn Embedder>> {
+    tracing::info!(
+        "[fastembed] load_embedder start: model={}, device={}, data_dir={}",
+        model.model_id(),
+        device,
+        data_dir.display()
+    );
     let info = find_model_info(&model.0)?;
     let dimension = info.dimension;
     let model_id = model.0.clone();
     let preferred_batch_size = get_preferred_batch_size(&model_id, &info.description);
     let request = build_text_init_request(info, data_dir.to_path_buf(), device);
+    tracing::info!("[fastembed] load_embedder: initializing runtime");
     let inner = RealFastembedRuntimeFactory
         .try_new(request)
         .map_err(|e| anyhow::anyhow!("fastembed load: {e}"))?;
+    tracing::info!("[fastembed] load_embedder: runtime initialized");
 
     Ok(Arc::new(FastEmbedder {
         inner: Mutex::new(inner),

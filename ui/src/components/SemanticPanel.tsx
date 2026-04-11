@@ -583,11 +583,19 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   const handleAction = useCallback(async () => {
     dispatch({ type: "clear_error" });
     if (!settings) return;
+    console.log("[SemanticPanel] handleAction", {
+      phase,
+      directory,
+      engine: effectiveSelected?.engine ?? null,
+      model: effectiveSelected?.model ?? null,
+    });
 
     if (phase === "downloading" || phase === "building") {
+      console.log("[SemanticPanel] cancelEmbed -> invoking backend");
       dispatch({ type: "cancel_started" });
       api.cancelEmbed()
         .then(() => {
+          console.log("[SemanticPanel] cancelEmbed -> resolved");
           dispatch({ type: "cancel_completed" });
         })
         .catch((e) => {
@@ -600,6 +608,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     if (!effectiveSelected) return;
 
     if (phase === "not_downloaded") {
+      console.log("[SemanticPanel] downloadModel -> invoking backend");
       dispatch({ type: "op_started", op: "downloading" });
       dispatch({
         type: "queue_build",
@@ -617,6 +626,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
         });
       });
     } else if (phase === "ready" || phase === "engine_mismatch") {
+      console.log("[SemanticPanel] buildIndex -> invoking backend");
       dispatch({ type: "op_started", op: "building" });
       api.buildIndex(directory, effectiveSelected).catch((e) => {
         console.error("buildIndex failed:", e);

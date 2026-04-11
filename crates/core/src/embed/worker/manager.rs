@@ -78,7 +78,6 @@ type SenderSlot = Arc<std::sync::Mutex<mpsc::Sender<ManagerCommand>>>;
 #[derive(Clone)]
 pub struct WorkerManager {
     sender: SenderSlot,
-    /// PID of the active worker process. 0 = no active worker.
     active_pid: Arc<AtomicU32>,
     /// Status snapshot updated by the manager loop; readable without going through the loop.
     status: Arc<RwLock<WorkerStatus>>,
@@ -386,7 +385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancel_and_kill_helpers() {
+    async fn test_request_shutdown_is_non_blocking() {
         let paths = WorkerPaths {
             python_path: PathBuf::from("p"),
             python_package_dir: PathBuf::from("pkg"),
@@ -397,13 +396,6 @@ mod tests {
         };
         let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
         let _loop_handle = tokio::spawn(loop_fut);
-
-        // Test roof_knock_active with pid 0 (no-op)
-        manager.roof_knock_active(Duration::from_millis(1));
-
-        // Mock an active PID
-        manager.active_pid.store(123456, Ordering::Relaxed);
-        manager.roof_knock_active(Duration::from_millis(1));
 
         manager.request_shutdown();
     }

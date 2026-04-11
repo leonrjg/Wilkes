@@ -18,6 +18,7 @@ struct LoadedEmbedderKey {
 struct LoadedEmbedder {
     key: LoadedEmbedderKey,
     embedder: Arc<dyn wilkes_core::embed::Embedder>,
+    background_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug)]
@@ -48,22 +49,31 @@ impl WorkerEventSink for StdoutEventSink {
     }
 }
 
-trait LocalEmbedderLoader: Send + Sync {
-    fn load(
+trait EmbedderLoader: Send + Sync {
+    async fn load(
         &self,
         key: &LoadedEmbedderKey,
-    ) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>>;
+        event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
+    ) -> anyhow::Result<LoadedEmbedder>;
 }
 
-struct RealLocalEmbedderLoader;
+struct RealEmbedderLoader;
 
-impl LocalEmbedderLoader for RealLocalEmbedderLoader {
-    fn load(
+impl EmbedderLoader for RealEmbedderLoader {
+    async fn load(
         &self,
         key: &LoadedEmbedderKey,
-    ) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
+        event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
+    ) -> anyhow::Result<LoadedEmbedder> {
         let model = EmbedderModel(key.model.clone());
-        dispatch::load_embedder_local(key.engine, &model, &key.data_dir, &key.device)
+        let prepared =
+            dispatch::prepare_embedder(key.engine, &model, &key.data_dir, &key.device, event_tx)
+                .await?;
+        Ok(LoadedEmbedder {
+            key: key.clone(),
+            embedder: prepared.embedder,
+            background_task: prepared.background_task,
+        })
     }
 }
 
@@ -107,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
 
     let stdin = std::io::stdin();
     let mut active_embedder: Option<LoadedEmbedder> = None;
-    let loader = RealLocalEmbedderLoader;
+    let loader = RealEmbedderLoader;
     let sink = StdoutEventSink;
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<WorkerEvent>(128);
@@ -149,7 +159,7 @@ async fn handle_worker_request(
     req: WorkerRequest,
     active_embedder: &mut Option<LoadedEmbedder>,
     event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
-    loader: &dyn LocalEmbedderLoader,
+    loader: &impl EmbedderLoader,
 ) -> anyhow::Result<()> {
     match classify_worker_request(&req) {
         WorkerRequestKind::Build => {
@@ -174,9 +184,16 @@ async fn handle_build_plan(
     req: WorkerRequest,
     active_embedder: &mut Option<LoadedEmbedder>,
     event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
-    loader: &dyn LocalEmbedderLoader,
+    loader: &impl EmbedderLoader,
 ) -> anyhow::Result<()> {
-    let embedder = get_or_load_embedder(active_embedder, &req, loader)?;
+    tracing::info!("[worker] build: loading embedder");
+    let embedder = get_or_load_embedder(active_embedder, &req, loader, Some(&event_tx)).await?;
+    tracing::info!(
+        "[worker] build: embedder loaded (engine={:?}, model={}, dim={})",
+        req.engine,
+        embedder.model_id(),
+        embedder.dimension()
+    );
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<EmbedProgress>(64);
     let tx_c = event_tx.clone();
@@ -201,8 +218,10 @@ async fn handle_build_plan(
         supported_extensions: req.supported_extensions,
     };
 
+    tracing::info!("[worker] build: starting build_index_with_embedder");
     let result =
         wilkes_api::commands::embed::build_index_with_embedder(req.root, embedder, options).await;
+    tracing::info!("[worker] build: build_index_with_embedder returned");
 
     forward.await?;
 
@@ -221,9 +240,9 @@ async fn handle_embed_plan(
     req: WorkerRequest,
     active_embedder: &mut Option<LoadedEmbedder>,
     event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
-    loader: &dyn LocalEmbedderLoader,
+    loader: &impl EmbedderLoader,
 ) -> anyhow::Result<()> {
-    let embedder = get_or_load_embedder(active_embedder, &req, loader)?;
+    let embedder = get_or_load_embedder(active_embedder, &req, loader, None).await?;
     let texts = req.texts.unwrap_or_default();
     let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
     match embedder.embed(&text_refs) {
@@ -244,9 +263,9 @@ async fn handle_info_plan(
     req: WorkerRequest,
     active_embedder: &mut Option<LoadedEmbedder>,
     event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
-    loader: &dyn LocalEmbedderLoader,
+    loader: &impl EmbedderLoader,
 ) -> anyhow::Result<()> {
-    let embedder = get_or_load_embedder(active_embedder, &req, loader)?;
+    let embedder = get_or_load_embedder(active_embedder, &req, loader, None).await?;
     let _ = event_tx
         .send(WorkerEvent::Info {
             dimension: embedder.dimension(),
@@ -257,15 +276,17 @@ async fn handle_info_plan(
     Ok(())
 }
 
-fn get_or_load_embedder(
+async fn get_or_load_embedder(
     active: &mut Option<LoadedEmbedder>,
     req: &WorkerRequest,
-    loader: &dyn LocalEmbedderLoader,
+    loader: &impl EmbedderLoader,
+    event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
 ) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
     let key = LoadedEmbedderKey::from_request(req);
 
     if let Some(current) = active {
         if current.key == key {
+            tracing::info!("[worker] reusing cached embedder");
             return Ok(Arc::clone(&current.embedder));
         }
 
@@ -282,11 +303,16 @@ fn get_or_load_embedder(
         );
     }
 
-    let embedder = loader.load(&key)?;
-    *active = Some(LoadedEmbedder {
-        key,
-        embedder: Arc::clone(&embedder),
-    });
+    tracing::info!("[worker] loading embedder from scratch");
+    if let Some(current) = active.take() {
+        if let Some(task) = current.background_task {
+            task.abort();
+        }
+    }
+    let loaded = loader.load(&key, event_tx).await?;
+    tracing::info!("[worker] embedder load succeeded");
+    let embedder = Arc::clone(&loaded.embedder);
+    *active = Some(loaded);
     Ok(embedder)
 }
 
@@ -306,22 +332,28 @@ mod tests {
 
     struct SuccessLoader;
 
-    impl LocalEmbedderLoader for SuccessLoader {
-        fn load(
+    impl EmbedderLoader for SuccessLoader {
+        async fn load(
             &self,
             _key: &LoadedEmbedderKey,
-        ) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
-            Ok(Arc::new(MockEmbedder::default()))
+            _event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
+        ) -> anyhow::Result<LoadedEmbedder> {
+            Ok(LoadedEmbedder {
+                key: _key.clone(),
+                embedder: Arc::new(MockEmbedder::default()),
+                background_task: None,
+            })
         }
     }
 
     struct FailLoader;
 
-    impl LocalEmbedderLoader for FailLoader {
-        fn load(
+    impl EmbedderLoader for FailLoader {
+        async fn load(
             &self,
             _key: &LoadedEmbedderKey,
-        ) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
+            _event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
+        ) -> anyhow::Result<LoadedEmbedder> {
             Err(anyhow::anyhow!("load failed"))
         }
     }
@@ -387,8 +419,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_get_or_load_embedder_caching() {
+    #[tokio::test]
+    async fn test_get_or_load_embedder_caching() {
         let dir = tempdir().unwrap();
         let mut active = Some(LoadedEmbedder {
             key: LoadedEmbedderKey {
@@ -398,6 +430,7 @@ mod tests {
                 device: "cpu".to_string(),
             },
             embedder: Arc::new(MockEmbedder::default()),
+            background_task: None,
         });
         let req = WorkerRequest {
             mode: "embed".to_string(),
@@ -414,12 +447,14 @@ mod tests {
         };
 
         // Should return the cached MockEmbedder immediately
-        let res = get_or_load_embedder(&mut active, &req, &SuccessLoader).unwrap();
+        let res = get_or_load_embedder(&mut active, &req, &SuccessLoader, None)
+            .await
+            .unwrap();
         assert_eq!(res.model_id(), "mock-model");
     }
 
-    #[test]
-    fn test_get_or_load_embedder_invalidates_on_request_change() {
+    #[tokio::test]
+    async fn test_get_or_load_embedder_invalidates_on_request_change() {
         let dir = tempdir().unwrap();
         let mut active = Some(LoadedEmbedder {
             key: LoadedEmbedderKey {
@@ -429,6 +464,7 @@ mod tests {
                 device: "cpu".to_string(),
             },
             embedder: Arc::new(MockEmbedder::default()),
+            background_task: None,
         });
         let req = WorkerRequest {
             mode: "embed".to_string(),
@@ -444,16 +480,13 @@ mod tests {
             supported_extensions: vec![],
         };
 
-        let res = get_or_load_embedder(&mut active, &req, &FailLoader);
+        let res = get_or_load_embedder(&mut active, &req, &FailLoader, None).await;
         assert!(res.is_err());
-        assert!(
-            active.is_some(),
-            "cached embedder should remain available on reload failure"
-        );
+        assert!(active.is_none());
     }
 
-    #[test]
-    fn test_get_or_load_embedder_failure() {
+    #[tokio::test]
+    async fn test_get_or_load_embedder_failure() {
         let dir = tempdir().unwrap();
         let mut active = None;
         let req = WorkerRequest {
@@ -471,7 +504,7 @@ mod tests {
         };
 
         // Should fail to load non-existent model from empty temp dir
-        let res = get_or_load_embedder(&mut active, &req, &FailLoader);
+        let res = get_or_load_embedder(&mut active, &req, &FailLoader, None).await;
         assert!(res.is_err());
     }
 
@@ -486,6 +519,7 @@ mod tests {
                 device: "cpu".to_string(),
             },
             embedder: Arc::new(MockEmbedder::default()),
+            background_task: None,
         });
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
 
@@ -529,6 +563,7 @@ mod tests {
                 device: "cpu".to_string(),
             },
             embedder: Arc::new(MockEmbedder::default()),
+            background_task: None,
         });
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
 
@@ -596,6 +631,7 @@ mod tests {
                 device: "cpu".to_string(),
             },
             embedder: Arc::new(MockEmbedder::default()),
+            background_task: None,
         });
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
 
@@ -639,6 +675,7 @@ mod tests {
                 device: "cpu".to_string(),
             },
             embedder: Arc::new(MockEmbedder::default()),
+            background_task: None,
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(10);
 
@@ -683,14 +720,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_real_loader_fails_on_missing_model() {
-        let loader = RealLocalEmbedderLoader;
+        let loader = RealEmbedderLoader;
         let key = LoadedEmbedderKey {
             engine: EmbeddingEngine::Candle,
             model: "non-existent".to_string(),
             data_dir: PathBuf::from("/tmp/non-existent-data-dir"),
             device: "cpu".to_string(),
         };
-        let res = loader.load(&key);
+        let res = loader.load(&key).await;
         assert!(res.is_err());
     }
 
@@ -713,12 +750,17 @@ mod tests {
         }
 
         struct FailEmbedderLoader;
-        impl LocalEmbedderLoader for FailEmbedderLoader {
-            fn load(
+        impl EmbedderLoader for FailEmbedderLoader {
+            async fn load(
                 &self,
                 _key: &LoadedEmbedderKey,
-            ) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
-                Ok(Arc::new(FailEmbedder))
+                _event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
+            ) -> anyhow::Result<LoadedEmbedder> {
+                Ok(LoadedEmbedder {
+                    key: _key.clone(),
+                    embedder: Arc::new(FailEmbedder),
+                    background_task: None,
+                })
             }
         }
 

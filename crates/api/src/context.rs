@@ -107,6 +107,7 @@ pub struct AppContext {
     index: PLMutex<Arc<Mutex<Option<SemanticIndex>>>>,
     watcher: PLMutex<Option<IndexWatcher>>,
     embed_task: PLMutex<Option<EmbedTaskHandle>>,
+    embed_cancel_in_progress: AtomicBool,
     shutting_down: AtomicBool,
     pub worker_manager: WorkerManager,
     events: Arc<dyn EventEmitter>,
@@ -132,6 +133,7 @@ impl AppContext {
             index: PLMutex::new(Arc::new(Mutex::new(None))),
             watcher: PLMutex::new(None),
             embed_task: PLMutex::new(None),
+            embed_cancel_in_progress: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             worker_manager,
             events,
@@ -219,12 +221,16 @@ impl AppContext {
     }
 
     fn embed_task_is_running(&self) -> bool {
+        if self.embed_cancel_in_progress.load(Ordering::Acquire) {
+            return true;
+        }
         let guard = self.embed_task.lock();
         guard.as_ref().is_some_and(|task| !task.join.is_finished())
     }
 
     fn clear_embed_task(&self) {
         *self.embed_task.lock() = None;
+        self.embed_cancel_in_progress.store(false, Ordering::Release);
     }
 
     async fn validate_index_root(
@@ -400,9 +406,16 @@ impl AppContext {
         root: String,
         selected: SelectedEmbedder,
     ) -> Result<(), String> {
+        info!(
+            "AppContext::start_build_index: root={}, engine={}, model={}",
+            root,
+            selected.engine.as_str(),
+            selected.model.model_id()
+        );
         let plan = match self.prepare_build_index(&root, &selected).await {
             Ok(plan) => plan,
             Err(err) => {
+                info!("AppContext::start_build_index: prepare failed: {err}");
                 self.emit_embed_error("Build", err.clone());
                 return Err(err);
             }
@@ -427,6 +440,7 @@ impl AppContext {
             cancel_flag,
             join,
         });
+        info!("AppContext::start_build_index: build task registered");
         Ok(())
     }
 
@@ -437,9 +451,15 @@ impl AppContext {
         self: Arc<Self>,
         selected: SelectedEmbedder,
     ) -> Result<(), String> {
+        info!(
+            "AppContext::start_download_model: engine={}, model={}",
+            selected.engine.as_str(),
+            selected.model.model_id()
+        );
         let plan = match self.prepare_download_model(&selected).await {
             Ok(plan) => plan,
             Err(err) => {
+                info!("AppContext::start_download_model: prepare failed: {err}");
                 self.emit_embed_error("Download", err.clone());
                 return Err(err);
             }
@@ -453,6 +473,7 @@ impl AppContext {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             join,
         });
+        info!("AppContext::start_download_model: download task registered");
         Ok(())
     }
 
@@ -652,6 +673,10 @@ impl AppContext {
         let cancel_for_task = cancel.clone();
 
         tokio::spawn(async move {
+            info!(
+                "AppContext::spawn_build_index_task: entered for root={}",
+                plan.root_path.display()
+            );
             enum TerminalEvent {
                 Done,
                 Cancelled,
@@ -699,18 +724,21 @@ impl AppContext {
                 tokio::select! {
                     biased;
 
-                    _ = cancel_for_task.cancelled() => {
+                    _ = cancel_for_task.cancelled(), if !cancel_flag.load(Ordering::Relaxed) => {
+                        info!("AppContext::spawn_build_index_task: cancellation observed");
                         cancel_flag.store(true, Ordering::Relaxed);
-                        Self::cleanup_partial_index_files(&data_dir);
-                        terminal_event.terminal = Some(TerminalEvent::Cancelled);
-                        ctx.emit_embed_error("Build", "");
-                        return Ok(());
+                        ctx.worker_manager.request_shutdown();
                     }
 
                     res = &mut build_fut => {
+                        info!("AppContext::spawn_build_index_task: build future completed");
                         match res {
                             Ok(embedder) => {
-                                if let Err(err) = ctx
+                                if cancel_flag.load(Ordering::Relaxed) {
+                                    Self::cleanup_partial_index_files(&data_dir);
+                                    terminal_event.terminal = Some(TerminalEvent::Cancelled);
+                                    ctx.emit_embed_error("Build", "");
+                                } else if let Err(err) = ctx
                                     .finish_build_index(&plan, &selected, &data_dir, embedder)
                                     .await
                                 {
@@ -721,15 +749,23 @@ impl AppContext {
                                 }
                             }
                             Err(e) => {
-                                terminal_event.terminal = Some(TerminalEvent::Cancelled);
-                                ctx.emit_embed_error("Build", format!("{e:#}"));
+                                if cancel_flag.load(Ordering::Relaxed) {
+                                    Self::cleanup_partial_index_files(&data_dir);
+                                    terminal_event.terminal = Some(TerminalEvent::Cancelled);
+                                    ctx.emit_embed_error("Build", "");
+                                } else {
+                                    terminal_event.terminal = Some(TerminalEvent::Cancelled);
+                                    ctx.emit_embed_error("Build", format!("{e:#}"));
+                                }
                             }
                         }
                         break;
                     }
 
                     Some(p) = progress_rx.recv() => {
-                        ctx.emit_progress_event(&p);
+                        if !cancel_flag.load(Ordering::Relaxed) {
+                            ctx.emit_progress_event(&p);
+                        }
                     }
                 }
             }
@@ -823,31 +859,41 @@ impl AppContext {
 
     // ── Embed lifecycle ───────────────────────────────────────────────────────
 
-    pub fn cancel_embed(&self) {
+    pub async fn cancel_embed(&self) {
+        info!("AppContext::cancel_embed: requested");
         self.worker_manager.request_shutdown();
-        if let Some(task) = self.embed_task.lock().take() {
-            task.cancel_flag.store(true, Ordering::Relaxed);
-            task.cancel.cancel();
-            match task.operation {
-                EmbedOperation::Build => {
-                    // Let the build task observe the cancellation token and run its own
-                    // cleanup path instead of aborting it mid-flight. Aborting here can
-                    // leave the blocking index build running without a chance to stop.
-                }
-                EmbedOperation::Download => {
-                    self.emit_embed_error(task.operation.as_str(), "");
-                    task.join.abort();
-                }
+        let Some(task) = self.embed_task.lock().take() else {
+            info!("AppContext::cancel_embed: no active task");
+            return;
+        };
+
+        self.embed_cancel_in_progress.store(true, Ordering::Release);
+        task.cancel_flag.store(true, Ordering::Relaxed);
+        task.cancel.cancel();
+
+        match task.operation {
+            EmbedOperation::Build => {
+                info!("AppContext::cancel_embed: waiting for build task to finish");
+                let _ = task.join.await;
+            }
+            EmbedOperation::Download => {
+                info!("AppContext::cancel_embed: aborting download task");
+                self.emit_embed_error(task.operation.as_str(), "");
+                task.join.abort();
+                let _ = task.join.await;
             }
         }
+
+        self.clear_embed_task();
+        info!("AppContext::cancel_embed: completed");
     }
 
-    pub fn shutdown(&self) {
+    pub async fn shutdown(&self) {
         if self.shutting_down.swap(true, Ordering::AcqRel) {
             return;
         }
         self.stop_watcher();
-        self.cancel_embed();
+        self.cancel_embed().await;
         self.kill_worker();
     }
 
@@ -2459,7 +2505,7 @@ mod tests {
             join,
         });
 
-        ctx.cancel_embed(); // Should not panic
+        ctx.cancel_embed().await; // Should not panic
         assert!(ctx.embed_task.lock().is_none());
 
         let events_guard = events.lock().unwrap();
@@ -2505,8 +2551,9 @@ mod tests {
         *ctx.watcher.lock() = Some(watcher);
 
         let cancel = CancellationToken::new();
-        let join = tokio::spawn(async {
-            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        let cancel_for_task = cancel.clone();
+        let join = tokio::spawn(async move {
+            cancel_for_task.cancelled().await;
             Ok(())
         });
         *ctx.embed_task.lock() = Some(EmbedTaskHandle {
@@ -2516,10 +2563,63 @@ mod tests {
             join,
         });
 
-        ctx.shutdown();
+        ctx.shutdown().await;
 
         assert!(ctx.watcher.lock().is_none());
         assert!(ctx.embed_task.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_build_index_rejects_retry_while_cancel_in_progress() {
+        let dir = tempdir().unwrap();
+        let emitter = Arc::new(MockEmitter {
+            events: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths {
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: dir.path().to_path_buf(),
+            },
+            emitter,
+        );
+
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let join = tokio::spawn(async move {
+            cancel_for_task.cancelled().await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            Ok(())
+        });
+        *ctx.embed_task.lock() = Some(EmbedTaskHandle {
+            operation: EmbedOperation::Build,
+            cancel,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            join,
+        });
+
+        let cancel_ctx = Arc::clone(&ctx);
+        let cancel_task = tokio::spawn(async move {
+            cancel_ctx.cancel_embed().await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let err = ctx
+            .prepare_build_index(&root.to_string_lossy(), &selected)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "A build is already in progress.");
+
+        cancel_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -3551,7 +3651,7 @@ mod tests {
             .unwrap();
 
         // Immediately cancel
-        ctx.cancel_embed();
+        ctx.cancel_embed().await;
 
         assert!(ctx.embed_task.lock().is_none());
         assert!(!ctx.get_worker_status().active);
@@ -3809,8 +3909,8 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_twice() {
         let (_dir, ctx) = test_ctx();
-        ctx.shutdown();
-        ctx.shutdown(); // Should return early
+        ctx.shutdown().await;
+        ctx.shutdown().await; // Should return early
     }
 
     #[tokio::test]

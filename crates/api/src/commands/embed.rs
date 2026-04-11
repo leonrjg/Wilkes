@@ -6,10 +6,12 @@ use ignore::WalkBuilder;
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::installer::ProgressTx;
 use wilkes_core::embed::models::installer::EmbedderInstaller;
+use wilkes_core::embed::worker::ipc::{WorkerEvent, WorkerRequest};
+use wilkes_core::embed::worker::manager::{ManagerCommand, WorkerManager};
 use wilkes_core::embed::Embedder;
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
-use wilkes_core::types::{IndexStatus, SelectedEmbedder};
+use wilkes_core::types::{EmbeddingEngine, IndexStatus, SelectedEmbedder};
 
 pub struct BuildIndexOptions {
     pub manager: Option<wilkes_core::embed::worker::manager::WorkerManager>,
@@ -46,6 +48,12 @@ pub async fn build_index_with_embedder(
     embedder: Arc<dyn Embedder>,
     options: BuildIndexOptions,
 ) -> anyhow::Result<Arc<dyn Embedder>> {
+    tracing::info!(
+        "build_index_with_embedder: root={}, model={}, engine={:?}",
+        root.display(),
+        embedder.model_id(),
+        embedder.engine()
+    );
     let embedder_clone = Arc::clone(&embedder);
 
     let paths: Vec<PathBuf> = WalkBuilder::new(&root)
@@ -60,6 +68,10 @@ pub async fn build_index_with_embedder(
         })
         .map(|e| e.path().to_path_buf())
         .collect();
+    tracing::info!(
+        "build_index_with_embedder: collected {} candidate files",
+        paths.len()
+    );
 
     let data_dir_clone = options.data_dir.clone();
     let root_clone = root.clone();
@@ -70,6 +82,7 @@ pub async fn build_index_with_embedder(
     };
 
     tokio::task::spawn_blocking(move || {
+        tracing::info!("build_index_with_embedder: spawn_blocking SemanticIndex::build start");
         let mut registry = ExtractorRegistry::new();
         registry.register(Box::new(PdfExtractor::new()));
 
@@ -83,6 +96,7 @@ pub async fn build_index_with_embedder(
             options.cancel_flag,
             &indexing,
         )?;
+        tracing::info!("build_index_with_embedder: SemanticIndex::build done");
         anyhow::Ok(())
     })
     .await??;
@@ -110,14 +124,68 @@ pub async fn build_index(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("device is required for build_index"))?;
 
-    let installer = wilkes_core::embed::dispatch::get_installer(
-        selected.engine,
-        selected.model,
-        manager,
-        device,
-    );
+    if matches!(selected.engine, EmbeddingEngine::Fastembed | EmbeddingEngine::Candle) {
+        return build_index_via_worker(root, selected, manager, device, options).await;
+    }
+
+    let installer =
+        wilkes_core::embed::dispatch::get_installer(selected.engine, selected.model, manager, device);
 
     build_index_with_installer(root, installer, options).await
+}
+
+async fn build_index_via_worker(
+    root: PathBuf,
+    selected: SelectedEmbedder,
+    manager: WorkerManager,
+    device: String,
+    options: BuildIndexOptions,
+) -> anyhow::Result<Arc<dyn Embedder>> {
+    let request = WorkerRequest {
+        mode: "build".to_string(),
+        root,
+        engine: selected.engine,
+        model: selected.model.model_id().to_string(),
+        data_dir: options.data_dir.clone(),
+        chunk_size: Some(options.chunk_size),
+        chunk_overlap: Some(options.chunk_overlap),
+        device: device.clone(),
+        paths: None,
+        texts: None,
+        supported_extensions: options.supported_extensions.clone(),
+    };
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(128);
+    manager
+        .send(ManagerCommand::Submit {
+            req: Box::new(request),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to send build command to manager: {e}"))?;
+
+    while let Some(event) = reply_rx.recv().await {
+        match event {
+            WorkerEvent::Progress(progress) => {
+                let _ = options.tx.send(progress).await;
+            }
+            WorkerEvent::Done => {
+                let installer = wilkes_core::embed::dispatch::get_installer(
+                    selected.engine,
+                    selected.model.clone(),
+                    manager,
+                    device,
+                );
+                return installer.build(&options.data_dir);
+            }
+            WorkerEvent::Error(err) => {
+                anyhow::bail!(err);
+            }
+            WorkerEvent::Embeddings(_) | WorkerEvent::Info { .. } => {}
+        }
+    }
+
+    anyhow::bail!("Worker finished without returning build status")
 }
 
 pub async fn build_index_with_installer(

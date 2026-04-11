@@ -674,6 +674,22 @@ impl CandleInstaller {
     }
 }
 
+pub fn install_local(data_dir: &Path, model: &EmbedderModel) -> anyhow::Result<()> {
+    let model_id = model.0.clone();
+    let fetcher = RealHfModelFetcher {
+        cache_dir: data_dir.to_path_buf(),
+    };
+    fetcher.download_required_files(&model_id, MODEL_FILES)?;
+
+    let fetcher = RealHfModelFetcher {
+        cache_dir: data_dir.to_path_buf(),
+    };
+    fetcher.fetch_optional_files(&model_id, &["1_Pooling/config.json"])?;
+
+    super::aux_config::fetch_aux_configs(data_dir, &model_id);
+    Ok(())
+}
+
 #[async_trait]
 impl EmbedderInstaller for CandleInstaller {
     fn is_available(&self, data_dir: &Path) -> bool {
@@ -681,9 +697,6 @@ impl EmbedderInstaller for CandleInstaller {
     }
 
     async fn install(&self, data_dir: &Path, tx: ProgressTx) -> anyhow::Result<()> {
-        let model_id = self.model.0.clone();
-        let data_dir = data_dir.to_path_buf();
-
         let _ = tx
             .send(EmbedProgress::Download(DownloadProgress {
                 bytes_received: 0,
@@ -692,30 +705,9 @@ impl EmbedderInstaller for CandleInstaller {
             }))
             .await;
 
-        let fetcher = RealHfModelFetcher {
-            cache_dir: data_dir.clone(),
-        };
-        let model_id_required = model_id.clone();
-        tokio::task::spawn_blocking(move || {
-            fetcher.download_required_files(&model_id_required, MODEL_FILES)
-        })
-        .await??;
-
-        let fetcher = RealHfModelFetcher {
-            cache_dir: data_dir.clone(),
-        };
-        let aux_model_id = model_id.clone();
-        tokio::task::spawn_blocking(move || {
-            fetcher.fetch_optional_files(&aux_model_id, &["1_Pooling/config.json"])
-        })
-        .await??;
-
-        let aux_model_id = self.model.0.clone();
-        let aux_cache_dir = data_dir.to_path_buf();
-        let _ = tokio::task::spawn_blocking(move || {
-            super::aux_config::fetch_aux_configs(&aux_cache_dir, &aux_model_id);
-        })
-        .await;
+        let model = self.model.clone();
+        let data_dir = data_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || install_local(&data_dir, &model)).await??;
 
         let _ = tx
             .send(EmbedProgress::Download(DownloadProgress {

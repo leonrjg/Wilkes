@@ -79,7 +79,7 @@ async fn shutdown_signal(ctx: Arc<AppContext>) {
         _ = terminate => {}
     }
 
-    ctx.shutdown();
+    ctx.shutdown().await;
 }
 
 // ── Search ────────────────────────────────────────────────────────────────────
@@ -495,7 +495,7 @@ async fn delete_index_handler(
 }
 
 async fn cancel_embed_handler(State(state): State<Arc<AppState>>) -> StatusCode {
-    state.ctx.cancel_embed();
+    state.ctx.cancel_embed().await;
     StatusCode::NO_CONTENT
 }
 

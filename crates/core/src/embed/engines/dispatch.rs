@@ -1,9 +1,16 @@
 use super::super::models::installer::EmbedderInstaller;
 use super::super::worker::manager::WorkerManager;
 use super::super::Embedder;
+use crate::embed::installer::{DownloadProgress, EmbedProgress};
+use crate::embed::worker::ipc::WorkerEvent;
 use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
 use std::path::Path;
 use std::sync::Arc;
+
+pub struct PreparedEmbedder {
+    pub embedder: Arc<dyn Embedder>,
+    pub background_task: Option<tokio::task::JoinHandle<()>>,
+}
 
 pub fn list_models(engine: EmbeddingEngine, data_dir: &Path) -> Vec<ModelDescriptor> {
     // Each engine provides its own builtin catalog, checking data_dir for downloaded models.
@@ -94,6 +101,98 @@ pub fn load_embedder_local(
 
         #[cfg(feature = "fastembed")]
         EmbeddingEngine::Fastembed => super::fastembed::load_embedder(model, data_dir, device),
+        #[cfg(not(feature = "fastembed"))]
+        EmbeddingEngine::Fastembed => anyhow::bail!("Fastembed feature is disabled"),
+    }
+}
+
+async fn emit_download_progress(
+    event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
+    done: bool,
+) {
+    if let Some(tx) = event_tx {
+        let _ = tx
+            .send(WorkerEvent::Progress(EmbedProgress::Download(
+                DownloadProgress {
+                    bytes_received: 0,
+                    total_bytes: 0,
+                    done,
+                },
+            )))
+            .await;
+    }
+}
+
+pub async fn prepare_embedder(
+    engine: EmbeddingEngine,
+    model: &EmbedderModel,
+    data_dir: &Path,
+    device: &str,
+    event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
+) -> anyhow::Result<PreparedEmbedder> {
+    match engine {
+        EmbeddingEngine::SBERT => {
+            let paths = super::super::worker::manager::WorkerPaths::resolve(data_dir);
+            let (manager, _event_rx, loop_fut) =
+                super::super::worker::manager::WorkerManager::new(paths);
+            let background_task = tokio::spawn(loop_fut);
+            let installer =
+                super::sbert::SBERTInstaller::new(model.clone(), manager, device.to_string());
+            let (probe_tx, _probe_rx) = tokio::sync::mpsc::channel(1);
+            installer.install(data_dir, probe_tx).await?;
+            let embedder = installer.build(data_dir)?;
+            Ok(PreparedEmbedder {
+                embedder,
+                background_task: Some(background_task),
+            })
+        }
+
+        #[cfg(feature = "candle")]
+        EmbeddingEngine::Candle => {
+            emit_download_progress(event_tx, false).await;
+            let install_model = model.clone();
+            let install_data_dir = data_dir.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                super::candle::install_local(&install_data_dir, &install_model)
+            })
+            .await??;
+            let model = model.clone();
+            let data_dir = data_dir.to_path_buf();
+            let device = device.to_string();
+            let embedder = tokio::task::spawn_blocking(move || {
+                super::candle::load_embedder(&model, &data_dir, &device)
+            })
+            .await??;
+            emit_download_progress(event_tx, true).await;
+            Ok(PreparedEmbedder {
+                embedder,
+                background_task: None,
+            })
+        }
+        #[cfg(not(feature = "candle"))]
+        EmbeddingEngine::Candle => anyhow::bail!("Candle feature is disabled"),
+
+        #[cfg(feature = "fastembed")]
+        EmbeddingEngine::Fastembed => {
+            let available = super::fastembed::is_model_available(data_dir, model);
+            if !available {
+                emit_download_progress(event_tx, false).await;
+            }
+            let model = model.clone();
+            let data_dir = data_dir.to_path_buf();
+            let device = device.to_string();
+            let embedder = tokio::task::spawn_blocking(move || {
+                super::fastembed::load_embedder(&model, &data_dir, &device)
+            })
+            .await??;
+            if !available {
+                emit_download_progress(event_tx, true).await;
+            }
+            Ok(PreparedEmbedder {
+                embedder,
+                background_task: None,
+            })
+        }
         #[cfg(not(feature = "fastembed"))]
         EmbeddingEngine::Fastembed => anyhow::bail!("Fastembed feature is disabled"),
     }

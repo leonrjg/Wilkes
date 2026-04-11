@@ -249,7 +249,7 @@ impl EmbedderInstaller for SBERTInstaller {
                 dimension,
                 device: self.device.clone(),
                 engine: EmbeddingEngine::SBERT,
-                data_dir: std::path::PathBuf::new(),
+                data_dir: _data_dir.to_path_buf(),
                 query_prefix: prefixes.query_prefix,
                 passage_prefix: prefixes.passage_prefix,
             },

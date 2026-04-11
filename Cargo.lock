@@ -7850,6 +7850,7 @@ dependencies = [
  "ureq 2.12.1",
  "which",
  "wilkes-core",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::task::JoinHandle;
+use tracing::info;
 use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
@@ -59,6 +60,11 @@ async fn download_model_for_ctx(
     ctx: Arc<AppContext>,
     selected: SelectedEmbedder,
 ) -> Result<(), String> {
+    info!(
+        "desktop::download_model_for_ctx: engine={}, model={}",
+        selected.engine.as_str(),
+        selected.model.model_id()
+    );
     ctx.start_download_model(selected).await
 }
 
@@ -67,6 +73,12 @@ async fn build_index_for_ctx(
     root: String,
     selected: SelectedEmbedder,
 ) -> Result<(), String> {
+    info!(
+        "desktop::build_index_for_ctx: root={}, engine={}, model={}",
+        root,
+        selected.engine.as_str(),
+        selected.model.model_id()
+    );
     Arc::clone(&ctx).start_build_index(root, selected).await
 }
 
@@ -78,7 +90,8 @@ async fn list_models_for_ctx(
 }
 
 async fn cancel_embed_for_ctx(ctx: Arc<AppContext>) -> Result<(), String> {
-    ctx.cancel_embed();
+    info!("desktop::cancel_embed_for_ctx");
+    ctx.cancel_embed().await;
     Ok(())
 }
 
@@ -111,7 +124,9 @@ fn handle_exit_event(app_handle: &AppHandle, event: tauri::RunEvent) {
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
     ) {
         let ctx = app_handle.state::<Arc<AppContext>>().inner().clone();
-        ctx.shutdown();
+        tauri::async_runtime::spawn(async move {
+            ctx.shutdown().await;
+        });
     }
 }
 
