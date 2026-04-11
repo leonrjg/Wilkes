@@ -14,6 +14,31 @@ const MINIMUM_SBERT_PYTHON: PythonVersion = PythonVersion {
     patch: 0,
 };
 
+#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(test, windows))]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn windows_creation_flags() -> u32 {
+    CREATE_NO_WINDOW
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(not(windows))]
+fn windows_creation_flags() -> u32 {
+    0
+}
+
+#[cfg(windows)]
+fn suppress_windows_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(windows_creation_flags());
+}
+
+#[cfg(not(windows))]
+fn suppress_windows_console(_command: &mut Command) {}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PythonVersion {
     major: u32,
@@ -76,7 +101,9 @@ pub(crate) async fn run_setup_step(
     label: &str,
 ) -> Result<(), String> {
     tracing::info!("[python-setup] {label}");
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    suppress_windows_console(&mut command);
+    let mut child = command
         .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -142,7 +169,9 @@ pub(crate) async fn run_setup_step(
 }
 
 async fn read_python_version(python_path: &Path) -> Result<PythonVersion, String> {
-    let output = Command::new(python_path)
+    let mut command = Command::new(python_path);
+    suppress_windows_console(&mut command);
+    let output = command
         .args([
             "-c",
             "import sys; print('.'.join(str(part) for part in sys.version_info[:3]))",
@@ -260,6 +289,15 @@ pub(crate) async fn setup_python_env(paths: &WorkerPaths) -> Result<PathBuf, Str
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_windows_creation_flags_shape() {
+        #[cfg(windows)]
+        assert_eq!(windows_creation_flags(), CREATE_NO_WINDOW);
+
+        #[cfg(not(windows))]
+        assert_eq!(windows_creation_flags(), 0);
+    }
 
     #[cfg(unix)]
     fn write_executable(path: &Path, content: &str) {

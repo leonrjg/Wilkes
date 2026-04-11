@@ -1,34 +1,42 @@
 import { useState, useEffect } from "react";
 import type { SearchApi, DataPaths } from "../services/api";
 import { isTauri } from "../services";
-import type { IndexStatus } from "../lib/types";
+import { useSemanticStore } from "../stores/useSemanticStore";
 
 interface Props {
   api: SearchApi;
+  isActive: boolean;
 }
 
-export default function DataPanel({ api }: Props) {
+export default function DataPanel({ api, isActive }: Props) {
   const [paths, setPaths] = useState<DataPaths | null>(null);
-  const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  const indexStatus = useSemanticStore((s) => s.indexStatus);
+  const refreshCurrentRootStatus = useSemanticStore((s) => s.refreshCurrentRootStatus);
+  const handleCurrentRootIndexRemoved = useSemanticStore((s) => s.handleCurrentRootIndexRemoved);
 
-  const fetchData = async () => {
+  const fetchPaths = async () => {
     try {
-      const [p, idx] = await Promise.all([
-        api.getDataPaths(),
-        api.getIndexStatus().catch(() => null),
-      ]);
+      const p = await api.getDataPaths();
       setPaths(p);
-      setIndexStatus(idx);
     } catch (e: any) {
       setError(e.toString());
     }
   };
 
   useEffect(() => {
-    fetchData();
+    fetchPaths();
   }, [api]);
+
+  useEffect(() => {
+    if (!isActive) return;
+    setError(null);
+    fetchPaths();
+    refreshCurrentRootStatus().catch((e) => {
+      setError(e?.toString?.() ?? "Failed to refresh semantic index status");
+    });
+  }, [isActive, api, refreshCurrentRootStatus]);
 
   const onOpen = (path: string) => {
     api.openPath(path).catch((e) => setError(e.toString()));
@@ -41,7 +49,9 @@ export default function DataPanel({ api }: Props) {
     setIsDeleting(true);
     try {
       await api.deleteIndex();
-      await fetchData();
+      await handleCurrentRootIndexRemoved();
+      await refreshCurrentRootStatus();
+      await fetchPaths();
     } catch (e: any) {
       setError(e.toString());
     } finally {
@@ -60,7 +70,13 @@ export default function DataPanel({ api }: Props) {
       <div className="p-4 bg-red-900/20 border border-red-900/50 rounded-lg">
         <p className="text-xs text-red-400 leading-relaxed">{error}</p>
         <button 
-          onClick={() => { setError(null); fetchData(); }}
+          onClick={() => {
+            setError(null);
+            fetchPaths();
+            refreshCurrentRootStatus().catch((e) => {
+              setError(e?.toString?.() ?? "Failed to refresh semantic index status");
+            });
+          }}
           className="mt-2 text-[10px] text-red-400 underline hover:text-red-300"
         >
           Try again
@@ -172,4 +188,3 @@ export default function DataPanel({ api }: Props) {
     </div>
   );
 }
-

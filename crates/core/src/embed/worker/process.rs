@@ -42,6 +42,31 @@ pub(super) struct WorkerProcess {
 
 pub(super) const ROOF_KNOCK_TIMEOUT: Duration = Duration::from_secs(3);
 
+#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(test, windows))]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn windows_creation_flags() -> u32 {
+    CREATE_NO_WINDOW
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(not(windows))]
+fn windows_creation_flags() -> u32 {
+    0
+}
+
+#[cfg(windows)]
+fn suppress_windows_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(windows_creation_flags());
+}
+
+#[cfg(not(windows))]
+fn suppress_windows_console(_command: &mut Command) {}
+
 #[cfg(unix)]
 pub(super) fn pid_is_alive(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as i32, 0) };
@@ -133,7 +158,7 @@ async fn build_command_plan(
 }
 
 fn apply_command_plan(plan: &ProcessCommandPlan) -> Command {
-    match plan {
+    let mut command = match plan {
         ProcessCommandPlan::WorkerBin { worker_bin } => Command::new(worker_bin),
         ProcessCommandPlan::Sbert {
             python,
@@ -156,7 +181,9 @@ fn apply_command_plan(plan: &ProcessCommandPlan) -> Command {
             command.arg("wilkes_python_worker");
             command
         }
-    }
+    };
+    suppress_windows_console(&mut command);
+    command
 }
 
 fn parse_worker_stdout_line(line: &str) -> ProtocolReadOutcome {
@@ -921,5 +948,19 @@ exit 0
             reply_rx.recv().await.unwrap(),
             WorkerEvent::Error(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn test_windows_creation_flags_shape() {
+        #[cfg(windows)]
+        assert_eq!(windows_creation_flags(), CREATE_NO_WINDOW);
+
+        #[cfg(not(windows))]
+        assert_eq!(windows_creation_flags(), 0);
     }
 }

@@ -74,6 +74,7 @@ type Action =
   | { type: "index_loaded"; indexStatus: IndexStatus | null }
   | { type: "error"; error: string }
   | { type: "clear_error" }
+  | { type: "op_started"; op: "downloading" | "building" }
   | { type: "progress"; op: "downloading" | "building"; progress: ProgressState }
   | { type: "op_done"; operation: string; indexStatus?: IndexStatus }
   | { type: "op_error"; message: string; operation: string }
@@ -101,6 +102,14 @@ function reducer(state: PanelState, action: Action): PanelState {
       return { ...state, error: action.error };
     case "clear_error":
       return { ...state, error: null };
+    case "op_started":
+      return {
+        ...state,
+        activeOp: action.op,
+        progress: { current: 0, total: 0 },
+        error: null,
+        isCancelling: false,
+      };
     case "progress":
       return { ...state, activeOp: action.op, progress: action.progress };
     case "op_done":
@@ -591,6 +600,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     if (!effectiveSelected) return;
 
     if (phase === "not_downloaded") {
+      dispatch({ type: "op_started", op: "downloading" });
       dispatch({
         type: "queue_build",
         build: {
@@ -598,9 +608,24 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
           selected: effectiveSelected,
         },
       });
-      api.downloadModel(effectiveSelected).catch((e) => console.error("downloadModel failed:", e));
+      api.downloadModel(effectiveSelected).catch((e) => {
+        console.error("downloadModel failed:", e);
+        dispatch({
+          type: "op_error",
+          message: e?.toString?.() ?? "Failed to start download",
+          operation: "Download",
+        });
+      });
     } else if (phase === "ready" || phase === "engine_mismatch") {
-      api.buildIndex(directory, effectiveSelected).catch((e) => console.error("buildIndex failed:", e));
+      dispatch({ type: "op_started", op: "building" });
+      api.buildIndex(directory, effectiveSelected).catch((e) => {
+        console.error("buildIndex failed:", e);
+        dispatch({
+          type: "op_error",
+          message: e?.toString?.() ?? "Failed to start build",
+          operation: "Build",
+        });
+      });
     } else if (phase === "indexed") {
       api.deleteIndex().then(() => {
         dispatch({ type: "index_deleted" });

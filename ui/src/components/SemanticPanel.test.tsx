@@ -252,6 +252,28 @@ describe("SemanticPanel", () => {
     expect(screen.getByText(/Cancel build/i)).toBeInTheDocument();
   });
 
+  it("shows download feedback immediately after starting a model download", async () => {
+    mockApi.listModels.mockResolvedValue([
+      { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
+    ]);
+    mockApi.getSettings.mockResolvedValue({
+      semantic: { ...defaultSettings.semantic, selected: { ...defaultSettings.semantic.selected, model: "not-cached" } }
+    });
+
+    await act(async () => {
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText(/Download model and index files/i));
+    });
+
+    expect(mockApi.downloadModel).toHaveBeenCalled();
+    expect(screen.getByText(/Cancel download/i)).toBeInTheDocument();
+    expect(screen.getByText(/Downloading model/i)).toBeInTheDocument();
+    expect(screen.getByText(/0%/i)).toBeInTheDocument();
+  });
+
   it("does not start a queued build after cancelling a download", async () => {
     mockApi.listModels.mockResolvedValue([
       { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
@@ -349,6 +371,21 @@ describe("SemanticPanel", () => {
     });
 
     expect(screen.getByText(/45%/)).toBeInTheDocument();
+  });
+
+  it("shows build feedback immediately after starting an index build", async () => {
+    await act(async () => {
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Build semantic index"));
+    });
+
+    expect(mockApi.buildIndex).toHaveBeenCalled();
+    expect(screen.getByText(/Cancel build/i)).toBeInTheDocument();
+    expect(screen.getByText(/Indexing/i)).toBeInTheDocument();
+    expect(screen.getByText(/0%/i)).toBeInTheDocument();
   });
 
   it("does not persist draft selection on build completion from the panel", async () => {

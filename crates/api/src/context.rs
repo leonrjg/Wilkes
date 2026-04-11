@@ -227,6 +227,42 @@ impl AppContext {
         *self.embed_task.lock() = None;
     }
 
+    async fn validate_index_root(
+        &self,
+        root: &Path,
+        settings: &Settings,
+        missing_dir_message: &str,
+    ) -> Result<(), String> {
+        let root_display = root.display().to_string();
+
+        if root_display.trim().is_empty() {
+            return Err(missing_dir_message.to_string());
+        }
+        if !root.exists() {
+            return Err(format!("Index root not found: {}", root.display()));
+        }
+        if !root.is_dir() {
+            return Err(format!("Index root is not a directory: {}", root.display()));
+        }
+
+        let files = crate::commands::files::list_files(
+            root.to_path_buf(),
+            settings.supported_extensions.clone(),
+            settings.max_file_size,
+        )
+        .await
+        .map_err(|err| format!("Failed to scan index root: {err}"))?;
+
+        if files.is_empty() {
+            return Err(format!(
+                "No supported files found in selected directory: {}",
+                root.display()
+            ));
+        }
+
+        Ok(())
+    }
+
     // ── Settings ──────────────────────────────────────────────────────────────
 
     pub async fn update_semantic_settings<F>(&self, f: F)
@@ -364,7 +400,13 @@ impl AppContext {
         root: String,
         selected: SelectedEmbedder,
     ) -> Result<(), String> {
-        let plan = self.prepare_build_index(&root, &selected).await?;
+        let plan = match self.prepare_build_index(&root, &selected).await {
+            Ok(plan) => plan,
+            Err(err) => {
+                self.emit_embed_error("Build", err.clone());
+                return Err(err);
+            }
+        };
 
         self.stop_watcher();
         self.events
@@ -395,7 +437,13 @@ impl AppContext {
         self: Arc<Self>,
         selected: SelectedEmbedder,
     ) -> Result<(), String> {
-        let plan = self.prepare_download_model(&selected).await?;
+        let plan = match self.prepare_download_model(&selected).await {
+            Ok(plan) => plan,
+            Err(err) => {
+                self.emit_embed_error("Download", err.clone());
+                return Err(err);
+            }
+        };
         let join = Arc::clone(&self).spawn_download_model_task(plan, selected);
 
         let cancel = CancellationToken::new();
@@ -418,17 +466,14 @@ impl AppContext {
         }
 
         let root_path = PathBuf::from(root);
-        if !root_path.exists() {
-            return Err(format!("Index root not found: {}", root_path.display()));
-        }
-        if !root_path.is_dir() {
-            return Err(format!(
-                "Index root is not a directory: {}",
-                root_path.display()
-            ));
-        }
-
         let settings = self.settings().await;
+        self.validate_index_root(
+            &root_path,
+            &settings,
+            "Choose a directory before building an index.",
+        )
+        .await?;
+
         Ok(BuildIndexPlan {
             root_path,
             device: settings.semantic.device_for(selected.engine).to_string(),
@@ -447,6 +492,17 @@ impl AppContext {
         }
 
         let settings = self.settings().await;
+        let Some(root_path) = settings.last_directory.clone() else {
+            return Err("Choose a directory before downloading a model and building an index."
+                .to_string());
+        };
+        self.validate_index_root(
+            &root_path,
+            &settings,
+            "Choose a directory before downloading a model and building an index.",
+        )
+        .await?;
+
         Ok(DownloadModelPlan {
             device: settings.semantic.device_for(selected.engine).to_string(),
         })
@@ -1539,6 +1595,7 @@ mod tests {
         let (dir, ctx) = test_ctx();
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), "hello").unwrap();
 
         let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
         let plan = ctx
@@ -1602,12 +1659,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(not_dir.contains("not a directory"));
+
+        let empty_dir = tempdir().unwrap();
+        let empty = ctx
+            .prepare_build_index(&empty_dir.path().to_string_lossy(), &selected)
+            .await
+            .unwrap_err();
+        assert!(empty.contains("No supported files found"));
     }
 
     #[tokio::test]
     async fn test_prepare_download_model_happy_path_and_running_guard() {
-        let (_dir, ctx) = test_ctx();
+        let (dir, ctx) = test_ctx();
         let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), "hello").unwrap();
+        ctx.update_settings(serde_json::json!({ "last_directory": root }))
+            .await
+            .unwrap();
 
         let plan = ctx.prepare_download_model(&selected).await.unwrap();
         assert_eq!(
@@ -2885,7 +2955,13 @@ mod tests {
 
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("Index root not found"));
-        assert!(events.lock().unwrap().is_empty());
+        assert!(events.lock().unwrap().iter().any(|(name, payload)| {
+            name == "embed-error"
+                && payload["operation"] == "Build"
+                && payload["message"]
+                    .as_str()
+                    .is_some_and(|msg| msg.contains("Index root not found"))
+        }));
     }
 
     #[tokio::test]
@@ -3051,6 +3127,7 @@ mod tests {
         // Search in a different root
         let root2 = dir.path().join("root2");
         std::fs::create_dir_all(&root2).unwrap();
+        std::fs::write(root2.join("file.txt"), "hello").unwrap();
         let query = SearchQuery {
             pattern: "test".to_string(),
             is_regex: false,
@@ -3124,6 +3201,7 @@ mod tests {
 
         let root2 = dir.path().join("root2");
         std::fs::create_dir_all(&root2).unwrap();
+        std::fs::write(root2.join("file.txt"), "hello").unwrap();
         let query = SearchQuery {
             pattern: "test".to_string(),
             is_regex: false,
@@ -3457,6 +3535,7 @@ mod tests {
             },
             emitter,
         );
+        std::fs::write(dir.path().join("file.txt"), "hello").unwrap();
 
         // Start a fake build index
         ctx.clone()
@@ -3498,6 +3577,12 @@ mod tests {
             },
             emitter,
         );
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), "hello").unwrap();
+        ctx.update_settings(serde_json::json!({ "last_directory": root }))
+            .await
+            .unwrap();
 
         // Requesting download of non-existent model should eventually emit error
         ctx.clone()

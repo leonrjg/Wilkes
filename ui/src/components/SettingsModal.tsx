@@ -312,7 +312,7 @@ export default function SettingsModal({
             </div>
 
             <div className={activeTab === "data" ? "block h-full" : "hidden"}>
-              <DataPanel api={api} />
+              <DataPanel api={api} isActive={activeTab === "data"} />
             </div>
 
             <div className={activeTab === "workers" ? "block h-full" : "hidden"}>

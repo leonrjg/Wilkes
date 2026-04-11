@@ -1,4 +1,5 @@
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 /// Checks if `path` is contained within `base`.
 ///
@@ -56,6 +57,18 @@ pub fn normalize_path(path: &Path) -> PathBuf {
 /// 1. `WILKES_PYTHON` environment variable.
 /// 2. Common bundled paths relative to the current executable.
 /// 3. The system PATH for `python3` or `python`.
+fn python_probe_args() -> [&'static str; 2] {
+    ["-c", "import sys; print(sys.executable)"]
+}
+
+fn python_candidate_is_usable(path: &Path) -> bool {
+    Command::new(path)
+        .args(python_probe_args())
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 pub fn resolve_python() -> anyhow::Result<PathBuf> {
     let mut attempted = Vec::new();
 
@@ -63,7 +76,7 @@ pub fn resolve_python() -> anyhow::Result<PathBuf> {
     if let Ok(s) = std::env::var("WILKES_PYTHON") {
         if !s.is_empty() {
             let p = PathBuf::from(s);
-            if p.exists() {
+            if p.exists() && python_candidate_is_usable(&p) {
                 return Ok(p);
             }
             attempted.push(p);
@@ -89,16 +102,25 @@ pub fn resolve_python() -> anyhow::Result<PathBuf> {
     };
 
     if let Some(ref p) = bundled {
-        if p.exists() {
+        if p.exists() && python_candidate_is_usable(p) {
             return Ok(p.clone());
         }
         attempted.push(p.clone());
     }
 
     // 3. System PATH
-    for name in &["python3", "python"] {
+    #[cfg(target_os = "windows")]
+    let system_names = ["python", "py", "python3"];
+
+    #[cfg(not(target_os = "windows"))]
+    let system_names = ["python3", "python"];
+
+    for name in system_names {
         if let Ok(p) = which::which(name) {
-            return Ok(p);
+            if python_candidate_is_usable(&p) {
+                return Ok(p);
+            }
+            attempted.push(p);
         }
     }
 
@@ -106,6 +128,9 @@ pub fn resolve_python() -> anyhow::Result<PathBuf> {
     for p in attempted {
         msg.push_str(&format!("- {}\n", p.display()));
     }
+    #[cfg(target_os = "windows")]
+    msg.push_str("- system PATH (python, py, python3)\n");
+    #[cfg(not(target_os = "windows"))]
     msg.push_str("- system PATH (python3, python)\n");
     anyhow::bail!("{}", msg);
 }
@@ -145,7 +170,62 @@ pub fn resolve_python_package_dir() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use tempfile::tempdir;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn write_fake_python(dir: &Path) -> PathBuf {
+        write_named_fake_python(dir, "fake-python", true)
+    }
+
+    fn write_named_fake_python(dir: &Path, stem: &str, success: bool) -> PathBuf {
+        #[cfg(windows)]
+        let path = dir.join(format!("{stem}.cmd"));
+        #[cfg(not(windows))]
+        let path = dir.join(stem);
+
+        #[cfg(windows)]
+        {
+            let body = if success {
+                "@echo off\r\nexit /b 0\r\n"
+            } else {
+                "@echo off\r\nexit /b 1\r\n"
+            };
+            std::fs::write(&path, body).unwrap();
+        }
+
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let body = if success {
+                "#!/bin/sh\nexit 0\n"
+            } else {
+                "#!/bin/sh\nexit 1\n"
+            };
+            std::fs::write(&path, body).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+
+        path
+    }
+
+    fn with_temp_env_var<T>(key: &str, value: Option<OsString>, f: impl FnOnce() -> T) -> T {
+        let previous = std::env::var_os(key);
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        let result = f();
+        match previous {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        result
+    }
 
     #[test]
     fn test_normalize_path_more() {
@@ -221,6 +301,7 @@ mod tests {
 
     #[test]
     fn test_resolve_python_invalid_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("WILKES_PYTHON", "/tmp/nonexistent_python_12345");
         let result = resolve_python();
         // It might still succeed if it falls back to system path,
@@ -239,14 +320,43 @@ mod tests {
 
     #[test]
     fn test_resolve_python_with_env_var() {
-        let exe_path = std::env::current_exe().unwrap();
-        std::env::set_var("WILKES_PYTHON", exe_path.to_str().unwrap());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let python_path = write_fake_python(dir.path());
+        std::env::set_var("WILKES_PYTHON", python_path.to_str().unwrap());
 
         let result = resolve_python();
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), exe_path);
+        assert_eq!(result.unwrap(), python_path);
 
         std::env::remove_var("WILKES_PYTHON");
+    }
+
+    #[test]
+    fn test_python_candidate_is_usable_detects_failures() {
+        let dir = tempdir().unwrap();
+        let ok = write_named_fake_python(dir.path(), "python-ok", true);
+        let bad = write_named_fake_python(dir.path(), "python-bad", false);
+
+        assert!(python_candidate_is_usable(&ok));
+        assert!(!python_candidate_is_usable(&bad));
+    }
+
+    #[test]
+    fn test_resolve_python_skips_broken_path_candidate() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let broken = write_named_fake_python(dir.path(), "python3", false);
+        let working = write_named_fake_python(dir.path(), "python", true);
+        let path = std::env::join_paths([dir.path()]).unwrap();
+
+        let resolved = with_temp_env_var("WILKES_PYTHON", None, || {
+            with_temp_env_var("PATH", Some(path), || resolve_python())
+        })
+        .unwrap();
+
+        assert_eq!(resolved, working);
+        assert_ne!(resolved, broken);
     }
 
     #[test]
