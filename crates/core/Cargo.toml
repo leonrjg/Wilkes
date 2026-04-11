@@ -38,6 +38,7 @@ libc = "0.2"
 sqlite-vec = "0.1.9"
 strip-ansi-escapes = "0.2.1"
 which = "6"
+windows-sys = "0.61.2"
 
 [dependencies.ort]
 version = "=2.0.0-rc.11"

@@ -192,8 +192,8 @@ fn hf_sibling_matches_relevant(
 ) -> bool {
     relevant.contains(filename)
         || relevant
-            .iter()
-            .any(|f| filename.ends_with(&format!("/{f}")))
+        .iter()
+        .any(|f| filename.ends_with(&format!("/{f}")))
 }
 
 fn sum_matching_hf_sizes(
@@ -565,13 +565,8 @@ mod tests {
             "cpu".to_string(),
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let drain = tokio::spawn(async move {
-            while rx.recv().await.is_some() {}
-        });
-
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
         installer.install(dir.path(), tx).await.unwrap();
-        let _ = drain.await;
     }
 
     #[test]

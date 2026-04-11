@@ -55,7 +55,24 @@ pub(super) fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(super) fn pid_is_alive(pid: u32) -> bool {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle == null_mut() {
+        return false;
+    }
+    let rc = unsafe { WaitForSingleObject(handle, 0) };
+    unsafe { CloseHandle(handle) };
+    rc == WAIT_TIMEOUT
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(super) fn pid_is_alive(_pid: u32) -> bool {
     false
 }
@@ -69,7 +86,31 @@ fn send_signal(pid: u32, signal: i32, label: &str) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn force_kill_by_pid(pid: u32, label: &str) {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle == null_mut() {
+        tracing::warn!(
+            "WorkerProcess::{label}: OpenProcess(PROCESS_TERMINATE) failed for pid {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let rc = unsafe { TerminateProcess(handle, 1) };
+    if rc == 0 {
+        tracing::warn!(
+            "WorkerProcess::{label}: TerminateProcess failed for pid {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    unsafe { CloseHandle(handle) };
+}
+
+#[cfg(not(any(unix, windows)))]
 fn send_signal(_pid: u32, _signal: i32, _label: &str) {}
 
 pub(super) fn kill_after_timeout(pid: u32, timeout: Duration, label: &str) {
@@ -96,6 +137,8 @@ pub(super) fn kill_after_timeout(pid: u32, timeout: Duration, label: &str) {
         );
         #[cfg(unix)]
         send_signal(pid, libc::SIGKILL, label);
+        #[cfg(windows)]
+        force_kill_by_pid(pid, label);
     }
 }
 

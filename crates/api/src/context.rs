@@ -256,8 +256,8 @@ impl AppContext {
             settings.supported_extensions.clone(),
             settings.max_file_size,
         )
-        .await
-        .map_err(|err| format!("Failed to scan index root: {err}"))?;
+            .await
+            .map_err(|err| format!("Failed to scan index root: {err}"))?;
 
         if files.files.is_empty() {
             return Err(format!(
@@ -288,7 +288,7 @@ impl AppContext {
             &self.settings_path,
             serde_json::json!({ "semantic": semantic }),
         )
-        .await
+            .await
         {
             error!("update_semantic_settings: write: {e:#}");
         }
@@ -305,11 +305,11 @@ impl AppContext {
     pub fn is_semantic_ready(&self) -> bool {
         self.embedder.lock().is_some()
             && self
-                .index
-                .lock()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_some()
+            .index
+            .lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
     }
 
     // ── Search ────────────────────────────────────────────────────────────────
@@ -493,7 +493,7 @@ impl AppContext {
             &settings,
             "Choose a directory before building an index.",
         )
-        .await?;
+            .await?;
 
         Ok(BuildIndexPlan {
             root_path,
@@ -522,7 +522,7 @@ impl AppContext {
             &settings,
             "Choose a directory before downloading a model and building an index.",
         )
-        .await?;
+            .await?;
 
         Ok(DownloadModelPlan {
             device: settings.semantic.device_for(selected.engine).to_string(),
@@ -640,7 +640,7 @@ impl AppContext {
             enabled: true,
             ..s
         })
-        .await;
+            .await;
 
         self.events
             .emit("embed-done", serde_json::json!({ "operation": "Build" }));
@@ -797,7 +797,7 @@ impl AppContext {
                 data_dir.clone(),
                 progress_tx,
             )
-            .await;
+                .await;
 
             let _ = forward.await;
 
@@ -906,7 +906,7 @@ impl AppContext {
             index_path: None,
             ..s
         })
-        .await;
+            .await;
         Ok(())
     }
 
@@ -1031,7 +1031,7 @@ impl AppContext {
             index_path: None,
             ..s
         })
-        .await;
+            .await;
     }
 
     async fn load_restore_db_status(&self, settings: &Settings) -> Option<IndexStatus> {
@@ -1039,7 +1039,7 @@ impl AppContext {
             let d = self.data_dir.clone();
             move || SemanticIndex::read_status_from_path(&d)
         })
-        .await
+            .await
         {
             Ok(Ok(status)) => Some(status),
             Ok(Err(err)) => {
@@ -1144,7 +1144,7 @@ impl AppContext {
                 SemanticIndex::open(dir, model, dim)
             })
         })
-        .await
+            .await
         {
             Ok(Ok(index)) => Some(index),
             Ok(Err(err)) => {
@@ -1199,7 +1199,7 @@ impl AppContext {
                     IndexWatcher::start(
                         root, index_arc, registry, embedder, indexing, on_reindex, on_done,
                     )
-                    .map_err(Into::into)
+                        .map_err(Into::into)
                 },
             ) {
                 Ok(watcher) => *self.watcher.lock() = Some(watcher),
@@ -1222,7 +1222,7 @@ impl AppContext {
         self.update_semantic_settings(|s| {
             Self::restore_state_enabled_settings(s, db_path.clone(), plan.selected.clone(), dim)
         })
-        .await;
+            .await;
 
         info!("restore_state: embedder and index restored");
     }
@@ -1405,9 +1405,9 @@ mod tests {
             name == "embed-error"
                 && payload["operation"] == "Build"
                 && payload["message"].as_str().is_some_and(|msg| {
-                    msg.contains("Fatal embedder error while indexing /tmp/example.md")
-                        && msg.contains("inner worker failure")
-                })
+                msg.contains("Fatal embedder error while indexing /tmp/example.md")
+                    && msg.contains("inner worker failure")
+            })
         }));
     }
 
@@ -1760,7 +1760,7 @@ mod tests {
                 worker_bin: PathBuf::from("worker"),
                 data_dir: dir.path().to_path_buf(),
             })
-            .0,
+                .0,
             dir.path().to_path_buf(),
             &plan,
             tx,
@@ -1826,8 +1826,8 @@ mod tests {
                 done: false,
             },
         ))
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         drop(tx);
         forward.await.unwrap();
 
@@ -1856,7 +1856,7 @@ mod tests {
             EmbeddingEngine::Candle,
             Some(dir.path()),
         )
-        .unwrap();
+            .unwrap();
         let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
         let index_arc = ctx.restore_store_loaded_state(Arc::clone(&embedder), index);
 
@@ -2014,7 +2014,7 @@ mod tests {
             EmbeddingEngine::Candle,
             Some(dir.path()),
         )
-        .unwrap();
+            .unwrap();
         let index_arc = Arc::new(Mutex::new(Some(index)));
         let bad_root = dir.path().join("not-a-dir.txt");
         std::fs::write(&bad_root, "nope").unwrap();
@@ -2042,7 +2042,7 @@ mod tests {
             EmbeddingEngine::Candle,
             None,
         )
-        .unwrap();
+            .unwrap();
         let plan = RestoreStatePlan {
             settings: Settings::default(),
             db_status: IndexStatus {
@@ -2087,8 +2087,8 @@ mod tests {
                 "index_path": "semantic_index.db"
             }
         }))
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         let db_status = ctx.load_restore_db_status(&settings).await;
         assert!(db_status.is_none());
@@ -2108,7 +2108,7 @@ mod tests {
             EmbeddingEngine::Candle,
             Some(dir.path()),
         )
-        .unwrap();
+            .unwrap();
         let settings = Settings {
             semantic: SemanticSettings {
                 enabled: true,
@@ -2139,7 +2139,7 @@ mod tests {
             EmbeddingEngine::Candle,
             Some(&root),
         )
-        .unwrap();
+            .unwrap();
         let plan = BuildIndexPlan {
             root_path: root.clone(),
             device: "cpu".to_string(),
@@ -2184,7 +2184,7 @@ mod tests {
             EmbeddingEngine::Candle,
             None,
         )
-        .unwrap();
+            .unwrap();
         let index_arc = Arc::new(Mutex::new(Some(index)));
         let missing_root = PathBuf::from("/definitely/missing/watcher/root");
         let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
@@ -2210,7 +2210,7 @@ mod tests {
         let emitter = Arc::new(MockEmitter {
             events: Arc::clone(&events),
         });
-        let (ctx, _rx, loop_fut) = AppContext::new(
+        let (ctx, _rx, _loop) = AppContext::new(
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
@@ -2223,7 +2223,6 @@ mod tests {
             },
             emitter,
         );
-        tokio::spawn(loop_fut);
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
         let stale = ctx.data_dir.join("semantic_index.db.tmp");
@@ -2271,7 +2270,7 @@ mod tests {
         let emitter = Arc::new(MockEmitter {
             events: Arc::clone(&events),
         });
-        let (ctx, _rx, loop_fut) = AppContext::new(
+        let (ctx, _rx, _loop) = AppContext::new(
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
@@ -2284,7 +2283,6 @@ mod tests {
             },
             emitter,
         );
-        tokio::spawn(loop_fut);
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
 
@@ -2318,7 +2316,9 @@ mod tests {
         assert!(events.iter().any(|(name, payload)| {
             name == "embed-error"
                 && payload["operation"] == "Build"
-                && payload["message"].as_str().is_some_and(|msg| !msg.is_empty())
+                && payload["message"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("is not supported by fastembed"))
         }));
         assert!(events.iter().any(|(name, payload)| {
             name == "manager-event" && payload == &serde_json::json!("ReindexingCancelled")
@@ -2353,7 +2353,7 @@ mod tests {
             chunk_size: 1234,
             ..s
         })
-        .await;
+            .await;
 
         let updated = get_settings(&settings_path).await.unwrap();
         assert_eq!(updated.semantic.enabled, true);
@@ -2429,7 +2429,7 @@ mod tests {
             || {},
             || {},
         )
-        .unwrap();
+            .unwrap();
 
         *ctx.watcher.lock() = Some(watcher);
         ctx.stop_watcher();
@@ -2467,7 +2467,7 @@ mod tests {
             EmbeddingEngine::Candle,
             None,
         )
-        .unwrap();
+            .unwrap();
         *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
         assert!(ctx.is_semantic_ready());
     }
@@ -2547,7 +2547,7 @@ mod tests {
             || {},
             || {},
         )
-        .unwrap();
+            .unwrap();
         *ctx.watcher.lock() = Some(watcher);
 
         let cancel = CancellationToken::new();
@@ -3059,8 +3059,8 @@ mod tests {
             name == "embed-error"
                 && payload["operation"] == "Build"
                 && payload["message"]
-                    .as_str()
-                    .is_some_and(|msg| msg.contains("Index root not found"))
+                .as_str()
+                .is_some_and(|msg| msg.contains("Index root not found"))
         }));
     }
 
@@ -3221,7 +3221,7 @@ mod tests {
             EmbeddingEngine::Candle,
             Some(&root1),
         )
-        .unwrap();
+            .unwrap();
         *ctx.index.lock() = Arc::new(Mutex::new(Some(idx)));
 
         // Search in a different root
@@ -3296,7 +3296,7 @@ mod tests {
             EmbeddingEngine::Candle,
             None,
         )
-        .unwrap();
+            .unwrap();
         *ctx.index.lock() = Arc::new(Mutex::new(Some(idx)));
 
         let root2 = dir.path().join("root2");
@@ -3446,7 +3446,7 @@ mod tests {
             EmbeddingEngine::Candle,
             None,
         )
-        .unwrap();
+            .unwrap();
 
         let emitter = Arc::new(MockEmitter {
             events: Arc::new(Mutex::new(Vec::new())),
@@ -3533,7 +3533,7 @@ mod tests {
             data_dir.join("semantic_index.status.json"),
             r#"{"model_id": "m", "dimension": 1, "engine": "Candle"}"#,
         )
-        .unwrap();
+            .unwrap();
 
         ctx.delete_index().await.unwrap();
         assert!(!data_dir.join("semantic_index.db").exists());
@@ -3610,7 +3610,7 @@ mod tests {
             s.chunk_size = 1234;
             s
         })
-        .await;
+            .await;
 
         let settings = ctx.get_settings().await;
         assert_eq!(settings.semantic.chunk_size, 1234);
@@ -3622,7 +3622,7 @@ mod tests {
         let emitter = Arc::new(MockEmitter {
             events: Arc::new(Mutex::new(Vec::new())),
         });
-        let (ctx, _rx, loop_fut) = AppContext::new(
+        let (ctx, _rx, _loop) = AppContext::new(
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
@@ -3635,7 +3635,6 @@ mod tests {
             },
             emitter,
         );
-        tokio::spawn(loop_fut);
         std::fs::write(dir.path().join("file.txt"), "hello").unwrap();
 
         // Start a fake build index
@@ -3720,7 +3719,7 @@ mod tests {
             &settings_path,
             serde_json::to_string(&initial_settings).unwrap(),
         )
-        .unwrap();
+            .unwrap();
 
         // Create an index status file matching that model
         let index_dir = dir.path().join("index");
@@ -3740,7 +3739,7 @@ mod tests {
             index_dir.join("status.json"),
             serde_json::to_string(&status).unwrap(),
         )
-        .unwrap();
+            .unwrap();
 
         let (ctx, _rx, _loop) = AppContext::new(
             dir.path().to_path_buf(),
@@ -3855,7 +3854,7 @@ mod tests {
             EmbeddingEngine::Candle,
             Some(dir.path()),
         )
-        .unwrap();
+            .unwrap();
         drop(index);
 
         let index_path = data_dir.join("semantic_index.db");

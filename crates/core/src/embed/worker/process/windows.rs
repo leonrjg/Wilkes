@@ -96,9 +96,7 @@ impl WorkerProcess {
             .spawn()
             .map_err(|e| format!("Failed to spawn worker: {e}"))?;
 
-        if let Some(pid) = child.id() {
-            active_pid.store(pid, Ordering::Relaxed);
-        }
+        active_pid.store(child.id(), Ordering::Relaxed);
 
         let stdout = child
             .stdout
@@ -122,9 +120,7 @@ impl WorkerProcess {
         let result = tokio::task::spawn_blocking(move || {
             let mut inner = inner.lock().unwrap();
             let pid = inner.child.id();
-            if let Some(pid) = pid {
-                tracing::info!("WorkerProcess::shutdown: closing stdin for pid {pid}");
-            }
+            tracing::info!("WorkerProcess::shutdown: closing stdin for pid {pid}");
             drop(inner.child.stdin.take());
 
             match wait_for_process_exit(&mut inner.child, ROOF_KNOCK_TIMEOUT) {
@@ -132,7 +128,7 @@ impl WorkerProcess {
                 Ok(false) => {
                     tracing::warn!(
                         "WorkerProcess::shutdown: pid {} ignored EOF grace period, calling TerminateProcess",
-                        pid.unwrap_or(0)
+                        pid
                     );
                     terminate_process(&mut inner.child)?;
                     let exited = wait_for_process_exit(&mut inner.child, ROOF_KNOCK_TIMEOUT)?;
@@ -169,6 +165,7 @@ impl WorkerProcess {
     ) -> Result<(), ()> {
         let req_json = req_json.to_string();
         let reply = reply.clone();
+        let reply_outer = reply.clone();
         let inner = Arc::clone(&self.inner);
 
         let result = tokio::task::spawn_blocking(move || {
@@ -237,7 +234,7 @@ impl WorkerProcess {
             Ok(inner) => inner,
             Err(e) => {
                 tracing::warn!("WorkerProcess::send_request thread join failed: {e}");
-                let _ = reply
+                let _ = reply_outer
                     .send(WorkerEvent::Error(
                         "Worker request thread failed unexpectedly".to_string(),
                     ))
