@@ -379,7 +379,7 @@ impl EmbeddingEngine {
     pub fn default_model(&self) -> &'static str {
         match self {
             EmbeddingEngine::SBERT => "intfloat/e5-small-v2",
-            EmbeddingEngine::Candle => "sentence-transformers/all-MiniLM-L12-v2",
+            EmbeddingEngine::Candle => "sentence-transformers/all-MiniLM-L6-v2",
             EmbeddingEngine::Fastembed => "AllMiniLML6V2",
         }
     }

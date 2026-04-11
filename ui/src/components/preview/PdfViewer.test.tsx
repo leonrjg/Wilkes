@@ -33,6 +33,20 @@ const { mockUsePdfInnerSearch } = vi.hoisted(() => ({
   },
 }));
 
+const { mockUsePdfPageMetrics } = vi.hoisted(() => ({
+  mockUsePdfPageMetrics: {
+    value: {
+      pageMetrics: [
+        { width: 600, height: 800 },
+        { width: 600, height: 800 },
+        { width: 600, height: 800 },
+      ],
+      isLoadingPageMetrics: false,
+      hasPageMetrics: true,
+    },
+  },
+}));
+
 const mockPage = vi.fn(({ pageNumber, onLoadSuccess, onRenderSuccess }: any) => {
   if (onLoadSuccess && pageNumber === 1) {
     setTimeout(() => onLoadSuccess({ getViewport: () => ({ width: 600, height: 800 }) }), 0);
@@ -64,6 +78,14 @@ vi.mock("@tanstack/react-virtual", () => ({
 vi.mock("./usePdfInnerSearch", () => ({
   usePdfInnerSearch: vi.fn(() => mockUsePdfInnerSearch.value),
 }));
+
+vi.mock("./usePdfPageMetrics", async () => {
+  const actual = await vi.importActual<typeof import("./usePdfPageMetrics")>("./usePdfPageMetrics");
+  return {
+    ...actual,
+    usePdfPageMetrics: vi.fn(() => mockUsePdfPageMetrics.value),
+  };
+});
 
 // Mock ResizeObserver
 global.ResizeObserver = class {
@@ -100,6 +122,15 @@ describe("PdfViewer", () => {
       handleNextMatch: vi.fn(),
       handlePrevMatch: vi.fn(),
       handleSearchInputKeyDown: vi.fn(),
+    };
+    mockUsePdfPageMetrics.value = {
+      pageMetrics: [
+        { width: 600, height: 800 },
+        { width: 600, height: 800 },
+        { width: 600, height: 800 },
+      ],
+      isLoadingPageMetrics: false,
+      hasPageMetrics: true,
     };
     global.requestAnimationFrame = ((cb: FrameRequestCallback) => {
       cb(0);

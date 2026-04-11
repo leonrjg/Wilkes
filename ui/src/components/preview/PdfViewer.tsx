@@ -6,6 +6,7 @@ import "react-pdf/dist/Page/TextLayer.css";
 import type { BoundingBox } from "../../lib/types";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { usePdfInnerSearch } from "./usePdfInnerSearch";
+import { getScaledPageHeight, usePdfPageMetrics } from "./usePdfPageMetrics";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -19,11 +20,11 @@ export interface PdfViewerProps {
   onRenderSuccess?: () => void;
 }
 
+const PAGE_GAP_PX = 12;
+
 export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }: PdfViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState(600);
-  const [pageWidth, setPageWidth] = useState<number | null>(null);
-  const [pageAspectRatio, setPageAspectRatio] = useState<number | null>(null);
   const [numPages, setNumPages] = useState<number | null>(null);
   const [currentPage, setCurrentPage] = useState(page);
   const prevNavigationTargetRef = useRef<{ page: number; bbox: BoundingBox | null } | null>(null);
@@ -40,13 +41,31 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
   }, []);
 
   const renderedWidth = containerWidth * zoom;
+  const { pageMetrics, hasPageMetrics } = usePdfPageMetrics(pdf, url);
+
+  const getVirtualPageSize = useCallback(
+    (index: number) => {
+      const metric = pageMetrics[index];
+      if (!metric) return 900 + PAGE_GAP_PX;
+      return getScaledPageHeight(metric, renderedWidth) + PAGE_GAP_PX;
+    },
+    [pageMetrics, renderedWidth],
+  );
 
   const virtualizer = useVirtualizer({
-    count: numPages ?? 0,
+    count: hasPageMetrics ? pageMetrics.length : 0,
     getScrollElement: () => containerRef.current,
-    estimateSize: () => (pageAspectRatio ? pageAspectRatio * renderedWidth : 900),
+    estimateSize: getVirtualPageSize,
     overscan: 2,
   });
+  const virtualItems = virtualizer.getVirtualItems();
+  const totalSize = virtualizer.getTotalSize();
+  const paddingTop = virtualItems[0]?.start ?? 0;
+  const paddingBottom = (() => {
+    const lastItem = virtualItems[virtualItems.length - 1];
+    if (!lastItem) return 0;
+    return Math.max(totalSize - lastItem.start - getVirtualPageSize(lastItem.index), 0);
+  })();
 
   const scrollToPage = useCallback(
     (p: number) => virtualizer.scrollToIndex(p - 1, { align: "start" }),
@@ -110,23 +129,19 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
   }, []);
 
   useEffect(() => {
-    virtualizer.measure();
-  }, [pageAspectRatio, renderedWidth, virtualizer]);
-
-  useEffect(() => {
     const prevTarget = prevNavigationTargetRef.current;
     const navigationChanged =
       !prevTarget ||
       prevTarget.page !== page ||
       prevTarget.bbox !== highlight_bbox;
 
-    if (numPages && !isSearchOpen && navigationChanged) {
+    if (hasPageMetrics && !isSearchOpen && navigationChanged) {
       virtualizer.scrollToIndex(page - 1, { align: "start" });
       setCurrentPage(page);
     }
 
     prevNavigationTargetRef.current = { page, bbox: highlight_bbox };
-  }, [page, numPages, highlight_bbox, isSearchOpen, virtualizer]);
+  }, [page, hasPageMetrics, highlight_bbox, isSearchOpen, virtualizer]);
 
   useEffect(() => {
     if (numPages) {
@@ -135,12 +150,10 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
   }, [numPages]);
 
   useEffect(() => {
-    if (numPages) {
+    if (hasPageMetrics) {
       requestAnimationFrame(syncCurrentPageFromScroll);
     }
-  }, [numPages, zoom, syncCurrentPageFromScroll]);
-
-  const scale = pageWidth ? renderedWidth / pageWidth : 1;
+  }, [hasPageMetrics, zoom, syncCurrentPageFromScroll]);
 
   return (
     <div className="h-full relative flex flex-col">
@@ -242,9 +255,13 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
             setNumPages(doc.numPages);
           }}
         >
-          <div style={{ height: virtualizer.getTotalSize(), position: "relative", minWidth: "fit-content" }}>
-            {virtualizer.getVirtualItems().map((vItem) => {
+          <div style={{ paddingTop, paddingBottom, minWidth: "fit-content" }}>
+            {virtualItems.map((vItem) => {
               const pageNum = vItem.index + 1;
+              const pageMetric = pageMetrics[vItem.index];
+              if (!pageMetric) return null;
+              const pageScale = renderedWidth / pageMetric.width;
+              const pageHeight = getScaledPageHeight(pageMetric, renderedWidth);
 
               const isTargetPage = pageNum === page;
               const targetBbox = isTargetPage ? highlight_bbox : null;
@@ -259,10 +276,10 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
                 const { x, y, width, height } = activeBbox;
                 overlayStyle = {
                   position: "absolute",
-                  left: `${x * scale}px`,
-                  top: `${y * scale}px`,
-                  width: `${Math.max(width * scale, 4)}px`,
-                  height: `${Math.max(height * scale, 4)}px`,
+                  left: `${x * pageScale}px`,
+                  top: `${y * pageScale}px`,
+                  width: `${Math.max(width * pageScale, 4)}px`,
+                  height: `${Math.max(height * pageScale, 4)}px`,
                   backgroundColor: isSearchOpen
                     ? "rgba(59, 130, 246, 0.25)"
                     : "rgba(250, 204, 21, 0.25)",
@@ -278,9 +295,9 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
                 <div
                   key={vItem.key}
                   data-page-number={pageNum}
-                  style={{ position: "absolute", top: vItem.start, width: "100%" }}
+                  style={{ width: "100%", height: pageHeight + PAGE_GAP_PX }}
                 >
-                  <div style={{ position: "relative", display: "inline-block" }}>
+                  <div style={{ position: "relative", display: "inline-block", height: pageHeight }}>
                     <Page
                       pageNumber={pageNum}
                       width={renderedWidth}
@@ -292,15 +309,6 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
                           onRenderSuccess?.();
                         }
                       }}
-                      onLoadSuccess={
-                        pageNum === 1
-                          ? (p) => {
-                              const vp = p.getViewport({ scale: 1 });
-                              setPageWidth(vp.width);
-                              setPageAspectRatio(vp.height / vp.width);
-                            }
-                          : undefined
-                      }
                     />
                     {overlayStyle && <div style={overlayStyle} />}
                     {!isSearchOpen &&
@@ -308,9 +316,9 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
                       isTargetPage &&
                       (() => {
                         const { x, y, width, height } = targetBbox;
-                        const cx = (x + width / 2) * scale;
-                        const cy = (y + height / 2) * scale;
-                        const r = Math.max(width, height) * scale;
+                        const cx = (x + width / 2) * pageScale;
+                        const cy = (y + height / 2) * pageScale;
+                        const r = Math.max(width, height) * pageScale;
                         return (
                           <div
                             key={`${x}-${y}-${width}-${height}`}

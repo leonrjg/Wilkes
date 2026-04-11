@@ -101,7 +101,6 @@
 /* PDF Viewer Styling */
 .react-pdf__Page {
   background-color: transparent !important;
-  margin-bottom: 12px;
 }
 
 .react-pdf__Page canvas {
