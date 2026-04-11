@@ -158,7 +158,7 @@ fn create_job_for_child(child: &std::process::Child) -> Result<Arc<JobHandle>, S
     };
 
     let job = unsafe { CreateJobObjectW(null_mut(), null_mut()) };
-    if job == 0 {
+    if job == std::ptr::null_mut() {
         return Err(format!(
             "CreateJobObjectW failed: {}",
             std::io::Error::last_os_error()
