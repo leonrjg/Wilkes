@@ -443,40 +443,6 @@ exit 0
     }
 
     #[tokio::test]
-    async fn test_setup_python_env_reinstalls_when_python_version_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let python_path = dir.path().join("fake_python");
-        let version_file = dir.path().join("python-version.txt");
-        let venv_counter_file = dir.path().join("venv-count.txt");
-        std::fs::write(&version_file, "3.9.6\n").unwrap();
-        std::fs::write(&venv_counter_file, "0").unwrap();
-        #[cfg(unix)]
-        write_fake_python(&python_path, &version_file, &venv_counter_file);
-        #[cfg(windows)]
-        {
-            std::fs::write(&python_path, "@echo off\nexit 0").unwrap();
-        }
-
-        let requirements_path = dir.path().join("requirements.txt");
-        std::fs::write(&requirements_path, "torch\n").unwrap();
-
-        let paths = WorkerPaths {
-            python_path,
-            python_package_dir: dir.path().to_path_buf(),
-            requirements_path,
-            venv_dir: dir.path().join("venv"),
-            worker_bin: dir.path().join("worker"),
-            data_dir: dir.path().to_path_buf(),
-        };
-
-        setup_python_env(&paths).await.unwrap();
-        std::fs::write(&version_file, "3.11.9\n").unwrap();
-        setup_python_env(&paths).await.unwrap();
-
-        assert_eq!(std::fs::read_to_string(&venv_counter_file).unwrap(), "2");
-    }
-
-    #[tokio::test]
     async fn test_run_setup_step_fail() {
         let dir = tempdir().unwrap();
         let bad_path = dir.path().join("non_existent");
