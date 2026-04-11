@@ -220,6 +220,11 @@ impl AppContext {
         }
     }
 
+    fn prepare_for_full_rebuild(&self) {
+        self.stop_watcher();
+        *self.index.lock() = Arc::new(Mutex::new(None));
+    }
+
     fn embed_task_is_running(&self) -> bool {
         if self.embed_cancel_in_progress.load(Ordering::Acquire) {
             return true;
@@ -421,7 +426,7 @@ impl AppContext {
             }
         };
 
-        self.stop_watcher();
+        self.prepare_for_full_rebuild();
         self.events
             .emit("manager-event", serde_json::json!("Reindexing"));
 
@@ -2434,6 +2439,58 @@ mod tests {
         *ctx.watcher.lock() = Some(watcher);
         ctx.stop_watcher();
         assert!(ctx.watcher.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_for_full_rebuild_stops_watcher_and_drops_resident_index() {
+        let dir = tempdir().unwrap();
+        let emitter = Arc::new(MockEmitter {
+            events: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths {
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: dir.path().to_path_buf(),
+            },
+            emitter,
+        );
+
+        let index = SemanticIndex::create(
+            &ctx.data_dir,
+            "rebuild-model",
+            384,
+            EmbeddingEngine::Candle,
+            Some(dir.path()),
+        )
+        .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
+
+        let watcher = IndexWatcher::start(
+            dir.path().to_path_buf(),
+            ctx.index.lock().clone(),
+            Arc::new(ExtractorRegistry::new()),
+            Arc::new(MockEmbedder::default()),
+            IndexingConfig {
+                chunk_size: 100,
+                chunk_overlap: 10,
+                supported_extensions: vec![],
+            },
+            || {},
+            || {},
+        )
+        .unwrap();
+        *ctx.watcher.lock() = Some(watcher);
+
+        ctx.prepare_for_full_rebuild();
+
+        assert!(ctx.watcher.lock().is_none());
+        assert!(ctx.index.lock().lock().unwrap().is_none());
     }
 
     #[tokio::test]
