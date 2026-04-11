@@ -727,7 +727,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/non-existent-data-dir"),
             device: "cpu".to_string(),
         };
-        let res = loader.load(&key).await;
+        let res = loader.load(&key, None).await;
         assert!(res.is_err());
     }
 

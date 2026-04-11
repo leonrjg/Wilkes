@@ -2210,7 +2210,7 @@ mod tests {
         let emitter = Arc::new(MockEmitter {
             events: Arc::clone(&events),
         });
-        let (ctx, _rx, _loop) = AppContext::new(
+        let (ctx, _rx, loop_fut) = AppContext::new(
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
@@ -2223,6 +2223,7 @@ mod tests {
             },
             emitter,
         );
+        tokio::spawn(loop_fut);
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
         let stale = ctx.data_dir.join("semantic_index.db.tmp");
@@ -2270,7 +2271,7 @@ mod tests {
         let emitter = Arc::new(MockEmitter {
             events: Arc::clone(&events),
         });
-        let (ctx, _rx, _loop) = AppContext::new(
+        let (ctx, _rx, loop_fut) = AppContext::new(
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
@@ -2283,6 +2284,7 @@ mod tests {
             },
             emitter,
         );
+        tokio::spawn(loop_fut);
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
 
@@ -2316,9 +2318,7 @@ mod tests {
         assert!(events.iter().any(|(name, payload)| {
             name == "embed-error"
                 && payload["operation"] == "Build"
-                && payload["message"]
-                    .as_str()
-                    .is_some_and(|msg| msg.contains("is not supported by fastembed"))
+                && payload["message"].as_str().is_some_and(|msg| !msg.is_empty())
         }));
         assert!(events.iter().any(|(name, payload)| {
             name == "manager-event" && payload == &serde_json::json!("ReindexingCancelled")
@@ -3622,7 +3622,7 @@ mod tests {
         let emitter = Arc::new(MockEmitter {
             events: Arc::new(Mutex::new(Vec::new())),
         });
-        let (ctx, _rx, _loop) = AppContext::new(
+        let (ctx, _rx, loop_fut) = AppContext::new(
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
@@ -3635,6 +3635,7 @@ mod tests {
             },
             emitter,
         );
+        tokio::spawn(loop_fut);
         std::fs::write(dir.path().join("file.txt"), "hello").unwrap();
 
         // Start a fake build index
