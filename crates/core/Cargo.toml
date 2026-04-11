@@ -38,7 +38,6 @@ libc = "0.2"
 sqlite-vec = "0.1.9"
 strip-ansi-escapes = "0.2.1"
 which = "6"
-windows-sys = "0.61.2"
 
 [dependencies.ort]
 version = "=2.0.0-rc.11"
@@ -88,8 +87,9 @@ optional = true
 features = ["metal"]
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
 
