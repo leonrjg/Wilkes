@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use super::ipc::{WorkerEvent, WorkerRequest};
@@ -44,6 +45,30 @@ pub(super) const ROOF_KNOCK_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(any(test, windows))]
 pub(super) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+pub(super) trait ActiveStopper: Send + Sync {
+    fn force_stop(&self, label: &str);
+}
+
+fn active_stopper_slot() -> &'static Mutex<Option<Arc<dyn ActiveStopper>>> {
+    static SLOT: OnceLock<Mutex<Option<Arc<dyn ActiveStopper>>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+pub(super) fn register_active_stopper(stopper: Arc<dyn ActiveStopper>) {
+    *active_stopper_slot().lock().unwrap() = Some(stopper);
+}
+
+pub(super) fn clear_active_stopper() {
+    *active_stopper_slot().lock().unwrap() = None;
+}
+
+pub(super) fn force_stop_active(label: &str) {
+    let stopper = active_stopper_slot().lock().unwrap().clone();
+    if let Some(stopper) = stopper {
+        stopper.force_stop(label);
+    }
+}
+
 #[cfg(unix)]
 pub(super) fn pid_is_alive(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as i32, 0) };
@@ -78,67 +103,11 @@ pub(super) fn pid_is_alive(_pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn send_signal(pid: u32, signal: i32, label: &str) {
-    let rc = unsafe { libc::kill(pid as i32, signal) };
+pub(super) fn hard_kill_pid(pid: u32, label: &str) {
+    let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     if rc != 0 {
         let err = std::io::Error::last_os_error();
-        tracing::warn!("WorkerProcess::{label}: failed to signal pid {pid}: {err}");
-    }
-}
-
-#[cfg(windows)]
-fn force_kill_by_pid(pid: u32, label: &str) {
-    use std::ptr::null_mut;
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if handle == null_mut() {
-        tracing::warn!(
-            "WorkerProcess::{label}: OpenProcess(PROCESS_TERMINATE) failed for pid {pid}: {}",
-            std::io::Error::last_os_error()
-        );
-        return;
-    }
-    let rc = unsafe { TerminateProcess(handle, 1) };
-    if rc == 0 {
-        tracing::warn!(
-            "WorkerProcess::{label}: TerminateProcess failed for pid {pid}: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    unsafe { CloseHandle(handle) };
-}
-
-#[cfg(not(any(unix, windows)))]
-fn send_signal(_pid: u32, _signal: i32, _label: &str) {}
-
-pub(super) fn kill_after_timeout(pid: u32, timeout: Duration, label: &str) {
-    if pid == 0 {
-        return;
-    }
-
-    tracing::info!(
-        "WorkerProcess::{label}: waiting up to {:?} for pid {pid} to exit after EOF",
-        timeout
-    );
-
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if !pid_is_alive(pid) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    if pid_is_alive(pid) {
-        tracing::warn!(
-            "WorkerProcess::{label}: pid {pid} ignored EOF grace period, sending SIGKILL"
-        );
-        #[cfg(unix)]
-        send_signal(pid, libc::SIGKILL, label);
-        #[cfg(windows)]
-        force_kill_by_pid(pid, label);
+        tracing::warn!("WorkerProcess::{label}: failed to SIGKILL pid {pid}: {err}");
     }
 }
 
@@ -596,8 +565,8 @@ exit 0
     }
 
     #[test]
-    fn test_roof_knock_pid_zero() {
-        kill_after_timeout(0, Duration::from_millis(1), "test");
+    fn test_force_stop_active_without_registered_worker_is_noop() {
+        force_stop_active("test");
     }
 
     #[tokio::test]

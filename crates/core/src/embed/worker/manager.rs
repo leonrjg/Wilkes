@@ -1,12 +1,11 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 use super::ipc::{WorkerEvent, WorkerRequest};
-use super::process::{kill_after_timeout, ROOF_KNOCK_TIMEOUT};
+use super::process::force_stop_active;
 use super::runtime::supervised_manager_loop;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -78,7 +77,6 @@ type SenderSlot = Arc<std::sync::Mutex<mpsc::Sender<ManagerCommand>>>;
 #[derive(Clone)]
 pub struct WorkerManager {
     sender: SenderSlot,
-    active_pid: Arc<AtomicU32>,
     /// Status snapshot updated by the manager loop; readable without going through the loop.
     status: Arc<RwLock<WorkerStatus>>,
 }
@@ -115,7 +113,6 @@ impl WorkerManager {
         (
             Self {
                 sender,
-                active_pid,
                 status,
             },
             event_rx,
@@ -150,22 +147,8 @@ impl WorkerManager {
     }
 
     pub fn request_shutdown(&self) {
+        std::thread::spawn(move || force_stop_active("request_shutdown"));
         let _ = self.try_send(ManagerCommand::ShutdownWorker);
-        self.roof_knock_active(ROOF_KNOCK_TIMEOUT);
-    }
-
-    pub fn roof_knock_active(&self, timeout: Duration) {
-        let pid = self.active_pid.load(Ordering::Relaxed);
-        if pid != 0 {
-            let active_pid = Arc::clone(&self.active_pid);
-            std::thread::spawn(move || {
-                kill_after_timeout(pid, timeout, "request_shutdown");
-                if !super::process::pid_is_alive(pid) {
-                    let _ =
-                        active_pid.compare_exchange(pid, 0, Ordering::Relaxed, Ordering::Relaxed);
-                }
-            });
-        }
     }
 }
 

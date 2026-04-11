@@ -6,15 +6,97 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use super::{
-    apply_command_plan, build_command_plan, parse_worker_stdout_line, ProtocolReadOutcome,
+    apply_command_plan, build_command_plan, clear_active_stopper, parse_worker_stdout_line,
+    pid_is_alive, register_active_stopper, ActiveStopper, ProtocolReadOutcome,
     ROOF_KNOCK_TIMEOUT,
 };
 use crate::embed::worker::ipc::{WorkerEvent, WorkerRequest};
 use crate::embed::worker::manager::WorkerPaths;
 
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+
+struct JobHandle {
+    handle: HANDLE,
+}
+
+unsafe impl Send for JobHandle {}
+unsafe impl Sync for JobHandle {}
+
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
+struct WindowsStopper {
+    pid: u32,
+    job: Arc<JobHandle>,
+}
+
+impl ActiveStopper for WindowsStopper {
+    fn force_stop(&self, label: &str) {
+        let pid = self.pid;
+        if pid == 0 {
+            return;
+        }
+
+        tracing::info!(
+            "WorkerProcess::{label}: waiting up to {:?} for pid {pid} to exit after EOF",
+            ROOF_KNOCK_TIMEOUT
+        );
+        let start = std::time::Instant::now();
+        while start.elapsed() < ROOF_KNOCK_TIMEOUT {
+            if !pid_is_alive(pid) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        if !pid_is_alive(pid) {
+            return;
+        }
+
+        tracing::warn!(
+            "WorkerProcess::{label}: pid {pid} ignored EOF grace period, hard-killing tree"
+        );
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        let rc = unsafe { TerminateJobObject(self.job.handle, 1) };
+        if rc == 0 {
+            tracing::warn!(
+                "WorkerProcess::{label}: TerminateJobObject failed for pid {pid}: {}",
+                std::io::Error::last_os_error()
+            );
+            terminate_process_by_pid(pid, label);
+        }
+    }
+}
+
+fn terminate_process_by_pid(pid: u32, label: &str) {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle == null_mut() {
+        tracing::warn!(
+            "WorkerProcess::{label}: OpenProcess(PROCESS_TERMINATE) failed for pid {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let rc = unsafe { TerminateProcess(handle, 1) };
+    if rc == 0 {
+        tracing::warn!(
+            "WorkerProcess::{label}: TerminateProcess failed for pid {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    unsafe { CloseHandle(handle) };
+}
+
 struct WorkerInner {
     child: std::process::Child,
     stdout: BufReader<std::process::ChildStdout>,
+    _job: Arc<JobHandle>,
 }
 
 pub(crate) struct WorkerProcess {
@@ -47,7 +129,7 @@ fn wait_for_process_exit(
     timeout: std::time::Duration,
 ) -> Result<bool, String> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     let handle = child.as_raw_handle() as HANDLE;
@@ -65,20 +147,53 @@ fn wait_for_process_exit(
     }
 }
 
-fn terminate_process(child: &mut std::process::Child) -> Result<(), String> {
+fn create_job_for_child(child: &std::process::Child) -> Result<Arc<JobHandle>, String> {
+    use std::mem::{size_of, zeroed};
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::System::Threading::TerminateProcess;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
 
-    let handle = child.as_raw_handle() as HANDLE;
-    let rc = unsafe { TerminateProcess(handle, 1) };
-    if rc == 0 {
+    let job = unsafe { CreateJobObjectW(null_mut(), null_mut()) };
+    if job == 0 {
         return Err(format!(
-            "TerminateProcess failed: {}",
+            "CreateJobObjectW failed: {}",
             std::io::Error::last_os_error()
         ));
     }
-    Ok(())
+
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let rc = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &mut info as *mut _ as *mut _,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if rc == 0 {
+        unsafe { CloseHandle(job) };
+        return Err(format!(
+            "SetInformationJobObject failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let process_handle = child.as_raw_handle() as HANDLE;
+    let rc = unsafe { AssignProcessToJobObject(job, process_handle) };
+    if rc == 0 {
+        unsafe { CloseHandle(job) };
+        return Err(format!(
+            "AssignProcessToJobObject failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(Arc::new(JobHandle { handle: job }))
 }
 
 impl WorkerProcess {
@@ -96,7 +211,14 @@ impl WorkerProcess {
             .spawn()
             .map_err(|e| format!("Failed to spawn worker: {e}"))?;
 
-        active_pid.store(child.id(), Ordering::Relaxed);
+        let job = create_job_for_child(&child)?;
+
+        let pid = child.id();
+        active_pid.store(pid, Ordering::Relaxed);
+        register_active_stopper(Arc::new(WindowsStopper {
+            pid,
+            job: Arc::clone(&job),
+        }));
 
         let stdout = child
             .stdout
@@ -111,6 +233,7 @@ impl WorkerProcess {
             inner: Arc::new(Mutex::new(WorkerInner {
                 child,
                 stdout: BufReader::new(stdout),
+                _job: job,
             })),
         })
     }
@@ -119,32 +242,11 @@ impl WorkerProcess {
         let inner = Arc::clone(&self.inner);
         let result = tokio::task::spawn_blocking(move || {
             let mut inner = inner.lock().unwrap();
-            let pid = inner.child.id();
-            tracing::info!("WorkerProcess::shutdown: closing stdin for pid {pid}");
             drop(inner.child.stdin.take());
-
+            super::force_stop_active("shutdown");
             match wait_for_process_exit(&mut inner.child, ROOF_KNOCK_TIMEOUT) {
-                Ok(true) => Ok(()),
-                Ok(false) => {
-                    tracing::warn!(
-                        "WorkerProcess::shutdown: pid {} ignored EOF grace period, calling TerminateProcess",
-                        pid
-                    );
-                    terminate_process(&mut inner.child)?;
-                    let exited = wait_for_process_exit(&mut inner.child, ROOF_KNOCK_TIMEOUT)?;
-                    if !exited {
-                        return Err(
-                            "Worker did not exit after TerminateProcess within timeout".to_string()
-                        );
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    tracing::warn!("WorkerProcess::shutdown: graceful wait failed: {e}");
-                    terminate_process(&mut inner.child)?;
-                    let _ = wait_for_process_exit(&mut inner.child, ROOF_KNOCK_TIMEOUT);
-                    Ok(())
-                }
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
             }
         })
         .await;
@@ -154,7 +256,7 @@ impl WorkerProcess {
         } else if let Ok(Err(e)) = result {
             tracing::warn!("{e}");
         }
-
+        clear_active_stopper();
         pid_slot.store(0, Ordering::Relaxed);
     }
 
