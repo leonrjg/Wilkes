@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use super::{
     apply_command_plan, build_command_plan, clear_active_stopper, parse_worker_stdout_line,
-    pid_is_alive, register_active_stopper, ActiveStopper, ProtocolReadOutcome,
+    register_active_stopper, ActiveStopper, ProtocolReadOutcome,
     ROOF_KNOCK_TIMEOUT,
 };
 use crate::embed::worker::ipc::{WorkerEvent, WorkerRequest};
@@ -46,14 +46,7 @@ impl ActiveStopper for WindowsStopper {
         );
         let start = std::time::Instant::now();
         while start.elapsed() < ROOF_KNOCK_TIMEOUT {
-            if !pid_is_alive(pid) {
-                return;
-            }
             std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-
-        if !pid_is_alive(pid) {
-            return;
         }
 
         tracing::warn!(
