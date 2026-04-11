@@ -35,7 +35,7 @@ describe("TauriSearchApi", () => {
   });
 
   it("should call invoke for listFiles", async () => {
-    (invoke as any).mockResolvedValue([]);
+    (invoke as any).mockResolvedValue({ files: [], omitted: [] });
     await api.listFiles("/some/root");
     expect(invoke).toHaveBeenCalledWith("list_files", { root: "/some/root" });
   });

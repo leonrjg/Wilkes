@@ -20,7 +20,7 @@ use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
-    EmbedderModel, FileEntry, IndexStatus, IndexingConfig, PreviewData, SearchMode, SearchQuery,
+    EmbedderModel, IndexStatus, IndexingConfig, PreviewData, SearchMode, SearchQuery,
     SelectedEmbedder, SemanticSettings, Settings,
 };
 
@@ -193,7 +193,7 @@ impl AppContext {
         get_settings(&self.settings_path).await.unwrap_or_default()
     }
 
-    pub async fn list_files(&self, root: PathBuf) -> anyhow::Result<Vec<FileEntry>> {
+    pub async fn list_files(&self, root: PathBuf) -> anyhow::Result<wilkes_core::types::FileListResponse> {
         let s = self.get_settings().await;
         crate::commands::files::list_files(root, s.supported_extensions, s.max_file_size).await
     }
@@ -253,7 +253,7 @@ impl AppContext {
         .await
         .map_err(|err| format!("Failed to scan index root: {err}"))?;
 
-        if files.is_empty() {
+        if files.files.is_empty() {
             return Err(format!(
                 "No supported files found in selected directory: {}",
                 root.display()
@@ -2688,7 +2688,7 @@ mod tests {
         );
 
         let files = ctx.list_files(root.to_path_buf()).await.unwrap();
-        assert!(files.len() >= 2);
+        assert!(files.files.len() >= 2);
 
         let preview = ctx.open_file(root.join("test.txt")).await.unwrap();
         match preview {

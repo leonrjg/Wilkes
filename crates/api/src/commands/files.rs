@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
 use ignore::WalkBuilder;
-use wilkes_core::types::{ByteRange, FileEntry, FileType, PreviewData};
+use wilkes_core::types::{
+    ByteRange, FileEntry, FileListResponse, FileType, OmittedFileEntry, OmittedFileReason,
+    PreviewData,
+};
 
 use super::preview::detect_language;
 
@@ -9,9 +12,10 @@ pub async fn list_files(
     root: PathBuf,
     supported_extensions: Vec<String>,
     max_file_size: u64,
-) -> anyhow::Result<Vec<FileEntry>> {
+) -> anyhow::Result<FileListResponse> {
     tokio::task::spawn_blocking(move || {
-        let mut entries = Vec::new();
+        let mut files = Vec::new();
+        let mut omitted = Vec::new();
         for result in WalkBuilder::new(&root).build() {
             let entry = match result {
                 Ok(e) => e,
@@ -23,23 +27,45 @@ pub async fn list_files(
                 .unwrap_or(false)
             {
                 let path = entry.path().to_path_buf();
-
-                // File size filter
-                let meta = entry.metadata().ok();
-                let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                if max_file_size > 0 && size_bytes > max_file_size {
-                    continue;
-                }
-
-                let Some(file_type) = FileType::detect(&path, &supported_extensions) else {
-                    continue;
-                };
                 let extension = path
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                entries.push(FileEntry {
+
+                // File size filter
+                let meta = entry.metadata().ok();
+                let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let file_type = FileType::detect(&path, &supported_extensions);
+
+                if file_type.is_none() {
+                    omitted.push(OmittedFileEntry {
+                        file: FileEntry {
+                            path,
+                            size_bytes,
+                            file_type: FileType::PlainText,
+                            extension,
+                        },
+                        reason: OmittedFileReason::UnsupportedExtension,
+                    });
+                    continue;
+                }
+                let file_type = file_type.expect("checked is_some above");
+
+                if max_file_size > 0 && size_bytes > max_file_size {
+                    omitted.push(OmittedFileEntry {
+                        file: FileEntry {
+                            path,
+                            size_bytes,
+                            file_type,
+                            extension,
+                        },
+                        reason: OmittedFileReason::TooLarge,
+                    });
+                    continue;
+                }
+
+                files.push(FileEntry {
                     path,
                     size_bytes,
                     file_type,
@@ -47,8 +73,9 @@ pub async fn list_files(
                 });
             }
         }
-        entries.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(entries)
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        omitted.sort_by(|a, b| a.file.path.cmp(&b.file.path));
+        Ok(FileListResponse { files, omitted })
     })
     .await?
 }
@@ -94,7 +121,9 @@ mod tests {
         let extensions = vec!["txt".to_string(), "pdf".to_string()];
         let files = list_files(root.to_path_buf(), extensions, 0).await.unwrap();
 
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.files.len(), 2);
+        assert_eq!(files.omitted.len(), 1);
+        assert_eq!(files.omitted[0].reason, OmittedFileReason::UnsupportedExtension);
     }
 
     #[tokio::test]
@@ -109,8 +138,11 @@ mod tests {
         // Filter to 5 bytes
         let files = list_files(root.to_path_buf(), extensions, 5).await.unwrap();
 
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path.file_name().unwrap(), "small.txt");
+        assert_eq!(files.files.len(), 1);
+        assert_eq!(files.files[0].path.file_name().unwrap(), "small.txt");
+        assert_eq!(files.omitted.len(), 1);
+        assert_eq!(files.omitted[0].file.path.file_name().unwrap(), "large.txt");
+        assert_eq!(files.omitted[0].reason, OmittedFileReason::TooLarge);
     }
 
     #[tokio::test]
@@ -172,7 +204,7 @@ mod tests {
         let extensions = vec!["txt".to_string()];
         let files = list_files(root.to_path_buf(), extensions, 0).await.unwrap();
 
-        assert!(files.iter().any(|entry| entry.path.ends_with("ok.txt")));
+        assert!(files.files.iter().any(|entry| entry.path.ends_with("ok.txt")));
 
         let mut perms = fs::metadata(&bad_dir).unwrap().permissions();
         perms.set_mode(0o755);

@@ -4,7 +4,7 @@ import { buildRows, COLLAPSED_LIMIT, type Row } from "../lib/utils/flattenResult
 import { useToasts } from "./Toast";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
-import type { Match, MatchRef, SourceOrigin, FileEntry } from "../lib/types";
+import type { Match, MatchRef, SourceOrigin, FileEntry, OmittedFileEntry } from "../lib/types";
 
 function originLabel(origin: SourceOrigin): string {
   if ("TextFile" in origin) return `L${origin.TextFile.line}`;
@@ -65,16 +65,22 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
 
   const excluded = useSettingsStore((s) => s.excluded);
   const fileList = useSettingsStore((s) => s.fileList);
+  const omittedFileList = useSettingsStore((s) => s.omittedFileList);
   const filterText = useSettingsStore((s) => s.filterText);
   const setFilterText = useSettingsStore((s) => s.setFilterText);
   const indexing = useSettingsStore((s) => s.indexing);
 
   const parentRef = useRef<HTMLDivElement>(null);
   const [expandedFiles, setExpandedFiles] = useState<Set<number>>(new Set());
+  const [showOmittedFiles, setShowOmittedFiles] = useState(false);
 
   useEffect(() => {
     if (results.length === 0) setExpandedFiles(new Set());
   }, [results.length]);
+
+  useEffect(() => {
+    if (omittedFileList.length === 0) setShowOmittedFiles(false);
+  }, [omittedFileList.length]);
 
   useEffect(() => {
     if (!stats || stats.errors.length === 0) return;
@@ -102,11 +108,14 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
   const totalCount = results.reduce((n, fm) => n + fm.matches.length, 0);
 
   if (!hasQuery) {
-    const filteredList = filteredFileList.filter((entry) => {
+    const omittedFiles = omittedFileList.filter((f) => !excluded.has(f.extension));
+    const matchesFilter = (entry: FileEntry) => {
       if (!filterText) return true;
       const search = filterText.toLowerCase();
       return entry.path.toLowerCase().includes(search);
-    });
+    };
+    const filteredVisibleFiles = filteredFileList.filter(matchesFilter);
+    const filteredOmittedFiles = omittedFiles.filter((entry) => matchesFilter(entry));
 
     return (
       <div className="flex flex-col h-full overflow-hidden relative bg-[var(--bg-app)]">
@@ -124,7 +133,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
         )}
         <div className="px-3 py-1.5 text-xs text-[var(--text-muted)] border-b border-[var(--border-main)] flex-shrink-0 flex items-center gap-2">
           <div className="flex-shrink-0 whitespace-nowrap">
-            {indexing ? "Indexing..." : `${filteredFileList.length} files`}
+            {indexing ? "Indexing..." : `${filteredFileList.length} file${filteredFileList.length === 1 ? "" : "s"}`}
           </div>
           <span className="text-[var(--text-dim)]">/</span>
           <input
@@ -136,7 +145,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
           />
         </div>
         <div className="flex-1 overflow-y-auto">
-          {filteredList.map((entry) => (
+          {filteredVisibleFiles.map((entry) => (
             <FileEntryRow
               key={entry.path}
               entry={entry}
@@ -144,9 +153,37 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
               onClick={() => onFileClick(entry.path)}
             />
           ))}
-          {filteredList.length === 0 && filteredFileList.length > 0 && (
+          {filteredVisibleFiles.length === 0 && filteredFileList.length > 0 && (
             <div className="px-3 py-8 text-center text-xs text-[var(--text-dim)] italic">
               No files match "{filterText}"
+            </div>
+          )}
+          {filteredOmittedFiles.length > 0 && (
+            <div className="mt-2 px-3 text-[11px] text-[var(--text-dim)]">
+              <button
+                type="button"
+                onClick={() => setShowOmittedFiles((shown) => !shown)}
+                className="w-full flex items-center justify-between gap-3 text-left hover:text-[var(--text-muted)] transition-colors"
+              >
+                <span>
+                  {filteredOmittedFiles.length} file{filteredOmittedFiles.length === 1 ? "" : "s"} omitted from this list
+                </span>
+                <span className="text-[10px] uppercase tracking-wider">
+                  {showOmittedFiles ? "Hide" : "Show"}
+                </span>
+              </button>
+              {showOmittedFiles && (
+                <div className="mt-2">
+                  {filteredOmittedFiles.map((entry) => (
+                    <div key={entry.path} className="py-1.5">
+                      <div className="truncate">{fileName(entry.path)}</div>
+                      <div className="text-[10px] opacity-75 truncate">
+                        {formatOmittedReason(entry)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -251,6 +288,15 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
       </div>
     </div>
   );
+}
+
+function formatOmittedReason(entry: OmittedFileEntry): string {
+  if (entry.reason === "TooLarge") {
+    return `${formatSize(entry.size_bytes)} exceeds current file size limit`;
+  }
+  return entry.extension
+    ? `.${entry.extension} is not in the allowed extensions`
+    : "File extension is not in the allowed extensions";
 }
 
 function FileHeader({ path, count, onClick }: { path: string; count: number; onClick: () => void }) {

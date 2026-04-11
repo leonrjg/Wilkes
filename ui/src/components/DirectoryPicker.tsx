@@ -48,12 +48,12 @@ export default function DirectoryPicker({
   }, [bookmarks, recentDirs, directory]);
 
   return (
-    <div className="flex items-center gap-1 min-w-0">
-      <div className="flex items-center gap-0.5 bg-[var(--bg-active)] rounded overflow-hidden">
+    <div className="flex items-center gap-1 min-w-0 w-full">
+      <div className="flex h-6 items-center gap-0.5 bg-[var(--bg-active)] rounded overflow-hidden">
         <button
           onClick={onPickDirectory}
           title={directory || "Choose directory"}
-          className="text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] px-2 py-1 flex-shrink-0 flex items-center gap-1.5"
+          className="h-full text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] px-3 flex-shrink-0 flex items-center gap-1.5"
         >
           <Folder size={12} />
           <span>Open folder</span>
@@ -62,7 +62,7 @@ export default function DirectoryPicker({
 
       {/* Folders list (Bookmarks + History) */}
       {displayDirs.length > 0 && (
-        <div className="flex items-center gap-1 overflow-x-auto max-w-[400px] custom-scrollbar">
+        <div className="flex items-center gap-1 overflow-x-auto flex-1 min-w-0 custom-scrollbar">
           {displayDirs.map((b) => {
             const bookmarked = isBookmarked(b);
             const active = b === directory;
@@ -70,7 +70,7 @@ export default function DirectoryPicker({
             return (
               <div
                 key={b}
-                className={`flex items-center gap-0.5 rounded transition-colors group bg-[var(--bg-active)]`}
+                className={`flex h-6 items-center gap-0.5 rounded transition-colors group bg-[var(--bg-active)]`}
               >
                 {onForgetDirectory && (
                   <button
@@ -80,7 +80,7 @@ export default function DirectoryPicker({
                       if (confirmed) onForgetDirectory(b);
                     }}
                     title="Remove from history"
-                    className="text-[10px] pl-1.5 py-1 text-[var(--text-dim)] hover:text-[var(--text-error)] transition-colors"
+                    className="h-full text-[10px] pl-1.5 pr-1 text-[var(--text-dim)] hover:text-[var(--text-error)] transition-colors"
                   >
                     <X size={12} />
                   </button>
@@ -88,7 +88,7 @@ export default function DirectoryPicker({
                 <button
                   onClick={() => onChange(b)}
                   title={b}
-                  className={`text-xs px-2 py-1 flex-shrink-0 truncate max-w-[100px] transition-colors ${
+                  className={`h-full text-xs px-2 flex-shrink-0 truncate max-w-[100px] transition-colors ${
                     active
                       ? "text-[var(--text-main)] font-bold"
                       : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
@@ -103,7 +103,7 @@ export default function DirectoryPicker({
                       bookmarked ? onBookmarkRemove(b) : onBookmarkAdd(b);
                     }}
                     title={bookmarked ? "Remove bookmark" : "Bookmark this directory"}
-                    className={`text-[10px] px-1 py-1 transition-colors ${
+                    className={`h-full text-[10px] px-1.5 transition-colors ${
                       bookmarked
                         ? "text-[var(--accent-blue)]"
                         : "text-[var(--text-dim)] hover:text-[var(--accent-blue)]"

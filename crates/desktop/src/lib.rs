@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::task::JoinHandle;
 use wilkes_api::context::{AppContext, EventEmitter};
-use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
-    DataPaths, EmbeddingEngine, FileEntry, IndexStatus, ModelDescriptor, SelectedEmbedder, Settings,
+    DataPaths, EmbeddingEngine, FileListResponse, IndexStatus, ModelDescriptor, SelectedEmbedder,
+    Settings,
 };
 
 mod platform;
@@ -29,7 +29,7 @@ fn data_paths_from(app_data: String) -> DataPaths {
     DataPaths { app_data }
 }
 
-async fn list_files_for_ctx(ctx: Arc<AppContext>, root: String) -> Result<Vec<FileEntry>, String> {
+async fn list_files_for_ctx(ctx: Arc<AppContext>, root: String) -> Result<FileListResponse, String> {
     ctx.list_files(root.into()).await.map_err(|e| e.to_string())
 }
 
@@ -273,7 +273,7 @@ async fn preview(
 }
 
 #[tauri::command]
-async fn list_files(root: String, app: AppHandle) -> Result<Vec<FileEntry>, String> {
+async fn list_files(root: String, app: AppHandle) -> Result<FileListResponse, String> {
     list_files_for_ctx(app_context(&app), root).await
 }
 
@@ -446,6 +446,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use wilkes_api::context::EventEmitter;
+    use wilkes_core::embed::worker::manager::WorkerPaths;
 
     static OPEN_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -787,7 +788,7 @@ mod tests {
         let files = list_files_for_ctx(ctx, dir.path().display().to_string())
             .await
             .unwrap();
-        assert!(!files.is_empty());
+        assert!(!files.files.is_empty());
     }
 
     #[tokio::test]

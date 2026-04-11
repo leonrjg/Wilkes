@@ -154,8 +154,8 @@ describe("HttpSearchApi", () => {
     expect(res).toEqual(mockData);
   });
 
-  it("listFiles calls fetch and returns FileEntry[]", async () => {
-    const mockFiles = [{ name: "test.txt", path: "test.txt", is_dir: false }];
+  it("listFiles calls fetch and returns file list response", async () => {
+    const mockFiles = { files: [{ path: "test.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" }], omitted: [] };
     (fetch as any).mockResolvedValue({
       ok: true,
       json: () => Promise.resolve(mockFiles),

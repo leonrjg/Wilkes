@@ -6,7 +6,7 @@ import type {
   EmbedError,
   EmbedProgress,
   EmbeddingEngine,
-  FileEntry,
+  FileListResponse,
   FileMatches,
   IndexStatus,
   MatchRef,
@@ -65,8 +65,8 @@ export class TauriSearchApi implements SearchApi {
     return invoke<Settings>("update_settings", { patch });
   }
 
-  async listFiles(root: string): Promise<FileEntry[]> {
-    return invoke<FileEntry[]>("list_files", { root });
+  async listFiles(root: string): Promise<FileListResponse> {
+    return invoke<FileListResponse>("list_files", { root });
   }
 
   async openFile(path: string): Promise<PreviewData> {

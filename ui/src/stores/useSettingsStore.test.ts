@@ -22,6 +22,7 @@ describe("useSettingsStore", () => {
       contextLines: 2,
       supportedExtensions: [],
       fileList: [],
+      omittedFileList: [],
       filterText: "",
       excluded: new Set(),
       preferSemantic: false,
@@ -50,7 +51,10 @@ describe("useSettingsStore", () => {
     };
 
     (api.getSettings as any).mockResolvedValue(mockSettings);
-    (api.listFiles as any).mockResolvedValue([{ path: "/path/1/file.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" }]);
+    (api.listFiles as any).mockResolvedValue({
+      files: [{ path: "/path/1/file.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" }],
+      omitted: [],
+    });
     await useSettingsStore.getState().load();
     // Allow the directory-change subscription to resolve its async listFiles call
     await Promise.resolve();
@@ -82,7 +86,7 @@ describe("useSettingsStore", () => {
 
   it("should update directory", async () => {
     (api.updateSettings as any).mockResolvedValue({});
-    (api.listFiles as any).mockResolvedValue([]);
+    (api.listFiles as any).mockResolvedValue({ files: [], omitted: [] });
 
     useSettingsStore.getState().setDirectory("/new/path");
 
@@ -92,10 +96,29 @@ describe("useSettingsStore", () => {
     expect(api.updateSettings).toHaveBeenCalled();
   });
 
+  it("should not reorder an existing recent directory when selecting it", async () => {
+    (api.updateSettings as any).mockResolvedValue({});
+    (api.listFiles as any).mockResolvedValue({ files: [], omitted: [] });
+    useSettingsStore.setState({
+      recentDirs: ["/older/path", "/current/path", "/newer/path"],
+      directory: "/older/path",
+    });
+
+    useSettingsStore.getState().setDirectory("/current/path");
+
+    const state = useSettingsStore.getState();
+    expect(state.directory).toBe("/current/path");
+    expect(state.recentDirs).toEqual(["/older/path", "/current/path", "/newer/path"]);
+    expect(api.updateSettings).toHaveBeenCalledWith({
+      last_directory: "/current/path",
+      recent_dirs: ["/older/path", "/current/path", "/newer/path"],
+    });
+  });
+
   it("should load file list reactively when directory changes", async () => {
     const mockFile = { path: "/dir/file.ts", size_bytes: 10, file_type: "PlainText", extension: "ts" };
     (api.updateSettings as any).mockResolvedValue({});
-    (api.listFiles as any).mockResolvedValue([mockFile]);
+    (api.listFiles as any).mockResolvedValue({ files: [mockFile], omitted: [] });
 
     useSettingsStore.getState().setDirectory("/dir");
     await Promise.resolve();
@@ -105,7 +128,11 @@ describe("useSettingsStore", () => {
   });
 
   it("should clear file list reactively when directory is removed", async () => {
-    useSettingsStore.setState({ directory: "/some/dir", fileList: [{ path: "/some/dir/f.ts", size_bytes: 1, file_type: "PlainText", extension: "ts" }] });
+    useSettingsStore.setState({
+      directory: "/some/dir",
+      fileList: [{ path: "/some/dir/f.ts", size_bytes: 1, file_type: "PlainText", extension: "ts" }],
+      omittedFileList: [],
+    });
     (api.updateSettings as any).mockResolvedValue({});
 
     useSettingsStore.getState().forgetDirectory("/some/dir");

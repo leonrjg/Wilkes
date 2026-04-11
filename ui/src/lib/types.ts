@@ -96,6 +96,17 @@ export interface FileEntry {
   extension: string;
 }
 
+export interface FileListResponse {
+  files: FileEntry[];
+  omitted: OmittedFileEntry[];
+}
+
+export interface OmittedFileEntry extends FileEntry {
+  reason: OmittedFileReason;
+}
+
+export type OmittedFileReason = "TooLarge" | "UnsupportedExtension";
+
 /** HuggingFace model code, e.g. "BAAI/bge-base-en-v1.5". */
 export type EmbedderModel = string;
 

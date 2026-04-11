@@ -43,6 +43,7 @@ describe("ResultList", () => {
     useSettingsStore.setState({
       excluded: new Set(),
       fileList: [],
+      omittedFileList: [],
       filterText: "",
       setFilterText: vi.fn(),
       indexing: false,
@@ -52,6 +53,29 @@ describe("ResultList", () => {
   it("renders empty state when no query", () => {
     renderWithToasts();
     expect(screen.getByPlaceholderText("Filter files...")).toBeInTheDocument();
+  });
+
+  it("renders omitted files in a muted footer", () => {
+    useSettingsStore.setState({
+      fileList: [
+        { path: "/test/visible.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" },
+      ],
+      omittedFileList: [
+        { path: "/test/large.pdf", size_bytes: 15 * 1024 * 1024, file_type: "Pdf", extension: "pdf", reason: "TooLarge" },
+      ],
+    });
+
+    renderWithToasts();
+
+    expect(screen.getByText("1 file")).toBeInTheDocument();
+    expect(screen.getByText("visible.txt")).toBeInTheDocument();
+    expect(screen.getByText("1 file omitted from this list")).toBeInTheDocument();
+    expect(screen.queryByText("large.pdf")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /1 file omitted from this list/i }));
+
+    expect(screen.getByText("large.pdf")).toBeInTheDocument();
+    expect(screen.getByText(/exceeds current file size limit/)).toBeInTheDocument();
   });
 
   it("renders results when searching", () => {

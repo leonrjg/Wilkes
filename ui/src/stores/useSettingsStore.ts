@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import { api } from "../services";
-import type { FileEntry, SemanticSettings, Settings, Theme } from "../lib/types";
+import type { FileEntry, OmittedFileEntry, SemanticSettings, Settings, Theme } from "../lib/types";
 
 const EMPTY_EXCLUDED: Set<string> = new Set();
 
@@ -26,6 +26,7 @@ interface SettingsStore {
   contextLines: number;
   supportedExtensions: string[];
   fileList: FileEntry[];
+  omittedFileList: OmittedFileEntry[];
   filterText: string;
   excluded: Set<string>;
   preferSemantic: boolean;
@@ -59,6 +60,7 @@ export const useSettingsStore = create<SettingsStore>()(
     contextLines: 2,
     supportedExtensions: [],
     fileList: [],
+    omittedFileList: [],
     filterText: "",
     excluded: EMPTY_EXCLUDED,
     preferSemantic: false,
@@ -88,12 +90,13 @@ export const useSettingsStore = create<SettingsStore>()(
         preferSemantic: s.search_prefer_semantic,
         theme: s.theme,
         maxResults: s.max_results ?? 0,
+        omittedFileList: [],
       });
     },
 
     setDirectory: (dir: string) => {
       const { recentDirs, directory } = get();
-      const next = [dir, ...recentDirs.filter((d) => d !== dir)].slice(0, 10);
+      const next = recentDirs.includes(dir) ? recentDirs : [...recentDirs, dir].slice(-10);
       api.updateSettings({ last_directory: dir, recent_dirs: next }).catch(() => {});
       if (dir === directory) {
         // Subscription only fires on value change; refresh explicitly when directory is unchanged.
@@ -137,7 +140,7 @@ export const useSettingsStore = create<SettingsStore>()(
       const { directory } = get();
       if (!directory) return;
       api.listFiles(directory)
-        .then((files) => set({ fileList: files }))
+        .then((response) => set({ fileList: response.files, omittedFileList: response.omitted }))
         .catch(() => {});
     },
 
@@ -176,6 +179,7 @@ export const useSettingsStore = create<SettingsStore>()(
         preferSemantic: settings.search_prefer_semantic,
         theme: settings.theme,
         maxResults: settings.max_results ?? 0,
+        omittedFileList: [],
       });
     },
 
@@ -196,10 +200,16 @@ useSettingsStore.subscribe(
     if (directory) {
       api
         .listFiles(directory)
-        .then((files) => useSettingsStore.setState({ fileList: files, excluded: EMPTY_EXCLUDED, filterText: "" }))
+        .then((response) =>
+          useSettingsStore.setState({
+            fileList: response.files,
+            omittedFileList: response.omitted,
+            excluded: EMPTY_EXCLUDED,
+            filterText: "",
+          }))
         .catch(() => {});
     } else {
-      useSettingsStore.setState({ fileList: [], excluded: EMPTY_EXCLUDED, filterText: "" });
+      useSettingsStore.setState({ fileList: [], omittedFileList: [], excluded: EMPTY_EXCLUDED, filterText: "" });
     }
   }
 );

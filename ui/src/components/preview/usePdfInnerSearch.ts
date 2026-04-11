@@ -108,6 +108,16 @@ export function usePdfInnerSearch(
     setCurrentMatchIdx((prev) => (prev - 1 + innerMatches.length) % innerMatches.length);
   };
 
+  const handleSearchInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    if (e.shiftKey) {
+      handlePrevMatch();
+      return;
+    }
+    handleNextMatch();
+  };
+
   return {
     searchInputRef,
     isSearchOpen,
@@ -119,5 +129,6 @@ export function usePdfInnerSearch(
     isSearching,
     handleNextMatch,
     handlePrevMatch,
+    handleSearchInputKeyDown,
   };
 }

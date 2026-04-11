@@ -3,7 +3,7 @@ import type {
   EmbedError,
   EmbedProgress,
   EmbeddingEngine,
-  FileEntry,
+  FileListResponse,
   FileMatches,
   IndexStatus,
   MatchRef,
@@ -119,10 +119,10 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<Settings>;
   }
 
-  async listFiles(root: string): Promise<FileEntry[]> {
+  async listFiles(root: string): Promise<FileListResponse> {
     const res = await fetch(`/api/files?root=${encodeURIComponent(root)}`);
     if (!res.ok) throw new Error(`listFiles failed: ${res.status}`);
-    return res.json() as Promise<FileEntry[]>;
+    return res.json() as Promise<FileListResponse>;
   }
 
   async openFile(path: string): Promise<PreviewData> {

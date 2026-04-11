@@ -93,6 +93,40 @@ describe("usePdfInnerSearch", () => {
     expect(result.current.currentMatchIdx).toBe(1); // Wrapped backwards
   });
 
+  it("advances on Enter and goes backward on Shift+Enter", async () => {
+    const { result } = renderHook(() => usePdfInnerSearch(mockPdf as any, scrollToPage));
+
+    act(() => {
+      result.current.setIsSearchOpen(true);
+      result.current.setInnerQuery("hello");
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+    });
+
+    const preventDefault = vi.fn();
+
+    act(() => {
+      result.current.handleSearchInputKeyDown({
+        key: "Enter",
+        shiftKey: false,
+        preventDefault,
+      } as any);
+    });
+    expect(preventDefault).toHaveBeenCalled();
+    expect(result.current.currentMatchIdx).toBe(1);
+
+    act(() => {
+      result.current.handleSearchInputKeyDown({
+        key: "Enter",
+        shiftKey: true,
+        preventDefault: vi.fn(),
+      } as any);
+    });
+    expect(result.current.currentMatchIdx).toBe(0);
+  });
+
   it("closes search on Escape", () => {
     const { result } = renderHook(() => usePdfInnerSearch(null, scrollToPage));
     

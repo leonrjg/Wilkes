@@ -3,7 +3,7 @@ import type {
   EmbedError,
   EmbedProgress,
   EmbeddingEngine,
-  FileEntry,
+  FileListResponse,
   FileMatches,
   IndexStatus,
   MatchRef,
@@ -30,7 +30,7 @@ export interface SearchApi {
   preview(matchRef: MatchRef): Promise<PreviewData>;
   getSettings(): Promise<Settings>;
   updateSettings(patch: Partial<Settings>): Promise<Settings>;
-  listFiles(root: string): Promise<FileEntry[]>;
+  listFiles(root: string): Promise<FileListResponse>;
   openFile(path: string): Promise<PreviewData>;
   resolvePdfUrl(path: string): string;
   getLogs(): Promise<string[]>;

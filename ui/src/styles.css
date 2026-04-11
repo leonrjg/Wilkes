@@ -110,7 +110,7 @@
 }
 
 .pdf-dark-mode .react-pdf__Page canvas {
-  background-color: transparent !important;
+  background-color: white !important;
   filter: invert(0.9) hue-rotate(180deg) brightness(1.1);
   box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.5);
 }

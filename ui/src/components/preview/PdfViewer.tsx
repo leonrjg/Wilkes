@@ -26,6 +26,7 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
   const [pageAspectRatio, setPageAspectRatio] = useState<number | null>(null);
   const [numPages, setNumPages] = useState<number | null>(null);
   const [currentPage, setCurrentPage] = useState(page);
+  const prevNavigationTargetRef = useRef<{ page: number; bbox: BoundingBox | null } | null>(null);
   const [zoom, setZoom] = useState(1.0);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
@@ -92,6 +93,7 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
     isSearching,
     handleNextMatch,
     handlePrevMatch,
+    handleSearchInputKeyDown,
   } = usePdfInnerSearch(pdf, scrollToPage);
 
   useEffect(() => {
@@ -101,7 +103,6 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
       const w = entries[0].contentRect.width;
       if (w > 0) {
         setContainerWidth(w);
-        virtualizer.measure();
       }
     });
     ro.observe(el);
@@ -110,14 +111,22 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
 
   useEffect(() => {
     virtualizer.measure();
-  }, [zoom]);
+  }, [pageAspectRatio, renderedWidth, virtualizer]);
 
   useEffect(() => {
-    if (numPages && !isSearchOpen) {
+    const prevTarget = prevNavigationTargetRef.current;
+    const navigationChanged =
+      !prevTarget ||
+      prevTarget.page !== page ||
+      prevTarget.bbox !== highlight_bbox;
+
+    if (numPages && !isSearchOpen && navigationChanged) {
       virtualizer.scrollToIndex(page - 1, { align: "start" });
       setCurrentPage(page);
     }
-  }, [page, numPages, highlight_bbox, isSearchOpen]);
+
+    prevNavigationTargetRef.current = { page, bbox: highlight_bbox };
+  }, [page, numPages, highlight_bbox, isSearchOpen, virtualizer]);
 
   useEffect(() => {
     if (numPages) {
@@ -146,6 +155,7 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
                 placeholder="Find in document..."
                 value={innerQuery}
                 onChange={(e) => setInnerQuery(e.target.value)}
+                onKeyDown={handleSearchInputKeyDown}
                 className="bg-transparent border-none outline-none px-2 py-1 text-xs text-[var(--text-main)] placeholder-[var(--text-dim)] w-48"
               />
             </div>
@@ -216,7 +226,9 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
       <div
         ref={containerRef}
         className={`flex-1 overflow-auto bg-[var(--bg-sidebar)] pr-1 ${isDark ? "pdf-dark-mode" : ""}`}
-        onScroll={() => requestAnimationFrame(syncCurrentPageFromScroll)}
+        onScroll={() => {
+          requestAnimationFrame(syncCurrentPageFromScroll);
+        }}
         style={{
           WebkitUserSelect: "text",
           userSelect: "text",
@@ -274,7 +286,7 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
                       width={renderedWidth}
                       renderAnnotationLayer={false}
                       renderTextLayer={true}
-                      canvasBackground="transparent"
+                      canvasBackground="white"
                       onRenderSuccess={() => {
                         if (pageNum === page || (!page && pageNum === 1)) {
                           onRenderSuccess?.();
@@ -286,7 +298,6 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
                               const vp = p.getViewport({ scale: 1 });
                               setPageWidth(vp.width);
                               setPageAspectRatio(vp.height / vp.width);
-                              virtualizer.measure();
                             }
                           : undefined
                       }

@@ -8,7 +8,7 @@ vi.mock("../services", () => ({
   api: {
     getIndexStatus: vi.fn(),
     buildIndex: vi.fn().mockResolvedValue(undefined),
-    listFiles: vi.fn().mockResolvedValue([]),
+    listFiles: vi.fn().mockResolvedValue({ files: [], omitted: [] }),
   },
 }));
 

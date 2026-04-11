@@ -676,6 +676,26 @@ pub struct FileEntry {
     pub extension: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileListResponse {
+    pub files: Vec<FileEntry>,
+    #[serde(default)]
+    pub omitted: Vec<OmittedFileEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OmittedFileEntry {
+    #[serde(flatten)]
+    pub file: FileEntry,
+    pub reason: OmittedFileReason,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OmittedFileReason {
+    TooLarge,
+    UnsupportedExtension,
+}
+
 // ── Paths ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
