@@ -140,7 +140,9 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
       setCurrentPage(page);
     }
 
-    prevNavigationTargetRef.current = { page, bbox: highlight_bbox };
+    if (hasPageMetrics) {
+      prevNavigationTargetRef.current = { page, bbox: highlight_bbox };
+    }
   }, [page, hasPageMetrics, highlight_bbox, isSearchOpen, virtualizer]);
 
   useEffect(() => {

@@ -64,7 +64,11 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
     );
   }
 
-  if (!displayData) {
+  const isPdfFile = "PdfPage" in selectedMatch.origin;
+  const pdfPage = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.page : 1;
+  const pdfBbox = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.bbox : null;
+
+  if (!isPdfFile && !displayData) {
     return (
       <div className="flex items-center justify-center h-full text-[var(--text-muted)] text-sm animate-pulse">
         Loading…
@@ -123,22 +127,22 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
             </div>
           </div>
         )}
-        {"Text" in displayData ? (
+        {isPdfFile ? (
+          <PdfViewer
+            key={api.resolvePdfUrl(selectedMatch.path)}
+            url={api.resolvePdfUrl(selectedMatch.path)}
+            page={pdfPage}
+            highlight_bbox={pdfBbox}
+            onRenderSuccess={() => setIsPdfRendering(false)}
+          />
+        ) : displayData && "Text" in displayData ? (
           <CodeViewer
             content={displayData.Text.content}
             language={displayData.Text.language}
             highlightLine={displayData.Text.highlight_line}
             highlightRange={displayData.Text.highlight_range}
           />
-        ) : (
-          <PdfViewer
-            key={api.resolvePdfUrl(selectedMatch.path)}
-            url={api.resolvePdfUrl(selectedMatch.path)}
-            page={displayData.Pdf.page}
-            highlight_bbox={displayData.Pdf.highlight_bbox}
-            onRenderSuccess={() => setIsPdfRendering(false)}
-          />
-        )}
+        ) : null}
       </div>
     </div>
   );

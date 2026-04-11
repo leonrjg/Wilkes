@@ -29,7 +29,7 @@ vi.mock("./services", () => ({
     getIndexStatus: vi.fn(() => Promise.resolve(null)),
     isSemanticReady: vi.fn(() => Promise.resolve(true)),
     getDataPaths: vi.fn(() => Promise.resolve({ app_data: "" })),
-    listFiles: vi.fn(() => Promise.resolve([])),
+    listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
   },
   source: {
     type: "desktop",

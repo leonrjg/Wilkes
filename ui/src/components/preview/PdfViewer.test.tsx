@@ -222,6 +222,49 @@ describe("PdfViewer", () => {
     });
   });
 
+  it("scrolls to target page when metrics arrive after mount", async () => {
+    // Regression: prevNavigationTargetRef was set unconditionally in the scroll
+    // effect, even when hasPageMetrics was false. This meant that when metrics
+    // later became available the effect saw navigationChanged === false and
+    // skipped the scroll entirely, leaving pages beyond the initial viewport
+    // (roughly page 4+) unreachable on first load.
+    mockUsePdfPageMetrics.value = {
+      pageMetrics: [],
+      isLoadingPageMetrics: true,
+      hasPageMetrics: false,
+    };
+
+    const onRenderSuccess = vi.fn();
+    const { rerender } = render(
+      <PdfViewer url="test.pdf" page={7} highlight_bbox={null} onRenderSuccess={onRenderSuccess} />,
+    );
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    // No scroll while metrics are pending
+    expect(mockVirtualizer.scrollToIndex).not.toHaveBeenCalled();
+
+    // Metrics arrive
+    mockUsePdfPageMetrics.value = {
+      pageMetrics: Array.from({ length: 10 }, () => ({ width: 600, height: 800 })),
+      isLoadingPageMetrics: false,
+      hasPageMetrics: true,
+    };
+
+    rerender(
+      <PdfViewer url="test.pdf" page={7} highlight_bbox={null} onRenderSuccess={onRenderSuccess} />,
+    );
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    // Must scroll to page 7 (0-based index 6)
+    expect(mockVirtualizer.scrollToIndex).toHaveBeenCalledWith(6, { align: "start" });
+  });
+
   it("does not snap back to the original page when inner search closes", async () => {
     mockUsePdfInnerSearch.value = {
       ...mockUsePdfInnerSearch.value,
