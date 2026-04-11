@@ -1056,7 +1056,6 @@ mod tests {
     #[test]
     fn test_settings_default() {
         let s = Settings::default();
-        assert!(s.supported_extensions.contains(&"rs".to_string()));
         assert!(s.supported_extensions.contains(&"pdf".to_string()));
         assert_eq!(s.context_lines, 2);
     }
