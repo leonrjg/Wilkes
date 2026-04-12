@@ -17,8 +17,8 @@
 </table>
 
 ## Features
-- Document viewer with highlighted matches
-- **Local semantic search**: data is embedded using open-source models, no cloud
+- Document viewer with match highlighting
+- **Local semantic search**: uses open-source embedding models; no cloud
   - You can choose from a set of predefined models or any HuggingFace model
 - Fully configurable: adjust embedding chunk size and overlap, or just use the default settings
 - Cross-platform: works on Windows, Linux, and macOS
@@ -34,7 +34,6 @@
 Docker allows you to run software in isolation from your system.
 
 ```shell
-docker pull ghcr.io/leonrjg/wilkes:latest
 docker run --rm -p 2000:2000 -v wilkes-data:/data ghcr.io/leonrjg/wilkes:latest
 # Now you can visit localhost:2000
 ```
@@ -70,7 +69,7 @@ The app supports multiple engines to maximize model availability:
   - Default model: `e5-small-v2`
   - This has the widest variety of models, but you need to have Python installed. The environment is automatically set up by the app.
 - **Candle**
-  - Default model: `all-miniLM-L12-v2`
+  - Default model: `all-miniLM-L6-v2`
 
 ## Q&A
 - What model should I use?
@@ -97,7 +96,7 @@ The app supports multiple engines to maximize model availability:
 If you have feature requests, feel free to open an issue (or a PR).
 
 ### Contributing
-<img alt="Coverage" src="https://img.shields.io/badge/coverage-84%25-green" />
+<img alt="Coverage" src="https://img.shields.io/badge/coverage-82%25-green" />
 Contributions are welcome! Please fork the repository and submit a pull request with your changes.
 
 ### License
