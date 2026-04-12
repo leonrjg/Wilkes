@@ -47,6 +47,9 @@ docker compose up
 # Now you can visit localhost:2000
 ```
 
+### Demo
+You can visit https://demo.wilkes.app to use the app online with your own sample files.
+The demo is reset every hour.
 
 ## Why? | Similar software
 - [Recoll](https://www.recoll.org/) is complex and has no first-party PDF support
