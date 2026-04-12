@@ -64,12 +64,14 @@ fn terminate_job_tree(job: &Arc<JobHandle>, pid: u32, label: &str) {
 
 struct WorkerInner {
     child: std::process::Child,
-    stdout: BufReader<std::process::ChildStdout>,
-    _job: Arc<JobHandle>,
+    job: Arc<JobHandle>,
 }
 
+#[derive(Clone)]
 pub(crate) struct WorkerProcess {
-    inner: Arc<Mutex<WorkerInner>>,
+    child: Arc<Mutex<WorkerInner>>,
+    stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
+    stdout: Arc<Mutex<BufReader<std::process::ChildStdout>>>,
 }
 
 fn spawn_stderr_forwarder(stderr: std::process::ChildStderr) {
@@ -185,6 +187,7 @@ impl WorkerProcess {
         let pid = child.id();
         active_pid.store(pid, Ordering::Relaxed);
 
+        let stdin = child.stdin.take();
         let stdout = child
             .stdout
             .take()
@@ -195,20 +198,22 @@ impl WorkerProcess {
         }
 
         Ok(Self {
-            inner: Arc::new(Mutex::new(WorkerInner {
+            child: Arc::new(Mutex::new(WorkerInner {
                 child,
-                stdout: BufReader::new(stdout),
-                _job: job,
+                job,
             })),
+            stdin: Arc::new(Mutex::new(stdin)),
+            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
         })
     }
 
-    pub(crate) async fn shutdown(&mut self, pid_slot: &AtomicU32) {
-        let inner = Arc::clone(&self.inner);
+    pub(crate) async fn shutdown(&self, pid_slot: &AtomicU32) {
+        let child = Arc::clone(&self.child);
+        let stdin = Arc::clone(&self.stdin);
         let result = tokio::task::spawn_blocking(move || {
-            let mut inner = inner.lock().unwrap();
+            drop(stdin.lock().unwrap().take());
+            let mut inner = child.lock().unwrap();
             let pid = inner.child.id();
-            drop(inner.child.stdin.take());
             tracing::info!(
                 "WorkerProcess::shutdown: sent EOF to pid {pid}; waiting up to {:?} for graceful exit",
                 ROOF_KNOCK_TIMEOUT
@@ -224,7 +229,7 @@ impl WorkerProcess {
                     tracing::warn!(
                         "WorkerProcess::shutdown: pid {pid} did not exit during grace period; hard-killing tree"
                     );
-                    terminate_job_tree(&inner._job, pid, "shutdown");
+                    terminate_job_tree(&inner.job, pid, "shutdown");
                     let _ = inner
                         .child
                         .wait()
@@ -245,20 +250,19 @@ impl WorkerProcess {
     }
 
     pub(crate) async fn send_request(
-        &mut self,
+        &self,
         req_json: &str,
         reply: &mpsc::Sender<WorkerEvent>,
     ) -> Result<(), ()> {
         let req_json = req_json.to_string();
         let reply = reply.clone();
         let reply_outer = reply.clone();
-        let inner = Arc::clone(&self.inner);
+        let stdin = Arc::clone(&self.stdin);
+        let stdout = Arc::clone(&self.stdout);
 
         let result = tokio::task::spawn_blocking(move || {
-            let mut inner = inner.lock().unwrap();
-
             let mut success = false;
-            if let Some(stdin) = inner.child.stdin.as_mut() {
+            if let Some(stdin) = stdin.lock().unwrap().as_mut() {
                 if stdin.write_all(req_json.as_bytes()).is_ok()
                     && stdin.write_all(b"\n").is_ok()
                     && stdin.flush().is_ok()
@@ -274,10 +278,11 @@ impl WorkerProcess {
                 return Err(());
             }
 
+            let mut stdout = stdout.lock().unwrap();
             let mut line = String::new();
             loop {
                 line.clear();
-                match inner.stdout.read_line(&mut line) {
+                match stdout.read_line(&mut line) {
                     Ok(0) => {
                         let _ = reply.blocking_send(WorkerEvent::Error(
                             "Worker process closed stdout unexpectedly".to_string(),

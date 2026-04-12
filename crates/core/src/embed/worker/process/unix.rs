@@ -1,8 +1,10 @@
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use super::{
@@ -12,9 +14,15 @@ use super::{
 use crate::embed::worker::ipc::{WorkerEvent, WorkerRequest};
 use crate::embed::worker::manager::WorkerPaths;
 
-pub(crate) struct WorkerProcess {
+struct WorkerInner {
     child: tokio::process::Child,
-    stdout: BufReader<tokio::process::ChildStdout>,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkerProcess {
+    child: Arc<Mutex<WorkerInner>>,
+    stdin: Arc<Mutex<Option<tokio::process::ChildStdin>>>,
+    stdout: Arc<Mutex<BufReader<tokio::process::ChildStdout>>>,
 }
 
 async fn spawn_stderr_forwarder(stderr: tokio::process::ChildStderr) {
@@ -50,6 +58,7 @@ impl WorkerProcess {
             active_pid.store(pid, Ordering::Relaxed);
         }
 
+        let stdin = child.stdin.take();
         let stdout = child
             .stdout
             .take()
@@ -60,24 +69,26 @@ impl WorkerProcess {
         }
 
         Ok(Self {
-            child,
-            stdout: BufReader::new(stdout),
+            child: Arc::new(Mutex::new(WorkerInner { child })),
+            stdin: Arc::new(Mutex::new(stdin)),
+            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
         })
     }
 
-    pub(crate) async fn shutdown(&mut self, pid_slot: &AtomicU32) {
-        let pid = self.child.id().unwrap_or(0);
-        drop(self.child.stdin.take());
+    pub(crate) async fn shutdown(&self, pid_slot: &AtomicU32) {
+        let pid = self.child.lock().await.child.id().unwrap_or(0);
+        drop(self.stdin.lock().await.take());
         tracing::info!(
             "WorkerProcess::shutdown: sent EOF to pid {pid}; waiting up to {:?} for graceful exit",
             ROOF_KNOCK_TIMEOUT
         );
-        if timeout(ROOF_KNOCK_TIMEOUT, self.child.wait()).await.is_err() {
+        let mut child = self.child.lock().await;
+        if timeout(ROOF_KNOCK_TIMEOUT, child.child.wait()).await.is_err() {
             tracing::warn!(
                 "WorkerProcess::shutdown: pid {pid} did not exit during grace period; hard-killing"
             );
-            let _ = self.child.kill().await;
-            let _ = self.child.wait().await;
+            let _ = child.child.kill().await;
+            let _ = child.child.wait().await;
         } else {
             tracing::info!("WorkerProcess::shutdown: pid {pid} exited during grace period");
         }
@@ -85,12 +96,12 @@ impl WorkerProcess {
     }
 
     pub(crate) async fn send_request(
-        &mut self,
+        &self,
         req_json: &str,
         reply: &mpsc::Sender<WorkerEvent>,
     ) -> Result<(), ()> {
         let mut success = false;
-        if let Some(stdin) = self.child.stdin.as_mut() {
+        if let Some(stdin) = self.stdin.lock().await.as_mut() {
             if stdin.write_all(req_json.as_bytes()).await.is_ok()
                 && stdin.write_all(b"\n").await.is_ok()
                 && stdin.flush().await.is_ok()
@@ -108,10 +119,11 @@ impl WorkerProcess {
             return Err(());
         }
 
+        let mut stdout = self.stdout.lock().await;
         let mut line = String::new();
         loop {
             line.clear();
-            match self.stdout.read_line(&mut line).await {
+            match stdout.read_line(&mut line).await {
                 Ok(0) => match ProtocolReadOutcome::ClosedStdout {
                     ProtocolReadOutcome::ClosedStdout => {
                         let _ = reply

@@ -866,6 +866,7 @@ impl AppContext {
 
     pub async fn cancel_embed(&self) {
         info!("AppContext::cancel_embed: requested");
+        info!("AppContext::cancel_embed: requesting worker shutdown immediately");
         self.worker_manager.request_shutdown();
         let Some(task) = self.embed_task.lock().take() else {
             info!("AppContext::cancel_embed: no active task");
@@ -878,7 +879,9 @@ impl AppContext {
 
         match task.operation {
             EmbedOperation::Build => {
-                info!("AppContext::cancel_embed: waiting for build task to finish");
+                info!(
+                    "AppContext::cancel_embed: worker shutdown requested; awaiting build task cleanup"
+                );
                 let _ = task.join.await;
             }
             EmbedOperation::Download => {

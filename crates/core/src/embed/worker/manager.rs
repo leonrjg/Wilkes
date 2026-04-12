@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
 use super::ipc::{WorkerEvent, WorkerRequest};
-use super::runtime::supervised_manager_loop;
+use super::runtime::{supervised_manager_loop, ActiveProcessSlot};
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkerStatus {
@@ -76,6 +76,8 @@ type SenderSlot = Arc<std::sync::Mutex<mpsc::Sender<ManagerCommand>>>;
 #[derive(Clone)]
 pub struct WorkerManager {
     sender: SenderSlot,
+    active_pid: Arc<AtomicU32>,
+    active_process: ActiveProcessSlot,
     /// Status snapshot updated by the manager loop; readable without going through the loop.
     status: Arc<RwLock<WorkerStatus>>,
 }
@@ -91,6 +93,7 @@ impl WorkerManager {
         let (tx, rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::channel(32);
         let active_pid = Arc::new(AtomicU32::new(0));
+        let active_process: ActiveProcessSlot = Arc::new(std::sync::Mutex::new(None));
         let status = Arc::new(RwLock::new(WorkerStatus {
             active: false,
             engine: None,
@@ -106,12 +109,15 @@ impl WorkerManager {
             rx,
             event_tx,
             Arc::clone(&active_pid),
+            Arc::clone(&active_process),
             Arc::clone(&sender),
             Arc::clone(&status),
         );
         (
             Self {
                 sender,
+                active_pid,
+                active_process,
                 status,
             },
             event_rx,
@@ -146,6 +152,12 @@ impl WorkerManager {
     }
 
     pub fn request_shutdown(&self) {
+        if let Some(proc) = self.active_process.lock().unwrap().take() {
+            let active_pid = Arc::clone(&self.active_pid);
+            tokio::spawn(async move {
+                proc.shutdown(&active_pid).await;
+            });
+        }
         let _ = self.try_send(ManagerCommand::ShutdownWorker);
     }
 }

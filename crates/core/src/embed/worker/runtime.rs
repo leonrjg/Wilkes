@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use std::{future::Future, pin::Pin};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -12,15 +13,17 @@ use super::process::WorkerProcess;
 use crate::types::EmbeddingEngine;
 
 #[async_trait]
-pub(crate) trait WorkerSession: Send {
-    async fn send_request(
-        &mut self,
-        req_json: &str,
-        reply: &mpsc::Sender<WorkerEvent>,
-    ) -> Result<(), ()>;
+pub(crate) trait WorkerSession: Send + Sync {
+    fn start_request(
+        &self,
+        req_json: String,
+        reply: mpsc::Sender<WorkerEvent>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send>>;
 
-    async fn shutdown(&mut self, pid_slot: &AtomicU32);
+    async fn shutdown(&self, pid_slot: &AtomicU32);
 }
+
+pub(super) type ActiveProcessSlot = Arc<std::sync::Mutex<Option<Arc<dyn WorkerSession>>>>;
 
 #[async_trait]
 trait WorkerProcessSpawner: Send + Sync {
@@ -29,7 +32,7 @@ trait WorkerProcessSpawner: Send + Sync {
         paths: &WorkerPaths,
         req: &WorkerRequest,
         active_pid: &AtomicU32,
-    ) -> Result<Box<dyn WorkerSession>, String>;
+    ) -> Result<Arc<dyn WorkerSession>, String>;
 }
 
 struct RealWorkerProcessSpawner;
@@ -41,23 +44,24 @@ impl WorkerProcessSpawner for RealWorkerProcessSpawner {
         paths: &WorkerPaths,
         req: &WorkerRequest,
         active_pid: &AtomicU32,
-    ) -> Result<Box<dyn WorkerSession>, String> {
+    ) -> Result<Arc<dyn WorkerSession>, String> {
         let proc = WorkerProcess::spawn(paths, req, active_pid).await?;
-        Ok(Box::new(proc))
+        Ok(Arc::new(proc))
     }
 }
 
 #[async_trait]
 impl WorkerSession for WorkerProcess {
-    async fn send_request(
-        &mut self,
-        req_json: &str,
-        reply: &mpsc::Sender<WorkerEvent>,
-    ) -> Result<(), ()> {
-        WorkerProcess::send_request(self, req_json, reply).await
+    fn start_request(
+        &self,
+        req_json: String,
+        reply: mpsc::Sender<WorkerEvent>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send>> {
+        let proc = self.clone();
+        Box::pin(async move { proc.send_request(&req_json, &reply).await })
     }
 
-    async fn shutdown(&mut self, pid_slot: &AtomicU32) {
+    async fn shutdown(&self, pid_slot: &AtomicU32) {
         WorkerProcess::shutdown(self, pid_slot).await;
     }
 }
@@ -67,6 +71,7 @@ pub(super) async fn supervised_manager_loop(
     initial_rx: mpsc::Receiver<ManagerCommand>,
     event_tx: mpsc::Sender<ManagerEvent>,
     active_pid: Arc<AtomicU32>,
+    active_process: ActiveProcessSlot,
     sender_slot: Arc<std::sync::Mutex<mpsc::Sender<ManagerCommand>>>,
     status: Arc<RwLock<WorkerStatus>>,
 ) {
@@ -78,6 +83,7 @@ pub(super) async fn supervised_manager_loop(
             rx,
             event_tx.clone(),
             Arc::clone(&active_pid),
+            Arc::clone(&active_process),
             Arc::clone(&status),
             Arc::clone(&spawner),
         );
@@ -124,9 +130,10 @@ struct WorkerRuntime {
     rx: mpsc::Receiver<ManagerCommand>,
     event_tx: mpsc::Sender<ManagerEvent>,
     active_pid: Arc<AtomicU32>,
+    active_process_slot: ActiveProcessSlot,
     status: Arc<RwLock<WorkerStatus>>,
     spawner: Arc<dyn WorkerProcessSpawner>,
-    active_process: Option<Box<dyn WorkerSession>>,
+    active_process: Option<Arc<dyn WorkerSession>>,
     active_engine: Option<EmbeddingEngine>,
     active_model: Option<String>,
     active_device: Option<String>,
@@ -165,6 +172,7 @@ impl WorkerRuntime {
         rx: mpsc::Receiver<ManagerCommand>,
         event_tx: mpsc::Sender<ManagerEvent>,
         active_pid: Arc<AtomicU32>,
+        active_process_slot: ActiveProcessSlot,
         status: Arc<RwLock<WorkerStatus>>,
         spawner: Arc<dyn WorkerProcessSpawner>,
     ) -> Self {
@@ -173,6 +181,7 @@ impl WorkerRuntime {
             rx,
             event_tx,
             active_pid,
+            active_process_slot,
             status,
             spawner,
             active_process: None,
@@ -261,11 +270,9 @@ impl WorkerRuntime {
 
         self.maybe_hot_swap_tracking(&req);
 
-        if let Some(proc) = self.active_process.as_mut() {
-            if proc.send_request(&req_json, &reply).await.is_err() {
-                proc.shutdown(&self.active_pid).await;
-                self.active_process = None;
-                self.update_status_idle();
+        if let Some(proc) = self.active_process.as_ref() {
+            if proc.start_request(req_json, reply).await.is_err() {
+                self.clear_active_worker().await;
             }
         }
     }
@@ -309,7 +316,8 @@ impl WorkerRuntime {
 
         match self.spawner.spawn(&self.paths, req, &self.active_pid).await {
             Ok(proc) => {
-                self.active_process = Some(proc);
+                self.active_process = Some(Arc::clone(&proc));
+                *self.active_process_slot.lock().unwrap() = Some(proc);
                 self.active_engine = Some(req.engine);
                 self.active_model = Some(req.model.clone());
                 self.active_device = Some(req.device.clone());
@@ -345,8 +353,11 @@ impl WorkerRuntime {
     }
 
     async fn clear_active_worker(&mut self) {
-        if let Some(mut proc) = self.active_process.take() {
-            proc.shutdown(&self.active_pid).await;
+        if let Some(proc) = self.active_process.take() {
+            let needs_shutdown = self.active_process_slot.lock().unwrap().take().is_some();
+            if needs_shutdown {
+                proc.shutdown(&self.active_pid).await;
+            }
         }
         self.active_engine = None;
         self.active_model = None;
@@ -403,19 +414,23 @@ mod tests {
 
     #[async_trait]
     impl WorkerSession for FakeSession {
-        async fn send_request(
-            &mut self,
-            _req_json: &str,
-            _reply: &mpsc::Sender<WorkerEvent>,
-        ) -> Result<(), ()> {
-            self.send_calls.fetch_add(1, Ordering::Relaxed);
-            if self.send_should_fail {
-                return Err(());
-            }
-            Ok(())
+        fn start_request(
+            &self,
+            _req_json: String,
+            _reply: mpsc::Sender<WorkerEvent>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send>> {
+            let send_calls = Arc::clone(&self.send_calls);
+            let send_should_fail = self.send_should_fail;
+            Box::pin(async move {
+                send_calls.fetch_add(1, Ordering::Relaxed);
+                if send_should_fail {
+                    return Err(());
+                }
+                Ok(())
+            })
         }
 
-        async fn shutdown(&mut self, _pid_slot: &AtomicU32) {
+        async fn shutdown(&self, _pid_slot: &AtomicU32) {
             self.shutdown_calls.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -435,12 +450,12 @@ mod tests {
             _paths: &WorkerPaths,
             _req: &WorkerRequest,
             _active_pid: &AtomicU32,
-        ) -> Result<Box<dyn WorkerSession>, String> {
+        ) -> Result<Arc<dyn WorkerSession>, String> {
             self.spawn_calls.fetch_add(1, Ordering::Relaxed);
             if self.spawn_should_fail {
                 return Err("Failed to spawn worker: fake failure".to_string());
             }
-            Ok(Box::new(FakeSession {
+            Ok(Arc::new(FakeSession {
                 send_calls: Arc::clone(&self.send_calls),
                 shutdown_calls: Arc::clone(&self.shutdown_calls),
                 send_should_fail: self.send_should_fail,
@@ -476,6 +491,7 @@ mod tests {
             pid: None,
             timeout_secs: 300,
         }));
+        let active_process_slot: ActiveProcessSlot = Arc::new(std::sync::Mutex::new(None));
         let spawn_calls = Arc::new(AtomicUsize::new(0));
         let send_calls = Arc::new(AtomicUsize::new(0));
         let shutdown_calls = Arc::new(AtomicUsize::new(0));
@@ -484,6 +500,7 @@ mod tests {
             rx,
             event_tx,
             active_pid,
+            active_process_slot,
             status,
             Arc::new(FakeSpawner {
                 spawn_calls: Arc::clone(&spawn_calls),
@@ -604,11 +621,13 @@ mod tests {
     async fn test_handle_command_kill_worker_clears_active_process() {
         let (mut runtime, _spawn_calls, _send_calls, shutdown_calls, _tx, _event_rx) =
             test_runtime();
-        runtime.active_process = Some(Box::new(FakeSession {
+        let proc: Arc<dyn WorkerSession> = Arc::new(FakeSession {
             send_calls: Arc::new(AtomicUsize::new(0)),
             shutdown_calls: Arc::clone(&shutdown_calls),
             send_should_fail: false,
-        }));
+        });
+        *runtime.active_process_slot.lock().unwrap() = Some(Arc::clone(&proc));
+        runtime.active_process = Some(proc);
         runtime.active_engine = Some(EmbeddingEngine::Candle);
         runtime.active_model = Some("model-a".to_string());
         runtime.active_device = Some("cpu".to_string());
@@ -703,6 +722,7 @@ mod tests {
             rx,
             event_tx,
             active_pid,
+            Arc::new(std::sync::Mutex::new(None)),
             status,
             Arc::new(FakeSpawner {
                 spawn_calls: Arc::clone(&spawn_calls),
@@ -845,6 +865,7 @@ mod tests {
             rx,
             event_tx,
             active_pid,
+            Arc::new(std::sync::Mutex::new(None)),
             status,
             Arc::new(FakeSpawner {
                 spawn_calls: Arc::clone(&spawn_calls),
@@ -884,11 +905,13 @@ mod tests {
         let (mut runtime, _spawn_calls, _send_calls, shutdown_calls, tx, _event_rx) =
             test_runtime();
         let status = Arc::clone(&runtime.status);
-        runtime.active_process = Some(Box::new(FakeSession {
+        let proc: Arc<dyn WorkerSession> = Arc::new(FakeSession {
             send_calls: Arc::new(AtomicUsize::new(0)),
             shutdown_calls: Arc::clone(&shutdown_calls),
             send_should_fail: false,
-        }));
+        });
+        *runtime.active_process_slot.lock().unwrap() = Some(Arc::clone(&proc));
+        runtime.active_process = Some(proc);
         runtime.active_engine = Some(EmbeddingEngine::Candle);
         runtime.active_model = Some("model-a".to_string());
         runtime.active_device = Some("cpu".to_string());
@@ -905,11 +928,13 @@ mod tests {
         let (mut runtime, _spawn_calls, _send_calls, shutdown_calls, tx, _event_rx) =
             test_runtime();
         let status = Arc::clone(&runtime.status);
-        runtime.active_process = Some(Box::new(FakeSession {
+        let proc: Arc<dyn WorkerSession> = Arc::new(FakeSession {
             send_calls: Arc::new(AtomicUsize::new(0)),
             shutdown_calls: Arc::clone(&shutdown_calls),
             send_should_fail: false,
-        }));
+        });
+        *runtime.active_process_slot.lock().unwrap() = Some(Arc::clone(&proc));
+        runtime.active_process = Some(proc);
         runtime.active_engine = Some(EmbeddingEngine::Candle);
         runtime.active_model = Some("model-a".to_string());
         runtime.active_device = Some("cpu".to_string());

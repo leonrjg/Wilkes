@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ignore::WalkBuilder;
@@ -164,24 +164,32 @@ async fn build_index_via_worker(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to send build command to manager: {e}"))?;
 
-    while let Some(event) = reply_rx.recv().await {
-        match event {
-            WorkerEvent::Progress(progress) => {
-                let _ = options.tx.send(progress).await;
-            }
-            WorkerEvent::Done => {
-                let installer = wilkes_core::embed::dispatch::get_installer(
-                    selected.engine,
-                    selected.model.clone(),
-                    manager,
-                    device,
-                );
-                return installer.build(&options.data_dir);
-            }
-            WorkerEvent::Error(err) => {
-                anyhow::bail!(err);
-            }
-            WorkerEvent::Embeddings(_) | WorkerEvent::Info { .. } => {}
+    loop {
+        if options.cancel_flag.load(Ordering::Relaxed) {
+            anyhow::bail!("Build cancelled");
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_millis(100), reply_rx.recv()).await {
+            Ok(Some(event)) => match event {
+                WorkerEvent::Progress(progress) => {
+                    let _ = options.tx.send(progress).await;
+                }
+                WorkerEvent::Done => {
+                    let installer = wilkes_core::embed::dispatch::get_installer(
+                        selected.engine,
+                        selected.model.clone(),
+                        manager,
+                        device,
+                    );
+                    return installer.build(&options.data_dir);
+                }
+                WorkerEvent::Error(err) => {
+                    anyhow::bail!(err);
+                }
+                WorkerEvent::Embeddings(_) | WorkerEvent::Info { .. } => {}
+            },
+            Ok(None) => break,
+            Err(_) => continue,
         }
     }
 
