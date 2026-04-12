@@ -61,8 +61,20 @@ fn python_probe_args() -> [&'static str; 2] {
     ["-c", "import sys; print(sys.executable)"]
 }
 
+#[cfg(windows)]
+fn suppress_windows_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(0x0800_0000);
+}
+
+#[cfg(not(windows))]
+fn suppress_windows_console(_command: &mut Command) {}
+
 fn python_candidate_is_usable(path: &Path) -> bool {
-    Command::new(path)
+    let mut command = Command::new(path);
+    suppress_windows_console(&mut command);
+    command
         .args(python_probe_args())
         .output()
         .map(|output| output.status.success())

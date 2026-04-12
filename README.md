@@ -34,6 +34,14 @@
 Docker allows you to run software in isolation from your system.
 
 ```shell
+docker pull ghcr.io/leonrjg/wilkes:latest
+docker run --rm -p 2000:2000 -v wilkes-data:/data ghcr.io/leonrjg/wilkes:latest
+# Now you can visit localhost:2000
+```
+
+If you want to build locally instead:
+
+```shell
 git clone https://github.com/leonrjg/Wilkes
 cd Wilkes
 docker compose up
