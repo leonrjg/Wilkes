@@ -107,4 +107,4 @@ VOLUME /data
 EXPOSE 2000
 
 USER wilkes
-CMD ["/app/wilkes-server", "--data-dir", "/data", "--dist-dir", "/app/dist", "--port", "2000"]
+CMD ["/app/wilkes-server", "--host", "0.0.0.0", "--data-dir", "/data", "--dist-dir", "/app/dist", "--port", "2000"]
