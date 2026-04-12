@@ -5,7 +5,6 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
 use super::ipc::{WorkerEvent, WorkerRequest};
-use super::process::force_stop_active;
 use super::runtime::supervised_manager_loop;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -147,7 +146,6 @@ impl WorkerManager {
     }
 
     pub fn request_shutdown(&self) {
-        std::thread::spawn(move || force_stop_active("request_shutdown"));
         let _ = self.try_send(ManagerCommand::ShutdownWorker);
     }
 }

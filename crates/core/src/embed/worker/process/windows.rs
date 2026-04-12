@@ -6,8 +6,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use super::{
-    apply_command_plan, build_command_plan, clear_active_stopper, parse_worker_stdout_line,
-    register_active_stopper, ActiveStopper, ProtocolReadOutcome,
+    apply_command_plan, build_command_plan, parse_worker_stdout_line, ProtocolReadOutcome,
     ROOF_KNOCK_TIMEOUT,
 };
 use crate::embed::worker::ipc::{WorkerEvent, WorkerRequest};
@@ -25,42 +24,6 @@ unsafe impl Sync for JobHandle {}
 impl Drop for JobHandle {
     fn drop(&mut self) {
         unsafe { CloseHandle(self.handle) };
-    }
-}
-
-struct WindowsStopper {
-    pid: u32,
-    job: Arc<JobHandle>,
-}
-
-impl ActiveStopper for WindowsStopper {
-    fn force_stop(&self, label: &str) {
-        let pid = self.pid;
-        if pid == 0 {
-            return;
-        }
-
-        tracing::info!(
-            "WorkerProcess::{label}: waiting up to {:?} for pid {pid} to exit after EOF",
-            ROOF_KNOCK_TIMEOUT
-        );
-        let start = std::time::Instant::now();
-        while start.elapsed() < ROOF_KNOCK_TIMEOUT {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-
-        tracing::warn!(
-            "WorkerProcess::{label}: pid {pid} ignored EOF grace period, hard-killing tree"
-        );
-        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-        let rc = unsafe { TerminateJobObject(self.job.handle, 1) };
-        if rc == 0 {
-            tracing::warn!(
-                "WorkerProcess::{label}: TerminateJobObject failed for pid {pid}: {}",
-                std::io::Error::last_os_error()
-            );
-            terminate_process_by_pid(pid, label);
-        }
     }
 }
 
@@ -84,6 +47,19 @@ fn terminate_process_by_pid(pid: u32, label: &str) {
         );
     }
     unsafe { CloseHandle(handle) };
+}
+
+fn terminate_job_tree(job: &Arc<JobHandle>, pid: u32, label: &str) {
+    use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+    let rc = unsafe { TerminateJobObject(job.handle, 1) };
+    if rc == 0 {
+        tracing::warn!(
+            "WorkerProcess::{label}: TerminateJobObject failed for pid {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+        terminate_process_by_pid(pid, label);
+    }
 }
 
 struct WorkerInner {
@@ -208,10 +184,6 @@ impl WorkerProcess {
 
         let pid = child.id();
         active_pid.store(pid, Ordering::Relaxed);
-        register_active_stopper(Arc::new(WindowsStopper {
-            pid,
-            job: Arc::clone(&job),
-        }));
 
         let stdout = child
             .stdout
@@ -235,10 +207,30 @@ impl WorkerProcess {
         let inner = Arc::clone(&self.inner);
         let result = tokio::task::spawn_blocking(move || {
             let mut inner = inner.lock().unwrap();
+            let pid = inner.child.id();
             drop(inner.child.stdin.take());
-            super::force_stop_active("shutdown");
+            tracing::info!(
+                "WorkerProcess::shutdown: sent EOF to pid {pid}; waiting up to {:?} for graceful exit",
+                ROOF_KNOCK_TIMEOUT
+            );
             match wait_for_process_exit(&mut inner.child, ROOF_KNOCK_TIMEOUT) {
-                Ok(_) => Ok(()),
+                Ok(true) => {
+                    tracing::info!(
+                        "WorkerProcess::shutdown: pid {pid} exited during grace period"
+                    );
+                    Ok(())
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        "WorkerProcess::shutdown: pid {pid} did not exit during grace period; hard-killing tree"
+                    );
+                    terminate_job_tree(&inner._job, pid, "shutdown");
+                    let _ = inner
+                        .child
+                        .wait()
+                        .map_err(|e| format!("Failed to reap worker after kill: {e}"))?;
+                    Ok(())
+                }
                 Err(e) => Err(e),
             }
         })
@@ -249,7 +241,6 @@ impl WorkerProcess {
         } else if let Ok(Err(e)) = result {
             tracing::warn!("{e}");
         }
-        clear_active_stopper();
         pid_slot.store(0, Ordering::Relaxed);
     }
 

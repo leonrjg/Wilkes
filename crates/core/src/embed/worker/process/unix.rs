@@ -6,9 +6,8 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use super::{
-    apply_command_plan, build_command_plan, clear_active_stopper, force_stop_active,
-    hard_kill_pid, parse_worker_stdout_line, pid_is_alive, register_active_stopper,
-    ActiveStopper, ProtocolReadOutcome, ROOF_KNOCK_TIMEOUT,
+    apply_command_plan, build_command_plan, parse_worker_stdout_line, ProtocolReadOutcome,
+    ROOF_KNOCK_TIMEOUT,
 };
 use crate::embed::worker::ipc::{WorkerEvent, WorkerRequest};
 use crate::embed::worker::manager::WorkerPaths;
@@ -16,38 +15,6 @@ use crate::embed::worker::manager::WorkerPaths;
 pub(crate) struct WorkerProcess {
     child: tokio::process::Child,
     stdout: BufReader<tokio::process::ChildStdout>,
-}
-
-struct UnixPidStopper {
-    pid: u32,
-}
-
-impl ActiveStopper for UnixPidStopper {
-    fn force_stop(&self, label: &str) {
-        let pid = self.pid;
-        if pid == 0 {
-            return;
-        }
-
-        tracing::info!(
-            "WorkerProcess::{label}: waiting up to {:?} for pid {pid} to exit after EOF",
-            ROOF_KNOCK_TIMEOUT
-        );
-        let start = std::time::Instant::now();
-        while start.elapsed() < ROOF_KNOCK_TIMEOUT {
-            if !pid_is_alive(pid) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-
-        if pid_is_alive(pid) {
-            tracing::warn!(
-                "WorkerProcess::{label}: pid {pid} ignored EOF grace period, hard-killing"
-            );
-            hard_kill_pid(pid, label);
-        }
-    }
 }
 
 async fn spawn_stderr_forwarder(stderr: tokio::process::ChildStderr) {
@@ -81,7 +48,6 @@ impl WorkerProcess {
 
         if let Some(pid) = child.id() {
             active_pid.store(pid, Ordering::Relaxed);
-            register_active_stopper(std::sync::Arc::new(UnixPidStopper { pid }));
         }
 
         let stdout = child
@@ -100,16 +66,21 @@ impl WorkerProcess {
     }
 
     pub(crate) async fn shutdown(&mut self, pid_slot: &AtomicU32) {
+        let pid = self.child.id().unwrap_or(0);
         drop(self.child.stdin.take());
-        force_stop_active("shutdown");
-        if timeout(ROOF_KNOCK_TIMEOUT, self.child.wait())
-            .await
-            .is_err()
-        {
+        tracing::info!(
+            "WorkerProcess::shutdown: sent EOF to pid {pid}; waiting up to {:?} for graceful exit",
+            ROOF_KNOCK_TIMEOUT
+        );
+        if timeout(ROOF_KNOCK_TIMEOUT, self.child.wait()).await.is_err() {
+            tracing::warn!(
+                "WorkerProcess::shutdown: pid {pid} did not exit during grace period; hard-killing"
+            );
             let _ = self.child.kill().await;
             let _ = self.child.wait().await;
+        } else {
+            tracing::info!("WorkerProcess::shutdown: pid {pid} exited during grace period");
         }
-        clear_active_stopper();
         pid_slot.store(0, Ordering::Relaxed);
     }
 

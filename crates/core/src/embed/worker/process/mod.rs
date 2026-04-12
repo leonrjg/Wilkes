@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use super::ipc::{WorkerEvent, WorkerRequest};
@@ -44,72 +43,6 @@ pub(super) const ROOF_KNOCK_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg_attr(not(windows), allow(dead_code))]
 #[cfg(any(test, windows))]
 pub(super) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-pub(super) trait ActiveStopper: Send + Sync {
-    fn force_stop(&self, label: &str);
-}
-
-fn active_stopper_slot() -> &'static Mutex<Option<Arc<dyn ActiveStopper>>> {
-    static SLOT: OnceLock<Mutex<Option<Arc<dyn ActiveStopper>>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
-}
-
-pub(super) fn register_active_stopper(stopper: Arc<dyn ActiveStopper>) {
-    *active_stopper_slot().lock().unwrap() = Some(stopper);
-}
-
-pub(super) fn clear_active_stopper() {
-    *active_stopper_slot().lock().unwrap() = None;
-}
-
-pub(super) fn force_stop_active(label: &str) {
-    let stopper = active_stopper_slot().lock().unwrap().clone();
-    if let Some(stopper) = stopper {
-        stopper.force_stop(label);
-    }
-}
-
-#[cfg(unix)]
-pub(super) fn pid_is_alive(pid: u32) -> bool {
-    let rc = unsafe { libc::kill(pid as i32, 0) };
-    if rc == 0 {
-        true
-    } else {
-        let errno = std::io::Error::last_os_error().raw_os_error();
-        errno == Some(libc::EPERM)
-    }
-}
-
-#[cfg(windows)]
-pub(super) fn pid_is_alive(pid: u32) -> bool {
-    use std::ptr::null_mut;
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle == null_mut() {
-        return false;
-    }
-    let rc = unsafe { WaitForSingleObject(handle, 0) };
-    unsafe { CloseHandle(handle) };
-    rc == WAIT_TIMEOUT
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(super) fn pid_is_alive(_pid: u32) -> bool {
-    false
-}
-
-#[cfg(unix)]
-pub(super) fn hard_kill_pid(pid: u32, label: &str) {
-    let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        tracing::warn!("WorkerProcess::{label}: failed to SIGKILL pid {pid}: {err}");
-    }
-}
 
 pub(super) async fn build_command_plan(
     paths: &WorkerPaths,
@@ -562,11 +495,6 @@ exit 0
             }
             other => panic!("expected read error, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn test_force_stop_active_without_registered_worker_is_noop() {
-        force_stop_active("test");
     }
 
     #[tokio::test]
