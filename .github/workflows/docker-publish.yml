@@ -3,6 +3,15 @@ name: Docker Publish
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build from
+        required: false
+        default: main
+      version:
+        description: Image version to publish
+        required: true
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/wilkes
@@ -16,6 +25,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -40,6 +51,16 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
+      - name: Extract manual Docker metadata
+        id: manual_meta
+        if: github.event_name == 'workflow_dispatch'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ inputs.version }}
+            type=raw,value=latest
+
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
@@ -47,7 +68,7 @@ jobs:
           file: ./Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ github.event_name == 'workflow_dispatch' && steps.manual_meta.outputs.tags || steps.meta.outputs.tags }}
+          labels: ${{ github.event_name == 'workflow_dispatch' && steps.manual_meta.outputs.labels || steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
