@@ -12,6 +12,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
@@ -33,6 +38,9 @@ jobs:
           path: target
           key: ubuntu-cargo-build-${{ hashFiles('Cargo.lock') }}
           restore-keys: ubuntu-cargo-build-
+
+      - name: Prepare desktop sidecar
+        run: node scripts/prepare-sidecar.mjs
 
       - name: Check
         run: cargo check --workspace
