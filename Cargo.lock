@@ -7790,7 +7790,7 @@ dependencies = [
 
 [[package]]
 name = "wilkes-api"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7809,7 +7809,7 @@ dependencies = [
 
 [[package]]
 name = "wilkes-core"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7855,7 +7855,7 @@ dependencies = [
 
 [[package]]
 name = "wilkes-desktop"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "serde",
@@ -7874,7 +7874,7 @@ dependencies = [
 
 [[package]]
 name = "wilkes-rust-worker"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -7887,7 +7887,7 @@ dependencies = [
 
 [[package]]
 name = "wilkes-server"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "async-trait",
