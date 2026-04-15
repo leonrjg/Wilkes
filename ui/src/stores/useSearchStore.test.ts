@@ -45,7 +45,6 @@ describe("useSearchStore", () => {
       root: "/root",
       is_regex: false,
       case_sensitive: false,
-      file_type_filters: [],
       max_results: 100,
       respect_gitignore: true,
       max_file_size: 1000,

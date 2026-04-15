@@ -530,7 +530,6 @@ mod tests {
             is_regex: false,
             case_sensitive: false,
             root: root.clone(),
-            file_type_filters: vec![],
             max_results: 10,
             respect_gitignore: true,
             max_file_size: 1024 * 1024,
