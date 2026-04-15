@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Wilkes",
-  "version": "0.9.3",
   "identifier": "app.wilkes",
   "build": {
     "frontendDist": "../../ui/dist",

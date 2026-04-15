@@ -2,6 +2,9 @@
 members = ["crates/core", "crates/api", "crates/desktop", "crates/server", "crates/worker"]
 resolver = "2"
 
+[workspace.package]
+version = "0.9.4"
+
 # mupdf-sys compiles bundled C code with /MDd (debug CRT) at opt-level 0,
 # but ort-sys ships pre-built ONNX Runtime objects compiled with /MD (release CRT).
 # MSVC refuses to link these together (_ITERATOR_DEBUG_LEVEL mismatch).
