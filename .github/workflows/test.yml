@@ -3,6 +3,9 @@ name: Test
 on:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -16,6 +19,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: lts/*
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Install Linux dependencies
         run: |
@@ -48,8 +53,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
-      - name: Test
-        run: cargo test --workspace
+      - name: Test with coverage
+        run: cargo llvm-cov --workspace --no-report
+
+      - name: Write Rust coverage reports
+        run: |
+          cargo llvm-cov report --json --summary-only --output-path rust-coverage.json
+          cargo llvm-cov report --cobertura --output-path rust-cobertura.xml
+
+      - name: Upload Rust coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage-report
+          path: |
+            rust-coverage.json
+            rust-cobertura.xml
 
   frontend:
     runs-on: ubuntu-latest
@@ -71,8 +89,89 @@ jobs:
       - name: Install dependencies
         run: npm ci --prefix ui
 
-      - name: Test
-        run: npm test --prefix ui -- --run
+      - name: Test with coverage
+        run: npm run test:coverage --prefix ui
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-coverage-report
+          path: ui/coverage
 
       - name: Build
         run: npm run build --prefix ui
+
+  coverage:
+    runs-on: ubuntu-latest
+    needs:
+      - rust
+      - frontend
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Build coverage comment
+        run: |
+          python3 scripts/pr_coverage_report.py \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --base-sha "${{ github.event.pull_request.base.sha }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --ui-summary "artifacts/ui-coverage-report/coverage-summary.json" \
+            --ui-cobertura "artifacts/ui-coverage-report/cobertura-coverage.xml" \
+            --rust-summary "artifacts/rust-coverage-report/rust-coverage.json" \
+            --rust-cobertura "artifacts/rust-coverage-report/rust-cobertura.xml" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --output coverage-comment.md
+
+      - name: Write workflow summary
+        run: cat coverage-comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish coverage summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const body = fs.readFileSync("coverage-comment.md", "utf8");
+
+            if (context.eventName !== "pull_request") {
+              return;
+            }
+
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+            });
+
+            const existing = comments.find(
+              (comment) =>
+                comment.user?.type === "Bot" &&
+                comment.body?.includes("<!-- wilkes-pr-coverage -->"),
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body,
+            });

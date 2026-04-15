@@ -74,7 +74,6 @@ describe("SemanticPanel", () => {
       supportedExtensions: [],
       fileList: [],
       filterText: "",
-      excluded: new Set(),
       preferSemantic: false,
       indexing: false,
       theme: "System",

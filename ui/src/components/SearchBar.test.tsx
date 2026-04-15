@@ -24,8 +24,6 @@ describe("SearchBar", () => {
       maxFileSize: 1000,
       contextLines: 2,
       supportedExtensions: [],
-      fileList: [],
-      excluded: new Set(),
       preferSemantic: false,
       setPreferSemantic: vi.fn(),
     });

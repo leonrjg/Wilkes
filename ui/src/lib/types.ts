@@ -25,7 +25,6 @@ export interface SearchQuery {
   is_regex: boolean;
   case_sensitive: boolean;
   root: string;
-  file_type_filters: string[];
   /** 0 = unlimited */
   max_results: number;
   respect_gitignore: boolean;

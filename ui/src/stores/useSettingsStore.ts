@@ -3,8 +3,6 @@ import { subscribeWithSelector } from "zustand/middleware";
 import { api } from "../services";
 import type { FileEntry, OmittedFileEntry, SemanticSettings, Settings, Theme } from "../lib/types";
 
-const EMPTY_EXCLUDED: Set<string> = new Set();
-
 function applyTheme(theme: Theme) {
   const root = window.document.documentElement;
   root.classList.remove("light", "dark");
@@ -28,7 +26,6 @@ interface SettingsStore {
   fileList: FileEntry[];
   omittedFileList: OmittedFileEntry[];
   filterText: string;
-  excluded: Set<string>;
   preferSemantic: boolean;
   indexing: boolean;
   theme: Theme;
@@ -40,7 +37,6 @@ interface SettingsStore {
   removeBookmark: (dir: string) => void;
   forgetDirectory: (dir: string) => void;
   refreshFileList: () => void;
-  setExcluded: (excluded: Set<string>) => void;
   setFilterText: (text: string) => void;
   setPreferSemantic: (active: boolean) => void;
   setIndexing: (indexing: boolean) => void;
@@ -62,7 +58,6 @@ export const useSettingsStore = create<SettingsStore>()(
     fileList: [],
     omittedFileList: [],
     filterText: "",
-    excluded: EMPTY_EXCLUDED,
     preferSemantic: false,
     indexing: false,
     theme: "System",
@@ -144,7 +139,6 @@ export const useSettingsStore = create<SettingsStore>()(
         .catch(() => {});
     },
 
-    setExcluded: (excluded: Set<string>) => set({ excluded }),
     setFilterText: (text: string) => set({ filterText: text }),
     setIndexing: (indexing: boolean) => set({ indexing }),
 
@@ -204,12 +198,11 @@ useSettingsStore.subscribe(
           useSettingsStore.setState({
             fileList: response.files,
             omittedFileList: response.omitted,
-            excluded: EMPTY_EXCLUDED,
             filterText: "",
           }))
         .catch(() => {});
     } else {
-      useSettingsStore.setState({ fileList: [], omittedFileList: [], excluded: EMPTY_EXCLUDED, filterText: "" });
+      useSettingsStore.setState({ fileList: [], omittedFileList: [], filterText: "" });
     }
   }
 );
