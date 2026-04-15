@@ -24,7 +24,6 @@ describe("useSettingsStore", () => {
       fileList: [],
       omittedFileList: [],
       filterText: "",
-      excluded: new Set(),
       preferSemantic: false,
       indexing: false,
       theme: "System",
@@ -205,12 +204,6 @@ describe("useSettingsStore", () => {
   it("should update filter text", () => {
     useSettingsStore.getState().setFilterText("new filter");
     expect(useSettingsStore.getState().filterText).toBe("new filter");
-  });
-
-  it("should update excluded", () => {
-    const excluded = new Set(["ts"]);
-    useSettingsStore.getState().setExcluded(excluded);
-    expect(useSettingsStore.getState().excluded).toBe(excluded);
   });
 
   it("should update indexing", () => {

@@ -36,7 +36,6 @@ pub struct SearchQuery {
     pub is_regex: bool,
     pub case_sensitive: bool,
     pub root: PathBuf,
-    pub file_type_filters: Vec<String>,
     /// 0 = unlimited
     pub max_results: usize,
     /// Respect .gitignore / .ignore files during the walk.
@@ -1054,7 +1053,8 @@ mod tests {
 
     #[test]
     fn test_search_query_defaults() {
-        let json = r#"{"pattern": "p", "is_regex": false, "case_sensitive": false, "root": ".", "file_type_filters": [], "max_results": 10}"#;
+        let json =
+            r#"{"pattern": "p", "is_regex": false, "case_sensitive": false, "root": ".", "max_results": 10}"#;
         let q: SearchQuery = serde_json::from_str(json).unwrap();
         assert_eq!(q.respect_gitignore, true);
         assert_eq!(q.max_file_size, 0);

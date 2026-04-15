@@ -41,7 +41,6 @@ describe("ResultList", () => {
       selectedMatch: null,
     });
     useSettingsStore.setState({
-      excluded: new Set(),
       fileList: [],
       omittedFileList: [],
       filterText: "",

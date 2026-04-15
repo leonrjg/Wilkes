@@ -22,8 +22,6 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const maxFileSize = useSettingsStore((s) => s.maxFileSize);
   const contextLines = useSettingsStore((s) => s.contextLines);
   const supportedExtensions = useSettingsStore((s) => s.supportedExtensions);
-  const fileList = useSettingsStore((s) => s.fileList);
-  const excluded = useSettingsStore((s) => s.excluded);
   const preferSemantic = useSettingsStore((s) => s.preferSemantic);
   const setPreferSemantic = useSettingsStore((s) => s.setPreferSemantic);
   const maxResults = useSettingsStore((s) => s.maxResults);
@@ -47,15 +45,11 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
       pat: string,
       opts: { isRegex?: boolean; caseSensitive?: boolean; isSemanticMode?: boolean } = {},
     ): SearchQuery => {
-      const allExtensions = [...new Set(fileList.map((f) => f.extension))];
-      const file_type_filters =
-        excluded.size === 0 ? [] : allExtensions.filter((ext) => !excluded.has(ext));
       return {
         pattern: pat,
         is_regex: opts.isRegex ?? isRegex,
         case_sensitive: opts.caseSensitive ?? caseSensitive,
         root: directory,
-        file_type_filters,
         max_results: maxResults,
         respect_gitignore: respectGitignore,
         max_file_size: maxFileSize,
@@ -68,8 +62,6 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
       isRegex,
       caseSensitive,
       directory,
-      excluded,
-      fileList,
       respectGitignore,
       maxFileSize,
       contextLines,
@@ -112,14 +104,14 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     };
   }, [pattern]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Re-trigger when externally-driven settings change (directory, excluded)
+  // Re-trigger when externally-driven settings change (directory)
   useEffect(() => {
     if (!directory) {
       clearResults();
     } else if (pattern.trim()) {
       triggerSearch(pattern, undefined, "reactive");
     }
-  }, [directory, excluded]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [directory]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-retry search once the index finishes building
   useEffect(() => {

@@ -80,27 +80,8 @@ impl SearchProvider for GrepSearchProvider {
                 }
             }
 
-            // File type filter
-            if !query.file_type_filters.is_empty() {
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if !query
-                    .file_type_filters
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(ext))
-                {
-                    continue;
-                }
-            }
-
-            let file_type = match FileType::detect(path, &query.supported_extensions) {
-                Some(ft) => ft,
-                None => {
-                    // Use infer for unknown types; skip if recognised binary.
-                    match infer::get_from_path(path) {
-                        Ok(Some(_)) => continue,  // known binary format — skip
-                        _ => FileType::PlainText, // assume text
-                    }
-                }
+            let Some(file_type) = FileType::detect(path, &query.supported_extensions) else {
+                continue;
             };
 
             let matches = match &file_type {
@@ -334,7 +315,6 @@ mod tests {
             is_regex: false,
             case_sensitive: false,
             root: Path::new(".").to_path_buf(),
-            file_type_filters: vec![],
             max_results: 0,
             respect_gitignore: true,
             max_file_size: 0,
@@ -371,7 +351,6 @@ mod tests {
             is_regex: false,
             case_sensitive: true,
             root: dir.path().to_path_buf(),
-            file_type_filters: vec![],
             max_results: 0,
             respect_gitignore: true,
             max_file_size: 0,
@@ -402,7 +381,6 @@ mod tests {
             is_regex: true,
             case_sensitive: true,
             root: dir.path().to_path_buf(),
-            file_type_filters: vec![],
             max_results: 0,
             respect_gitignore: true,
             max_file_size: 0,
@@ -430,7 +408,6 @@ mod tests {
             is_regex: false,
             case_sensitive: true,
             root: dir.path().to_path_buf(),
-            file_type_filters: vec![],
             max_results: 0,
             respect_gitignore: true,
             max_file_size: 0,
@@ -474,7 +451,6 @@ mod tests {
             is_regex: false,
             case_sensitive: true,
             root: Path::new(".").to_path_buf(),
-            file_type_filters: vec![],
             max_results: 0,
             respect_gitignore: true,
             max_file_size: 0,
@@ -504,7 +480,6 @@ mod tests {
             is_regex: false,
             case_sensitive: true,
             root: dir.path().to_path_buf(),
-            file_type_filters: vec![],
             max_results: 0,
             respect_gitignore: true,
             max_file_size: 10, // Max 10 bytes
@@ -553,7 +528,6 @@ mod tests {
             is_regex: false,
             case_sensitive: true,
             root: dir.path().to_path_buf(),
-            file_type_filters: vec![],
             max_results: 0,
             respect_gitignore: true,
             max_file_size: 0,
@@ -586,7 +560,6 @@ mod tests {
             is_regex: false,
             case_sensitive: false,
             root: Path::new(".").to_path_buf(),
-            file_type_filters: vec![],
             max_results: 0,
             respect_gitignore: true,
             max_file_size: 0,
@@ -613,7 +586,6 @@ mod tests {
             is_regex: false,
             case_sensitive: true,
             root: dir.path().to_path_buf(),
-            file_type_filters: vec![],
             max_results: 1, // Limit to 1 match
             respect_gitignore: true,
             max_file_size: 0,
@@ -639,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_file_type_filter() {
+    fn test_search_supported_extensions_allow_list() {
         let dir = tempdir().unwrap();
         let path_rs = dir.path().join("main.rs");
         let path_txt = dir.path().join("notes.txt");
@@ -651,13 +623,12 @@ mod tests {
             is_regex: false,
             case_sensitive: true,
             root: dir.path().to_path_buf(),
-            file_type_filters: vec!["rs".to_string()], // Only .rs files
             max_results: 0,
             respect_gitignore: true,
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Grep,
-            supported_extensions: vec!["rs".to_string(), "txt".to_string()],
+            supported_extensions: vec!["rs".to_string()],
         };
 
         let provider = GrepSearchProvider::new();
@@ -711,7 +682,6 @@ mod tests {
             is_regex: false,
             case_sensitive: true,
             root: dir.path().to_path_buf(),
-            file_type_filters: vec![],
             max_results: 0,
             respect_gitignore: true,
             max_file_size: 0,
@@ -740,7 +710,6 @@ mod tests {
             is_regex: false,
             case_sensitive: true,
             root: dir.path().to_path_buf(),
-            file_type_filters: vec![],
             max_results: 0,
             respect_gitignore: true,
             max_file_size: 0,
@@ -792,18 +761,16 @@ mod tests {
     }
 
     #[test]
-    fn test_search_binary_skip() {
+    fn test_search_skips_unsupported_extensions() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.png");
-        // PNG header to trigger 'infer' as binary
-        fs::write(&path, &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        fs::write(&path, "match").unwrap();
 
         let query = SearchQuery {
             pattern: "match".to_string(),
             is_regex: false,
             case_sensitive: true,
             root: dir.path().to_path_buf(),
-            file_type_filters: vec![],
             max_results: 0,
             respect_gitignore: true,
             max_file_size: 0,

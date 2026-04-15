@@ -63,7 +63,6 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
   const selectedMatch = useSearchStore((s) => s.selectedMatch);
   const { addToast } = useToasts();
 
-  const excluded = useSettingsStore((s) => s.excluded);
   const fileList = useSettingsStore((s) => s.fileList);
   const omittedFileList = useSettingsStore((s) => s.omittedFileList);
   const filterText = useSettingsStore((s) => s.filterText);
@@ -87,7 +86,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
     addToast(stats.errors[0], { type: "error" });
   }, [addToast, stats]);
 
-  const filteredFileList = fileList.filter((f) => !excluded.has(f.extension));
+  const filteredFileList = fileList;
   const rows = buildRows(results, expandedFiles);
 
   const rowVirtualizer = useVirtualizer({
@@ -108,14 +107,13 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
   const totalCount = results.reduce((n, fm) => n + fm.matches.length, 0);
 
   if (!hasQuery) {
-    const omittedFiles = omittedFileList.filter((f) => !excluded.has(f.extension));
     const matchesFilter = (entry: FileEntry) => {
       if (!filterText) return true;
       const search = filterText.toLowerCase();
       return entry.path.toLowerCase().includes(search);
     };
     const filteredVisibleFiles = filteredFileList.filter(matchesFilter);
-    const filteredOmittedFiles = omittedFiles.filter((entry) => matchesFilter(entry));
+    const filteredOmittedFiles = omittedFileList.filter((entry) => matchesFilter(entry));
 
     return (
       <div className="flex flex-col h-full overflow-hidden relative bg-[var(--bg-app)]">
