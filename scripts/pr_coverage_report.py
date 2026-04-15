@@ -63,9 +63,9 @@ def load_rust_coverage(
 ) -> CoverageData:
     summary = json.loads(summary_path.read_text())["data"][0]["totals"]
     overall_metrics = [
-        Metric("Lines", summary["lines"]["count"], summary["lines"]["total"]),
-        Metric("Regions", summary["regions"]["count"], summary["regions"]["total"]),
-        Metric("Functions", summary["functions"]["count"], summary["functions"]["total"]),
+        Metric("Lines", summary["lines"]["covered"], summary["lines"]["count"]),
+        Metric("Regions", summary["regions"]["covered"], summary["regions"]["count"]),
+        Metric("Functions", summary["functions"]["covered"], summary["functions"]["count"]),
     ]
     return CoverageData(
         overall_metrics=overall_metrics,
