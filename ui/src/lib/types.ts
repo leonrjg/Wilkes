@@ -88,6 +88,14 @@ export type PreviewData =
       };
     };
 
+export interface DocumentMetadata {
+  title: string | null;
+  author: string | null;
+  doi: string | null;
+}
+
+export type ViewerMetadataStatus = "idle" | "loading" | "ready" | "failed";
+
 export interface FileEntry {
   path: string;
   size_bytes: number;

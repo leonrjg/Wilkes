@@ -1,7 +1,15 @@
 import { create } from "zustand";
 import { api } from "../services";
 import { isUsableSemanticIndex } from "../lib/semantic";
-import type { FileMatches, MatchRef, PreviewData, SearchQuery, SearchStats } from "../lib/types";
+import type {
+  DocumentMetadata,
+  FileMatches,
+  MatchRef,
+  PreviewData,
+  SearchQuery,
+  SearchStats,
+  ViewerMetadataStatus,
+} from "../lib/types";
 
 interface SearchStore {
   results: FileMatches[];
@@ -11,6 +19,8 @@ interface SearchStore {
   selectedMatch: MatchRef | null;
   previewData: PreviewData | null;
   previewLoading: boolean;
+  viewerMetadata: DocumentMetadata | null;
+  viewerMetadataStatus: ViewerMetadataStatus;
   currentSearchId: string | null;
   lastQuery: SearchQuery | null;
 
@@ -32,6 +42,8 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
   selectedMatch: null,
   previewData: null,
   previewLoading: false,
+  viewerMetadata: null,
+  viewerMetadataStatus: "idle",
   currentSearchId: null,
   lastQuery: null,
 
@@ -44,7 +56,15 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
     // Keep existing results visible until the first new result arrives.
     // Clear selected match/preview immediately since they belong to the old query.
     const hasStale = results.length > 0;
-    set({ stats: null, searching: true, lastQuery: query, selectedMatch: null, previewData: null });
+    set({
+      stats: null,
+      searching: true,
+      lastQuery: query,
+      selectedMatch: null,
+      previewData: null,
+      viewerMetadata: null,
+      viewerMetadataStatus: "idle",
+    });
     if (!hasStale) set({ results: [] });
 
     let firstResult = true;
@@ -82,6 +102,8 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
       selectedMatch: null,
       previewData: null,
       previewLoading: false,
+      viewerMetadata: null,
+      viewerMetadataStatus: "idle",
     }),
 
   replaySearch: async () => {
@@ -116,11 +138,19 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
         selectedMatch: null,
         previewData: null,
         previewLoading: false,
+        viewerMetadata: null,
+        viewerMetadataStatus: "idle",
       };
     }),
 
   selectMatch: (matchRef: MatchRef) => {
-    set({ selectedMatch: matchRef, previewLoading: true });
+    const selectedPath = matchRef.path;
+    set({
+      selectedMatch: matchRef,
+      previewLoading: true,
+      viewerMetadata: null,
+      viewerMetadataStatus: "loading",
+    });
     api
       .preview(matchRef)
       .then((data) => set({ previewData: data, previewLoading: false }))
@@ -128,8 +158,34 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
         console.error("Preview failed:", e);
         set({ previewData: null, previewLoading: false });
       });
+
+    api
+      .getFileMetadata(selectedPath)
+      .then((metadata) => {
+        if (get().selectedMatch?.path !== selectedPath) return;
+        set({ viewerMetadata: metadata, viewerMetadataStatus: "ready" });
+      })
+      .catch((e) => {
+        console.error("Metadata fetch failed:", e);
+        if (get().selectedMatch?.path !== selectedPath) return;
+        set({ viewerMetadata: null, viewerMetadataStatus: "failed" });
+      });
   },
 
-  clearPreview: () => set({ selectedMatch: null, previewData: null }),
-  clearResults: () => set({ results: [], stats: null, selectedMatch: null, previewData: null }),
+  clearPreview: () =>
+    set({
+      selectedMatch: null,
+      previewData: null,
+      viewerMetadata: null,
+      viewerMetadataStatus: "idle",
+    }),
+  clearResults: () =>
+    set({
+      results: [],
+      stats: null,
+      selectedMatch: null,
+      previewData: null,
+      viewerMetadata: null,
+      viewerMetadataStatus: "idle",
+    }),
 }));

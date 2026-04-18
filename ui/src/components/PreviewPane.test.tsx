@@ -11,10 +11,17 @@ vi.mock("./preview/PdfViewer", () => ({ default: (props: any) => mockPdfViewer(p
 describe("PreviewPane", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: vi.fn() },
+      configurable: true,
+    });
+    vi.stubGlobal("open", vi.fn());
     useSearchStore.setState({
       selectedMatch: null,
       previewData: null,
       previewLoading: false,
+      viewerMetadata: null,
+      viewerMetadataStatus: "idle",
       clearPreview: vi.fn(),
     });
   });
@@ -43,6 +50,72 @@ describe("PreviewPane", () => {
     render(<PreviewPane />);
     expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
     expect(screen.getAllByText("test.txt")[0]).toBeInTheDocument();
+  });
+
+  it("renders metadata title and author when available", () => {
+    const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
+    useSearchStore.setState({
+      selectedMatch: mockMatch,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: { title: "A Better Title", author: "Test Author", doi: null },
+      viewerMetadataStatus: "ready",
+    });
+
+    render(<PreviewPane />);
+    expect(screen.getByText("A Better Title")).toBeInTheDocument();
+    expect(screen.getByText("Test Author")).toBeInTheDocument();
+    expect(screen.getByText("test.pdf")).toBeInTheDocument();
+  });
+
+  it("renders metadata loading placeholder while preserving the path", () => {
+    const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
+    useSearchStore.setState({
+      selectedMatch: mockMatch,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: null,
+      viewerMetadataStatus: "loading",
+    });
+
+    render(<PreviewPane />);
+    expect(screen.getByText("Loading metadata…")).toBeInTheDocument();
+    expect(screen.getAllByText("test.pdf").length).toBeGreaterThan(0);
+  });
+
+  it("renders DOI open and copy actions when DOI is available", () => {
+    const mockMatch = { path: "paper.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
+    useSearchStore.setState({
+      selectedMatch: mockMatch,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: { title: "Paper", author: "Author", doi: "10.1000/xyz123" },
+      viewerMetadataStatus: "ready",
+    });
+
+    render(<PreviewPane />);
+    expect(screen.getByTitle("Open DOI 10.1000/xyz123")).toBeInTheDocument();
+    expect(screen.getByTitle("Copy DOI 10.1000/xyz123")).toBeInTheDocument();
+    expect(screen.getByText("10.1000/xyz123")).toBeInTheDocument();
+  });
+
+  it("opens DOI URL and copies DOI from header actions", () => {
+    const mockMatch = { path: "paper.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
+    useSearchStore.setState({
+      selectedMatch: mockMatch,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: { title: "Paper", author: "Author", doi: "10.1000/xyz123" },
+      viewerMetadataStatus: "ready",
+    });
+
+    render(<PreviewPane />);
+
+    fireEvent.click(screen.getByTitle("Open DOI 10.1000/xyz123"));
+    expect(window.open).toHaveBeenCalledWith(
+      "https://doi.org/10.1000/xyz123",
+      "_blank",
+      "noopener,noreferrer",
+    );
+
+    fireEvent.click(screen.getByTitle("Copy DOI 10.1000/xyz123"));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("10.1000/xyz123");
   });
 
   it("renders PdfViewer for pdf data", () => {

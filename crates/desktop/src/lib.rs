@@ -7,14 +7,14 @@ use tracing::info;
 use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
-    DataPaths, EmbeddingEngine, FileListResponse, IndexStatus, ModelDescriptor, SelectedEmbedder,
-    Settings,
+    DataPaths, DocumentMetadata, EmbeddingEngine, FileListResponse, IndexStatus, ModelDescriptor,
+    SelectedEmbedder, Settings,
 };
 
 mod platform;
 
 use platform::{
-    build_startup_plan, validate_open_path, DesktopPlatform, DesktopStartupPlan,
+    build_startup_plan, validate_open_target, DesktopPlatform, DesktopStartupPlan,
     SystemDesktopPlatform, TauriPlatform,
 };
 
@@ -39,6 +39,16 @@ async fn open_file_for_ctx(
     path: String,
 ) -> Result<wilkes_core::types::PreviewData, String> {
     ctx.open_file(path.into()).await.map_err(|e| e.to_string())
+}
+
+async fn get_file_metadata_for_path(
+    ctx: Arc<AppContext>,
+    path: String,
+) -> Result<DocumentMetadata, String> {
+    let supported_extensions = ctx.get_settings().await.supported_extensions;
+    wilkes_api::commands::metadata::get_file_metadata(path.into(), supported_extensions)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn get_settings_for_ctx(ctx: Arc<AppContext>) -> Result<Settings, String> {
@@ -241,9 +251,8 @@ async fn get_python_info() -> Result<String, String> {
 
 #[tauri::command]
 async fn open_path(path: String) -> Result<(), String> {
-    let p = std::path::PathBuf::from(&path);
-    validate_open_path(&p)?;
-    SystemDesktopPlatform.open_path(&p)?;
+    validate_open_target(&path)?;
+    SystemDesktopPlatform.open_target(&path)?;
     Ok(())
 }
 
@@ -298,6 +307,11 @@ async fn open_file(
     app: AppHandle,
 ) -> Result<wilkes_core::types::PreviewData, String> {
     open_file_for_ctx(app_context(&app), path).await
+}
+
+#[tauri::command]
+async fn get_file_metadata(path: String, app: AppHandle) -> Result<DocumentMetadata, String> {
+    get_file_metadata_for_path(app_context(&app), path).await
 }
 
 #[tauri::command]
@@ -429,6 +443,7 @@ pub fn run() {
             preview,
             list_files,
             open_file,
+            get_file_metadata,
             get_python_info,
             get_supported_engines,
             get_settings,
@@ -569,13 +584,14 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_open_path() {
+    fn test_validate_open_target() {
         let dir = tempdir().unwrap();
-        assert!(validate_open_path(dir.path()).is_ok());
+        assert!(validate_open_target(&dir.path().display().to_string()).is_ok());
         assert_eq!(
-            validate_open_path(&dir.path().join("missing")),
+            validate_open_target(&dir.path().join("missing").display().to_string()),
             Err("Path does not exist".into())
         );
+        assert!(validate_open_target("https://doi.org/10.1000/xyz123").is_ok());
     }
 
     #[cfg(unix)]
@@ -666,6 +682,19 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("Access denied"));
+    }
+
+    #[tokio::test]
+    async fn test_get_file_metadata_for_path_allows_outside_data_dir() {
+        let outside_dir = tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.txt");
+        std::fs::write(&outside, "hello").unwrap();
+
+        let (_dir, ctx) = test_ctx();
+        let metadata = get_file_metadata_for_path(ctx, outside.display().to_string())
+            .await
+            .unwrap();
+        assert_eq!(metadata, DocumentMetadata::default());
     }
 
     #[tokio::test]

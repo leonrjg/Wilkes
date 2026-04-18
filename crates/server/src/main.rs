@@ -28,7 +28,7 @@ use tracing::info;
 use wilkes_api::context::AppContext;
 use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::types::{
-    EmbeddingEngine, MatchRef, ModelDescriptor, SearchQuery, SelectedEmbedder,
+    DocumentMetadata, EmbeddingEngine, MatchRef, ModelDescriptor, SearchQuery, SelectedEmbedder,
 };
 
 fn confine_to_uploads(
@@ -197,6 +197,19 @@ async fn open_file_handler(
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(data))
+}
+
+async fn get_file_metadata_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<OpenFileBody>,
+) -> Result<Json<DocumentMetadata>, (StatusCode, Json<ErrorBody>)> {
+    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
+    let metadata = state
+        .ctx
+        .get_file_metadata(path)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(metadata))
 }
 
 // ── Upload ────────────────────────────────────────────────────────────────────
@@ -654,6 +667,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/worker/python-info", get(get_python_info_handler))
         .route("/api/files", get(list_files_handler))
         .route("/api/file", post(open_file_handler))
+        .route("/api/file/metadata", post(get_file_metadata_handler))
         // Upload (server-only: desktop uses native file picker)
         .route(
             "/api/upload",

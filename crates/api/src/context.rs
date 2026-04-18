@@ -20,8 +20,8 @@ use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
-    EmbedderModel, IndexStatus, IndexingConfig, PreviewData, SearchMode, SearchQuery,
-    SelectedEmbedder, SemanticSettings, Settings,
+    DocumentMetadata, EmbedderModel, IndexStatus, IndexingConfig, PreviewData, SearchMode,
+    SearchQuery, SelectedEmbedder, SemanticSettings, Settings,
 };
 
 use crate::commands::search::{start_search, SearchHandle};
@@ -206,6 +206,14 @@ impl AppContext {
         }
         let s = self.get_settings().await;
         crate::commands::files::open_file(path, s.supported_extensions).await
+    }
+
+    pub async fn get_file_metadata(&self, path: PathBuf) -> anyhow::Result<DocumentMetadata> {
+        if !is_under(&path, &self.data_dir) {
+            anyhow::bail!("Access denied: path outside data directory");
+        }
+        let s = self.get_settings().await;
+        crate::commands::metadata::get_file_metadata(path, s.supported_extensions).await
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────

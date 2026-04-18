@@ -7,6 +7,7 @@ describe("HttpSearchApi", () => {
   beforeEach(() => {
     api = new HttpSearchApi();
     vi.stubGlobal("fetch", vi.fn());
+    vi.stubGlobal("open", vi.fn());
     vi.stubGlobal("EventSource", vi.fn(() => ({
       addEventListener: vi.fn(),
       close: vi.fn(),
@@ -181,6 +182,21 @@ describe("HttpSearchApi", () => {
     expect(res).toEqual(mockData);
   });
 
+  it("getFileMetadata calls fetch and returns document metadata", async () => {
+    const mockData = { title: "Test Title", author: "Test Author", doi: null };
+    (fetch as any).mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(mockData),
+    });
+
+    const res = await api.getFileMetadata("test.pdf");
+    expect(fetch).toHaveBeenCalledWith("/api/file/metadata", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ path: "test.pdf" }),
+    }));
+    expect(res).toEqual(mockData);
+  });
+
   it("resolvePdfUrl returns correctly formatted URL", () => {
     const url = api.resolvePdfUrl("/path/to/test.pdf");
     expect(url).toBe("/asset?path=%2Fpath%2Fto%2Ftest.pdf");
@@ -250,9 +266,19 @@ describe("HttpSearchApi", () => {
     expect(res).toEqual(mockData);
   });
 
-  it("openPath does nothing in browser mode", async () => {
+  it("openPath opens web URLs in browser mode", async () => {
+    await api.openPath("https://doi.org/10.1000/xyz123");
+    expect(window.open).toHaveBeenCalledWith(
+      "https://doi.org/10.1000/xyz123",
+      "_blank",
+      "noopener,noreferrer",
+    );
+  });
+
+  it("openPath does nothing for local paths in browser mode", async () => {
     await api.openPath("/some/path");
     // Just verifying it doesn't throw and coverage is recorded
+    expect(window.open).not.toHaveBeenCalled();
   });
 
   it("getWorkerStatus calls fetch and returns WorkerStatus", async () => {

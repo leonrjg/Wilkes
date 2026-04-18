@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { X, ArrowLeft, ArrowRight } from "react-feather";
+import { X, ArrowLeft, ArrowRight, ExternalLink, Copy } from "react-feather";
 import CodeViewer from "./preview/CodeViewer";
 import PdfViewer from "./preview/PdfViewer";
 import { useSearchStore } from "../stores/useSearchStore";
 import { api } from "../services";
+import type { DocumentMetadata, ViewerMetadataStatus } from "../lib/types";
 
 interface Props {
   canGoBack?: boolean;
@@ -16,10 +17,31 @@ function fileName(path: string) {
   return path.split(/[/\\]/).pop() ?? path;
 }
 
+function headerTitle(path: string, metadata: DocumentMetadata | null) {
+  const title = metadata?.title?.trim();
+  return title && title.length > 0 ? title : fileName(path);
+}
+
+function metadataSummary(metadata: DocumentMetadata | null, status: ViewerMetadataStatus) {
+  const parts = [metadata?.author?.trim()].filter(
+    (value): value is string => Boolean(value && value.length > 0),
+  );
+
+  if (parts.length > 0) return parts.join(" · ");
+  if (status === "loading") return "Loading metadata…";
+  return null;
+}
+
+function doiUrl(doi: string) {
+  return `https://doi.org/${doi}`;
+}
+
 export default function PreviewPane({ canGoBack = false, canGoForward = false, onGoBack, onGoForward }: Props) {
   const selectedMatch = useSearchStore((s) => s.selectedMatch);
   const previewData = useSearchStore((s) => s.previewData);
   const previewLoading = useSearchStore((s) => s.previewLoading);
+  const viewerMetadata = useSearchStore((s) => s.viewerMetadata);
+  const viewerMetadataStatus = useSearchStore((s) => s.viewerMetadataStatus);
   const clearPreview = useSearchStore((s) => s.clearPreview);
 
   // Keep the last valid previewData so the content stays mounted while a new
@@ -67,6 +89,20 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   const isPdfFile = "PdfPage" in selectedMatch.origin;
   const pdfPage = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.page : 1;
   const pdfBbox = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.bbox : null;
+  const summary = metadataSummary(viewerMetadata, viewerMetadataStatus);
+  const doi = viewerMetadata?.doi?.trim() || null;
+
+  const handleOpenDoi = () => {
+    if (!doi) return;
+    api.openPath(doiUrl(doi)).catch((e) => console.error("Open DOI failed:", e));
+  };
+
+  const handleCopyDoi = () => {
+    if (!doi) return;
+    Promise.resolve(navigator.clipboard?.writeText(doi)).catch((e) =>
+      console.error("Copy DOI failed:", e),
+    );
+  };
 
   if (!isPdfFile && !displayData) {
     return (
@@ -101,11 +137,33 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
 
         <div className="flex flex-col min-w-0 flex-1 selectable">
           <span className="text-xs font-medium text-[var(--text-main)] truncate leading-tight">
-            {fileName(selectedMatch.path)}
+            {headerTitle(selectedMatch.path, viewerMetadata)}
           </span>
-          <span className="text-[10px] text-[var(--text-dim)] truncate leading-tight">
-            {selectedMatch.path}
-          </span>
+          <div className="flex items-center gap-1 min-w-0 text-[10px] text-[var(--text-dim)] leading-tight">
+            {summary && <span className="truncate">{summary}</span>}
+            {summary && <span aria-hidden="true">·</span>}
+            {doi && (
+              <>
+                <button
+                  onClick={handleOpenDoi}
+                  className="inline-flex items-center gap-1 hover:text-[var(--text-main)] transition-colors"
+                  title={`Open DOI ${doi}`}
+                >
+                  <span className="truncate max-w-[140px]">DOI: {doi}</span>
+                  <ExternalLink size={10} />
+                </button>
+                <button
+                  onClick={handleCopyDoi}
+                  className="p-0.5 hover:text-[var(--text-main)] transition-colors"
+                  title={`Copy DOI ${doi}`}
+                >
+                  <Copy size={10} />
+                </button>
+                <span aria-hidden="true">·</span>
+              </>
+            )}
+            <span className="truncate min-w-0 flex-1">{selectedMatch.path}</span>
+          </div>
         </div>
 
         <button
