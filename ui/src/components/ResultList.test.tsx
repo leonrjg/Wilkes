@@ -1,9 +1,24 @@
 import { render, screen, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import ResultList from "./ResultList";
 import { ToastProvider } from "./Toast";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
+
+const { mockOpenPath, mockIsTauri } = vi.hoisted(() => ({
+  mockOpenPath: vi.fn(),
+  mockIsTauri: { value: false },
+}));
+
+vi.mock("../services", () => ({
+  api: {
+    openPath: mockOpenPath,
+  },
+  get isTauri() {
+    return mockIsTauri.value;
+  },
+}));
+
+import ResultList from "./ResultList";
 
 // Mock @tanstack/react-virtual
 vi.mock("@tanstack/react-virtual", () => ({
@@ -33,6 +48,7 @@ describe("ResultList", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockIsTauri.value = false;
     useSearchStore.setState({
       results: [],
       stats: null,
@@ -213,5 +229,105 @@ describe("ResultList", () => {
     expect(screen.getByText("0 matches…")).toBeInTheDocument();
     // Shimmer element
     expect(container.querySelector(".animate-shimmer")).toBeDefined();
+  });
+
+  it("opens a file context menu on right click without opening the file", () => {
+    useSettingsStore.setState({
+      fileList: [
+        { path: "/test/visible.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" },
+      ],
+    });
+
+    renderWithToasts();
+    const row = screen.getByRole("button", { name: /visible\.txt/i });
+
+    fireEvent.contextMenu(row);
+
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Open" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Copy path" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Open containing folder" })).not.toBeInTheDocument();
+    expect(mockOnFileClick).not.toHaveBeenCalled();
+  });
+
+  it("runs the open action from a match-row context menu", () => {
+    useSearchStore.setState({
+      hasQuery: true,
+      results: [
+        {
+          path: "/test/file.txt",
+          file_type: "PlainText",
+          matches: [
+            {
+              text_range: { start: 0, end: 4 },
+              matched_text: "test",
+              context_before: "",
+              context_after: "",
+              origin: { TextFile: { line: 1, col: 1 } },
+            },
+          ],
+        },
+      ],
+    });
+
+    renderWithToasts();
+    const matchRow = screen.getByRole("button", { name: /L1test/ });
+
+    fireEvent.contextMenu(matchRow);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Open" }));
+
+    expect(mockOnMatchClick).toHaveBeenCalledWith(expect.objectContaining({
+      path: "/test/file.txt",
+    }));
+  });
+
+  it("copies a file path and shows a success toast", async () => {
+    useSettingsStore.setState({
+      fileList: [
+        { path: "/test/visible.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" },
+      ],
+    });
+
+    renderWithToasts();
+    fireEvent.contextMenu(screen.getByRole("button", { name: /visible\.txt/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy path" }));
+
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("/test/visible.txt");
+    expect(await screen.findByText("Path copied")).toBeInTheDocument();
+  });
+
+  it("closes the menu on Escape", () => {
+    useSettingsStore.setState({
+      fileList: [
+        { path: "/test/visible.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" },
+      ],
+    });
+
+    renderWithToasts();
+    fireEvent.contextMenu(screen.getByRole("button", { name: /visible\.txt/i }));
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("shows the desktop folder action and calls openPath", () => {
+    mockIsTauri.value = true;
+    useSearchStore.setState({
+      hasQuery: true,
+      results: [
+        {
+          path: "/test/file.txt",
+          file_type: "PlainText",
+          matches: [],
+        },
+      ],
+    });
+
+    renderWithToasts();
+    fireEvent.contextMenu(screen.getByText("file.txt"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Open containing folder" }));
+
+    expect(mockOpenPath).toHaveBeenCalledWith("/test");
   });
 });
