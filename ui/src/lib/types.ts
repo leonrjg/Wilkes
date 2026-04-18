@@ -92,6 +92,7 @@ export interface DocumentMetadata {
   title: string | null;
   author: string | null;
   doi: string | null;
+  created_at: string | null;
 }
 
 export type ViewerMetadataStatus = "idle" | "loading" | "ready" | "failed";

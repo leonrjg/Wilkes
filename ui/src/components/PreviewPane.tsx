@@ -5,6 +5,7 @@ import PdfViewer from "./preview/PdfViewer";
 import { useSearchStore } from "../stores/useSearchStore";
 import { api } from "../services";
 import type { DocumentMetadata, ViewerMetadataStatus } from "../lib/types";
+import { buildExternalLinks } from "../lib/externalLinks";
 
 interface Props {
   canGoBack?: boolean;
@@ -22,18 +23,51 @@ function headerTitle(path: string, metadata: DocumentMetadata | null) {
   return title && title.length > 0 ? title : fileName(path);
 }
 
-function metadataSummary(metadata: DocumentMetadata | null, status: ViewerMetadataStatus) {
-  const parts = [metadata?.author?.trim()].filter(
-    (value): value is string => Boolean(value && value.length > 0),
-  );
+function formatCreatedAt(createdAt: string | null | undefined) {
+  if (!createdAt) return null;
 
-  if (parts.length > 0) return parts.join(" · ");
-  if (status === "loading") return "Loading metadata…";
-  return null;
+  const match = /^(\d{4})-(\d{2})$/.exec(createdAt);
+  if (!match) return null;
+
+  const [, year, month] = match;
+  const monthIndex = Number(month) - 1;
+  const date = new Date(Date.UTC(Number(year), monthIndex, 1));
+  if (Number.isNaN(date.getTime())) return null;
+
+  return new Intl.DateTimeFormat("en", {
+    month: "short",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(date);
 }
 
-function doiUrl(doi: string) {
-  return `https://doi.org/${doi}`;
+function actionButtonClassName(compact = false) {
+  return [
+    "inline-flex items-center transition-colors border border-[var(--border-main)]",
+    "bg-[var(--bg-active)] hover:text-[var(--text-main)] hover:border-[var(--border-strong)]",
+    compact ? "gap-1 px-1.5 py-0.5 rounded" : "gap-1 px-2 py-0.5 rounded",
+  ].join(" ");
+}
+
+function groupedActionClassName() {
+  return [
+    "inline-flex items-stretch overflow-hidden rounded border border-[var(--border-main)]",
+    "bg-[var(--bg-active)]",
+  ].join(" ");
+}
+
+function groupedActionSegmentClassName() {
+  return [
+    "inline-flex items-center gap-1 px-2 py-0.5 transition-colors",
+    "hover:text-[var(--text-main)] hover:bg-[var(--bg-header)]",
+  ].join(" ");
+}
+
+function metadataBadgeClassName() {
+  return [
+    "inline-flex items-center px-1.5 py-0.5 rounded border border-[var(--border-main)]",
+    "bg-[var(--bg-active)] text-[var(--text-main)]",
+  ].join(" ");
 }
 
 export default function PreviewPane({ canGoBack = false, canGoForward = false, onGoBack, onGoForward }: Props) {
@@ -89,12 +123,19 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   const isPdfFile = "PdfPage" in selectedMatch.origin;
   const pdfPage = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.page : 1;
   const pdfBbox = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.bbox : null;
-  const summary = metadataSummary(viewerMetadata, viewerMetadataStatus);
-  const doi = viewerMetadata?.doi?.trim() || null;
+  const author = viewerMetadata?.author?.trim() || null;
+  const createdAt = formatCreatedAt(viewerMetadata?.created_at);
+  const links = buildExternalLinks(viewerMetadata?.doi);
+  const doi = links?.doi ?? null;
 
   const handleOpenDoi = () => {
-    if (!doi) return;
-    api.openPath(doiUrl(doi)).catch((e) => console.error("Open DOI failed:", e));
+    if (!links) return;
+    api.openPath(links.doiUrl).catch((e) => console.error("Open DOI failed:", e));
+  };
+
+  const handleOpenScholar = () => {
+    if (!links) return;
+    api.openPath(links.googleScholarUrl).catch((e) => console.error("Open Google Scholar failed:", e));
   };
 
   const handleCopyDoi = () => {
@@ -140,24 +181,36 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
             {headerTitle(selectedMatch.path, viewerMetadata)}
           </span>
           <div className="flex items-center gap-1 min-w-0 text-[10px] text-[var(--text-dim)] leading-tight">
-            {summary && <span className="truncate">{summary}</span>}
-            {summary && <span aria-hidden="true">·</span>}
+            {createdAt && <span className={metadataBadgeClassName()}>{createdAt}</span>}
+            {author && <span className="truncate">{author}</span>}
+            {!createdAt && !author && viewerMetadataStatus === "loading" && <span>Loading metadata…</span>}
+            {(createdAt || author || viewerMetadataStatus === "loading") && <span aria-hidden="true">·</span>}
             {doi && (
               <>
+                <div className={groupedActionClassName()}>
+                  <button
+                    onClick={handleOpenDoi}
+                    className={groupedActionSegmentClassName()}
+                    title={`Open DOI ${doi}`}
+                  >
+                    <span className="truncate max-w-[140px]">DOI: {doi}</span>
+                    <ExternalLink size={10} />
+                  </button>
+                  <button
+                    onClick={handleCopyDoi}
+                    className={`${groupedActionSegmentClassName()} border-l border-[var(--border-main)]`}
+                    title={`Copy DOI ${doi}`}
+                  >
+                    <Copy size={10} />
+                  </button>
+                </div>
                 <button
-                  onClick={handleOpenDoi}
-                  className="inline-flex items-center gap-1 hover:text-[var(--text-main)] transition-colors"
-                  title={`Open DOI ${doi}`}
+                  onClick={handleOpenScholar}
+                  className={actionButtonClassName()}
+                  title={`Open Google Scholar for DOI ${doi}`}
                 >
-                  <span className="truncate max-w-[140px]">DOI: {doi}</span>
+                  <span>Scholar</span>
                   <ExternalLink size={10} />
-                </button>
-                <button
-                  onClick={handleCopyDoi}
-                  className="p-0.5 hover:text-[var(--text-main)] transition-colors"
-                  title={`Copy DOI ${doi}`}
-                >
-                  <Copy size={10} />
                 </button>
                 <span aria-hidden="true">·</span>
               </>

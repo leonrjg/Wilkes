@@ -68,6 +68,7 @@ mod tests {
                 title: Some("Mock Title".into()),
                 author: None,
                 doi: None,
+                created_at: None,
             })
         }
     }
