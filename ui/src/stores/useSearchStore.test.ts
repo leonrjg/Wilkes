@@ -123,7 +123,7 @@ describe("useSearchStore", () => {
     };
 
     (api.preview as any).mockResolvedValue(mockPreviewData);
-    (api.getFileMetadata as any).mockResolvedValue({ title: "Test Title", author: "Test Author", doi: "10.1000/xyz123" });
+    (api.getFileMetadata as any).mockResolvedValue({ title: "Test Title", author: "Test Author", doi: "10.1000/xyz123", created_at: "2025-04" });
 
     await useSearchStore.getState().selectMatch(mockMatchRef);
 
@@ -131,7 +131,7 @@ describe("useSearchStore", () => {
     expect(state.selectedMatch).toEqual(mockMatchRef);
     expect(state.previewData).toEqual(mockPreviewData);
     expect(state.previewLoading).toBe(false);
-    expect(state.viewerMetadata).toEqual({ title: "Test Title", author: "Test Author", doi: "10.1000/xyz123" });
+    expect(state.viewerMetadata).toEqual({ title: "Test Title", author: "Test Author", doi: "10.1000/xyz123", created_at: "2025-04" });
     expect(state.viewerMetadataStatus).toBe("ready");
   });
 
@@ -139,7 +139,7 @@ describe("useSearchStore", () => {
     useSearchStore.setState({
       selectedMatch: {} as any,
       previewData: {} as any,
-      viewerMetadata: { title: "Test Title", author: null, doi: null },
+      viewerMetadata: { title: "Test Title", author: null, doi: null, created_at: null },
       viewerMetadataStatus: "ready",
     });
 
@@ -204,7 +204,7 @@ describe("useSearchStore", () => {
       stats: { files_scanned: 1, total_matches: 1, elapsed_ms: 10, errors: [] },
       selectedMatch: { path: "/f.ts", origin: { TextFile: { line: 1, col: 1 } } } as any,
       previewData: { Text: { content: "", language: "text", highlight_line: 1, highlight_range: { start: 0, end: 0 } } },
-      viewerMetadata: { title: "Test Title", author: null, doi: null },
+      viewerMetadata: { title: "Test Title", author: null, doi: null, created_at: null },
       viewerMetadataStatus: "ready",
     });
 
@@ -226,7 +226,7 @@ describe("useSearchStore", () => {
       stats: { files_scanned: 1, total_matches: 1, elapsed_ms: 10, errors: [] },
       selectedMatch: { path: "/f.ts", origin: { TextFile: { line: 1, col: 1 } } } as any,
       previewData: { Text: { content: "", language: "text", highlight_line: 1, highlight_range: { start: 0, end: 0 } } },
-      viewerMetadata: { title: "Test Title", author: null, doi: null },
+      viewerMetadata: { title: "Test Title", author: null, doi: null, created_at: null },
       viewerMetadataStatus: "ready",
     });
 
@@ -248,7 +248,7 @@ describe("useSearchStore", () => {
       stats: { files_scanned: 1, total_matches: 1, elapsed_ms: 10, errors: [] },
       selectedMatch: { path: "/f.ts", origin: { TextFile: { line: 1, col: 1 } } } as any,
       previewData: { Text: { content: "", language: "text", highlight_line: 1, highlight_range: { start: 0, end: 0 } } },
-      viewerMetadata: { title: "Test Title", author: null, doi: null },
+      viewerMetadata: { title: "Test Title", author: null, doi: null, created_at: null },
       viewerMetadataStatus: "ready",
     });
 
@@ -296,13 +296,14 @@ describe("useSearchStore", () => {
       },
     });
 
-    resolveMetadata?.({ title: "Test Title", author: null, doi: null });
+    resolveMetadata?.({ title: "Test Title", author: null, doi: null, created_at: null });
     await Promise.resolve();
 
     expect(useSearchStore.getState().viewerMetadata).toEqual({
       title: "Test Title",
       author: null,
       doi: null,
+      created_at: null,
     });
     expect(useSearchStore.getState().viewerMetadataStatus).toBe("ready");
   });
@@ -324,7 +325,7 @@ describe("useSearchStore", () => {
             resolveFirstMetadata = resolve;
           }),
       )
-      .mockResolvedValueOnce({ title: "Second Title", author: null, doi: null });
+      .mockResolvedValueOnce({ title: "Second Title", author: null, doi: null, created_at: null });
 
     useSearchStore.getState().selectMatch({
       path: "/root/first.txt",
@@ -336,7 +337,7 @@ describe("useSearchStore", () => {
     });
 
     await Promise.resolve();
-    resolveFirstMetadata?.({ title: "First Title", author: null, doi: null });
+    resolveFirstMetadata?.({ title: "First Title", author: null, doi: null, created_at: null });
     await Promise.resolve();
 
     expect(useSearchStore.getState().selectedMatch?.path).toBe("/root/second.txt");
@@ -344,6 +345,7 @@ describe("useSearchStore", () => {
       title: "Second Title",
       author: null,
       doi: null,
+      created_at: null,
     });
   });
 

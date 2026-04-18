@@ -41,6 +41,7 @@ impl FileMetadataExtractor for TextMetadataExtractor {
             title: None,
             author: None,
             doi: find_doi(&head),
+            created_at: None,
         })
     }
 }

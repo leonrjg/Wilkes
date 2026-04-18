@@ -183,7 +183,7 @@ describe("HttpSearchApi", () => {
   });
 
   it("getFileMetadata calls fetch and returns document metadata", async () => {
-    const mockData = { title: "Test Title", author: "Test Author", doi: null };
+    const mockData = { title: "Test Title", author: "Test Author", doi: null, created_at: "2025-04" };
     (fetch as any).mockResolvedValue({
       ok: true,
       json: () => Promise.resolve(mockData),

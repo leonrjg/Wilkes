@@ -131,10 +131,10 @@ describe("TauriSearchApi", () => {
   });
 
   it("should call get_file_metadata", async () => {
-    (invoke as any).mockResolvedValue({ title: "Test Title", author: "Test Author", doi: null });
+    (invoke as any).mockResolvedValue({ title: "Test Title", author: "Test Author", doi: null, created_at: "2025-04" });
     const result = await api.getFileMetadata("/path/to/file.pdf");
     expect(invoke).toHaveBeenCalledWith("get_file_metadata", { path: "/path/to/file.pdf" });
-    expect(result).toEqual({ title: "Test Title", author: "Test Author", doi: null });
+    expect(result).toEqual({ title: "Test Title", author: "Test Author", doi: null, created_at: "2025-04" });
   });
 
   it("should call get_data_paths", async () => {
