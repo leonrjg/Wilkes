@@ -4,7 +4,7 @@ import CodeViewer from "./preview/CodeViewer";
 import PdfViewer from "./preview/PdfViewer";
 import { useSearchStore } from "../stores/useSearchStore";
 import { api } from "../services";
-import type { DocumentMetadata, ViewerMetadataStatus } from "../lib/types";
+import type { DocumentMetadata } from "../lib/types";
 import { buildExternalLinks } from "../lib/externalLinks";
 
 interface Props {
