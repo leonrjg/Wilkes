@@ -144,12 +144,14 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
     }),
 
   selectMatch: (matchRef: MatchRef) => {
+    const previousPath = get().selectedMatch?.path;
     const selectedPath = matchRef.path;
+    const sameFile = previousPath === selectedPath;
     set({
       selectedMatch: matchRef,
       previewLoading: true,
-      viewerMetadata: null,
-      viewerMetadataStatus: "loading",
+      viewerMetadata: sameFile ? get().viewerMetadata : null,
+      viewerMetadataStatus: sameFile ? get().viewerMetadataStatus : "loading",
     });
     api
       .preview(matchRef)
@@ -158,6 +160,10 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
         console.error("Preview failed:", e);
         set({ previewData: null, previewLoading: false });
       });
+
+    if (sameFile) {
+      return;
+    }
 
     api
       .getFileMetadata(selectedPath)

@@ -349,6 +349,58 @@ describe("useSearchStore", () => {
     });
   });
 
+  it("should reuse metadata for same-file selections without refetching", async () => {
+    (api.preview as any)
+      .mockResolvedValueOnce({
+        Text: {
+          content: "first preview",
+          language: "text",
+          highlight_line: 1,
+          highlight_range: { start: 0, end: 4 },
+        },
+      })
+      .mockResolvedValueOnce({
+        Text: {
+          content: "second preview",
+          language: "text",
+          highlight_line: 8,
+          highlight_range: { start: 5, end: 9 },
+        },
+      });
+    (api.getFileMetadata as any).mockResolvedValue({
+      title: "Shared Title",
+      author: "Shared Author",
+      doi: null,
+      created_at: "2025-04",
+    });
+
+    await useSearchStore.getState().selectMatch({
+      path: "/root/file.txt",
+      origin: { TextFile: { line: 1, col: 1 } },
+    });
+    await useSearchStore.getState().selectMatch({
+      path: "/root/file.txt",
+      origin: { TextFile: { line: 8, col: 3 } },
+    });
+
+    expect(api.getFileMetadata).toHaveBeenCalledTimes(1);
+    expect(useSearchStore.getState().previewData).toEqual({
+      Text: {
+        content: "second preview",
+        language: "text",
+        highlight_line: 8,
+        highlight_range: { start: 5, end: 9 },
+      },
+    });
+    expect(useSearchStore.getState().viewerMetadata).toEqual({
+      title: "Shared Title",
+      author: "Shared Author",
+      doi: null,
+      created_at: "2025-04",
+    });
+    expect(useSearchStore.getState().viewerMetadataStatus).toBe("ready");
+  });
+
   it("should mark metadata loading as failed without clearing preview", async () => {
     (api.preview as any).mockResolvedValue({
       Text: {
@@ -374,6 +426,48 @@ describe("useSearchStore", () => {
         language: "text",
         highlight_line: 1,
         highlight_range: { start: 0, end: 4 },
+      },
+    });
+    expect(useSearchStore.getState().viewerMetadata).toBeNull();
+    expect(useSearchStore.getState().viewerMetadataStatus).toBe("failed");
+  });
+
+  it("should keep failed metadata state for same-file selections without retrying", async () => {
+    (api.preview as any)
+      .mockResolvedValueOnce({
+        Text: {
+          content: "first preview",
+          language: "text",
+          highlight_line: 1,
+          highlight_range: { start: 0, end: 4 },
+        },
+      })
+      .mockResolvedValueOnce({
+        Text: {
+          content: "second preview",
+          language: "text",
+          highlight_line: 2,
+          highlight_range: { start: 5, end: 9 },
+        },
+      });
+    (api.getFileMetadata as any).mockRejectedValue(new Error("metadata failed"));
+
+    await useSearchStore.getState().selectMatch({
+      path: "/root/file.txt",
+      origin: { TextFile: { line: 1, col: 1 } },
+    });
+    await useSearchStore.getState().selectMatch({
+      path: "/root/file.txt",
+      origin: { TextFile: { line: 2, col: 1 } },
+    });
+
+    expect(api.getFileMetadata).toHaveBeenCalledTimes(1);
+    expect(useSearchStore.getState().previewData).toEqual({
+      Text: {
+        content: "second preview",
+        language: "text",
+        highlight_line: 2,
+        highlight_range: { start: 5, end: 9 },
       },
     });
     expect(useSearchStore.getState().viewerMetadata).toBeNull();

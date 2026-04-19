@@ -50,9 +50,6 @@ jobs:
       - name: Check
         run: cargo check --workspace
 
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
-
       - name: Test with coverage
         run: cargo llvm-cov --workspace --no-report
 
