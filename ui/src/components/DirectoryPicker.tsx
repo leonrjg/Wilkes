@@ -1,6 +1,10 @@
 import { useMemo } from "react";
 import { confirmDialog } from "../lib/utils/dialog";
 import { Folder, Bookmark, X } from "react-feather";
+import { useToasts } from "./Toast";
+import { ContextMenu, useContextMenu } from "./ContextMenu";
+import { api, isTauri } from "../services";
+import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileActions";
 
 interface Props {
   directory: string;
@@ -29,7 +33,10 @@ export default function DirectoryPicker({
   onBookmarkRemove,
   onForgetDirectory,
 }: Props) {
+  const { addToast } = useToasts();
+  const { menu, openMenu, closeMenu } = useContextMenu<ContextMenuTarget>();
   const isBookmarked = (dir: string) => bookmarks.includes(dir);
+  const onToast = (message: string, type: "success" | "error") => addToast(message, { type });
 
   // Combine bookmarks and recent dirs for the list, prioritizing bookmarks
   // and removing duplicates.
@@ -71,6 +78,17 @@ export default function DirectoryPicker({
               <div
                 key={b}
                 className={`flex h-6 items-center gap-0.5 rounded transition-colors group bg-[var(--bg-active)]`}
+                onContextMenu={(event) =>
+                  openMenu({
+                    event,
+                    target: { kind: "directory", path: b, open: () => onChange(b) },
+                    items: buildFileContextMenuItems({
+                      target: { kind: "directory", path: b, open: () => onChange(b) },
+                      api,
+                      capabilities: { canOpenInFileManager: isTauri },
+                      onToast,
+                    }),
+                  })}
               >
                 {onForgetDirectory && (
                   <button
@@ -117,6 +135,7 @@ export default function DirectoryPicker({
           })}
         </div>
       )}
+      <ContextMenu menu={menu} onClose={closeMenu} />
     </div>
   );
 }

@@ -315,19 +315,20 @@ if [ "$1" = "-c" ]; then
     exit 0
 fi
 
-case "$*" in
-*"-m venv"*)
-    mkdir -p "$3/bin" || mkdir -p "$3/Scripts"
-    touch "$3/bin/python3" || touch "$3/Scripts/python.exe"
-    chmod +x "$3/bin/python3" 2>/dev/null || true
+if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
+    mkdir -p "$3/bin"
+    cat > "$3/bin/python3" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+    chmod +x "$3/bin/python3"
     count=0
     if [ -f "{}" ]; then
         count=$(cat "{}")
     fi
     count=$((count + 1))
     printf "%s" "$count" > "{}"
-    ;;
-esac
+fi
 
 exit 0
 "#,
@@ -348,8 +349,7 @@ if [ "$1" = "-c" ]; then
     exit 0
 fi
 
-case "$*" in
-*"-m venv"*)
+if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
     mkdir -p "$3/bin"
     cat > "$3/bin/python3" <<'EOF'
 #!/bin/sh
@@ -359,8 +359,7 @@ fi
 exit 0
 EOF
     chmod +x "$3/bin/python3"
-    ;;
-esac
+fi
 
 exit 0
 "#
@@ -398,15 +397,65 @@ exit 0
         };
 
         let res = setup_python_env(&paths).await;
-        assert!(res.is_ok());
-
-        let res2 = setup_python_env(&paths).await;
-        assert!(res2.is_ok());
+        assert!(res.is_ok(), "{res:?}");
         assert_eq!(std::fs::read_to_string(&venv_counter_file).unwrap(), "1");
 
         let stamp =
             std::fs::read_to_string(paths.venv_dir.join(".requirements_installed")).unwrap();
         assert!(stamp.starts_with("# python=3.9.6\n"));
+    }
+
+    #[tokio::test]
+    async fn test_setup_python_env_skips_when_stamp_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let python_path = dir.path().join("fake_python");
+        let version_file = dir.path().join("python-version.txt");
+        let venv_counter_file = dir.path().join("venv-count.txt");
+        std::fs::write(&version_file, "3.9.6\n").unwrap();
+        std::fs::write(&venv_counter_file, "0").unwrap();
+        #[cfg(unix)]
+        write_fake_python(&python_path, &version_file, &venv_counter_file);
+        #[cfg(windows)]
+        {
+            std::fs::write(&python_path, "@echo off\nexit 0").unwrap();
+        }
+
+        let requirements_path = dir.path().join("requirements.txt");
+        std::fs::write(&requirements_path, "torch\n").unwrap();
+
+        let paths = WorkerPaths {
+            python_path: python_path.clone(),
+            python_package_dir: dir.path().to_path_buf(),
+            requirements_path: requirements_path.clone(),
+            venv_dir: dir.path().join("venv"),
+            worker_bin: dir.path().join("worker"),
+            data_dir: dir.path().to_path_buf(),
+        };
+
+        let venv_python_path = venv_python(&paths.venv_dir);
+        if let Some(parent) = venv_python_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        #[cfg(unix)]
+        write_executable(&venv_python_path, "#!/bin/sh\nexit 0\n");
+        #[cfg(windows)]
+        {
+            std::fs::write(&venv_python_path, "@echo off\nexit 0").unwrap();
+        }
+
+        let stamp_contents = build_requirements_stamp(
+            "torch\n",
+            PythonVersion {
+                major: 3,
+                minor: 9,
+                patch: 6,
+            },
+        );
+        std::fs::write(paths.venv_dir.join(".requirements_installed"), stamp_contents).unwrap();
+
+        let res = setup_python_env(&paths).await;
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(std::fs::read_to_string(&venv_counter_file).unwrap(), "0");
     }
 
     #[tokio::test]

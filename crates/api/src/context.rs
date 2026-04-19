@@ -20,8 +20,8 @@ use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
-    EmbedderModel, IndexStatus, IndexingConfig, PreviewData, SearchMode, SearchQuery,
-    SelectedEmbedder, SemanticSettings, Settings,
+    DocumentMetadata, EmbedderModel, IndexStatus, IndexingConfig, PreviewData, SearchMode,
+    SearchQuery, SelectedEmbedder, SemanticSettings, Settings,
 };
 
 use crate::commands::search::{start_search, SearchHandle};
@@ -206,6 +206,14 @@ impl AppContext {
         }
         let s = self.get_settings().await;
         crate::commands::files::open_file(path, s.supported_extensions).await
+    }
+
+    pub async fn get_file_metadata(&self, path: PathBuf) -> anyhow::Result<DocumentMetadata> {
+        if !is_under(&path, &self.data_dir) {
+            anyhow::bail!("Access denied: path outside data directory");
+        }
+        let s = self.get_settings().await;
+        crate::commands::metadata::get_file_metadata(path, s.supported_extensions).await
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -1270,6 +1278,14 @@ mod tests {
         EmbedderModel, IndexStatus, SearchMode, SelectedEmbedder, SemanticSettings, Settings, Theme,
     };
 
+    #[cfg(unix)]
+    fn write_executable(path: &Path, content: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, content).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     struct MockEmitter {
         events: Arc<Mutex<Vec<(String, Value)>>>,
     }
@@ -2218,7 +2234,7 @@ mod tests {
         let emitter = Arc::new(MockEmitter {
             events: Arc::clone(&events),
         });
-        let (ctx, _rx, _loop) = AppContext::new(
+        let (ctx, _rx, loop_fut) = AppContext::new(
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
@@ -2226,11 +2242,12 @@ mod tests {
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
                 venv_dir: PathBuf::from("v"),
-                worker_bin: PathBuf::from("w"),
+                worker_bin: dir.path().join("missing-worker"),
                 data_dir: dir.path().to_path_buf(),
             },
             emitter,
         );
+        let _loop_handle = tokio::spawn(loop_fut);
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
         let stale = ctx.data_dir.join("semantic_index.db.tmp");
@@ -2271,6 +2288,7 @@ mod tests {
             || payload != &serde_json::json!("ReindexingDone")));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_spawn_build_index_task_failure_emits_cancelled_without_done() {
         let dir = tempdir().unwrap();
@@ -2278,7 +2296,16 @@ mod tests {
         let emitter = Arc::new(MockEmitter {
             events: Arc::clone(&events),
         });
-        let (ctx, _rx, _loop) = AppContext::new(
+        let worker_bin = dir.path().join("worker.sh");
+        write_executable(
+            &worker_bin,
+            r#"#!/bin/sh
+read req
+echo '{"Error":"Model '\''DefinitelyNotARealFastembedModel'\'' is not supported by fastembed"}'
+exit 0
+"#,
+        );
+        let (ctx, _rx, loop_fut) = AppContext::new(
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
@@ -2286,11 +2313,12 @@ mod tests {
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
                 venv_dir: PathBuf::from("v"),
-                worker_bin: PathBuf::from("w"),
+                worker_bin,
                 data_dir: dir.path().to_path_buf(),
             },
             emitter,
         );
+        let _loop_handle = tokio::spawn(loop_fut);
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
 

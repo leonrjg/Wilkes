@@ -565,7 +565,7 @@ mod tests {
             "cpu".to_string(),
         );
 
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel(2);
         installer.install(dir.path(), tx).await.unwrap();
     }
 

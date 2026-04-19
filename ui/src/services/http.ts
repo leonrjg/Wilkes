@@ -7,6 +7,7 @@ import type {
   FileMatches,
   IndexStatus,
   MatchRef,
+  DocumentMetadata,
   ModelDescriptor,
   PreviewData,
   SelectedEmbedder,
@@ -135,6 +136,16 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<PreviewData>;
   }
 
+  async getFileMetadata(path: string): Promise<DocumentMetadata> {
+    const res = await fetch("/api/file/metadata", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (!res.ok) throw new Error(`getFileMetadata failed: ${res.status}`);
+    return res.json() as Promise<DocumentMetadata>;
+  }
+
   resolvePdfUrl(path: string): string {
     return `/asset?path=${encodeURIComponent(path)}`;
   }
@@ -174,8 +185,11 @@ export class HttpSearchApi implements SearchApi {
     return res.json();
   }
 
-  async openPath(_path: string): Promise<void> {
-    // Opening paths in the OS's file manager is not possible in browser mode.
+  async openPath(path: string): Promise<void> {
+    if (path.startsWith("http://") || path.startsWith("https://")) {
+      window.open(path, "_blank", "noopener,noreferrer");
+    }
+    // Opening local filesystem paths in the OS's file manager is not possible in browser mode.
     // No endpoint exists for this in the server, so we just return.
     return;
   }

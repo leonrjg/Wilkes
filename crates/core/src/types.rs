@@ -251,6 +251,14 @@ pub struct ExtractedContent {
     pub metadata: FileMetadata,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DocumentMetadata {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub doi: Option<String>,
+    pub created_at: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileMetadata {
     pub path: PathBuf,

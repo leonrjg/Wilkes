@@ -7,7 +7,7 @@ pub(crate) trait DesktopPlatform {
     fn app_config_dir(&self) -> anyhow::Result<PathBuf>;
     fn app_data_dir(&self) -> anyhow::Result<PathBuf>;
     fn emit(&self, name: &str, payload: serde_json::Value);
-    fn open_path(&self, path: &Path) -> Result<(), String>;
+    fn open_target(&self, target: &str) -> Result<(), String>;
 }
 
 #[derive(Clone)]
@@ -26,8 +26,8 @@ impl<R: Runtime> DesktopPlatform for TauriPlatform<R> {
         let _ = Emitter::emit(&self.0, name, &payload);
     }
 
-    fn open_path(&self, path: &Path) -> Result<(), String> {
-        spawn_open_path(path)
+    fn open_target(&self, target: &str) -> Result<(), String> {
+        spawn_open_target(target)
     }
 }
 
@@ -44,8 +44,8 @@ impl DesktopPlatform for SystemDesktopPlatform {
 
     fn emit(&self, _name: &str, _payload: serde_json::Value) {}
 
-    fn open_path(&self, path: &Path) -> Result<(), String> {
-        spawn_open_path(path)
+    fn open_target(&self, target: &str) -> Result<(), String> {
+        spawn_open_target(target)
     }
 }
 
@@ -58,8 +58,12 @@ pub(crate) fn desktop_settings_path<P: DesktopPlatform>(platform: &P) -> anyhow:
     Ok(desktop_settings_path_from(config))
 }
 
-pub(crate) fn validate_open_path(path: &Path) -> Result<(), String> {
-    if !path.exists() {
+pub(crate) fn validate_open_target(target: &str) -> Result<(), String> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return Ok(());
+    }
+
+    if !Path::new(target).exists() {
         return Err("Path does not exist".into());
     }
     Ok(())
@@ -80,9 +84,9 @@ pub(crate) fn opener_command() -> &'static str {
     }
 }
 
-pub(crate) fn spawn_open_path(path: &Path) -> Result<(), String> {
+pub(crate) fn spawn_open_target(target: &str) -> Result<(), String> {
     std::process::Command::new(opener_command())
-        .arg(path)
+        .arg(target)
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -134,7 +138,7 @@ mod tests {
 
         fn emit(&self, _name: &str, _payload: serde_json::Value) {}
 
-        fn open_path(&self, _path: &Path) -> Result<(), String> {
+        fn open_target(&self, _target: &str) -> Result<(), String> {
             Ok(())
         }
     }
@@ -185,13 +189,14 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_open_path() {
+    fn test_validate_open_target() {
         let dir = tempdir().unwrap();
-        assert!(validate_open_path(dir.path()).is_ok());
+        assert!(validate_open_target(&dir.path().display().to_string()).is_ok());
         assert_eq!(
-            validate_open_path(&dir.path().join("missing")),
+            validate_open_target(&dir.path().join("missing").display().to_string()),
             Err("Path does not exist".into())
         );
+        assert!(validate_open_target("https://doi.org/10.1000/xyz123").is_ok());
     }
 
     #[test]
@@ -205,7 +210,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_system_platform_open_path_uses_opener() {
+    fn test_system_platform_open_target_uses_opener() {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = OPEN_PATH_LOCK.lock().unwrap();
@@ -224,7 +229,7 @@ mod tests {
         let new_path = format!("{}:{}", dir.path().display(), original_path);
         std::env::set_var("PATH", &new_path);
 
-        let res = SystemDesktopPlatform.open_path(&path);
+        let res = SystemDesktopPlatform.open_target(&path.display().to_string());
         std::env::set_var("PATH", original_path);
 
         assert!(res.is_ok());
@@ -242,7 +247,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_tauri_platform_open_path_uses_opener() {
+    fn test_tauri_platform_open_target_uses_opener() {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = OPEN_PATH_LOCK.lock().unwrap();
@@ -264,7 +269,7 @@ mod tests {
         let new_path = format!("{}:{}", dir.path().display(), original_path);
         std::env::set_var("PATH", &new_path);
 
-        let res = platform.open_path(&target);
+        let res = platform.open_target(&target.display().to_string());
         std::env::set_var("PATH", original_path);
 
         assert!(res.is_ok());

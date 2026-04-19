@@ -7,6 +7,7 @@ import type {
   FileMatches,
   IndexStatus,
   MatchRef,
+  DocumentMetadata,
   ModelDescriptor,
   PreviewData,
   SelectedEmbedder,
@@ -32,6 +33,7 @@ export interface SearchApi {
   updateSettings(patch: Partial<Settings>): Promise<Settings>;
   listFiles(root: string): Promise<FileListResponse>;
   openFile(path: string): Promise<PreviewData>;
+  getFileMetadata(path: string): Promise<DocumentMetadata>;
   resolvePdfUrl(path: string): string;
   getLogs(): Promise<string[]>;
   clearLogs(): Promise<void>;

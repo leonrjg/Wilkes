@@ -8,6 +8,7 @@ vi.mock("../services", () => ({
     search: vi.fn(),
     cancelSearch: vi.fn(),
     preview: vi.fn(),
+    getFileMetadata: vi.fn(),
     getIndexStatus: vi.fn(),
   },
 }));
@@ -23,6 +24,8 @@ describe("useSearchStore", () => {
       selectedMatch: null,
       previewData: null,
       previewLoading: false,
+      viewerMetadata: null,
+      viewerMetadataStatus: "idle",
       currentSearchId: null,
       lastQuery: null,
     });
@@ -120,6 +123,7 @@ describe("useSearchStore", () => {
     };
 
     (api.preview as any).mockResolvedValue(mockPreviewData);
+    (api.getFileMetadata as any).mockResolvedValue({ title: "Test Title", author: "Test Author", doi: "10.1000/xyz123", created_at: "2025-04" });
 
     await useSearchStore.getState().selectMatch(mockMatchRef);
 
@@ -127,12 +131,16 @@ describe("useSearchStore", () => {
     expect(state.selectedMatch).toEqual(mockMatchRef);
     expect(state.previewData).toEqual(mockPreviewData);
     expect(state.previewLoading).toBe(false);
+    expect(state.viewerMetadata).toEqual({ title: "Test Title", author: "Test Author", doi: "10.1000/xyz123", created_at: "2025-04" });
+    expect(state.viewerMetadataStatus).toBe("ready");
   });
 
   it("should clear preview", () => {
     useSearchStore.setState({
       selectedMatch: {} as any,
       previewData: {} as any,
+      viewerMetadata: { title: "Test Title", author: null, doi: null, created_at: null },
+      viewerMetadataStatus: "ready",
     });
 
     useSearchStore.getState().clearPreview();
@@ -140,6 +148,8 @@ describe("useSearchStore", () => {
     const state = useSearchStore.getState();
     expect(state.selectedMatch).toBeNull();
     expect(state.previewData).toBeNull();
+    expect(state.viewerMetadata).toBeNull();
+    expect(state.viewerMetadataStatus).toBe("idle");
   });
 
   it("should replay search", async () => {
@@ -194,6 +204,8 @@ describe("useSearchStore", () => {
       stats: { files_scanned: 1, total_matches: 1, elapsed_ms: 10, errors: [] },
       selectedMatch: { path: "/f.ts", origin: { TextFile: { line: 1, col: 1 } } } as any,
       previewData: { Text: { content: "", language: "text", highlight_line: 1, highlight_range: { start: 0, end: 0 } } },
+      viewerMetadata: { title: "Test Title", author: null, doi: null, created_at: null },
+      viewerMetadataStatus: "ready",
     });
 
     useSearchStore.getState().deferSemanticSearch({ pattern: "queued", mode: "Semantic", root: "/root" } as any);
@@ -203,6 +215,8 @@ describe("useSearchStore", () => {
     expect(state.stats).toBeNull();
     expect(state.selectedMatch).toBeNull();
     expect(state.previewData).toBeNull();
+    expect(state.viewerMetadata).toBeNull();
+    expect(state.viewerMetadataStatus).toBe("idle");
   });
 
   it("should invalidate stale semantic results for the matching root", () => {
@@ -212,6 +226,8 @@ describe("useSearchStore", () => {
       stats: { files_scanned: 1, total_matches: 1, elapsed_ms: 10, errors: [] },
       selectedMatch: { path: "/f.ts", origin: { TextFile: { line: 1, col: 1 } } } as any,
       previewData: { Text: { content: "", language: "text", highlight_line: 1, highlight_range: { start: 0, end: 0 } } },
+      viewerMetadata: { title: "Test Title", author: null, doi: null, created_at: null },
+      viewerMetadataStatus: "ready",
     });
 
     useSearchStore.getState().invalidateSemanticResultsForRoot("/root");
@@ -221,6 +237,8 @@ describe("useSearchStore", () => {
     expect(state.stats).toBeNull();
     expect(state.selectedMatch).toBeNull();
     expect(state.previewData).toBeNull();
+    expect(state.viewerMetadata).toBeNull();
+    expect(state.viewerMetadataStatus).toBe("idle");
     expect(state.lastQuery).toEqual(expect.objectContaining({ root: "/root" }));
   });
 
@@ -230,6 +248,8 @@ describe("useSearchStore", () => {
       stats: { files_scanned: 1, total_matches: 1, elapsed_ms: 10, errors: [] },
       selectedMatch: { path: "/f.ts", origin: { TextFile: { line: 1, col: 1 } } } as any,
       previewData: { Text: { content: "", language: "text", highlight_line: 1, highlight_range: { start: 0, end: 0 } } },
+      viewerMetadata: { title: "Test Title", author: null, doi: null, created_at: null },
+      viewerMetadataStatus: "ready",
     });
 
     useSearchStore.getState().clearResults();
@@ -239,6 +259,219 @@ describe("useSearchStore", () => {
     expect(state.stats).toBeNull();
     expect(state.selectedMatch).toBeNull();
     expect(state.previewData).toBeNull();
+    expect(state.viewerMetadata).toBeNull();
+    expect(state.viewerMetadataStatus).toBe("idle");
+  });
+
+  it("should set loading metadata state immediately and keep preview independent", async () => {
+    let resolveMetadata: ((value: any) => void) | undefined;
+    (api.preview as any).mockResolvedValue({
+      Text: {
+        content: "test content",
+        language: "text",
+        highlight_line: 1,
+        highlight_range: { start: 0, end: 4 },
+      },
+    });
+    (api.getFileMetadata as any).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveMetadata = resolve;
+        }),
+    );
+
+    useSearchStore.getState().selectMatch({
+      path: "/root/file.txt",
+      origin: { TextFile: { line: 1, col: 1 } },
+    });
+
+    expect(useSearchStore.getState().viewerMetadataStatus).toBe("loading");
+    await Promise.resolve();
+    expect(useSearchStore.getState().previewData).toEqual({
+      Text: {
+        content: "test content",
+        language: "text",
+        highlight_line: 1,
+        highlight_range: { start: 0, end: 4 },
+      },
+    });
+
+    resolveMetadata?.({ title: "Test Title", author: null, doi: null, created_at: null });
+    await Promise.resolve();
+
+    expect(useSearchStore.getState().viewerMetadata).toEqual({
+      title: "Test Title",
+      author: null,
+      doi: null,
+      created_at: null,
+    });
+    expect(useSearchStore.getState().viewerMetadataStatus).toBe("ready");
+  });
+
+  it("should ignore late metadata responses for stale selections", async () => {
+    let resolveFirstMetadata: ((value: any) => void) | undefined;
+    (api.preview as any).mockResolvedValue({
+      Text: {
+        content: "test content",
+        language: "text",
+        highlight_line: 1,
+        highlight_range: { start: 0, end: 4 },
+      },
+    });
+    (api.getFileMetadata as any)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirstMetadata = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({ title: "Second Title", author: null, doi: null, created_at: null });
+
+    useSearchStore.getState().selectMatch({
+      path: "/root/first.txt",
+      origin: { TextFile: { line: 1, col: 1 } },
+    });
+    useSearchStore.getState().selectMatch({
+      path: "/root/second.txt",
+      origin: { TextFile: { line: 1, col: 1 } },
+    });
+
+    await Promise.resolve();
+    resolveFirstMetadata?.({ title: "First Title", author: null, doi: null, created_at: null });
+    await Promise.resolve();
+
+    expect(useSearchStore.getState().selectedMatch?.path).toBe("/root/second.txt");
+    expect(useSearchStore.getState().viewerMetadata).toEqual({
+      title: "Second Title",
+      author: null,
+      doi: null,
+      created_at: null,
+    });
+  });
+
+  it("should reuse metadata for same-file selections without refetching", async () => {
+    (api.preview as any)
+      .mockResolvedValueOnce({
+        Text: {
+          content: "first preview",
+          language: "text",
+          highlight_line: 1,
+          highlight_range: { start: 0, end: 4 },
+        },
+      })
+      .mockResolvedValueOnce({
+        Text: {
+          content: "second preview",
+          language: "text",
+          highlight_line: 8,
+          highlight_range: { start: 5, end: 9 },
+        },
+      });
+    (api.getFileMetadata as any).mockResolvedValue({
+      title: "Shared Title",
+      author: "Shared Author",
+      doi: null,
+      created_at: "2025-04",
+    });
+
+    await useSearchStore.getState().selectMatch({
+      path: "/root/file.txt",
+      origin: { TextFile: { line: 1, col: 1 } },
+    });
+    await useSearchStore.getState().selectMatch({
+      path: "/root/file.txt",
+      origin: { TextFile: { line: 8, col: 3 } },
+    });
+
+    expect(api.getFileMetadata).toHaveBeenCalledTimes(1);
+    expect(useSearchStore.getState().previewData).toEqual({
+      Text: {
+        content: "second preview",
+        language: "text",
+        highlight_line: 8,
+        highlight_range: { start: 5, end: 9 },
+      },
+    });
+    expect(useSearchStore.getState().viewerMetadata).toEqual({
+      title: "Shared Title",
+      author: "Shared Author",
+      doi: null,
+      created_at: "2025-04",
+    });
+    expect(useSearchStore.getState().viewerMetadataStatus).toBe("ready");
+  });
+
+  it("should mark metadata loading as failed without clearing preview", async () => {
+    (api.preview as any).mockResolvedValue({
+      Text: {
+        content: "test content",
+        language: "text",
+        highlight_line: 1,
+        highlight_range: { start: 0, end: 4 },
+      },
+    });
+    (api.getFileMetadata as any).mockRejectedValue(new Error("metadata failed"));
+
+    useSearchStore.getState().selectMatch({
+      path: "/root/file.txt",
+      origin: { TextFile: { line: 1, col: 1 } },
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(useSearchStore.getState().previewData).toEqual({
+      Text: {
+        content: "test content",
+        language: "text",
+        highlight_line: 1,
+        highlight_range: { start: 0, end: 4 },
+      },
+    });
+    expect(useSearchStore.getState().viewerMetadata).toBeNull();
+    expect(useSearchStore.getState().viewerMetadataStatus).toBe("failed");
+  });
+
+  it("should keep failed metadata state for same-file selections without retrying", async () => {
+    (api.preview as any)
+      .mockResolvedValueOnce({
+        Text: {
+          content: "first preview",
+          language: "text",
+          highlight_line: 1,
+          highlight_range: { start: 0, end: 4 },
+        },
+      })
+      .mockResolvedValueOnce({
+        Text: {
+          content: "second preview",
+          language: "text",
+          highlight_line: 2,
+          highlight_range: { start: 5, end: 9 },
+        },
+      });
+    (api.getFileMetadata as any).mockRejectedValue(new Error("metadata failed"));
+
+    await useSearchStore.getState().selectMatch({
+      path: "/root/file.txt",
+      origin: { TextFile: { line: 1, col: 1 } },
+    });
+    await useSearchStore.getState().selectMatch({
+      path: "/root/file.txt",
+      origin: { TextFile: { line: 2, col: 1 } },
+    });
+
+    expect(api.getFileMetadata).toHaveBeenCalledTimes(1);
+    expect(useSearchStore.getState().previewData).toEqual({
+      Text: {
+        content: "second preview",
+        language: "text",
+        highlight_line: 2,
+        highlight_range: { start: 5, end: 9 },
+      },
+    });
+    expect(useSearchStore.getState().viewerMetadata).toBeNull();
+    expect(useSearchStore.getState().viewerMetadataStatus).toBe("failed");
   });
 
   it("should handle search cancellation by user", async () => {

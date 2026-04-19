@@ -10,6 +10,7 @@ import type {
   FileMatches,
   IndexStatus,
   MatchRef,
+  DocumentMetadata,
   ModelDescriptor,
   PreviewData,
   SelectedEmbedder,
@@ -71,6 +72,10 @@ export class TauriSearchApi implements SearchApi {
 
   async openFile(path: string): Promise<PreviewData> {
     return invoke<PreviewData>("open_file", { path });
+  }
+
+  async getFileMetadata(path: string): Promise<DocumentMetadata> {
+    return invoke<DocumentMetadata>("get_file_metadata", { path });
   }
 
   resolvePdfUrl(path: string): string {

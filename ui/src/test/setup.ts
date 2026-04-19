@@ -29,6 +29,13 @@ global.ResizeObserver = vi.fn().mockImplementation(function() {
   this.disconnect = vi.fn();
 });
 
+Object.defineProperty(navigator, "clipboard", {
+  configurable: true,
+  value: {
+    writeText: vi.fn().mockResolvedValue(undefined),
+  },
+});
+
 // Mock CodeMirror for all tests
 vi.mock("@codemirror/view", () => {
   function MockView() {

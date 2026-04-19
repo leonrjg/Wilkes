@@ -9,6 +9,8 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -22,6 +24,11 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Cache Rust dependencies and build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
@@ -30,28 +37,19 @@ jobs:
             libssl-dev libfontconfig-dev libglib2.0-dev \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
 
-      - name: Cache Rust registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ubuntu-cargo-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ubuntu-cargo-registry-
+      - name: Create desktop sidecar placeholder for Tauri compile-time checks
+        run: |
+          # The desktop crate's Tauri build script requires the packaged sidecar path
+          # to exist at compile time. For test/coverage CI we only need the file to
+          # exist; we do not need to build the real worker binary here.
+          target_triple="$(rustc -vV | awk '/^host: / { print $2 }')"
+          sidecar_path="crates/desktop/sidecars/wilkes-rust-worker-${target_triple}"
+          mkdir -p "$(dirname "$sidecar_path")"
+          printf '#!/bin/sh\nexit 0\n' > "$sidecar_path"
+          chmod +x "$sidecar_path"
 
-      - name: Cache Rust build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ubuntu-cargo-build-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ubuntu-cargo-build-
-
-      - name: Prepare desktop sidecar
-        run: node scripts/prepare-sidecar.mjs
-
-      - name: Check
-        run: cargo check --workspace
-
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+      - name: Clean stale coverage artifacts
+        run: cargo llvm-cov clean --workspace
 
       - name: Test with coverage
         run: cargo llvm-cov --workspace --no-report

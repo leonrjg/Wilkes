@@ -2,9 +2,12 @@ import React, { useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { buildRows, COLLAPSED_LIMIT, type Row } from "../lib/utils/flattenResults";
 import { useToasts } from "./Toast";
+import { ContextMenu, useContextMenu } from "./ContextMenu";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import type { Match, MatchRef, SourceOrigin, FileEntry, OmittedFileEntry } from "../lib/types";
+import { api, isTauri } from "../services";
+import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileActions";
 
 function originLabel(origin: SourceOrigin): string {
   if ("TextFile" in origin) return `L${origin.TextFile.line}`;
@@ -68,6 +71,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
   const filterText = useSettingsStore((s) => s.filterText);
   const setFilterText = useSettingsStore((s) => s.setFilterText);
   const indexing = useSettingsStore((s) => s.indexing);
+  const { menu, openMenu, closeMenu } = useContextMenu<ContextMenuTarget>();
 
   const parentRef = useRef<HTMLDivElement>(null);
   const [expandedFiles, setExpandedFiles] = useState<Set<number>>(new Set());
@@ -88,6 +92,23 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
 
   const filteredFileList = fileList;
   const rows = buildRows(results, expandedFiles);
+  const onToast = (message: string, type: "success" | "error") => addToast(message, { type });
+
+  const handleRowContextMenu = (
+    event: React.MouseEvent,
+    target: ContextMenuTarget,
+  ) => {
+    openMenu({
+      event,
+      target,
+      items: buildFileContextMenuItems({
+        target,
+        api,
+        capabilities: { canOpenInFileManager: isTauri },
+        onToast,
+      }),
+    });
+  };
 
   const rowVirtualizer = useVirtualizer({
     count: rows.length,
@@ -149,6 +170,12 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
               entry={entry}
               selected={selectedMatch?.path === entry.path}
               onClick={() => onFileClick(entry.path)}
+              onContextMenu={(event) =>
+                handleRowContextMenu(event, {
+                  kind: "file",
+                  path: entry.path,
+                  open: () => onFileClick(entry.path),
+                })}
             />
           ))}
           {filteredVisibleFiles.length === 0 && filteredFileList.length > 0 && (
@@ -185,6 +212,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
             </div>
           )}
         </div>
+        <ContextMenu menu={menu} onClose={closeMenu} />
       </div>
     );
   }
@@ -257,6 +285,12 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
                       path={row.path}
                       count={row.fileMatches.matches.length}
                       onClick={() => onFileClick(row.path)}
+                      onContextMenu={(event) =>
+                        handleRowContextMenu(event, {
+                          kind: "file",
+                          path: row.path,
+                          open: () => onFileClick(row.path),
+                        })}
                     />
                   ) : row.kind === "expand" ? (
                     <ExpandStrip
@@ -275,6 +309,17 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
                           text_range: row.match.text_range ?? undefined,
                         })
                       }
+                      onContextMenu={(event) =>
+                        handleRowContextMenu(event, {
+                          kind: "match",
+                          path: row.path,
+                          open: () =>
+                            onMatchClick({
+                              path: row.path,
+                              origin: row.match.origin,
+                              text_range: row.match.text_range ?? undefined,
+                            }),
+                        })}
                     />
                   )}
                 </div>
@@ -284,6 +329,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
         </div>
       </div>
       </div>
+      <ContextMenu menu={menu} onClose={closeMenu} />
     </div>
   );
 }
@@ -297,11 +343,22 @@ function formatOmittedReason(entry: OmittedFileEntry): string {
     : "File extension is not in the allowed extensions";
 }
 
-function FileHeader({ path, count, onClick }: { path: string; count: number; onClick: () => void }) {
+function FileHeader({
+  path,
+  count,
+  onClick,
+  onContextMenu,
+}: {
+  path: string;
+  count: number;
+  onClick: () => void;
+  onContextMenu: (event: React.MouseEvent) => void;
+}) {
   return (
     <div
       className="flex items-center gap-2 px-3 py-2 bg-[var(--bg-sidebar)] border-y border-[var(--border-main)] cursor-pointer hover:bg-[var(--bg-hover)] transition-colors"
       onClick={onClick}
+      onContextMenu={onContextMenu}
     >
       <span className="text-xs font-semibold text-[var(--text-main)] truncate">{fileName(path)}</span>
       <span className="text-[10px] text-[var(--text-muted)] bg-[var(--bg-active)] px-1.5 py-0.5 rounded-full">
@@ -323,10 +380,21 @@ function ExpandStrip({ remaining, onExpand }: { remaining: number; onExpand: () 
   );
 }
 
-function FileEntryRow({ entry, selected, onClick }: { entry: FileEntry; selected: boolean; onClick: () => void }) {
+function FileEntryRow({
+  entry,
+  selected,
+  onClick,
+  onContextMenu,
+}: {
+  entry: FileEntry;
+  selected: boolean;
+  onClick: () => void;
+  onContextMenu: (event: React.MouseEvent) => void;
+}) {
   return (
     <button
       onClick={onClick}
+      onContextMenu={onContextMenu}
       className={`w-full flex items-baseline gap-2 px-3 py-1.5 text-left hover:bg-[var(--bg-hover)] transition-colors selectable ${
         selected ? "bg-[var(--bg-active)]" : ""
       }`}
@@ -346,15 +414,18 @@ function MatchRow({
   path: _path,
   selected,
   onClick,
+  onContextMenu,
 }: {
   match: Match;
   path: string;
   selected: boolean;
   onClick: () => void;
+  onContextMenu: (event: React.MouseEvent) => void;
 }) {
   return (
     <button
       onClick={onClick}
+      onContextMenu={onContextMenu}
       className={`w-full flex items-start gap-2 px-3 py-1 text-left hover:bg-[var(--bg-hover)] transition-colors selectable ${
         selected ? "bg-[var(--bg-active)]" : ""
       }`}

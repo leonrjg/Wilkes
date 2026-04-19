@@ -11,10 +11,17 @@ vi.mock("./preview/PdfViewer", () => ({ default: (props: any) => mockPdfViewer(p
 describe("PreviewPane", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: vi.fn() },
+      configurable: true,
+    });
+    vi.stubGlobal("open", vi.fn());
     useSearchStore.setState({
       selectedMatch: null,
       previewData: null,
       previewLoading: false,
+      viewerMetadata: null,
+      viewerMetadataStatus: "idle",
       clearPreview: vi.fn(),
     });
   });
@@ -45,6 +52,81 @@ describe("PreviewPane", () => {
     expect(screen.getAllByText("test.txt")[0]).toBeInTheDocument();
   });
 
+  it("renders metadata title and author when available", () => {
+    const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
+    useSearchStore.setState({
+      selectedMatch: mockMatch,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: { title: "A Better Title", author: "Test Author", doi: null, created_at: null },
+      viewerMetadataStatus: "ready",
+    });
+
+    render(<PreviewPane />);
+    expect(screen.getByText("A Better Title")).toBeInTheDocument();
+    expect(screen.getByText("Test Author")).toBeInTheDocument();
+    expect(screen.getByText("test.pdf")).toBeInTheDocument();
+  });
+
+  it("renders metadata loading placeholder while preserving the path", () => {
+    const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
+    useSearchStore.setState({
+      selectedMatch: mockMatch,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: null,
+      viewerMetadataStatus: "loading",
+    });
+
+    render(<PreviewPane />);
+    expect(screen.getByText("Loading metadata…")).toBeInTheDocument();
+    expect(screen.getAllByText("test.pdf").length).toBeGreaterThan(0);
+  });
+
+  it("renders DOI open and copy actions when DOI is available", () => {
+    const mockMatch = { path: "paper.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
+    useSearchStore.setState({
+      selectedMatch: mockMatch,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: { title: "Paper", author: "Author", doi: "10.1000/xyz123", created_at: null },
+      viewerMetadataStatus: "ready",
+    });
+
+    render(<PreviewPane />);
+    expect(screen.getByTitle("Open DOI 10.1000/xyz123")).toBeInTheDocument();
+    expect(screen.getByTitle("Open Google Scholar for DOI 10.1000/xyz123")).toBeInTheDocument();
+    expect(screen.getByTitle("Copy DOI 10.1000/xyz123")).toBeInTheDocument();
+    expect(screen.getByText("DOI: 10.1000/xyz123")).toBeInTheDocument();
+    expect(screen.getByText("Scholar")).toBeInTheDocument();
+  });
+
+  it("opens DOI and Google Scholar URLs and copies DOI from header actions", () => {
+    const mockMatch = { path: "paper.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
+    useSearchStore.setState({
+      selectedMatch: mockMatch,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: { title: "Paper", author: "Author", doi: "10.1000/xyz123", created_at: null },
+      viewerMetadataStatus: "ready",
+    });
+
+    render(<PreviewPane />);
+
+    fireEvent.click(screen.getByTitle("Open DOI 10.1000/xyz123"));
+    expect(window.open).toHaveBeenCalledWith(
+      "https://doi.org/10.1000/xyz123",
+      "_blank",
+      "noopener,noreferrer",
+    );
+
+    fireEvent.click(screen.getByTitle("Open Google Scholar for DOI 10.1000/xyz123"));
+    expect(window.open).toHaveBeenCalledWith(
+      "https://scholar.google.com/scholar?q=10.1000%2Fxyz123",
+      "_blank",
+      "noopener,noreferrer",
+    );
+
+    fireEvent.click(screen.getByTitle("Copy DOI 10.1000/xyz123"));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("10.1000/xyz123");
+  });
+
   it("renders PdfViewer for pdf data", () => {
     const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
     const mockPreviewData = {
@@ -61,6 +143,20 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
     expect(screen.getByTestId("pdf-viewer")).toBeInTheDocument();
+  });
+
+  it("renders created-at month and year in the metadata summary", () => {
+    const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
+    useSearchStore.setState({
+      selectedMatch: mockMatch,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: { title: "Paper", author: "Author", doi: null, created_at: "2025-04" },
+      viewerMetadataStatus: "ready",
+    });
+
+    render(<PreviewPane />);
+    expect(screen.getByText("Apr 2025")).toBeInTheDocument();
+    expect(screen.getByText("Author")).toBeInTheDocument();
   });
 
   it("renders PdfViewer using selectedMatch.origin even when previewData is stale", () => {
