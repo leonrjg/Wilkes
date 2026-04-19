@@ -48,6 +48,9 @@ jobs:
           printf '#!/bin/sh\nexit 0\n' > "$sidecar_path"
           chmod +x "$sidecar_path"
 
+      - name: Clean stale coverage artifacts
+        run: cargo llvm-cov clean --workspace
+
       - name: Test with coverage
         run: cargo llvm-cov --workspace --no-report
 
