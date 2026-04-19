@@ -32,6 +32,17 @@ jobs:
             libssl-dev libfontconfig-dev libglib2.0-dev \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
 
+      - name: Create desktop sidecar placeholder for Tauri compile-time checks
+        run: |
+          # The desktop crate's Tauri build script requires the packaged sidecar path
+          # to exist at compile time. For test/coverage CI we only need the file to
+          # exist; we do not need to build the real worker binary here.
+          target_triple="$(rustc -vV | awk '/^host: / { print $2 }')"
+          sidecar_path="crates/desktop/sidecars/wilkes-rust-worker-${target_triple}"
+          mkdir -p "$(dirname "$sidecar_path")"
+          printf '#!/bin/sh\nexit 0\n' > "$sidecar_path"
+          chmod +x "$sidecar_path"
+
       - name: Test with coverage
         run: cargo llvm-cov --workspace --no-report
 
