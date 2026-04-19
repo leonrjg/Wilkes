@@ -1278,6 +1278,14 @@ mod tests {
         EmbedderModel, IndexStatus, SearchMode, SelectedEmbedder, SemanticSettings, Settings, Theme,
     };
 
+    #[cfg(unix)]
+    fn write_executable(path: &Path, content: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, content).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     struct MockEmitter {
         events: Arc<Mutex<Vec<(String, Value)>>>,
     }
@@ -2226,7 +2234,7 @@ mod tests {
         let emitter = Arc::new(MockEmitter {
             events: Arc::clone(&events),
         });
-        let (ctx, _rx, _loop) = AppContext::new(
+        let (ctx, _rx, loop_fut) = AppContext::new(
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
@@ -2234,11 +2242,12 @@ mod tests {
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
                 venv_dir: PathBuf::from("v"),
-                worker_bin: PathBuf::from("w"),
+                worker_bin: dir.path().join("missing-worker"),
                 data_dir: dir.path().to_path_buf(),
             },
             emitter,
         );
+        let _loop_handle = tokio::spawn(loop_fut);
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
         let stale = ctx.data_dir.join("semantic_index.db.tmp");
@@ -2279,6 +2288,7 @@ mod tests {
             || payload != &serde_json::json!("ReindexingDone")));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_spawn_build_index_task_failure_emits_cancelled_without_done() {
         let dir = tempdir().unwrap();
@@ -2286,7 +2296,16 @@ mod tests {
         let emitter = Arc::new(MockEmitter {
             events: Arc::clone(&events),
         });
-        let (ctx, _rx, _loop) = AppContext::new(
+        let worker_bin = dir.path().join("worker.sh");
+        write_executable(
+            &worker_bin,
+            r#"#!/bin/sh
+read req
+echo '{"Error":"Model '\''DefinitelyNotARealFastembedModel'\'' is not supported by fastembed"}'
+exit 0
+"#,
+        );
+        let (ctx, _rx, loop_fut) = AppContext::new(
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
@@ -2294,11 +2313,12 @@ mod tests {
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
                 venv_dir: PathBuf::from("v"),
-                worker_bin: PathBuf::from("w"),
+                worker_bin,
                 data_dir: dir.path().to_path_buf(),
             },
             emitter,
         );
+        let _loop_handle = tokio::spawn(loop_fut);
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
 

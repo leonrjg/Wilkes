@@ -21,6 +21,8 @@ jobs:
           node-version: lts/*
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Cache Rust dependencies and build outputs
+        uses: Swatinem/rust-cache@v2
 
       - name: Install Linux dependencies
         run: |
@@ -29,26 +31,6 @@ jobs:
             build-essential pkg-config clang libclang-dev \
             libssl-dev libfontconfig-dev libglib2.0-dev \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
-
-      - name: Cache Rust registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ubuntu-cargo-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ubuntu-cargo-registry-
-
-      - name: Cache Rust build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ubuntu-cargo-build-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ubuntu-cargo-build-
-
-      - name: Prepare desktop sidecar
-        run: node scripts/prepare-sidecar.mjs
-
-      - name: Check
-        run: cargo check --workspace
 
       - name: Test with coverage
         run: cargo llvm-cov --workspace --no-report
