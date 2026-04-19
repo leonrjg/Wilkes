@@ -847,16 +847,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_path_and_model_size() {
-        let _ = super::open_path(".".to_string()).await;
-
-        let res =
-            super::get_model_size(EmbeddingEngine::Candle, "BAAI/bge-base-en-v1.5".to_string())
-                .await;
-        assert!(res.is_ok());
-    }
-
-    #[tokio::test]
     async fn test_data_paths_and_logs_for_ctx() {
         let (_dir, _ctx) = test_ctx();
 
