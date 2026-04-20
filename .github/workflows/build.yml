@@ -94,6 +94,15 @@ jobs:
           CFLAGS: /MD
           CXXFLAGS: /MD
         run: |
+          $releaseDir = "../../target/${{ matrix.target }}/release"
+          $bundleDir = Join-Path $releaseDir "bundle"
+          foreach ($dir in @("nsis", "msi")) {
+            $path = Join-Path $bundleDir $dir
+            if (Test-Path $path) {
+              Remove-Item $path -Recurse -Force
+            }
+          }
+
           if ($env:CERTIFICATE_BASE64) {
             $bytes = [Convert]::FromBase64String($env:CERTIFICATE_BASE64)
             $pfxPath = Join-Path $env:TEMP certificate.pfx
