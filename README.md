@@ -98,9 +98,18 @@ The app supports multiple engines to maximize model availability:
 
 If you have feature requests, feel free to open an issue (or a PR).
 
-### Contributing
+## Changelog
+### 0.9.5 - 2026-04-20
+
+#### Added
+
+- Document metadata extraction (DOI, author, date).
+- External links (Google Scholar) on viewer.
+- Context menu.
+
+## Contributing
 <img alt="Coverage" src="https://img.shields.io/badge/coverage-82%25-green" />
 Contributions are welcome! Please fork the repository and submit a pull request with your changes.
 
-### License
+## License
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
