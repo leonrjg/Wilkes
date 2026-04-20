@@ -78,6 +78,13 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci --prefix ui
 
+      - name: Clean Linux bundle outputs
+        if: runner.os == 'Linux'
+        run: |
+          rm -rf \
+            target/${{ matrix.target }}/release/bundle/deb \
+            target/${{ matrix.target }}/release/bundle/appimage
+
       - name: Build
         if: runner.os != 'Windows'
         working-directory: crates/desktop
