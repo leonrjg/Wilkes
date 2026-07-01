@@ -2,11 +2,13 @@ import { render, screen, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import PreviewPane from "./PreviewPane";
 import { useSearchStore } from "../stores/useSearchStore";
+import { useBookmarksStore } from "../stores/useBookmarksStore";
 
 vi.mock("./preview/CodeViewer", () => ({ default: () => <div data-testid="code-viewer">CodeViewer</div> }));
 
 const mockPdfViewer = vi.fn(() => <div data-testid="pdf-viewer">PdfViewer</div>);
 vi.mock("./preview/PdfViewer", () => ({ default: (props: any) => mockPdfViewer(props) }));
+vi.mock("./Toast", () => ({ useToasts: () => ({ addToast: vi.fn() }) }));
 
 describe("PreviewPane", () => {
   beforeEach(() => {
@@ -23,6 +25,9 @@ describe("PreviewPane", () => {
       viewerMetadata: null,
       viewerMetadataStatus: "idle",
       clearPreview: vi.fn(),
+    });
+    useBookmarksStore.setState({
+      bookmarks: [],
     });
   });
 
@@ -179,6 +184,52 @@ describe("PreviewPane", () => {
     const call = mockPdfViewer.mock.calls[mockPdfViewer.mock.calls.length - 1][0];
     expect(call.page).toBe(8);
     expect(call.highlight_bbox).toEqual({ x: 1, y: 2, width: 3, height: 4 });
+  });
+
+  it("passes only current-file PDF bookmarks to PdfViewer", () => {
+    useSearchStore.setState({
+      selectedMatch: {
+        path: "current.pdf",
+        origin: { PdfPage: { page: 1, bbox: null } },
+      } as any,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } },
+      previewLoading: false,
+    });
+    useBookmarksStore.setState({
+      bookmarks: [
+        {
+          id: "current",
+          path: "current.pdf",
+          origin: { PdfPage: { page: 4, bbox: { x: 1, y: 2, width: 3, height: 4 } } },
+          quote: "current quote",
+          created_at: "2026-01-01T00:00:00Z",
+          note: null,
+        },
+        {
+          id: "other",
+          path: "other.pdf",
+          origin: { PdfPage: { page: 5, bbox: { x: 10, y: 20, width: 30, height: 40 } } },
+          quote: "other quote",
+          created_at: "2026-01-01T00:00:00Z",
+          note: null,
+        },
+        {
+          id: "text",
+          path: "current.pdf",
+          origin: { TextFile: { line: 1, col: 1 } },
+          quote: "text quote",
+          created_at: "2026-01-01T00:00:00Z",
+          note: null,
+        },
+      ],
+    });
+
+    render(<PreviewPane />);
+
+    const call = mockPdfViewer.mock.calls[mockPdfViewer.mock.calls.length - 1][0];
+    expect(call.bookmarkHighlights).toEqual([
+      { id: "current", page: 4, bbox: { x: 1, y: 2, width: 3, height: 4 } },
+    ]);
   });
 
   it("renders PdfViewer when selectedMatch is PDF but previewData is stale Text data", () => {

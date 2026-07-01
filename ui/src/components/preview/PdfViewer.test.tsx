@@ -177,6 +177,66 @@ describe("PdfViewer", () => {
     expect(highlight).toBeInTheDocument();
   });
 
+  it("renders persisted bookmark highlights with scaled PDF coordinates", async () => {
+    render(
+      <PdfViewer
+        {...defaultProps}
+        bookmarkHighlights={[
+          { id: "bookmark-1", page: 1, bbox: { x: 20, y: 30, width: 40, height: 10 } },
+          { id: "bookmark-2", page: 3, bbox: { x: 1, y: 2, width: 3, height: 4 } },
+        ]}
+      />,
+    );
+
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    });
+
+    const highlights = screen.getAllByTestId("bookmark-highlight");
+    expect(highlights).toHaveLength(2);
+    expect(highlights[0]).toHaveStyle({
+      left: "20px",
+      top: "30px",
+      width: "40px",
+      height: "10px",
+    });
+  });
+
+  it("shows the selection action below the selected text", async () => {
+    render(<PdfViewer {...defaultProps} onAddBookmark={vi.fn()} />);
+
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    });
+
+    const scrollContainer = document.querySelector(".overflow-auto") as HTMLElement;
+    const root = scrollContainer.parentElement as HTMLElement;
+    const pageWrapper = document.querySelector<HTMLElement>("[data-page-number='1']")!;
+
+    root.getBoundingClientRect = () =>
+      ({ top: 10, left: 20, width: 500, height: 500, bottom: 510, right: 520, x: 20, y: 10, toJSON: () => ({}) }) as DOMRect;
+    pageWrapper.getBoundingClientRect = () =>
+      ({ top: 50, left: 40, width: 600, height: 800, bottom: 850, right: 640, x: 40, y: 50, toJSON: () => ({}) }) as DOMRect;
+
+    const range = {
+      startContainer: pageWrapper,
+      getBoundingClientRect: () =>
+        ({ top: 70, left: 60, width: 100, height: 20, bottom: 90, right: 160, x: 60, y: 70, toJSON: () => ({}) }) as DOMRect,
+    };
+    vi.spyOn(window, "getSelection").mockReturnValue({
+      isCollapsed: false,
+      rangeCount: 1,
+      getRangeAt: () => range,
+      toString: () => "selected text",
+      removeAllRanges: vi.fn(),
+    } as any);
+
+    fireEvent.mouseUp(scrollContainer);
+
+    const button = screen.getByRole("button", { name: "+ Bookmark" });
+    expect(button).toHaveStyle({ top: "83px", left: "40px" });
+  });
+
   it("centers the ping animation on the highlighted match", async () => {
     render(
       <PdfViewer

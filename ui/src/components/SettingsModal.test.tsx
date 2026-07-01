@@ -30,7 +30,7 @@ describe("SettingsModal", () => {
   };
 
   const mockSettings = {
-    bookmarked_dirs: [],
+    favorites: [],
     recent_dirs: [],
     last_directory: "/test",
     respect_gitignore: true,

@@ -6,12 +6,14 @@ import type {
   EmbedError,
   EmbedProgress,
   EmbeddingEngine,
+  Bookmark,
   FileListResponse,
   FileMatches,
   IndexStatus,
   MatchRef,
   DocumentMetadata,
   ModelDescriptor,
+  NewBookmark,
   PreviewData,
   SelectedEmbedder,
   SearchQuery,
@@ -64,6 +66,18 @@ export class TauriSearchApi implements SearchApi {
 
   async updateSettings(patch: Partial<Settings>): Promise<Settings> {
     return invoke<Settings>("update_settings", { patch });
+  }
+
+  async listBookmarks(): Promise<Bookmark[]> {
+    return invoke<Bookmark[]>("list_bookmarks");
+  }
+
+  async addBookmark(bookmark: NewBookmark): Promise<Bookmark> {
+    return invoke<Bookmark>("add_bookmark", { bookmark });
+  }
+
+  async removeBookmark(id: string): Promise<void> {
+    return invoke("remove_bookmark", { id });
   }
 
   async listFiles(root: string): Promise<FileListResponse> {

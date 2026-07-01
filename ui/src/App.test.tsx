@@ -14,7 +14,7 @@ vi.mock("./services", () => ({
     onEmbedError: vi.fn(() => Promise.resolve(() => {})),
     onManagerEvent: vi.fn(() => Promise.resolve(() => {})),
     getSettings: vi.fn(() => Promise.resolve({
-      bookmarked_dirs: [],
+      favorites: [],
       recent_dirs: [],
       last_directory: "/test/dir",
       respect_gitignore: true,
@@ -49,11 +49,11 @@ describe("App", () => {
     useSettingsStore.setState({
       load: vi.fn().mockResolvedValue(undefined),
       directory: "/test/dir",
-      bookmarks: [],
+      favorites: [],
       recentDirs: [],
       setDirectory: vi.fn(),
-      addBookmark: vi.fn(),
-      removeBookmark: vi.fn(),
+      addFavorite: vi.fn(),
+      removeFavorite: vi.fn(),
       applySettingsPatch: vi.fn(),
       setIndexing: vi.fn(),
     });

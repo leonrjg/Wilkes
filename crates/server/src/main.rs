@@ -28,7 +28,8 @@ use tracing::info;
 use wilkes_api::context::AppContext;
 use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::types::{
-    DocumentMetadata, EmbeddingEngine, MatchRef, ModelDescriptor, SearchQuery, SelectedEmbedder,
+    DocumentMetadata, EmbeddingEngine, MatchRef, ModelDescriptor, NewBookmark, SearchQuery,
+    SelectedEmbedder,
 };
 
 fn confine_to_uploads(
@@ -155,6 +156,41 @@ async fn update_settings_handler(
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(settings))
+}
+
+async fn list_bookmarks_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let bookmarks = state
+        .ctx
+        .list_bookmarks()
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(bookmarks))
+}
+
+async fn add_bookmark_handler(
+    State(state): State<Arc<AppState>>,
+    Json(bookmark): Json<NewBookmark>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let bookmark = state
+        .ctx
+        .add_bookmark(bookmark)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(bookmark))
+}
+
+async fn remove_bookmark_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .remove_bookmark(&id)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn is_semantic_ready_handler(State(state): State<Arc<AppState>>) -> Json<bool> {
@@ -660,6 +696,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/preview", post(preview_handler))
         .route("/api/settings", get(get_settings_handler))
         .route("/api/settings", patch(update_settings_handler))
+        .route("/api/bookmarks", get(list_bookmarks_handler))
+        .route("/api/bookmarks", post(add_bookmark_handler))
+        .route("/api/bookmarks/:id", delete(remove_bookmark_handler))
         .route("/api/embed/ready", get(is_semantic_ready_handler))
         .route("/api/logs", get(get_logs_handler))
         .route("/api/logs", delete(clear_logs_handler))

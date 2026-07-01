@@ -3,9 +3,11 @@ import { X, ArrowLeft, ArrowRight, ExternalLink, Copy } from "react-feather";
 import CodeViewer from "./preview/CodeViewer";
 import PdfViewer from "./preview/PdfViewer";
 import { useSearchStore } from "../stores/useSearchStore";
+import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { api } from "../services";
-import type { DocumentMetadata } from "../lib/types";
+import type { BoundingBox, DocumentMetadata } from "../lib/types";
 import { buildExternalLinks } from "../lib/externalLinks";
+import { useToasts } from "./Toast";
 
 interface Props {
   canGoBack?: boolean;
@@ -77,6 +79,9 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   const viewerMetadata = useSearchStore((s) => s.viewerMetadata);
   const viewerMetadataStatus = useSearchStore((s) => s.viewerMetadataStatus);
   const clearPreview = useSearchStore((s) => s.clearPreview);
+  const addBookmark = useBookmarksStore((s) => s.add);
+  const bookmarks = useBookmarksStore((s) => s.bookmarks);
+  const { addToast } = useToasts();
 
   // Keep the last valid previewData so the content stays mounted while a new
   // match is loading. This prevents PdfViewer from unmounting/remounting on
@@ -123,6 +128,13 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   const isPdfFile = "PdfPage" in selectedMatch.origin;
   const pdfPage = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.page : 1;
   const pdfBbox = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.bbox : null;
+  const bookmarkHighlights = bookmarks.flatMap((bookmark) => {
+    if (bookmark.path !== selectedMatch.path || !("PdfPage" in bookmark.origin)) {
+      return [];
+    }
+    const { page, bbox } = bookmark.origin.PdfPage;
+    return bbox ? [{ id: bookmark.id, page, bbox }] : [];
+  });
   const author = viewerMetadata?.author?.trim() || null;
   const createdAt = formatCreatedAt(viewerMetadata?.created_at);
   const links = buildExternalLinks(viewerMetadata?.doi);
@@ -143,6 +155,17 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
     Promise.resolve(navigator.clipboard?.writeText(doi)).catch((e) =>
       console.error("Copy DOI failed:", e),
     );
+  };
+
+  const handleAddBookmark = ({ page, bbox, quote }: { page: number; bbox: BoundingBox; quote: string }) => {
+    if (!selectedMatch) return;
+    addBookmark({
+      path: selectedMatch.path,
+      origin: { PdfPage: { page, bbox } },
+      quote,
+    })
+      .then(() => addToast("Bookmark added", { type: "success" }))
+      .catch((e) => console.error("Add bookmark failed:", e));
   };
 
   if (!isPdfFile && !displayData) {
@@ -244,7 +267,9 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
             url={api.resolvePdfUrl(selectedMatch.path)}
             page={pdfPage}
             highlight_bbox={pdfBbox}
+            bookmarkHighlights={bookmarkHighlights}
             onRenderSuccess={() => setIsPdfRendering(false)}
+            onAddBookmark={handleAddBookmark}
           />
         ) : displayData && "Text" in displayData ? (
           <CodeViewer

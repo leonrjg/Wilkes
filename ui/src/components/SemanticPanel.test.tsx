@@ -39,7 +39,7 @@ describe("SemanticPanel", () => {
   } as any;
 
   const defaultSettings = {
-    bookmarked_dirs: [],
+    favorites: [],
     recent_dirs: [],
     last_directory: null,
     respect_gitignore: true,
@@ -64,7 +64,7 @@ describe("SemanticPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useSettingsStore.setState({
-      bookmarks: [],
+      favorites: [],
       recentDirs: [],
       directory: "",
       semantic: null,

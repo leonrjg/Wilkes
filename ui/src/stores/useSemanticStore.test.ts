@@ -41,7 +41,7 @@ describe("useSemanticStore", () => {
       load: async () => {
         const settings = await (api as any).getSettings();
         useSettingsStore.setState({
-          bookmarks: settings.bookmarked_dirs,
+          favorites: settings.favorites,
           recentDirs: settings.recent_dirs || [],
           directory: settings.last_directory ?? "",
           semantic: settings.semantic,
@@ -121,7 +121,7 @@ describe("useSemanticStore", () => {
 
   it("kicks off indexing during startup load when semantic is already preferred", async () => {
     (api as any).getSettings = vi.fn().mockResolvedValue({
-      bookmarked_dirs: [],
+      favorites: [],
       recent_dirs: [],
       last_directory: "/startup",
       respect_gitignore: true,

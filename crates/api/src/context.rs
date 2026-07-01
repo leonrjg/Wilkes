@@ -20,8 +20,8 @@ use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
-    DocumentMetadata, EmbedderModel, IndexStatus, IndexingConfig, PreviewData, SearchMode,
-    SearchQuery, SelectedEmbedder, SemanticSettings, Settings,
+    Bookmark, DocumentMetadata, EmbedderModel, IndexStatus, IndexingConfig, NewBookmark,
+    PreviewData, SearchMode, SearchQuery, SelectedEmbedder, SemanticSettings, Settings,
 };
 
 use crate::commands::search::{start_search, SearchHandle};
@@ -103,6 +103,7 @@ enum RestoreStatePreparation {
 pub struct AppContext {
     pub data_dir: PathBuf,
     pub settings_path: PathBuf,
+    pub bookmarks_path: PathBuf,
     embedder: PLMutex<Option<Arc<dyn Embedder>>>,
     index: PLMutex<Arc<Mutex<Option<SemanticIndex>>>>,
     watcher: PLMutex<Option<IndexWatcher>>,
@@ -112,6 +113,7 @@ pub struct AppContext {
     pub worker_manager: WorkerManager,
     events: Arc<dyn EventEmitter>,
     settings_lock: tokio::sync::Mutex<()>,
+    bookmarks_lock: tokio::sync::Mutex<()>,
 }
 
 impl AppContext {
@@ -128,6 +130,7 @@ impl AppContext {
         let (worker_manager, event_rx, loop_fut) = WorkerManager::new(paths);
         let ctx = Arc::new(Self {
             data_dir,
+            bookmarks_path: settings_path.with_file_name("bookmarks.json"),
             settings_path,
             embedder: PLMutex::new(None),
             index: PLMutex::new(Arc::new(Mutex::new(None))),
@@ -138,6 +141,7 @@ impl AppContext {
             worker_manager,
             events,
             settings_lock: tokio::sync::Mutex::new(()),
+            bookmarks_lock: tokio::sync::Mutex::new(()),
         });
         (ctx, event_rx, loop_fut)
     }
@@ -195,7 +199,24 @@ impl AppContext {
         get_settings(&self.settings_path).await.unwrap_or_default()
     }
 
-    pub async fn list_files(&self, root: PathBuf) -> anyhow::Result<wilkes_core::types::FileListResponse> {
+    pub async fn list_bookmarks(&self) -> anyhow::Result<Vec<Bookmark>> {
+        crate::commands::bookmarks::load(&self.bookmarks_path).await
+    }
+
+    pub async fn add_bookmark(&self, bookmark: NewBookmark) -> anyhow::Result<Bookmark> {
+        let _guard = self.bookmarks_lock.lock().await;
+        crate::commands::bookmarks::add(&self.bookmarks_path, bookmark).await
+    }
+
+    pub async fn remove_bookmark(&self, id: &str) -> anyhow::Result<()> {
+        let _guard = self.bookmarks_lock.lock().await;
+        crate::commands::bookmarks::remove(&self.bookmarks_path, id).await
+    }
+
+    pub async fn list_files(
+        &self,
+        root: PathBuf,
+    ) -> anyhow::Result<wilkes_core::types::FileListResponse> {
         let s = self.get_settings().await;
         crate::commands::files::list_files(root, s.supported_extensions, s.max_file_size).await
     }
@@ -243,7 +264,8 @@ impl AppContext {
 
     fn clear_embed_task(&self) {
         *self.embed_task.lock() = None;
-        self.embed_cancel_in_progress.store(false, Ordering::Release);
+        self.embed_cancel_in_progress
+            .store(false, Ordering::Release);
     }
 
     async fn validate_index_root(
@@ -269,8 +291,8 @@ impl AppContext {
             settings.supported_extensions.clone(),
             settings.max_file_size,
         )
-            .await
-            .map_err(|err| format!("Failed to scan index root: {err}"))?;
+        .await
+        .map_err(|err| format!("Failed to scan index root: {err}"))?;
 
         if files.files.is_empty() {
             return Err(format!(
@@ -301,7 +323,7 @@ impl AppContext {
             &self.settings_path,
             serde_json::json!({ "semantic": semantic }),
         )
-            .await
+        .await
         {
             error!("update_semantic_settings: write: {e:#}");
         }
@@ -318,11 +340,11 @@ impl AppContext {
     pub fn is_semantic_ready(&self) -> bool {
         self.embedder.lock().is_some()
             && self
-            .index
-            .lock()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_some()
+                .index
+                .lock()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
     }
 
     // ── Search ────────────────────────────────────────────────────────────────
@@ -506,7 +528,7 @@ impl AppContext {
             &settings,
             "Choose a directory before building an index.",
         )
-            .await?;
+        .await?;
 
         Ok(BuildIndexPlan {
             root_path,
@@ -527,15 +549,16 @@ impl AppContext {
 
         let settings = self.settings().await;
         let Some(root_path) = settings.last_directory.clone() else {
-            return Err("Choose a directory before downloading a model and building an index."
-                .to_string());
+            return Err(
+                "Choose a directory before downloading a model and building an index.".to_string(),
+            );
         };
         self.validate_index_root(
             &root_path,
             &settings,
             "Choose a directory before downloading a model and building an index.",
         )
-            .await?;
+        .await?;
 
         Ok(DownloadModelPlan {
             device: settings.semantic.device_for(selected.engine).to_string(),
@@ -653,7 +676,7 @@ impl AppContext {
             enabled: true,
             ..s
         })
-            .await;
+        .await;
 
         self.events
             .emit("embed-done", serde_json::json!({ "operation": "Build" }));
@@ -810,7 +833,7 @@ impl AppContext {
                 data_dir.clone(),
                 progress_tx,
             )
-                .await;
+            .await;
 
             let _ = forward.await;
 
@@ -922,7 +945,7 @@ impl AppContext {
             index_path: None,
             ..s
         })
-            .await;
+        .await;
         Ok(())
     }
 
@@ -1047,7 +1070,7 @@ impl AppContext {
             index_path: None,
             ..s
         })
-            .await;
+        .await;
     }
 
     async fn load_restore_db_status(&self, settings: &Settings) -> Option<IndexStatus> {
@@ -1055,7 +1078,7 @@ impl AppContext {
             let d = self.data_dir.clone();
             move || SemanticIndex::read_status_from_path(&d)
         })
-            .await
+        .await
         {
             Ok(Ok(status)) => Some(status),
             Ok(Err(err)) => {
@@ -1160,7 +1183,7 @@ impl AppContext {
                 SemanticIndex::open(dir, model, dim)
             })
         })
-            .await
+        .await
         {
             Ok(Ok(index)) => Some(index),
             Ok(Err(err)) => {
@@ -1215,7 +1238,7 @@ impl AppContext {
                     IndexWatcher::start(
                         root, index_arc, registry, embedder, indexing, on_reindex, on_done,
                     )
-                        .map_err(Into::into)
+                    .map_err(Into::into)
                 },
             ) {
                 Ok(watcher) => *self.watcher.lock() = Some(watcher),
@@ -1238,7 +1261,7 @@ impl AppContext {
         self.update_semantic_settings(|s| {
             Self::restore_state_enabled_settings(s, db_path.clone(), plan.selected.clone(), dim)
         })
-            .await;
+        .await;
 
         info!("restore_state: embedder and index restored");
     }
@@ -1275,7 +1298,8 @@ mod tests {
     use wilkes_core::embed::MockEmbedder;
     use wilkes_core::types::EmbeddingEngine;
     use wilkes_core::types::{
-        EmbedderModel, IndexStatus, SearchMode, SelectedEmbedder, SemanticSettings, Settings, Theme,
+        BookmarkDock, EmbedderModel, IndexStatus, SearchMode, SelectedEmbedder, SemanticSettings,
+        Settings, SourceOrigin, Theme,
     };
 
     #[cfg(unix)]
@@ -1358,6 +1382,30 @@ mod tests {
         (dir, ctx)
     }
 
+    #[tokio::test]
+    async fn test_bookmark_methods_round_trip() {
+        let (_dir, ctx) = test_ctx();
+
+        let bookmark = ctx
+            .add_bookmark(wilkes_core::types::NewBookmark {
+                path: "/tmp/example.pdf".into(),
+                origin: SourceOrigin::PdfPage {
+                    page: 2,
+                    bbox: None,
+                },
+                quote: "important".to_string(),
+                note: Some("ignored".to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.list_bookmarks().await.unwrap().len(), 1);
+        assert!(bookmark.note.is_none());
+
+        ctx.remove_bookmark(&bookmark.id).await.unwrap();
+        assert!(ctx.list_bookmarks().await.unwrap().is_empty());
+    }
+
     #[test]
     fn test_emit_embed_error_logs_and_emits() {
         wilkes_core::logging::clear_logs();
@@ -1429,9 +1477,9 @@ mod tests {
             name == "embed-error"
                 && payload["operation"] == "Build"
                 && payload["message"].as_str().is_some_and(|msg| {
-                msg.contains("Fatal embedder error while indexing /tmp/example.md")
-                    && msg.contains("inner worker failure")
-            })
+                    msg.contains("Fatal embedder error while indexing /tmp/example.md")
+                        && msg.contains("inner worker failure")
+                })
         }));
     }
 
@@ -1444,7 +1492,7 @@ mod tests {
     #[test]
     fn test_restore_state_needs_reset_on_missing_db() {
         let settings = Settings {
-            bookmarked_dirs: vec![],
+            favorites: vec![],
             recent_dirs: vec![],
             last_directory: None,
             respect_gitignore: true,
@@ -1460,6 +1508,7 @@ mod tests {
             },
             supported_extensions: vec![],
             max_results: 0,
+            bookmarks_dock: BookmarkDock::default(),
         };
 
         assert!(AppContext::restore_state_needs_reset(&settings, None));
@@ -1468,7 +1517,7 @@ mod tests {
     #[test]
     fn test_restore_state_needs_reset_on_mismatch() {
         let settings = Settings {
-            bookmarked_dirs: vec![],
+            favorites: vec![],
             recent_dirs: vec![],
             last_directory: None,
             respect_gitignore: true,
@@ -1488,6 +1537,7 @@ mod tests {
             },
             supported_extensions: vec![],
             max_results: 0,
+            bookmarks_dock: BookmarkDock::default(),
         };
         let db_status = IndexStatus {
             indexed_files: 1,
@@ -1510,7 +1560,7 @@ mod tests {
     #[test]
     fn test_restore_state_needs_reset_false_when_matching() {
         let settings = Settings {
-            bookmarked_dirs: vec![],
+            favorites: vec![],
             recent_dirs: vec![],
             last_directory: None,
             respect_gitignore: true,
@@ -1530,6 +1580,7 @@ mod tests {
             },
             supported_extensions: vec![],
             max_results: 0,
+            bookmarks_dock: BookmarkDock::default(),
         };
         let db_status = IndexStatus {
             indexed_files: 1,
@@ -1784,7 +1835,7 @@ mod tests {
                 worker_bin: PathBuf::from("worker"),
                 data_dir: dir.path().to_path_buf(),
             })
-                .0,
+            .0,
             dir.path().to_path_buf(),
             &plan,
             tx,
@@ -1850,8 +1901,8 @@ mod tests {
                 done: false,
             },
         ))
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         drop(tx);
         forward.await.unwrap();
 
@@ -1880,7 +1931,7 @@ mod tests {
             EmbeddingEngine::Candle,
             Some(dir.path()),
         )
-            .unwrap();
+        .unwrap();
         let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
         let index_arc = ctx.restore_store_loaded_state(Arc::clone(&embedder), index);
 
@@ -2038,7 +2089,7 @@ mod tests {
             EmbeddingEngine::Candle,
             Some(dir.path()),
         )
-            .unwrap();
+        .unwrap();
         let index_arc = Arc::new(Mutex::new(Some(index)));
         let bad_root = dir.path().join("not-a-dir.txt");
         std::fs::write(&bad_root, "nope").unwrap();
@@ -2066,7 +2117,7 @@ mod tests {
             EmbeddingEngine::Candle,
             None,
         )
-            .unwrap();
+        .unwrap();
         let plan = RestoreStatePlan {
             settings: Settings::default(),
             db_status: IndexStatus {
@@ -2111,8 +2162,8 @@ mod tests {
                 "index_path": "semantic_index.db"
             }
         }))
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let db_status = ctx.load_restore_db_status(&settings).await;
         assert!(db_status.is_none());
@@ -2132,7 +2183,7 @@ mod tests {
             EmbeddingEngine::Candle,
             Some(dir.path()),
         )
-            .unwrap();
+        .unwrap();
         let settings = Settings {
             semantic: SemanticSettings {
                 enabled: true,
@@ -2163,7 +2214,7 @@ mod tests {
             EmbeddingEngine::Candle,
             Some(&root),
         )
-            .unwrap();
+        .unwrap();
         let plan = BuildIndexPlan {
             root_path: root.clone(),
             device: "cpu".to_string(),
@@ -2208,7 +2259,7 @@ mod tests {
             EmbeddingEngine::Candle,
             None,
         )
-            .unwrap();
+        .unwrap();
         let index_arc = Arc::new(Mutex::new(Some(index)));
         let missing_root = PathBuf::from("/definitely/missing/watcher/root");
         let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
@@ -2353,8 +2404,8 @@ exit 0
             name == "embed-error"
                 && payload["operation"] == "Build"
                 && payload["message"]
-                .as_str()
-                .is_some_and(|msg| msg.contains("is not supported by fastembed"))
+                    .as_str()
+                    .is_some_and(|msg| msg.contains("is not supported by fastembed"))
         }));
         assert!(events.iter().any(|(name, payload)| {
             name == "manager-event" && payload == &serde_json::json!("ReindexingCancelled")
@@ -2389,7 +2440,7 @@ exit 0
             chunk_size: 1234,
             ..s
         })
-            .await;
+        .await;
 
         let updated = get_settings(&settings_path).await.unwrap();
         assert_eq!(updated.semantic.enabled, true);
@@ -2465,7 +2516,7 @@ exit 0
             || {},
             || {},
         )
-            .unwrap();
+        .unwrap();
 
         *ctx.watcher.lock() = Some(watcher);
         ctx.stop_watcher();
@@ -2555,7 +2606,7 @@ exit 0
             EmbeddingEngine::Candle,
             None,
         )
-            .unwrap();
+        .unwrap();
         *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
         assert!(ctx.is_semantic_ready());
     }
@@ -2635,7 +2686,7 @@ exit 0
             || {},
             || {},
         )
-            .unwrap();
+        .unwrap();
         *ctx.watcher.lock() = Some(watcher);
 
         let cancel = CancellationToken::new();
@@ -3145,8 +3196,8 @@ exit 0
             name == "embed-error"
                 && payload["operation"] == "Build"
                 && payload["message"]
-                .as_str()
-                .is_some_and(|msg| msg.contains("Index root not found"))
+                    .as_str()
+                    .is_some_and(|msg| msg.contains("Index root not found"))
         }));
     }
 
@@ -3306,7 +3357,7 @@ exit 0
             EmbeddingEngine::Candle,
             Some(&root1),
         )
-            .unwrap();
+        .unwrap();
         *ctx.index.lock() = Arc::new(Mutex::new(Some(idx)));
 
         // Search in a different root
@@ -3380,7 +3431,7 @@ exit 0
             EmbeddingEngine::Candle,
             None,
         )
-            .unwrap();
+        .unwrap();
         *ctx.index.lock() = Arc::new(Mutex::new(Some(idx)));
 
         let root2 = dir.path().join("root2");
@@ -3529,7 +3580,7 @@ exit 0
             EmbeddingEngine::Candle,
             None,
         )
-            .unwrap();
+        .unwrap();
 
         let emitter = Arc::new(MockEmitter {
             events: Arc::new(Mutex::new(Vec::new())),
@@ -3616,7 +3667,7 @@ exit 0
             data_dir.join("semantic_index.status.json"),
             r#"{"model_id": "m", "dimension": 1, "engine": "Candle"}"#,
         )
-            .unwrap();
+        .unwrap();
 
         ctx.delete_index().await.unwrap();
         assert!(!data_dir.join("semantic_index.db").exists());
@@ -3693,7 +3744,7 @@ exit 0
             s.chunk_size = 1234;
             s
         })
-            .await;
+        .await;
 
         let settings = ctx.get_settings().await;
         assert_eq!(settings.semantic.chunk_size, 1234);
@@ -3802,7 +3853,7 @@ exit 0
             &settings_path,
             serde_json::to_string(&initial_settings).unwrap(),
         )
-            .unwrap();
+        .unwrap();
 
         // Create an index status file matching that model
         let index_dir = dir.path().join("index");
@@ -3822,7 +3873,7 @@ exit 0
             index_dir.join("status.json"),
             serde_json::to_string(&status).unwrap(),
         )
-            .unwrap();
+        .unwrap();
 
         let (ctx, _rx, _loop) = AppContext::new(
             dir.path().to_path_buf(),
@@ -3937,7 +3988,7 @@ exit 0
             EmbeddingEngine::Candle,
             Some(dir.path()),
         )
-            .unwrap();
+        .unwrap();
         drop(index);
 
         let index_path = data_dir.join("semantic_index.db");

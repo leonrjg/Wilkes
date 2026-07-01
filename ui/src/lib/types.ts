@@ -65,6 +65,22 @@ export interface MatchRef {
   text_range?: ByteRange;
 }
 
+export interface Bookmark {
+  id: string;
+  path: string;
+  origin: SourceOrigin;
+  quote: string;
+  created_at: string;
+  note?: string | null;
+}
+
+export interface NewBookmark {
+  path: string;
+  origin: SourceOrigin;
+  quote: string;
+  note?: string | null;
+}
+
 export interface BoundingBox {
   x: number;
   y: number;
@@ -167,7 +183,7 @@ export interface WorkerStatus {
 }
 
 export interface Settings {
-  bookmarked_dirs: string[];
+  favorites: string[];
   recent_dirs: string[];
   last_directory: string | null;
   respect_gitignore: boolean;
@@ -178,9 +194,11 @@ export interface Settings {
   supported_extensions: string[];
   /** 0 = unlimited */
   max_results: number;
+  bookmarks_dock: BookmarkDock;
 }
 
 export type Theme = "System" | "Light" | "Dark";
+export type BookmarkDock = "Left" | "Right";
 
 export interface SearchCapabilities {
   supports_regex: boolean;

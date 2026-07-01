@@ -17,12 +17,22 @@ export interface PdfViewerProps {
   url: string;
   page: number;
   highlight_bbox: BoundingBox | null;
+  bookmarkHighlights?: Array<{ id: string; page: number; bbox: BoundingBox }>;
   onRenderSuccess?: () => void;
+  onAddBookmark?: (bookmark: { page: number; bbox: BoundingBox; quote: string }) => void;
 }
 
 const PAGE_GAP_PX = 12;
 
-export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }: PdfViewerProps) {
+export default function PdfViewer({
+  url,
+  page,
+  highlight_bbox,
+  bookmarkHighlights = [],
+  onRenderSuccess,
+  onAddBookmark,
+}: PdfViewerProps) {
+  const rootRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState(600);
   const [numPages, setNumPages] = useState<number | null>(null);
@@ -31,6 +41,13 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
   const [zoom, setZoom] = useState(1.0);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
+  const [selectionBookmark, setSelectionBookmark] = useState<{
+    page: number;
+    bbox: BoundingBox;
+    quote: string;
+    buttonLeft: number;
+    buttonTop: number;
+  } | null>(null);
 
   useEffect(() => {
     const observer = new MutationObserver(() => {
@@ -101,6 +118,62 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
     }
   }, []);
 
+  const handleMouseUp = useCallback(() => {
+    const root = rootRef.current;
+    const container = containerRef.current;
+    const selection = window.getSelection();
+    if (!root || !container || !selection || selection.isCollapsed || selection.rangeCount === 0) {
+      setSelectionBookmark(null);
+      return;
+    }
+
+    const range = selection.getRangeAt(0);
+    const startNode = range.startContainer;
+    const startElement =
+      startNode instanceof Element ? startNode : startNode.parentElement ?? null;
+    const pageElement = startElement?.closest<HTMLElement>("[data-page-number]");
+    if (!pageElement || !container.contains(pageElement)) {
+      setSelectionBookmark(null);
+      return;
+    }
+
+    const pageNumber = Number(pageElement.dataset.pageNumber);
+    const pageMetric = pageMetrics[pageNumber - 1];
+    if (!pageNumber || !pageMetric) {
+      setSelectionBookmark(null);
+      return;
+    }
+
+    const selectionRect = range.getBoundingClientRect();
+    const pageRect = pageElement.getBoundingClientRect();
+    const rootRect = root.getBoundingClientRect();
+    const pageScale = renderedWidth / pageMetric.width;
+    const quote = selection.toString().trim();
+    if (!quote || selectionRect.width <= 0 || selectionRect.height <= 0) {
+      setSelectionBookmark(null);
+      return;
+    }
+
+    setSelectionBookmark({
+      page: pageNumber,
+      bbox: {
+        x: (selectionRect.left - pageRect.left) / pageScale,
+        y: (selectionRect.top - pageRect.top) / pageScale,
+        width: selectionRect.width / pageScale,
+        height: selectionRect.height / pageScale,
+      },
+      quote,
+      buttonLeft: Math.min(
+        Math.max(selectionRect.left - rootRect.left, 8),
+        Math.max(rootRect.width - 128, 8),
+      ),
+      buttonTop: Math.min(
+        Math.max(selectionRect.bottom - rootRect.top + 3, 8),
+        Math.max(rootRect.height - 40, 8),
+      ),
+    });
+  }, [pageMetrics, renderedWidth]);
+
   const {
     searchInputRef,
     isSearchOpen,
@@ -158,7 +231,7 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
   }, [hasPageMetrics, zoom, syncCurrentPageFromScroll]);
 
   return (
-    <div className="h-full relative flex flex-col">
+    <div ref={rootRef} className="h-full relative flex flex-col">
       <div className="absolute bottom-4 right-4 z-20 flex flex-col gap-2 items-end">
         {isSearchOpen && (
           <div className="bg-[var(--bg-app)] border border-[var(--border-main)] rounded-lg shadow-xl flex items-center p-1 gap-1 animate-in fade-in slide-in-from-bottom-2 duration-200">
@@ -241,6 +314,7 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
       <div
         ref={containerRef}
         className={`flex-1 overflow-auto bg-[var(--bg-sidebar)] pr-1 ${isDark ? "pdf-dark-mode" : ""}`}
+        onMouseUp={handleMouseUp}
         onScroll={() => {
           requestAnimationFrame(syncCurrentPageFromScroll);
         }}
@@ -272,6 +346,9 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
               const innerBbox = innerMatch && innerMatch.page === pageNum ? innerMatch.bbox : null;
 
               const activeBbox = isSearchOpen ? innerBbox : targetBbox;
+              const pageBookmarkHighlights = bookmarkHighlights.filter(
+                (highlight) => highlight.page === pageNum,
+              );
 
               let overlayStyle: React.CSSProperties | undefined;
               if (activeBbox) {
@@ -312,6 +389,26 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
                         }
                       }}
                     />
+                    {pageBookmarkHighlights.map((highlight) => {
+                      const { x, y, width, height } = highlight.bbox;
+                      return (
+                        <div
+                          key={highlight.id}
+                          data-testid="bookmark-highlight"
+                          style={{
+                            position: "absolute",
+                            left: `${x * pageScale}px`,
+                            top: `${y * pageScale}px`,
+                            width: `${Math.max(width * pageScale, 4)}px`,
+                            height: `${Math.max(height * pageScale, 4)}px`,
+                            backgroundColor: "rgba(250, 204, 21, 0.16)",
+                            borderBottom: "2px solid rgba(202, 138, 4, 0.75)",
+                            borderRadius: "2px",
+                            pointerEvents: "none",
+                          }}
+                        />
+                      );
+                    })}
                     {overlayStyle && <div style={overlayStyle} />}
                     {!isSearchOpen &&
                       targetBbox &&
@@ -346,6 +443,21 @@ export default function PdfViewer({ url, page, highlight_bbox, onRenderSuccess }
           </div>
         </Document>
       </div>
+      {selectionBookmark && onAddBookmark && (
+        <button
+          type="button"
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => {
+            onAddBookmark(selectionBookmark);
+            setSelectionBookmark(null);
+            window.getSelection()?.removeAllRanges();
+          }}
+          className="absolute z-40 px-2 py-1 rounded border border-[var(--border-main)] bg-[var(--bg-app)] text-xs text-[var(--text-main)] shadow-lg hover:border-[var(--border-strong)]"
+          style={{ left: selectionBookmark.buttonLeft, top: selectionBookmark.buttonTop }}
+        >
+          + Bookmark
+        </button>
+      )}
     </div>
   );
 }

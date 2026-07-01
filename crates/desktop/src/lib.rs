@@ -7,8 +7,8 @@ use tracing::info;
 use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
-    DataPaths, DocumentMetadata, EmbeddingEngine, FileListResponse, IndexStatus, ModelDescriptor,
-    SelectedEmbedder, Settings,
+    Bookmark, DataPaths, DocumentMetadata, EmbeddingEngine, FileListResponse, IndexStatus,
+    ModelDescriptor, NewBookmark, SelectedEmbedder, Settings,
 };
 
 mod platform;
@@ -30,7 +30,10 @@ fn data_paths_from(app_data: String) -> DataPaths {
     DataPaths { app_data }
 }
 
-async fn list_files_for_ctx(ctx: Arc<AppContext>, root: String) -> Result<FileListResponse, String> {
+async fn list_files_for_ctx(
+    ctx: Arc<AppContext>,
+    root: String,
+) -> Result<FileListResponse, String> {
     ctx.list_files(root.into()).await.map_err(|e| e.to_string())
 }
 
@@ -60,6 +63,21 @@ async fn update_settings_for_ctx(
     patch: serde_json::Value,
 ) -> Result<Settings, String> {
     ctx.update_settings(patch).await.map_err(|e| e.to_string())
+}
+
+async fn list_bookmarks_for_ctx(ctx: Arc<AppContext>) -> Result<Vec<Bookmark>, String> {
+    ctx.list_bookmarks().await.map_err(|e| e.to_string())
+}
+
+async fn add_bookmark_for_ctx(
+    ctx: Arc<AppContext>,
+    bookmark: NewBookmark,
+) -> Result<Bookmark, String> {
+    ctx.add_bookmark(bookmark).await.map_err(|e| e.to_string())
+}
+
+async fn remove_bookmark_for_ctx(ctx: Arc<AppContext>, id: String) -> Result<(), String> {
+    ctx.remove_bookmark(&id).await.map_err(|e| e.to_string())
 }
 
 fn is_semantic_ready_for_ctx(ctx: Arc<AppContext>) -> bool {
@@ -325,6 +343,21 @@ async fn update_settings(patch: serde_json::Value, app: AppHandle) -> Result<Set
 }
 
 #[tauri::command]
+async fn list_bookmarks(app: AppHandle) -> Result<Vec<Bookmark>, String> {
+    list_bookmarks_for_ctx(app_context(&app)).await
+}
+
+#[tauri::command]
+async fn add_bookmark(bookmark: NewBookmark, app: AppHandle) -> Result<Bookmark, String> {
+    add_bookmark_for_ctx(app_context(&app), bookmark).await
+}
+
+#[tauri::command]
+async fn remove_bookmark(id: String, app: AppHandle) -> Result<(), String> {
+    remove_bookmark_for_ctx(app_context(&app), id).await
+}
+
+#[tauri::command]
 fn is_semantic_ready(app: AppHandle) -> bool {
     is_semantic_ready_for_ctx(app_context(&app))
 }
@@ -448,6 +481,9 @@ pub fn run() {
             get_supported_engines,
             get_settings,
             update_settings,
+            list_bookmarks,
+            add_bookmark,
+            remove_bookmark,
             pick_directory,
             download_model,
             build_index,
@@ -477,6 +513,7 @@ mod tests {
     use tempfile::tempdir;
     use wilkes_api::context::EventEmitter;
     use wilkes_core::embed::worker::manager::WorkerPaths;
+    use wilkes_core::types::SourceOrigin;
 
     static OPEN_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -802,9 +839,41 @@ mod tests {
     async fn test_get_settings_for_ctx() {
         let (_dir, ctx) = test_ctx();
         let settings = get_settings_for_ctx(ctx).await.unwrap();
-        assert!(settings.bookmarked_dirs.is_empty());
+        assert!(settings.favorites.is_empty());
         assert!(settings.last_directory.is_none());
         assert!(!settings.semantic.enabled);
+    }
+
+    #[tokio::test]
+    async fn test_bookmark_helpers_for_ctx() {
+        let (_dir, ctx) = test_ctx();
+        let bookmark = add_bookmark_for_ctx(
+            Arc::clone(&ctx),
+            NewBookmark {
+                path: "/tmp/example.pdf".into(),
+                origin: SourceOrigin::PdfPage {
+                    page: 4,
+                    bbox: None,
+                },
+                quote: "quote".to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            list_bookmarks_for_ctx(Arc::clone(&ctx))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        remove_bookmark_for_ctx(ctx.clone(), bookmark.id)
+            .await
+            .unwrap();
+        assert!(list_bookmarks_for_ctx(ctx).await.unwrap().is_empty());
     }
 
     #[tokio::test]

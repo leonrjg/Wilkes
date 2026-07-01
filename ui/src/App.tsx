@@ -1,13 +1,15 @@
 import { useState, useCallback, useRef, useEffect } from "react";
-import { Settings as SettingsIcon } from "react-feather";
+import { Bookmark, Settings as SettingsIcon } from "react-feather";
 import SearchBar from "./components/SearchBar";
 import ResultList from "./components/ResultList";
 import PreviewPane from "./components/PreviewPane";
+import BookmarksPane from "./components/BookmarksPane";
 import DirectoryPicker from "./components/DirectoryPicker";
 import UploadZone from "./components/UploadZone";
 import SettingsModal from "./components/SettingsModal";
 import { useToasts } from "./components/Toast";
 import { useSettingsStore } from "./stores/useSettingsStore";
+import { useBookmarksStore } from "./stores/useBookmarksStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useHistory } from "./hooks/useHistory";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
@@ -19,12 +21,16 @@ export default function App() {
   const { addToast } = useToasts();
 
   const loadSettings = useSettingsStore((s) => s.load);
+  const loadBookmarks = useBookmarksStore((s) => s.load);
+  const toggleBookmarksPane = useBookmarksStore((s) => s.togglePane);
+  const bookmarksPaneOpen = useBookmarksStore((s) => s.paneOpen);
+  const bookmarksDock = useSettingsStore((s) => s.bookmarksDock);
   const directory = useSettingsStore((s) => s.directory);
-  const bookmarks = useSettingsStore((s) => s.bookmarks);
+  const favorites = useSettingsStore((s) => s.favorites);
   const recentDirs = useSettingsStore((s) => s.recentDirs);
   const setDirectory = useSettingsStore((s) => s.setDirectory);
-  const addBookmark = useSettingsStore((s) => s.addBookmark);
-  const removeBookmark = useSettingsStore((s) => s.removeBookmark);
+  const addFavorite = useSettingsStore((s) => s.addFavorite);
+  const removeFavorite = useSettingsStore((s) => s.removeFavorite);
   const forgetDirectory = useSettingsStore((s) => s.forgetDirectory);
   const applySettingsPatch = useSettingsStore((s) => s.applySettingsPatch);
   const setIndexing = useSettingsStore((s) => s.setIndexing);
@@ -36,11 +42,20 @@ export default function App() {
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(320);
-  const isResizing = useRef(false);
+  const [bookmarksWidth, setBookmarksWidth] = useState(320);
+  const resizeRef = useRef<{
+    startX: number;
+    startWidth: number;
+    setWidth: (width: number) => void;
+    direction: 1 | -1;
+    minWidth: number;
+    maxWidth: number;
+  } | null>(null);
 
   useEffect(() => {
     loadSettings().catch(() => {});
-  }, [loadSettings]);
+    loadBookmarks().catch(() => {});
+  }, [loadSettings, loadBookmarks]);
 
   useEffect(() => {
     let mounted = true;
@@ -87,22 +102,44 @@ export default function App() {
   }, [handleIndexUpdated, setIndexing]);
 
   const handleMouseMove = useCallback((e: MouseEvent) => {
-    if (!isResizing.current) return;
-    const newWidth = Math.max(200, Math.min(window.innerWidth * 0.8, e.clientX));
-    setSidebarWidth(newWidth);
+    const resize = resizeRef.current;
+    if (!resize) return;
+    const delta = (e.clientX - resize.startX) * resize.direction;
+    const newWidth = Math.max(resize.minWidth, Math.min(resize.maxWidth, resize.startWidth + delta));
+    resize.setWidth(newWidth);
   }, []);
 
   const handleMouseUp = useCallback(() => {
-    isResizing.current = false;
+    resizeRef.current = null;
     document.removeEventListener("mousemove", handleMouseMove);
     document.removeEventListener("mouseup", handleMouseUp);
     document.body.style.cursor = "";
   }, [handleMouseMove]);
 
-  const handleMouseDown = useCallback(
+  const startResize = useCallback(
+    ({
+      width,
+      setWidth,
+      direction,
+      minWidth = 200,
+      maxWidth = window.innerWidth * 0.8,
+    }: {
+      width: number;
+      setWidth: (width: number) => void;
+      direction: 1 | -1;
+      minWidth?: number;
+      maxWidth?: number;
+    }) =>
     (e: React.MouseEvent) => {
       e.preventDefault();
-      isResizing.current = true;
+      resizeRef.current = {
+        startX: e.clientX,
+        startWidth: width,
+        setWidth,
+        direction,
+        minWidth,
+        maxWidth,
+      };
       document.addEventListener("mousemove", handleMouseMove);
       document.addEventListener("mouseup", handleMouseUp);
       document.body.style.cursor = "col-resize";
@@ -126,12 +163,12 @@ export default function App() {
     source.type === "desktop" ? (
       <DirectoryPicker
         directory={directory}
-        bookmarks={bookmarks}
+        favorites={favorites}
         recentDirs={recentDirs}
         onChange={setDirectory}
         onPickDirectory={handlePickDirectory}
-        onBookmarkAdd={addBookmark}
-        onBookmarkRemove={removeBookmark}
+        onFavoriteAdd={addFavorite}
+        onFavoriteRemove={removeFavorite}
         onForgetDirectory={forgetDirectory}
       />
     ) : (
@@ -143,6 +180,13 @@ export default function App() {
 
   const settingsSlot = (
     <>
+      <button
+        onClick={toggleBookmarksPane}
+        title="Bookmarks"
+        className="w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all border border-[var(--border-main)] hover:border-[var(--border-strong)]"
+      >
+        <Bookmark size={14} fill={bookmarksPaneOpen ? "currentColor" : "none"} />
+      </button>
       <button
         onClick={() => setSettingsOpen(true)}
         title="Settings"
@@ -161,6 +205,41 @@ export default function App() {
     </>
   );
 
+  const bookmarksColumn = bookmarksPaneOpen ? (
+    <>
+      {bookmarksDock === "Right" && (
+        <div
+          onMouseDown={startResize({
+            width: bookmarksWidth,
+            setWidth: setBookmarksWidth,
+            direction: -1,
+            minWidth: 240,
+            maxWidth: window.innerWidth * 0.5,
+          })}
+          className="w-1 cursor-col-resize flex-shrink-0 bg-transparent hover:bg-[var(--accent-blue)]/30 border-l border-[var(--border-main)] transition-colors"
+        />
+      )}
+      <div
+        className="flex-shrink-0 overflow-hidden"
+        style={{ width: `${bookmarksWidth}px`, minWidth: "240px" }}
+      >
+        <BookmarksPane />
+      </div>
+      {bookmarksDock === "Left" && (
+        <div
+          onMouseDown={startResize({
+            width: bookmarksWidth,
+            setWidth: setBookmarksWidth,
+            direction: 1,
+            minWidth: 240,
+            maxWidth: window.innerWidth * 0.5,
+          })}
+          className="w-1 cursor-col-resize flex-shrink-0 bg-transparent hover:bg-[var(--accent-blue)]/30 border-r border-[var(--border-main)] transition-colors"
+        />
+      )}
+    </>
+  ) : null;
+
   return (
     <div className="flex flex-col h-screen bg-[var(--bg-app)] text-[var(--text-main)]">
       <SearchBar sourceSlot={sourceSlot} settingsSlot={settingsSlot} />
@@ -174,9 +253,17 @@ export default function App() {
         </div>
 
         <div
-          onMouseDown={handleMouseDown}
+          onMouseDown={startResize({
+            width: sidebarWidth,
+            setWidth: setSidebarWidth,
+            direction: 1,
+            minWidth: 200,
+            maxWidth: window.innerWidth * 0.45,
+          })}
           className="w-1 cursor-col-resize flex-shrink-0 bg-transparent hover:bg-[var(--accent-blue)]/30 border-l border-[var(--border-main)] transition-colors"
         />
+
+        {bookmarksDock === "Left" && bookmarksColumn}
 
         <div className="flex-1 overflow-hidden bg-[var(--bg-app)]">
           <PreviewPane
@@ -186,6 +273,8 @@ export default function App() {
             onGoForward={goForward}
           />
         </div>
+
+        {bookmarksDock === "Right" && bookmarksColumn}
       </div>
     </div>
   );

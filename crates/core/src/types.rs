@@ -278,6 +278,26 @@ pub struct MatchRef {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Bookmark {
+    pub id: String,
+    pub path: PathBuf,
+    pub origin: SourceOrigin,
+    pub quote: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NewBookmark {
+    pub path: PathBuf,
+    pub origin: SourceOrigin,
+    pub quote: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PreviewData {
     Text {
         content: String,
@@ -611,7 +631,8 @@ pub struct IndexStatus {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
-    pub bookmarked_dirs: Vec<PathBuf>,
+    #[serde(default, alias = "bookmarked_dirs")]
+    pub favorites: Vec<PathBuf>,
     #[serde(default)]
     pub recent_dirs: Vec<PathBuf>,
     #[serde(default)]
@@ -627,20 +648,13 @@ pub struct Settings {
     pub supported_extensions: Vec<String>,
     #[serde(default)]
     pub max_results: usize,
+    #[serde(default)]
+    pub bookmarks_dock: BookmarkDock,
 }
 
 fn default_supported_extensions() -> Vec<String> {
     vec![
-        "txt",
-        "md",
-        "json",
-        "xml",
-        "html",
-        "htm",
-        "log",
-        "csv",
-        "jsonl",
-        "pdf",
+        "txt", "md", "json", "xml", "html", "htm", "log", "csv", "jsonl", "pdf",
     ]
     .into_iter()
     .map(String::from)
@@ -650,7 +664,7 @@ fn default_supported_extensions() -> Vec<String> {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            bookmarked_dirs: Vec::new(),
+            favorites: Vec::new(),
             recent_dirs: Vec::new(),
             last_directory: None,
             respect_gitignore: true,
@@ -661,8 +675,16 @@ impl Default for Settings {
             semantic: SemanticSettings::default(),
             supported_extensions: default_supported_extensions(),
             max_results: 50,
+            bookmarks_dock: BookmarkDock::default(),
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub enum BookmarkDock {
+    Left,
+    #[default]
+    Right,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1061,8 +1083,7 @@ mod tests {
 
     #[test]
     fn test_search_query_defaults() {
-        let json =
-            r#"{"pattern": "p", "is_regex": false, "case_sensitive": false, "root": ".", "max_results": 10}"#;
+        let json = r#"{"pattern": "p", "is_regex": false, "case_sensitive": false, "root": ".", "max_results": 10}"#;
         let q: SearchQuery = serde_json::from_str(json).unwrap();
         assert_eq!(q.respect_gitignore, true);
         assert_eq!(q.max_file_size, 0);

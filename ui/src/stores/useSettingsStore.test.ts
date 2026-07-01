@@ -14,7 +14,7 @@ describe("useSettingsStore", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useSettingsStore.setState({
-      bookmarks: [],
+      favorites: [],
       recentDirs: [],
       directory: "",
       respectGitignore: true,
@@ -33,12 +33,12 @@ describe("useSettingsStore", () => {
   it("should have initial state", () => {
     const state = useSettingsStore.getState();
     expect(state.directory).toBe("");
-    expect(state.bookmarks).toEqual([]);
+    expect(state.favorites).toEqual([]);
   });
 
   it("should load settings", async () => {
     const mockSettings = {
-      bookmarked_dirs: ["/path/1"],
+      favorites: ["/path/1"],
       recent_dirs: ["/path/recent"],
       last_directory: "/path/1",
       respect_gitignore: true,
@@ -59,7 +59,7 @@ describe("useSettingsStore", () => {
     await Promise.resolve();
 
     const state = useSettingsStore.getState();
-    expect(state.bookmarks).toEqual(["/path/1"]);
+    expect(state.favorites).toEqual(["/path/1"]);
     expect(state.directory).toBe("/path/1");
     expect(state.theme).toBe("Dark");
     expect(state.preferSemantic).toBe(true);
@@ -68,7 +68,7 @@ describe("useSettingsStore", () => {
 
   it("should handle load with no directory", async () => {
     (api.getSettings as any).mockResolvedValue({
-      bookmarked_dirs: [],
+      favorites: [],
       recent_dirs: [],
       last_directory: null,
       respect_gitignore: true,
@@ -143,34 +143,34 @@ describe("useSettingsStore", () => {
   it("should add a bookmark", async () => {
     (api.updateSettings as any).mockResolvedValue({});
 
-    useSettingsStore.getState().addBookmark("/bookmarked/path");
+    useSettingsStore.getState().addFavorite("/bookmarked/path");
 
     const state = useSettingsStore.getState();
-    expect(state.bookmarks).toContain("/bookmarked/path");
+    expect(state.favorites).toContain("/bookmarked/path");
     expect(api.updateSettings).toHaveBeenCalled();
   });
 
   it("should not add duplicate bookmark", async () => {
-    useSettingsStore.setState({ bookmarks: ["/path/1"] });
-    useSettingsStore.getState().addBookmark("/path/1");
-    expect(useSettingsStore.getState().bookmarks).toEqual(["/path/1"]);
+    useSettingsStore.setState({ favorites: ["/path/1"] });
+    useSettingsStore.getState().addFavorite("/path/1");
+    expect(useSettingsStore.getState().favorites).toEqual(["/path/1"]);
     expect(api.updateSettings).not.toHaveBeenCalled();
   });
 
   it("should remove a bookmark", async () => {
-    useSettingsStore.setState({ bookmarks: ["/path/1"] });
+    useSettingsStore.setState({ favorites: ["/path/1"] });
     (api.updateSettings as any).mockResolvedValue({});
 
-    useSettingsStore.getState().removeBookmark("/path/1");
+    useSettingsStore.getState().removeFavorite("/path/1");
 
     const state = useSettingsStore.getState();
-    expect(state.bookmarks).not.toContain("/path/1");
+    expect(state.favorites).not.toContain("/path/1");
     expect(api.updateSettings).toHaveBeenCalled();
   });
 
   it("should forget a directory", async () => {
     useSettingsStore.setState({
-      bookmarks: ["/path/1", "/path/2"],
+      favorites: ["/path/1", "/path/2"],
       recentDirs: ["/path/1", "/path/3"],
       directory: "/path/1",
     });
@@ -179,11 +179,11 @@ describe("useSettingsStore", () => {
     useSettingsStore.getState().forgetDirectory("/path/1");
 
     const state = useSettingsStore.getState();
-    expect(state.bookmarks).toEqual(["/path/2"]);
+    expect(state.favorites).toEqual(["/path/2"]);
     expect(state.recentDirs).toEqual(["/path/3"]);
     expect(state.directory).toBe("");
     expect(api.updateSettings).toHaveBeenCalledWith({
-      bookmarked_dirs: ["/path/2"],
+      favorites: ["/path/2"],
       recent_dirs: ["/path/3"],
       last_directory: null,
     });

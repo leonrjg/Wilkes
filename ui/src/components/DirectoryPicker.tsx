@@ -8,12 +8,12 @@ import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileAc
 
 interface Props {
   directory: string;
-  bookmarks: string[];
+  favorites: string[];
   recentDirs: string[];
   onChange: (dir: string) => void;
   onPickDirectory: () => void;
-  onBookmarkAdd?: (dir: string) => void;
-  onBookmarkRemove?: (dir: string) => void;
+  onFavoriteAdd?: (dir: string) => void;
+  onFavoriteRemove?: (dir: string) => void;
   onForgetDirectory?: (dir: string) => void;
 }
 
@@ -25,23 +25,23 @@ function shortPath(p: string): string {
 
 export default function DirectoryPicker({
   directory,
-  bookmarks,
+  favorites,
   recentDirs,
   onChange,
   onPickDirectory,
-  onBookmarkAdd,
-  onBookmarkRemove,
+  onFavoriteAdd,
+  onFavoriteRemove,
   onForgetDirectory,
 }: Props) {
   const { addToast } = useToasts();
   const { menu, openMenu, closeMenu } = useContextMenu<ContextMenuTarget>();
-  const isBookmarked = (dir: string) => bookmarks.includes(dir);
+  const isBookmarked = (dir: string) => favorites.includes(dir);
   const onToast = (message: string, type: "success" | "error") => addToast(message, { type });
 
-  // Combine bookmarks and recent dirs for the list, prioritizing bookmarks
+  // Combine favorites and recent dirs for the list, prioritizing favorites
   // and removing duplicates.
   const displayDirs = useMemo(() => {
-    const combined = [...bookmarks];
+    const combined = [...favorites];
     for (const d of recentDirs) {
       if (!combined.includes(d)) {
         combined.push(d);
@@ -52,7 +52,7 @@ export default function DirectoryPicker({
       combined.push(directory);
     }
     return combined;
-  }, [bookmarks, recentDirs, directory]);
+  }, [favorites, recentDirs, directory]);
 
   return (
     <div className="flex items-center gap-1 min-w-0 w-full">
@@ -114,13 +114,13 @@ export default function DirectoryPicker({
                 >
                   {shortPath(b).split("/").pop() || shortPath(b)}
                 </button>
-                {onBookmarkAdd && onBookmarkRemove && (
+                {onFavoriteAdd && onFavoriteRemove && (
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      bookmarked ? onBookmarkRemove(b) : onBookmarkAdd(b);
+                      bookmarked ? onFavoriteRemove(b) : onFavoriteAdd(b);
                     }}
-                    title={bookmarked ? "Remove bookmark" : "Bookmark this directory"}
+                    title={bookmarked ? "Remove favorite" : "Favorite this directory"}
                     className={`h-full text-[10px] px-1.5 transition-colors ${
                       bookmarked
                         ? "text-[var(--accent-blue)]"

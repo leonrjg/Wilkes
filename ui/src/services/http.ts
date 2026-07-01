@@ -3,12 +3,14 @@ import type {
   EmbedError,
   EmbedProgress,
   EmbeddingEngine,
+  Bookmark,
   FileListResponse,
   FileMatches,
   IndexStatus,
   MatchRef,
   DocumentMetadata,
   ModelDescriptor,
+  NewBookmark,
   PreviewData,
   SelectedEmbedder,
   SearchQuery,
@@ -118,6 +120,27 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw new Error(`updateSettings failed: ${res.status}`);
     return res.json() as Promise<Settings>;
+  }
+
+  async listBookmarks(): Promise<Bookmark[]> {
+    const res = await fetch("/api/bookmarks");
+    if (!res.ok) throw new Error(`listBookmarks failed: ${res.status}`);
+    return res.json() as Promise<Bookmark[]>;
+  }
+
+  async addBookmark(bookmark: NewBookmark): Promise<Bookmark> {
+    const res = await fetch("/api/bookmarks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(bookmark),
+    });
+    if (!res.ok) throw new Error(`addBookmark failed: ${res.status}`);
+    return res.json() as Promise<Bookmark>;
+  }
+
+  async removeBookmark(id: string): Promise<void> {
+    const res = await fetch(`/api/bookmarks/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!res.ok && res.status !== 204) throw new Error(`removeBookmark failed: ${res.status}`);
   }
 
   async listFiles(root: string): Promise<FileListResponse> {

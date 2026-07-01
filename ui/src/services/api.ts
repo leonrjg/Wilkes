@@ -3,12 +3,14 @@ import type {
   EmbedError,
   EmbedProgress,
   EmbeddingEngine,
+  Bookmark,
   FileListResponse,
   FileMatches,
   IndexStatus,
   MatchRef,
   DocumentMetadata,
   ModelDescriptor,
+  NewBookmark,
   PreviewData,
   SelectedEmbedder,
   SearchQuery,
@@ -31,6 +33,9 @@ export interface SearchApi {
   preview(matchRef: MatchRef): Promise<PreviewData>;
   getSettings(): Promise<Settings>;
   updateSettings(patch: Partial<Settings>): Promise<Settings>;
+  listBookmarks(): Promise<Bookmark[]>;
+  addBookmark(bookmark: NewBookmark): Promise<Bookmark>;
+  removeBookmark(id: string): Promise<void>;
   listFiles(root: string): Promise<FileListResponse>;
   openFile(path: string): Promise<PreviewData>;
   getFileMetadata(path: string): Promise<DocumentMetadata>;

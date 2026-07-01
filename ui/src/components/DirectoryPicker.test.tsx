@@ -24,12 +24,12 @@ vi.mock("../lib/utils/dialog", () => ({
 describe("DirectoryPicker", () => {
   const defaultProps = {
     directory: "/home/user/project",
-    bookmarks: ["/home/user/other"],
+    favorites: ["/home/user/other"],
     recentDirs: ["/home/user/recent"],
     onChange: vi.fn(),
     onPickDirectory: vi.fn(),
-    onBookmarkAdd: vi.fn(),
-    onBookmarkRemove: vi.fn(),
+    onFavoriteAdd: vi.fn(),
+    onFavoriteRemove: vi.fn(),
   };
 
   beforeEach(() => {
@@ -66,18 +66,18 @@ describe("DirectoryPicker", () => {
     expect(defaultProps.onPickDirectory).toHaveBeenCalled();
   });
 
-  it("calls onBookmarkAdd/Remove when bookmark button is clicked", () => {
+  it("calls onFavoriteAdd/Remove when bookmark button is clicked", () => {
     renderWithToasts();
     
     // "other" is already bookmarked
-    const otherBookmarkBtn = screen.getByTitle("Remove bookmark");
+    const otherBookmarkBtn = screen.getByTitle("Remove favorite");
     fireEvent.click(otherBookmarkBtn);
-    expect(defaultProps.onBookmarkRemove).toHaveBeenCalledWith("/home/user/other");
+    expect(defaultProps.onFavoriteRemove).toHaveBeenCalledWith("/home/user/other");
 
     // "recent" is not bookmarked
-    const bookmarkBtns = screen.getAllByTitle("Bookmark this directory");
+    const bookmarkBtns = screen.getAllByTitle("Favorite this directory");
     fireEvent.click(bookmarkBtns[0]); // Click the first one
-    expect(defaultProps.onBookmarkAdd).toHaveBeenCalledWith("/home/user/recent");
+    expect(defaultProps.onFavoriteAdd).toHaveBeenCalledWith("/home/user/recent");
   });
 
   it("calls onForgetDirectory when remove from history button is clicked", async () => {

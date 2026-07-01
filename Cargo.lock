@@ -7794,6 +7794,7 @@ version = "0.9.5"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "ignore",
  "parking_lot",
  "serde",
@@ -7804,6 +7805,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "wilkes-core",
 ]
 

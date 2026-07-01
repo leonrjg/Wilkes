@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import { api } from "../services";
-import type { FileEntry, OmittedFileEntry, SemanticSettings, Settings, Theme } from "../lib/types";
+import type { BookmarkDock, FileEntry, OmittedFileEntry, SemanticSettings, Settings, Theme } from "../lib/types";
 
 function applyTheme(theme: Theme) {
   const root = window.document.documentElement;
@@ -15,7 +15,7 @@ function applyTheme(theme: Theme) {
 }
 
 interface SettingsStore {
-  bookmarks: string[];
+  favorites: string[];
   recentDirs: string[];
   directory: string;
   semantic: SemanticSettings | null;
@@ -30,24 +30,26 @@ interface SettingsStore {
   indexing: boolean;
   theme: Theme;
   maxResults: number;
+  bookmarksDock: BookmarkDock;
 
   load: () => Promise<void>;
   setDirectory: (dir: string) => void;
-  addBookmark: (dir: string) => void;
-  removeBookmark: (dir: string) => void;
+  addFavorite: (dir: string) => void;
+  removeFavorite: (dir: string) => void;
   forgetDirectory: (dir: string) => void;
   refreshFileList: () => void;
   setFilterText: (text: string) => void;
   setPreferSemantic: (active: boolean) => void;
   setIndexing: (indexing: boolean) => void;
-  applySettingsPatch: (patch: { theme?: Theme; supported_extensions?: string[]; max_results?: number }) => void;
+  applySettingsPatch: (patch: { theme?: Theme; supported_extensions?: string[]; max_results?: number; bookmarks_dock?: BookmarkDock }) => void;
+  setBookmarksDock: (dock: BookmarkDock) => void;
   replaceSettings: (settings: Settings) => void;
   refreshSettings: () => Promise<Settings>;
 }
 
 export const useSettingsStore = create<SettingsStore>()(
   subscribeWithSelector((set, get) => ({
-    bookmarks: [],
+    favorites: [],
     recentDirs: [],
     directory: "",
     semantic: null,
@@ -62,6 +64,7 @@ export const useSettingsStore = create<SettingsStore>()(
     indexing: false,
     theme: "System",
     maxResults: 50,
+    bookmarksDock: "Right",
 
     load: async () => {
       const s = await api.getSettings();
@@ -75,7 +78,7 @@ export const useSettingsStore = create<SettingsStore>()(
       }
 
       set({
-        bookmarks: s.bookmarked_dirs,
+        favorites: s.favorites,
         recentDirs: s.recent_dirs || [],
         directory: s.last_directory ?? "",
         semantic: s.semantic,
@@ -85,6 +88,7 @@ export const useSettingsStore = create<SettingsStore>()(
         preferSemantic: s.search_prefer_semantic,
         theme: s.theme,
         maxResults: s.max_results ?? 0,
+        bookmarksDock: s.bookmarks_dock ?? "Right",
         omittedFileList: [],
       });
     },
@@ -101,34 +105,34 @@ export const useSettingsStore = create<SettingsStore>()(
       }
     },
 
-    addBookmark: (dir: string) => {
-      const { bookmarks } = get();
-      if (bookmarks.includes(dir)) return;
-      const next = [...bookmarks, dir];
-      api.updateSettings({ bookmarked_dirs: next }).catch(() => {});
-      set({ bookmarks: next });
+    addFavorite: (dir: string) => {
+      const { favorites } = get();
+      if (favorites.includes(dir)) return;
+      const next = [...favorites, dir];
+      api.updateSettings({ favorites: next }).catch(() => {});
+      set({ favorites: next });
     },
 
-    removeBookmark: (dir: string) => {
-      const { bookmarks } = get();
-      const next = bookmarks.filter((b) => b !== dir);
-      api.updateSettings({ bookmarked_dirs: next }).catch(() => {});
-      set({ bookmarks: next });
+    removeFavorite: (dir: string) => {
+      const { favorites } = get();
+      const next = favorites.filter((b) => b !== dir);
+      api.updateSettings({ favorites: next }).catch(() => {});
+      set({ favorites: next });
     },
 
     forgetDirectory: (dir: string) => {
-      const { bookmarks, recentDirs, directory } = get();
-      const nextBookmarks = bookmarks.filter((b) => b !== dir);
+      const { favorites, recentDirs, directory } = get();
+      const nextBookmarks = favorites.filter((b) => b !== dir);
       const nextRecent = recentDirs.filter((d) => d !== dir);
       const nextDir = directory === dir ? "" : directory;
 
       api.updateSettings({
-        bookmarked_dirs: nextBookmarks,
+        favorites: nextBookmarks,
         recent_dirs: nextRecent,
         last_directory: nextDir || null,
       }).catch(() => {});
 
-      set({ bookmarks: nextBookmarks, recentDirs: nextRecent, directory: nextDir });
+      set({ favorites: nextBookmarks, recentDirs: nextRecent, directory: nextDir });
     },
 
     refreshFileList: () => {
@@ -158,12 +162,20 @@ export const useSettingsStore = create<SettingsStore>()(
       if (patch.max_results !== undefined) {
         set({ maxResults: patch.max_results });
       }
+      if (patch.bookmarks_dock) {
+        set({ bookmarksDock: patch.bookmarks_dock });
+      }
+    },
+
+    setBookmarksDock: (dock) => {
+      set({ bookmarksDock: dock });
+      api.updateSettings({ bookmarks_dock: dock }).catch(console.error);
     },
 
     replaceSettings: (settings) => {
       applyTheme(settings.theme);
       set({
-        bookmarks: settings.bookmarked_dirs,
+        favorites: settings.favorites,
         recentDirs: settings.recent_dirs || [],
         directory: settings.last_directory ?? "",
         semantic: settings.semantic,
@@ -173,6 +185,7 @@ export const useSettingsStore = create<SettingsStore>()(
         preferSemantic: settings.search_prefer_semantic,
         theme: settings.theme,
         maxResults: settings.max_results ?? 0,
+        bookmarksDock: settings.bookmarks_dock ?? "Right",
         omittedFileList: [],
       });
     },
