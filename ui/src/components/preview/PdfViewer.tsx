@@ -2,11 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Search as SearchIcon, ChevronUp, ChevronDown, X } from "react-feather";
 import { Document, Page, pdfjs } from "react-pdf";
-import "react-pdf/dist/Page/TextLayer.css";
 import type { BoundingBox } from "../../lib/types";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { usePdfInnerSearch } from "./usePdfInnerSearch";
 import { getScaledPageHeight, usePdfPageMetrics } from "./usePdfPageMetrics";
+import PdfTextLayer from "./PdfTextLayer";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -381,7 +381,7 @@ export default function PdfViewer({
                       pageNumber={pageNum}
                       width={renderedWidth}
                       renderAnnotationLayer={false}
-                      renderTextLayer={true}
+                      renderTextLayer={false}
                       canvasBackground="white"
                       onRenderSuccess={() => {
                         if (pageNum === page || (!page && pageNum === 1)) {
@@ -389,6 +389,9 @@ export default function PdfViewer({
                         }
                       }}
                     />
+                    {pdf && (
+                      <PdfTextLayer pdf={pdf} pageNumber={pageNum} scale={pageScale} />
+                    )}
                     {pageBookmarkHighlights.map((highlight) => {
                       const { x, y, width, height } = highlight.bbox;
                       return (

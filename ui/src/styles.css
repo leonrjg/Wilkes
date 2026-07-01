@@ -49,7 +49,6 @@
 * {
   scrollbar-color: var(--border-strong) var(--bg-sidebar);
   scrollbar-width: auto;
-  user-select: text !important;
 }
 
 @keyframes shimmer {

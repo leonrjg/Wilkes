@@ -70,6 +70,12 @@ vi.mock("react-pdf", () => ({
   pdfjs: { GlobalWorkerOptions: { workerSrc: "" } },
 }));
 
+// Mock the text-selection overlay; it loads pdf.js' viewer-components bundle,
+// which is out of scope for these PdfViewer rendering/navigation unit tests.
+vi.mock("./PdfTextLayer", () => ({
+  default: () => null,
+}));
+
 // Mock @tanstack/react-virtual
 vi.mock("@tanstack/react-virtual", () => ({
   useVirtualizer: vi.fn().mockReturnValue(mockVirtualizer),
