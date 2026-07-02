@@ -3,6 +3,7 @@ import { useToasts } from "../components/Toast";
 import { api } from "../services";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
+import { useBookmarksStore } from "../stores/useBookmarksStore";
 
 export function useGlobalEvents() {
   const { addToast, removeToast } = useToasts();
@@ -49,6 +50,11 @@ export function useGlobalEvents() {
     api.onFileMetadataUpdated((updates) => {
       if (!mounted) return;
       useSettingsStore.getState().applyMetadataUpdates(updates);
+      // This event fires right after the metadata cache is re-keyed for
+      // renamed files, so it is the moment a bookmark's stale path can be
+      // re-resolved. Reload so `list_bookmarks` re-points them in-session
+      // instead of only on the next app start.
+      void useBookmarksStore.getState().load();
     }).then((u) => {
       if (!mounted) {
         u();

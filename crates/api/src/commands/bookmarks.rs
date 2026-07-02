@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use wilkes_core::metadata::cache::FileIdentity;
 use wilkes_core::types::{Bookmark, NewBookmark};
 
 pub async fn load(path: &Path) -> anyhow::Result<Vec<Bookmark>> {
@@ -24,8 +25,17 @@ fn normalize_note(note: Option<String>) -> Option<String> {
     note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty())
 }
 
+/// Content fingerprint of the file being bookmarked, stat-ed on disk. `None`
+/// when the file is unreadable — the bookmark is still created, it just can't
+/// be re-pointed if later renamed.
+fn identity_for(path: &Path) -> Option<FileIdentity> {
+    let meta = std::fs::metadata(path).ok()?;
+    FileIdentity::from_fs(meta.len(), meta.modified().ok())
+}
+
 pub async fn add(path: &Path, new_bookmark: NewBookmark) -> anyhow::Result<Bookmark> {
     let mut bookmarks = load(path).await?;
+    let identity = identity_for(&new_bookmark.path);
     let bookmark = Bookmark {
         id: uuid::Uuid::new_v4().to_string(),
         path: new_bookmark.path,
@@ -34,6 +44,7 @@ pub async fn add(path: &Path, new_bookmark: NewBookmark) -> anyhow::Result<Bookm
         created_at: chrono::Utc::now().to_rfc3339(),
         note: normalize_note(new_bookmark.note),
         rects: new_bookmark.rects,
+        identity,
     };
     bookmarks.push(bookmark.clone());
     save(path, &bookmarks).await?;
@@ -103,6 +114,34 @@ mod tests {
         assert_eq!(bookmark.quote, "important passage");
         assert!(bookmark.note.is_none());
         assert_eq!(load(&path).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_captures_file_identity_when_readable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bookmarks.json");
+
+        // Point the bookmark at a real file so its identity can be stat-ed.
+        let file = dir.path().join("doc.pdf");
+        std::fs::write(&file, b"content").unwrap();
+        let mut nb = new_bookmark();
+        nb.path = file.clone();
+
+        let bookmark = add(&path, nb).await.unwrap();
+        let expected = std::fs::metadata(&file)
+            .ok()
+            .and_then(|m| FileIdentity::from_fs(m.len(), m.modified().ok()));
+        assert!(expected.is_some());
+        assert_eq!(bookmark.identity, expected);
+    }
+
+    #[tokio::test]
+    async fn add_leaves_identity_none_when_file_missing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bookmarks.json");
+        // new_bookmark() points at a nonexistent /tmp path.
+        let bookmark = add(&path, new_bookmark()).await.unwrap();
+        assert!(bookmark.identity.is_none());
     }
 
     #[tokio::test]

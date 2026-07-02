@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use wilkes_core::embed::index::watcher::IndexWatcher;
 use wilkes_core::embed::index::SemanticIndex;
@@ -23,8 +23,9 @@ use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
-    Bookmark, DocumentMetadata, EmbedderModel, IndexStatus, IndexingConfig, NewBookmark,
-    PreviewData, SearchMode, SearchQuery, SelectedEmbedder, SemanticSettings, Settings,
+    Bookmark, DocumentMetadata, EmbedderModel, IndexStatus, IndexingConfig, IntegrationState,
+    NewBookmark, PreviewData, SearchMode, SearchQuery, SelectedEmbedder, SemanticSettings,
+    Settings,
 };
 
 use crate::commands::search::{start_search, SearchHandle};
@@ -207,7 +208,54 @@ impl AppContext {
     }
 
     pub async fn list_bookmarks(&self) -> anyhow::Result<Vec<Bookmark>> {
-        crate::commands::bookmarks::load(&self.bookmarks_path).await
+        let mut bookmarks = crate::commands::bookmarks::load(&self.bookmarks_path).await?;
+        self.resolve_bookmark_paths(&mut bookmarks);
+        Ok(bookmarks)
+    }
+
+    /// Re-point bookmarks whose stored `path` no longer exists to wherever their
+    /// content identity now lives, using the metadata cache as the identity
+    /// registry (the same mechanism that re-keys the index and metadata rows on
+    /// rename). Resolution is read-only and recomputed each call: nothing is
+    /// persisted, so there is no write on this read path.
+    ///
+    /// Best-effort by design — a bookmark keeps its stored path when it still
+    /// exists, has no captured identity, the cache is unavailable, or the
+    /// identity is absent/ambiguous in the cache (e.g. the renamed file has not
+    /// been re-listed yet). Such a bookmark simply resolves on a later read once
+    /// a listing has populated the cache; it never fails to load.
+    fn resolve_bookmark_paths(&self, bookmarks: &mut [Bookmark]) {
+        // Avoid opening/locking the cache unless something is actually stale.
+        if bookmarks.iter().all(|b| b.path.exists()) {
+            return;
+        }
+        let Some(cache) = self.metadata_cache() else {
+            return;
+        };
+        let Ok(guard) = cache.lock() else {
+            return;
+        };
+        for bookmark in bookmarks.iter_mut() {
+            if bookmark.path.exists() {
+                continue;
+            }
+            let Some(identity) = bookmark.identity else {
+                continue;
+            };
+            match guard.find_current_path(identity) {
+                Ok(Some(current)) => {
+                    info!(
+                        "bookmark {} re-pointed {} -> {}",
+                        bookmark.id,
+                        bookmark.path.display(),
+                        current.display()
+                    );
+                    bookmark.path = current;
+                }
+                Ok(None) => {}
+                Err(e) => error!("bookmark path resolution {}: {e:#}", bookmark.id),
+            }
+        }
     }
 
     pub async fn add_bookmark(&self, bookmark: NewBookmark) -> anyhow::Result<Bookmark> {
@@ -414,12 +462,39 @@ impl AppContext {
         crate::commands::integrations::zotero::resolve_file_metadata(s, path).await
     }
 
-    /// Clear the entire metadata cache so the next listing re-derives everything
+    /// Clear the metadata cache so the next listing re-derives everything
     /// (file-based + Zotero). Backs the manual "refresh metadata" action.
+    ///
+    /// A full clear is only safe when every row can be re-derived. File-based
+    /// rows always can (local extraction), but Zotero rows can only be rebuilt
+    /// while the library is reachable. So when Zotero is enabled but currently
+    /// down, clearing its rows would destroy authoritative metadata with no way
+    /// to recover it — in that case we preserve the Zotero rows and refresh only
+    /// the file-based ones.
     pub async fn refresh_file_metadata(&self) -> anyhow::Result<()> {
+        let s = self.get_settings().await;
+        let zotero = &s.integrations.zotero;
+        let preserve_zotero = if zotero.enabled {
+            let state = ZoteroClient::from_settings(zotero)
+                .status(true)
+                .await
+                .map(|st| st.state);
+            !matches!(state, Ok(IntegrationState::Ready))
+        } else {
+            false
+        };
+
         if let Some(cache) = self.metadata_cache() {
             if let Ok(guard) = cache.lock() {
-                guard.clear()?;
+                if preserve_zotero {
+                    warn!(
+                        "refresh metadata: Zotero enabled but not reachable; preserving \
+                         existing Zotero rows and refreshing file-based rows only"
+                    );
+                    guard.clear_file_rows()?;
+                } else {
+                    guard.clear()?;
+                }
             }
         }
         Ok(())
@@ -540,7 +615,7 @@ impl AppContext {
     }
 
     pub async fn update_settings(
-        &self,
+        self: &Arc<Self>,
         patch: serde_json::Value,
     ) -> anyhow::Result<wilkes_core::types::Settings> {
         let (before, updated) = {
@@ -550,7 +625,50 @@ impl AppContext {
             (before, updated)
         };
         self.on_zotero_settings_maybe_changed(&before, &updated);
+        self.on_semantic_pref_maybe_changed(&before, &updated);
         Ok(updated)
+    }
+
+    /// React to the user toggling semantic search on or off. `search_prefer_semantic`
+    /// is the single owner of whether the semantic subsystem is active: turning it
+    /// off tears down the watcher so file changes stop triggering reindexes; turning
+    /// it on reloads the index and watcher from the on-disk DB (no rebuild).
+    fn on_semantic_pref_maybe_changed(self: &Arc<Self>, before: &Settings, after: &Settings) {
+        if before.search_prefer_semantic == after.search_prefer_semantic {
+            return;
+        }
+        if after.search_prefer_semantic {
+            // Reload can install/probe the embedder, so do it off the settings
+            // write path; the caller's build flow covers the not-yet-built case.
+            let ctx = Arc::clone(self);
+            tokio::spawn(async move {
+                ctx.activate_semantic_from_disk().await;
+            });
+        } else {
+            self.deactivate_semantic();
+        }
+    }
+
+    /// Stop maintaining the semantic index: halt the watcher and release the
+    /// resident embedder + index so filesystem changes no longer reindex. The
+    /// on-disk DB is preserved so re-enabling is cheap.
+    fn deactivate_semantic(&self) {
+        self.stop_watcher();
+        *self.index.lock() = Arc::new(Mutex::new(None));
+        *self.embedder.lock() = None;
+    }
+
+    /// Reload the embedder, index, and watcher from the on-disk DB when a usable
+    /// one exists. No-op if semantic is already live or nothing is built yet.
+    async fn activate_semantic_from_disk(self: &Arc<Self>) {
+        if self.is_semantic_ready() {
+            return;
+        }
+        let settings = self.get_settings().await;
+        if let Some(loaded) = self.load_restore_state(settings).await {
+            self.finish_restore_state(&loaded.plan, loaded.embedder, loaded.index)
+                .await;
+        }
     }
 
     /// React to a change in Zotero configuration by keeping the metadata cache
@@ -589,7 +707,9 @@ impl AppContext {
         let events = Arc::clone(&self.events);
         tokio::spawn(async move {
             let rows = match cache.lock() {
-                Ok(guard) => guard.list_by_source(MetadataSource::File).unwrap_or_default(),
+                Ok(guard) => guard
+                    .list_by_source(MetadataSource::File)
+                    .unwrap_or_default(),
                 Err(_) => return,
             };
             if rows.is_empty() {
@@ -1331,7 +1451,9 @@ impl AppContext {
     {
         let ev1: Box<dyn Fn() + Send + Sync> = Box::new(|| {});
         let ev2: Box<dyn Fn() + Send + Sync> = Box::new(|| {});
-        start(root, index_arc, cache, registry, embedder, indexing, ev1, ev2)
+        start(
+            root, index_arc, cache, registry, embedder, indexing, ev1, ev2,
+        )
     }
 
     fn prepare_restore_state_plan(
@@ -1567,12 +1689,12 @@ impl AppContext {
                 return;
             }
         };
-        // The `enabled` flag is the sole authority on whether semantic search is
-        // active. A leftover index DB on disk must not resurrect the embedder or
-        // the watcher behind a feature the user turned off: honoring it here is
-        // what keeps a rename from silently triggering a reindex while disabled.
-        if !settings.semantic.enabled {
-            info!("restore_state: semantic search disabled, skipping restore");
+        // `search_prefer_semantic` is the single owner of whether the semantic
+        // subsystem is active. A leftover index DB on disk must not resurrect the
+        // embedder or the watcher behind a toggle the user turned off: honoring it
+        // here is what keeps a file change from silently triggering a reindex.
+        if !settings.search_prefer_semantic {
+            info!("restore_state: semantic search disabled by preference, skipping restore");
             return;
         }
         let Some(loaded) = self.load_restore_state(settings).await else {
@@ -2594,11 +2716,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_restore_state_skips_when_semantic_disabled() {
+    async fn test_restore_state_skips_when_semantic_pref_off() {
         let (dir, ctx) = test_ctx();
 
         // A fully restorable index DB sits on disk with the default selection,
-        // so the only thing that can prevent restore is the disabled flag.
+        // so the only thing that can prevent restore is the user's toggle.
         let selected = SelectedEmbedder::default();
         SemanticIndex::create(
             &ctx.data_dir,
@@ -2609,12 +2731,13 @@ mod tests {
         )
         .unwrap();
 
-        // Persist settings with semantic search turned off but the index path
-        // still pointing at the on-disk DB (the exact state a user leaves behind
-        // by disabling after a build).
+        // Persist settings with the semantic toggle OFF while the built index is
+        // still marked enabled and its path present (the exact state a user is in
+        // after building and then unchecking semantic search).
         let disabled = Settings {
+            search_prefer_semantic: false,
             semantic: SemanticSettings {
-                enabled: false,
+                enabled: true,
                 index_path: Some(ctx.data_dir.join("semantic_index.db")),
                 ..SemanticSettings::default()
             },
@@ -2626,14 +2749,11 @@ mod tests {
         )
         .unwrap();
 
-        // Positive control: the same settings *with* semantic enabled would be
-        // deemed restorable (selection matches the DB), proving the disabled
-        // flag is the decisive guard rather than a stale-selection reset.
+        // Positive control: the same settings with the toggle ON would be deemed
+        // restorable (selection matches the DB), proving `search_prefer_semantic`
+        // is the decisive gate rather than a stale-selection reset.
         let enabled = Settings {
-            semantic: SemanticSettings {
-                enabled: true,
-                ..disabled.semantic.clone()
-            },
+            search_prefer_semantic: true,
             ..disabled.clone()
         };
         let db_status = ctx
@@ -2647,11 +2767,71 @@ mod tests {
 
         Arc::clone(&ctx).restore_state().await;
 
-        // The watcher must not run behind a disabled feature, and restore must
-        // not silently flip the user's preference back to enabled.
+        // The watcher must not run behind a disabled toggle, and restore must not
+        // load the embedder/index behind the user's back.
         assert!(ctx.watcher.lock().is_none());
         assert!(ctx.embedder.lock().is_none());
-        assert!(!ctx.get_settings().await.semantic.enabled);
+        assert!(!ctx.get_settings().await.search_prefer_semantic);
+    }
+
+    #[tokio::test]
+    async fn test_update_settings_pref_off_tears_down_watcher() {
+        let (dir, ctx) = test_ctx();
+
+        // Seed persisted settings with the toggle already ON so the update below
+        // is a pure ON->OFF transition (no stray activate spawn to race with).
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string(&Settings {
+                search_prefer_semantic: true,
+                ..Settings::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Stand up a resident index + watcher as if semantic were active.
+        let index = SemanticIndex::create(
+            &ctx.data_dir,
+            "teardown-model",
+            384,
+            EmbeddingEngine::Candle,
+            None,
+        )
+        .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
+        *ctx.embedder.lock() = Some(Arc::new(MockEmbedder::default()) as Arc<dyn Embedder>);
+        let watcher = IndexWatcher::start(
+            ctx.data_dir.clone(),
+            Arc::clone(&*ctx.index.lock()),
+            ctx.metadata_cache(),
+            Arc::new(ExtractorRegistry::new()),
+            Arc::new(MockEmbedder::default()),
+            IndexingConfig {
+                chunk_size: 64,
+                chunk_overlap: 8,
+                supported_extensions: vec!["txt".to_string()],
+            },
+            || {},
+            || {},
+        )
+        .unwrap();
+        *ctx.watcher.lock() = Some(watcher);
+
+        ctx.update_settings(serde_json::json!({ "search_prefer_semantic": false }))
+            .await
+            .unwrap();
+
+        // Turning the toggle off must stop the watcher and release the resident
+        // embedder + index so file changes no longer reindex.
+        assert!(ctx.watcher.lock().is_none());
+        assert!(ctx.embedder.lock().is_none());
+        assert!(ctx
+            .index
+            .lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none());
     }
 
     #[tokio::test]
@@ -4072,6 +4252,7 @@ exit 0
         let settings_path = dir.path().join("settings.json");
 
         let settings = Settings {
+            search_prefer_semantic: true,
             semantic: SemanticSettings {
                 selected: SelectedEmbedder {
                     model: EmbedderModel("model-A".to_string()),
@@ -4416,6 +4597,7 @@ exit 0
         std::fs::create_dir(&index_path).unwrap();
 
         let settings = Settings {
+            search_prefer_semantic: true,
             semantic: SemanticSettings {
                 enabled: true,
                 index_path: Some(index_path),

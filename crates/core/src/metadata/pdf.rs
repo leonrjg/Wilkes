@@ -6,6 +6,7 @@ use regex::Regex;
 
 use crate::types::DocumentMetadata;
 
+use super::arxiv::find_arxiv_doi;
 use super::doi::find_doi;
 use super::FileMetadataExtractor;
 
@@ -43,7 +44,10 @@ fn read_non_empty_metadata(doc: &Document, name: MetadataName) -> Option<String>
 }
 
 fn extract_pdf_doi(doc: &Document) -> Option<String> {
-    find_embedded_doi(doc).or_else(|| find_first_page_doi(doc))
+    find_embedded_doi(doc)
+        .or_else(|| find_first_page_doi(doc))
+        .or_else(|| find_embedded_arxiv_doi(doc))
+        .or_else(|| find_first_page_arxiv_doi(doc))
 }
 
 fn normalize_pdf_creation_date(value: &str) -> Option<String> {
@@ -78,6 +82,14 @@ fn normalize_pdf_creation_date(value: &str) -> Option<String> {
 }
 
 fn find_embedded_doi(doc: &Document) -> Option<String> {
+    find_embedded_identifier(doc, find_doi)
+}
+
+fn find_embedded_arxiv_doi(doc: &Document) -> Option<String> {
+    find_embedded_identifier(doc, find_arxiv_doi)
+}
+
+fn find_embedded_identifier(doc: &Document, finder: fn(&str) -> Option<String>) -> Option<String> {
     [
         MetadataName::Keywords,
         MetadataName::Subject,
@@ -88,24 +100,75 @@ fn find_embedded_doi(doc: &Document) -> Option<String> {
     ]
     .into_iter()
     .filter_map(|name| read_non_empty_metadata(doc, name))
-    .find_map(|value| find_doi(&value))
+    .find_map(|value| finder(&value))
 }
 
 fn find_first_page_doi(doc: &Document) -> Option<String> {
+    find_first_page_identifier(doc, find_doi)
+}
+
+fn find_first_page_arxiv_doi(doc: &Document) -> Option<String> {
+    find_first_page_identifier(doc, find_arxiv_doi)
+}
+
+fn find_first_page_identifier(
+    doc: &Document,
+    finder: fn(&str) -> Option<String>,
+) -> Option<String> {
     let page = doc.load_page(0).ok()?;
     let text_page = page.to_text_page(TextPageFlags::empty()).ok()?;
     let text = text_page.to_text().ok()?;
-    find_doi(&text)
+    finder(&text)
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use tempfile::tempdir;
 
     use super::*;
+
+    fn write_text_pdf(path: &Path, text: &str) {
+        let escaped = text
+            .replace('\\', "\\\\")
+            .replace('(', "\\(")
+            .replace(')', "\\)");
+        let stream = format!("BT\n/F1 12 Tf\n50 80 Td\n({escaped}) Tj\nET\n");
+        let objects = [
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_string(),
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n".to_string(),
+            format!(
+                "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+                stream.as_bytes().len(),
+                stream
+            ),
+            "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_string(),
+        ];
+        let object_count = objects.len();
+        let mut pdf = "%PDF-1.4\n".to_string();
+        let mut offsets = Vec::new();
+        for object in objects {
+            offsets.push(pdf.len());
+            pdf.push_str(&object);
+        }
+        let xref_offset = pdf.len();
+        pdf.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            offsets.len() + 1
+        ));
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            object_count + 1
+        ));
+        fs::write(path, pdf).unwrap();
+    }
 
     #[test]
     fn test_pdf_metadata_extractor_reads_title_and_author() {
@@ -144,6 +207,16 @@ mod tests {
         let metadata = PdfMetadataExtractor.extract_metadata(&path).unwrap();
         assert_eq!(metadata.doi.as_deref(), Some("10.1000/xyz123"));
         assert_eq!(metadata.created_at, None);
+    }
+
+    #[test]
+    fn test_pdf_metadata_extractor_synthesizes_arxiv_doi_from_first_page() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("page-arxiv.pdf");
+        write_text_pdf(&path, "arXiv:2506.12014v2");
+
+        let metadata = PdfMetadataExtractor.extract_metadata(&path).unwrap();
+        assert_eq!(metadata.doi.as_deref(), Some("10.48550/arXiv.2506.12014"));
     }
 
     #[test]

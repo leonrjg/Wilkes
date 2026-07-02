@@ -146,8 +146,10 @@ level so callers can decide whether a weak match is acceptable.
 The resolution order balances precision against query cost:
 
 1. **DOI** — cheap, indexed, authoritative *when the file has one*. Single query
-   (`?q=<doi>&qmode=everything`). Wilkes already extracts the DOI locally
-   (`crates/core/src/metadata/doi.rs`), so this needs no new extraction.
+   (`?q=<doi>&qmode=everything`). Wilkes extracts normal DOIs locally
+   (`crates/core/src/metadata/doi.rs`) and normalizes detected arXiv IDs into
+   their arXiv DOI form (`10.48550/arXiv.<id>`), so arXiv papers still flow
+   through this DOI path rather than a separate Zotero lookup.
 2. **Exact absolute path** — ground truth for **linked-file attachments**, whose
    stored `attachment.path` is the file itself. A byte-for-byte path match identifies
    the exact owning item — a stronger signal than DOI. Requires enumerating attachment

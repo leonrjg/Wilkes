@@ -1,3 +1,4 @@
+pub mod arxiv;
 pub mod cache;
 pub mod doi;
 pub mod pdf;

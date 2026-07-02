@@ -59,7 +59,7 @@ pub struct CachedRow {
 }
 
 /// A file's content fingerprint. Preserved across renames, invalidated on edit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileIdentity {
     pub size_bytes: i64,
     pub modified_at_ms: i64,
@@ -91,7 +91,10 @@ impl MetadataCache {
         let path = cache_path(data_dir);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create data dir for metadata cache: {}", parent.display())
+                format!(
+                    "Failed to create data dir for metadata cache: {}",
+                    parent.display()
+                )
             })?;
         }
         let conn = Connection::open(&path)
@@ -164,7 +167,11 @@ impl MetadataCache {
                 "SELECT title, author, doi, publication_date
                  FROM file_metadata
                  WHERE path = ?1 AND size_bytes = ?2 AND modified_at_ms = ?3",
-                params![Self::key(path), identity.size_bytes, identity.modified_at_ms],
+                params![
+                    Self::key(path),
+                    identity.size_bytes,
+                    identity.modified_at_ms
+                ],
                 |row| {
                     Ok(DocumentMetadata {
                         title: row.get(0)?,
@@ -195,9 +202,10 @@ impl MetadataCache {
              WHERE size_bytes = ?1 AND modified_at_ms = ?2",
         )?;
         let candidates = stmt
-            .query_map(params![identity.size_bytes, identity.modified_at_ms], |row| {
-                row.get::<_, String>(0)
-            })?
+            .query_map(
+                params![identity.size_bytes, identity.modified_at_ms],
+                |row| row.get::<_, String>(0),
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         let current_key = Self::key(current);
         let mut sources = candidates
@@ -206,6 +214,35 @@ impl MetadataCache {
             .collect::<Vec<_>>();
         if sources.len() == 1 {
             Ok(Some(PathBuf::from(sources.pop().expect("len checked"))))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Find the current on-disk path for content identified by `identity`: the
+    /// unique cached row sharing this fingerprint whose path still exists on
+    /// disk. Mirrors [`find_rename_source`](Self::find_rename_source) for
+    /// callers that hold a *stale* path (e.g. a bookmark) and need the live one
+    /// after a rename. Returns `None` when no such row exists, or when more than
+    /// one on-disk file shares the fingerprint (ambiguous, e.g. duplicate
+    /// content), so callers never silently re-point to the wrong file.
+    pub fn find_current_path(&self, identity: FileIdentity) -> anyhow::Result<Option<PathBuf>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path FROM file_metadata
+             WHERE size_bytes = ?1 AND modified_at_ms = ?2",
+        )?;
+        let candidates = stmt
+            .query_map(
+                params![identity.size_bytes, identity.modified_at_ms],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut existing = candidates
+            .into_iter()
+            .filter(|p| Path::new(p).exists())
+            .collect::<Vec<_>>();
+        if existing.len() == 1 {
+            Ok(Some(PathBuf::from(existing.pop().expect("len checked"))))
         } else {
             Ok(None)
         }
@@ -305,10 +342,24 @@ impl MetadataCache {
         Ok(())
     }
 
+    /// Drop only file-sourced rows, preserving authoritative Zotero rows. Backs
+    /// a metadata refresh performed while Zotero is unreachable: file-based rows
+    /// can always be re-extracted locally, but Zotero rows cannot be rebuilt
+    /// until the library is reachable again, so clearing them would silently
+    /// destroy metadata with no way to recover it.
+    pub fn clear_file_rows(&self) -> anyhow::Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM file_metadata WHERE source = ?1",
+            params![MetadataSource::File.as_str()],
+        )?)
+    }
+
     /// Remove any cached row for `path`.
     pub fn remove(&self, path: &Path) -> anyhow::Result<()> {
-        self.conn
-            .execute("DELETE FROM file_metadata WHERE path = ?1", params![Self::key(path)])?;
+        self.conn.execute(
+            "DELETE FROM file_metadata WHERE path = ?1",
+            params![Self::key(path)],
+        )?;
         Ok(())
     }
 }
@@ -331,11 +382,16 @@ mod tests {
     fn test_upsert_and_get_valid() {
         let dir = tempdir().unwrap();
         let cache = MetadataCache::open(dir.path()).unwrap();
-        let id = FileIdentity { size_bytes: 100, modified_at_ms: 42 };
+        let id = FileIdentity {
+            size_bytes: 100,
+            modified_at_ms: 42,
+        };
         let path = Path::new("/docs/a.pdf");
 
         assert!(cache.get_valid(path, id).unwrap().is_none());
-        cache.upsert(path, id, &sample(), MetadataSource::File).unwrap();
+        cache
+            .upsert(path, id, &sample(), MetadataSource::File)
+            .unwrap();
         assert_eq!(cache.get_valid(path, id).unwrap(), Some(sample()));
     }
 
@@ -343,11 +399,19 @@ mod tests {
     fn test_get_valid_invalidated_when_identity_changes() {
         let dir = tempdir().unwrap();
         let cache = MetadataCache::open(dir.path()).unwrap();
-        let id = FileIdentity { size_bytes: 100, modified_at_ms: 42 };
+        let id = FileIdentity {
+            size_bytes: 100,
+            modified_at_ms: 42,
+        };
         let path = Path::new("/docs/a.pdf");
-        cache.upsert(path, id, &sample(), MetadataSource::File).unwrap();
+        cache
+            .upsert(path, id, &sample(), MetadataSource::File)
+            .unwrap();
 
-        let edited = FileIdentity { size_bytes: 100, modified_at_ms: 99 };
+        let edited = FileIdentity {
+            size_bytes: 100,
+            modified_at_ms: 99,
+        };
         assert!(cache.get_valid(path, edited).unwrap().is_none());
     }
 
@@ -355,7 +419,10 @@ mod tests {
     fn test_find_rename_source_resolves_when_destination_already_cached() {
         let dir = tempdir().unwrap();
         let cache = MetadataCache::open(dir.path()).unwrap();
-        let id = FileIdentity { size_bytes: 100, modified_at_ms: 42 };
+        let id = FileIdentity {
+            size_bytes: 100,
+            modified_at_ms: 42,
+        };
 
         // `old` was renamed away and no longer exists on disk. `new` exists and
         // already carries a stale row of its own (e.g. from a prior reindex),
@@ -363,8 +430,12 @@ mod tests {
         let old = dir.path().join("old.pdf");
         let new = dir.path().join("new.pdf");
         std::fs::write(&new, b"content").unwrap();
-        cache.upsert(&old, id, &sample(), MetadataSource::File).unwrap();
-        cache.upsert(&new, id, &sample(), MetadataSource::File).unwrap();
+        cache
+            .upsert(&old, id, &sample(), MetadataSource::File)
+            .unwrap();
+        cache
+            .upsert(&new, id, &sample(), MetadataSource::File)
+            .unwrap();
 
         assert_eq!(
             cache.find_rename_source(&new, id).unwrap(),
@@ -376,29 +447,100 @@ mod tests {
     fn test_find_rename_source_none_when_ambiguous_or_present() {
         let dir = tempdir().unwrap();
         let cache = MetadataCache::open(dir.path()).unwrap();
-        let id = FileIdentity { size_bytes: 100, modified_at_ms: 42 };
+        let id = FileIdentity {
+            size_bytes: 100,
+            modified_at_ms: 42,
+        };
         let new = dir.path().join("new.pdf");
         std::fs::write(&new, b"content").unwrap();
 
         // No other row: nothing to rekey from.
-        cache.upsert(&new, id, &sample(), MetadataSource::File).unwrap();
+        cache
+            .upsert(&new, id, &sample(), MetadataSource::File)
+            .unwrap();
         assert!(cache.find_rename_source(&new, id).unwrap().is_none());
 
         // Two distinct missing candidates sharing the fingerprint: genuinely
         // ambiguous, so callers must not treat it as a rename.
-        cache.upsert(&dir.path().join("gone_a.pdf"), id, &sample(), MetadataSource::File).unwrap();
-        cache.upsert(&dir.path().join("gone_b.pdf"), id, &sample(), MetadataSource::File).unwrap();
+        cache
+            .upsert(
+                &dir.path().join("gone_a.pdf"),
+                id,
+                &sample(),
+                MetadataSource::File,
+            )
+            .unwrap();
+        cache
+            .upsert(
+                &dir.path().join("gone_b.pdf"),
+                id,
+                &sample(),
+                MetadataSource::File,
+            )
+            .unwrap();
         assert!(cache.find_rename_source(&new, id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_find_current_path_resolves_and_rejects_ambiguity() {
+        let dir = tempdir().unwrap();
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        let id = FileIdentity {
+            size_bytes: 100,
+            modified_at_ms: 42,
+        };
+
+        // Content was renamed old -> new: the cache now carries a row at `new`
+        // (as the metadata fill / watcher re-keys it), and the old path is gone
+        // (never written to disk here), leaving `new` as the only live match.
+        let new = dir.path().join("new.pdf");
+        std::fs::write(&new, b"content").unwrap();
+        cache
+            .upsert(&new, id, &sample(), MetadataSource::File)
+            .unwrap();
+
+        // A stale holder of `old` resolves forward to the live `new`.
+        assert_eq!(cache.find_current_path(id).unwrap(), Some(new.clone()));
+
+        // A second on-disk file sharing the fingerprint makes it ambiguous:
+        // never guess.
+        let dup = dir.path().join("dup.pdf");
+        std::fs::write(&dup, b"content").unwrap();
+        cache
+            .upsert(&dup, id, &sample(), MetadataSource::File)
+            .unwrap();
+        assert!(cache.find_current_path(id).unwrap().is_none());
+
+        // No on-disk file with the fingerprint (row still points at the missing
+        // path) yields nothing rather than a dead path.
+        let missing_id = FileIdentity {
+            size_bytes: 7,
+            modified_at_ms: 9,
+        };
+        cache
+            .upsert(
+                &dir.path().join("ghost.pdf"),
+                missing_id,
+                &sample(),
+                MetadataSource::File,
+            )
+            .unwrap();
+        assert!(cache.find_current_path(missing_id).unwrap().is_none());
     }
 
     #[test]
     fn test_rename_rekeys_without_reextract() {
         let dir = tempdir().unwrap();
         let cache = MetadataCache::open(dir.path()).unwrap();
-        let id = FileIdentity { size_bytes: 100, modified_at_ms: 42 };
+        let id = FileIdentity {
+            size_bytes: 100,
+            modified_at_ms: 42,
+        };
         let old = Path::new("/docs/old.pdf");
         let new = Path::new("/docs/new.pdf");
-        cache.upsert(old, id, &sample(), MetadataSource::File).unwrap();
+        cache
+            .upsert(old, id, &sample(), MetadataSource::File)
+            .unwrap();
 
         cache.rename(old, new).unwrap();
 
@@ -410,9 +552,14 @@ mod tests {
     fn test_remove() {
         let dir = tempdir().unwrap();
         let cache = MetadataCache::open(dir.path()).unwrap();
-        let id = FileIdentity { size_bytes: 1, modified_at_ms: 1 };
+        let id = FileIdentity {
+            size_bytes: 1,
+            modified_at_ms: 1,
+        };
         let path = Path::new("/docs/a.pdf");
-        cache.upsert(path, id, &sample(), MetadataSource::File).unwrap();
+        cache
+            .upsert(path, id, &sample(), MetadataSource::File)
+            .unwrap();
         cache.remove(path).unwrap();
         assert!(cache.get_valid(path, id).unwrap().is_none());
     }
@@ -421,7 +568,10 @@ mod tests {
     fn test_invalidate_zotero_keeps_file_rows() {
         let dir = tempdir().unwrap();
         let cache = MetadataCache::open(dir.path()).unwrap();
-        let id = FileIdentity { size_bytes: 1, modified_at_ms: 1 };
+        let id = FileIdentity {
+            size_bytes: 1,
+            modified_at_ms: 1,
+        };
         cache
             .upsert(Path::new("/f.pdf"), id, &sample(), MetadataSource::File)
             .unwrap();
@@ -438,7 +588,10 @@ mod tests {
     fn test_list_by_source_and_clear() {
         let dir = tempdir().unwrap();
         let cache = MetadataCache::open(dir.path()).unwrap();
-        let id = FileIdentity { size_bytes: 7, modified_at_ms: 9 };
+        let id = FileIdentity {
+            size_bytes: 7,
+            modified_at_ms: 9,
+        };
         cache
             .upsert(Path::new("/f.pdf"), id, &sample(), MetadataSource::File)
             .unwrap();
@@ -452,8 +605,34 @@ mod tests {
         assert_eq!(file_rows[0].identity, id);
 
         cache.clear().unwrap();
-        assert!(cache.list_by_source(MetadataSource::File).unwrap().is_empty());
-        assert!(cache.list_by_source(MetadataSource::Zotero).unwrap().is_empty());
+        assert!(cache
+            .list_by_source(MetadataSource::File)
+            .unwrap()
+            .is_empty());
+        assert!(cache
+            .list_by_source(MetadataSource::Zotero)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_clear_file_rows_keeps_zotero_rows() {
+        let dir = tempdir().unwrap();
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        let id = FileIdentity {
+            size_bytes: 1,
+            modified_at_ms: 1,
+        };
+        cache
+            .upsert(Path::new("/f.pdf"), id, &sample(), MetadataSource::File)
+            .unwrap();
+        cache
+            .upsert(Path::new("/z.pdf"), id, &sample(), MetadataSource::Zotero)
+            .unwrap();
+
+        assert_eq!(cache.clear_file_rows().unwrap(), 1);
+        assert!(cache.get_valid(Path::new("/f.pdf"), id).unwrap().is_none());
+        assert!(cache.get_valid(Path::new("/z.pdf"), id).unwrap().is_some());
     }
 
     #[test]
@@ -469,8 +648,16 @@ mod tests {
         }
         // Opening should not error and should produce a usable cache.
         let cache = MetadataCache::open(dir.path()).unwrap();
-        let id = FileIdentity { size_bytes: 1, modified_at_ms: 1 };
-        cache.upsert(Path::new("/x"), id, &sample(), MetadataSource::File).unwrap();
-        assert_eq!(cache.get_valid(Path::new("/x"), id).unwrap(), Some(sample()));
+        let id = FileIdentity {
+            size_bytes: 1,
+            modified_at_ms: 1,
+        };
+        cache
+            .upsert(Path::new("/x"), id, &sample(), MetadataSource::File)
+            .unwrap();
+        assert_eq!(
+            cache.get_valid(Path::new("/x"), id).unwrap(),
+            Some(sample())
+        );
     }
 }

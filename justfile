@@ -5,14 +5,14 @@ default:
 ui-install:
     npm --prefix ui install
 
-# Run the Tauri desktop app in dev mode (hot-reloads both Rust and UI)
+# Run the Tauri desktop app in dev mode without rebuild watchers
 # Requires: cargo install tauri-cli --locked
 dev: ui-install
-    cd crates/desktop && cargo tauri dev
+    cd crates/desktop && cargo tauri dev --no-watch --config tauri.dev-static.conf.json
 
 # Same as `dev` but uses the npm-bundled Tauri CLI (no cargo install needed)
 dev-npm: ui-install
-    cd crates/desktop && ../../ui/node_modules/.bin/tauri dev
+    cd crates/desktop && ../../ui/node_modules/.bin/tauri dev --no-watch --config tauri.dev-static.conf.json
 
 # Build for release
 build: ui-install

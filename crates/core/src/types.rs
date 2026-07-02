@@ -290,6 +290,12 @@ pub struct Bookmark {
     /// text. Empty for text bookmarks.
     #[serde(default)]
     pub rects: Vec<BoundingBox>,
+    /// Content fingerprint of the bookmarked file, captured at creation. Lets a
+    /// bookmark survive a rename: when `path` goes missing, the current path is
+    /// re-resolved from this identity via the metadata cache. `None` only when
+    /// the file could not be stat-ed at creation.
+    #[serde(default)]
+    pub identity: Option<crate::metadata::cache::FileIdentity>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

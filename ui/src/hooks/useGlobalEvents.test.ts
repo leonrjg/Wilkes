@@ -5,6 +5,7 @@ import { api } from "../services";
 import { useToasts } from "../components/Toast";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
+import { useBookmarksStore } from "../stores/useBookmarksStore";
 
 vi.mock("../services", () => ({
   api: {
@@ -29,17 +30,26 @@ vi.mock("../stores/useSemanticStore", () => ({
   },
 }));
 
+vi.mock("../stores/useBookmarksStore", () => ({
+  useBookmarksStore: {
+    getState: vi.fn(),
+  },
+}));
+
 describe("useGlobalEvents", () => {
   const addToast = vi.fn().mockReturnValue("toast-id");
   const removeToast = vi.fn();
   const handleIndexUpdated = vi.fn().mockResolvedValue(undefined);
   const refreshFileList = vi.fn();
+  const applyMetadataUpdates = vi.fn();
+  const loadBookmarks = vi.fn().mockResolvedValue(undefined);
 
   beforeEach(() => {
     vi.clearAllMocks();
     (useToasts as any).mockReturnValue({ addToast, removeToast });
-    (useSettingsStore.getState as any).mockReturnValue({ refreshFileList });
+    (useSettingsStore.getState as any).mockReturnValue({ refreshFileList, applyMetadataUpdates });
     (useSemanticStore.getState as any).mockReturnValue({ handleIndexUpdated });
+    (useBookmarksStore.getState as any).mockReturnValue({ load: loadBookmarks });
   });
 
   it("handles WorkerStarting event", async () => {
@@ -87,6 +97,28 @@ describe("useGlobalEvents", () => {
     });
     expect(removeToast).toHaveBeenCalledWith("toast-id");
     expect(handleIndexUpdated).toHaveBeenCalled();
+  });
+
+  it("applies metadata updates and reloads bookmarks on file-metadata-updated", async () => {
+    let metadataHandler: any;
+    (api.onFileMetadataUpdated as any).mockImplementation((h: any) => {
+      metadataHandler = h;
+      return Promise.resolve(vi.fn());
+    });
+
+    renderHook(() => useGlobalEvents());
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const updates = [{ path: "/docs/renamed.pdf", publication_date: "2021" }];
+    act(() => {
+      metadataHandler(updates);
+    });
+
+    expect(applyMetadataUpdates).toHaveBeenCalledWith(updates);
+    expect(loadBookmarks).toHaveBeenCalled();
   });
 
   it("closes the reindex toast when reindexing is cancelled", async () => {

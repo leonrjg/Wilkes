@@ -1,0 +1,5 @@
+{
+  "build": {
+    "beforeDevCommand": "node ../scripts/prepare-sidecar.mjs && npm --prefix ../ui run build && npm --prefix ../ui run preview -- --host 127.0.0.1 --port 5173"
+  }
+}

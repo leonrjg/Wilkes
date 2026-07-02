@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::types::{DocumentMetadata, FileType};
 
+use super::arxiv::find_arxiv_doi;
 use super::doi::find_doi;
 use super::FileMetadataExtractor;
 
@@ -40,7 +41,7 @@ impl FileMetadataExtractor for TextMetadataExtractor {
         Ok(DocumentMetadata {
             title: None,
             author: None,
-            doi: find_doi(&head),
+            doi: find_doi(&head).or_else(|| find_arxiv_doi(&head)),
             created_at: None,
         })
     }
@@ -67,6 +68,19 @@ mod tests {
         assert_eq!(metadata.doi.as_deref(), Some("10.1000/xyz123"));
         assert_eq!(metadata.title, None);
         assert_eq!(metadata.author, None);
+    }
+
+    #[test]
+    fn test_text_metadata_extractor_synthesizes_arxiv_doi() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("paper.md");
+        fs::write(&path, "# Title\narXiv:2506.12014v2\n").unwrap();
+
+        let metadata = TextMetadataExtractor::new(vec!["md".into(), "txt".into()])
+            .extract_metadata(&path)
+            .unwrap();
+
+        assert_eq!(metadata.doi.as_deref(), Some("10.48550/arXiv.2506.12014"));
     }
 
     #[test]
