@@ -6,21 +6,14 @@ describe("LogsPanel", () => {
   const mockApi = {
     getLogs: vi.fn(),
     clearLogs: vi.fn(),
+    writeClipboard: vi.fn().mockResolvedValue(undefined),
   } as any;
 
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
     mockApi.getLogs.mockResolvedValue(["Log line 1", "Log line 2"]);
-    
-    // Mock clipboard
-    Object.defineProperty(navigator, "clipboard", {
-      value: {
-        writeText: vi.fn(),
-      },
-      configurable: true,
-    });
-    
+
     // Mock confirm
     vi.stubGlobal("confirm", vi.fn(() => true));
   });
@@ -43,7 +36,7 @@ describe("LogsPanel", () => {
     });
     const copyButton = screen.getByText("Copy");
     fireEvent.click(copyButton);
-    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("Log line 1\nLog line 2");
+    expect(mockApi.writeClipboard).toHaveBeenCalledWith("Log line 1\nLog line 2");
   });
 
   it("clears logs", async () => {

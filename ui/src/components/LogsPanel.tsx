@@ -33,7 +33,7 @@ export default function LogsPanel({ api }: LogsPanelProps) {
   }, [api]);
 
   const handleCopy = () => {
-    navigator.clipboard.writeText(logs.join("\n"));
+    api.writeClipboard(logs.join("\n")).catch((e) => console.error("Copy logs failed:", e));
   };
 
   const handleClear = async () => {

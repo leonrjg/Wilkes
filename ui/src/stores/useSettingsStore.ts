@@ -1,7 +1,18 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import { api } from "../services";
-import type { BookmarkDock, FileEntry, OmittedFileEntry, SemanticSettings, Settings, Theme } from "../lib/types";
+import type {
+  BookmarkDock,
+  FileDisplayField,
+  FileEntry,
+  FileMetadataUpdate,
+  FileSortDirection,
+  FileSortKey,
+  OmittedFileEntry,
+  SemanticSettings,
+  Settings,
+  Theme,
+} from "../lib/types";
 
 function applyTheme(theme: Theme) {
   const root = window.document.documentElement;
@@ -16,6 +27,7 @@ function applyTheme(theme: Theme) {
 
 interface SettingsStore {
   favorites: string[];
+  settings: Settings | null;
   recentDirs: string[];
   directory: string;
   semantic: SemanticSettings | null;
@@ -31,6 +43,9 @@ interface SettingsStore {
   theme: Theme;
   maxResults: number;
   bookmarksDock: BookmarkDock;
+  fileSortKey: FileSortKey;
+  fileSortDirection: FileSortDirection;
+  fileDisplayFields: FileDisplayField[];
 
   load: () => Promise<void>;
   setDirectory: (dir: string) => void;
@@ -38,11 +53,15 @@ interface SettingsStore {
   removeFavorite: (dir: string) => void;
   forgetDirectory: (dir: string) => void;
   refreshFileList: () => void;
+  applyMetadataUpdates: (updates: FileMetadataUpdate[]) => void;
   setFilterText: (text: string) => void;
   setPreferSemantic: (active: boolean) => void;
   setIndexing: (indexing: boolean) => void;
-  applySettingsPatch: (patch: { theme?: Theme; supported_extensions?: string[]; max_results?: number; bookmarks_dock?: BookmarkDock }) => void;
+  applySettingsPatch: (patch: Partial<Settings>) => void;
   setBookmarksDock: (dock: BookmarkDock) => void;
+  setFileSortKey: (key: FileSortKey) => void;
+  setFileSortDirection: (direction: FileSortDirection) => void;
+  toggleFileDisplayField: (field: FileDisplayField) => void;
   replaceSettings: (settings: Settings) => void;
   refreshSettings: () => Promise<Settings>;
 }
@@ -50,6 +69,7 @@ interface SettingsStore {
 export const useSettingsStore = create<SettingsStore>()(
   subscribeWithSelector((set, get) => ({
     favorites: [],
+    settings: null,
     recentDirs: [],
     directory: "",
     semantic: null,
@@ -65,6 +85,9 @@ export const useSettingsStore = create<SettingsStore>()(
     theme: "System",
     maxResults: 50,
     bookmarksDock: "Right",
+    fileSortKey: "filename",
+    fileSortDirection: "asc",
+    fileDisplayFields: ["size"],
 
     load: async () => {
       const s = await api.getSettings();
@@ -78,6 +101,7 @@ export const useSettingsStore = create<SettingsStore>()(
       }
 
       set({
+        settings: s,
         favorites: s.favorites,
         recentDirs: s.recent_dirs || [],
         directory: s.last_directory ?? "",
@@ -89,6 +113,9 @@ export const useSettingsStore = create<SettingsStore>()(
         theme: s.theme,
         maxResults: s.max_results ?? 0,
         bookmarksDock: s.bookmarks_dock ?? "Right",
+        fileSortKey: s.file_sort_key ?? "filename",
+        fileSortDirection: s.file_sort_direction ?? "asc",
+        fileDisplayFields: s.file_display_fields ?? ["size"],
         omittedFileList: [],
       });
     },
@@ -143,6 +170,19 @@ export const useSettingsStore = create<SettingsStore>()(
         .catch(() => {});
     },
 
+    applyMetadataUpdates: (updates: FileMetadataUpdate[]) => {
+      if (updates.length === 0) return;
+      const byPath = new Map(updates.map((u) => [u.path, u.publication_date]));
+      const patch = <T extends FileEntry>(entry: T): T =>
+        byPath.has(entry.path)
+          ? { ...entry, publication_date: byPath.get(entry.path) ?? null }
+          : entry;
+      set((state) => ({
+        fileList: state.fileList.map(patch),
+        omittedFileList: state.omittedFileList.map(patch),
+      }));
+    },
+
     setFilterText: (text: string) => set({ filterText: text }),
     setIndexing: (indexing: boolean) => set({ indexing }),
 
@@ -152,6 +192,26 @@ export const useSettingsStore = create<SettingsStore>()(
     },
 
     applySettingsPatch: (patch) => {
+      const settings = get().settings;
+      if (settings) {
+        set({
+          settings: {
+            ...settings,
+            ...patch,
+            semantic: patch.semantic ? { ...settings.semantic, ...patch.semantic } : settings.semantic,
+            integrations: patch.integrations
+              ? {
+                  ...settings.integrations,
+                  ...patch.integrations,
+                  zotero: {
+                    ...settings.integrations.zotero,
+                    ...patch.integrations.zotero,
+                  },
+                }
+              : settings.integrations,
+          },
+        });
+      }
       if (patch.theme) {
         applyTheme(patch.theme);
         set({ theme: patch.theme });
@@ -165,6 +225,15 @@ export const useSettingsStore = create<SettingsStore>()(
       if (patch.bookmarks_dock) {
         set({ bookmarksDock: patch.bookmarks_dock });
       }
+      if (patch.file_sort_key) {
+        set({ fileSortKey: patch.file_sort_key });
+      }
+      if (patch.file_sort_direction) {
+        set({ fileSortDirection: patch.file_sort_direction });
+      }
+      if (patch.file_display_fields) {
+        set({ fileDisplayFields: patch.file_display_fields });
+      }
     },
 
     setBookmarksDock: (dock) => {
@@ -172,9 +241,29 @@ export const useSettingsStore = create<SettingsStore>()(
       api.updateSettings({ bookmarks_dock: dock }).catch(console.error);
     },
 
+    setFileSortKey: (key) => {
+      set({ fileSortKey: key });
+      api.updateSettings({ file_sort_key: key }).catch(console.error);
+    },
+
+    setFileSortDirection: (direction) => {
+      set({ fileSortDirection: direction });
+      api.updateSettings({ file_sort_direction: direction }).catch(console.error);
+    },
+
+    toggleFileDisplayField: (field) => {
+      const current = get().fileDisplayFields;
+      const next = current.includes(field)
+        ? current.filter((f) => f !== field)
+        : [...current, field];
+      set({ fileDisplayFields: next });
+      api.updateSettings({ file_display_fields: next }).catch(console.error);
+    },
+
     replaceSettings: (settings) => {
       applyTheme(settings.theme);
       set({
+        settings,
         favorites: settings.favorites,
         recentDirs: settings.recent_dirs || [],
         directory: settings.last_directory ?? "",
@@ -186,6 +275,9 @@ export const useSettingsStore = create<SettingsStore>()(
         theme: settings.theme,
         maxResults: settings.max_results ?? 0,
         bookmarksDock: settings.bookmarks_dock ?? "Right",
+        fileSortKey: settings.file_sort_key ?? "filename",
+        fileSortDirection: settings.file_sort_direction ?? "asc",
+        fileDisplayFields: settings.file_display_fields ?? ["size"],
         omittedFileList: [],
       });
     },

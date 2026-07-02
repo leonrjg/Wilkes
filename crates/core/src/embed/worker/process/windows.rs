@@ -108,7 +108,9 @@ fn wait_for_process_exit(
     let wait_rc = unsafe { WaitForSingleObject(handle, timeout_ms) };
     match wait_rc {
         WAIT_OBJECT_0 => {
-            let _ = child.wait().map_err(|e| format!("Failed to reap worker: {e}"))?;
+            let _ = child
+                .wait()
+                .map_err(|e| format!("Failed to reap worker: {e}"))?;
             Ok(true)
         }
         WAIT_TIMEOUT => Ok(false),
@@ -123,8 +125,8 @@ fn create_job_for_child(child: &std::process::Child) -> Result<Arc<JobHandle>, S
     use std::os::windows::io::AsRawHandle;
     use std::ptr::null_mut;
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
@@ -198,10 +200,7 @@ impl WorkerProcess {
         }
 
         Ok(Self {
-            child: Arc::new(Mutex::new(WorkerInner {
-                child,
-                job,
-            })),
+            child: Arc::new(Mutex::new(WorkerInner { child, job })),
             stdin: Arc::new(Mutex::new(stdin)),
             stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
         })

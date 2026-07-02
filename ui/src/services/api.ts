@@ -6,7 +6,11 @@ import type {
   Bookmark,
   FileListResponse,
   FileMatches,
+  FileMetadataUpdate,
   IndexStatus,
+  AddOutcome,
+  CitationResult,
+  IntegrationStatus,
   MatchRef,
   DocumentMetadata,
   ModelDescriptor,
@@ -36,9 +40,19 @@ export interface SearchApi {
   listBookmarks(): Promise<Bookmark[]>;
   addBookmark(bookmark: NewBookmark): Promise<Bookmark>;
   removeBookmark(id: string): Promise<void>;
+  updateBookmarkNote(id: string, note: string | null): Promise<Bookmark>;
   listFiles(root: string): Promise<FileListResponse>;
   openFile(path: string): Promise<PreviewData>;
+  renameFile(path: string, newName: string): Promise<string>;
+  /** File-based extraction only (fast; used for the viewer's first paint). */
   getFileMetadata(path: string): Promise<DocumentMetadata>;
+  /** Authoritative metadata: file-based overridden by Zotero when it resolves. */
+  resolveFileMetadata(path: string): Promise<DocumentMetadata>;
+  /** Clear the metadata cache so listings re-derive everything. */
+  refreshFileMetadata(): Promise<void>;
+  zoteroStatus(): Promise<IntegrationStatus>;
+  zoteroAddItem(path: string): Promise<AddOutcome>;
+  zoteroGenerateCitation(path: string): Promise<CitationResult>;
   resolvePdfUrl(path: string): string;
   getLogs(): Promise<string[]>;
   clearLogs(): Promise<void>;
@@ -46,6 +60,11 @@ export interface SearchApi {
   getSupportedEngines(): Promise<EmbeddingEngine[]>;
   getDataPaths(): Promise<DataPaths>;
   openPath(path: string): Promise<void>;
+  revealPath(path: string): Promise<void>;
+  /** Write text to the system clipboard. On desktop this goes through the
+   *  native plugin, which (unlike `navigator.clipboard`) does not require the
+   *  call to happen inside a transient user-activation window. */
+  writeClipboard(text: string): Promise<void>;
 
   // ── Worker Management ────────────────────────────────────────────────────────
   getWorkerStatus(): Promise<import("../lib/types").WorkerStatus>;
@@ -66,6 +85,9 @@ export interface SearchApi {
   onEmbedDone(handler: (done: EmbedDone) => void): Promise<() => void>;
   onEmbedError(handler: (err: EmbedError) => void): Promise<() => void>;
   onManagerEvent(handler: (event: string) => void): Promise<() => void>;
+  onFileMetadataUpdated(
+    handler: (updates: FileMetadataUpdate[]) => void,
+  ): Promise<() => void>;
 }
 
 // Desktop: native directory picker.

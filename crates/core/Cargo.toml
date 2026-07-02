@@ -38,6 +38,9 @@ libc = "0.2"
 sqlite-vec = "0.1.9"
 strip-ansi-escapes = "0.2.1"
 which = "6"
+reqwest = { version = "0.12", features = ["json"] }
+urlencoding = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [dependencies.ort]
 version = "=2.0.0-rc.11"

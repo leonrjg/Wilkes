@@ -72,6 +72,20 @@ describe("PreviewPane", () => {
     expect(screen.getByText("test.pdf")).toBeInTheDocument();
   });
 
+  it("formats a Zotero MM/YYYY publication date in the header", () => {
+    const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
+    useSearchStore.setState({
+      selectedMatch: mockMatch,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: { title: "Paper", author: "Tambon et al.", doi: null, created_at: "05/2025" },
+      viewerMetadataStatus: "ready",
+    });
+
+    render(<PreviewPane />);
+    expect(screen.getByText("May 2025")).toBeInTheDocument();
+    expect(screen.getByText("Tambon et al.")).toBeInTheDocument();
+  });
+
   it("renders metadata loading placeholder while preserving the path", () => {
     const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
     useSearchStore.setState({
@@ -204,6 +218,7 @@ describe("PreviewPane", () => {
           quote: "current quote",
           created_at: "2026-01-01T00:00:00Z",
           note: null,
+          rects: [{ x: 1, y: 2, width: 3, height: 4 }],
         },
         {
           id: "other",
@@ -212,6 +227,7 @@ describe("PreviewPane", () => {
           quote: "other quote",
           created_at: "2026-01-01T00:00:00Z",
           note: null,
+          rects: [{ x: 10, y: 20, width: 30, height: 40 }],
         },
         {
           id: "text",
@@ -220,6 +236,7 @@ describe("PreviewPane", () => {
           quote: "text quote",
           created_at: "2026-01-01T00:00:00Z",
           note: null,
+          rects: [],
         },
       ],
     });
@@ -228,8 +245,9 @@ describe("PreviewPane", () => {
 
     const call = mockPdfViewer.mock.calls[mockPdfViewer.mock.calls.length - 1][0];
     expect(call.bookmarkHighlights).toEqual([
-      { id: "current", page: 4, bbox: { x: 1, y: 2, width: 3, height: 4 } },
+      { id: "current", page: 4, rects: [{ x: 1, y: 2, width: 3, height: 4 }] },
     ]);
+    // The text-file bookmark carries no rects and must not produce a highlight.
   });
 
   it("renders PdfViewer when selectedMatch is PDF but previewData is stale Text data", () => {

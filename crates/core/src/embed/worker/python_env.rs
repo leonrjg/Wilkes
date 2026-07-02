@@ -451,7 +451,11 @@ exit 0
                 patch: 6,
             },
         );
-        std::fs::write(paths.venv_dir.join(".requirements_installed"), stamp_contents).unwrap();
+        std::fs::write(
+            paths.venv_dir.join(".requirements_installed"),
+            stamp_contents,
+        )
+        .unwrap();
 
         let res = setup_python_env(&paths).await;
         assert!(res.is_ok(), "{res:?}");

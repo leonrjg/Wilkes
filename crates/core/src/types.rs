@@ -286,6 +286,10 @@ pub struct Bookmark {
     pub created_at: String,
     #[serde(default)]
     pub note: Option<String>,
+    /// Per-line rectangles (page coordinates) covering exactly the selected
+    /// text. Empty for text bookmarks.
+    #[serde(default)]
+    pub rects: Vec<BoundingBox>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -295,6 +299,8 @@ pub struct NewBookmark {
     pub quote: String,
     #[serde(default)]
     pub note: Option<String>,
+    #[serde(default)]
+    pub rects: Vec<BoundingBox>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -644,12 +650,24 @@ pub struct Settings {
     #[serde(default)]
     pub search_prefer_semantic: bool,
     pub semantic: SemanticSettings,
+    #[serde(default)]
+    pub integrations: IntegrationsSettings,
     #[serde(default = "default_supported_extensions")]
     pub supported_extensions: Vec<String>,
     #[serde(default)]
     pub max_results: usize,
     #[serde(default)]
     pub bookmarks_dock: BookmarkDock,
+    #[serde(default)]
+    pub file_sort_key: FileSortKey,
+    #[serde(default)]
+    pub file_sort_direction: FileSortDirection,
+    #[serde(default = "default_file_display_fields")]
+    pub file_display_fields: Vec<FileDisplayField>,
+}
+
+fn default_file_display_fields() -> Vec<FileDisplayField> {
+    vec![FileDisplayField::Size]
 }
 
 fn default_supported_extensions() -> Vec<String> {
@@ -673,11 +691,46 @@ impl Default for Settings {
             theme: Theme::default(),
             search_prefer_semantic: false,
             semantic: SemanticSettings::default(),
+            integrations: IntegrationsSettings::default(),
             supported_extensions: default_supported_extensions(),
             max_results: 50,
             bookmarks_dock: BookmarkDock::default(),
+            file_sort_key: FileSortKey::default(),
+            file_sort_direction: FileSortDirection::default(),
+            file_display_fields: default_file_display_fields(),
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileSortKey {
+    #[default]
+    Filename,
+    Created,
+    Modified,
+    Size,
+    Publication,
+}
+
+/// Optional document-metadata field that can be shown as a column in the file
+/// list. `Settings::file_display_fields` holds the set currently visible.
+/// Extend with new variants as more metadata is projected onto `FileEntry`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDisplayField {
+    Created,
+    Modified,
+    Publication,
+    Size,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileSortDirection {
+    #[default]
+    Asc,
+    Desc,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -685,6 +738,77 @@ pub enum BookmarkDock {
     Left,
     #[default]
     Right,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct IntegrationsSettings {
+    #[serde(default)]
+    pub zotero: ZoteroSettings,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ZoteroSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_zotero_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_zotero_citation_style")]
+    pub citation_style: String,
+}
+
+impl Default for ZoteroSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_zotero_base_url(),
+            citation_style: default_zotero_citation_style(),
+        }
+    }
+}
+
+fn default_zotero_base_url() -> String {
+    "http://127.0.0.1:23119".to_string()
+}
+
+fn default_zotero_citation_style() -> String {
+    "chicago-note-bibliography".to_string()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationState {
+    Disabled,
+    ZoteroDown,
+    LocalApiDisabled,
+    Ready,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntegrationStatus {
+    pub id: String,
+    pub enabled: bool,
+    pub state: IntegrationState,
+    pub message: String,
+    pub version: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum AddOutcome {
+    Added { item_key: Option<String> },
+    AlreadyPresent { item_key: String },
+    PossibleDuplicate { item_key: String, message: String },
+}
+
+/// CSL citation strings for a resolved Zotero item. `citation` is the in-text
+/// form and `bibliography` the full reference; both are HTML produced by Zotero.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CitationResult {
+    pub citation: Option<String>,
+    pub bibliography: Option<String>,
+    /// True when the item was resolved by a weak signal (filename or title),
+    /// so the citation may belong to the wrong work.
+    pub low_confidence: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -703,6 +827,12 @@ pub struct FileEntry {
     pub size_bytes: u64,
     pub file_type: FileType,
     pub extension: String,
+    pub created_at_ms: Option<i64>,
+    pub modified_at_ms: Option<i64>,
+    /// Document publication date ("YYYY-MM") from cached extracted metadata.
+    /// `None` until the metadata cache has processed this file.
+    #[serde(default)]
+    pub publication_date: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

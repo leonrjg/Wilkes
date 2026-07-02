@@ -40,6 +40,19 @@ describe("HttpSearchApi", () => {
     }));
   });
 
+  it("updateBookmarkNote sends a PATCH with the note body", async () => {
+    (fetch as any).mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ id: "b1", note: "hi" }),
+    });
+
+    await api.updateBookmarkNote("b1", "hi");
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/bookmarks/b1",
+      expect.objectContaining({ method: "PATCH", body: JSON.stringify({ note: "hi" }) }),
+    );
+  });
+
   it("search streams results", async () => {
     const mockFileMatches = { path: "test.txt", matches: [] };
     const mockStats = { total_files: 1, total_matches: 0, duration_ms: 10 };
@@ -180,6 +193,20 @@ describe("HttpSearchApi", () => {
       body: JSON.stringify({ path: "test.txt" }),
     }));
     expect(res).toEqual(mockData);
+  });
+
+  it("renameFile calls fetch and returns the new path", async () => {
+    (fetch as any).mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve("/root/new.txt"),
+    });
+
+    const res = await api.renameFile("/root/old.txt", "new.txt");
+    expect(fetch).toHaveBeenCalledWith("/api/file/rename", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ path: "/root/old.txt", new_name: "new.txt" }),
+    }));
+    expect(res).toBe("/root/new.txt");
   });
 
   it("getFileMetadata calls fetch and returns document metadata", async () => {

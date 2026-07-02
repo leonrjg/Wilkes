@@ -1,10 +1,12 @@
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import type { Icon } from "react-feather";
 
 export interface ContextMenuItem {
   id: string;
   label: string;
+  icon?: Icon;
   disabled?: boolean;
   run: () => Promise<void> | void;
 }
@@ -53,6 +55,9 @@ interface ContextMenuProps<T> {
 export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
   const menuRef = useRef<HTMLDivElement | null>(null);
   const [position, setPosition] = useState<ContextMenuPosition | null>(null);
+  // Id of the item whose async `run()` is in flight, so we can show a spinner
+  // and block further clicks. Generic — every menu action gets this for free.
+  const [pendingId, setPendingId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!menu) return;
@@ -88,6 +93,7 @@ export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
     if (!menu) {
       setPosition(null);
     }
+    setPendingId(null);
   }, [menu]);
 
   useLayoutEffect(() => {
@@ -118,24 +124,48 @@ export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
           visibility: position ? "visible" : "hidden",
         }}
       >
-        {menu.items.map((item) => (
-          <button
-            key={item.id}
-            role="menuitem"
-            disabled={item.disabled}
-            onClick={async () => {
-              if (item.disabled) return;
-              await item.run();
-              onClose();
-            }}
-            className="flex w-full items-center rounded-md px-3 py-1.5 text-left text-xs text-[var(--text-main)] hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {item.label}
-          </button>
-        ))}
+        {menu.items.map((item) => {
+          const Icon = item.icon;
+          const isPending = pendingId === item.id;
+          return (
+            <button
+              key={item.id}
+              role="menuitem"
+              disabled={item.disabled || pendingId !== null}
+              onClick={() => {
+                if (item.disabled || pendingId !== null) return;
+                const result = item.run();
+                if (result instanceof Promise) {
+                  // Keep the menu open with a spinner until the action settles,
+                  // so the click has immediate visible feedback.
+                  setPendingId(item.id);
+                  result.finally(() => {
+                    setPendingId(null);
+                    onClose();
+                  });
+                } else {
+                  onClose();
+                }
+              }}
+              className="flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-left text-xs text-[var(--text-main)] hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center text-[var(--text-muted)]">
+                {isPending ? (
+                  <span
+                    data-testid="context-menu-spinner"
+                    className="h-3 w-3 rounded-full border-2 border-[var(--text-muted)] border-t-transparent animate-spin"
+                  />
+                ) : (
+                  Icon && <Icon size={13} aria-hidden="true" />
+                )}
+              </span>
+              <span className="truncate">{item.label}</span>
+            </button>
+          );
+        })}
       </div>
     );
-  }, [menu, onClose, position]);
+  }, [menu, onClose, position, pendingId]);
 
   if (!menu || !content) return null;
   return createPortal(content, document.body);

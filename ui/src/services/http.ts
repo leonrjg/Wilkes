@@ -6,7 +6,11 @@ import type {
   Bookmark,
   FileListResponse,
   FileMatches,
+  FileMetadataUpdate,
   IndexStatus,
+  AddOutcome,
+  CitationResult,
+  IntegrationStatus,
   MatchRef,
   DocumentMetadata,
   ModelDescriptor,
@@ -143,6 +147,16 @@ export class HttpSearchApi implements SearchApi {
     if (!res.ok && res.status !== 204) throw new Error(`removeBookmark failed: ${res.status}`);
   }
 
+  async updateBookmarkNote(id: string, note: string | null): Promise<Bookmark> {
+    const res = await fetch(`/api/bookmarks/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note }),
+    });
+    if (!res.ok) throw new Error(`updateBookmarkNote failed: ${res.status}`);
+    return res.json() as Promise<Bookmark>;
+  }
+
   async listFiles(root: string): Promise<FileListResponse> {
     const res = await fetch(`/api/files?root=${encodeURIComponent(root)}`);
     if (!res.ok) throw new Error(`listFiles failed: ${res.status}`);
@@ -159,6 +173,16 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<PreviewData>;
   }
 
+  async renameFile(path: string, newName: string): Promise<string> {
+    const res = await fetch("/api/file/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, new_name: newName }),
+    });
+    if (!res.ok) throw new Error(`renameFile failed: ${res.status}`);
+    return res.json() as Promise<string>;
+  }
+
   async getFileMetadata(path: string): Promise<DocumentMetadata> {
     const res = await fetch("/api/file/metadata", {
       method: "POST",
@@ -167,6 +191,47 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw new Error(`getFileMetadata failed: ${res.status}`);
     return res.json() as Promise<DocumentMetadata>;
+  }
+
+  async resolveFileMetadata(path: string): Promise<DocumentMetadata> {
+    const res = await fetch("/api/file/metadata/resolve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (!res.ok) throw new Error(`resolveFileMetadata failed: ${res.status}`);
+    return res.json() as Promise<DocumentMetadata>;
+  }
+
+  async refreshFileMetadata(): Promise<void> {
+    const res = await fetch("/api/file/metadata/refresh", { method: "POST" });
+    if (!res.ok) throw new Error(`refreshFileMetadata failed: ${res.status}`);
+  }
+
+  async zoteroStatus(): Promise<IntegrationStatus> {
+    const res = await fetch("/api/integrations/zotero/status");
+    if (!res.ok) throw new Error(`zoteroStatus failed: ${res.status}`);
+    return res.json() as Promise<IntegrationStatus>;
+  }
+
+  async zoteroAddItem(path: string): Promise<AddOutcome> {
+    const res = await fetch("/api/integrations/zotero/add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (!res.ok) throw new Error(`zoteroAddItem failed: ${res.status}`);
+    return res.json() as Promise<AddOutcome>;
+  }
+
+  async zoteroGenerateCitation(path: string): Promise<CitationResult> {
+    const res = await fetch("/api/integrations/zotero/citation", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (!res.ok) throw new Error(`zoteroGenerateCitation failed: ${res.status}`);
+    return res.json() as Promise<CitationResult>;
   }
 
   resolvePdfUrl(path: string): string {
@@ -215,6 +280,18 @@ export class HttpSearchApi implements SearchApi {
     // Opening local filesystem paths in the OS's file manager is not possible in browser mode.
     // No endpoint exists for this in the server, so we just return.
     return;
+  }
+
+  async revealPath(_path: string): Promise<void> {
+    // Revealing local filesystem paths in the OS's file manager is not possible in browser mode.
+    return;
+  }
+
+  async writeClipboard(text: string): Promise<void> {
+    if (!navigator.clipboard?.writeText) {
+      throw new Error("Clipboard API unavailable");
+    }
+    await navigator.clipboard.writeText(text);
   }
 
   // ── Worker Management ────────────────────────────────────────────────────────
@@ -338,6 +415,15 @@ export class HttpSearchApi implements SearchApi {
     const listener = (e: any) => handler(JSON.parse(e.data));
     es.addEventListener("manager-event", listener);
     return () => this.releaseEmbedEventSource("manager-event", listener);
+  }
+
+  async onFileMetadataUpdated(
+    handler: (updates: FileMetadataUpdate[]) => void,
+  ): Promise<() => void> {
+    const es = this.acquireEmbedEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("file-metadata-updated", listener);
+    return () => this.releaseEmbedEventSource("file-metadata-updated", listener);
   }
 }
 

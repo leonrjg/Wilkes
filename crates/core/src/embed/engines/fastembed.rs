@@ -192,8 +192,8 @@ fn hf_sibling_matches_relevant(
 ) -> bool {
     relevant.contains(filename)
         || relevant
-        .iter()
-        .any(|f| filename.ends_with(&format!("/{f}")))
+            .iter()
+            .any(|f| filename.ends_with(&format!("/{f}")))
 }
 
 fn sum_matching_hf_sizes(

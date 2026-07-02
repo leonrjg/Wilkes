@@ -243,6 +243,44 @@ mod tests {
     }
 
     #[test]
+    fn test_rename_file_rekeys_chunks_and_keeps_embeddings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut idx =
+            SemanticIndex::create(root, "m", 3, EmbeddingEngine::Candle, Some(root)).unwrap();
+
+        let old = root.join("old.txt");
+        let new = root.join("new.txt");
+        idx.write_file(PreparedFile {
+            path: old.clone(),
+            chunks: vec![(
+                Chunk {
+                    file_path: old.clone(),
+                    text: "hello world".to_string(),
+                    byte_range: ByteRange { start: 0, end: 11 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![1.0, 0.0, 0.0],
+            )],
+        })
+        .unwrap();
+
+        idx.rename_file(&old, &new).unwrap();
+
+        // The chunk (and its embedding) survives the rename and is queryable.
+        let results = idx.query(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file_path, new);
+
+        // It is keyed under the new path only: removing the old path is a no-op,
+        // removing the new path clears it.
+        idx.remove_file(&old).unwrap();
+        assert_eq!(idx.query(&[1.0, 0.0, 0.0], 1).unwrap().len(), 1);
+        idx.remove_file(&new).unwrap();
+        assert_eq!(idx.query(&[1.0, 0.0, 0.0], 1).unwrap().len(), 0);
+    }
+
+    #[test]
     fn test_delete_non_existent() {
         let dir = tempdir().unwrap();
         let idx = SemanticIndex::create(dir.path(), "m", 3, EmbeddingEngine::Candle, None).unwrap();
@@ -1199,6 +1237,31 @@ impl SemanticIndex {
         )?;
         self.conn
             .execute("DELETE FROM chunks WHERE file_path = ?1", params![rel_str])?;
+        Ok(())
+    }
+
+    /// Re-key all chunks for a renamed file from `old` to `new` without
+    /// re-extracting or re-embedding. A rename preserves file content, so the
+    /// embeddings (`vec_chunks`, keyed by chunk rowid) stay valid untouched;
+    /// only the `file_path` column changes. Any chunks already stored under
+    /// `new` are removed first so the destination path is not duplicated.
+    pub fn rename_file(&mut self, old: &Path, new: &Path) -> anyhow::Result<()> {
+        let old_rel = self.to_rel_path(old).to_string_lossy().into_owned();
+        let new_rel = self.to_rel_path(new).to_string_lossy().into_owned();
+        if old_rel == new_rel {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE file_path = ?1)",
+            params![new_rel],
+        )?;
+        tx.execute("DELETE FROM chunks WHERE file_path = ?1", params![new_rel])?;
+        tx.execute(
+            "UPDATE chunks SET file_path = ?1 WHERE file_path = ?2",
+            params![new_rel, old_rel],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 

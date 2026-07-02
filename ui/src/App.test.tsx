@@ -13,6 +13,7 @@ vi.mock("./services", () => ({
     onEmbedDone: vi.fn(() => Promise.resolve(() => {})),
     onEmbedError: vi.fn(() => Promise.resolve(() => {})),
     onManagerEvent: vi.fn(() => Promise.resolve(() => {})),
+    onFileMetadataUpdated: vi.fn(() => Promise.resolve(() => {})),
     getSettings: vi.fn(() => Promise.resolve({
       favorites: [],
       recent_dirs: [],

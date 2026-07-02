@@ -1,0 +1,12 @@
+/* Clickable overlays for PDF Link annotations (within-document + external
+ * links). Transparent hit targets that tint faintly on hover so users can see
+ * a region is navigable, matching OS-reader affordance. */
+.pdf-link-overlay {
+  border-radius: 2px;
+  transition: background-color 0.1s ease;
+}
+
+.pdf-link-overlay:hover {
+  background-color: rgba(59, 130, 246, 0.18);
+  outline: 1px solid rgba(59, 130, 246, 0.5);
+}

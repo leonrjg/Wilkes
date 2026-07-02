@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod doi;
 pub mod pdf;
 pub mod text;
@@ -33,11 +34,7 @@ impl MetadataExtractorRegistry {
             .map(|e| e.as_ref())
     }
 
-    pub fn extract_for(
-        &self,
-        path: &Path,
-        mime: Option<&str>,
-    ) -> anyhow::Result<DocumentMetadata> {
+    pub fn extract_for(&self, path: &Path, mime: Option<&str>) -> anyhow::Result<DocumentMetadata> {
         match self.find(path, mime) {
             Some(extractor) => extractor.extract_metadata(path),
             None => Ok(DocumentMetadata::default()),

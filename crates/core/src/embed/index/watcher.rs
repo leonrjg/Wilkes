@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,7 +10,78 @@ use tracing::{error, info};
 use super::super::Embedder;
 use super::SemanticIndex;
 use crate::extract::ExtractorRegistry;
+use crate::metadata::cache::{FileIdentity, MetadataCache};
 use crate::types::IndexingConfig;
+
+/// Optional shared handle to the document-metadata cache. When present it acts
+/// as the file-identity registry that lets the watcher recognise renames.
+type CacheHandle = Option<Arc<Mutex<MetadataCache>>>;
+
+fn fs_identity(path: &Path) -> Option<FileIdentity> {
+    let meta = std::fs::metadata(path).ok()?;
+    FileIdentity::from_fs(meta.len(), meta.modified().ok())
+}
+
+/// Identify which of the `changed` paths are actually renames of files the
+/// cache already knows: same content fingerprint, old path now gone. Returns
+/// `(old_path, new_path)` pairs. Empty when there is no cache to consult.
+fn detect_renames(cache: &CacheHandle, changed: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
+    let Some(cache) = cache else {
+        return Vec::new();
+    };
+    let Ok(guard) = cache.lock() else {
+        return Vec::new();
+    };
+    let mut renames = Vec::new();
+    for new_path in changed {
+        let Some(identity) = fs_identity(new_path) else {
+            continue;
+        };
+        match guard.find_rename_source(new_path, identity) {
+            Ok(Some(old_path)) => renames.push((old_path, new_path.clone())),
+            Ok(None) => {}
+            Err(e) => error!(
+                "[IndexWatcher] rename detection for {}: {e:#}",
+                new_path.display()
+            ),
+        }
+    }
+    renames
+}
+
+/// Re-key both stores for each rename instead of deleting and re-embedding.
+fn apply_renames(
+    index: &Arc<Mutex<Option<SemanticIndex>>>,
+    cache: &CacheHandle,
+    renames: &[(PathBuf, PathBuf)],
+) {
+    if let Ok(mut guard) = index.lock() {
+        if let Some(idx) = guard.as_mut() {
+            for (old, new) in renames {
+                if let Err(e) = idx.rename_file(old, new) {
+                    error!(
+                        "[IndexWatcher] rename_file {} -> {}: {e:#}",
+                        old.display(),
+                        new.display()
+                    );
+                }
+            }
+        }
+    }
+    if let Some(cache) = cache {
+        if let Ok(guard) = cache.lock() {
+            for (old, new) in renames {
+                if let Err(e) = guard.rename(old, new) {
+                    error!(
+                        "[IndexWatcher] cache rename {} -> {}: {e:#}",
+                        old.display(),
+                        new.display()
+                    );
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClassifiedPaths {
@@ -42,6 +114,7 @@ pub fn classify_event_paths(
 fn process_watcher_result<F1, F2>(
     result: notify_debouncer_mini::DebounceEventResult,
     index: &Arc<Mutex<Option<SemanticIndex>>>,
+    cache: &CacheHandle,
     extractors: &Arc<ExtractorRegistry>,
     embedder: &Arc<dyn Embedder>,
     config: &IndexingConfig,
@@ -54,16 +127,37 @@ fn process_watcher_result<F1, F2>(
     match result {
         Ok(events) => {
             let classified = classify_event_paths(&events, &config.supported_extensions);
-            let changed_paths = classified.changed;
-            let removed_paths = classified.removed;
+            let mut changed_paths = classified.changed;
+            let mut removed_paths = classified.removed;
 
-            // Handle removals
+            // A rename surfaces as its old path removed and its new path changed.
+            // Detect that by content identity and re-key both stores instead of
+            // deleting + re-extracting + re-embedding identical content.
+            let renames = detect_renames(cache, &changed_paths);
+            if !renames.is_empty() {
+                apply_renames(index, cache, &renames);
+                let renamed_new: HashSet<&PathBuf> = renames.iter().map(|(_, n)| n).collect();
+                let renamed_old: HashSet<&PathBuf> = renames.iter().map(|(o, _)| o).collect();
+                changed_paths.retain(|p| !renamed_new.contains(p));
+                removed_paths.retain(|p| !renamed_old.contains(p));
+            }
+
+            // Handle removals (index + metadata cache).
             if !removed_paths.is_empty() {
                 if let Ok(mut guard) = index.lock() {
                     if let Some(idx) = guard.as_mut() {
-                        for path in removed_paths {
-                            if let Err(e) = idx.remove_file(&path) {
+                        for path in &removed_paths {
+                            if let Err(e) = idx.remove_file(path) {
                                 error!("[IndexWatcher] remove_file {}: {e:#}", path.display());
+                            }
+                        }
+                    }
+                }
+                if let Some(cache) = cache {
+                    if let Ok(guard) = cache.lock() {
+                        for path in &removed_paths {
+                            if let Err(e) = guard.remove(path) {
+                                error!("[IndexWatcher] cache remove {}: {e:#}", path.display());
                             }
                         }
                     }
@@ -105,9 +199,11 @@ pub struct IndexWatcher {
 
 impl IndexWatcher {
     /// Start watching `root`. Events are processed on a background thread.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         root: PathBuf,
         index: Arc<Mutex<Option<SemanticIndex>>>,
+        cache: CacheHandle,
         extractors: Arc<ExtractorRegistry>,
         embedder: Arc<dyn Embedder>,
         config: IndexingConfig,
@@ -130,6 +226,7 @@ impl IndexWatcher {
                 process_watcher_result(
                     result,
                     &index,
+                    &cache,
                     &extractors,
                     &embedder,
                     &config,
@@ -269,6 +366,7 @@ mod tests {
         let mut watcher = IndexWatcher::start(
             dir.path().to_path_buf(),
             index,
+            None,
             registry,
             embedder,
             config,
@@ -365,6 +463,7 @@ mod tests {
         let result = IndexWatcher::start(
             PathBuf::from("/non/existent/path/for/watcher"),
             index,
+            None,
             registry,
             embedder,
             config,
@@ -587,6 +686,7 @@ mod tests {
         process_watcher_result(
             Ok(events),
             &index,
+            &None,
             &registry,
             &embedder,
             &config,
@@ -601,6 +701,7 @@ mod tests {
         process_watcher_result(
             Err(notify::Error::generic("watch failed")),
             &index,
+            &None,
             &registry,
             &embedder,
             &config,
@@ -622,6 +723,7 @@ mod tests {
         let mut watcher = IndexWatcher::start(
             dir.path().to_path_buf(),
             index,
+            None,
             registry,
             embedder,
             crate::types::IndexingConfig {
@@ -727,6 +829,7 @@ mod tests {
         let mut watcher = IndexWatcher::start(
             dir.path().to_path_buf(),
             index.clone(),
+            None,
             registry,
             embedder,
             crate::types::IndexingConfig {
@@ -766,5 +869,109 @@ mod tests {
         std::fs::create_dir(&folder).unwrap();
 
         handle_event(&folder, &index, &registry, &embedder, 100, 10);
+    }
+
+    /// A rename must re-key both stores by content identity, never re-embed.
+    /// The embedder here fails if invoked, so a surviving chunk proves the
+    /// rename took the cheap re-key path rather than delete + re-extract.
+    #[test]
+    fn test_process_watcher_result_rekeys_rename_by_identity() {
+        struct FailingEmbedder;
+        impl Embedder for FailingEmbedder {
+            fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+                anyhow::bail!("embed must not be called on a rename")
+            }
+            fn model_id(&self) -> &str {
+                "m"
+            }
+            fn dimension(&self) -> usize {
+                3
+            }
+            fn engine(&self) -> EmbeddingEngine {
+                EmbeddingEngine::Candle
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let idx_dir = dir.path().join("idx");
+        std::fs::create_dir_all(&idx_dir).unwrap();
+        let mut idx =
+            SemanticIndex::create(&idx_dir, "m", 3, EmbeddingEngine::Candle, None).unwrap();
+
+        let old_path = dir.path().join("old.txt");
+        std::fs::write(&old_path, "hello world").unwrap();
+        idx.write_file(crate::embed::index::db::PreparedFile {
+            path: old_path.clone(),
+            chunks: vec![(
+                crate::embed::index::chunk::Chunk {
+                    file_path: old_path.clone(),
+                    text: "hello world".to_string(),
+                    byte_range: crate::types::ByteRange { start: 0, end: 11 },
+                    origin: crate::types::SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![0.1, 0.2, 0.3],
+            )],
+        })
+        .unwrap();
+        assert_eq!(idx.status().total_chunks, 1);
+
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        let identity = fs_identity(&old_path).unwrap();
+        cache
+            .upsert(
+                &old_path,
+                identity,
+                &crate::types::DocumentMetadata {
+                    title: None,
+                    author: None,
+                    doi: None,
+                    created_at: Some("2020-01".into()),
+                },
+                crate::metadata::cache::MetadataSource::File,
+            )
+            .unwrap();
+
+        // Rename preserves size and mtime, so the identity is unchanged.
+        let new_path = dir.path().join("new.txt");
+        std::fs::rename(&old_path, &new_path).unwrap();
+
+        let index = Arc::new(Mutex::new(Some(idx)));
+        let cache_handle: CacheHandle = Some(Arc::new(Mutex::new(cache)));
+        let registry = Arc::new(ExtractorRegistry::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
+        let config = IndexingConfig {
+            chunk_size: 100,
+            chunk_overlap: 0,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let events = vec![
+            DebouncedEvent {
+                path: old_path.clone(),
+                kind: DebouncedEventKind::Any,
+            },
+            DebouncedEvent {
+                path: new_path.clone(),
+                kind: DebouncedEventKind::Any,
+            },
+        ];
+
+        process_watcher_result(
+            Ok(events),
+            &index,
+            &cache_handle,
+            &registry,
+            &embedder,
+            &config,
+            &|| {},
+            &|| {},
+        );
+
+        // Index chunk survived (re-keyed, not deleted + re-embedded).
+        assert_eq!(index.lock().unwrap().as_ref().unwrap().status().total_chunks, 1);
+        // Metadata cache row moved from old path to new path.
+        let guard = cache_handle.as_ref().unwrap().lock().unwrap();
+        assert!(guard.get_valid(&new_path, identity).unwrap().is_some());
+        assert!(guard.get_valid(&old_path, identity).unwrap().is_none());
     }
 }

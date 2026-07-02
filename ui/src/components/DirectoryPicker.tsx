@@ -1,10 +1,11 @@
 import { useMemo } from "react";
 import { confirmDialog } from "../lib/utils/dialog";
-import { Folder, Bookmark, X } from "react-feather";
+import { Folder, Star, X } from "react-feather";
 import { useToasts } from "./Toast";
 import { ContextMenu, useContextMenu } from "./ContextMenu";
 import { api, isTauri } from "../services";
 import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileActions";
+import { useSettingsStore } from "../stores/useSettingsStore";
 
 interface Props {
   directory: string;
@@ -35,7 +36,8 @@ export default function DirectoryPicker({
 }: Props) {
   const { addToast } = useToasts();
   const { menu, openMenu, closeMenu } = useContextMenu<ContextMenuTarget>();
-  const isBookmarked = (dir: string) => favorites.includes(dir);
+  const settings = useSettingsStore((s) => s.settings);
+  const isFavorite = (dir: string) => favorites.includes(dir);
   const onToast = (message: string, type: "success" | "error") => addToast(message, { type });
 
   // Combine favorites and recent dirs for the list, prioritizing favorites
@@ -67,13 +69,13 @@ export default function DirectoryPicker({
         </button>
       </div>
 
-      {/* Folders list (Bookmarks + History) */}
+      {/* Folders list (Favorites + History) */}
       {displayDirs.length > 0 && (
         <div className="flex items-center gap-1 overflow-x-auto flex-1 min-w-0 custom-scrollbar">
           {displayDirs.map((b) => {
-            const bookmarked = isBookmarked(b);
+            const favorite = isFavorite(b);
             const active = b === directory;
-            
+
             return (
               <div
                 key={b}
@@ -86,6 +88,7 @@ export default function DirectoryPicker({
                       target: { kind: "directory", path: b, open: () => onChange(b) },
                       api,
                       capabilities: { canOpenInFileManager: isTauri },
+                      settings,
                       onToast,
                     }),
                   })}
@@ -118,16 +121,16 @@ export default function DirectoryPicker({
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      bookmarked ? onFavoriteRemove(b) : onFavoriteAdd(b);
+                      favorite ? onFavoriteRemove(b) : onFavoriteAdd(b);
                     }}
-                    title={bookmarked ? "Remove favorite" : "Favorite this directory"}
+                    title={favorite ? "Remove favorite" : "Favorite this directory"}
                     className={`h-full text-[10px] px-1.5 transition-colors ${
-                      bookmarked
+                      favorite
                         ? "text-[var(--accent-blue)]"
                         : "text-[var(--text-dim)] hover:text-[var(--accent-blue)]"
                     }`}
                   >
-                    <Bookmark size={10} fill={bookmarked ? "currentColor" : "none"} />
+                    <Star size={10} fill={favorite ? "currentColor" : "none"} />
                   </button>
                 )}
               </div>

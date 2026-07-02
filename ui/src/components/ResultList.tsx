@@ -1,11 +1,22 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { ArrowDown, ArrowUp, ChevronDown, File, RefreshCw } from "react-feather";
 import { buildRows, COLLAPSED_LIMIT, type Row } from "../lib/utils/flattenResults";
 import { useToasts } from "./Toast";
 import { ContextMenu, useContextMenu } from "./ContextMenu";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
-import type { Match, MatchRef, SourceOrigin, FileEntry, OmittedFileEntry } from "../lib/types";
+import type {
+  FileDisplayField,
+  FileEntry,
+  FileSortDirection,
+  FileSortKey,
+  Match,
+  MatchRef,
+  OmittedFileEntry,
+  SourceOrigin,
+} from "../lib/types";
 import { api, isTauri } from "../services";
 import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileActions";
 
@@ -32,6 +43,18 @@ function fileName(path: string): string {
   return path.split(/[/\\]/).pop() ?? path;
 }
 
+function editableNameEnd(name: string): number {
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? dot : name.length;
+}
+
+function validateNewFileName(name: string): string | null {
+  if (!name) return "File name cannot be empty";
+  if (name === "." || name === "..") return "Invalid file name";
+  if (/[\\/]/.test(name)) return "File name cannot contain path separators";
+  return null;
+}
+
 function dirName(path: string): string {
   const parts = path.split(/[/\\]/);
   parts.pop();
@@ -42,6 +65,110 @@ function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatTimestamp(ms: number): string {
+  return new Date(ms).toLocaleDateString();
+}
+
+/**
+ * Optional document-metadata columns for the file list, offered in the merged
+ * sort/visibility dropdown. To surface a new field: project it onto FileEntry
+ * (backend + type), then add one entry here, the matching `FileDisplayField`
+ * union member, and a `FileSortKey` entry if it should also be sortable.
+ */
+interface FileDisplayFieldDef {
+  key: FileDisplayField;
+  label: string;
+  get: (entry: FileEntry) => string | null | undefined;
+}
+
+const FILE_DISPLAY_FIELDS: FileDisplayFieldDef[] = [
+  { key: "created", label: "Created", get: (e) => (e.created_at_ms != null ? formatTimestamp(e.created_at_ms) : null) },
+  { key: "modified", label: "Modified", get: (e) => (e.modified_at_ms != null ? formatTimestamp(e.modified_at_ms) : null) },
+  { key: "publication", label: "Publication date", get: (e) => e.publication_date },
+  { key: "size", label: "Size", get: (e) => formatSize(e.size_bytes) },
+];
+
+const SORT_KEYS: FileSortKey[] = ["filename", "created", "modified", "publication", "size"];
+const SORT_KEY_LABELS: Record<FileSortKey, string> = {
+  filename: "Name",
+  created: "Created",
+  modified: "Modified",
+  publication: "Publication date",
+  size: "Size",
+};
+
+function displayFieldValue(entry: FileEntry, field: FileDisplayField): string | null {
+  const def = FILE_DISPLAY_FIELDS.find((f) => f.key === field);
+  const value = def?.get(entry);
+  return value && value.trim() !== "" ? value : null;
+}
+
+function compareFileNames(a: string, b: string): number {
+  return fileName(a).localeCompare(fileName(b), undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+function compareOptionalNumber(a: number | null | undefined, b: number | null | undefined): number {
+  const aMissing = a == null;
+  const bMissing = b == null;
+  if (aMissing && bMissing) return 0;
+  if (aMissing) return 1;
+  if (bMissing) return -1;
+  return a - b;
+}
+
+function isBlank(value: string | null | undefined): boolean {
+  return value == null || value === "";
+}
+
+function compareOptionalString(a: string | null | undefined, b: string | null | undefined): number {
+  const aMissing = isBlank(a);
+  const bMissing = isBlank(b);
+  if (aMissing && bMissing) return 0;
+  if (aMissing) return 1;
+  if (bMissing) return -1;
+  return (a as string).localeCompare(b as string);
+}
+
+function sortFileEntries<T extends FileEntry>(
+  entries: T[],
+  key: FileSortKey,
+  direction: FileSortDirection,
+): T[] {
+  return [...entries].sort((a, b) => {
+    let result = 0;
+    if (key === "filename") {
+      result = compareFileNames(a.path, b.path);
+      if (direction === "desc") result *= -1;
+    } else if (key === "size") {
+      result = a.size_bytes - b.size_bytes;
+      if (direction === "desc") result *= -1;
+    } else if (key === "publication") {
+      result = compareOptionalString(a.publication_date, b.publication_date);
+      // Keep files with no publication date last regardless of direction.
+      if (direction === "desc" && !isBlank(a.publication_date) && !isBlank(b.publication_date)) {
+        result *= -1;
+      }
+    } else {
+      result = compareOptionalNumber(
+        key === "created" ? a.created_at_ms : a.modified_at_ms,
+        key === "created" ? b.created_at_ms : b.modified_at_ms,
+      );
+      if (
+        direction === "desc" &&
+        (key === "created" ? a.created_at_ms : a.modified_at_ms) != null &&
+        (key === "created" ? b.created_at_ms : b.modified_at_ms) != null
+      ) {
+        result *= -1;
+      }
+    }
+
+    return result || compareFileNames(a.path, b.path) || a.path.localeCompare(b.path);
+  });
 }
 
 function isSelected(row: Row, selectedMatch: MatchRef | null): boolean {
@@ -64,6 +191,8 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
   const searching = useSearchStore((s) => s.searching);
   const hasQuery = useSearchStore((s) => s.hasQuery);
   const selectedMatch = useSearchStore((s) => s.selectedMatch);
+  const replaySearch = useSearchStore((s) => s.replaySearch);
+  const clearPreview = useSearchStore((s) => s.clearPreview);
   const { addToast } = useToasts();
 
   const fileList = useSettingsStore((s) => s.fileList);
@@ -71,11 +200,23 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
   const filterText = useSettingsStore((s) => s.filterText);
   const setFilterText = useSettingsStore((s) => s.setFilterText);
   const indexing = useSettingsStore((s) => s.indexing);
+  const settings = useSettingsStore((s) => s.settings);
+  const refreshFileList = useSettingsStore((s) => s.refreshFileList);
+  const fileSortKey = useSettingsStore((s) => s.fileSortKey);
+  const fileSortDirection = useSettingsStore((s) => s.fileSortDirection);
+  const setFileSortKey = useSettingsStore((s) => s.setFileSortKey);
+  const setFileSortDirection = useSettingsStore((s) => s.setFileSortDirection);
+  const fileDisplayFields = useSettingsStore((s) => s.fileDisplayFields);
+  const toggleFileDisplayField = useSettingsStore((s) => s.toggleFileDisplayField);
   const { menu, openMenu, closeMenu } = useContextMenu<ContextMenuTarget>();
 
   const parentRef = useRef<HTMLDivElement>(null);
+  const renameInputRef = useRef<HTMLInputElement>(null);
+  const sortMenuTriggerRef = useRef<HTMLButtonElement>(null);
+  const [sortMenuOpen, setSortMenuOpen] = useState(false);
   const [expandedFiles, setExpandedFiles] = useState<Set<number>>(new Set());
   const [showOmittedFiles, setShowOmittedFiles] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<{ path: string; name: string } | null>(null);
 
   useEffect(() => {
     if (results.length === 0) setExpandedFiles(new Set());
@@ -90,7 +231,18 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
     addToast(stats.errors[0], { type: "error" });
   }, [addToast, stats]);
 
-  const filteredFileList = fileList;
+  useEffect(() => {
+    if (!renameTarget) return;
+    requestAnimationFrame(() => {
+      const input = renameInputRef.current;
+      if (!input) return;
+      input.focus();
+      input.setSelectionRange(0, editableNameEnd(renameTarget.name));
+    });
+  }, [renameTarget?.path]);
+
+  const sortedFileList = sortFileEntries(fileList, fileSortKey, fileSortDirection);
+  const sortedOmittedFileList = sortFileEntries(omittedFileList, fileSortKey, fileSortDirection);
   const rows = buildRows(results, expandedFiles);
   const onToast = (message: string, type: "success" | "error") => addToast(message, { type });
 
@@ -105,10 +257,96 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
         target,
         api,
         capabilities: { canOpenInFileManager: isTauri },
+        settings,
         onToast,
+        onRenameRequest: (path) => setRenameTarget({ path, name: fileName(path) }),
       }),
     });
   };
+
+  const handleRenameSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!renameTarget) return;
+
+    const oldPath = renameTarget.path;
+    const oldName = fileName(oldPath);
+    const nextName = renameTarget.name.trim();
+    if (nextName === oldName) {
+      setRenameTarget(null);
+      return;
+    }
+
+    const validationError = validateNewFileName(nextName);
+    if (validationError) {
+      onToast(validationError, "error");
+      return;
+    }
+
+    try {
+      await api.renameFile(oldPath, nextName);
+      if (selectedMatch?.path === oldPath) {
+        clearPreview();
+      }
+      if (hasQuery) {
+        await replaySearch();
+      } else {
+        refreshFileList();
+      }
+      setRenameTarget(null);
+      onToast("File renamed", "success");
+    } catch (error) {
+      console.error("Failed to rename file:", error);
+      onToast("Failed to rename file", "error");
+    }
+  };
+
+  const renameDialog = renameTarget && (
+    <div className="fixed inset-0 z-[160] flex items-center justify-center bg-black/35 px-4">
+      <form
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="rename-file-title"
+        onSubmit={handleRenameSubmit}
+        className="w-full max-w-sm rounded-lg border border-[var(--border-main)] bg-[var(--bg-app)] p-3 shadow-2xl"
+      >
+        <div id="rename-file-title" className="mb-2 text-sm font-semibold text-[var(--text-main)]">
+          Rename file
+        </div>
+        <input
+          ref={renameInputRef}
+          aria-label="File name"
+          value={renameTarget.name}
+          onChange={(event) =>
+            setRenameTarget((target) =>
+              target ? { ...target, name: event.target.value } : target,
+            )
+          }
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              setRenameTarget(null);
+            }
+          }}
+          className="mb-3 h-8 w-full rounded border border-[var(--border-main)] bg-[var(--bg-active)] px-2 text-sm text-[var(--text-main)] outline-none focus:border-[var(--accent-blue)]"
+        />
+        <div className="flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={() => setRenameTarget(null)}
+            className="rounded border border-[var(--border-main)] px-3 py-1.5 text-xs text-[var(--text-muted)] hover:bg-[var(--bg-hover)]"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            className="rounded bg-[var(--accent-blue)] px-3 py-1.5 text-xs font-medium text-white hover:opacity-90"
+          >
+            Rename
+          </button>
+        </div>
+      </form>
+    </div>
+  );
 
   const rowVirtualizer = useVirtualizer({
     count: rows.length,
@@ -133,8 +371,8 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
       const search = filterText.toLowerCase();
       return entry.path.toLowerCase().includes(search);
     };
-    const filteredVisibleFiles = filteredFileList.filter(matchesFilter);
-    const filteredOmittedFiles = omittedFileList.filter((entry) => matchesFilter(entry));
+    const filteredVisibleFiles = sortedFileList.filter(matchesFilter);
+    const filteredOmittedFiles = sortedOmittedFileList.filter((entry) => matchesFilter(entry));
 
     return (
       <div className="flex flex-col h-full overflow-hidden relative bg-[var(--bg-app)]">
@@ -150,11 +388,29 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
             />
           </div>
         )}
-        <div className="px-3 py-1.5 text-xs text-[var(--text-muted)] border-b border-[var(--border-main)] flex-shrink-0 flex items-center gap-2">
-          <div className="flex-shrink-0 whitespace-nowrap">
-            {indexing ? "Indexing..." : `${filteredFileList.length} file${filteredFileList.length === 1 ? "" : "s"}`}
+        <div className="px-2 py-1.5 text-xs text-[var(--text-muted)] border-b border-[var(--border-main)] flex-shrink-0 flex items-center gap-1">
+          <div
+            className="flex flex-shrink-0 items-center gap-1 whitespace-nowrap"
+            aria-label={
+              indexing
+                ? "Indexing files"
+                : `${sortedFileList.length} file${sortedFileList.length === 1 ? "" : "s"}`
+            }
+            title={
+              indexing
+                ? "Indexing files"
+                : `${sortedFileList.length} file${sortedFileList.length === 1 ? "" : "s"}`
+            }
+          >
+            {indexing ? (
+              "Indexing..."
+            ) : (
+              <>
+                <File size={12} aria-hidden="true" />
+                <span className="tabular-nums">{sortedFileList.length}</span>
+              </>
+            )}
           </div>
-          <span className="text-[var(--text-dim)]">/</span>
           <input
             type="text"
             placeholder="Filter files..."
@@ -162,12 +418,61 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
             onChange={(e) => setFilterText(e.target.value)}
             className="flex-1 min-w-0 bg-transparent border-none outline-none text-[11px] text-[var(--text-main)] placeholder-[var(--text-dim)]"
           />
+          <button
+            ref={sortMenuTriggerRef}
+            type="button"
+            aria-label="Sort and column visibility"
+            aria-haspopup="menu"
+            aria-expanded={sortMenuOpen}
+            onClick={() => setSortMenuOpen((open) => !open)}
+            className="flex h-6 flex-shrink-0 items-center gap-0.5 rounded border border-[var(--border-main)] bg-[var(--bg-active)] px-1 text-[11px] text-[var(--text-main)] outline-none hover:bg-[var(--bg-hover)]"
+          >
+            <span className="max-w-[68px] truncate">{SORT_KEY_LABELS[fileSortKey]}</span>
+            <ChevronDown size={10} aria-hidden="true" />
+          </button>
+          <SortVisibilityMenu
+            anchorRef={sortMenuTriggerRef}
+            open={sortMenuOpen}
+            onClose={() => setSortMenuOpen(false)}
+            sortKey={fileSortKey}
+            onSortKeyChange={setFileSortKey}
+            displayFields={fileDisplayFields}
+            onToggleDisplayField={toggleFileDisplayField}
+          />
+          <button
+            type="button"
+            aria-label="Toggle file sort direction"
+            title={`Sort ${fileSortDirection === "asc" ? "ascending" : "descending"}`}
+            onClick={() => setFileSortDirection(fileSortDirection === "asc" ? "desc" : "asc")}
+            className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-main)] hover:bg-[var(--bg-hover)]"
+          >
+            {fileSortDirection === "asc" ? (
+              <ArrowUp size={12} aria-hidden="true" />
+            ) : (
+              <ArrowDown size={12} aria-hidden="true" />
+            )}
+          </button>
+          <button
+            type="button"
+            aria-label="Refresh file metadata"
+            title="Refresh metadata (re-derive titles, publication dates, Zotero)"
+            onClick={() => {
+              void api
+                .refreshFileMetadata()
+                .catch(() => {})
+                .finally(() => useSettingsStore.getState().refreshFileList());
+            }}
+            className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-main)] hover:bg-[var(--bg-hover)]"
+          >
+            <RefreshCw size={12} aria-hidden="true" />
+          </button>
         </div>
         <div className="flex-1 overflow-y-auto">
           {filteredVisibleFiles.map((entry) => (
             <FileEntryRow
               key={entry.path}
               entry={entry}
+              displayFields={fileDisplayFields}
               selected={selectedMatch?.path === entry.path}
               onClick={() => onFileClick(entry.path)}
               onContextMenu={(event) =>
@@ -178,7 +483,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
                 })}
             />
           ))}
-          {filteredVisibleFiles.length === 0 && filteredFileList.length > 0 && (
+          {filteredVisibleFiles.length === 0 && sortedFileList.length > 0 && (
             <div className="px-3 py-8 text-center text-xs text-[var(--text-dim)] italic">
               No files match "{filterText}"
             </div>
@@ -213,6 +518,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
           )}
         </div>
         <ContextMenu menu={menu} onClose={closeMenu} />
+        {renameDialog}
       </div>
     );
   }
@@ -330,6 +636,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
       </div>
       </div>
       <ContextMenu menu={menu} onClose={closeMenu} />
+      {renameDialog}
     </div>
   );
 }
@@ -356,7 +663,7 @@ function FileHeader({
 }) {
   return (
     <div
-      className="flex items-center gap-2 px-3 py-2 bg-[var(--bg-sidebar)] border-y border-[var(--border-main)] cursor-pointer hover:bg-[var(--bg-hover)] transition-colors"
+      className="flex select-none items-center gap-2 px-3 py-2 bg-[var(--bg-sidebar)] border-y border-[var(--border-main)] cursor-pointer hover:bg-[var(--bg-hover)] transition-colors"
       onClick={onClick}
       onContextMenu={onContextMenu}
     >
@@ -373,38 +680,153 @@ function ExpandStrip({ remaining, onExpand }: { remaining: number; onExpand: () 
   return (
     <button
       onClick={onExpand}
-      className="w-full py-1 text-[10px] text-[var(--accent-blue)] hover:bg-[var(--accent-blue-muted)] transition-colors border-b border-[var(--border-main)]"
+      className="w-full select-none py-1 text-[10px] text-[var(--accent-blue)] hover:bg-[var(--accent-blue-muted)] transition-colors border-b border-[var(--border-main)]"
     >
       Show {remaining} more matches...
     </button>
   );
 }
 
+function SortVisibilityMenu({
+  anchorRef,
+  open,
+  onClose,
+  sortKey,
+  onSortKeyChange,
+  displayFields,
+  onToggleDisplayField,
+}: {
+  anchorRef: React.RefObject<HTMLButtonElement | null>;
+  open: boolean;
+  onClose: () => void;
+  sortKey: FileSortKey;
+  onSortKeyChange: (key: FileSortKey) => void;
+  displayFields: FileDisplayField[];
+  onToggleDisplayField: (field: FileDisplayField) => void;
+}) {
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (!menuRef.current?.contains(target) && !anchorRef.current?.contains(target)) {
+        onClose();
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open, onClose, anchorRef]);
+
+  useEffect(() => {
+    if (!open) setPosition(null);
+  }, [open]);
+
+  useLayoutEffect(() => {
+    if (!open || !anchorRef.current || !menuRef.current) return;
+
+    const anchorRect = anchorRef.current.getBoundingClientRect();
+    const menuRect = menuRef.current.getBoundingClientRect();
+    const margin = 8;
+    const x = Math.min(
+      Math.max(anchorRect.right - menuRect.width, margin),
+      window.innerWidth - menuRect.width - margin,
+    );
+    const y = Math.min(anchorRect.bottom + 4, window.innerHeight - menuRect.height - margin);
+
+    setPosition({ x, y });
+  }, [open, anchorRef]);
+
+  if (!open) return null;
+
+  return createPortal(
+    <div
+      ref={menuRef}
+      role="menu"
+      aria-label="Sort and column visibility"
+      className="fixed z-[150] w-48 rounded-lg border border-[var(--border-main)] bg-[var(--bg-app)] p-1 shadow-2xl"
+      style={{
+        left: `${position?.x ?? 0}px`,
+        top: `${position?.y ?? 0}px`,
+        visibility: position ? "visible" : "hidden",
+      }}
+    >
+      {SORT_KEYS.map((key) => {
+        const isFilename = key === "filename";
+        const checked = isFilename || displayFields.includes(key as FileDisplayField);
+        return (
+          <div
+            key={key}
+            role="menuitemradio"
+            aria-checked={sortKey === key}
+            onClick={() => onSortKeyChange(key)}
+            className={`flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-[var(--bg-hover)] ${
+              sortKey === key ? "text-[var(--accent-blue)]" : "text-[var(--text-main)]"
+            }`}
+          >
+            <input
+              type="checkbox"
+              aria-label={`Show ${SORT_KEY_LABELS[key]} column`}
+              checked={checked}
+              disabled={isFilename}
+              onClick={(event) => event.stopPropagation()}
+              onChange={() => onToggleDisplayField(key as FileDisplayField)}
+              className="h-3 w-3 flex-shrink-0 rounded border-[var(--border-strong)] disabled:opacity-50"
+            />
+            <span className="flex-1 truncate">{SORT_KEY_LABELS[key]}</span>
+          </div>
+        );
+      })}
+    </div>,
+    document.body,
+  );
+}
+
 function FileEntryRow({
   entry,
+  displayFields,
   selected,
   onClick,
   onContextMenu,
 }: {
   entry: FileEntry;
+  displayFields: FileDisplayField[];
   selected: boolean;
   onClick: () => void;
   onContextMenu: (event: React.MouseEvent) => void;
 }) {
+  const activeFields = FILE_DISPLAY_FIELDS.filter((f) => displayFields.includes(f.key));
   return (
     <button
       onClick={onClick}
       onContextMenu={onContextMenu}
-      className={`w-full flex items-baseline gap-2 px-3 py-1.5 text-left hover:bg-[var(--bg-hover)] transition-colors selectable ${
+      className={`w-full flex select-none items-baseline gap-2 px-3 py-1.5 text-left hover:bg-[var(--bg-hover)] transition-colors ${
         selected ? "bg-[var(--bg-active)]" : ""
       }`}
     >
       <span className="text-sm font-medium text-[var(--text-main)] truncate">{fileName(entry.path)}</span>
       <span className="text-xs text-[var(--text-muted)] truncate flex-1">{dirName(entry.path)}</span>
-      <span className="text-xs text-[var(--text-muted)] flex-shrink-0 font-mono">
-        {entry.file_type === "Pdf" && <span className="text-[var(--accent-blue)] mr-1.5">PDF</span>}
-        {formatSize(entry.size_bytes)}
-      </span>
+      {activeFields.map((field) => (
+        <span
+          key={field.key}
+          className="text-xs text-[var(--text-muted)] flex-shrink-0 font-mono tabular-nums"
+        >
+          {displayFieldValue(entry, field.key) ?? "—"}
+        </span>
+      ))}
+      {entry.file_type === "Pdf" && (
+        <span className="text-xs text-[var(--accent-blue)] flex-shrink-0 font-mono">PDF</span>
+      )}
     </button>
   );
 }
@@ -426,7 +848,7 @@ function MatchRow({
     <button
       onClick={onClick}
       onContextMenu={onContextMenu}
-      className={`w-full flex items-start gap-2 px-3 py-1 text-left hover:bg-[var(--bg-hover)] transition-colors selectable ${
+      className={`w-full flex select-none items-start gap-2 px-3 py-1 text-left hover:bg-[var(--bg-hover)] transition-colors ${
         selected ? "bg-[var(--bg-active)]" : ""
       }`}
     >

@@ -72,6 +72,9 @@ export interface Bookmark {
   quote: string;
   created_at: string;
   note?: string | null;
+  /** Per-line rectangles (page coordinates) covering exactly the selected text.
+   *  Empty for text bookmarks. */
+  rects: BoundingBox[];
 }
 
 export interface NewBookmark {
@@ -79,6 +82,7 @@ export interface NewBookmark {
   origin: SourceOrigin;
   quote: string;
   note?: string | null;
+  rects: BoundingBox[];
 }
 
 export interface BoundingBox {
@@ -111,6 +115,30 @@ export interface DocumentMetadata {
   created_at: string | null;
 }
 
+export type IntegrationState = "disabled" | "zotero_down" | "local_api_disabled" | "ready";
+
+export interface IntegrationStatus {
+  id: string;
+  enabled: boolean;
+  state: IntegrationState;
+  message: string;
+  version: string | null;
+}
+
+export type AddOutcome =
+  | { status: "added"; item_key: string | null }
+  | { status: "already_present"; item_key: string }
+  | { status: "possible_duplicate"; item_key: string; message: string };
+
+export interface CitationResult {
+  /** In-text citation (HTML from Zotero), e.g. "(Smith 2020)". */
+  citation: string | null;
+  /** Full bibliography entry (HTML from Zotero). */
+  bibliography: string | null;
+  /** True when resolved by a weak signal (filename/title); may be the wrong work. */
+  low_confidence: boolean;
+}
+
 export type ViewerMetadataStatus = "idle" | "loading" | "ready" | "failed";
 
 export interface FileEntry {
@@ -118,6 +146,18 @@ export interface FileEntry {
   size_bytes: number;
   file_type: FileType;
   extension: string;
+  created_at_ms?: number | null;
+  modified_at_ms?: number | null;
+  /** Document publication date ("YYYY-MM") from cached extracted metadata.
+   *  Absent until the metadata cache has processed this file. */
+  publication_date?: string | null;
+}
+
+/** Payload entry of the `file-metadata-updated` event: cached document metadata
+ *  filled in for a file after its background extraction completes. */
+export interface FileMetadataUpdate {
+  path: string;
+  publication_date: string | null;
 }
 
 export interface FileListResponse {
@@ -130,6 +170,11 @@ export interface OmittedFileEntry extends FileEntry {
 }
 
 export type OmittedFileReason = "TooLarge" | "UnsupportedExtension";
+export type FileSortKey = "filename" | "created" | "modified" | "size" | "publication";
+/** Optional document-metadata field that can be shown as a column in the file
+ *  list. Extend alongside FILE_DISPLAY_FIELDS as FileEntry gains more fields. */
+export type FileDisplayField = "created" | "modified" | "size" | "publication";
+export type FileSortDirection = "asc" | "desc";
 
 /** HuggingFace model code, e.g. "BAAI/bge-base-en-v1.5". */
 export type EmbedderModel = string;
@@ -172,6 +217,16 @@ export interface SemanticSettings {
   worker_timeout_secs: number;
 }
 
+export interface ZoteroSettings {
+  enabled: boolean;
+  base_url: string;
+  citation_style: string;
+}
+
+export interface IntegrationsSettings {
+  zotero: ZoteroSettings;
+}
+
 export interface WorkerStatus {
   active: boolean;
   engine: string | null;
@@ -191,10 +246,14 @@ export interface Settings {
   theme: Theme;
   search_prefer_semantic: boolean;
   semantic: SemanticSettings;
+  integrations: IntegrationsSettings;
   supported_extensions: string[];
   /** 0 = unlimited */
   max_results: number;
   bookmarks_dock: BookmarkDock;
+  file_sort_key?: FileSortKey;
+  file_sort_direction?: FileSortDirection;
+  file_display_fields?: FileDisplayField[];
 }
 
 export type Theme = "System" | "Light" | "Dark";

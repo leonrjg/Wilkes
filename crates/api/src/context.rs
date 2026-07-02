@@ -18,6 +18,9 @@ use wilkes_core::embed::worker::manager::{
 use wilkes_core::embed::{dispatch, Embedder};
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
+use wilkes_core::integrations::zotero::model::ZoteroItem;
+use wilkes_core::integrations::zotero::ZoteroClient;
+use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
     Bookmark, DocumentMetadata, EmbedderModel, IndexStatus, IndexingConfig, NewBookmark,
@@ -106,6 +109,9 @@ pub struct AppContext {
     pub bookmarks_path: PathBuf,
     embedder: PLMutex<Option<Arc<dyn Embedder>>>,
     index: PLMutex<Arc<Mutex<Option<SemanticIndex>>>>,
+    /// Persistent cache of extracted document metadata, opened lazily. Shared
+    /// with the index watcher so renames re-key rather than re-extract.
+    metadata_cache: PLMutex<Option<Arc<Mutex<MetadataCache>>>>,
     watcher: PLMutex<Option<IndexWatcher>>,
     embed_task: PLMutex<Option<EmbedTaskHandle>>,
     embed_cancel_in_progress: AtomicBool,
@@ -134,6 +140,7 @@ impl AppContext {
             settings_path,
             embedder: PLMutex::new(None),
             index: PLMutex::new(Arc::new(Mutex::new(None))),
+            metadata_cache: PLMutex::new(None),
             watcher: PLMutex::new(None),
             embed_task: PLMutex::new(None),
             embed_cancel_in_progress: AtomicBool::new(false),
@@ -213,12 +220,157 @@ impl AppContext {
         crate::commands::bookmarks::remove(&self.bookmarks_path, id).await
     }
 
+    pub async fn update_bookmark_note(
+        &self,
+        id: &str,
+        note: Option<String>,
+    ) -> anyhow::Result<Bookmark> {
+        let _guard = self.bookmarks_lock.lock().await;
+        crate::commands::bookmarks::update_note(&self.bookmarks_path, id, note).await
+    }
+
     pub async fn list_files(
         &self,
         root: PathBuf,
     ) -> anyhow::Result<wilkes_core::types::FileListResponse> {
         let s = self.get_settings().await;
-        crate::commands::files::list_files(root, s.supported_extensions, s.max_file_size).await
+        let mut response = crate::commands::files::list_files(
+            root,
+            s.supported_extensions.clone(),
+            s.max_file_size,
+        )
+        .await?;
+
+        // Populate document metadata (e.g. publication date) from the cache and
+        // schedule background extraction for anything not yet cached.
+        let Some(cache) = self.metadata_cache() else {
+            return Ok(response);
+        };
+
+        let mut misses: Vec<PathBuf> = Vec::new();
+        if let Ok(guard) = cache.lock() {
+            for entry in response.files.iter_mut() {
+                let Some(identity) = entry_identity(entry) else {
+                    continue;
+                };
+                match guard.get_valid(&entry.path, identity) {
+                    Ok(Some(meta)) => entry.publication_date = meta.created_at,
+                    Ok(None) => misses.push(entry.path.clone()),
+                    Err(e) => error!("metadata cache read {}: {e:#}", entry.path.display()),
+                }
+            }
+        }
+
+        if !misses.is_empty() {
+            self.spawn_metadata_fill(misses, s, cache);
+        }
+
+        Ok(response)
+    }
+
+    /// Lazily open (once) the shared document-metadata cache. Returns `None` if
+    /// it cannot be opened; callers then simply skip metadata population.
+    fn metadata_cache(&self) -> Option<Arc<Mutex<MetadataCache>>> {
+        let mut guard = self.metadata_cache.lock();
+        if let Some(cache) = guard.as_ref() {
+            return Some(Arc::clone(cache));
+        }
+        match MetadataCache::open(&self.data_dir) {
+            Ok(cache) => {
+                let arc = Arc::new(Mutex::new(cache));
+                *guard = Some(Arc::clone(&arc));
+                Some(arc)
+            }
+            Err(e) => {
+                error!("metadata cache open failed: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Extract document metadata for the given paths off the request path,
+    /// upsert it into the cache, and emit `file-metadata-updated` so the UI can
+    /// fill in and re-sort. A file whose content matches a stale cache row
+    /// (a rename) is re-keyed instead of re-extracted.
+    fn spawn_metadata_fill(
+        &self,
+        paths: Vec<PathBuf>,
+        settings: Settings,
+        cache: Arc<Mutex<MetadataCache>>,
+    ) {
+        let events = Arc::clone(&self.events);
+        tokio::spawn(async move {
+            // Pass 1: file-based extraction (blocking). Emits immediately so the
+            // list gets publication dates fast, mirroring the on-open viewer's
+            // fast first paint before the Zotero upgrade.
+            let exts = settings.supported_extensions.clone();
+            let cache1 = Arc::clone(&cache);
+            let pass1 = tokio::task::spawn_blocking(move || {
+                let registry = crate::commands::metadata::build_registry(exts);
+                let mut eligible: Vec<(PathBuf, FileIdentity, DocumentMetadata)> = Vec::new();
+                let mut updates: Vec<serde_json::Value> = Vec::new();
+                for path in paths {
+                    let Some(identity) = fs_identity(&path) else {
+                        continue;
+                    };
+                    match extract_or_rekey(&cache1, &registry, &path, identity) {
+                        FillOutcome::Extracted(metadata) => {
+                            updates.push(metadata_update_json(&path, &metadata));
+                            eligible.push((path, identity, metadata));
+                        }
+                        // A rename hit already carries composed metadata (whose
+                        // Zotero source, if any, was preserved by re-keying), so
+                        // it is not eligible for a fresh Zotero resolve.
+                        FillOutcome::Renamed(metadata) => {
+                            updates.push(metadata_update_json(&path, &metadata));
+                        }
+                    }
+                }
+                (eligible, updates)
+            })
+            .await;
+
+            let (eligible, updates) = match pass1 {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("metadata fill task failed: {e}");
+                    return;
+                }
+            };
+            if !updates.is_empty() {
+                events.emit("file-metadata-updated", serde_json::json!(updates));
+            }
+
+            // Pass 2: authoritative Zotero override (async). Fetch the attachment
+            // list once for the whole batch, then resolve each file locally.
+            if !settings.integrations.zotero.enabled || eligible.is_empty() {
+                return;
+            }
+            let client = ZoteroClient::from_settings(&settings.integrations.zotero);
+            let attachments = match client.attachment_items().await {
+                Ok(a) => a,
+                Err(e) => {
+                    info!("metadata fill: zotero attachment fetch failed: {e:#}");
+                    return;
+                }
+            };
+            let mut z_updates: Vec<serde_json::Value> = Vec::new();
+            for (path, identity, file_based) in eligible {
+                if let Some(z) =
+                    zotero_override_for(&client, &path, &file_based, &attachments).await
+                {
+                    if let Ok(guard) = cache.lock() {
+                        if let Err(e) = guard.upsert(&path, identity, &z, MetadataSource::Zotero) {
+                            error!("metadata cache zotero upsert {}: {e:#}", path.display());
+                        }
+                    }
+                    z_updates.push(metadata_update_json(&path, &z));
+                }
+            }
+            if !z_updates.is_empty() {
+                events.emit("file-metadata-updated", serde_json::json!(z_updates));
+            }
+        });
     }
 
     pub async fn open_file(&self, path: PathBuf) -> anyhow::Result<PreviewData> {
@@ -229,12 +381,70 @@ impl AppContext {
         crate::commands::files::open_file(path, s.supported_extensions).await
     }
 
+    pub async fn rename_file(&self, path: PathBuf, new_name: String) -> anyhow::Result<PathBuf> {
+        if !is_under(&path, &self.data_dir) {
+            anyhow::bail!("Access denied: path outside data directory");
+        }
+        crate::commands::files::rename_file(path, new_name).await
+    }
+
     pub async fn get_file_metadata(&self, path: PathBuf) -> anyhow::Result<DocumentMetadata> {
         if !is_under(&path, &self.data_dir) {
             anyhow::bail!("Access denied: path outside data directory");
         }
         let s = self.get_settings().await;
         crate::commands::metadata::get_file_metadata(path, s.supported_extensions).await
+    }
+
+    pub async fn zotero_status(&self) -> anyhow::Result<wilkes_core::types::IntegrationStatus> {
+        let s = self.get_settings().await;
+        crate::commands::integrations::zotero::zotero_status(s).await
+    }
+
+    /// Authoritative document metadata: file-based extraction overridden by the
+    /// Zotero library record when the file resolves to an item. This is the
+    /// single owner of that composition — both the on-open viewer and the
+    /// background tabulation resolve through it (the fill batches the Zotero
+    /// attachment fetch, but composes identically).
+    pub async fn resolve_file_metadata(&self, path: PathBuf) -> anyhow::Result<DocumentMetadata> {
+        if !is_under(&path, &self.data_dir) {
+            anyhow::bail!("Access denied: path outside data directory");
+        }
+        let s = self.get_settings().await;
+        crate::commands::integrations::zotero::resolve_file_metadata(s, path).await
+    }
+
+    /// Clear the entire metadata cache so the next listing re-derives everything
+    /// (file-based + Zotero). Backs the manual "refresh metadata" action.
+    pub async fn refresh_file_metadata(&self) -> anyhow::Result<()> {
+        if let Some(cache) = self.metadata_cache() {
+            if let Ok(guard) = cache.lock() {
+                guard.clear()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn zotero_add_item(
+        &self,
+        path: PathBuf,
+    ) -> anyhow::Result<wilkes_core::types::AddOutcome> {
+        if !is_under(&path, &self.data_dir) {
+            anyhow::bail!("Access denied: path outside data directory");
+        }
+        let s = self.get_settings().await;
+        crate::commands::integrations::zotero::zotero_add_item(s, path).await
+    }
+
+    pub async fn zotero_generate_citation(
+        &self,
+        path: PathBuf,
+    ) -> anyhow::Result<wilkes_core::types::CitationResult> {
+        if !is_under(&path, &self.data_dir) {
+            anyhow::bail!("Access denied: path outside data directory");
+        }
+        let s = self.get_settings().await;
+        crate::commands::integrations::zotero::zotero_generate_citation(s, path).await
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -333,8 +543,85 @@ impl AppContext {
         &self,
         patch: serde_json::Value,
     ) -> anyhow::Result<wilkes_core::types::Settings> {
-        let _lock = self.settings_lock.lock().await;
-        update_settings(&self.settings_path, patch).await
+        let (before, updated) = {
+            let _lock = self.settings_lock.lock().await;
+            let before = get_settings(&self.settings_path).await.unwrap_or_default();
+            let updated = update_settings(&self.settings_path, patch).await?;
+            (before, updated)
+        };
+        self.on_zotero_settings_maybe_changed(&before, &updated);
+        Ok(updated)
+    }
+
+    /// React to a change in Zotero configuration by keeping the metadata cache
+    /// coherent with the current integration state: drop now-stale Zotero rows,
+    /// and, if Zotero is (still/now) enabled, re-resolve file-based rows into
+    /// authoritative Zotero rows in the background.
+    fn on_zotero_settings_maybe_changed(&self, before: &Settings, after: &Settings) {
+        let z_before = &before.integrations.zotero;
+        let z_after = &after.integrations.zotero;
+        let relevant_changed =
+            z_before.enabled != z_after.enabled || z_before.base_url != z_after.base_url;
+        if !relevant_changed {
+            return;
+        }
+
+        if let Some(cache) = self.metadata_cache() {
+            if let Ok(guard) = cache.lock() {
+                if let Err(e) = guard.invalidate_zotero() {
+                    error!("metadata cache invalidate_zotero: {e:#}");
+                }
+            }
+        }
+
+        if z_after.enabled {
+            self.spawn_zotero_backfill(after.clone());
+        }
+    }
+
+    /// Re-resolve every file-sourced cache row against Zotero and upgrade the
+    /// matches to authoritative Zotero rows. Runs after Zotero becomes usable so
+    /// already-tabulated files gain library data without re-extraction.
+    fn spawn_zotero_backfill(&self, settings: Settings) {
+        let Some(cache) = self.metadata_cache() else {
+            return;
+        };
+        let events = Arc::clone(&self.events);
+        tokio::spawn(async move {
+            let rows = match cache.lock() {
+                Ok(guard) => guard.list_by_source(MetadataSource::File).unwrap_or_default(),
+                Err(_) => return,
+            };
+            if rows.is_empty() {
+                return;
+            }
+            let client = ZoteroClient::from_settings(&settings.integrations.zotero);
+            let attachments = match client.attachment_items().await {
+                Ok(a) => a,
+                Err(e) => {
+                    info!("zotero backfill: attachment fetch failed: {e:#}");
+                    return;
+                }
+            };
+            let mut updates: Vec<serde_json::Value> = Vec::new();
+            for row in rows {
+                if let Some(z) =
+                    zotero_override_for(&client, &row.path, &row.metadata, &attachments).await
+                {
+                    if let Ok(guard) = cache.lock() {
+                        if let Err(e) =
+                            guard.upsert(&row.path, row.identity, &z, MetadataSource::Zotero)
+                        {
+                            error!("zotero backfill upsert {}: {e:#}", row.path.display());
+                        }
+                    }
+                    updates.push(metadata_update_json(&row.path, &z));
+                }
+            }
+            if !updates.is_empty() {
+                events.emit("file-metadata-updated", serde_json::json!(updates));
+            }
+        });
     }
 
     pub fn is_semantic_ready(&self) -> bool {
@@ -627,6 +914,7 @@ impl AppContext {
         match IndexWatcher::start(
             root_path,
             index_arc,
+            self.metadata_cache(),
             Arc::new(registry),
             embedder,
             indexing,
@@ -1023,6 +1311,7 @@ impl AppContext {
     fn start_index_watcher_with<F>(
         root: PathBuf,
         index_arc: Arc<Mutex<Option<SemanticIndex>>>,
+        cache: Option<Arc<Mutex<MetadataCache>>>,
         registry: Arc<ExtractorRegistry>,
         embedder: Arc<dyn Embedder>,
         indexing: IndexingConfig,
@@ -1032,6 +1321,7 @@ impl AppContext {
         F: FnOnce(
             PathBuf,
             Arc<Mutex<Option<SemanticIndex>>>,
+            Option<Arc<Mutex<MetadataCache>>>,
             Arc<ExtractorRegistry>,
             Arc<dyn Embedder>,
             IndexingConfig,
@@ -1041,7 +1331,7 @@ impl AppContext {
     {
         let ev1: Box<dyn Fn() + Send + Sync> = Box::new(|| {});
         let ev2: Box<dyn Fn() + Send + Sync> = Box::new(|| {});
-        start(root, index_arc, registry, embedder, indexing, ev1, ev2)
+        start(root, index_arc, cache, registry, embedder, indexing, ev1, ev2)
     }
 
     fn prepare_restore_state_plan(
@@ -1221,10 +1511,11 @@ impl AppContext {
             match Self::start_index_watcher_with(
                 root,
                 index_arc,
+                self.metadata_cache(),
                 Arc::new(registry),
                 embedder,
                 indexing,
-                |root, index_arc, registry, embedder, indexing, on_reindex, on_done| {
+                |root, index_arc, cache, registry, embedder, indexing, on_reindex, on_done| {
                     let ev1 = Arc::clone(&self.events);
                     let ev2 = Arc::clone(&self.events);
                     let on_reindex = move || {
@@ -1236,7 +1527,7 @@ impl AppContext {
                         ev2.emit("manager-event", serde_json::json!("ReindexingDone"))
                     };
                     IndexWatcher::start(
-                        root, index_arc, registry, embedder, indexing, on_reindex, on_done,
+                        root, index_arc, cache, registry, embedder, indexing, on_reindex, on_done,
                     )
                     .map_err(Into::into)
                 },
@@ -1276,12 +1567,106 @@ impl AppContext {
                 return;
             }
         };
+        // The `enabled` flag is the sole authority on whether semantic search is
+        // active. A leftover index DB on disk must not resurrect the embedder or
+        // the watcher behind a feature the user turned off: honoring it here is
+        // what keeps a rename from silently triggering a reindex while disabled.
+        if !settings.semantic.enabled {
+            info!("restore_state: semantic search disabled, skipping restore");
+            return;
+        }
         let Some(loaded) = self.load_restore_state(settings).await else {
             return;
         };
 
         self.finish_restore_state(&loaded.plan, loaded.embedder, loaded.index)
             .await;
+    }
+}
+
+/// Derive a file's content identity from an already-listed entry.
+fn entry_identity(entry: &wilkes_core::types::FileEntry) -> Option<FileIdentity> {
+    entry.modified_at_ms.map(|modified_at_ms| FileIdentity {
+        size_bytes: i64::try_from(entry.size_bytes).unwrap_or(i64::MAX),
+        modified_at_ms,
+    })
+}
+
+/// Derive a file's content identity by stat-ing it on disk.
+fn fs_identity(path: &Path) -> Option<FileIdentity> {
+    let meta = std::fs::metadata(path).ok()?;
+    FileIdentity::from_fs(meta.len(), meta.modified().ok())
+}
+
+/// Outcome of filling one file's metadata: either freshly extracted (and thus
+/// eligible for a Zotero upgrade), or recovered by re-keying a renamed file's
+/// existing row (already composed, so not re-resolved).
+enum FillOutcome {
+    Extracted(DocumentMetadata),
+    Renamed(DocumentMetadata),
+}
+
+/// JSON payload entry for the `file-metadata-updated` event.
+fn metadata_update_json(path: &Path, metadata: &DocumentMetadata) -> serde_json::Value {
+    serde_json::json!({
+        "path": path.to_string_lossy(),
+        "publication_date": metadata.created_at,
+    })
+}
+
+/// Fill one file's file-based metadata. Prefers a cheap re-key when the same
+/// content already exists in the cache under a stale (now-missing) path — a
+/// rename. Otherwise extract fresh and upsert as a `File`-sourced row.
+fn extract_or_rekey(
+    cache: &Arc<Mutex<MetadataCache>>,
+    registry: &wilkes_core::metadata::MetadataExtractorRegistry,
+    path: &Path,
+    identity: FileIdentity,
+) -> FillOutcome {
+    if let Ok(guard) = cache.lock() {
+        if let Ok(Some(old_path)) = guard.find_rename_source(path, identity) {
+            if let Err(e) = guard.rename(&old_path, path) {
+                error!(
+                    "metadata cache rename {} -> {}: {e:#}",
+                    old_path.display(),
+                    path.display()
+                );
+            } else if let Ok(Some(meta)) = guard.get_valid(path, identity) {
+                return FillOutcome::Renamed(meta);
+            }
+        }
+    }
+
+    let metadata = registry.extract_for(path, None).unwrap_or_default();
+    if let Ok(guard) = cache.lock() {
+        if let Err(e) = guard.upsert(path, identity, &metadata, MetadataSource::File) {
+            error!("metadata cache upsert {}: {e:#}", path.display());
+        }
+    }
+    FillOutcome::Extracted(metadata)
+}
+
+/// Best-effort Zotero override for one file against a pre-fetched attachment
+/// list. Returns `None` when the file does not resolve or the lookup errors.
+async fn zotero_override_for(
+    client: &ZoteroClient,
+    path: &Path,
+    file_based: &DocumentMetadata,
+    attachments: &[ZoteroItem],
+) -> Option<DocumentMetadata> {
+    match crate::commands::integrations::zotero::resolve_override(
+        client,
+        path,
+        file_based,
+        attachments,
+    )
+    .await
+    {
+        Ok(opt) => opt,
+        Err(e) => {
+            info!("zotero override {}: {e:#}", path.display());
+            None
+        }
     }
 }
 
@@ -1383,6 +1768,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_zotero_disable_invalidates_cached_zotero_rows() {
+        let (_dir, ctx) = test_ctx();
+        let cache = ctx.metadata_cache().expect("cache opens");
+        let id = FileIdentity {
+            size_bytes: 1,
+            modified_at_ms: 1,
+        };
+        {
+            let guard = cache.lock().unwrap();
+            guard
+                .upsert(
+                    Path::new("/f.pdf"),
+                    id,
+                    &DocumentMetadata::default(),
+                    MetadataSource::File,
+                )
+                .unwrap();
+            guard
+                .upsert(
+                    Path::new("/z.pdf"),
+                    id,
+                    &DocumentMetadata::default(),
+                    MetadataSource::Zotero,
+                )
+                .unwrap();
+        }
+
+        let mut before = Settings::default();
+        before.integrations.zotero.enabled = true;
+        let after = Settings::default(); // Zotero disabled.
+
+        ctx.on_zotero_settings_maybe_changed(&before, &after);
+
+        let guard = cache.lock().unwrap();
+        assert!(
+            guard.get_valid(Path::new("/z.pdf"), id).unwrap().is_none(),
+            "zotero-sourced row should be dropped on disable"
+        );
+        assert!(
+            guard.get_valid(Path::new("/f.pdf"), id).unwrap().is_some(),
+            "file-sourced row should survive"
+        );
+    }
+
+    #[tokio::test]
     async fn test_bookmark_methods_round_trip() {
         let (_dir, ctx) = test_ctx();
 
@@ -1394,13 +1824,24 @@ mod tests {
                     bbox: None,
                 },
                 quote: "important".to_string(),
-                note: Some("ignored".to_string()),
+                note: None,
+                rects: Vec::new(),
             })
             .await
             .unwrap();
 
         assert_eq!(ctx.list_bookmarks().await.unwrap().len(), 1);
         assert!(bookmark.note.is_none());
+
+        let noted = ctx
+            .update_bookmark_note(&bookmark.id, Some("a note".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(noted.note.as_deref(), Some("a note"));
+        assert_eq!(
+            ctx.list_bookmarks().await.unwrap()[0].note.as_deref(),
+            Some("a note")
+        );
 
         ctx.remove_bookmark(&bookmark.id).await.unwrap();
         assert!(ctx.list_bookmarks().await.unwrap().is_empty());
@@ -1506,9 +1947,11 @@ mod tests {
                 index_path: Some(PathBuf::from("semantic_index.db")),
                 ..SemanticSettings::default()
             },
+            integrations: Default::default(),
             supported_extensions: vec![],
             max_results: 0,
             bookmarks_dock: BookmarkDock::default(),
+            ..Settings::default()
         };
 
         assert!(AppContext::restore_state_needs_reset(&settings, None));
@@ -1535,9 +1978,11 @@ mod tests {
                 index_path: Some(PathBuf::from("semantic_index.db")),
                 ..SemanticSettings::default()
             },
+            integrations: Default::default(),
             supported_extensions: vec![],
             max_results: 0,
             bookmarks_dock: BookmarkDock::default(),
+            ..Settings::default()
         };
         let db_status = IndexStatus {
             indexed_files: 1,
@@ -1578,9 +2023,11 @@ mod tests {
                 index_path: Some(PathBuf::from("semantic_index.db")),
                 ..SemanticSettings::default()
             },
+            integrations: Default::default(),
             supported_extensions: vec![],
             max_results: 0,
             bookmarks_dock: BookmarkDock::default(),
+            ..Settings::default()
         };
         let db_status = IndexStatus {
             indexed_files: 1,
@@ -1668,6 +2115,7 @@ mod tests {
         let result = AppContext::start_index_watcher_with(
             dir.path().to_path_buf(),
             index_arc,
+            None,
             registry,
             embedder,
             IndexingConfig {
@@ -1675,7 +2123,7 @@ mod tests {
                 chunk_overlap: 16,
                 supported_extensions: vec!["txt".to_string()],
             },
-            |_root, _index_arc, _registry, _embedder, _indexing, _on_reindex, _on_done| {
+            |_root, _index_arc, _cache, _registry, _embedder, _indexing, _on_reindex, _on_done| {
                 Err(anyhow::anyhow!("watcher failed"))
             },
         );
@@ -2146,6 +2594,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_restore_state_skips_when_semantic_disabled() {
+        let (dir, ctx) = test_ctx();
+
+        // A fully restorable index DB sits on disk with the default selection,
+        // so the only thing that can prevent restore is the disabled flag.
+        let selected = SelectedEmbedder::default();
+        SemanticIndex::create(
+            &ctx.data_dir,
+            selected.model.model_id(),
+            384,
+            selected.engine,
+            None,
+        )
+        .unwrap();
+
+        // Persist settings with semantic search turned off but the index path
+        // still pointing at the on-disk DB (the exact state a user leaves behind
+        // by disabling after a build).
+        let disabled = Settings {
+            semantic: SemanticSettings {
+                enabled: false,
+                index_path: Some(ctx.data_dir.join("semantic_index.db")),
+                ..SemanticSettings::default()
+            },
+            ..Settings::default()
+        };
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string(&disabled).unwrap(),
+        )
+        .unwrap();
+
+        // Positive control: the same settings *with* semantic enabled would be
+        // deemed restorable (selection matches the DB), proving the disabled
+        // flag is the decisive guard rather than a stale-selection reset.
+        let enabled = Settings {
+            semantic: SemanticSettings {
+                enabled: true,
+                ..disabled.semantic.clone()
+            },
+            ..disabled.clone()
+        };
+        let db_status = ctx
+            .load_restore_db_status(&enabled)
+            .await
+            .expect("db status present");
+        assert!(!AppContext::restore_state_needs_reset(
+            &enabled,
+            Some(&db_status)
+        ));
+
+        Arc::clone(&ctx).restore_state().await;
+
+        // The watcher must not run behind a disabled feature, and restore must
+        // not silently flip the user's preference back to enabled.
+        assert!(ctx.watcher.lock().is_none());
+        assert!(ctx.embedder.lock().is_none());
+        assert!(!ctx.get_settings().await.semantic.enabled);
+    }
+
+    #[tokio::test]
     async fn test_load_restore_db_status_clears_stale_settings_when_missing_db() {
         let (_dir, ctx) = test_ctx();
         let settings = Settings {
@@ -2506,6 +3015,7 @@ exit 0
         let watcher = IndexWatcher::start(
             dir.path().to_path_buf(),
             ctx.index.lock().clone(),
+            None,
             Arc::new(ExtractorRegistry::new()),
             Arc::new(MockEmbedder::default()),
             IndexingConfig {
@@ -2556,6 +3066,7 @@ exit 0
         let watcher = IndexWatcher::start(
             dir.path().to_path_buf(),
             ctx.index.lock().clone(),
+            None,
             Arc::new(ExtractorRegistry::new()),
             Arc::new(MockEmbedder::default()),
             IndexingConfig {
@@ -2676,6 +3187,7 @@ exit 0
         let watcher = IndexWatcher::start(
             dir.path().to_path_buf(),
             ctx.index.lock().clone(),
+            None,
             Arc::new(ExtractorRegistry::new()),
             Arc::new(MockEmbedder::default()),
             IndexingConfig {

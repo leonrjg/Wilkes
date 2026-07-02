@@ -7,15 +7,16 @@ use tracing::info;
 use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
-    Bookmark, DataPaths, DocumentMetadata, EmbeddingEngine, FileListResponse, IndexStatus,
-    ModelDescriptor, NewBookmark, SelectedEmbedder, Settings,
+    AddOutcome, Bookmark, CitationResult, DataPaths, DocumentMetadata, EmbeddingEngine,
+    FileListResponse, IndexStatus, IntegrationStatus, ModelDescriptor, NewBookmark,
+    SelectedEmbedder, Settings,
 };
 
 mod platform;
 
 use platform::{
-    build_startup_plan, validate_open_target, DesktopPlatform, DesktopStartupPlan,
-    SystemDesktopPlatform, TauriPlatform,
+    build_startup_plan, validate_open_target, validate_reveal_target, DesktopPlatform,
+    DesktopStartupPlan, SystemDesktopPlatform, TauriPlatform,
 };
 
 fn app_context(app: &AppHandle) -> Arc<AppContext> {
@@ -42,6 +43,13 @@ async fn open_file_for_ctx(
     path: String,
 ) -> Result<wilkes_core::types::PreviewData, String> {
     ctx.open_file(path.into()).await.map_err(|e| e.to_string())
+}
+
+async fn rename_file_for_path(path: String, new_name: String) -> Result<String, String> {
+    wilkes_api::commands::files::rename_file(path.into(), new_name)
+        .await
+        .map(|path| path.display().to_string())
+        .map_err(|e| e.to_string())
 }
 
 async fn get_file_metadata_for_path(
@@ -78,6 +86,47 @@ async fn add_bookmark_for_ctx(
 
 async fn remove_bookmark_for_ctx(ctx: Arc<AppContext>, id: String) -> Result<(), String> {
     ctx.remove_bookmark(&id).await.map_err(|e| e.to_string())
+}
+
+async fn update_bookmark_note_for_ctx(
+    ctx: Arc<AppContext>,
+    id: String,
+    note: Option<String>,
+) -> Result<Bookmark, String> {
+    ctx.update_bookmark_note(&id, note)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn zotero_status_for_ctx(ctx: Arc<AppContext>) -> Result<IntegrationStatus, String> {
+    ctx.zotero_status().await.map_err(|e| e.to_string())
+}
+
+async fn resolve_file_metadata_for_ctx(
+    ctx: Arc<AppContext>,
+    path: String,
+) -> Result<DocumentMetadata, String> {
+    let settings = ctx.get_settings().await;
+    wilkes_api::commands::integrations::zotero::resolve_file_metadata(settings, path.into())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn zotero_add_item_for_ctx(ctx: Arc<AppContext>, path: String) -> Result<AddOutcome, String> {
+    let settings = ctx.get_settings().await;
+    wilkes_api::commands::integrations::zotero::zotero_add_item(settings, path.into())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn zotero_generate_citation_for_ctx(
+    ctx: Arc<AppContext>,
+    path: String,
+) -> Result<CitationResult, String> {
+    let settings = ctx.get_settings().await;
+    wilkes_api::commands::integrations::zotero::zotero_generate_citation(settings, path.into())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 fn is_semantic_ready_for_ctx(ctx: Arc<AppContext>) -> bool {
@@ -275,6 +324,13 @@ async fn open_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn reveal_path(path: String) -> Result<(), String> {
+    validate_reveal_target(&path)?;
+    SystemDesktopPlatform.reveal_target(&path)?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn pick_directory(app: AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
@@ -328,6 +384,11 @@ async fn open_file(
 }
 
 #[tauri::command]
+async fn rename_file(path: String, new_name: String) -> Result<String, String> {
+    rename_file_for_path(path, new_name).await
+}
+
+#[tauri::command]
 async fn get_file_metadata(path: String, app: AppHandle) -> Result<DocumentMetadata, String> {
     get_file_metadata_for_path(app_context(&app), path).await
 }
@@ -355,6 +416,43 @@ async fn add_bookmark(bookmark: NewBookmark, app: AppHandle) -> Result<Bookmark,
 #[tauri::command]
 async fn remove_bookmark(id: String, app: AppHandle) -> Result<(), String> {
     remove_bookmark_for_ctx(app_context(&app), id).await
+}
+
+#[tauri::command]
+async fn update_bookmark_note(
+    id: String,
+    note: Option<String>,
+    app: AppHandle,
+) -> Result<Bookmark, String> {
+    update_bookmark_note_for_ctx(app_context(&app), id, note).await
+}
+
+#[tauri::command]
+async fn zotero_status(app: AppHandle) -> Result<IntegrationStatus, String> {
+    zotero_status_for_ctx(app_context(&app)).await
+}
+
+#[tauri::command]
+async fn resolve_file_metadata(path: String, app: AppHandle) -> Result<DocumentMetadata, String> {
+    resolve_file_metadata_for_ctx(app_context(&app), path).await
+}
+
+#[tauri::command]
+async fn refresh_file_metadata(app: AppHandle) -> Result<(), String> {
+    app_context(&app)
+        .refresh_file_metadata()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn zotero_add_item(path: String, app: AppHandle) -> Result<AddOutcome, String> {
+    zotero_add_item_for_ctx(app_context(&app), path).await
+}
+
+#[tauri::command]
+async fn zotero_generate_citation(path: String, app: AppHandle) -> Result<CitationResult, String> {
+    zotero_generate_citation_for_ctx(app_context(&app), path).await
 }
 
 #[tauri::command]
@@ -447,6 +545,7 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let handle = app.handle().clone();
             let platform = TauriPlatform(handle.clone());
@@ -476,6 +575,7 @@ pub fn run() {
             preview,
             list_files,
             open_file,
+            rename_file,
             get_file_metadata,
             get_python_info,
             get_supported_engines,
@@ -484,6 +584,12 @@ pub fn run() {
             list_bookmarks,
             add_bookmark,
             remove_bookmark,
+            update_bookmark_note,
+            zotero_status,
+            resolve_file_metadata,
+            refresh_file_metadata,
+            zotero_add_item,
+            zotero_generate_citation,
             pick_directory,
             download_model,
             build_index,
@@ -496,6 +602,7 @@ pub fn run() {
             clear_logs,
             get_data_paths,
             open_path,
+            reveal_path,
             is_semantic_ready,
             get_worker_status,
             kill_worker,
@@ -735,6 +842,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rename_file_for_path_allows_outside_data_dir() {
+        let outside_dir = tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.txt");
+        std::fs::write(&outside, "hello").unwrap();
+
+        let renamed = rename_file_for_path(outside.display().to_string(), "renamed.txt".into())
+            .await
+            .unwrap();
+
+        let renamed_path = outside_dir.path().join("renamed.txt");
+        assert_eq!(renamed, renamed_path.display().to_string());
+        assert!(!outside.exists());
+        assert_eq!(std::fs::read_to_string(renamed_path).unwrap(), "hello");
+    }
+
+    #[tokio::test]
     async fn test_build_index_for_ctx_missing_root() {
         let (_dir, ctx) = test_ctx();
         let err = build_index_for_ctx(
@@ -857,6 +980,7 @@ mod tests {
                 },
                 quote: "quote".to_string(),
                 note: None,
+                rects: Vec::new(),
             },
         )
         .await
@@ -869,6 +993,15 @@ mod tests {
                 .len(),
             1
         );
+
+        let noted = update_bookmark_note_for_ctx(
+            Arc::clone(&ctx),
+            bookmark.id.clone(),
+            Some("a note".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(noted.note.as_deref(), Some("a note"));
 
         remove_bookmark_for_ctx(ctx.clone(), bookmark.id)
             .await

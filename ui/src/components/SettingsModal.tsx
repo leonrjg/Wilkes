@@ -5,6 +5,7 @@ import SemanticPanel from "./SemanticPanel";
 import ChunkingPanel from "./ChunkingPanel";
 import DataPanel from "./DataPanel";
 import ExtensionsPanel from "./ExtensionsPanel";
+import IntegrationsPanel from "./IntegrationsPanel";
 import LogsPanel from "./LogsPanel";
 import WorkersPanel from "./WorkersPanel";
 import { EditorState } from "@codemirror/state";
@@ -149,7 +150,7 @@ export default function SettingsModal({
   refreshSemanticReady,
   onSettingsUpdate,
 }: SettingsModalProps) {
-  const [activeTab, setActiveTab] = useState<"general" | "extensions" | "models" | "chunking" | "data" | "workers" | "logs" | "technical">("general");
+  const [activeTab, setActiveTab] = useState<"general" | "extensions" | "integrations" | "models" | "chunking" | "data" | "workers" | "logs" | "technical">("general");
   const [settings, setSettings] = useState<Settings | null>(null);
 
   useEffect(() => {
@@ -204,6 +205,7 @@ export default function SettingsModal({
             <div className="flex flex-col gap-0.5">
               <TabButton id="general" label="General" />
               <TabButton id="extensions" label="File extensions" />
+              <TabButton id="integrations" label="Integrations" />
             </div>
 
             <div className="flex flex-col gap-0.5">
@@ -294,6 +296,12 @@ export default function SettingsModal({
             <div className={activeTab === "extensions" ? "block h-full" : "hidden"}>
               {settings && (
                 <ExtensionsPanel settings={settings} onUpdate={handleUpdateSettings} />
+              )}
+            </div>
+
+            <div className={activeTab === "integrations" ? "block h-full" : "hidden"}>
+              {settings && (
+                <IntegrationsPanel api={api} settings={settings} onUpdate={handleUpdateSettings} />
               )}
             </div>
 

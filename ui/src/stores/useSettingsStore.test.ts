@@ -27,6 +27,8 @@ describe("useSettingsStore", () => {
       preferSemantic: false,
       indexing: false,
       theme: "System",
+      fileSortKey: "filename",
+      fileSortDirection: "asc",
     });
   });
 
@@ -47,6 +49,8 @@ describe("useSettingsStore", () => {
       search_prefer_semantic: true,
       semantic: { enabled: true, index_path: "/some/path" },
       supported_extensions: ["ts", "js"],
+      file_sort_key: "modified",
+      file_sort_direction: "desc",
     };
 
     (api.getSettings as any).mockResolvedValue(mockSettings);
@@ -63,6 +67,8 @@ describe("useSettingsStore", () => {
     expect(state.directory).toBe("/path/1");
     expect(state.theme).toBe("Dark");
     expect(state.preferSemantic).toBe(true);
+    expect(state.fileSortKey).toBe("modified");
+    expect(state.fileSortDirection).toBe("desc");
     expect(state.fileList.length).toBe(1);
   });
 
@@ -214,6 +220,28 @@ describe("useSettingsStore", () => {
   it("should apply settings patch for extensions", () => {
     useSettingsStore.getState().applySettingsPatch({ supported_extensions: ["rs"] });
     expect(useSettingsStore.getState().supportedExtensions).toEqual(["rs"]);
+  });
+
+  it("should persist file sort options", () => {
+    (api.updateSettings as any).mockResolvedValue({});
+
+    useSettingsStore.getState().setFileSortKey("size");
+    useSettingsStore.getState().setFileSortDirection("desc");
+
+    expect(useSettingsStore.getState().fileSortKey).toBe("size");
+    expect(useSettingsStore.getState().fileSortDirection).toBe("desc");
+    expect(api.updateSettings).toHaveBeenCalledWith({ file_sort_key: "size" });
+    expect(api.updateSettings).toHaveBeenCalledWith({ file_sort_direction: "desc" });
+  });
+
+  it("should apply settings patch for file sort options", () => {
+    useSettingsStore.getState().applySettingsPatch({
+      file_sort_key: "created",
+      file_sort_direction: "desc",
+    });
+
+    expect(useSettingsStore.getState().fileSortKey).toBe("created");
+    expect(useSettingsStore.getState().fileSortDirection).toBe("desc");
   });
 
   it("should apply settings patch for theme", () => {

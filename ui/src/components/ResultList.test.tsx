@@ -1,17 +1,35 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { ToastProvider } from "./Toast";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 
-const { mockOpenPath, mockIsTauri } = vi.hoisted(() => ({
+const {
+  mockOpenPath,
+  mockRevealPath,
+  mockRenameFile,
+  mockWriteClipboard,
+  mockListFiles,
+  mockUpdateSettings,
+  mockIsTauri,
+} = vi.hoisted(() => ({
   mockOpenPath: vi.fn(),
+  mockRevealPath: vi.fn(),
+  mockRenameFile: vi.fn(),
+  mockWriteClipboard: vi.fn().mockResolvedValue(undefined),
+  mockListFiles: vi.fn().mockResolvedValue({ files: [], omitted: [] }),
+  mockUpdateSettings: vi.fn().mockResolvedValue({}),
   mockIsTauri: { value: false },
 }));
 
 vi.mock("../services", () => ({
   api: {
     openPath: mockOpenPath,
+    revealPath: mockRevealPath,
+    renameFile: mockRenameFile,
+    writeClipboard: mockWriteClipboard,
+    listFiles: mockListFiles,
+    updateSettings: mockUpdateSettings,
   },
   get isTauri() {
     return mockIsTauri.value;
@@ -48,6 +66,8 @@ describe("ResultList", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockRenameFile.mockResolvedValue("/test/renamed.txt");
+    mockListFiles.mockResolvedValue({ files: [], omitted: [] });
     mockIsTauri.value = false;
     useSearchStore.setState({
       results: [],
@@ -62,6 +82,9 @@ describe("ResultList", () => {
       filterText: "",
       setFilterText: vi.fn(),
       indexing: false,
+      fileSortKey: "filename",
+      fileSortDirection: "asc",
+      fileDisplayFields: ["size"],
     });
   });
 
@@ -82,7 +105,7 @@ describe("ResultList", () => {
 
     renderWithToasts();
 
-    expect(screen.getByText("1 file")).toBeInTheDocument();
+    expect(screen.getByTitle("1 file")).toBeInTheDocument();
     expect(screen.getByText("visible.txt")).toBeInTheDocument();
     expect(screen.getByText("1 file omitted from this list")).toBeInTheDocument();
     expect(screen.queryByText("large.pdf")).not.toBeInTheDocument();
@@ -91,6 +114,100 @@ describe("ResultList", () => {
 
     expect(screen.getByText("large.pdf")).toBeInTheDocument();
     expect(screen.getByText(/exceeds current file size limit/)).toBeInTheDocument();
+  });
+
+  it("sorts the file list by filename, size, and dates", () => {
+    useSettingsStore.setState({
+      fileList: [
+        {
+          path: "/test/beta.txt",
+          size_bytes: 30,
+          file_type: "PlainText",
+          extension: "txt",
+          created_at_ms: 3000,
+          modified_at_ms: 1000,
+        },
+        {
+          path: "/test/alpha.txt",
+          size_bytes: 10,
+          file_type: "PlainText",
+          extension: "txt",
+          created_at_ms: 1000,
+          modified_at_ms: 3000,
+        },
+        {
+          path: "/test/gamma.txt",
+          size_bytes: 20,
+          file_type: "PlainText",
+          extension: "txt",
+          created_at_ms: null,
+          modified_at_ms: 2000,
+        },
+      ],
+    });
+
+    renderWithToasts();
+
+    const alpha = screen.getByRole("button", { name: /alpha\.txt/i });
+    const beta = screen.getByRole("button", { name: /beta\.txt/i });
+    const gamma = screen.getByRole("button", { name: /gamma\.txt/i });
+    expect(alpha.compareDocumentPosition(beta) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(beta.compareDocumentPosition(gamma) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sort and column visibility" }));
+    const menu = screen.getByRole("menu");
+    fireEvent.click(within(menu).getByText("Size"));
+    expect(mockUpdateSettings).toHaveBeenCalledWith({ file_sort_key: "size" });
+    expect(alpha.compareDocumentPosition(gamma) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(gamma.compareDocumentPosition(beta) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Toggle file sort direction" }));
+    expect(mockUpdateSettings).toHaveBeenCalledWith({ file_sort_direction: "desc" });
+    expect(beta.compareDocumentPosition(gamma) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(gamma.compareDocumentPosition(alpha) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    fireEvent.click(within(menu).getByText("Created"));
+    expect(beta.compareDocumentPosition(alpha) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(alpha.compareDocumentPosition(gamma) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("toggles a metadata column's visibility via checkbox without changing the sort", () => {
+    useSettingsStore.setState({
+      fileList: [
+        {
+          path: "/test/withdate.pdf",
+          size_bytes: 10,
+          file_type: "Pdf",
+          extension: "pdf",
+          publication_date: "2021-05",
+        },
+        {
+          path: "/test/nodate.pdf",
+          size_bytes: 10,
+          file_type: "Pdf",
+          extension: "pdf",
+          publication_date: null,
+        },
+      ],
+    });
+
+    renderWithToasts();
+
+    // Hidden by default.
+    expect(screen.queryByText("2021-05")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sort and column visibility" }));
+    const menu = screen.getByRole("menu");
+    fireEvent.click(within(menu).getByLabelText("Show Publication date column"));
+
+    expect(mockUpdateSettings).toHaveBeenCalledWith({ file_display_fields: ["size", "publication"] });
+    expect(screen.getByText("2021-05")).toBeInTheDocument();
+    // Files without the field show a placeholder dash.
+    expect(screen.getAllByText("—").length).toBeGreaterThan(0);
+    // Checking the box doesn't change the active sort key.
+    expect(mockUpdateSettings).not.toHaveBeenCalledWith(
+      expect.objectContaining({ file_sort_key: expect.anything() }),
+    );
   });
 
   it("renders results when searching", () => {
@@ -240,13 +357,15 @@ describe("ResultList", () => {
 
     renderWithToasts();
     const row = screen.getByRole("button", { name: /visible\.txt/i });
+    expect(row).toHaveClass("select-none");
+    expect(row).not.toHaveClass("selectable");
 
     fireEvent.contextMenu(row);
 
     expect(screen.getByRole("menu")).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: "Open" })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: "Copy path" })).toBeInTheDocument();
-    expect(screen.queryByRole("menuitem", { name: "Open containing folder" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Reveal in folder" })).not.toBeInTheDocument();
     expect(mockOnFileClick).not.toHaveBeenCalled();
   });
 
@@ -272,6 +391,8 @@ describe("ResultList", () => {
 
     renderWithToasts();
     const matchRow = screen.getByRole("button", { name: /L1test/ });
+    expect(matchRow).toHaveClass("select-none");
+    expect(matchRow).not.toHaveClass("selectable");
 
     fireEvent.contextMenu(matchRow);
     fireEvent.click(screen.getByRole("menuitem", { name: "Open" }));
@@ -292,7 +413,7 @@ describe("ResultList", () => {
     fireEvent.contextMenu(screen.getByRole("button", { name: /visible\.txt/i }));
     fireEvent.click(screen.getByRole("menuitem", { name: "Copy path" }));
 
-    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("/test/visible.txt");
+    expect(mockWriteClipboard).toHaveBeenCalledWith("/test/visible.txt");
     expect(await screen.findByText("Path copied")).toBeInTheDocument();
   });
 
@@ -311,7 +432,7 @@ describe("ResultList", () => {
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 
-  it("shows the desktop folder action and calls openPath", () => {
+  it("shows the desktop reveal action and calls revealPath", () => {
     mockIsTauri.value = true;
     useSearchStore.setState({
       hasQuery: true,
@@ -326,8 +447,33 @@ describe("ResultList", () => {
 
     renderWithToasts();
     fireEvent.contextMenu(screen.getByText("file.txt"));
-    fireEvent.click(screen.getByRole("menuitem", { name: "Open containing folder" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reveal in folder" }));
 
-    expect(mockOpenPath).toHaveBeenCalledWith("/test");
+    expect(mockRevealPath).toHaveBeenCalledWith("/test/file.txt");
+  });
+
+  it("renames a file from the context menu", async () => {
+    useSettingsStore.setState({
+      directory: "/test",
+      fileList: [
+        { path: "/test/file.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" },
+      ],
+    });
+
+    renderWithToasts();
+    fireEvent.contextMenu(screen.getByRole("button", { name: /file\.txt/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+
+    const input = screen.getByLabelText("File name") as HTMLInputElement;
+    expect(input).toHaveValue("file.txt");
+    await waitFor(() => {
+      expect(input.selectionStart).toBe(0);
+      expect(input.selectionEnd).toBe(4);
+    });
+
+    fireEvent.change(input, { target: { value: "renamed.txt" } });
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+
+    expect(mockRenameFile).toHaveBeenCalledWith("/test/file.txt", "renamed.txt");
   });
 });

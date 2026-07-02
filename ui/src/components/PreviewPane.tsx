@@ -25,15 +25,32 @@ function headerTitle(path: string, metadata: DocumentMetadata | null) {
   return title && title.length > 0 ? title : fileName(path);
 }
 
+function parseYearMonth(createdAt: string): { year: number; month?: number } | null {
+  const value = createdAt.trim();
+  // Local PDF metadata: "YYYY-MM" or "YYYY-MM-DD".
+  let m = /^(\d{4})-(\d{2})(?:-\d{2})?$/.exec(value);
+  if (m) return { year: Number(m[1]), month: Number(m[2]) };
+  // Zotero stores dates as "MM/YYYY" (or "M/YYYY").
+  m = /^(\d{1,2})\/(\d{4})$/.exec(value);
+  if (m) return { year: Number(m[2]), month: Number(m[1]) };
+  // Bare year.
+  m = /^(\d{4})$/.exec(value);
+  if (m) return { year: Number(m[1]) };
+  return null;
+}
+
 function formatCreatedAt(createdAt: string | null | undefined) {
   if (!createdAt) return null;
 
-  const match = /^(\d{4})-(\d{2})$/.exec(createdAt);
-  if (!match) return null;
+  const parsed = parseYearMonth(createdAt);
+  if (!parsed) return null;
 
-  const [, year, month] = match;
-  const monthIndex = Number(month) - 1;
-  const date = new Date(Date.UTC(Number(year), monthIndex, 1));
+  const { year, month } = parsed;
+  if (month === undefined || month < 1 || month > 12) {
+    return String(year);
+  }
+
+  const date = new Date(Date.UTC(year, month - 1, 1));
   if (Number.isNaN(date.getTime())) return null;
 
   return new Intl.DateTimeFormat("en", {
@@ -132,9 +149,29 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
     if (bookmark.path !== selectedMatch.path || !("PdfPage" in bookmark.origin)) {
       return [];
     }
-    const { page, bbox } = bookmark.origin.PdfPage;
-    return bbox ? [{ id: bookmark.id, page, bbox }] : [];
+    const { page } = bookmark.origin.PdfPage;
+    return bookmark.rects.length > 0
+      ? [{ id: bookmark.id, page, rects: bookmark.rects }]
+      : [];
   });
+  // When the navigation target is one of this file's bookmarks, emphasise its
+  // exact per-line rects instead of the union bbox the search path uses.
+  const bboxesEqual = (a: BoundingBox | null, b: BoundingBox | null) =>
+    a != null &&
+    b != null &&
+    a.x === b.x &&
+    a.y === b.y &&
+    a.width === b.width &&
+    a.height === b.height;
+  const targetBookmarkRects =
+    bookmarks.find(
+      (bookmark) =>
+        bookmark.path === selectedMatch.path &&
+        bookmark.rects.length > 0 &&
+        "PdfPage" in bookmark.origin &&
+        bookmark.origin.PdfPage.page === pdfPage &&
+        bboxesEqual(bookmark.origin.PdfPage.bbox, pdfBbox),
+    )?.rects ?? null;
   const author = viewerMetadata?.author?.trim() || null;
   const createdAt = formatCreatedAt(viewerMetadata?.created_at);
   const links = buildExternalLinks(viewerMetadata?.doi);
@@ -152,17 +189,26 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
 
   const handleCopyDoi = () => {
     if (!doi) return;
-    Promise.resolve(navigator.clipboard?.writeText(doi)).catch((e) =>
-      console.error("Copy DOI failed:", e),
-    );
+    api.writeClipboard(doi).catch((e) => console.error("Copy DOI failed:", e));
   };
 
-  const handleAddBookmark = ({ page, bbox, quote }: { page: number; bbox: BoundingBox; quote: string }) => {
+  const handleAddBookmark = ({
+    page,
+    bbox,
+    rects,
+    quote,
+  }: {
+    page: number;
+    bbox: BoundingBox;
+    rects: BoundingBox[];
+    quote: string;
+  }) => {
     if (!selectedMatch) return;
     addBookmark({
       path: selectedMatch.path,
       origin: { PdfPage: { page, bbox } },
       quote,
+      rects,
     })
       .then(() => addToast("Bookmark added", { type: "success" }))
       .catch((e) => console.error("Add bookmark failed:", e));
@@ -267,6 +313,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
             url={api.resolvePdfUrl(selectedMatch.path)}
             page={pdfPage}
             highlight_bbox={pdfBbox}
+            highlight_rects={targetBookmarkRects}
             bookmarkHighlights={bookmarkHighlights}
             onRenderSuccess={() => setIsPdfRendering(false)}
             onAddBookmark={handleAddBookmark}

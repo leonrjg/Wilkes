@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import type {
   EmbedDone,
   EmbedError,
@@ -9,7 +10,11 @@ import type {
   Bookmark,
   FileListResponse,
   FileMatches,
+  FileMetadataUpdate,
   IndexStatus,
+  AddOutcome,
+  CitationResult,
+  IntegrationStatus,
   MatchRef,
   DocumentMetadata,
   ModelDescriptor,
@@ -80,6 +85,10 @@ export class TauriSearchApi implements SearchApi {
     return invoke("remove_bookmark", { id });
   }
 
+  async updateBookmarkNote(id: string, note: string | null): Promise<Bookmark> {
+    return invoke<Bookmark>("update_bookmark_note", { id, note });
+  }
+
   async listFiles(root: string): Promise<FileListResponse> {
     return invoke<FileListResponse>("list_files", { root });
   }
@@ -88,8 +97,32 @@ export class TauriSearchApi implements SearchApi {
     return invoke<PreviewData>("open_file", { path });
   }
 
+  async renameFile(path: string, newName: string): Promise<string> {
+    return invoke<string>("rename_file", { path, newName });
+  }
+
   async getFileMetadata(path: string): Promise<DocumentMetadata> {
     return invoke<DocumentMetadata>("get_file_metadata", { path });
+  }
+
+  async resolveFileMetadata(path: string): Promise<DocumentMetadata> {
+    return invoke<DocumentMetadata>("resolve_file_metadata", { path });
+  }
+
+  async refreshFileMetadata(): Promise<void> {
+    await invoke("refresh_file_metadata");
+  }
+
+  async zoteroStatus(): Promise<IntegrationStatus> {
+    return invoke<IntegrationStatus>("zotero_status");
+  }
+
+  async zoteroAddItem(path: string): Promise<AddOutcome> {
+    return invoke<AddOutcome>("zotero_add_item", { path });
+  }
+
+  async zoteroGenerateCitation(path: string): Promise<CitationResult> {
+    return invoke<CitationResult>("zotero_generate_citation", { path });
   }
 
   resolvePdfUrl(path: string): string {
@@ -118,6 +151,14 @@ export class TauriSearchApi implements SearchApi {
 
   async openPath(path: string): Promise<void> {
     return invoke("open_path", { path });
+  }
+
+  async revealPath(path: string): Promise<void> {
+    return invoke("reveal_path", { path });
+  }
+
+  async writeClipboard(text: string): Promise<void> {
+    return writeText(text);
   }
 
   // ── Worker Management ────────────────────────────────────────────────────────
@@ -186,6 +227,12 @@ export class TauriSearchApi implements SearchApi {
 
   async onManagerEvent(handler: (event: string) => void): Promise<() => void> {
     return listen<string>("manager-event", (e) => handler(e.payload));
+  }
+
+  async onFileMetadataUpdated(
+    handler: (updates: FileMetadataUpdate[]) => void,
+  ): Promise<() => void> {
+    return listen<FileMetadataUpdate[]>("file-metadata-updated", (e) => handler(e.payload));
   }
 }
 

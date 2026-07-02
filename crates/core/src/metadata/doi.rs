@@ -37,11 +37,40 @@ pub fn normalize_doi(value: &str) -> Option<String> {
     };
     let canonical = strip_doi_wrappers(without_doi.trim());
 
-    if canonical.is_empty() || !canonical.starts_with("10.") || !canonical.contains('/') {
+    if canonical.is_empty()
+        || !canonical.starts_with("10.")
+        || !canonical.contains('/')
+        || has_repeated_alnum_suffix(canonical)
+    {
         return None;
     }
 
     Some(canonical.to_string())
+}
+
+fn has_repeated_alnum_suffix(canonical: &str) -> bool {
+    let Some((_, suffix)) = canonical.split_once('/') else {
+        return false;
+    };
+
+    let mut chars = suffix
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase());
+
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    let mut count = 1;
+    for ch in chars {
+        count += 1;
+        if ch != first {
+            return false;
+        }
+    }
+
+    count >= 6
 }
 
 fn strip_doi_wrappers(value: &str) -> &str {
@@ -49,7 +78,10 @@ fn strip_doi_wrappers(value: &str) -> &str {
 
     loop {
         trimmed = trimmed.trim_end_matches(|c: char| {
-            matches!(c, '.' | ',' | ';' | ':' | '"' | '\'' | ')' | ']' | '}' | '>')
+            matches!(
+                c,
+                '.' | ',' | ';' | ':' | '"' | '\'' | ')' | ']' | '}' | '>'
+            )
         });
 
         let updated = trimmed
@@ -59,7 +91,11 @@ fn strip_doi_wrappers(value: &str) -> &str {
             .or_else(|| trimmed.strip_prefix('{').and_then(|v| v.strip_suffix('}')))
             .or_else(|| trimmed.strip_prefix('<').and_then(|v| v.strip_suffix('>')))
             .or_else(|| trimmed.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
-            .or_else(|| trimmed.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')));
+            .or_else(|| {
+                trimmed
+                    .strip_prefix('\'')
+                    .and_then(|v| v.strip_suffix('\''))
+            });
 
         match updated {
             Some(next) => trimmed = next.trim(),
@@ -96,10 +132,7 @@ mod tests {
 
     #[test]
     fn test_find_doi_ignores_surrounding_punctuation() {
-        assert_eq!(
-            find_doi("(10.1000/xyz123)."),
-            Some("10.1000/xyz123".into())
-        );
+        assert_eq!(find_doi("(10.1000/xyz123)."), Some("10.1000/xyz123".into()));
     }
 
     #[test]
@@ -107,6 +140,24 @@ mod tests {
         assert_eq!(
             find_doi("bad 10.1 nope and then 10.1000/xyz123"),
             Some("10.1000/xyz123".into())
+        );
+    }
+
+    #[test]
+    fn test_find_doi_rejects_repeated_alnum_suffix_placeholders() {
+        assert_eq!(find_doi("https://doi.org/10.1145/nnnnnnn.nnnnnnn"), None);
+        assert_eq!(find_doi("doi:10.1145/0000000.0000000"), None);
+    }
+
+    #[test]
+    fn test_find_doi_allows_mixed_alnum_suffixes() {
+        assert_eq!(
+            find_doi("https://doi.org/10.1000/xyz123"),
+            Some("10.1000/xyz123".into())
+        );
+        assert_eq!(
+            find_doi("https://doi.org/10.1145/3544548.3581349"),
+            Some("10.1145/3544548.3581349".into())
         );
     }
 }

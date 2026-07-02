@@ -1,5 +1,9 @@
 import type { SearchApi } from "../services/api";
 import type { ContextMenuItem } from "../components/ContextMenu";
+import { zoteroMenuContributor } from "./integrations/zotero";
+import type { MenuContributor } from "./integrations/types";
+import type { Settings } from "./types";
+import { Copy, Edit2, ExternalLink, Folder } from "react-feather";
 
 export type ContextMenuTarget =
   | { kind: "file" | "match"; path: string; open: () => void }
@@ -13,41 +17,35 @@ interface BuildFileContextMenuItemsArgs {
   target: ContextMenuTarget;
   api: SearchApi;
   capabilities: ContextMenuCapabilities;
+  settings?: Settings | null;
   onToast: (message: string, type: "success" | "error") => void;
+  onRenameRequest?: (path: string) => void;
 }
 
-function parentDir(path: string): string {
-  const normalized = path.replace(/[\\/]+$/, "");
-  const idx = Math.max(normalized.lastIndexOf("/"), normalized.lastIndexOf("\\"));
-  if (idx <= 0) return normalized;
-  return normalized.slice(0, idx);
-}
-
-async function copyToClipboard(text: string): Promise<void> {
-  if (!navigator.clipboard?.writeText) {
-    throw new Error("Clipboard API unavailable");
-  }
-  await navigator.clipboard.writeText(text);
-}
+const menuContributors: MenuContributor[] = [zoteroMenuContributor];
 
 export function buildFileContextMenuItems({
   target,
   api,
   capabilities,
+  settings,
   onToast,
+  onRenameRequest,
 }: BuildFileContextMenuItemsArgs): ContextMenuItem[] {
   const items: ContextMenuItem[] = [
     {
       id: "open",
       label: "Open",
+      icon: ExternalLink,
       run: () => target.open(),
     },
     {
       id: "copy-path",
       label: "Copy path",
+      icon: Copy,
       run: async () => {
         try {
-          await copyToClipboard(target.path);
+          await api.writeClipboard(target.path);
           onToast("Path copied", "success");
         } catch (error) {
           console.error("Failed to copy path:", error);
@@ -57,15 +55,41 @@ export function buildFileContextMenuItems({
     },
   ];
 
+  if (target.kind !== "directory") {
+    items.push({
+      id: "rename",
+      label: "Rename",
+      icon: Edit2,
+      run: () => onRenameRequest?.(target.path),
+    });
+  }
+
   if (capabilities.canOpenInFileManager) {
     items.push({
       id: "open-in-file-manager",
-      label: target.kind === "directory" ? "Open in file manager" : "Open containing folder",
+      label: target.kind === "directory" ? "Open in file manager" : "Reveal in folder",
+      icon: Folder,
       run: async () => {
-        const path = target.kind === "directory" ? target.path : parentDir(target.path);
-        await api.openPath(path);
+        if (target.kind === "directory") {
+          await api.openPath(target.path);
+        } else {
+          await api.revealPath(target.path);
+        }
       },
     });
+  }
+
+  if (settings) {
+    items.push(
+      ...menuContributors.flatMap((contributor) =>
+        contributor({
+          target,
+          api,
+          settings,
+          onToast,
+        }),
+      ),
+    );
   }
 
   return items;

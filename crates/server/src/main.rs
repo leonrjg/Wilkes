@@ -28,8 +28,8 @@ use tracing::info;
 use wilkes_api::context::AppContext;
 use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::types::{
-    DocumentMetadata, EmbeddingEngine, MatchRef, ModelDescriptor, NewBookmark, SearchQuery,
-    SelectedEmbedder,
+    AddOutcome, CitationResult, DocumentMetadata, EmbeddingEngine, IntegrationStatus, MatchRef,
+    ModelDescriptor, NewBookmark, SearchQuery, SelectedEmbedder,
 };
 
 fn confine_to_uploads(
@@ -193,6 +193,24 @@ async fn remove_bookmark_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+struct UpdateNoteBody {
+    note: Option<String>,
+}
+
+async fn update_bookmark_note_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<UpdateNoteBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let bookmark = state
+        .ctx
+        .update_bookmark_note(&id, body.note)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(bookmark))
+}
+
 async fn is_semantic_ready_handler(State(state): State<Arc<AppState>>) -> Json<bool> {
     Json(state.ctx.is_semantic_ready())
 }
@@ -222,6 +240,12 @@ struct OpenFileBody {
     path: String,
 }
 
+#[derive(Deserialize)]
+struct RenameFileBody {
+    path: String,
+    new_name: String,
+}
+
 async fn open_file_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<OpenFileBody>,
@@ -235,6 +259,19 @@ async fn open_file_handler(
     Ok(Json(data))
 }
 
+async fn rename_file_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RenameFileBody>,
+) -> Result<Json<String>, (StatusCode, Json<ErrorBody>)> {
+    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
+    let new_path = state
+        .ctx
+        .rename_file(path, body.new_name)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(new_path.display().to_string()))
+}
+
 async fn get_file_metadata_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<OpenFileBody>,
@@ -246,6 +283,67 @@ async fn get_file_metadata_handler(
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(metadata))
+}
+
+async fn zotero_status_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<IntegrationStatus>, (StatusCode, Json<ErrorBody>)> {
+    let status = state
+        .ctx
+        .zotero_status()
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(status))
+}
+
+async fn resolve_file_metadata_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<OpenFileBody>,
+) -> Result<Json<DocumentMetadata>, (StatusCode, Json<ErrorBody>)> {
+    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
+    let metadata = state
+        .ctx
+        .resolve_file_metadata(path)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(metadata))
+}
+
+async fn refresh_file_metadata_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<()>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .refresh_file_metadata()
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(()))
+}
+
+async fn zotero_add_item_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<OpenFileBody>,
+) -> Result<Json<AddOutcome>, (StatusCode, Json<ErrorBody>)> {
+    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
+    let outcome = state
+        .ctx
+        .zotero_add_item(path)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(outcome))
+}
+
+async fn zotero_generate_citation_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<OpenFileBody>,
+) -> Result<Json<CitationResult>, (StatusCode, Json<ErrorBody>)> {
+    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
+    let citation = state
+        .ctx
+        .zotero_generate_citation(path)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(citation))
 }
 
 // ── Upload ────────────────────────────────────────────────────────────────────
@@ -699,6 +797,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/bookmarks", get(list_bookmarks_handler))
         .route("/api/bookmarks", post(add_bookmark_handler))
         .route("/api/bookmarks/:id", delete(remove_bookmark_handler))
+        .route("/api/bookmarks/:id", patch(update_bookmark_note_handler))
+        .route(
+            "/api/integrations/zotero/status",
+            get(zotero_status_handler),
+        )
+        .route(
+            "/api/integrations/zotero/add",
+            post(zotero_add_item_handler),
+        )
+        .route(
+            "/api/integrations/zotero/citation",
+            post(zotero_generate_citation_handler),
+        )
         .route("/api/embed/ready", get(is_semantic_ready_handler))
         .route("/api/logs", get(get_logs_handler))
         .route("/api/logs", delete(clear_logs_handler))
@@ -706,7 +817,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/worker/python-info", get(get_python_info_handler))
         .route("/api/files", get(list_files_handler))
         .route("/api/file", post(open_file_handler))
+        .route("/api/file/rename", post(rename_file_handler))
         .route("/api/file/metadata", post(get_file_metadata_handler))
+        .route(
+            "/api/file/metadata/resolve",
+            post(resolve_file_metadata_handler),
+        )
+        .route(
+            "/api/file/metadata/refresh",
+            post(refresh_file_metadata_handler),
+        )
         // Upload (server-only: desktop uses native file picker)
         .route(
             "/api/upload",
@@ -957,6 +1077,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_bookmark_note_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (events_tx, _) = broadcast::channel(1024);
+        let emitter = Arc::new(BroadcastEmitter {
+            tx: events_tx.clone(),
+        });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("s.json"),
+            paths,
+            emitter,
+        );
+        let state = Arc::new(AppState {
+            ctx,
+            uploads_dir: dir.path().join("uploads"),
+            events_tx,
+        });
+
+        let added = add_bookmark_handler(
+            State(Arc::clone(&state)),
+            Json(NewBookmark {
+                path: "/tmp/example.pdf".into(),
+                origin: wilkes_core::types::SourceOrigin::PdfPage {
+                    page: 1,
+                    bbox: None,
+                },
+                quote: "q".to_string(),
+                note: None,
+                rects: Vec::new(),
+            }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .expect("add_bookmark_handler failed")
+        .into_response();
+        assert_eq!(added.status(), StatusCode::OK);
+
+        let id = state.ctx.list_bookmarks().await.unwrap()[0].id.clone();
+        update_bookmark_note_handler(
+            State(Arc::clone(&state)),
+            axum::extract::Path(id.clone()),
+            Json(UpdateNoteBody {
+                note: Some("  noted  ".to_string()),
+            }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .expect("update_bookmark_note_handler failed");
+
+        assert_eq!(
+            state.ctx.list_bookmarks().await.unwrap()[0].note.as_deref(),
+            Some("noted")
+        );
+    }
+
+    #[tokio::test]
     async fn test_search_handler_grep() {
         let dir = tempfile::tempdir().unwrap();
         let uploads_dir = dir.path().join("uploads");
@@ -1181,6 +1365,60 @@ mod tests {
         };
         let res = open_file_handler(State(state), axum::Json(body)).await;
         assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rename_file_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+        let file_path = uploads_dir.join("old.txt");
+        tokio::fs::write(&file_path, "file content").await.unwrap();
+
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("p"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (events_tx, _) = broadcast::channel(1024);
+        let emitter = Arc::new(BroadcastEmitter {
+            tx: events_tx.clone(),
+        });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("s.json"),
+            paths,
+            emitter,
+        );
+        let state = Arc::new(AppState {
+            ctx,
+            uploads_dir: uploads_dir.clone(),
+            events_tx,
+        });
+
+        let body = RenameFileBody {
+            path: file_path.to_string_lossy().to_string(),
+            new_name: "new.txt".into(),
+        };
+        let res = match rename_file_handler(State(state), axum::Json(body)).await {
+            Ok(res) => res,
+            Err((status, body)) => panic!("rename failed: {status} {}", body.0.error),
+        };
+
+        assert_eq!(
+            PathBuf::from(res.0).canonicalize().unwrap(),
+            uploads_dir.join("new.txt").canonicalize().unwrap()
+        );
+        assert!(!file_path.exists());
+        assert_eq!(
+            tokio::fs::read_to_string(uploads_dir.join("new.txt"))
+                .await
+                .unwrap(),
+            "file content"
+        );
     }
 
     #[tokio::test]

@@ -34,6 +34,7 @@ pub async fn update_settings(path: &Path, patch: serde_json::Value) -> anyhow::R
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use wilkes_core::types::{FileDisplayField, FileSortDirection, FileSortKey};
 
     #[tokio::test]
     async fn test_get_settings_default() {
@@ -43,6 +44,33 @@ mod tests {
         let settings = get_settings(&path).await.unwrap();
         assert_eq!(settings.respect_gitignore, true);
         assert_eq!(settings.context_lines, 2);
+        assert_eq!(settings.file_sort_key, FileSortKey::Filename);
+        assert_eq!(settings.file_sort_direction, FileSortDirection::Asc);
+    }
+
+    #[tokio::test]
+    async fn test_update_settings_accepts_publication_sort_and_display_fields() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let patch = serde_json::json!({
+            "file_sort_key": "publication",
+            "file_display_fields": ["publication", "size"]
+        });
+
+        let updated = update_settings(&path, patch).await.unwrap();
+        assert_eq!(updated.file_sort_key, FileSortKey::Publication);
+        assert_eq!(
+            updated.file_display_fields,
+            vec![FileDisplayField::Publication, FileDisplayField::Size]
+        );
+
+        let loaded = get_settings(&path).await.unwrap();
+        assert_eq!(loaded.file_sort_key, FileSortKey::Publication);
+        assert_eq!(
+            loaded.file_display_fields,
+            vec![FileDisplayField::Publication, FileDisplayField::Size]
+        );
     }
 
     #[tokio::test]
@@ -52,17 +80,23 @@ mod tests {
 
         let patch = serde_json::json!({
             "context_lines": 5,
-            "respect_gitignore": false
+            "respect_gitignore": false,
+            "file_sort_key": "modified",
+            "file_sort_direction": "desc"
         });
 
         let updated = update_settings(&path, patch).await.unwrap();
         assert_eq!(updated.context_lines, 5);
         assert_eq!(updated.respect_gitignore, false);
+        assert_eq!(updated.file_sort_key, FileSortKey::Modified);
+        assert_eq!(updated.file_sort_direction, FileSortDirection::Desc);
 
         // Verify it was persisted
         let loaded = get_settings(&path).await.unwrap();
         assert_eq!(loaded.context_lines, 5);
         assert_eq!(loaded.respect_gitignore, false);
+        assert_eq!(loaded.file_sort_key, FileSortKey::Modified);
+        assert_eq!(loaded.file_sort_direction, FileSortDirection::Desc);
     }
 
     #[tokio::test]

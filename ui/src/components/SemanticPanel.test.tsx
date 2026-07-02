@@ -29,6 +29,9 @@ describe("SemanticPanel", () => {
     onManagerEvent: vi.fn().mockImplementation(() => {
       return Promise.resolve(() => {});
     }),
+    onFileMetadataUpdated: vi.fn().mockImplementation(() => {
+      return Promise.resolve(() => {});
+    }),
     updateSettings: vi.fn(),
     downloadModel: vi.fn().mockResolvedValue(undefined),
     buildIndex: vi.fn().mockResolvedValue(undefined),

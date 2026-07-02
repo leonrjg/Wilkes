@@ -9,6 +9,7 @@ import { useSemanticStore } from "../stores/useSemanticStore";
 vi.mock("../services", () => ({
   api: {
     onManagerEvent: vi.fn().mockResolvedValue(vi.fn()),
+    onFileMetadataUpdated: vi.fn().mockResolvedValue(vi.fn()),
   },
 }));
 

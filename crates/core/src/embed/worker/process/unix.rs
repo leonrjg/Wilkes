@@ -83,7 +83,10 @@ impl WorkerProcess {
             ROOF_KNOCK_TIMEOUT
         );
         let mut child = self.child.lock().await;
-        if timeout(ROOF_KNOCK_TIMEOUT, child.child.wait()).await.is_err() {
+        if timeout(ROOF_KNOCK_TIMEOUT, child.child.wait())
+            .await
+            .is_err()
+        {
             tracing::warn!(
                 "WorkerProcess::shutdown: pid {pid} did not exit during grace period; hard-killing"
             );

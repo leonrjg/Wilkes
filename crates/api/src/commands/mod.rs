@@ -1,6 +1,7 @@
 pub mod bookmarks;
 pub mod embed;
 pub mod files;
+pub mod integrations;
 pub mod logs;
 pub mod metadata;
 pub mod preview;

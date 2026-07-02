@@ -34,10 +34,26 @@ describe("TauriSearchApi", () => {
     expect(invoke).toHaveBeenCalledWith("update_settings", { patch });
   });
 
+  it("should call invoke for updateBookmarkNote", async () => {
+    (invoke as any).mockResolvedValue({ id: "b1", note: "hi" });
+    await api.updateBookmarkNote("b1", "hi");
+    expect(invoke).toHaveBeenCalledWith("update_bookmark_note", { id: "b1", note: "hi" });
+  });
+
   it("should call invoke for listFiles", async () => {
     (invoke as any).mockResolvedValue({ files: [], omitted: [] });
     await api.listFiles("/some/root");
     expect(invoke).toHaveBeenCalledWith("list_files", { root: "/some/root" });
+  });
+
+  it("should call rename_file", async () => {
+    (invoke as any).mockResolvedValue("/some/new.txt");
+    const path = await api.renameFile("/some/old.txt", "new.txt");
+    expect(invoke).toHaveBeenCalledWith("rename_file", {
+      path: "/some/old.txt",
+      newName: "new.txt",
+    });
+    expect(path).toBe("/some/new.txt");
   });
 
   it("should perform a search with listeners", async () => {
@@ -148,6 +164,12 @@ describe("TauriSearchApi", () => {
     (invoke as any).mockResolvedValue(undefined);
     await api.openPath("/some/path");
     expect(invoke).toHaveBeenCalledWith("open_path", { path: "/some/path" });
+  });
+
+  it("should call reveal_path", async () => {
+    (invoke as any).mockResolvedValue(undefined);
+    await api.revealPath("/some/path");
+    expect(invoke).toHaveBeenCalledWith("reveal_path", { path: "/some/path" });
   });
 
   it("should call get_python_info", async () => {

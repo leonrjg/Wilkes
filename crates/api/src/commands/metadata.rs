@@ -20,7 +20,7 @@ pub async fn get_file_metadata(
     .await?
 }
 
-fn build_registry(supported_extensions: Vec<String>) -> MetadataExtractorRegistry {
+pub(crate) fn build_registry(supported_extensions: Vec<String>) -> MetadataExtractorRegistry {
     let mut registry = MetadataExtractorRegistry::new();
     registry.register(Box::new(PdfMetadataExtractor));
     registry.register(Box::new(TextMetadataExtractor::new(supported_extensions)));

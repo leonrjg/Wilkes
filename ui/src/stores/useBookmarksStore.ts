@@ -10,6 +10,7 @@ interface BookmarksStore {
   load: () => Promise<void>;
   add: (bookmark: NewBookmark) => Promise<Bookmark>;
   remove: (id: string) => Promise<void>;
+  updateNote: (id: string, note: string | null) => Promise<void>;
   setFilter: (text: string) => void;
   setScope: (path: string | null) => void;
   togglePane: () => void;
@@ -35,6 +36,13 @@ export const useBookmarksStore = create<BookmarksStore>((set) => ({
   remove: async (id) => {
     await api.removeBookmark(id);
     set((state) => ({ bookmarks: state.bookmarks.filter((bookmark) => bookmark.id !== id) }));
+  },
+
+  updateNote: async (id, note) => {
+    const updated = await api.updateBookmarkNote(id, note);
+    set((state) => ({
+      bookmarks: state.bookmarks.map((bookmark) => (bookmark.id === id ? updated : bookmark)),
+    }));
   },
 
   setFilter: (filterText) => set({ filterText }),

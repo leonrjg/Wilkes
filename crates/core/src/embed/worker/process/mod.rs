@@ -143,8 +143,8 @@ fn _assert_path(_: &Path) {}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicU32;
     use tempfile::tempdir;
 
     fn write_executable(path: &Path, content: &str) {

@@ -8,6 +8,7 @@ vi.mock("../services", () => ({
     listBookmarks: vi.fn(),
     addBookmark: vi.fn(),
     removeBookmark: vi.fn(),
+    updateBookmarkNote: vi.fn(),
   },
 }));
 
@@ -15,6 +16,7 @@ const newBookmark: NewBookmark = {
   path: "/tmp/example.pdf",
   origin: { PdfPage: { page: 2, bbox: { x: 1, y: 2, width: 3, height: 4 } } },
   quote: "selected text",
+  rects: [{ x: 1, y: 2, width: 3, height: 4 }],
 };
 
 const bookmark: Bookmark = {
@@ -60,6 +62,17 @@ describe("useBookmarksStore", () => {
 
     expect(api.removeBookmark).toHaveBeenCalledWith("bookmark-1");
     expect(useBookmarksStore.getState().bookmarks).toEqual([]);
+  });
+
+  it("updates a bookmark note through the API", async () => {
+    useBookmarksStore.setState({ bookmarks: [bookmark] });
+    const noted: Bookmark = { ...bookmark, note: "my note" };
+    vi.mocked(api.updateBookmarkNote).mockResolvedValue(noted);
+
+    await useBookmarksStore.getState().updateNote("bookmark-1", "my note");
+
+    expect(api.updateBookmarkNote).toHaveBeenCalledWith("bookmark-1", "my note");
+    expect(useBookmarksStore.getState().bookmarks).toEqual([noted]);
   });
 
   it("toggles pane state", () => {

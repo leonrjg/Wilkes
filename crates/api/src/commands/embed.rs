@@ -124,12 +124,19 @@ pub async fn build_index(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("device is required for build_index"))?;
 
-    if matches!(selected.engine, EmbeddingEngine::Fastembed | EmbeddingEngine::Candle) {
+    if matches!(
+        selected.engine,
+        EmbeddingEngine::Fastembed | EmbeddingEngine::Candle
+    ) {
         return build_index_via_worker(root, selected, manager, device, options).await;
     }
 
-    let installer =
-        wilkes_core::embed::dispatch::get_installer(selected.engine, selected.model, manager, device);
+    let installer = wilkes_core::embed::dispatch::get_installer(
+        selected.engine,
+        selected.model,
+        manager,
+        device,
+    );
 
     build_index_with_installer(root, installer, options).await
 }

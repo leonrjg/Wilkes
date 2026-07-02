@@ -7,6 +7,7 @@ vi.mock("./SemanticPanel", () => ({ default: () => <div data-testid="semantic-pa
 vi.mock("./ChunkingPanel", () => ({ default: () => <div data-testid="chunking-panel">ChunkingPanel</div> }));
 vi.mock("./DataPanel", () => ({ default: () => <div data-testid="data-panel">DataPanel</div> }));
 vi.mock("./ExtensionsPanel", () => ({ default: () => <div data-testid="extensions-panel">ExtensionsPanel</div> }));
+vi.mock("./IntegrationsPanel", () => ({ default: () => <div data-testid="integrations-panel">IntegrationsPanel</div> }));
 vi.mock("./LogsPanel", () => ({ default: () => <div data-testid="logs-panel">LogsPanel</div> }));
 vi.mock("./WorkersPanel", () => ({ default: () => <div data-testid="workers-panel">WorkersPanel</div> }));
 

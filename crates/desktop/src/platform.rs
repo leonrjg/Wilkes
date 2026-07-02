@@ -8,6 +8,7 @@ pub(crate) trait DesktopPlatform {
     fn app_data_dir(&self) -> anyhow::Result<PathBuf>;
     fn emit(&self, name: &str, payload: serde_json::Value);
     fn open_target(&self, target: &str) -> Result<(), String>;
+    fn reveal_target(&self, target: &str) -> Result<(), String>;
 }
 
 #[derive(Clone)]
@@ -29,6 +30,10 @@ impl<R: Runtime> DesktopPlatform for TauriPlatform<R> {
     fn open_target(&self, target: &str) -> Result<(), String> {
         spawn_open_target(target)
     }
+
+    fn reveal_target(&self, target: &str) -> Result<(), String> {
+        spawn_reveal_target(target)
+    }
 }
 
 pub(crate) struct SystemDesktopPlatform;
@@ -47,6 +52,10 @@ impl DesktopPlatform for SystemDesktopPlatform {
     fn open_target(&self, target: &str) -> Result<(), String> {
         spawn_open_target(target)
     }
+
+    fn reveal_target(&self, target: &str) -> Result<(), String> {
+        spawn_reveal_target(target)
+    }
 }
 
 pub(crate) fn desktop_settings_path_from(config_dir: PathBuf) -> PathBuf {
@@ -61,6 +70,17 @@ pub(crate) fn desktop_settings_path<P: DesktopPlatform>(platform: &P) -> anyhow:
 pub(crate) fn validate_open_target(target: &str) -> Result<(), String> {
     if target.starts_with("http://") || target.starts_with("https://") {
         return Ok(());
+    }
+
+    if !Path::new(target).exists() {
+        return Err("Path does not exist".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_reveal_target(target: &str) -> Result<(), String> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return Err("Cannot reveal a URL in the file manager".into());
     }
 
     if !Path::new(target).exists() {
@@ -90,6 +110,71 @@ pub(crate) fn spawn_open_target(target: &str) -> Result<(), String> {
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub(crate) fn spawn_reveal_target(target: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(target)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{target}"))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        reveal_target_linux(target)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reveal_target_linux(target: &str) -> Result<(), String> {
+    let uri = file_uri_from_path(Path::new(target));
+    let status = std::process::Command::new("dbus-send")
+        .arg("--session")
+        .arg("--dest=org.freedesktop.FileManager1")
+        .arg("--type=method_call")
+        .arg("/org/freedesktop/FileManager1")
+        .arg("org.freedesktop.FileManager1.ShowItems")
+        .arg(format!("array:string:{uri}"))
+        .arg("string:")
+        .status();
+
+    if matches!(status, Ok(status) if status.success()) {
+        return Ok(());
+    }
+
+    let parent = Path::new(target)
+        .parent()
+        .ok_or_else(|| "Path has no containing directory".to_string())?;
+    spawn_open_target(&parent.display().to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn file_uri_from_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut uri = String::from("file://");
+    for byte in path.as_os_str().as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(*byte as char);
+            }
+            byte => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri
 }
 
 pub(crate) fn build_startup_plan<P: DesktopPlatform>(
@@ -139,6 +224,10 @@ mod tests {
         fn emit(&self, _name: &str, _payload: serde_json::Value) {}
 
         fn open_target(&self, _target: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn reveal_target(&self, _target: &str) -> Result<(), String> {
             Ok(())
         }
     }
@@ -197,6 +286,20 @@ mod tests {
             Err("Path does not exist".into())
         );
         assert!(validate_open_target("https://doi.org/10.1000/xyz123").is_ok());
+    }
+
+    #[test]
+    fn test_validate_reveal_target() {
+        let dir = tempdir().unwrap();
+        assert!(validate_reveal_target(&dir.path().display().to_string()).is_ok());
+        assert_eq!(
+            validate_reveal_target(&dir.path().join("missing").display().to_string()),
+            Err("Path does not exist".into())
+        );
+        assert_eq!(
+            validate_reveal_target("https://doi.org/10.1000/xyz123"),
+            Err("Cannot reveal a URL in the file manager".into())
+        );
     }
 
     #[test]

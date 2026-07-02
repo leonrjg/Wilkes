@@ -1,5 +1,6 @@
 import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { StrictMode } from "react";
 import PdfViewer from "./PdfViewer";
 
 const { mockVirtualizer } = vi.hoisted(() => ({
@@ -47,6 +48,27 @@ const { mockUsePdfPageMetrics } = vi.hoisted(() => ({
   },
 }));
 
+// The `pdf` document proxy handed to the viewer via <Document onLoadSuccess>.
+// Defaults to a textless stub so auto-zoom measures no body text and stays at
+// 100%; auto-zoom tests override `getPage` to return sized glyphs.
+const { mockPdfDoc } = vi.hoisted(() => ({
+  mockPdfDoc: {
+    value: {
+      numPages: 10,
+      getPage: async (_pageNumber: number) => ({
+        view: [0, 0, 600, 800],
+        getTextContent: async () => ({ items: [] as unknown[] }),
+      }),
+    } as {
+      numPages: number;
+      getPage: (pageNumber: number) => Promise<{
+        view: number[];
+        getTextContent: () => Promise<{ items: unknown[] }>;
+      }>;
+    },
+  },
+}));
+
 const mockPage = vi.fn(({ pageNumber, onLoadSuccess, onRenderSuccess }: any) => {
   if (onLoadSuccess && pageNumber === 1) {
     setTimeout(() => onLoadSuccess({ getViewport: () => ({ width: 600, height: 800 }) }), 0);
@@ -62,7 +84,7 @@ vi.mock("react-pdf", () => ({
   Document: ({ children, onLoadSuccess }: any) => {
     // Simulate loading success
     if (onLoadSuccess) {
-      setTimeout(() => onLoadSuccess({ numPages: 10 }), 0);
+      setTimeout(() => onLoadSuccess(mockPdfDoc.value), 0);
     }
     return <div data-testid="pdf-document">{children}</div>;
   },
@@ -76,6 +98,12 @@ vi.mock("./PdfTextLayer", () => ({
   default: () => null,
 }));
 
+// Mock the link-annotation overlay; it calls pdf.js page APIs absent from the
+// lightweight `pdf` stub these rendering/navigation unit tests use.
+vi.mock("./PdfLinkLayer", () => ({
+  default: () => null,
+}));
+
 // Mock @tanstack/react-virtual
 vi.mock("@tanstack/react-virtual", () => ({
   useVirtualizer: vi.fn().mockReturnValue(mockVirtualizer),
@@ -83,6 +111,20 @@ vi.mock("@tanstack/react-virtual", () => ({
 
 vi.mock("./usePdfInnerSearch", () => ({
   usePdfInnerSearch: vi.fn(() => mockUsePdfInnerSearch.value),
+}));
+
+// The outline hook calls pdf.getOutline(), absent from the lightweight `pdf`
+// stub; drive its return value per-test via mockUsePdfOutline.
+const { mockUsePdfOutline } = vi.hoisted(() => ({
+  mockUsePdfOutline: { value: null as unknown },
+}));
+vi.mock("./usePdfOutline", () => ({
+  usePdfOutline: vi.fn(() => mockUsePdfOutline.value),
+}));
+
+// Render the real outline panel so its presence/absence is observable.
+vi.mock("./PdfOutline", () => ({
+  default: () => <div data-testid="pdf-outline-panel" />,
 }));
 
 vi.mock("./usePdfPageMetrics", async () => {
@@ -93,12 +135,15 @@ vi.mock("./usePdfPageMetrics", async () => {
   };
 });
 
-// Mock ResizeObserver
+// Non-firing ResizeObserver: leaves `containerWidth` at its 600px placeholder
+// (pageScale = 1, which the overlay-position assertions rely on). Auto-zoom does
+// not depend on the observed width — it measures against a fixed reference — so
+// nothing here needs to report a size.
 global.ResizeObserver = class {
-    observe = vi.fn();
-    unobserve = vi.fn();
-    disconnect = vi.fn();
-} as any;
+  observe = vi.fn();
+  unobserve = vi.fn();
+  disconnect = vi.fn();
+} as unknown as typeof ResizeObserver;
 
 describe("PdfViewer", () => {
   const defaultProps = {
@@ -110,6 +155,14 @@ describe("PdfViewer", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockPdfDoc.value = {
+      numPages: 10,
+      getPage: async (_pageNumber: number) => ({
+        view: [0, 0, 600, 800],
+        getTextContent: async () => ({ items: [] as unknown[] }),
+      }),
+    };
+    mockUsePdfOutline.value = null;
     document.documentElement.classList.remove("dark");
     mockVirtualizer.getVirtualItems = () => [
       { index: 0, key: "0", start: 0 },
@@ -157,6 +210,91 @@ describe("PdfViewer", () => {
     expect(screen.getByText("1/10")).toBeInTheDocument();
   });
 
+  it("changes zoom in 10 percent steps", async () => {
+    render(<PdfViewer {...defaultProps} />);
+
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "+" }));
+    expect(screen.getByText("110%")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "−" }));
+    expect(screen.getByText("100%")).toBeInTheDocument();
+  });
+
+  // Build a document proxy whose sampled pages report a uniform body-font size
+  // (via the text-transform vertical scale) on a page of the given point width.
+  const sizedDoc = (fontSize: number, pageWidth: number) => ({
+    numPages: 10,
+    getPage: async (_pageNumber: number) => ({
+      view: [0, 0, pageWidth, 800],
+      getTextContent: async () => ({
+        items: Array.from({ length: 3 }, () => ({
+          str: "sample text",
+          transform: [fontSize, 0, 0, fontSize, 0, 0],
+        })),
+      }),
+    }),
+  });
+
+  it("auto-zooms in when body text renders small at fit-to-width", async () => {
+    // 9pt body on a 612pt (US Letter) page renders ~13.2px at the 900px
+    // reference fit, below the ~16.5px target -> 16.5 / 13.235 ≈ 1.25x.
+    mockPdfDoc.value = sizedDoc(9, 612);
+
+    // Render under StrictMode: its mount/unmount/remount cancels the first
+    // measurement pass, so this guards against the once-per-doc guard being set
+    // up front (which previously made the remount skip measuring entirely).
+    render(
+      <StrictMode>
+        <PdfViewer {...defaultProps} />
+      </StrictMode>,
+    );
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    await waitFor(() => expect(screen.getByText("125%")).toBeInTheDocument());
+  });
+
+  it("leaves documents with comfortable body text at 100%", async () => {
+    // 12pt body on a small 439pt page is blown up ~2x by fit-to-width, well
+    // above target, so the computed zoom is floored to 1.0 (never shrink).
+    mockPdfDoc.value = sizedDoc(12, 439);
+
+    render(<PdfViewer {...defaultProps} />);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    expect(screen.getByText("100%")).toBeInTheDocument();
+  });
+
+  it("does not auto-zoom (nor flicker) when text is only marginally small", async () => {
+    // 16pt body on a 900pt page renders ~16px at the reference fit -> raw zoom
+    // 16.5/16 = 1.03x, inside the deadband, so no setZoom fires.
+    mockPdfDoc.value = sizedDoc(16, 900);
+
+    render(<PdfViewer {...defaultProps} />);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    expect(screen.getByText("100%")).toBeInTheDocument();
+  });
+
+  it("does not auto-zoom a textless (scanned) document", async () => {
+    // mockPdfDoc defaults to empty text content -> no font samples.
+    render(<PdfViewer {...defaultProps} />);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    expect(screen.getByText("100%")).toBeInTheDocument();
+  });
+
   it("uses an opaque white canvas background so PDF composition stays stable", async () => {
     document.documentElement.classList.add("dark");
 
@@ -183,13 +321,38 @@ describe("PdfViewer", () => {
     expect(highlight).toBeInTheDocument();
   });
 
+  it("emphasises the navigation target per-line when highlight_rects is provided", async () => {
+    render(
+      <PdfViewer
+        {...defaultProps}
+        highlight_rects={[
+          { x: 5, y: 5, width: 30, height: 8 },
+          { x: 5, y: 15, width: 12, height: 8 },
+        ]}
+      />,
+    );
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    // Precise per-line emphasis is drawn instead of the single union box.
+    const targets = screen.getAllByTestId("target-highlight");
+    expect(targets).toHaveLength(2);
+    expect(targets[0]).toHaveStyle({ left: "5px", top: "5px", width: "30px", height: "8px" });
+    // The coarse union overlay must not also be present.
+    expect(
+      document.querySelectorAll('div[style*="background-color: rgba(250, 204, 21, 0.25)"]'),
+    ).toHaveLength(2);
+  });
+
   it("renders persisted bookmark highlights with scaled PDF coordinates", async () => {
     render(
       <PdfViewer
         {...defaultProps}
         bookmarkHighlights={[
-          { id: "bookmark-1", page: 1, bbox: { x: 20, y: 30, width: 40, height: 10 } },
-          { id: "bookmark-2", page: 3, bbox: { x: 1, y: 2, width: 3, height: 4 } },
+          { id: "bookmark-1", page: 1, rects: [{ x: 20, y: 30, width: 40, height: 10 }] },
+          { id: "bookmark-2", page: 3, rects: [{ x: 1, y: 2, width: 3, height: 4 }] },
         ]}
       />,
     );
@@ -216,7 +379,7 @@ describe("PdfViewer", () => {
     });
 
     const scrollContainer = document.querySelector(".overflow-auto") as HTMLElement;
-    const root = scrollContainer.parentElement as HTMLElement;
+    const root = document.querySelector(".h-full.relative") as HTMLElement;
     const pageWrapper = document.querySelector<HTMLElement>("[data-page-number='1']")!;
 
     root.getBoundingClientRect = () =>
@@ -224,10 +387,21 @@ describe("PdfViewer", () => {
     pageWrapper.getBoundingClientRect = () =>
       ({ top: 50, left: 40, width: 600, height: 800, bottom: 850, right: 640, x: 40, y: 50, toJSON: () => ({}) }) as DOMRect;
 
+    const selectionDomRect = {
+      top: 70,
+      left: 60,
+      width: 100,
+      height: 20,
+      bottom: 90,
+      right: 160,
+      x: 60,
+      y: 70,
+      toJSON: () => ({}),
+    } as DOMRect;
     const range = {
       startContainer: pageWrapper,
-      getBoundingClientRect: () =>
-        ({ top: 70, left: 60, width: 100, height: 20, bottom: 90, right: 160, x: 60, y: 70, toJSON: () => ({}) }) as DOMRect,
+      getBoundingClientRect: () => selectionDomRect,
+      getClientRects: () => [selectionDomRect] as unknown as DOMRectList,
     };
     vi.spyOn(window, "getSelection").mockReturnValue({
       isCollapsed: false,
@@ -375,5 +549,33 @@ describe("PdfViewer", () => {
     });
 
     expect(mockVirtualizer.scrollToIndex).toHaveBeenCalledTimes(0);
+  });
+
+  it("shows a disabled TOC button when the document has no outline", async () => {
+    mockUsePdfOutline.value = null;
+    render(<PdfViewer {...defaultProps} />);
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    const button = screen.getByTitle("This document has no table of contents");
+    expect(button).toBeDisabled();
+  });
+
+  it("opens the outline panel when the TOC button is clicked", async () => {
+    mockUsePdfOutline.value = [{ title: "Chapter 1", dest: "ch1", url: null, items: [] }];
+    render(<PdfViewer {...defaultProps} />);
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    expect(screen.queryByTestId("pdf-outline-panel")).not.toBeInTheDocument();
+    const button = screen.getByTitle("Table of contents");
+    expect(button).toBeEnabled();
+
+    fireEvent.click(button);
+    expect(screen.getByTestId("pdf-outline-panel")).toBeInTheDocument();
   });
 });

@@ -66,17 +66,17 @@ describe("DirectoryPicker", () => {
     expect(defaultProps.onPickDirectory).toHaveBeenCalled();
   });
 
-  it("calls onFavoriteAdd/Remove when bookmark button is clicked", () => {
+  it("calls onFavoriteAdd/Remove when favorite button is clicked", () => {
     renderWithToasts();
-    
-    // "other" is already bookmarked
-    const otherBookmarkBtn = screen.getByTitle("Remove favorite");
-    fireEvent.click(otherBookmarkBtn);
+
+    // "other" is already favorited
+    const otherFavoriteBtn = screen.getByTitle("Remove favorite");
+    fireEvent.click(otherFavoriteBtn);
     expect(defaultProps.onFavoriteRemove).toHaveBeenCalledWith("/home/user/other");
 
-    // "recent" is not bookmarked
-    const bookmarkBtns = screen.getAllByTitle("Favorite this directory");
-    fireEvent.click(bookmarkBtns[0]); // Click the first one
+    // "recent" is not favorited
+    const favoriteBtns = screen.getAllByTitle("Favorite this directory");
+    fireEvent.click(favoriteBtns[0]); // Click the first one
     expect(defaultProps.onFavoriteAdd).toHaveBeenCalledWith("/home/user/recent");
   });
 

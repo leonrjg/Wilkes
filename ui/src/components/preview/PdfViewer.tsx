@@ -1,12 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Search as SearchIcon, ChevronUp, ChevronDown, X } from "react-feather";
+import { Search as SearchIcon, ChevronUp, ChevronDown, X, List } from "react-feather";
 import { Document, Page, pdfjs } from "react-pdf";
 import type { BoundingBox } from "../../lib/types";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { usePdfInnerSearch } from "./usePdfInnerSearch";
 import { getScaledPageHeight, usePdfPageMetrics } from "./usePdfPageMetrics";
 import PdfTextLayer from "./PdfTextLayer";
+import PdfLinkLayer from "./PdfLinkLayer";
+import PdfOutline from "./PdfOutline";
+import { usePdfOutline } from "./usePdfOutline";
+import { resolveDestination, type PdfDestination } from "./pdfDestinations";
+import { api } from "../../services";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -17,17 +22,86 @@ export interface PdfViewerProps {
   url: string;
   page: number;
   highlight_bbox: BoundingBox | null;
-  bookmarkHighlights?: Array<{ id: string; page: number; bbox: BoundingBox }>;
+  /** Precise per-line rects for the navigation target (bookmarks). When set,
+   *  the emphasis is drawn per line instead of over `highlight_bbox`'s union. */
+  highlight_rects?: BoundingBox[] | null;
+  bookmarkHighlights?: Array<{ id: string; page: number; rects: BoundingBox[] }>;
   onRenderSuccess?: () => void;
-  onAddBookmark?: (bookmark: { page: number; bbox: BoundingBox; quote: string }) => void;
+  onAddBookmark?: (bookmark: {
+    page: number;
+    bbox: BoundingBox;
+    rects: BoundingBox[];
+    quote: string;
+  }) => void;
 }
 
 const PAGE_GAP_PX = 12;
+const ZOOM_STEP = 0.1;
+
+// Auto-zoom: bring the dominant body text of a freshly opened document up to a
+// comfortable on-screen size. TARGET is the desired CSS-pixel height of body
+// text; we only ever enlarge (floor 1.0, so already-comfortable documents are
+// left untouched) and cap the enlargement so pathological cases stay sane.
+const AUTO_ZOOM_TARGET_PX = 16.5;
+const AUTO_ZOOM_MAX = 1.6;
+// Deadband: only auto-zoom when it enlarges by at least this factor. Applying a
+// near-1.0x zoom still re-renders every page and recentres, which reads as a
+// flicker on documents that are already comfortable, for no visible gain.
+const AUTO_ZOOM_MIN_INCREASE = 1.05;
+const AUTO_ZOOM_SAMPLE_PAGES = 5;
+// Reference fit-to-width viewport used to judge body-text size. Using a fixed
+// width (rather than the live pane) makes "does this document read small?" a
+// deterministic property of the document itself, so the same file auto-zooms
+// the same amount regardless of the current window size.
+const AUTO_ZOOM_REFERENCE_WIDTH_PX = 900;
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/** Merge client rects that belong to the same visual text line into one
+ *  rectangle. `Range.getClientRects()` can emit several fragments per line
+ *  (one per text node); rendering them as separate translucent highlights
+ *  would stack into uneven darker bands, so collapse each line first. */
+function mergeRectsByLine(rects: BoundingBox[]): BoundingBox[] {
+  const sorted = [...rects].sort((a, b) => a.y - b.y || a.x - b.x);
+  const lines: BoundingBox[] = [];
+  for (const rect of sorted) {
+    const last = lines[lines.length - 1];
+    const sameLine =
+      last && rect.y < last.y + last.height && rect.y + rect.height > last.y;
+    if (sameLine) {
+      const x1 = Math.min(last.x, rect.x);
+      const y1 = Math.min(last.y, rect.y);
+      const x2 = Math.max(last.x + last.width, rect.x + rect.width);
+      const y2 = Math.max(last.y + last.height, rect.y + rect.height);
+      last.x = x1;
+      last.y = y1;
+      last.width = x2 - x1;
+      last.height = y2 - y1;
+    } else {
+      lines.push({ ...rect });
+    }
+  }
+  return lines;
+}
+
+/** Bounding envelope of a set of rectangles (used as the navigation anchor). */
+function unionBox(rects: BoundingBox[]): BoundingBox {
+  const x1 = Math.min(...rects.map((r) => r.x));
+  const y1 = Math.min(...rects.map((r) => r.y));
+  const x2 = Math.max(...rects.map((r) => r.x + r.width));
+  const y2 = Math.max(...rects.map((r) => r.y + r.height));
+  return { x: x1, y: y1, width: x2 - x1, height: y2 - y1 };
+}
 
 export default function PdfViewer({
   url,
   page,
   highlight_bbox,
+  highlight_rects = null,
   bookmarkHighlights = [],
   onRenderSuccess,
   onAddBookmark,
@@ -40,10 +114,12 @@ export default function PdfViewer({
   const prevNavigationTargetRef = useRef<{ page: number; bbox: BoundingBox | null } | null>(null);
   const [zoom, setZoom] = useState(1.0);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
+  const [isOutlineOpen, setIsOutlineOpen] = useState(false);
   const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
   const [selectionBookmark, setSelectionBookmark] = useState<{
     page: number;
     bbox: BoundingBox;
+    rects: BoundingBox[];
     quote: string;
     buttonLeft: number;
     buttonTop: number;
@@ -57,8 +133,127 @@ export default function PdfViewer({
     return () => observer.disconnect();
   }, []);
 
+  // Dismiss the "+ Bookmark" action as soon as the selection collapses (the
+  // user clicked elsewhere, pressed a key, etc.) rather than waiting for the
+  // next mouseup inside the viewer.
+  useEffect(() => {
+    const onSelectionChange = () => {
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+        setSelectionBookmark(null);
+      }
+    };
+    window.document.addEventListener("selectionchange", onSelectionChange);
+    return () => window.document.removeEventListener("selectionchange", onSelectionChange);
+  }, []);
+
   const renderedWidth = containerWidth * zoom;
   const { pageMetrics, hasPageMetrics } = usePdfPageMetrics(pdf, url);
+  const outline = usePdfOutline(pdf);
+
+  // Preserve the horizontal focal point across a zoom change. Without this the
+  // scroll container keeps scrollLeft = 0, so a zoomed-in page stays pinned to
+  // the left edge and its centre drifts off-screen to the right. We capture the
+  // point under the viewport's horizontal centre as a fraction of the current
+  // content width, then re-apply it once the page has grown to its new width.
+  const pendingZoomAnchorRef = useRef<number | null>(null);
+
+  // URL of the document we have already auto-zoomed, so the measurement runs
+  // exactly once per document (and never fights a subsequent manual zoom).
+  const autoZoomedUrlRef = useRef<string | null>(null);
+
+  const setZoomKeepingHorizontalCenter = useCallback(
+    (nextZoom: (zoom: number) => number) => {
+      setZoom((zoom) => {
+        const next = nextZoom(zoom);
+        // No-op at the min/max limits: leave no pending anchor, otherwise it
+        // would be applied later on an unrelated resize.
+        if (next === zoom) return zoom;
+        const container = containerRef.current;
+        if (container && renderedWidth > 0) {
+          const centerX = container.scrollLeft + container.clientWidth / 2;
+          pendingZoomAnchorRef.current = centerX / renderedWidth;
+        }
+        return next;
+      });
+    },
+    [renderedWidth],
+  );
+
+  useLayoutEffect(() => {
+    const relativeCenter = pendingZoomAnchorRef.current;
+    const container = containerRef.current;
+    if (relativeCenter === null || !container) return;
+    pendingZoomAnchorRef.current = null;
+    // Synchronous: renderedWidth (and the page div's width) already updated in
+    // this commit, so scrollWidth is grown before paint — no left-edge flash.
+    container.scrollLeft = relativeCenter * renderedWidth - container.clientWidth / 2;
+  }, [renderedWidth]);
+
+  // Auto-zoom a freshly opened document so its body text renders at a
+  // comfortable on-screen size. We sample a few pages, take the
+  // character-weighted median font size (which locks onto body text and ignores
+  // headings/footnotes), and combine it with the page width to predict the
+  // pixel height of body text against a fixed reference viewport. The required
+  // zoom is then TARGET / that height, floored at 1.0 (never shrink) and capped.
+  // Runs once per document; a scanned/textless PDF yields no samples and is
+  // left at 1.0.
+  useEffect(() => {
+    if (!pdf) return;
+    if (autoZoomedUrlRef.current === url) return;
+
+    let cancelled = false;
+    (async () => {
+      const fontSizes: number[] = [];
+      const pageWidths: number[] = [];
+      const total = pdf.numPages;
+      // Skip the title page when the document is long enough to have one.
+      const start = total > AUTO_ZOOM_SAMPLE_PAGES + 1 ? 2 : 1;
+      const end = Math.min(start + AUTO_ZOOM_SAMPLE_PAGES - 1, total);
+      for (let p = start; p <= end; p++) {
+        const pdfPage = await pdf.getPage(p);
+        if (cancelled) return;
+        pageWidths.push(pdfPage.view[2] - pdfPage.view[0]);
+        const content = await pdfPage.getTextContent();
+        if (cancelled) return;
+        for (const item of content.items) {
+          if (!("str" in item)) continue;
+          const length = item.str.trim().length;
+          if (length === 0) continue;
+          // Font size in PDF units = vertical scale of the text transform.
+          const size = Math.hypot(item.transform[2], item.transform[3]);
+          for (let i = 0; i < length; i++) fontSizes.push(size);
+        }
+      }
+      if (cancelled) return;
+      // Mark done only after a full measurement completes. Setting this up front
+      // would break under React StrictMode, whose mount/unmount/remount cancels
+      // the first pass — the remount would then see the flag and skip measuring.
+      autoZoomedUrlRef.current = url;
+      if (fontSizes.length === 0 || pageWidths.length === 0) return;
+
+      const medianPageWidth = median(pageWidths);
+      if (medianPageWidth <= 0) return;
+      // Body-text height in CSS px when the reference viewport is fit to the page.
+      const renderedPx =
+        median(fontSizes) * (AUTO_ZOOM_REFERENCE_WIDTH_PX / medianPageWidth);
+      if (renderedPx <= 0) return;
+
+      const rawZoom = AUTO_ZOOM_TARGET_PX / renderedPx;
+      // Below the deadband the text is already comfortable; leave zoom at 1.0
+      // untouched rather than nudging it and flickering the page.
+      if (rawZoom < AUTO_ZOOM_MIN_INCREASE) return;
+      const autoZoom = Math.min(AUTO_ZOOM_MAX, rawZoom);
+      // Reuse the recentre mechanism so the enlarged page opens horizontally
+      // centred (equal margins trimmed) instead of pinned to the left edge.
+      pendingZoomAnchorRef.current = 0.5;
+      setZoom(autoZoom);
+    })().catch((e) => console.error("PDF auto-zoom measurement failed:", e));
+
+    return () => {
+      cancelled = true;
+    };
+  }, [pdf, url]);
 
   const getVirtualPageSize = useCallback(
     (index: number) => {
@@ -88,6 +283,40 @@ export default function PdfViewer({
     (p: number) => virtualizer.scrollToIndex(p - 1, { align: "start" }),
     [virtualizer],
   );
+
+  // Follow an in-document GoTo link (table-of-contents entry, cross-reference):
+  // resolve its destination to a page and scroll there, nudging to the exact
+  // vertical anchor when the destination pins one.
+  const navigateToDestination = useCallback(
+    (dest: PdfDestination) => {
+      if (!pdf) return;
+      resolveDestination(pdf, dest)
+        .then((resolved) => {
+          if (!resolved) return;
+          const { pageIndex, offsetY } = resolved;
+          virtualizer.scrollToIndex(pageIndex, { align: "start" });
+          setCurrentPage(pageIndex + 1);
+          if (offsetY !== null) {
+            const metric = pageMetrics[pageIndex];
+            const container = containerRef.current;
+            if (metric && container) {
+              const pageScale = renderedWidth / metric.width;
+              // scrollToIndex sets scrollTop synchronously; apply the in-page
+              // offset on the next frame so it lands after the page is measured.
+              requestAnimationFrame(() => {
+                container.scrollTop += offsetY * pageScale;
+              });
+            }
+          }
+        })
+        .catch((e) => console.error("PDF link navigation failed:", e));
+    },
+    [pdf, virtualizer, pageMetrics, renderedWidth],
+  );
+
+  const openExternalLink = useCallback((url: string) => {
+    api.openPath(url).catch((e) => console.error("Open PDF link failed:", e));
+  }, []);
 
   const syncCurrentPageFromScroll = useCallback(() => {
     const container = containerRef.current;
@@ -154,14 +383,34 @@ export default function PdfViewer({
       return;
     }
 
+    // Highlight the exact selected text by capturing one rectangle per line
+    // (getClientRects) instead of the selection's bounding box, which on a
+    // multi-line selection would also cover the unselected head/tail of the
+    // first and last lines. Keep only fragments centred on the start page so a
+    // selection dragged across page boundaries doesn't pull in other pages.
+    const rects = mergeRectsByLine(
+      Array.from(range.getClientRects())
+        .filter((rect) => {
+          if (rect.width <= 0 || rect.height <= 0) return false;
+          const centerY = rect.top + rect.height / 2;
+          return centerY >= pageRect.top && centerY <= pageRect.bottom;
+        })
+        .map((rect) => ({
+          x: (rect.left - pageRect.left) / pageScale,
+          y: (rect.top - pageRect.top) / pageScale,
+          width: rect.width / pageScale,
+          height: rect.height / pageScale,
+        })),
+    );
+    if (rects.length === 0) {
+      setSelectionBookmark(null);
+      return;
+    }
+
     setSelectionBookmark({
       page: pageNumber,
-      bbox: {
-        x: (selectionRect.left - pageRect.left) / pageScale,
-        y: (selectionRect.top - pageRect.top) / pageScale,
-        width: selectionRect.width / pageScale,
-        height: selectionRect.height / pageScale,
-      },
+      bbox: unionBox(rects),
+      rects,
       quote,
       buttonLeft: Math.min(
         Math.max(selectionRect.left - rootRect.left, 8),
@@ -281,6 +530,18 @@ export default function PdfViewer({
         )}
 
         <div className="flex items-center gap-1 bg-[var(--bg-app)] border border-[var(--border-main)] rounded-lg shadow-lg px-2 py-1 text-xs text-[var(--text-main)]">
+          {pdf && (
+            <button
+              onClick={() => setIsOutlineOpen((open) => !open)}
+              disabled={!outline}
+              className={`p-1 transition-colors mr-1 border-r border-[var(--border-main)] pr-2 ${
+                outline ? "hover:text-[var(--accent-blue)]" : "opacity-40 cursor-default"
+              } ${isOutlineOpen ? "text-[var(--accent-blue)]" : ""}`}
+              title={outline ? "Table of contents" : "This document has no table of contents"}
+            >
+              <List size={12} />
+            </button>
+          )}
           {!isSearchOpen && (
             <button
               onClick={() => {
@@ -296,14 +557,18 @@ export default function PdfViewer({
           {numPages && <span className="w-16 text-center font-mono">{currentPage}/{numPages}</span>}
           {numPages && <span className="text-[var(--text-dim)]">|</span>}
           <button
-            onClick={() => setZoom((z) => Math.max(0.25, +(z - 0.25).toFixed(2)))}
+            onClick={() =>
+              setZoomKeepingHorizontalCenter((z) => Math.max(0.25, +(z - ZOOM_STEP).toFixed(2)))
+            }
             className="px-1 hover:text-[var(--accent-blue)]"
           >
             −
           </button>
           <span className="w-10 text-center font-mono">{Math.round(zoom * 100)}%</span>
           <button
-            onClick={() => setZoom((z) => Math.min(3.0, +(z + 0.25).toFixed(2)))}
+            onClick={() =>
+              setZoomKeepingHorizontalCenter((z) => Math.min(3.0, +(z + ZOOM_STEP).toFixed(2)))
+            }
             className="px-1 hover:text-[var(--accent-blue)]"
           >
             +
@@ -311,19 +576,28 @@ export default function PdfViewer({
         </div>
       </div>
 
-      <div
-        ref={containerRef}
-        className={`flex-1 overflow-auto bg-[var(--bg-sidebar)] pr-1 ${isDark ? "pdf-dark-mode" : ""}`}
-        onMouseUp={handleMouseUp}
-        onScroll={() => {
-          requestAnimationFrame(syncCurrentPageFromScroll);
-        }}
-        style={{
-          WebkitUserSelect: "text",
-          userSelect: "text",
-          transition: "filter 0.3s ease",
-        }}
-      >
+      <div className="flex-1 flex min-h-0">
+        {isOutlineOpen && outline && (
+          <PdfOutline
+            outline={outline}
+            onNavigateToDestination={navigateToDestination}
+            onOpenExternal={openExternalLink}
+            onClose={() => setIsOutlineOpen(false)}
+          />
+        )}
+        <div
+          ref={containerRef}
+          className={`flex-1 min-w-0 overflow-auto bg-[var(--bg-sidebar)] pr-1 ${isDark ? "pdf-dark-mode" : ""}`}
+          onMouseUp={handleMouseUp}
+          onScroll={() => {
+            requestAnimationFrame(syncCurrentPageFromScroll);
+          }}
+          style={{
+            WebkitUserSelect: "text",
+            userSelect: "text",
+            transition: "filter 0.3s ease",
+          }}
+        >
         <Document
           file={url}
           onLoadSuccess={(doc) => {
@@ -331,7 +605,12 @@ export default function PdfViewer({
             setNumPages(doc.numPages);
           }}
         >
-          <div style={{ paddingTop, paddingBottom, minWidth: "fit-content" }}>
+          {/* Explicit width (not fit-content) so the scrollable extent grows in
+              the same commit as a zoom change, instead of trailing react-pdf's
+              async canvas render. This lets the zoom-recentre effect set
+              scrollLeft synchronously without the browser clamping it to a
+              stale, not-yet-widened maximum. */}
+          <div style={{ paddingTop, paddingBottom, width: `${renderedWidth}px` }}>
             {virtualItems.map((vItem) => {
               const pageNum = vItem.index + 1;
               const pageMetric = pageMetrics[vItem.index];
@@ -341,11 +620,19 @@ export default function PdfViewer({
 
               const isTargetPage = pageNum === page;
               const targetBbox = isTargetPage ? highlight_bbox : null;
+              // Precise emphasis for a bookmark target; when present it replaces
+              // the coarse single-box emphasis below.
+              const targetRects =
+                isTargetPage && !isSearchOpen ? highlight_rects : null;
 
               const innerMatch = innerMatches[currentMatchIdx];
               const innerBbox = innerMatch && innerMatch.page === pageNum ? innerMatch.bbox : null;
 
-              const activeBbox = isSearchOpen ? innerBbox : targetBbox;
+              const activeBbox = isSearchOpen
+                ? innerBbox
+                : targetRects && targetRects.length > 0
+                  ? null
+                  : targetBbox;
               const pageBookmarkHighlights = bookmarkHighlights.filter(
                 (highlight) => highlight.page === pageNum,
               );
@@ -392,27 +679,59 @@ export default function PdfViewer({
                     {pdf && (
                       <PdfTextLayer pdf={pdf} pageNumber={pageNum} scale={pageScale} />
                     )}
-                    {pageBookmarkHighlights.map((highlight) => {
-                      const { x, y, width, height } = highlight.bbox;
+                    {pdf && (
+                      <PdfLinkLayer
+                        pdf={pdf}
+                        pageNumber={pageNum}
+                        scale={pageScale}
+                        onNavigateToDestination={navigateToDestination}
+                        onOpenExternal={openExternalLink}
+                      />
+                    )}
+                    {pageBookmarkHighlights.flatMap((highlight) =>
+                      highlight.rects.map((rect, rectIndex) => {
+                        const { x, y, width, height } = rect;
+                        return (
+                          <div
+                            key={`${highlight.id}-${rectIndex}`}
+                            data-testid="bookmark-highlight"
+                            data-bookmark-id={highlight.id}
+                            style={{
+                              position: "absolute",
+                              left: `${x * pageScale}px`,
+                              top: `${y * pageScale}px`,
+                              width: `${Math.max(width * pageScale, 4)}px`,
+                              height: `${Math.max(height * pageScale, 4)}px`,
+                              backgroundColor: "rgba(250, 204, 21, 0.16)",
+                              borderBottom: "2px solid rgba(202, 138, 4, 0.75)",
+                              borderRadius: "2px",
+                              pointerEvents: "none",
+                            }}
+                          />
+                        );
+                      }),
+                    )}
+                    {overlayStyle && <div style={overlayStyle} />}
+                    {targetRects?.map((rect, rectIndex) => {
+                      const { x, y, width, height } = rect;
                       return (
                         <div
-                          key={highlight.id}
-                          data-testid="bookmark-highlight"
+                          key={`target-${rectIndex}`}
+                          data-testid="target-highlight"
                           style={{
                             position: "absolute",
                             left: `${x * pageScale}px`,
                             top: `${y * pageScale}px`,
                             width: `${Math.max(width * pageScale, 4)}px`,
                             height: `${Math.max(height * pageScale, 4)}px`,
-                            backgroundColor: "rgba(250, 204, 21, 0.16)",
-                            borderBottom: "2px solid rgba(202, 138, 4, 0.75)",
+                            backgroundColor: "rgba(250, 204, 21, 0.25)",
+                            border: "1px solid rgba(250, 204, 21, 0.8)",
                             borderRadius: "2px",
                             pointerEvents: "none",
                           }}
                         />
                       );
                     })}
-                    {overlayStyle && <div style={overlayStyle} />}
                     {!isSearchOpen &&
                       targetBbox &&
                       isTargetPage &&
@@ -445,6 +764,7 @@ export default function PdfViewer({
             })}
           </div>
         </Document>
+        </div>
       </div>
       {selectionBookmark && onAddBookmark && (
         <button

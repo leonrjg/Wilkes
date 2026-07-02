@@ -25,6 +25,10 @@ interface ToastOptions {
 interface ToastContextType {
   addToast: (message: string, options?: ToastOptions) => string;
   removeToast: (id: string) => void;
+  /** Show a persistent "working" toast immediately and return a dismisser to
+   *  call once the async action settles. Reusable for any button whose result
+   *  toast would otherwise be the first sign anything happened. */
+  notifyPending: (message: string) => () => void;
 }
 
 const ToastContext = createContext<ToastContextType | undefined>(undefined);
@@ -70,8 +74,16 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     return id;
   }, [removeToast]);
 
+  const notifyPending = useCallback(
+    (message: string) => {
+      const id = addToast(message, { type: "info", shimmer: true, duration: 0 });
+      return () => removeToast(id);
+    },
+    [addToast, removeToast],
+  );
+
   return (
-    <ToastContext.Provider value={{ addToast, removeToast }}>
+    <ToastContext.Provider value={{ addToast, removeToast, notifyPending }}>
       {children}
       <div className="fixed bottom-4 right-4 z-[200] flex flex-col gap-2 max-w-sm w-full">
         {toasts.map((toast) => (

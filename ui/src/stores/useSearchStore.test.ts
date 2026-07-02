@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { useSearchStore } from "./useSearchStore";
+import { useSettingsStore } from "./useSettingsStore";
 import { api } from "../services";
 import type { SearchQuery, FileMatches, SearchStats, MatchRef, PreviewData } from "../lib/types";
 
@@ -9,6 +10,7 @@ vi.mock("../services", () => ({
     cancelSearch: vi.fn(),
     preview: vi.fn(),
     getFileMetadata: vi.fn(),
+    resolveFileMetadata: vi.fn(),
     getIndexStatus: vi.fn(),
   },
 }));
@@ -16,6 +18,8 @@ vi.mock("../services", () => ({
 describe("useSearchStore", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Zotero disabled by default so selectMatch does not attempt a lookup.
+    useSettingsStore.setState({ settings: null });
     useSearchStore.setState({
       results: [],
       stats: null,
@@ -133,6 +137,42 @@ describe("useSearchStore", () => {
     expect(state.previewLoading).toBe(false);
     expect(state.viewerMetadata).toEqual({ title: "Test Title", author: "Test Author", doi: "10.1000/xyz123", created_at: "2025-04" });
     expect(state.viewerMetadataStatus).toBe("ready");
+  });
+
+  it("overrides local metadata with Zotero's when the integration is enabled", async () => {
+    useSettingsStore.setState({
+      settings: { integrations: { zotero: { enabled: true } } },
+    } as never);
+    const mockMatchRef: MatchRef = { path: "/test/paper.pdf", origin: { PdfPage: { page: 1, bbox: null } } };
+    (api.preview as any).mockResolvedValue({ Pdf: { page: 1, highlight_bbox: null } });
+    (api.getFileMetadata as any).mockResolvedValue({ title: "Embedded", author: null, doi: null, created_at: null });
+    const zoteroMeta = { title: "Real Title", author: "Tambon et al.", doi: "10.1/x", created_at: "05/2025" };
+    (api.resolveFileMetadata as any).mockResolvedValue(zoteroMeta);
+
+    useSearchStore.getState().selectMatch(mockMatchRef);
+
+    await vi.waitFor(() =>
+      expect(useSearchStore.getState().viewerMetadata).toEqual(zoteroMeta),
+    );
+    expect(api.resolveFileMetadata).toHaveBeenCalledWith("/test/paper.pdf");
+    expect(useSearchStore.getState().viewerMetadataStatus).toBe("ready");
+  });
+
+  it("keeps local metadata when the Zotero lookup finds nothing", async () => {
+    useSettingsStore.setState({
+      settings: { integrations: { zotero: { enabled: true } } },
+    } as never);
+    const mockMatchRef: MatchRef = { path: "/test/paper.pdf", origin: { PdfPage: { page: 1, bbox: null } } };
+    (api.preview as any).mockResolvedValue({ Pdf: { page: 1, highlight_bbox: null } });
+    const local = { title: "Embedded", author: "PDF Author", doi: null, created_at: "2025-04" };
+    (api.getFileMetadata as any).mockResolvedValue(local);
+    (api.resolveFileMetadata as any).mockRejectedValue(new Error("No Zotero item found for this file"));
+
+    useSearchStore.getState().selectMatch(mockMatchRef);
+
+    await vi.waitFor(() => expect(api.resolveFileMetadata).toHaveBeenCalled());
+    await Promise.resolve();
+    expect(useSearchStore.getState().viewerMetadata).toEqual(local);
   });
 
   it("should clear preview", () => {

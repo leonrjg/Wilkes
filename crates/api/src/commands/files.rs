@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ignore::WalkBuilder;
 use wilkes_core::types::{
@@ -36,6 +37,14 @@ pub async fn list_files(
                 // File size filter
                 let meta = entry.metadata().ok();
                 let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let created_at_ms = meta
+                    .as_ref()
+                    .and_then(|m| m.created().ok())
+                    .and_then(system_time_ms);
+                let modified_at_ms = meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(system_time_ms);
                 let file_type = FileType::detect(&path, &supported_extensions);
 
                 if file_type.is_none() {
@@ -45,6 +54,9 @@ pub async fn list_files(
                             size_bytes,
                             file_type: FileType::PlainText,
                             extension,
+                            created_at_ms,
+                            modified_at_ms,
+                            publication_date: None,
                         },
                         reason: OmittedFileReason::UnsupportedExtension,
                     });
@@ -59,6 +71,9 @@ pub async fn list_files(
                             size_bytes,
                             file_type,
                             extension,
+                            created_at_ms,
+                            modified_at_ms,
+                            publication_date: None,
                         },
                         reason: OmittedFileReason::TooLarge,
                     });
@@ -70,6 +85,9 @@ pub async fn list_files(
                     size_bytes,
                     file_type,
                     extension,
+                    created_at_ms,
+                    modified_at_ms,
+                    publication_date: None,
                 });
             }
         }
@@ -78,6 +96,11 @@ pub async fn list_files(
         Ok(FileListResponse { files, omitted })
     })
     .await?
+}
+
+fn system_time_ms(time: SystemTime) -> Option<i64> {
+    let millis = time.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    i64::try_from(millis).ok()
 }
 
 pub async fn open_file(
@@ -103,6 +126,47 @@ pub async fn open_file(
     }
 }
 
+pub async fn rename_file(path: PathBuf, new_name: String) -> anyhow::Result<PathBuf> {
+    let new_name = new_name.trim();
+    validate_new_file_name(new_name)?;
+
+    let metadata = tokio::fs::metadata(&path).await?;
+    if !metadata.is_file() {
+        anyhow::bail!("Can only rename files");
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("File has no containing directory"))?;
+    let target = parent.join(new_name);
+
+    if tokio::fs::try_exists(&target).await? {
+        anyhow::bail!("A file or folder with that name already exists");
+    }
+
+    tokio::fs::rename(&path, &target).await?;
+    Ok(target)
+}
+
+fn validate_new_file_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("File name cannot be empty");
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        anyhow::bail!("File name cannot contain path separators");
+    }
+    if name == "." || name == ".." {
+        anyhow::bail!("Invalid file name");
+    }
+    if !matches!(
+        PathBuf::from(name).components().next(),
+        Some(Component::Normal(_))
+    ) {
+        anyhow::bail!("Invalid file name");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,7 +187,14 @@ mod tests {
 
         assert_eq!(files.files.len(), 2);
         assert_eq!(files.omitted.len(), 1);
-        assert_eq!(files.omitted[0].reason, OmittedFileReason::UnsupportedExtension);
+        assert!(files
+            .files
+            .iter()
+            .all(|entry| entry.modified_at_ms.is_some()));
+        assert_eq!(
+            files.omitted[0].reason,
+            OmittedFileReason::UnsupportedExtension
+        );
     }
 
     #[tokio::test]
@@ -204,10 +275,42 @@ mod tests {
         let extensions = vec!["txt".to_string()];
         let files = list_files(root.to_path_buf(), extensions, 0).await.unwrap();
 
-        assert!(files.files.iter().any(|entry| entry.path.ends_with("ok.txt")));
+        assert!(files
+            .files
+            .iter()
+            .any(|entry| entry.path.ends_with("ok.txt")));
 
         let mut perms = fs::metadata(&bad_dir).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&bad_dir, perms).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rename_file_renames_within_parent_directory() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("old.txt");
+        fs::write(&path, "hello").unwrap();
+
+        let renamed = rename_file(path.clone(), "new.txt".into()).await.unwrap();
+
+        assert_eq!(renamed, dir.path().join("new.txt"));
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(renamed).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn test_rename_file_rejects_path_names_and_existing_targets() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("old.txt");
+        fs::write(&path, "hello").unwrap();
+        fs::write(dir.path().join("taken.txt"), "existing").unwrap();
+
+        let err = rename_file(path.clone(), "../new.txt".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("path separators"));
+
+        let err = rename_file(path, "taken.txt".into()).await.unwrap_err();
+        assert!(err.to_string().contains("already exists"));
     }
 }

@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { api } from "../services";
 import { isUsableSemanticIndex } from "../lib/semantic";
+import { useSettingsStore } from "./useSettingsStore";
 import type {
   DocumentMetadata,
   FileMatches,
@@ -165,6 +166,25 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
       return;
     }
 
+    // File-based metadata shows immediately (fast first paint). The backend then
+    // returns the authoritative value — file-based overridden by the Zotero
+    // library record when the file resolves — which the composition owner
+    // decides; the UI just replaces the header with whatever it returns. Only
+    // consulted when Zotero is enabled, since otherwise it equals the fast value.
+    const upgradeAuthoritative = () => {
+      if (!useSettingsStore.getState().settings?.integrations.zotero.enabled) return;
+      api
+        .resolveFileMetadata(selectedPath)
+        .then((metadata) => {
+          if (get().selectedMatch?.path !== selectedPath) return;
+          set({ viewerMetadata: metadata, viewerMetadataStatus: "ready" });
+        })
+        .catch((e) => {
+          // Keep the file-based metadata already shown on any resolve failure.
+          console.debug("Authoritative metadata resolve skipped:", e);
+        });
+    };
+
     api
       .getFileMetadata(selectedPath)
       .then((metadata) => {
@@ -175,7 +195,8 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
         console.error("Metadata fetch failed:", e);
         if (get().selectedMatch?.path !== selectedPath) return;
         set({ viewerMetadata: null, viewerMetadataStatus: "failed" });
-      });
+      })
+      .finally(upgradeAuthoritative);
   },
 
   clearPreview: () =>

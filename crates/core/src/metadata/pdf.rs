@@ -47,11 +47,10 @@ fn extract_pdf_doi(doc: &Document) -> Option<String> {
 }
 
 fn normalize_pdf_creation_date(value: &str) -> Option<String> {
-    let captures = Regex::new(
-        r"^D:(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})([+-])(\d{2})'(\d{2})'$",
-    )
-    .ok()?
-    .captures(value)?;
+    let captures =
+        Regex::new(r"^D:(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})([+-])(\d{2})'(\d{2})'$")
+            .ok()?
+            .captures(value)?;
 
     let year = captures.get(1)?.as_str().parse::<i32>().ok()?;
     let month = captures.get(2)?.as_str().parse::<u32>().ok()?;

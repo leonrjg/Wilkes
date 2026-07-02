@@ -10,6 +10,7 @@ export function useGlobalEvents() {
 
   useEffect(() => {
     let managerUnlisten: (() => void) | undefined;
+    let metadataUnlisten: (() => void) | undefined;
     let mounted = true;
 
     const closeReindexToast = () => {
@@ -45,9 +46,21 @@ export function useGlobalEvents() {
       }
     });
 
+    api.onFileMetadataUpdated((updates) => {
+      if (!mounted) return;
+      useSettingsStore.getState().applyMetadataUpdates(updates);
+    }).then((u) => {
+      if (!mounted) {
+        u();
+      } else {
+        metadataUnlisten = u;
+      }
+    });
+
     return () => {
       mounted = false;
       if (managerUnlisten) managerUnlisten();
+      if (metadataUnlisten) metadataUnlisten();
     };
   }, [addToast, removeToast]);
 }

@@ -7,5 +7,7 @@ function fileName(path: string) {
 export function toMarkdown(bookmark: Bookmark): string {
   const page = "PdfPage" in bookmark.origin ? bookmark.origin.PdfPage.page : null;
   const pageSuffix = page === null ? "" : `, p.${page}`;
-  return `> ${bookmark.quote}\n\n- [${fileName(bookmark.path)}](${bookmark.path})${pageSuffix}`;
+  const note = bookmark.note?.trim();
+  const noteBlock = note ? `\n\n${note}` : "";
+  return `> ${bookmark.quote}${noteBlock}\n\n- [${fileName(bookmark.path)}](${bookmark.path})${pageSuffix}`;
 }
