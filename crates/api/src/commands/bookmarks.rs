@@ -25,17 +25,12 @@ fn normalize_note(note: Option<String>) -> Option<String> {
     note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty())
 }
 
-/// Content fingerprint of the file being bookmarked, stat-ed on disk. `None`
-/// when the file is unreadable — the bookmark is still created, it just can't
-/// be re-pointed if later renamed.
-fn identity_for(path: &Path) -> Option<FileIdentity> {
-    let meta = std::fs::metadata(path).ok()?;
-    FileIdentity::from_fs(meta.len(), meta.modified().ok())
-}
-
 pub async fn add(path: &Path, new_bookmark: NewBookmark) -> anyhow::Result<Bookmark> {
     let mut bookmarks = load(path).await?;
-    let identity = identity_for(&new_bookmark.path);
+    // Content fingerprint of the file being bookmarked, stat-ed on disk. `None`
+    // when the file is unreadable — the bookmark is still created, it just can't
+    // be re-pointed if later renamed.
+    let identity = FileIdentity::for_path(&new_bookmark.path);
     let bookmark = Bookmark {
         id: uuid::Uuid::new_v4().to_string(),
         path: new_bookmark.path,
@@ -128,9 +123,7 @@ mod tests {
         nb.path = file.clone();
 
         let bookmark = add(&path, nb).await.unwrap();
-        let expected = std::fs::metadata(&file)
-            .ok()
-            .and_then(|m| FileIdentity::from_fs(m.len(), m.modified().ok()));
+        let expected = FileIdentity::for_path(&file);
         assert!(expected.is_some());
         assert_eq!(bookmark.identity, expected);
     }

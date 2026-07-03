@@ -111,7 +111,7 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
     expect(screen.getByTitle("Open DOI 10.1000/xyz123")).toBeInTheDocument();
-    expect(screen.getByTitle("Open Google Scholar for DOI 10.1000/xyz123")).toBeInTheDocument();
+    expect(screen.getByTitle("Open Google Scholar")).toBeInTheDocument();
     expect(screen.getByTitle("Copy DOI 10.1000/xyz123")).toBeInTheDocument();
     expect(screen.getByText("DOI: 10.1000/xyz123")).toBeInTheDocument();
     expect(screen.getByText("Scholar")).toBeInTheDocument();
@@ -135,7 +135,7 @@ describe("PreviewPane", () => {
       "noopener,noreferrer",
     );
 
-    fireEvent.click(screen.getByTitle("Open Google Scholar for DOI 10.1000/xyz123"));
+    fireEvent.click(screen.getByTitle("Open Google Scholar"));
     expect(window.open).toHaveBeenCalledWith(
       "https://scholar.google.com/scholar?q=10.1000%2Fxyz123",
       "_blank",
@@ -144,6 +144,26 @@ describe("PreviewPane", () => {
 
     fireEvent.click(screen.getByTitle("Copy DOI 10.1000/xyz123"));
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith("10.1000/xyz123");
+  });
+
+  it("renders Google Scholar action using title when DOI is unavailable", () => {
+    const mockMatch = { path: "paper.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
+    useSearchStore.setState({
+      selectedMatch: mockMatch,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: { title: "A Title Without DOI", author: "Author", doi: null, created_at: null },
+      viewerMetadataStatus: "ready",
+    });
+
+    render(<PreviewPane />);
+
+    expect(screen.queryByTitle(/^Open DOI /)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTitle("Open Google Scholar"));
+    expect(window.open).toHaveBeenCalledWith(
+      "https://scholar.google.com/scholar?q=A%20Title%20Without%20DOI",
+      "_blank",
+      "noopener,noreferrer",
+    );
   });
 
   it("renders PdfViewer for pdf data", () => {

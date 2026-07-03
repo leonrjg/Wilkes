@@ -505,12 +505,21 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
               {showOmittedFiles && (
                 <div className="mt-2">
                   {filteredOmittedFiles.map((entry) => (
-                    <div key={entry.path} className="py-1.5">
-                      <div className="truncate">{fileName(entry.path)}</div>
-                      <div className="text-[10px] opacity-75 truncate">
-                        {formatOmittedReason(entry)}
-                      </div>
-                    </div>
+                    <FileEntryRow
+                      key={entry.path}
+                      entry={entry}
+                      displayFields={[]}
+                      selected={selectedMatch?.path === entry.path}
+                      detail={formatOmittedReason(entry)}
+                      muted
+                      onClick={() => onFileClick(entry.path)}
+                      onContextMenu={(event) =>
+                        handleRowContextMenu(event, {
+                          kind: "file",
+                          path: entry.path,
+                          open: () => onFileClick(entry.path),
+                        })}
+                    />
                   ))}
                 </div>
               )}
@@ -796,12 +805,16 @@ function FileEntryRow({
   entry,
   displayFields,
   selected,
+  detail,
+  muted = false,
   onClick,
   onContextMenu,
 }: {
   entry: FileEntry;
   displayFields: FileDisplayField[];
   selected: boolean;
+  detail?: string;
+  muted?: boolean;
   onClick: () => void;
   onContextMenu: (event: React.MouseEvent) => void;
 }) {
@@ -814,19 +827,32 @@ function FileEntryRow({
         selected ? "bg-[var(--bg-active)]" : ""
       }`}
     >
-      <span className="text-sm font-medium text-[var(--text-main)] truncate">{fileName(entry.path)}</span>
-      <span className="text-xs text-[var(--text-muted)] truncate flex-1">{dirName(entry.path)}</span>
-      {activeFields.map((field) => (
-        <span
-          key={field.key}
-          className="text-xs text-[var(--text-muted)] flex-shrink-0 font-mono tabular-nums"
-        >
-          {displayFieldValue(entry, field.key) ?? "—"}
-        </span>
-      ))}
-      {entry.file_type === "Pdf" && (
-        <span className="text-xs text-[var(--accent-blue)] flex-shrink-0 font-mono">PDF</span>
-      )}
+      <span
+        className={`text-sm font-medium truncate ${
+          muted ? "text-[var(--text-muted)]" : "text-[var(--text-main)]"
+        }`}
+      >
+        {fileName(entry.path)}
+      </span>
+      <span className="text-xs text-[var(--text-muted)] truncate flex-1">
+        {detail ?? dirName(entry.path)}
+      </span>
+      <div className="flex items-baseline gap-1 flex-shrink-0">
+        {activeFields.map((field) => (
+          <React.Fragment key={field.key}>
+            <span className="text-xs text-[var(--text-dim)] select-none">·</span>
+            <span className="text-xs text-[var(--text-muted)] font-mono tabular-nums">
+              {displayFieldValue(entry, field.key) ?? "—"}
+            </span>
+          </React.Fragment>
+        ))}
+        {entry.file_type === "Pdf" && (
+          <>
+            <span className="text-xs text-[var(--text-dim)] select-none">·</span>
+            <span className="text-xs text-[var(--accent-blue)] font-mono">PDF</span>
+          </>
+        )}
+      </div>
     </button>
   );
 }

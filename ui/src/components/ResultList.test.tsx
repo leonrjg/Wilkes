@@ -114,6 +114,9 @@ describe("ResultList", () => {
 
     expect(screen.getByText("large.pdf")).toBeInTheDocument();
     expect(screen.getByText(/exceeds current file size limit/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /large\.pdf/i }));
+    expect(mockOnFileClick).toHaveBeenCalledWith("/test/large.pdf");
   });
 
   it("sorts the file list by filename, size, and dates", () => {

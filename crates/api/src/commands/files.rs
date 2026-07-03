@@ -1,4 +1,4 @@
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ignore::WalkBuilder;
@@ -105,15 +105,26 @@ fn system_time_ms(time: SystemTime) -> Option<i64> {
 
 pub async fn open_file(
     path: PathBuf,
-    supported_extensions: Vec<String>,
+    _supported_extensions: Vec<String>,
 ) -> anyhow::Result<PreviewData> {
-    match FileType::detect(&path, &supported_extensions) {
-        Some(FileType::Pdf) => Ok(PreviewData::Pdf {
+    match viewer_file_type(&path) {
+        FileType::Pdf => Ok(PreviewData::Pdf {
             page: 1,
             highlight_bbox: None,
         }),
-        Some(FileType::PlainText) => {
-            let content = tokio::fs::read_to_string(&path).await?;
+        FileType::PlainText => {
+            let content =
+                tokio::fs::read_to_string(&path)
+                    .await
+                    .map_err(|err| match err.kind() {
+                        std::io::ErrorKind::InvalidData => {
+                            anyhow::anyhow!(
+                                "Cannot preview non-UTF-8 text file: {}",
+                                path.display()
+                            )
+                        }
+                        _ => anyhow::Error::from(err),
+                    })?;
             let language = detect_language(&path);
             Ok(PreviewData::Text {
                 content,
@@ -122,7 +133,17 @@ pub async fn open_file(
                 highlight_range: ByteRange { start: 0, end: 0 },
             })
         }
-        None => anyhow::bail!("unsupported file type: {}", path.display()),
+    }
+}
+
+fn viewer_file_type(path: &Path) -> FileType {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("pdf"))
+    {
+        Some(true) => FileType::Pdf,
+        _ => FileType::PlainText,
     }
 }
 
@@ -232,14 +253,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_file_unsupported() {
+    async fn test_open_file_unsupported_extension_as_text() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("test.exe");
-        fs::write(&path, "binary").unwrap();
+        let path = dir.path().join("test.log");
+        fs::write(&path, "plain text").unwrap();
+
+        let extensions = vec!["txt".to_string()];
+        let preview = open_file(path, extensions).await.unwrap();
+
+        match preview {
+            PreviewData::Text { content, .. } => assert_eq!(content, "plain text"),
+            _ => panic!("Expected Text preview"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_open_file_non_utf8_text_fails() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
 
         let extensions = vec!["txt".to_string()];
         let result = open_file(path, extensions).await;
         assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot preview non-UTF-8 text file"));
     }
 
     #[tokio::test]

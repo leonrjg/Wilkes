@@ -174,11 +174,11 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
     )?.rects ?? null;
   const author = viewerMetadata?.author?.trim() || null;
   const createdAt = formatCreatedAt(viewerMetadata?.created_at);
-  const links = buildExternalLinks(viewerMetadata?.doi);
+  const links = buildExternalLinks(viewerMetadata?.doi, viewerMetadata?.title);
   const doi = links?.doi ?? null;
 
   const handleOpenDoi = () => {
-    if (!links) return;
+    if (!links?.doiUrl) return;
     api.openPath(links.doiUrl).catch((e) => console.error("Open DOI failed:", e));
   };
 
@@ -190,6 +190,11 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   const handleCopyDoi = () => {
     if (!doi) return;
     api.writeClipboard(doi).catch((e) => console.error("Copy DOI failed:", e));
+  };
+
+  const handleCopyTitle = () => {
+    const title = headerTitle(selectedMatch.path, viewerMetadata);
+    api.writeClipboard(title).catch((e) => console.error("Copy title failed:", e));
   };
 
   const handleAddBookmark = ({
@@ -246,37 +251,48 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
         </div>
 
         <div className="flex flex-col min-w-0 flex-1 selectable">
-          <span className="text-xs font-medium text-[var(--text-main)] truncate leading-tight">
-            {headerTitle(selectedMatch.path, viewerMetadata)}
-          </span>
+          <div className="flex items-center gap-1 min-w-0">
+            <span className="text-xs font-medium text-[var(--text-main)] truncate leading-tight">
+              {headerTitle(selectedMatch.path, viewerMetadata)}
+            </span>
+            <button
+              onClick={handleCopyTitle}
+              className="p-0.5 hover:bg-[var(--bg-active)] rounded text-[var(--text-dim)] hover:text-[var(--text-main)] flex-shrink-0"
+              title="Copy title"
+            >
+              <Copy size={10} />
+            </button>
+          </div>
           <div className="flex items-center gap-1 min-w-0 text-[10px] text-[var(--text-dim)] leading-tight">
             {createdAt && <span className={metadataBadgeClassName()}>{createdAt}</span>}
             {author && <span className="truncate">{author}</span>}
             {!createdAt && !author && viewerMetadataStatus === "loading" && <span>Loading metadata…</span>}
             {(createdAt || author || viewerMetadataStatus === "loading") && <span aria-hidden="true">·</span>}
             {doi && (
+              <div className={groupedActionClassName()}>
+                <button
+                  onClick={handleOpenDoi}
+                  className={groupedActionSegmentClassName()}
+                  title={`Open DOI ${doi}`}
+                >
+                  <span className="truncate max-w-[140px]">DOI: {doi}</span>
+                  <ExternalLink size={10} />
+                </button>
+                <button
+                  onClick={handleCopyDoi}
+                  className={`${groupedActionSegmentClassName()} border-l border-[var(--border-main)]`}
+                  title={`Copy DOI ${doi}`}
+                >
+                  <Copy size={10} />
+                </button>
+              </div>
+            )}
+            {links && (
               <>
-                <div className={groupedActionClassName()}>
-                  <button
-                    onClick={handleOpenDoi}
-                    className={groupedActionSegmentClassName()}
-                    title={`Open DOI ${doi}`}
-                  >
-                    <span className="truncate max-w-[140px]">DOI: {doi}</span>
-                    <ExternalLink size={10} />
-                  </button>
-                  <button
-                    onClick={handleCopyDoi}
-                    className={`${groupedActionSegmentClassName()} border-l border-[var(--border-main)]`}
-                    title={`Copy DOI ${doi}`}
-                  >
-                    <Copy size={10} />
-                  </button>
-                </div>
                 <button
                   onClick={handleOpenScholar}
                   className={actionButtonClassName()}
-                  title={`Open Google Scholar for DOI ${doi}`}
+                  title="Open Google Scholar"
                 >
                   <span>Scholar</span>
                   <ExternalLink size={10} />

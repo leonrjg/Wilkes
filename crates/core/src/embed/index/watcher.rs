@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,11 +17,6 @@ use crate::types::IndexingConfig;
 /// as the file-identity registry that lets the watcher recognise renames.
 type CacheHandle = Option<Arc<Mutex<MetadataCache>>>;
 
-fn fs_identity(path: &Path) -> Option<FileIdentity> {
-    let meta = std::fs::metadata(path).ok()?;
-    FileIdentity::from_fs(meta.len(), meta.modified().ok())
-}
-
 /// Identify which of the `changed` paths are actually renames of files the
 /// cache already knows: same content fingerprint, old path now gone. Returns
 /// `(old_path, new_path)` pairs. Empty when there is no cache to consult.
@@ -34,7 +29,7 @@ fn detect_renames(cache: &CacheHandle, changed: &[PathBuf]) -> Vec<(PathBuf, Pat
     };
     let mut renames = Vec::new();
     for new_path in changed {
-        let Some(identity) = fs_identity(new_path) else {
+        let Some(identity) = FileIdentity::for_path(new_path) else {
             continue;
         };
         match guard.find_rename_source(new_path, identity) {
@@ -916,7 +911,7 @@ mod tests {
         assert_eq!(idx.status().total_chunks, 1);
 
         let cache = MetadataCache::open(dir.path()).unwrap();
-        let identity = fs_identity(&old_path).unwrap();
+        let identity = FileIdentity::for_path(&old_path).unwrap();
         cache
             .upsert(
                 &old_path,

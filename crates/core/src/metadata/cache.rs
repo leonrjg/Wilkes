@@ -73,9 +73,33 @@ impl FileIdentity {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .and_then(|d| i64::try_from(d.as_millis()).ok())?;
         Some(Self {
-            size_bytes: i64::try_from(size_bytes).unwrap_or(i64::MAX),
+            size_bytes: Self::clamp_size(size_bytes),
             modified_at_ms,
         })
+    }
+
+    /// Derive an identity by stat-ing `path` on disk. Returns `None` when the
+    /// file is unreadable or its modified time cannot be represented. This is
+    /// the canonical way to fingerprint a file that must be read from disk.
+    pub fn for_path(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Self::from_fs(meta.len(), meta.modified().ok())
+    }
+
+    /// Derive an identity from an already-listed [`FileEntry`], reusing the
+    /// `size_bytes`/`modified_at_ms` it already carries instead of re-stat-ing.
+    /// Returns `None` when the entry has no modified time.
+    pub fn from_entry(entry: &crate::types::FileEntry) -> Option<Self> {
+        entry.modified_at_ms.map(|modified_at_ms| Self {
+            size_bytes: Self::clamp_size(entry.size_bytes),
+            modified_at_ms,
+        })
+    }
+
+    /// Clamp a `u64` byte count into the `i64` the identity stores. Kept in one
+    /// place so every constructor treats oversized files identically.
+    fn clamp_size(size_bytes: u64) -> i64 {
+        i64::try_from(size_bytes).unwrap_or(i64::MAX)
     }
 }
 
@@ -264,8 +288,25 @@ impl MetadataCache {
         Ok(())
     }
 
-    /// Insert or replace the cached metadata for `path` at the given identity,
-    /// tagging it with its provenance.
+    /// Merge `metadata` into the cached row for `path` (inserting when absent).
+    ///
+    /// This is a true upsert, not a replace: a re-derivation must never *lose*
+    /// data it happens not to reproduce. Two rules govern the merge, applied
+    /// per field:
+    ///
+    /// * **Empty never overwrites non-empty.** A `NULL`/blank incoming field
+    ///   leaves the stored value intact, so re-extracting a file whose title no
+    ///   longer parses — or resolving against a Zotero that is momentarily down
+    ///   or has since dropped the item — keeps the previously stored value.
+    /// * **File extraction never clobbers Zotero.** Once a row is
+    ///   `Zotero`-sourced its fields are authoritative; a later `File`-sourced
+    ///   write may only fill fields the Zotero record left blank, never replace
+    ///   them. The `source` tag is therefore sticky: it upgrades `File → Zotero`
+    ///   but never downgrades (only [`invalidate_zotero`](Self::invalidate_zotero)
+    ///   clears it).
+    ///
+    /// Identity (`size_bytes`/`modified_at_ms`) and `extracted_at_ms` always
+    /// take the incoming values: they describe the file as seen right now.
     pub fn upsert(
         &self,
         path: &Path,
@@ -278,11 +319,39 @@ impl MetadataCache {
             .ok()
             .and_then(|d| i64::try_from(d.as_millis()).ok())
             .unwrap_or(0);
+        // Per-field merge expression: when the existing row is Zotero and the
+        // incoming write is File, the stored (Zotero) value wins and File may
+        // only backfill a blank; otherwise the incoming value wins but a blank
+        // incoming falls back to what is already stored. `NULLIF(x, '')` folds
+        // blank strings into the same "absent" case as SQL NULL.
         self.conn.execute(
-            "INSERT OR REPLACE INTO file_metadata
+            "INSERT INTO file_metadata
                 (path, size_bytes, modified_at_ms, extracted_at_ms, source,
                  title, author, doi, publication_date)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(path) DO UPDATE SET
+                size_bytes      = excluded.size_bytes,
+                modified_at_ms  = excluded.modified_at_ms,
+                extracted_at_ms = excluded.extracted_at_ms,
+                source = CASE
+                    WHEN excluded.source = 'zotero' OR file_metadata.source = 'zotero'
+                    THEN 'zotero' ELSE 'file' END,
+                title = CASE
+                    WHEN file_metadata.source = 'zotero' AND excluded.source = 'file'
+                    THEN COALESCE(NULLIF(file_metadata.title, ''), NULLIF(excluded.title, ''))
+                    ELSE COALESCE(NULLIF(excluded.title, ''), NULLIF(file_metadata.title, '')) END,
+                author = CASE
+                    WHEN file_metadata.source = 'zotero' AND excluded.source = 'file'
+                    THEN COALESCE(NULLIF(file_metadata.author, ''), NULLIF(excluded.author, ''))
+                    ELSE COALESCE(NULLIF(excluded.author, ''), NULLIF(file_metadata.author, '')) END,
+                doi = CASE
+                    WHEN file_metadata.source = 'zotero' AND excluded.source = 'file'
+                    THEN COALESCE(NULLIF(file_metadata.doi, ''), NULLIF(excluded.doi, ''))
+                    ELSE COALESCE(NULLIF(excluded.doi, ''), NULLIF(file_metadata.doi, '')) END,
+                publication_date = CASE
+                    WHEN file_metadata.source = 'zotero' AND excluded.source = 'file'
+                    THEN COALESCE(NULLIF(file_metadata.publication_date, ''), NULLIF(excluded.publication_date, ''))
+                    ELSE COALESCE(NULLIF(excluded.publication_date, ''), NULLIF(file_metadata.publication_date, '')) END",
             params![
                 Self::key(path),
                 identity.size_bytes,
@@ -336,22 +405,17 @@ impl MetadataCache {
         )?)
     }
 
-    /// Drop every cached row. Backs the manual "refresh metadata" action.
-    pub fn clear(&self) -> anyhow::Result<()> {
-        self.conn.execute("DELETE FROM file_metadata", [])?;
-        Ok(())
-    }
-
-    /// Drop only file-sourced rows, preserving authoritative Zotero rows. Backs
-    /// a metadata refresh performed while Zotero is unreachable: file-based rows
-    /// can always be re-extracted locally, but Zotero rows cannot be rebuilt
-    /// until the library is reachable again, so clearing them would silently
-    /// destroy metadata with no way to recover it.
-    pub fn clear_file_rows(&self) -> anyhow::Result<usize> {
-        Ok(self.conn.execute(
-            "DELETE FROM file_metadata WHERE source = ?1",
-            params![MetadataSource::File.as_str()],
-        )?)
+    /// Every cached path, regardless of provenance. Backs the manual "refresh
+    /// metadata" action, which re-derives each known file in place (merging
+    /// through [`upsert`](Self::upsert)) rather than clearing and repopulating —
+    /// so no row is ever deleted along the way.
+    pub fn all_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM file_metadata")?;
+        let paths = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|r| r.map(PathBuf::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(paths)
     }
 
     /// Remove any cached row for `path`.
@@ -585,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn test_list_by_source_and_clear() {
+    fn test_list_by_source_and_all_paths() {
         let dir = tempdir().unwrap();
         let cache = MetadataCache::open(dir.path()).unwrap();
         let id = FileIdentity {
@@ -604,35 +668,93 @@ mod tests {
         assert_eq!(file_rows[0].path, Path::new("/f.pdf"));
         assert_eq!(file_rows[0].identity, id);
 
-        cache.clear().unwrap();
-        assert!(cache
-            .list_by_source(MetadataSource::File)
-            .unwrap()
-            .is_empty());
-        assert!(cache
-            .list_by_source(MetadataSource::Zotero)
-            .unwrap()
-            .is_empty());
+        // `all_paths` returns every row regardless of provenance — the set a
+        // refresh re-derives in place.
+        let mut paths = cache.all_paths().unwrap();
+        paths.sort();
+        assert_eq!(paths, vec![PathBuf::from("/f.pdf"), PathBuf::from("/z.pdf")]);
     }
 
+    /// The core invariant behind the fix: re-deriving a Zotero-backed file when
+    /// Zotero yields nothing (item removed, or API down) must not erase the
+    /// stored library data. A `File`-sourced write with empty fields is a no-op
+    /// on a `Zotero` row; the row keeps its data and its `zotero` provenance.
     #[test]
-    fn test_clear_file_rows_keeps_zotero_rows() {
+    fn test_upsert_file_pass_does_not_erase_zotero_row() {
         let dir = tempdir().unwrap();
         let cache = MetadataCache::open(dir.path()).unwrap();
         let id = FileIdentity {
             size_bytes: 1,
             modified_at_ms: 1,
         };
-        cache
-            .upsert(Path::new("/f.pdf"), id, &sample(), MetadataSource::File)
-            .unwrap();
-        cache
-            .upsert(Path::new("/z.pdf"), id, &sample(), MetadataSource::Zotero)
-            .unwrap();
+        let path = Path::new("/doc.pdf");
+        cache.upsert(path, id, &sample(), MetadataSource::Zotero).unwrap();
 
-        assert_eq!(cache.clear_file_rows().unwrap(), 1);
-        assert!(cache.get_valid(Path::new("/f.pdf"), id).unwrap().is_none());
-        assert!(cache.get_valid(Path::new("/z.pdf"), id).unwrap().is_some());
+        let empty = DocumentMetadata {
+            title: None,
+            author: None,
+            doi: None,
+            created_at: None,
+        };
+        cache.upsert(path, id, &empty, MetadataSource::File).unwrap();
+
+        assert_eq!(cache.get_valid(path, id).unwrap(), Some(sample()));
+        // Provenance stayed Zotero, so a later `invalidate_zotero` still targets it.
+        let zotero_rows = cache.list_by_source(MetadataSource::Zotero).unwrap();
+        assert_eq!(zotero_rows.len(), 1);
+        assert_eq!(zotero_rows[0].path, path);
+    }
+
+    /// Blank fields never overwrite stored values, but real ones do; and a
+    /// `File` write may still backfill a field the Zotero record left empty.
+    #[test]
+    fn test_upsert_merges_field_by_field() {
+        let dir = tempdir().unwrap();
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        let id = FileIdentity {
+            size_bytes: 1,
+            modified_at_ms: 1,
+        };
+        let path = Path::new("/doc.pdf");
+
+        // Zotero row missing a publication date but carrying a title.
+        let partial_zotero = DocumentMetadata {
+            title: Some("Zotero Title".into()),
+            author: Some("Zotero Author".into()),
+            doi: None,
+            created_at: None,
+        };
+        cache.upsert(path, id, &partial_zotero, MetadataSource::Zotero).unwrap();
+
+        // File extraction: a different title (must NOT clobber Zotero's) plus a
+        // publication date the Zotero record lacked (must backfill).
+        let file_based = DocumentMetadata {
+            title: Some("File Title".into()),
+            author: None,
+            doi: None,
+            created_at: Some("2021-05".into()),
+        };
+        cache.upsert(path, id, &file_based, MetadataSource::File).unwrap();
+
+        let merged = cache.get_valid(path, id).unwrap().unwrap();
+        assert_eq!(merged.title.as_deref(), Some("Zotero Title"));
+        assert_eq!(merged.author.as_deref(), Some("Zotero Author"));
+        assert_eq!(merged.created_at.as_deref(), Some("2021-05"));
+
+        // A subsequent Zotero write is authoritative: it overwrites where it has
+        // a value, but a blank field still leaves the prior value intact.
+        let newer_zotero = DocumentMetadata {
+            title: Some("Newer Zotero Title".into()),
+            author: None,
+            doi: Some("10.1/x".into()),
+            created_at: None,
+        };
+        cache.upsert(path, id, &newer_zotero, MetadataSource::Zotero).unwrap();
+        let merged = cache.get_valid(path, id).unwrap().unwrap();
+        assert_eq!(merged.title.as_deref(), Some("Newer Zotero Title"));
+        assert_eq!(merged.author.as_deref(), Some("Zotero Author"));
+        assert_eq!(merged.doi.as_deref(), Some("10.1/x"));
+        assert_eq!(merged.created_at.as_deref(), Some("2021-05"));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use wilkes_core::embed::index::watcher::IndexWatcher;
 use wilkes_core::embed::index::SemanticIndex;
@@ -23,9 +23,8 @@ use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
-    Bookmark, DocumentMetadata, EmbedderModel, IndexStatus, IndexingConfig, IntegrationState,
-    NewBookmark, PreviewData, SearchMode, SearchQuery, SelectedEmbedder, SemanticSettings,
-    Settings,
+    Bookmark, DocumentMetadata, EmbedderModel, IndexStatus, IndexingConfig, NewBookmark,
+    PreviewData, SearchMode, SearchQuery, SelectedEmbedder, SemanticSettings, Settings,
 };
 
 use crate::commands::search::{start_search, SearchHandle};
@@ -244,12 +243,6 @@ impl AppContext {
             };
             match guard.find_current_path(identity) {
                 Ok(Some(current)) => {
-                    info!(
-                        "bookmark {} re-pointed {} -> {}",
-                        bookmark.id,
-                        bookmark.path.display(),
-                        current.display()
-                    );
                     bookmark.path = current;
                 }
                 Ok(None) => {}
@@ -298,7 +291,7 @@ impl AppContext {
         let mut misses: Vec<PathBuf> = Vec::new();
         if let Ok(guard) = cache.lock() {
             for entry in response.files.iter_mut() {
-                let Some(identity) = entry_identity(entry) else {
+                let Some(identity) = FileIdentity::from_entry(entry) else {
                     continue;
                 };
                 match guard.get_valid(&entry.path, identity) {
@@ -358,7 +351,7 @@ impl AppContext {
                 let mut eligible: Vec<(PathBuf, FileIdentity, DocumentMetadata)> = Vec::new();
                 let mut updates: Vec<serde_json::Value> = Vec::new();
                 for path in paths {
-                    let Some(identity) = fs_identity(&path) else {
+                    let Some(identity) = FileIdentity::for_path(&path) else {
                         continue;
                     };
                     match extract_or_rekey(&cache1, &registry, &path, identity) {
@@ -462,40 +455,28 @@ impl AppContext {
         crate::commands::integrations::zotero::resolve_file_metadata(s, path).await
     }
 
-    /// Clear the metadata cache so the next listing re-derives everything
-    /// (file-based + Zotero). Backs the manual "refresh metadata" action.
+    /// Re-derive metadata for every cached file in place. Backs the manual
+    /// "refresh metadata" action.
     ///
-    /// A full clear is only safe when every row can be re-derived. File-based
-    /// rows always can (local extraction), but Zotero rows can only be rebuilt
-    /// while the library is reachable. So when Zotero is enabled but currently
-    /// down, clearing its rows would destroy authoritative metadata with no way
-    /// to recover it — in that case we preserve the Zotero rows and refresh only
-    /// the file-based ones.
+    /// Refresh never clears: clearing then repopulating loses any field the
+    /// re-derivation fails to reproduce — a Zotero item that has since been
+    /// removed from the library, or any field at all while Zotero is
+    /// unreachable. Instead we re-run the same extraction + Zotero-override fill
+    /// used on listing over the known files, writing through the merging
+    /// [`MetadataCache::upsert`], which only overwrites a field when the new
+    /// derivation actually produced a value and never lets file extraction
+    /// clobber authoritative Zotero fields.
     pub async fn refresh_file_metadata(&self) -> anyhow::Result<()> {
         let s = self.get_settings().await;
-        let zotero = &s.integrations.zotero;
-        let preserve_zotero = if zotero.enabled {
-            let state = ZoteroClient::from_settings(zotero)
-                .status(true)
-                .await
-                .map(|st| st.state);
-            !matches!(state, Ok(IntegrationState::Ready))
-        } else {
-            false
+        let Some(cache) = self.metadata_cache() else {
+            return Ok(());
         };
-
-        if let Some(cache) = self.metadata_cache() {
-            if let Ok(guard) = cache.lock() {
-                if preserve_zotero {
-                    warn!(
-                        "refresh metadata: Zotero enabled but not reachable; preserving \
-                         existing Zotero rows and refreshing file-based rows only"
-                    );
-                    guard.clear_file_rows()?;
-                } else {
-                    guard.clear()?;
-                }
-            }
+        let paths = match cache.lock() {
+            Ok(guard) => guard.all_paths()?,
+            Err(_) => return Ok(()),
+        };
+        if !paths.is_empty() {
+            self.spawn_metadata_fill(paths, s, cache);
         }
         Ok(())
     }
@@ -1704,20 +1685,6 @@ impl AppContext {
         self.finish_restore_state(&loaded.plan, loaded.embedder, loaded.index)
             .await;
     }
-}
-
-/// Derive a file's content identity from an already-listed entry.
-fn entry_identity(entry: &wilkes_core::types::FileEntry) -> Option<FileIdentity> {
-    entry.modified_at_ms.map(|modified_at_ms| FileIdentity {
-        size_bytes: i64::try_from(entry.size_bytes).unwrap_or(i64::MAX),
-        modified_at_ms,
-    })
-}
-
-/// Derive a file's content identity by stat-ing it on disk.
-fn fs_identity(path: &Path) -> Option<FileIdentity> {
-    let meta = std::fs::metadata(path).ok()?;
-    FileIdentity::from_fs(meta.len(), meta.modified().ok())
 }
 
 /// Outcome of filling one file's metadata: either freshly extracted (and thus

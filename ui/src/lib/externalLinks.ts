@@ -1,6 +1,6 @@
 export interface ExternalLinks {
-  doi: string;
-  doiUrl: string;
+  doi: string | null;
+  doiUrl: string | null;
   googleScholarUrl: string;
 }
 
@@ -11,15 +11,18 @@ function normalizeDoi(rawDoi: string): string {
     .replace(/^doi:\s*/i, "");
 }
 
-export function buildExternalLinks(rawDoi: string | null | undefined): ExternalLinks | null {
-  if (!rawDoi) return null;
-
-  const doi = normalizeDoi(rawDoi);
-  if (!doi) return null;
+export function buildExternalLinks(
+  rawDoi: string | null | undefined,
+  rawTitle: string | null | undefined,
+): ExternalLinks | null {
+  const doi = rawDoi ? normalizeDoi(rawDoi) : "";
+  const title = rawTitle?.trim() ?? "";
+  const googleScholarQuery = doi || title;
+  if (!googleScholarQuery) return null;
 
   return {
-    doi,
-    doiUrl: `https://doi.org/${doi}`,
-    googleScholarUrl: `https://scholar.google.com/scholar?q=${encodeURIComponent(doi)}`,
+    doi: doi || null,
+    doiUrl: doi ? `https://doi.org/${doi}` : null,
+    googleScholarUrl: `https://scholar.google.com/scholar?q=${encodeURIComponent(googleScholarQuery)}`,
   };
 }
