@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import { api } from "../services";
 import type {
+  AgentBackend,
   BookmarkDock,
   FileDisplayField,
   FileEntry,
@@ -46,6 +47,7 @@ interface SettingsStore {
   fileSortKey: FileSortKey;
   fileSortDirection: FileSortDirection;
   fileDisplayFields: FileDisplayField[];
+  chatBackend: AgentBackend;
 
   load: () => Promise<void>;
   setDirectory: (dir: string) => void;
@@ -62,6 +64,7 @@ interface SettingsStore {
   setFileSortKey: (key: FileSortKey) => void;
   setFileSortDirection: (direction: FileSortDirection) => void;
   toggleFileDisplayField: (field: FileDisplayField) => void;
+  setChatBackend: (backend: AgentBackend) => void;
   replaceSettings: (settings: Settings) => void;
   refreshSettings: () => Promise<Settings>;
 }
@@ -88,6 +91,7 @@ export const useSettingsStore = create<SettingsStore>()(
     fileSortKey: "filename",
     fileSortDirection: "asc",
     fileDisplayFields: ["size"],
+    chatBackend: "ClaudeCode",
 
     load: async () => {
       const s = await api.getSettings();
@@ -116,6 +120,7 @@ export const useSettingsStore = create<SettingsStore>()(
         fileSortKey: s.file_sort_key ?? "filename",
         fileSortDirection: s.file_sort_direction ?? "asc",
         fileDisplayFields: s.file_display_fields ?? ["size"],
+        chatBackend: s.chat_backend ?? "ClaudeCode",
         omittedFileList: [],
       });
     },
@@ -234,6 +239,9 @@ export const useSettingsStore = create<SettingsStore>()(
       if (patch.file_display_fields) {
         set({ fileDisplayFields: patch.file_display_fields });
       }
+      if (patch.chat_backend) {
+        set({ chatBackend: patch.chat_backend });
+      }
     },
 
     setBookmarksDock: (dock) => {
@@ -260,6 +268,11 @@ export const useSettingsStore = create<SettingsStore>()(
       api.updateSettings({ file_display_fields: next }).catch(console.error);
     },
 
+    setChatBackend: (backend) => {
+      set({ chatBackend: backend });
+      api.updateSettings({ chat_backend: backend }).catch(console.error);
+    },
+
     replaceSettings: (settings) => {
       applyTheme(settings.theme);
       set({
@@ -278,6 +291,7 @@ export const useSettingsStore = create<SettingsStore>()(
         fileSortKey: settings.file_sort_key ?? "filename",
         fileSortDirection: settings.file_sort_direction ?? "asc",
         fileDisplayFields: settings.file_display_fields ?? ["size"],
+        chatBackend: settings.chat_backend ?? "ClaudeCode",
         omittedFileList: [],
       });
     },

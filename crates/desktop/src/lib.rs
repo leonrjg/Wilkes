@@ -1,15 +1,21 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{error, info};
+use wilkes_agent::session::{ChatConfigOption, ChatEvent, ChatSession};
+use wilkes_api::commands::chat::{
+    BackendStatus, ChatActiveDocRecord, ChatContextFileRecord, ChatConversationRecord,
+};
 use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
-    AddOutcome, Bookmark, CitationResult, DataPaths, DocumentMetadata, EmbeddingEngine,
-    FileListResponse, IndexStatus, IntegrationStatus, ModelDescriptor, NewBookmark,
-    SelectedEmbedder, Settings,
+    AddOutcome, AgentBackend, Bookmark, CitationResult, DataPaths, DocumentMetadata,
+    EmbeddingEngine, FileListResponse, IndexStatus, IntegrationStatus, ModelDescriptor,
+    NewBookmark, SelectedEmbedder, Settings,
 };
 
 mod platform;
@@ -201,6 +207,9 @@ fn handle_exit_event(app_handle: &AppHandle, event: tauri::RunEvent) {
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
     ) {
         let ctx = app_handle.state::<Arc<AppContext>>().inner().clone();
+        // Kill any in-flight turn and the chat subprocesses themselves before
+        // the process tree goes away, rather than leaving orphaned CLIs behind.
+        chat_manager_state(app_handle).close_all();
         tauri::async_runtime::spawn(async move {
             ctx.shutdown().await;
         });
@@ -216,6 +225,153 @@ impl EventEmitter for TauriEmitter {
         let platform = TauriPlatform(self.0.clone());
         platform.emit(name, payload);
     }
+}
+
+// ── Chat (ACP) state ─────────────────────────────────────────────────────────
+
+/// Open chat sessions, keyed by a Wilkes-generated session id. Mirrors
+/// `ActiveSearches`: session lifetime and event forwarding are owned here,
+/// not by `wilkes_api`/`wilkes_agent`, which stay UI-framework-agnostic.
+struct ManagedChatSession {
+    session: Arc<ChatSession>,
+    conversation_id: Mutex<Option<String>>,
+    cwd: PathBuf,
+    context_files: Mutex<Vec<ChatContextFileRecord>>,
+    active_doc: Mutex<Option<ChatActiveDocRecord>>,
+}
+
+struct ChatManager(Mutex<HashMap<String, Arc<ManagedChatSession>>>);
+
+impl ChatManager {
+    fn insert(&self, id: String, session: Arc<ManagedChatSession>) {
+        self.0.lock().unwrap().insert(id, session);
+    }
+
+    fn get(&self, id: &str) -> Option<Arc<ManagedChatSession>> {
+        self.0.lock().unwrap().get(id).cloned()
+    }
+
+    fn remove(&self, id: &str) -> Option<Arc<ManagedChatSession>> {
+        self.0.lock().unwrap().remove(id)
+    }
+
+    fn close_all(&self) {
+        for (_, managed) in self.0.lock().unwrap().drain() {
+            managed.session.close();
+        }
+    }
+}
+
+fn chat_manager_state(app: &AppHandle) -> Arc<ChatManager> {
+    app.state::<Arc<ChatManager>>().inner().clone()
+}
+
+fn chat_session_or_err(
+    manager: &ChatManager,
+    session_id: &str,
+) -> Result<Arc<ChatSession>, String> {
+    manager
+        .get(session_id)
+        .map(|managed| Arc::clone(&managed.session))
+        .ok_or_else(|| format!("chat session not found: {session_id}"))
+}
+
+fn managed_chat_session_or_err(
+    manager: &ChatManager,
+    session_id: &str,
+) -> Result<Arc<ManagedChatSession>, String> {
+    manager
+        .get(session_id)
+        .ok_or_else(|| format!("chat session not found: {session_id}"))
+}
+
+/// Forward every `ChatEvent` for the life of a session -- not just one turn --
+/// through `EventEmitter` as `chat/update-<turn_id>` (spec §7.8). Runs until
+/// the subprocess's connection closes (session close, crash, or app exit).
+fn spawn_chat_event_forwarder(
+    app: AppHandle,
+    session_id: String,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<ChatEvent>,
+) {
+    tokio::spawn(async move {
+        let emitter = TauriEmitter(app);
+        while let Some(event) = events.recv().await {
+            match event {
+                ChatEvent::TextDelta { turn_id, delta } => {
+                    emitter.emit(
+                        &format!("chat/update-{turn_id}"),
+                        serde_json::json!({ "kind": "text", "delta": delta }),
+                    );
+                }
+                ChatEvent::ThoughtDelta { turn_id, delta } => {
+                    emitter.emit(
+                        &format!("chat/update-{turn_id}"),
+                        serde_json::json!({ "kind": "thought", "delta": delta }),
+                    );
+                }
+                ChatEvent::ToolCall {
+                    turn_id,
+                    tool_call_id,
+                    title,
+                    status,
+                    locations,
+                    content,
+                    raw_input,
+                    raw_output,
+                } => {
+                    let locations = locations.map(|locs| {
+                        locs.into_iter()
+                            .map(|l| serde_json::json!({ "path": l.path, "line": l.line }))
+                            .collect::<Vec<_>>()
+                    });
+                    emitter.emit(
+                        &format!("chat/update-{turn_id}"),
+                        serde_json::json!({
+                            "kind": "tool",
+                            "tool_call_id": tool_call_id,
+                            "title": title,
+                            "status": status,
+                            "locations": locations,
+                            "content": content,
+                            "raw_input": raw_input,
+                            "raw_output": raw_output,
+                        }),
+                    );
+                }
+                ChatEvent::PermissionRequest {
+                    turn_id,
+                    request_id,
+                    tool_call_id,
+                    title,
+                    options,
+                } => {
+                    emitter.emit(
+                        &format!("chat/update-{turn_id}"),
+                        serde_json::json!({
+                            "kind": "permission",
+                            "request_id": request_id,
+                            "tool_call_id": tool_call_id,
+                            "title": title,
+                            "options": options,
+                        }),
+                    );
+                }
+                ChatEvent::SessionError { message } => {
+                    error!("chat session {session_id} error: {message}");
+                    emitter.emit(
+                        &format!("chat/session-error-{session_id}"),
+                        serde_json::json!({ "message": message }),
+                    );
+                }
+                ChatEvent::ConfigOptionsUpdated { options } => {
+                    emitter.emit(
+                        &format!("chat/config-{session_id}"),
+                        serde_json::json!(options),
+                    );
+                }
+            }
+        }
+    });
 }
 
 // ── Desktop-specific state ────────────────────────────────────────────────────
@@ -356,6 +512,399 @@ async fn search(
 #[tauri::command]
 async fn cancel_search(search_id: String, app: AppHandle) -> Result<(), String> {
     cancel_search_for_ctx(active_searches_state(&app), &search_id);
+    Ok(())
+}
+
+// ── Chat commands ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct ChatStartResult {
+    session_id: String,
+    conversation_id: Option<String>,
+    backend_session_id: Option<String>,
+    /// Initial ACP session config options (model, mode, ...), if the agent
+    /// supports `session/set_config_option`. Later changes -- ours or the
+    /// agent's own -- arrive via `chat/config-<sessionId>`.
+    config_options: Vec<ChatConfigOption>,
+    replay_messages: Vec<wilkes_agent::session::ChatReplayMessage>,
+    context_files: Vec<ChatContextFileRecord>,
+    active_doc: Option<ChatActiveDocRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatSendResult {
+    conversation_id: Option<String>,
+}
+
+fn ensure_chat_conversation(
+    ctx: &AppContext,
+    managed: &ManagedChatSession,
+) -> Result<Option<String>, String> {
+    if !wilkes_api::commands::chat::is_durable_backend(managed.session.backend) {
+        return Ok(None);
+    }
+
+    let config_options = managed.session.config_options();
+    let context_files = managed.context_files.lock().unwrap();
+    let active_doc = managed.active_doc.lock().unwrap();
+    let mut conversation_id = managed.conversation_id.lock().unwrap();
+    if conversation_id.is_some() {
+        return Ok(conversation_id.clone());
+    }
+
+    let record = wilkes_api::commands::chat::create_conversation(
+        &ctx.data_dir,
+        managed.session.backend,
+        &managed.cwd,
+        managed.session.backend_session_id().to_string(),
+        &config_options,
+        context_files.clone(),
+        active_doc.clone(),
+    )
+    .map_err(|e| e.to_string())?;
+    *conversation_id = record.map(|record| record.conversation_id);
+    Ok(conversation_id.clone())
+}
+
+#[tauri::command]
+async fn chat_list_backends(refresh: bool, _app: AppHandle) -> Vec<BackendStatus> {
+    wilkes_api::commands::chat::list_backends(refresh)
+}
+
+#[tauri::command]
+async fn chat_install_backend(
+    backend: AgentBackend,
+    _app: AppHandle,
+) -> Result<BackendStatus, String> {
+    wilkes_api::commands::chat::install_backend(backend)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn chat_list_conversations(app: AppHandle) -> Result<Vec<ChatConversationRecord>, String> {
+    let ctx = app_context(&app);
+    wilkes_api::commands::chat::list_conversations(&ctx.data_dir).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn chat_forget_conversation(conversation_id: String, app: AppHandle) -> Result<(), String> {
+    let ctx = app_context(&app);
+    wilkes_api::commands::chat::forget_conversation(&ctx.data_dir, &conversation_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn chat_start(
+    backend: AgentBackend,
+    search_root: Option<String>,
+    app: AppHandle,
+) -> Result<ChatStartResult, String> {
+    let ctx = app_context(&app);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let spawned = wilkes_api::commands::chat::start(backend, cwd.clone(), Some(ctx.clone()))
+        .await
+        .map_err(|e| e.to_string())?;
+    let wilkes_agent::session::SpawnedChatSession {
+        session,
+        events,
+        replay_messages,
+    } = spawned;
+    let session = Arc::new(session);
+    let current_root = match search_root {
+        Some(root) => Some(root),
+        None => ctx
+            .get_settings()
+            .await
+            .last_directory
+            .map(|path| path.to_string_lossy().into_owned()),
+    };
+    session.set_search_root(current_root);
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    // Restore the config (model, thought level, mode) last chosen for this
+    // backend before the first-send snapshot, so the eventual conversation
+    // record starts from the persisted default.
+    let desired_config = ctx
+        .get_settings()
+        .await
+        .chat_config
+        .into_iter()
+        .find(|entry| entry.backend == backend)
+        .map(|entry| entry.values)
+        .unwrap_or_default();
+    let config_options = wilkes_api::commands::chat::apply_config(&session, &desired_config).await;
+    let backend_session_id = session.backend_session_id().to_string();
+    spawn_chat_event_forwarder(app.clone(), session_id.clone(), events);
+    chat_manager_state(&app).insert(
+        session_id.clone(),
+        Arc::new(ManagedChatSession {
+            session,
+            conversation_id: Mutex::new(None),
+            cwd,
+            context_files: Mutex::new(Vec::new()),
+            active_doc: Mutex::new(None),
+        }),
+    );
+    Ok(ChatStartResult {
+        session_id,
+        conversation_id: None,
+        backend_session_id: Some(backend_session_id),
+        config_options,
+        replay_messages,
+        context_files: Vec::new(),
+        active_doc: None,
+    })
+}
+
+#[tauri::command]
+async fn chat_open_conversation(
+    conversation_id: String,
+    search_root: Option<String>,
+    app: AppHandle,
+) -> Result<ChatStartResult, String> {
+    let ctx = app_context(&app);
+    let record = wilkes_api::commands::chat::get_conversation(&ctx.data_dir, &conversation_id)
+        .map_err(|e| e.to_string())?;
+    let spawned = wilkes_api::commands::chat::open(&record, Some(ctx.clone()))
+        .await
+        .map_err(|e| e.to_string())?;
+    let wilkes_agent::session::SpawnedChatSession {
+        session,
+        events,
+        replay_messages,
+    } = spawned;
+    let session = Arc::new(session);
+    session.set_search_root(search_root);
+    for file in &record.context_files {
+        session.add_context(file.path.clone(), file.pages);
+    }
+    if let Some(active_doc) = &record.active_doc {
+        session.set_active_doc(Some(active_doc.path.clone()), active_doc.page);
+    }
+    wilkes_api::commands::chat::touch_conversation(&ctx.data_dir, &conversation_id, None)
+        .map_err(|e| e.to_string())?;
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    // Restore the config this conversation was last using -- not the backend's
+    // global default -- so reopening lands on the same model/mode as before.
+    let config_options =
+        wilkes_api::commands::chat::apply_config(&session, &record.config_values).await;
+    spawn_chat_event_forwarder(app.clone(), session_id.clone(), events);
+    chat_manager_state(&app).insert(
+        session_id.clone(),
+        Arc::new(ManagedChatSession {
+            session,
+            conversation_id: Mutex::new(Some(conversation_id.clone())),
+            cwd: std::path::PathBuf::from(&record.cwd),
+            context_files: Mutex::new(record.context_files.clone()),
+            active_doc: Mutex::new(record.active_doc.clone()),
+        }),
+    );
+    Ok(ChatStartResult {
+        session_id,
+        conversation_id: Some(conversation_id),
+        backend_session_id: Some(record.backend_session_id),
+        config_options,
+        replay_messages,
+        context_files: record.context_files,
+        active_doc: record.active_doc,
+    })
+}
+
+#[tauri::command]
+async fn chat_set_config_option(
+    session_id: String,
+    config_id: String,
+    value: String,
+    app: AppHandle,
+) -> Result<Vec<ChatConfigOption>, String> {
+    let ctx = app_context(&app);
+    let managed = managed_chat_session_or_err(&chat_manager_state(&app), &session_id)?;
+    let options = managed
+        .session
+        .set_config_option(config_id, value)
+        .await
+        .map_err(|e| e.to_string())?;
+    let conversation_id = managed.conversation_id.lock().unwrap().clone();
+    if let Some(conversation_id) = conversation_id {
+        wilkes_api::commands::chat::update_conversation_config(
+            &ctx.data_dir,
+            &conversation_id,
+            &options,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // Remember this as the backend's default so the *next* new chat with it
+    // starts from the same config, even for non-durable backends that keep no
+    // conversation record.
+    let backend = managed.session.backend;
+    let values = wilkes_api::commands::chat::config_values_from_options(&options);
+    let chat_config = wilkes_api::commands::chat::upsert_backend_config(
+        ctx.get_settings().await.chat_config,
+        backend,
+        values,
+    );
+    ctx.update_settings(serde_json::json!({ "chat_config": chat_config }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(options)
+}
+
+#[tauri::command]
+async fn chat_add_context(
+    session_id: String,
+    path: String,
+    pages: Option<u32>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let ctx = app_context(&app);
+    let managed = managed_chat_session_or_err(&chat_manager_state(&app), &session_id)?;
+    managed.session.add_context(path.clone(), pages);
+    let context_files = {
+        let mut files = managed.context_files.lock().unwrap();
+        if !files.iter().any(|file| file.path == path) {
+            files.push(ChatContextFileRecord { path, pages });
+        }
+        files.clone()
+    };
+    let conversation_id = managed.conversation_id.lock().unwrap().clone();
+    if let Some(conversation_id) = conversation_id {
+        wilkes_api::commands::chat::update_conversation_context(
+            &ctx.data_dir,
+            &conversation_id,
+            Some(context_files),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn chat_remove_context(
+    session_id: String,
+    path: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let ctx = app_context(&app);
+    let managed = managed_chat_session_or_err(&chat_manager_state(&app), &session_id)?;
+    managed.session.remove_context(&path);
+    let context_files = {
+        let mut files = managed.context_files.lock().unwrap();
+        files.retain(|file| file.path != path);
+        files.clone()
+    };
+    let conversation_id = managed.conversation_id.lock().unwrap().clone();
+    if let Some(conversation_id) = conversation_id {
+        wilkes_api::commands::chat::update_conversation_context(
+            &ctx.data_dir,
+            &conversation_id,
+            Some(context_files),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn chat_set_active_doc(
+    session_id: String,
+    path: Option<String>,
+    page: Option<u32>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let ctx = app_context(&app);
+    let managed = managed_chat_session_or_err(&chat_manager_state(&app), &session_id)?;
+    managed.session.set_active_doc(path.clone(), page);
+    let active_doc = path.map(|path| ChatActiveDocRecord { path, page });
+    *managed.active_doc.lock().unwrap() = active_doc.clone();
+    let conversation_id = managed.conversation_id.lock().unwrap().clone();
+    if let Some(conversation_id) = conversation_id {
+        wilkes_api::commands::chat::update_conversation_context(
+            &ctx.data_dir,
+            &conversation_id,
+            None,
+            Some(active_doc),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn chat_send(
+    session_id: String,
+    turn_id: String,
+    text: String,
+    search_root: Option<String>,
+    app: AppHandle,
+) -> Result<ChatSendResult, String> {
+    let ctx = app_context(&app);
+    let managed = managed_chat_session_or_err(&chat_manager_state(&app), &session_id)?;
+    managed.session.set_search_root(search_root);
+    let session = Arc::clone(&managed.session);
+    let conversation_id = ensure_chat_conversation(&ctx, &managed)?;
+    let task_conversation_id = conversation_id.clone();
+    let title_hint = text.clone();
+
+    tokio::spawn(async move {
+        let emitter = TauriEmitter(app);
+        let payload = match session.send(turn_id.clone(), text).await {
+            Ok(stop_reason) => {
+                if let Some(conversation_id) = &task_conversation_id {
+                    if let Err(e) = wilkes_api::commands::chat::touch_conversation(
+                        &ctx.data_dir,
+                        conversation_id,
+                        Some(&title_hint),
+                    ) {
+                        error!("chat: failed to update conversation metadata: {e:#}");
+                    }
+                }
+                serde_json::json!({ "stop_reason": stop_reason })
+            }
+            Err(e) => {
+                error!("chat turn {turn_id} failed: {e:#}");
+                emitter.emit(
+                    &format!("chat/update-{turn_id}"),
+                    serde_json::json!({ "kind": "error", "message": e.to_string() }),
+                );
+                serde_json::json!({ "stop_reason": "error" })
+            }
+        };
+        emitter.emit(&format!("chat/done-{turn_id}"), payload);
+    });
+
+    Ok(ChatSendResult { conversation_id })
+}
+
+#[tauri::command]
+async fn chat_cancel(session_id: String, turn_id: String, app: AppHandle) -> Result<(), String> {
+    info!("chat_cancel: session={session_id} turn={turn_id}");
+    let session = chat_session_or_err(&chat_manager_state(&app), &session_id)?;
+    session.cancel().map_err(|e| e.to_string())
+}
+
+/// Answer a surfaced permission prompt with the user's choice. `option_id` is
+/// `None` when the user dismisses/denies without picking an offered option.
+#[tauri::command]
+async fn chat_answer_permission(
+    session_id: String,
+    request_id: String,
+    option_id: Option<String>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let session = chat_session_or_err(&chat_manager_state(&app), &session_id)?;
+    session.answer_permission(&request_id, option_id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn chat_close(session_id: String, app: AppHandle) -> Result<(), String> {
+    if let Some(managed) = chat_manager_state(&app).remove(&session_id) {
+        managed.session.close();
+    }
     Ok(())
 }
 
@@ -561,6 +1110,7 @@ pub fn run() {
 
             app.manage(Arc::clone(&ctx));
             app.manage(Arc::new(ActiveSearches(Mutex::new(HashMap::new()))));
+            app.manage(Arc::new(ChatManager(Mutex::new(HashMap::new()))));
 
             let ctx_c = Arc::clone(&ctx);
             tauri::async_runtime::spawn(async move {
@@ -607,6 +1157,20 @@ pub fn run() {
             get_worker_status,
             kill_worker,
             set_worker_timeout,
+            chat_list_backends,
+            chat_install_backend,
+            chat_list_conversations,
+            chat_forget_conversation,
+            chat_start,
+            chat_open_conversation,
+            chat_set_config_option,
+            chat_add_context,
+            chat_remove_context,
+            chat_set_active_doc,
+            chat_send,
+            chat_cancel,
+            chat_answer_permission,
+            chat_close,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

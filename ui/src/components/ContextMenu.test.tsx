@@ -1,5 +1,5 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { ContextMenu } from "./ContextMenu";
 
 function makeMenu(items: { id: string; label: string; run: () => Promise<void> | void }[]) {
@@ -7,6 +7,10 @@ function makeMenu(items: { id: string; label: string; run: () => Promise<void> |
 }
 
 describe("ContextMenu", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("shows a spinner and blocks the menu while an async action is in flight", async () => {
     let resolveRun!: () => void;
     const pending = new Promise<void>((resolve) => {
@@ -48,5 +52,24 @@ describe("ContextMenu", () => {
 
     expect(screen.queryByTestId("context-menu-spinner")).not.toBeInTheDocument();
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes and handles rejected async actions", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const onClose = vi.fn();
+    render(
+      <ContextMenu
+        menu={makeMenu([
+          { id: "reject", label: "Rejected Action", run: vi.fn().mockRejectedValue(new Error("boom")) },
+        ])}
+        onClose={onClose}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rejected Action" }));
+
+    expect(screen.getByTestId("context-menu-spinner")).toBeInTheDocument();
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    expect(consoleError).toHaveBeenCalledWith("context menu action failed", expect.any(Error));
   });
 });

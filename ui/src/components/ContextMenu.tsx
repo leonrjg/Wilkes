@@ -134,18 +134,29 @@ export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
               disabled={item.disabled || pendingId !== null}
               onClick={() => {
                 if (item.disabled || pendingId !== null) return;
-                const result = item.run();
-                if (result instanceof Promise) {
-                  // Keep the menu open with a spinner until the action settles,
-                  // so the click has immediate visible feedback.
-                  setPendingId(item.id);
-                  result.finally(() => {
+                let result: Promise<void> | void;
+                try {
+                  result = item.run();
+                } catch (error) {
+                  console.error("context menu action failed", error);
+                  onClose();
+                  return;
+                }
+                if (!result || typeof result.then !== "function") {
+                  onClose();
+                  return;
+                }
+                // Keep the menu open with a spinner until the action settles,
+                // so the click has immediate visible feedback.
+                setPendingId(item.id);
+                void result
+                  .catch((error) => {
+                    console.error("context menu action failed", error);
+                  })
+                  .finally(() => {
                     setPendingId(null);
                     onClose();
                   });
-                } else {
-                  onClose();
-                }
               }}
               className="flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-left text-xs text-[var(--text-main)] hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50"
             >

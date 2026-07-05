@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -670,6 +670,20 @@ pub struct Settings {
     pub file_sort_direction: FileSortDirection,
     #[serde(default = "default_file_display_fields")]
     pub file_display_fields: Vec<FileDisplayField>,
+    /// Preferred agent backend for the "Ask the documents" chat pane. The
+    /// in-pane selector and header dropdown may switch a session to a
+    /// different backend transiently, but this Settings field is the single
+    /// persisted default (see docs/chat-agent-integration-spec.md §7.10).
+    #[serde(default, deserialize_with = "deserialize_chat_backend_setting")]
+    pub chat_backend: AgentBackend,
+    /// Per-backend chat config defaults applied to newly started sessions.
+    /// Written whenever the user changes a config option in the chat pane, so
+    /// each backend restores its last model/thought level/mode on a new chat
+    /// (see docs/chat-agent-integration-spec.md §7.10). Distinct from a
+    /// conversation's own `config_values` snapshot, which restores *that*
+    /// conversation on reopen.
+    #[serde(default)]
+    pub chat_config: Vec<ChatBackendConfig>,
 }
 
 fn default_file_display_fields() -> Vec<FileDisplayField> {
@@ -704,8 +718,58 @@ impl Default for Settings {
             file_sort_key: FileSortKey::default(),
             file_sort_direction: FileSortDirection::default(),
             file_display_fields: default_file_display_fields(),
+            chat_backend: AgentBackend::default(),
+            chat_config: Vec::new(),
         }
     }
+}
+
+fn deserialize_chat_backend_setting<'de, D>(deserializer: D) -> Result<AgentBackend, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match String::deserialize(deserializer)?.as_str() {
+        "ClaudeCode" => Ok(AgentBackend::ClaudeCode),
+        "Codex" => Ok(AgentBackend::Codex),
+        "Nanocoder" => Ok(AgentBackend::Nanocoder),
+        // Migration-only: Gemini support was removed, but older settings files
+        // may still contain this persisted preference.
+        "Gemini" => Ok(AgentBackend::default()),
+        value => Err(de::Error::unknown_variant(
+            value,
+            &["ClaudeCode", "Codex", "Nanocoder"],
+        )),
+    }
+}
+
+/// Which CLI the "Ask the documents" chat pane drives over ACP. The launch
+/// command is the only per-backend difference (see `wilkes_agent::launch_spec`);
+/// everything else -- context injection, permission boundary, transport -- is
+/// shared (docs/chat-agent-integration-spec.md §5).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
+pub enum AgentBackend {
+    #[default]
+    ClaudeCode,
+    Codex,
+    Nanocoder,
+}
+
+/// One resolved ACP session config selection (e.g. `model` = `sonnet`). The
+/// canonical shape for persisting config, shared by the per-conversation
+/// snapshot and the per-backend default below.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatConfigValue {
+    pub id: String,
+    pub value: String,
+}
+
+/// The chat config (model, thought level, mode, ...) last chosen for a given
+/// backend, persisted so a *new* chat with that backend restores it instead of
+/// falling back to the agent's own defaults.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatBackendConfig {
+    pub backend: AgentBackend,
+    pub values: Vec<ChatConfigValue>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1243,5 +1307,46 @@ mod tests {
         let s = Settings::default();
         assert!(s.supported_extensions.contains(&"pdf".to_string()));
         assert_eq!(s.context_lines, 2);
+        assert_eq!(s.chat_backend, AgentBackend::ClaudeCode);
+    }
+
+    #[test]
+    fn test_removed_gemini_chat_backend_setting_migrates_to_default() {
+        let json = r#"{
+            "favorites": [],
+            "recent_dirs": [],
+            "respect_gitignore": true,
+            "max_file_size": 10485760,
+            "context_lines": 2,
+            "theme": "System",
+            "semantic": {
+                "enabled": false,
+                "index_path": null
+            },
+            "chat_backend": "Gemini"
+        }"#;
+
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.chat_backend, AgentBackend::ClaudeCode);
+    }
+
+    #[test]
+    fn test_nanocoder_chat_backend_setting_deserializes() {
+        let json = r#"{
+            "favorites": [],
+            "recent_dirs": [],
+            "respect_gitignore": true,
+            "max_file_size": 10485760,
+            "context_lines": 2,
+            "theme": "System",
+            "semantic": {
+                "enabled": false,
+                "index_path": null
+            },
+            "chat_backend": "Nanocoder"
+        }"#;
+
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.chat_backend, AgentBackend::Nanocoder);
     }
 }

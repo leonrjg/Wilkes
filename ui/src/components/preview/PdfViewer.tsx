@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Search as SearchIcon, ChevronUp, ChevronDown, X, List } from "react-feather";
-import { Document, Page, pdfjs } from "react-pdf";
+import { Page, pdfjs } from "react-pdf";
 import type { BoundingBox } from "../../lib/types";
-import type { PDFDocumentProxy } from "pdfjs-dist";
 import { usePdfInnerSearch } from "./usePdfInnerSearch";
 import { getScaledPageHeight, usePdfPageMetrics } from "./usePdfPageMetrics";
 import PdfTextLayer from "./PdfTextLayer";
@@ -11,6 +10,13 @@ import PdfLinkLayer from "./PdfLinkLayer";
 import PdfOutline from "./PdfOutline";
 import { usePdfOutline } from "./usePdfOutline";
 import { resolveDestination, type PdfDestination } from "./pdfDestinations";
+import {
+  readPdfScrollPosition,
+  savePdfScrollPosition,
+  type PdfScrollAnchor,
+  type PdfScrollPosition,
+} from "./pdfScrollMemory";
+import { usePdfDocument } from "./pdfDocumentCache";
 import { api } from "../../services";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
@@ -27,12 +33,23 @@ export interface PdfViewerProps {
   highlight_rects?: BoundingBox[] | null;
   bookmarkHighlights?: Array<{ id: string; page: number; rects: BoundingBox[] }>;
   onRenderSuccess?: () => void;
-  onAddBookmark?: (bookmark: {
-    page: number;
-    bbox: BoundingBox;
-    rects: BoundingBox[];
-    quote: string;
-  }) => void;
+  /** Fires (debounced) whenever the page nearest the viewport center changes
+   *  -- covers scroll, page-jump, and link/outline navigation alike, since
+   *  all of them funnel through `currentPage`. Used to keep the chat pane's
+   *  "open document" page badge live as the user reads, not just on the
+   *  initial landing page. */
+  onPageChange?: (page: number) => void;
+  onAddBookmark?: (selection: PdfSelection) => void;
+  showChatSelectionActions?: boolean;
+  onExplainSelection?: (selection: PdfSelection) => void;
+  onAskSelection?: (selection: PdfSelection, question: string) => void;
+}
+
+export interface PdfSelection {
+  page: number;
+  bbox: BoundingBox;
+  rects: BoundingBox[];
+  quote: string;
 }
 
 const PAGE_GAP_PX = 12;
@@ -88,6 +105,23 @@ function mergeRectsByLine(rects: BoundingBox[]): BoundingBox[] {
   return lines;
 }
 
+/** Capture the reader's current position as a page + intra-page ratio, reading
+ *  live DOM geometry. Returns null when nothing is measurable yet (no rendered
+ *  page spans the viewport top), so callers never persist a garbage position. */
+function captureScrollPosition(container: HTMLDivElement): PdfScrollAnchor | null {
+  const viewportTop = container.getBoundingClientRect().top;
+  const pageElements = container.querySelectorAll<HTMLElement>("[data-page-number]");
+  for (const pageElement of pageElements) {
+    const rect = pageElement.getBoundingClientRect();
+    if (rect.height > 0 && rect.top <= viewportTop && rect.bottom > viewportTop) {
+      const page = Number(pageElement.dataset.pageNumber);
+      if (!page) return null;
+      return { page, offsetRatio: (viewportTop - rect.top) / rect.height };
+    }
+  }
+  return null;
+}
+
 /** Bounding envelope of a set of rectangles (used as the navigation anchor). */
 function unionBox(rects: BoundingBox[]): BoundingBox {
   const x1 = Math.min(...rects.map((r) => r.x));
@@ -105,15 +139,37 @@ export default function PdfViewer({
   bookmarkHighlights = [],
   onRenderSuccess,
   onAddBookmark,
+  showChatSelectionActions = false,
+  onExplainSelection,
+  onAskSelection,
+  onPageChange,
 }: PdfViewerProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState(600);
-  const [numPages, setNumPages] = useState<number | null>(null);
   const [currentPage, setCurrentPage] = useState(page);
   const prevNavigationTargetRef = useRef<{ page: number; bbox: BoundingBox | null } | null>(null);
-  const [zoom, setZoom] = useState(1.0);
-  const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
+  // The page this viewer actually lands on for the initial open (props.page, or
+  // the remembered scroll position when one is restored). PreviewPane's loading
+  // overlay is cleared when *this* page paints -- gating on props.page instead
+  // would hang forever whenever the two diverge (e.g. a restored position deep
+  // in the document, whose page never enters the render window).
+  const landingPageRef = useRef<number | null>(null);
+  const initialRenderSignaledRef = useRef(false);
+  // True while a remembered position is being restored. Restoring scrolls the
+  // container programmatically, which fires `onScroll`; without this guard those
+  // events would save an intermediate (page-top) position back over the anchor
+  // we are mid-way through restoring, corrupting it a little more each reopen.
+  const isRestoringRef = useRef(false);
+  const restoreSettleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Restore the reader's last zoom for this document synchronously, so
+  // renderedWidth is already correct when the scroll position is restored and
+  // auto-zoom (skipped below when a zoom is remembered) never shifts it.
+  const [zoom, setZoom] = useState(() => readPdfScrollPosition(url)?.zoom ?? 1.0);
+  // The parsed document comes from a shared LRU cache (kept alive across
+  // unmounts), so navigating back to a recently opened file is instant.
+  const pdf = usePdfDocument(url);
+  const numPages = pdf?.numPages ?? null;
   const [isOutlineOpen, setIsOutlineOpen] = useState(false);
   const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
   const [selectionBookmark, setSelectionBookmark] = useState<{
@@ -124,6 +180,9 @@ export default function PdfViewer({
     buttonLeft: number;
     buttonTop: number;
   } | null>(null);
+  const [askDraft, setAskDraft] = useState("");
+  const [isAskOpen, setIsAskOpen] = useState(false);
+  const askInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     const observer = new MutationObserver(() => {
@@ -138,14 +197,25 @@ export default function PdfViewer({
   // next mouseup inside the viewer.
   useEffect(() => {
     const onSelectionChange = () => {
+      // While the ask form is open, focusing its input collapses the PDF text
+      // selection, which would otherwise tear down the popup mid-typing. The
+      // form captured what it needs in selectionBookmark and owns its own
+      // dismissal (Escape/Cancel/submit), so ignore selection loss here.
+      if (isAskOpen) return;
       const selection = window.getSelection();
       if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
         setSelectionBookmark(null);
+        setIsAskOpen(false);
+        setAskDraft("");
       }
     };
     window.document.addEventListener("selectionchange", onSelectionChange);
     return () => window.document.removeEventListener("selectionchange", onSelectionChange);
-  }, []);
+  }, [isAskOpen]);
+
+  useEffect(() => {
+    if (isAskOpen) askInputRef.current?.focus();
+  }, [isAskOpen]);
 
   const renderedWidth = containerWidth * zoom;
   const { pageMetrics, hasPageMetrics } = usePdfPageMetrics(pdf, url);
@@ -159,8 +229,12 @@ export default function PdfViewer({
   const pendingZoomAnchorRef = useRef<number | null>(null);
 
   // URL of the document we have already auto-zoomed, so the measurement runs
-  // exactly once per document (and never fights a subsequent manual zoom).
-  const autoZoomedUrlRef = useRef<string | null>(null);
+  // exactly once per document (and never fights a subsequent manual zoom). A
+  // remembered zoom means this document was already sized in an earlier mount;
+  // pre-mark it so auto-zoom is skipped on reopen and the restored zoom stands.
+  const autoZoomedUrlRef = useRef<string | null>(
+    readPdfScrollPosition(url)?.zoom !== undefined ? url : null,
+  );
 
   const setZoomKeepingHorizontalCenter = useCallback(
     (nextZoom: (zoom: number) => number) => {
@@ -282,6 +356,46 @@ export default function PdfViewer({
   const scrollToPage = useCallback(
     (p: number) => virtualizer.scrollToIndex(p - 1, { align: "start" }),
     [virtualizer],
+  );
+
+  // Restore a remembered position as the exact inverse of captureScrollPosition.
+  // scrollToIndex only brings the target page into the render window (and near
+  // the top); the precise landing is then computed from live DOM geometry using
+  // the *same* basis capture used -- the page element's own height, gap included
+  // -- so `capture(restore(pos)) === pos`. Reading the element's real position
+  // also absorbs any residual from scrollToIndex's estimate-based alignment,
+  // replacing the old relative `+=` nudge that landed on an uncertain base.
+  const restoreScrollPosition = useCallback(
+    (pos: PdfScrollPosition) => {
+      const pageIndex = Math.min(Math.max(pos.page - 1, 0), pageMetrics.length - 1);
+      isRestoringRef.current = true;
+      if (restoreSettleTimerRef.current) clearTimeout(restoreSettleTimerRef.current);
+
+      virtualizer.scrollToIndex(pageIndex, { align: "start" });
+      setCurrentPage(pageIndex + 1);
+
+      requestAnimationFrame(() => {
+        const container = containerRef.current;
+        const pageElement = container?.querySelector<HTMLElement>(
+          `[data-page-number="${pageIndex + 1}"]`,
+        );
+        if (container && pageElement) {
+          const viewportTop = container.getBoundingClientRect().top;
+          const rect = pageElement.getBoundingClientRect();
+          // Bring the page's top to the viewport top, then descend by the stored
+          // fraction of the same height capture divided by.
+          container.scrollTop += rect.top - viewportTop + pos.offsetRatio * rect.height;
+        }
+        // Re-enable saving only after this restore's scroll events have drained
+        // (each onScroll saves a frame later), so an intermediate state can't be
+        // written back over the anchor. The anchor already sits in memory
+        // unchanged, so nothing is lost by not saving during the restore.
+        restoreSettleTimerRef.current = setTimeout(() => {
+          isRestoringRef.current = false;
+        }, 250);
+      });
+    },
+    [virtualizer, pageMetrics],
   );
 
   // Follow an in-document GoTo link (table-of-contents entry, cross-reference):
@@ -421,6 +535,8 @@ export default function PdfViewer({
         Math.max(rootRect.height - 40, 8),
       ),
     });
+    setIsAskOpen(false);
+    setAskDraft("");
   }, [pageMetrics, renderedWidth]);
 
   const {
@@ -437,9 +553,16 @@ export default function PdfViewer({
     handleSearchInputKeyDown,
   } = usePdfInnerSearch(pdf, scrollToPage);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = containerRef.current;
     if (!el) return;
+    // Adopt the real width synchronously, before paint: the page heights that
+    // the position restore reads are derived from it, and starting at the 600px
+    // placeholder would let the async ResizeObserver correct it only *after*
+    // restore had landed, reflowing the document and shifting the restored
+    // position off by a constant amount.
+    const initialWidth = el.clientWidth;
+    if (initialWidth > 0) setContainerWidth(initialWidth);
     const ro = new ResizeObserver((entries) => {
       const w = entries[0].contentRect.width;
       if (w > 0) {
@@ -450,6 +573,14 @@ export default function PdfViewer({
     return () => ro.disconnect();
   }, []);
 
+  // Clear PreviewPane's "loading document" overlay exactly once, when the page
+  // we actually landed on has painted.
+  const signalInitialRender = useCallback(() => {
+    if (initialRenderSignaledRef.current) return;
+    initialRenderSignaledRef.current = true;
+    onRenderSuccess?.();
+  }, [onRenderSuccess]);
+
   useEffect(() => {
     const prevTarget = prevNavigationTargetRef.current;
     const navigationChanged =
@@ -458,14 +589,62 @@ export default function PdfViewer({
       prevTarget.bbox !== highlight_bbox;
 
     if (hasPageMetrics && !isSearchOpen && navigationChanged) {
-      virtualizer.scrollToIndex(page - 1, { align: "start" });
-      setCurrentPage(page);
+      // On the first navigation for this document, a plain open (page 1, no
+      // highlight target) carries no explicit destination, so restore where the
+      // reader was last left. An explicit target (a search hit or bookmark)
+      // always wins over the remembered position.
+      const isInitial = prevTarget === null;
+      const isDefaultTarget = page === 1 && highlight_bbox === null;
+      const remembered = isInitial && isDefaultTarget ? readPdfScrollPosition(url) : null;
+      if (remembered) {
+        restoreScrollPosition(remembered);
+      } else {
+        virtualizer.scrollToIndex(page - 1, { align: "start" });
+        setCurrentPage(page);
+      }
+
+      if (isInitial) {
+        // Record the page we actually land on so the loading overlay is cleared
+        // by *its* paint, not props.page's. When restoring, this is the
+        // remembered page (clamped the same way restoreScrollPosition clamps).
+        const landing = remembered
+          ? Math.min(Math.max(remembered.page, 1), pageMetrics.length)
+          : page;
+        landingPageRef.current = landing;
+        // A top-of-document open can paint the landing page before this effect
+        // runs; that page's onRenderSuccess has already fired and won't fire
+        // again, so signal now instead of waiting for an event that never comes.
+        if (containerRef.current?.querySelector(`[data-page-number="${landing}"] canvas`)) {
+          signalInitialRender();
+        }
+      }
     }
 
     if (hasPageMetrics) {
       prevNavigationTargetRef.current = { page, bbox: highlight_bbox };
     }
-  }, [page, hasPageMetrics, highlight_bbox, isSearchOpen, virtualizer]);
+  }, [page, hasPageMetrics, highlight_bbox, isSearchOpen, virtualizer, url, restoreScrollPosition, pageMetrics, signalInitialRender]);
+
+  // Remember where the reader is as it scrolls, so reopening this document later
+  // in the same session lands back here. Captured live (not on unmount): by the
+  // time an unmounting component's effect cleanup runs, React has already
+  // detached the ref and removed the DOM, leaving nothing to measure.
+  const rememberScrollPosition = useCallback(() => {
+    // Ignore the container's own restore-driven scrolls; only genuine user
+    // scrolling should update the remembered position.
+    if (isRestoringRef.current) return;
+    const container = containerRef.current;
+    if (!container) return;
+    const pos = captureScrollPosition(container);
+    if (pos) savePdfScrollPosition(url, { ...pos, zoom });
+  }, [url, zoom]);
+
+  useEffect(
+    () => () => {
+      if (restoreSettleTimerRef.current) clearTimeout(restoreSettleTimerRef.current);
+    },
+    [],
+  );
 
   useEffect(() => {
     if (numPages) {
@@ -479,8 +658,16 @@ export default function PdfViewer({
     }
   }, [hasPageMetrics, zoom, syncCurrentPageFromScroll]);
 
+  // Debounced so a fast scroll-past doesn't report every page it flies
+  // through -- only where the reader actually settles.
+  useEffect(() => {
+    if (!onPageChange) return;
+    const id = setTimeout(() => onPageChange(currentPage), 400);
+    return () => clearTimeout(id);
+  }, [currentPage, onPageChange]);
+
   return (
-    <div ref={rootRef} className="h-full relative flex flex-col">
+    <div ref={rootRef} className="h-full min-h-0 relative flex flex-col overflow-hidden">
       <div className="absolute bottom-4 right-4 z-20 flex flex-col gap-2 items-end">
         {isSearchOpen && (
           <div className="bg-[var(--bg-app)] border border-[var(--border-main)] rounded-lg shadow-xl flex items-center p-1 gap-1 animate-in fade-in slide-in-from-bottom-2 duration-200">
@@ -590,19 +777,15 @@ export default function PdfViewer({
           className={`flex-1 min-w-0 overflow-auto bg-[var(--bg-sidebar)] pr-1 ${isDark ? "pdf-dark-mode" : ""}`}
           onMouseUp={handleMouseUp}
           onScroll={() => {
-            requestAnimationFrame(syncCurrentPageFromScroll);
+            requestAnimationFrame(() => {
+              syncCurrentPageFromScroll();
+              rememberScrollPosition();
+            });
           }}
           style={{
             WebkitUserSelect: "text",
             userSelect: "text",
             transition: "filter 0.3s ease",
-          }}
-        >
-        <Document
-          file={url}
-          onLoadSuccess={(doc) => {
-            setPdf(doc);
-            setNumPages(doc.numPages);
           }}
         >
           {/* Explicit width (not fit-content) so the scrollable extent grows in
@@ -665,15 +848,15 @@ export default function PdfViewer({
                 >
                   <div style={{ position: "relative", display: "inline-block", height: pageHeight }}>
                     <Page
+                      pdf={pdf ?? false}
                       pageNumber={pageNum}
                       width={renderedWidth}
                       renderAnnotationLayer={false}
                       renderTextLayer={false}
                       canvasBackground="white"
                       onRenderSuccess={() => {
-                        if (pageNum === page || (!page && pageNum === 1)) {
-                          onRenderSuccess?.();
-                        }
+                        const landing = landingPageRef.current ?? (page || 1);
+                        if (pageNum === landing) signalInitialRender();
                       }}
                     />
                     {pdf && (
@@ -763,23 +946,102 @@ export default function PdfViewer({
               );
             })}
           </div>
-        </Document>
         </div>
       </div>
-      {selectionBookmark && onAddBookmark && (
-        <button
-          type="button"
-          onMouseDown={(event) => event.preventDefault()}
-          onClick={() => {
-            onAddBookmark(selectionBookmark);
-            setSelectionBookmark(null);
-            window.getSelection()?.removeAllRanges();
-          }}
-          className="absolute z-40 px-2 py-1 rounded border border-[var(--border-main)] bg-[var(--bg-app)] text-xs text-[var(--text-main)] shadow-lg hover:border-[var(--border-strong)]"
-          style={{ left: selectionBookmark.buttonLeft, top: selectionBookmark.buttonTop }}
-        >
-          + Bookmark
-        </button>
+      {selectionBookmark &&
+        (onAddBookmark ||
+          (showChatSelectionActions && (onExplainSelection || onAskSelection))) && (
+          <div
+            onMouseDown={(event) => event.preventDefault()}
+            className="absolute z-40 rounded border border-[var(--border-main)] bg-[var(--bg-app)] text-xs text-[var(--text-main)] shadow-lg"
+            style={{ left: selectionBookmark.buttonLeft, top: selectionBookmark.buttonTop }}
+          >
+            {isAskOpen ? (
+              <form
+                className="flex items-center gap-1 p-1"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  const question = askDraft.trim();
+                  if (!question || !onAskSelection) return;
+                  onAskSelection(selectionBookmark, question);
+                  setSelectionBookmark(null);
+                  setIsAskOpen(false);
+                  setAskDraft("");
+                  window.getSelection()?.removeAllRanges();
+                }}
+              >
+                <input
+                  ref={askInputRef}
+                  value={askDraft}
+                  onChange={(event) => setAskDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      setIsAskOpen(false);
+                      setAskDraft("");
+                    }
+                  }}
+                  placeholder="Ask about this…"
+                  className="w-48 bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-1.5 py-0.5 text-xs outline-none focus:border-[var(--accent-blue)]"
+                />
+                <button
+                  type="submit"
+                  disabled={!askDraft.trim()}
+                  className="px-1.5 py-0.5 rounded bg-[var(--accent-blue)] text-white disabled:opacity-40"
+                >
+                  Send
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsAskOpen(false);
+                    setAskDraft("");
+                  }}
+                  className="px-1.5 py-0.5 rounded hover:bg-[var(--bg-active)]"
+                >
+                  Cancel
+                </button>
+              </form>
+            ) : (
+              <div className="flex items-center">
+                {onAddBookmark && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onAddBookmark(selectionBookmark);
+                      setSelectionBookmark(null);
+                      window.getSelection()?.removeAllRanges();
+                    }}
+                    className="px-2 py-1 hover:bg-[var(--bg-active)]"
+                  >
+                    + Bookmark
+                  </button>
+                )}
+                {showChatSelectionActions && onExplainSelection && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onExplainSelection(selectionBookmark);
+                      setSelectionBookmark(null);
+                      window.getSelection()?.removeAllRanges();
+                    }}
+                    className="px-2 py-1 border-l border-[var(--border-main)] hover:bg-[var(--bg-active)]"
+                  >
+                    Explain
+                  </button>
+                )}
+                {showChatSelectionActions && onAskSelection && (
+                  <button
+                    type="button"
+                    onClick={() => setIsAskOpen(true)}
+                    className="px-2 py-1 border-l border-[var(--border-main)] hover:bg-[var(--bg-active)]"
+                  >
+                    Ask about this
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
       )}
     </div>
   );

@@ -963,7 +963,16 @@ mod tests {
         );
 
         // Index chunk survived (re-keyed, not deleted + re-embedded).
-        assert_eq!(index.lock().unwrap().as_ref().unwrap().status().total_chunks, 1);
+        assert_eq!(
+            index
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .status()
+                .total_chunks,
+            1
+        );
         // Metadata cache row moved from old path to new path.
         let guard = cache_handle.as_ref().unwrap().lock().unwrap();
         assert!(guard.get_valid(&new_path, identity).unwrap().is_some());

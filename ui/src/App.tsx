@@ -1,19 +1,23 @@
 import { useState, useCallback, useRef, useEffect } from "react";
-import { Bookmark, Settings as SettingsIcon } from "react-feather";
+import { Bookmark, MessageSquare, Settings as SettingsIcon, ChevronDown, Loader } from "react-feather";
 import SearchBar from "./components/SearchBar";
 import ResultList from "./components/ResultList";
 import PreviewPane from "./components/PreviewPane";
 import BookmarksPane from "./components/BookmarksPane";
+import ChatPane from "./components/ChatPane";
 import DirectoryPicker from "./components/DirectoryPicker";
 import UploadZone from "./components/UploadZone";
 import SettingsModal from "./components/SettingsModal";
 import { useToasts } from "./components/Toast";
+import { useContextMenu, ContextMenu } from "./components/ContextMenu";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useBookmarksStore } from "./stores/useBookmarksStore";
+import { useChatStore } from "./stores/useChatStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useHistory } from "./hooks/useHistory";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
-import { api, source } from "./services";
+import { api, source, isTauri } from "./services";
+import type { AgentBackend } from "./lib/types";
 import type { DesktopSourceApi, WebSourceApi } from "./services/api";
 
 export default function App() {
@@ -37,12 +41,21 @@ export default function App() {
   const refreshSemanticReady = useSemanticStore((s) => s.refreshCurrentRootStatus);
   const handleIndexUpdated = useSemanticStore((s) => s.handleIndexUpdated);
 
+  const chatPaneOpen = useChatStore((s) => s.paneOpen);
+  const chatPaneOpening = useChatStore((s) => s.paneOpening);
+  const toggleChatPane = useChatStore((s) => s.togglePane);
+  const openChatPane = useChatStore((s) => s.openPane);
+  const loadChatBackends = useChatStore((s) => s.loadBackends);
+  const { menu: chatBackendMenu, openMenu: openChatBackendMenu, closeMenu: closeChatBackendMenu } =
+    useContextMenu<null>();
+
   const { canGoBack, canGoForward, goBack, goForward, handleMatchClick, handleFileClick } =
     useHistory();
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(320);
   const [bookmarksWidth, setBookmarksWidth] = useState(320);
+  const [chatWidth, setChatWidth] = useState(320);
   const resizeRef = useRef<{
     startX: number;
     startWidth: number;
@@ -180,6 +193,51 @@ export default function App() {
 
   const settingsSlot = (
     <>
+      {isTauri && (
+        <div className="inline-flex rounded border border-[var(--border-main)] overflow-hidden">
+          <button
+            onClick={() => openChatPane().catch((e) => console.error("chat: open pane failed", e))}
+            title="Ask the documents"
+            aria-busy={chatPaneOpening}
+            className={`w-[32px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] transition-all active:scale-95 ${
+              chatPaneOpen
+                ? "text-[var(--accent-blue)] shadow-inner"
+                : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
+            }`}
+          >
+            {chatPaneOpening ? (
+              <Loader size={14} className="animate-spin" />
+            ) : (
+              <MessageSquare size={14} fill={chatPaneOpen ? "currentColor" : "none"} />
+            )}
+          </button>
+          <button
+            onClick={async (e) => {
+              const event = e;
+              await loadChatBackends().catch((error) => {
+                console.error("chat: failed to load backends", error);
+              });
+              const chatBackends = useChatStore.getState().backends;
+              openChatBackendMenu({
+                event,
+                target: null,
+                items: chatBackends.map((b) => ({
+                  id: b.backend,
+                  label: `${b.available ? "●" : "○"} ${b.label}${
+                    !b.available ? ` — ${b.unavailable_reason ?? b.auth_note}` : ""
+                  }`,
+                  disabled: !b.available,
+                  run: () => openChatPane(b.backend as AgentBackend),
+                })),
+              });
+            }}
+            title="Choose chat agent"
+            className="w-[14px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] text-[var(--text-dim)] hover:text-[var(--text-main)] transition-all border-l border-[var(--border-main)]"
+          >
+            <ChevronDown size={10} />
+          </button>
+        </div>
+      )}
       <button
         onClick={toggleBookmarksPane}
         title="Bookmarks"
@@ -202,6 +260,7 @@ export default function App() {
         refreshSemanticReady={refreshSemanticReady}
         onSettingsUpdate={applySettingsPatch}
       />
+      <ContextMenu menu={chatBackendMenu} onClose={closeChatBackendMenu} />
     </>
   );
 
@@ -240,13 +299,35 @@ export default function App() {
     </>
   ) : null;
 
+  // Chat is right-dock-only for v1 (bookmarks already covers left, spec §7.1).
+  const chatColumn = isTauri && chatPaneOpen ? (
+    <>
+      <div
+        onMouseDown={startResize({
+          width: chatWidth,
+          setWidth: setChatWidth,
+          direction: -1,
+          minWidth: 320,
+          maxWidth: window.innerWidth * 0.5,
+        })}
+        className="w-1 cursor-col-resize flex-shrink-0 bg-transparent hover:bg-[var(--accent-blue)]/30 border-l border-[var(--border-main)] transition-colors"
+      />
+      <div
+        className="flex-shrink-0 overflow-hidden"
+        style={{ width: `${chatWidth}px`, minWidth: "320px" }}
+      >
+        <ChatPane onClose={toggleChatPane} />
+      </div>
+    </>
+  ) : null;
+
   return (
-    <div className="flex flex-col h-screen bg-[var(--bg-app)] text-[var(--text-main)]">
+    <div className="flex flex-col h-screen min-h-0 overflow-hidden bg-[var(--bg-app)] text-[var(--text-main)]">
       <SearchBar sourceSlot={sourceSlot} settingsSlot={settingsSlot} />
 
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 min-h-0 overflow-hidden">
         <div
-          className="flex-shrink-0 flex flex-col bg-[var(--bg-sidebar)]"
+          className="flex-shrink-0 flex flex-col min-h-0 bg-[var(--bg-sidebar)]"
           style={{ width: `${sidebarWidth}px`, minWidth: "200px" }}
         >
           <ResultList onMatchClick={handleMatchClick} onFileClick={handleFileClick} />
@@ -265,7 +346,7 @@ export default function App() {
 
         {bookmarksDock === "Left" && bookmarksColumn}
 
-        <div className="flex-1 overflow-hidden bg-[var(--bg-app)]">
+        <div className="flex-1 min-h-0 min-w-0 overflow-hidden bg-[var(--bg-app)]">
           <PreviewPane
             canGoBack={canGoBack}
             canGoForward={canGoForward}
@@ -275,6 +356,7 @@ export default function App() {
         </div>
 
         {bookmarksDock === "Right" && bookmarksColumn}
+        {chatColumn}
       </div>
     </div>
   );

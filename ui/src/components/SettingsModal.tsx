@@ -15,6 +15,14 @@ import { json } from "@codemirror/lang-json";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { indentWithTab } from "@codemirror/commands";
 import {Tool} from "react-feather";
+import { isTauri } from "../services";
+import type { AgentBackend } from "../lib/types";
+
+const CHAT_BACKENDS: { value: AgentBackend; label: string }[] = [
+  { value: "ClaudeCode", label: "Claude Code" },
+  { value: "Codex", label: "Codex" },
+  { value: "Nanocoder", label: "Nanocoder" },
+];
 
 interface SettingsModalProps {
   api: SearchApi;
@@ -289,6 +297,31 @@ export default function SettingsModal({
                       ))}
                     </div>
                   </section>
+
+                  {isTauri && (
+                    <section>
+                      <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Chat</h3>
+                      <div className="space-y-1">
+                        <div className="flex justify-between items-baseline">
+                          <label className="text-xs text-[var(--text-muted)]">Default chat agent</label>
+                          <p className="text-[10px] text-[var(--text-dim)] italic">Ask the documents pane</p>
+                        </div>
+                        <select
+                          value={settings.chat_backend ?? "ClaudeCode"}
+                          onChange={(e) =>
+                            handleUpdateSettings({ chat_backend: e.target.value as AgentBackend })
+                          }
+                          className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
+                        >
+                          {CHAT_BACKENDS.map((b) => (
+                            <option key={b.value} value={b.value}>
+                              {b.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </section>
+                  )}
                 </div>
               )}
             </div>

@@ -23,8 +23,7 @@ pub async fn resolve_file_metadata(
     settings: Settings,
     path: PathBuf,
 ) -> anyhow::Result<DocumentMetadata> {
-    let file_based =
-        get_file_metadata(path.clone(), settings.supported_extensions.clone()).await?;
+    let file_based = get_file_metadata(path.clone(), settings.supported_extensions.clone()).await?;
 
     if !settings.integrations.zotero.enabled {
         return Ok(file_based);

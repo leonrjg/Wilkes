@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 wilkes-core = { path = "../core" }
+wilkes-agent = { path = "../agent" }
 anyhow = "1"
 tracing = "0.1"
 ignore = "0.4"
@@ -16,9 +17,9 @@ thiserror = "2"
 parking_lot = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber = "0.3"
 wilkes-core = { path = "../core", features = ["test-utils"] }
-async-trait = "0.1"

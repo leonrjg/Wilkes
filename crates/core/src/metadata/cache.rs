@@ -10,6 +10,7 @@
 //! fingerprint but changes the path, so identity lets callers re-key an existing
 //! row instead of re-extracting identical content.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -105,6 +106,42 @@ impl FileIdentity {
 
 pub struct MetadataCache {
     conn: Connection,
+}
+
+fn component_count(path: &Path) -> usize {
+    path.components().count()
+}
+
+fn preferred_alias(canonical: &Path, aliases: &[PathBuf], preferred_roots: &[PathBuf]) -> PathBuf {
+    let mut choices: Vec<(usize, usize, usize, PathBuf)> = Vec::new();
+
+    for (root_idx, root) in preferred_roots.iter().enumerate() {
+        if !root.exists() {
+            continue;
+        }
+
+        if let Ok(root_canonical) = std::fs::canonicalize(root) {
+            if let Ok(relative) = canonical.strip_prefix(&root_canonical) {
+                let preferred = root.join(relative);
+                if preferred.exists() {
+                    choices.push((component_count(relative), root_idx, 0, preferred));
+                }
+            }
+        }
+
+        for alias in aliases {
+            if let Ok(relative) = alias.strip_prefix(root) {
+                choices.push((component_count(relative), root_idx, 1, alias.clone()));
+            }
+        }
+    }
+
+    choices.sort();
+    choices
+        .into_iter()
+        .next()
+        .map(|(_, _, _, path)| path)
+        .unwrap_or_else(|| aliases[0].clone())
 }
 
 impl MetadataCache {
@@ -247,10 +284,19 @@ impl MetadataCache {
     /// unique cached row sharing this fingerprint whose path still exists on
     /// disk. Mirrors [`find_rename_source`](Self::find_rename_source) for
     /// callers that hold a *stale* path (e.g. a bookmark) and need the live one
-    /// after a rename. Returns `None` when no such row exists, or when more than
-    /// one on-disk file shares the fingerprint (ambiguous, e.g. duplicate
-    /// content), so callers never silently re-point to the wrong file.
-    pub fn find_current_path(&self, identity: FileIdentity) -> anyhow::Result<Option<PathBuf>> {
+    /// after a rename.
+    ///
+    /// Multiple absolute strings that canonicalize to the same file count as one
+    /// logical candidate: cloud-file providers can expose the same file through
+    /// aliases such as a friendly mounted path and a provider storage path. When
+    /// that happens, `preferred_roots` chooses the spelling closest to an app
+    /// root. Returns `None` when no row exists, or when more than one distinct
+    /// on-disk file shares the fingerprint (ambiguous, e.g. duplicate content).
+    pub fn find_current_path(
+        &self,
+        identity: FileIdentity,
+        preferred_roots: &[PathBuf],
+    ) -> anyhow::Result<Option<PathBuf>> {
         let mut stmt = self.conn.prepare(
             "SELECT path FROM file_metadata
              WHERE size_bytes = ?1 AND modified_at_ms = ?2",
@@ -261,12 +307,19 @@ impl MetadataCache {
                 |row| row.get::<_, String>(0),
             )?
             .collect::<Result<Vec<_>, _>>()?;
-        let mut existing = candidates
-            .into_iter()
-            .filter(|p| Path::new(p).exists())
-            .collect::<Vec<_>>();
-        if existing.len() == 1 {
-            Ok(Some(PathBuf::from(existing.pop().expect("len checked"))))
+        let mut logical_files: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+        for candidate in candidates {
+            let path = PathBuf::from(candidate);
+            if !path.exists() {
+                continue;
+            }
+            let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            logical_files.entry(canonical).or_default().push(path);
+        }
+        if logical_files.len() == 1 {
+            let (canonical, mut aliases) = logical_files.pop_first().expect("len checked");
+            aliases.sort();
+            Ok(Some(preferred_alias(&canonical, &aliases, preferred_roots)))
         } else {
             Ok(None)
         }
@@ -564,7 +617,7 @@ mod tests {
             .unwrap();
 
         // A stale holder of `old` resolves forward to the live `new`.
-        assert_eq!(cache.find_current_path(id).unwrap(), Some(new.clone()));
+        assert_eq!(cache.find_current_path(id, &[]).unwrap(), Some(new.clone()));
 
         // A second on-disk file sharing the fingerprint makes it ambiguous:
         // never guess.
@@ -573,7 +626,7 @@ mod tests {
         cache
             .upsert(&dup, id, &sample(), MetadataSource::File)
             .unwrap();
-        assert!(cache.find_current_path(id).unwrap().is_none());
+        assert!(cache.find_current_path(id, &[]).unwrap().is_none());
 
         // No on-disk file with the fingerprint (row still points at the missing
         // path) yields nothing rather than a dead path.
@@ -589,7 +642,38 @@ mod tests {
                 MetadataSource::File,
             )
             .unwrap();
-        assert!(cache.find_current_path(missing_id).unwrap().is_none());
+        assert!(cache.find_current_path(missing_id, &[]).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_current_path_collapses_aliases_and_prefers_configured_root() {
+        let dir = tempdir().unwrap();
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        let id = FileIdentity {
+            size_bytes: 100,
+            modified_at_ms: 42,
+        };
+        let storage_root = dir.path().join("storage");
+        let friendly_root = dir.path().join("friendly");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        std::fs::create_dir_all(&friendly_root).unwrap();
+
+        let storage_path = storage_root.join("doc.pdf");
+        let friendly_path = friendly_root.join("doc.pdf");
+        std::fs::write(&storage_path, b"content").unwrap();
+        std::os::unix::fs::symlink(&storage_path, &friendly_path).unwrap();
+        cache
+            .upsert(&storage_path, id, &sample(), MetadataSource::File)
+            .unwrap();
+        cache
+            .upsert(&friendly_path, id, &sample(), MetadataSource::File)
+            .unwrap();
+
+        assert_eq!(
+            cache.find_current_path(id, &[friendly_root]).unwrap(),
+            Some(friendly_path)
+        );
     }
 
     #[test]
@@ -672,7 +756,10 @@ mod tests {
         // refresh re-derives in place.
         let mut paths = cache.all_paths().unwrap();
         paths.sort();
-        assert_eq!(paths, vec![PathBuf::from("/f.pdf"), PathBuf::from("/z.pdf")]);
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/f.pdf"), PathBuf::from("/z.pdf")]
+        );
     }
 
     /// The core invariant behind the fix: re-deriving a Zotero-backed file when
@@ -688,7 +775,9 @@ mod tests {
             modified_at_ms: 1,
         };
         let path = Path::new("/doc.pdf");
-        cache.upsert(path, id, &sample(), MetadataSource::Zotero).unwrap();
+        cache
+            .upsert(path, id, &sample(), MetadataSource::Zotero)
+            .unwrap();
 
         let empty = DocumentMetadata {
             title: None,
@@ -696,7 +785,9 @@ mod tests {
             doi: None,
             created_at: None,
         };
-        cache.upsert(path, id, &empty, MetadataSource::File).unwrap();
+        cache
+            .upsert(path, id, &empty, MetadataSource::File)
+            .unwrap();
 
         assert_eq!(cache.get_valid(path, id).unwrap(), Some(sample()));
         // Provenance stayed Zotero, so a later `invalidate_zotero` still targets it.
@@ -724,7 +815,9 @@ mod tests {
             doi: None,
             created_at: None,
         };
-        cache.upsert(path, id, &partial_zotero, MetadataSource::Zotero).unwrap();
+        cache
+            .upsert(path, id, &partial_zotero, MetadataSource::Zotero)
+            .unwrap();
 
         // File extraction: a different title (must NOT clobber Zotero's) plus a
         // publication date the Zotero record lacked (must backfill).
@@ -734,7 +827,9 @@ mod tests {
             doi: None,
             created_at: Some("2021-05".into()),
         };
-        cache.upsert(path, id, &file_based, MetadataSource::File).unwrap();
+        cache
+            .upsert(path, id, &file_based, MetadataSource::File)
+            .unwrap();
 
         let merged = cache.get_valid(path, id).unwrap().unwrap();
         assert_eq!(merged.title.as_deref(), Some("Zotero Title"));
@@ -749,7 +844,9 @@ mod tests {
             doi: Some("10.1/x".into()),
             created_at: None,
         };
-        cache.upsert(path, id, &newer_zotero, MetadataSource::Zotero).unwrap();
+        cache
+            .upsert(path, id, &newer_zotero, MetadataSource::Zotero)
+            .unwrap();
         let merged = cache.get_valid(path, id).unwrap().unwrap();
         assert_eq!(merged.title.as_deref(), Some("Newer Zotero Title"));
         assert_eq!(merged.author.as_deref(), Some("Zotero Author"));

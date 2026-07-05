@@ -254,10 +254,24 @@ export interface Settings {
   file_sort_key?: FileSortKey;
   file_sort_direction?: FileSortDirection;
   file_display_fields?: FileDisplayField[];
+  /** Persisted default agent for the chat pane (`SettingsModal`). The in-pane
+   *  selector and header split-button dropdown may switch a session to a
+   *  different backend transiently without touching this field. */
+  chat_backend?: AgentBackend;
+  /** Per-backend chat config defaults (model, thought level, mode). Written by
+   *  the backend when a config option changes in the chat pane and applied to
+   *  new sessions; the UI does not edit this directly. */
+  chat_config?: ChatBackendConfig[];
+}
+
+export interface ChatBackendConfig {
+  backend: AgentBackend;
+  values: { id: string; value: string }[];
 }
 
 export type Theme = "System" | "Light" | "Dark";
 export type BookmarkDock = "Left" | "Right";
+export type AgentBackend = "ClaudeCode" | "Codex" | "Nanocoder";
 
 export interface SearchCapabilities {
   supports_regex: boolean;
@@ -312,4 +326,138 @@ export interface EmbedDone {
 export interface EmbedError {
   operation: EmbedOperation;
   message: string;
+}
+
+// ── Chat (ACP) ───────────────────────────────────────────────────────────────
+// Mirrors crates/api/src/commands/chat.rs and wilkes_agent::session::ChatEvent.
+// Desktop-only for v1 (see docs/chat-agent-integration-spec.md §11) -- not
+// part of `SearchApi`, which is shared with the web/server build.
+
+export interface BackendStatus {
+  backend: AgentBackend;
+  label: string;
+  available: boolean;
+  auth_note: string;
+  installable: boolean;
+  unavailable_reason: string | null;
+}
+
+export interface ChatToolLocation {
+  path: string;
+  line: number | null;
+}
+
+export interface ChatContextFileRecord {
+  path: string;
+  pages: number | null;
+}
+
+export interface ChatActiveDocRecord {
+  path: string;
+  page: number | null;
+}
+
+/** A tool call's own reported content -- the detail behind the compact chip. */
+export type ChatToolContentBlock =
+  | { kind: "text"; text: string }
+  | { kind: "diff"; path: string; old_text: string | null; new_text: string }
+  | { kind: "terminal"; terminal_id: string };
+
+/** One choice offered for a surfaced permission request, mirrored from the
+ *  agent's own `PermissionOption`. */
+export interface ChatPermissionOption {
+  option_id: string;
+  name: string;
+  kind: string;
+}
+
+/** One `chat/update-<turnId>` payload. Tool fields are a patch: `undefined`
+ *  means "unchanged from the last update for this tool_call_id". */
+export type ChatUpdate =
+  | { kind: "text"; delta: string }
+  | { kind: "thought"; delta: string }
+  | {
+      kind: "tool";
+      tool_call_id: string;
+      title?: string | null;
+      status?: string | null;
+      locations?: ChatToolLocation[] | null;
+      content?: ChatToolContentBlock[] | null;
+      raw_input?: unknown;
+      raw_output?: unknown;
+    }
+  | {
+      kind: "permission";
+      request_id: string;
+      tool_call_id: string;
+      title?: string | null;
+      options: ChatPermissionOption[];
+    }
+  | { kind: "error"; message: string };
+
+export interface ChatDone {
+  stop_reason: string;
+}
+
+/** ACP session configuration (model, mode, thought level, ...), reported by
+ *  `session/new` and settable via `session/set_config_option`. Not every
+ *  agent exposes every category -- Claude's adapter reports `model`,
+ *  `thought_level`, and an uncategorized agent-variant picker, for example. */
+export interface ChatConfigChoice {
+  value: string;
+  name: string;
+  group: string | null;
+}
+
+export interface ChatConfigOption {
+  id: string;
+  name: string;
+  category: string | null;
+  current_value: string;
+  choices: ChatConfigChoice[];
+}
+
+export interface ChatReplayToolCall {
+  tool_call_id: string;
+  title: string;
+  status: string;
+  locations: ChatToolLocation[];
+  content: ChatToolContentBlock[];
+  raw_input: unknown;
+  raw_output: unknown;
+}
+
+export interface ChatReplayMessage {
+  role: "user" | "assistant";
+  text: string;
+  thought: string;
+  tools: ChatReplayToolCall[];
+}
+
+export interface ChatConversationRecord {
+  conversation_id: string;
+  backend: AgentBackend;
+  backend_session_id: string;
+  cwd: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  last_opened_at: string;
+  context_files: ChatContextFileRecord[];
+  active_doc: ChatActiveDocRecord | null;
+  config_values: { id: string; value: string }[];
+}
+
+export interface ChatStartResult {
+  session_id: string;
+  conversation_id: string | null;
+  backend_session_id: string | null;
+  config_options: ChatConfigOption[];
+  replay_messages: ChatReplayMessage[];
+  context_files: ChatContextFileRecord[];
+  active_doc: ChatActiveDocRecord | null;
+}
+
+export interface ChatSendResult {
+  conversation_id: string | null;
 }

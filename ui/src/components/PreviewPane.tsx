@@ -2,9 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import { X, ArrowLeft, ArrowRight, ExternalLink, Copy } from "react-feather";
 import CodeViewer from "./preview/CodeViewer";
 import PdfViewer from "./preview/PdfViewer";
+import type { PdfSelection } from "./preview/PdfViewer";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
-import { api } from "../services";
+import { useChatStore } from "../stores/useChatStore";
+import { api, isTauri } from "../services";
 import type { BoundingBox, DocumentMetadata } from "../lib/types";
 import { buildExternalLinks } from "../lib/externalLinks";
 import { useToasts } from "./Toast";
@@ -98,7 +100,30 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   const clearPreview = useSearchStore((s) => s.clearPreview);
   const addBookmark = useBookmarksStore((s) => s.add);
   const bookmarks = useBookmarksStore((s) => s.bookmarks);
+  const setChatActiveDoc = useChatStore((s) => s.setActiveDoc);
+  const chatBackendsLoaded = useChatStore((s) => s.backendsLoaded);
+  const hasAvailableChatBackend = useChatStore((s) => s.hasAvailableBackend);
+  const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
   const { addToast } = useToasts();
+
+  // The chat pane's "open document" badge (spec §6.1, §7.4): PreviewPane is
+  // the single owner of "what's currently being viewed" since it's the only
+  // component that knows both the open file *and* -- via PdfViewer's live
+  // scroll tracking below -- the page actually on screen, not just the page
+  // the user landed on.
+  useEffect(() => {
+    if (!isTauri) return;
+    if (!selectedMatch) {
+      setChatActiveDoc(null);
+      return;
+    }
+    const page = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.page : null;
+    setChatActiveDoc(selectedMatch.path, page);
+  }, [selectedMatch, setChatActiveDoc]);
+
+  const handleChatPageChange = (page: number) => {
+    if (isTauri && selectedMatch) setChatActiveDoc(selectedMatch.path, page);
+  };
 
   // Keep the last valid previewData so the content stays mounted while a new
   // match is loading. This prevents PdfViewer from unmounting/remounting on
@@ -219,6 +244,20 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
       .catch((e) => console.error("Add bookmark failed:", e));
   };
 
+  const chatSelectionActionsAvailable = isTauri && chatBackendsLoaded && hasAvailableChatBackend;
+
+  const handleExplainSelection = (selection: PdfSelection) => {
+    openChatPaneAndSend(`Explain: ${selection.quote}`).catch((e) =>
+      console.error("Explain selection failed:", e),
+    );
+  };
+
+  const handleAskSelection = (selection: PdfSelection, question: string) => {
+    openChatPaneAndSend(`Question: ${question}\n\nSelected text:\n${selection.quote}`).catch((e) =>
+      console.error("Ask about selection failed:", e),
+    );
+  };
+
   if (!isPdfFile && !displayData) {
     return (
       <div className="flex items-center justify-center h-full text-[var(--text-muted)] text-sm animate-pulse">
@@ -228,7 +267,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full min-h-0 overflow-hidden">
       {/* Header */}
       <div className="px-3 py-2 border-b border-[var(--border-main)] flex items-center gap-3 flex-shrink-0 bg-[var(--bg-header)]">
         <div className="flex items-center gap-1">
@@ -314,7 +353,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-hidden relative bg-[var(--bg-app)]">
+      <div className="flex-1 min-h-0 overflow-hidden relative bg-[var(--bg-app)]">
         {(previewLoading || isPdfRendering) && (
           <div className="absolute inset-0 flex items-center justify-center bg-[var(--bg-app)] z-30 pointer-events-none">
             <div className="flex flex-col items-center gap-3">
@@ -333,6 +372,10 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
             bookmarkHighlights={bookmarkHighlights}
             onRenderSuccess={() => setIsPdfRendering(false)}
             onAddBookmark={handleAddBookmark}
+            showChatSelectionActions={chatSelectionActionsAvailable}
+            onExplainSelection={handleExplainSelection}
+            onAskSelection={handleAskSelection}
+            onPageChange={handleChatPageChange}
           />
         ) : displayData && "Text" in displayData ? (
           <CodeViewer

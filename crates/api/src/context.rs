@@ -38,6 +38,39 @@ pub trait EventEmitter: Send + Sync + 'static {
     fn emit(&self, name: &str, payload: serde_json::Value);
 }
 
+#[async_trait::async_trait]
+impl wilkes_agent::search::SearchService for AppContext {
+    async fn default_root(self: Arc<Self>) -> Option<PathBuf> {
+        self.get_settings().await.last_directory
+    }
+
+    async fn search(
+        self: Arc<Self>,
+        query: SearchQuery,
+        max_files: usize,
+    ) -> Result<wilkes_agent::search::CollectedSearch, String> {
+        let handle = self.start_search(query).await?;
+        let mut files = Vec::new();
+        let mut truncated = false;
+        let stats = handle
+            .run(|file_matches| {
+                if files.len() < max_files {
+                    files.push(file_matches);
+                } else {
+                    truncated = true;
+                }
+                async { true }
+            })
+            .await;
+
+        Ok(wilkes_agent::search::CollectedSearch {
+            files,
+            stats,
+            truncated,
+        })
+    }
+}
+
 // ── Embed task handle ─────────────────────────────────────────────────────────
 
 pub struct EmbedTaskHandle {
@@ -96,6 +129,24 @@ enum RestoreStatePreparation {
         db_status: IndexStatus,
         selected: SelectedEmbedder,
     },
+}
+
+fn preferred_bookmark_roots(settings: &Settings) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(root) = settings.last_directory.clone() {
+        roots.push(root);
+    }
+    for root in settings
+        .favorites
+        .iter()
+        .chain(settings.recent_dirs.iter())
+        .cloned()
+    {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
 }
 
 // ── AppContext ────────────────────────────────────────────────────────────────
@@ -208,7 +259,8 @@ impl AppContext {
 
     pub async fn list_bookmarks(&self) -> anyhow::Result<Vec<Bookmark>> {
         let mut bookmarks = crate::commands::bookmarks::load(&self.bookmarks_path).await?;
-        self.resolve_bookmark_paths(&mut bookmarks);
+        let settings = self.get_settings().await;
+        self.resolve_bookmark_paths(&mut bookmarks, &settings);
         Ok(bookmarks)
     }
 
@@ -223,11 +275,12 @@ impl AppContext {
     /// identity is absent/ambiguous in the cache (e.g. the renamed file has not
     /// been re-listed yet). Such a bookmark simply resolves on a later read once
     /// a listing has populated the cache; it never fails to load.
-    fn resolve_bookmark_paths(&self, bookmarks: &mut [Bookmark]) {
+    fn resolve_bookmark_paths(&self, bookmarks: &mut [Bookmark], settings: &Settings) {
         // Avoid opening/locking the cache unless something is actually stale.
         if bookmarks.iter().all(|b| b.path.exists()) {
             return;
         }
+        let preferred_roots = preferred_bookmark_roots(settings);
         let Some(cache) = self.metadata_cache() else {
             return;
         };
@@ -241,7 +294,7 @@ impl AppContext {
             let Some(identity) = bookmark.identity else {
                 continue;
             };
-            match guard.find_current_path(identity) {
+            match guard.find_current_path(identity, &preferred_roots) {
                 Ok(Some(current)) => {
                     bookmark.path = current;
                 }

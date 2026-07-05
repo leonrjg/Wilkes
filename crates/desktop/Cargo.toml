@@ -17,6 +17,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 wilkes-api = { path = "../api" }
+wilkes-agent = { path = "../agent" }
 wilkes-core = { path = "../core" }
 tauri = { version = "2", features = ["protocol-asset", "devtools", "test"] }
 tauri-plugin-dialog = "2"

@@ -3,7 +3,9 @@ import type { ContextMenuItem } from "../components/ContextMenu";
 import { zoteroMenuContributor } from "./integrations/zotero";
 import type { MenuContributor } from "./integrations/types";
 import type { Settings } from "./types";
-import { Copy, Edit2, ExternalLink, Folder } from "react-feather";
+import { isTauri } from "../services";
+import { useChatStore } from "../stores/useChatStore";
+import { Copy, Edit2, ExternalLink, Folder, MessageSquare } from "react-feather";
 
 export type ContextMenuTarget =
   | { kind: "file" | "match"; path: string; open: () => void }
@@ -62,6 +64,19 @@ export function buildFileContextMenuItems({
       icon: Edit2,
       run: () => onRenameRequest?.(target.path),
     });
+
+    if (isTauri) {
+      items.push({
+        id: "ask-about-file",
+        label: "Ask about this file",
+        icon: MessageSquare,
+        run: async () => {
+          const chat = useChatStore.getState();
+          await chat.openPane();
+          chat.addContext(target.path);
+        },
+      });
+    }
   }
 
   if (capabilities.canOpenInFileManager) {
