@@ -1,11 +1,13 @@
 use std::sync::{Arc, Mutex};
 
 use crate::extract::ExtractorRegistry;
-use crate::types::{FileMatches, FileType, Match, SearchCapabilities, SearchQuery, SourceOrigin};
+use crate::types::{
+    FileMatches, FileType, Match, SearchCapabilities, SearchQuery, SearchScope, SourceOrigin,
+};
 use tracing::{error, info};
 
 use super::{SearchProvider, SearchResultTx};
-use crate::embed::index::SemanticIndex;
+use crate::embed::index::{SemanticIndex, SemanticQueryScope};
 use crate::embed::Embedder;
 
 pub struct SemanticSearchProvider {
@@ -57,7 +59,11 @@ impl SearchProvider for SemanticSearchProvider {
             .ok_or_else(|| anyhow::anyhow!("Semantic index is not built yet"))?;
 
         let top_k = query.max_results;
-        let results = idx.query(&query_vec, top_k)?;
+        let scope = match &query.scope {
+            SearchScope::Corpus => SemanticQueryScope::Corpus,
+            SearchScope::File { path } => SemanticQueryScope::File(path),
+        };
+        let results = idx.query_scoped(&query_vec, top_k, scope)?;
         drop(guard);
 
         // 3. Convert IndexedChunk results into FileMatches / Match.
@@ -182,6 +188,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Semantic,
+            scope: Default::default(),
             supported_extensions: vec![],
         };
 
@@ -238,6 +245,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Semantic,
+            scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
         };
 
@@ -358,6 +366,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Semantic,
+            scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
         };
 

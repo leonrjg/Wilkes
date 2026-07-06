@@ -1183,6 +1183,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: wilkes_core::types::SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
         };
 
@@ -1834,6 +1835,7 @@ mod tests {
             max_file_size: 1024,
             context_lines: 0,
             mode: SearchMode::Semantic,
+            scope: Default::default(),
             supported_extensions: vec![],
         };
         let res_semantic = search_handler(State(state.clone()), Json(query_semantic)).await;

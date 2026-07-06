@@ -23,8 +23,9 @@ use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
-    Bookmark, DocumentMetadata, EmbedderModel, IndexStatus, IndexingConfig, NewBookmark,
-    PreviewData, SearchMode, SearchQuery, SelectedEmbedder, SemanticSettings, Settings,
+    Bookmark, DocumentMetadata, EmbedderModel, FileType, IndexStatus, IndexingConfig, NewBookmark,
+    PreviewData, SearchMode, SearchQuery, SearchScope, SelectedEmbedder, SemanticSettings,
+    Settings,
 };
 
 use crate::commands::search::{start_search, SearchHandle};
@@ -790,6 +791,53 @@ impl AppContext {
 
     // ── Search ────────────────────────────────────────────────────────────────
 
+    fn prepare_search_query(
+        mut query: SearchQuery,
+        supported_extensions: Vec<String>,
+    ) -> Result<SearchQuery, String> {
+        query.supported_extensions = supported_extensions;
+        let root = std::fs::canonicalize(&query.root).map_err(|err| {
+            format!(
+                "Search root does not exist or cannot be accessed: {} ({err})",
+                query.root.display()
+            )
+        })?;
+        query.root = root;
+
+        if let SearchScope::File { path } = &query.scope {
+            let requested = if path.is_absolute() {
+                path.clone()
+            } else {
+                query.root.join(path)
+            };
+            let file = std::fs::canonicalize(&requested).map_err(|err| {
+                format!(
+                    "Search file does not exist or cannot be accessed: {} ({err})",
+                    requested.display()
+                )
+            })?;
+            if !file.is_file() {
+                return Err(format!("Search file is not a file: {}", file.display()));
+            }
+            if !is_under(&file, &query.root) {
+                return Err(format!(
+                    "Search file must be inside the search root: {} is outside {}",
+                    file.display(),
+                    query.root.display()
+                ));
+            }
+            if FileType::detect(&file, &query.supported_extensions).is_none() {
+                return Err(format!(
+                    "Search file type is not supported: {}",
+                    file.display()
+                ));
+            }
+            query.scope = SearchScope::File { path: file };
+        }
+
+        Ok(query)
+    }
+
     /// Resolve semantic state (if needed) and start the search. Handles both
     /// Grep and Semantic modes; callers do not branch on mode.
     pub async fn start_search(
@@ -797,7 +845,7 @@ impl AppContext {
         mut query: SearchQuery,
     ) -> Result<SearchHandle, String> {
         let settings = self.settings().await;
-        query.supported_extensions = settings.supported_extensions.clone();
+        query = Self::prepare_search_query(query, settings.supported_extensions.clone())?;
 
         let (embedder, index) = if query.mode == SearchMode::Semantic {
             // Block if a build task is currently running.
@@ -861,6 +909,12 @@ impl AppContext {
                             error!("background reindex failed: {e}");
                         }
                     });
+                }
+                if matches!(query.scope, SearchScope::File { .. }) {
+                    return Err(format!(
+                        "Semantic index is not ready for search root {}. Reindexing has been requested; please try again when indexing finishes.",
+                        query.root.display()
+                    ));
                 }
             }
 
@@ -3678,12 +3732,69 @@ exit 0
             max_file_size: 0,
             context_lines: 2,
             mode: SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec![],
         };
 
         let handle = ctx.clone().start_search(query).await.unwrap();
         // SearchHandle only has rx field (mpsc::Receiver)
         drop(handle);
+    }
+
+    #[test]
+    fn test_prepare_search_query_normalizes_file_scope() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("paper.txt"), "hello").unwrap();
+
+        let query = SearchQuery {
+            pattern: "hello".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: dir.path().to_path_buf(),
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 2,
+            mode: SearchMode::Grep,
+            scope: SearchScope::File {
+                path: PathBuf::from("paper.txt"),
+            },
+            supported_extensions: vec![],
+        };
+
+        let prepared = AppContext::prepare_search_query(query, vec!["txt".to_string()]).unwrap();
+        assert_eq!(prepared.root, std::fs::canonicalize(dir.path()).unwrap());
+        assert_eq!(
+            prepared.scope,
+            SearchScope::File {
+                path: std::fs::canonicalize(dir.path().join("paper.txt")).unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn test_prepare_search_query_rejects_file_outside_root() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join("paper.txt");
+        std::fs::write(&outside_file, "hello").unwrap();
+
+        let query = SearchQuery {
+            pattern: "hello".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: root.path().to_path_buf(),
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 2,
+            mode: SearchMode::Grep,
+            scope: SearchScope::File { path: outside_file },
+            supported_extensions: vec![],
+        };
+
+        let err = AppContext::prepare_search_query(query, vec!["txt".to_string()]).unwrap_err();
+        assert!(err.contains("outside"));
     }
 
     #[tokio::test]
@@ -3716,6 +3827,7 @@ exit 0
             max_file_size: 0,
             context_lines: 2,
             mode: SearchMode::Semantic,
+            scope: Default::default(),
             supported_extensions: vec![],
         };
 
@@ -3945,6 +4057,7 @@ exit 0
             respect_gitignore: true,
             max_file_size: 0,
             context_lines: 0,
+            scope: Default::default(),
             supported_extensions: vec![],
         };
 
@@ -4086,6 +4199,7 @@ exit 0
             max_file_size: 0,
             context_lines: 2,
             mode: SearchMode::Semantic,
+            scope: Default::default(),
             supported_extensions: vec![],
         };
 
@@ -4159,6 +4273,7 @@ exit 0
             max_file_size: 0,
             context_lines: 2,
             mode: SearchMode::Semantic,
+            scope: Default::default(),
             supported_extensions: vec![],
         };
 

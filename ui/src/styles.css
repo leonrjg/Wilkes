@@ -142,3 +142,122 @@ body,
   );
   animation: shimmer 1.5s infinite;
 }
+
+.prose-chat {
+  max-width: min(100%, 420px);
+  overflow-wrap: anywhere;
+}
+
+.prose-chat > :first-child {
+  margin-top: 0;
+}
+
+.prose-chat > :last-child {
+  margin-bottom: 0;
+}
+
+.prose-chat p,
+.prose-chat ul,
+.prose-chat ol,
+.prose-chat blockquote,
+.prose-chat pre,
+.prose-chat table {
+  margin: 0.55rem 0;
+}
+
+.prose-chat h1,
+.prose-chat h2,
+.prose-chat h3,
+.prose-chat h4 {
+  margin: 0.7rem 0 0.35rem;
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.prose-chat h1 {
+  font-size: 1.15em;
+}
+
+.prose-chat h2 {
+  font-size: 1.08em;
+}
+
+.prose-chat h3,
+.prose-chat h4 {
+  font-size: 1em;
+}
+
+.prose-chat ul,
+.prose-chat ol {
+  padding-left: 1.25rem;
+}
+
+.prose-chat ul {
+  list-style: disc;
+}
+
+.prose-chat ol {
+  list-style: decimal;
+}
+
+.prose-chat li + li {
+  margin-top: 0.2rem;
+}
+
+.prose-chat blockquote {
+  border-left: 3px solid var(--border-strong);
+  color: var(--text-muted);
+  padding-left: 0.75rem;
+}
+
+.prose-chat a {
+  color: var(--accent-blue);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.prose-chat code {
+  background: var(--bg-active);
+  border: 1px solid var(--border-main);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+  padding: 0.05rem 0.25rem;
+}
+
+.prose-chat pre {
+  background: var(--bg-active);
+  border: 1px solid var(--border-main);
+  border-radius: 6px;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 0.6rem 0.7rem;
+}
+
+.prose-chat pre code {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  display: block;
+  padding: 0;
+  white-space: pre;
+}
+
+.prose-chat table {
+  border-collapse: collapse;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.prose-chat th,
+.prose-chat td {
+  border: 1px solid var(--border-main);
+  padding: 0.25rem 0.45rem;
+}
+
+.prose-chat th {
+  background: var(--bg-active);
+  font-weight: 650;
+}

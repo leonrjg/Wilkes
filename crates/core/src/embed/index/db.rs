@@ -433,6 +433,54 @@ mod tests {
     }
 
     #[test]
+    fn test_query_file_scope_selects_within_file_before_top_k() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut idx =
+            SemanticIndex::create(root, "m", 2, EmbeddingEngine::Candle, Some(root)).unwrap();
+        let scoped_path = root.join("scoped.txt");
+        let other_path = root.join("other.txt");
+
+        idx.write_file(PreparedFile {
+            path: scoped_path.clone(),
+            chunks: vec![(
+                Chunk {
+                    file_path: scoped_path.clone(),
+                    text: "scoped chunk".to_string(),
+                    byte_range: ByteRange { start: 0, end: 12 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![0.0, 1.0],
+            )],
+        })
+        .unwrap();
+        idx.write_file(PreparedFile {
+            path: other_path.clone(),
+            chunks: vec![(
+                Chunk {
+                    file_path: other_path.clone(),
+                    text: "other chunk".to_string(),
+                    byte_range: ByteRange { start: 0, end: 11 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![1.0, 0.0],
+            )],
+        })
+        .unwrap();
+
+        let global = idx.query(&[1.0, 0.0], 1).unwrap();
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].file_path, other_path);
+
+        let scoped = idx
+            .query_scoped(&[1.0, 0.0], 1, SemanticQueryScope::File(&scoped_path))
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].file_path, scoped_path);
+        assert_eq!(scoped[0].chunk_text, "scoped chunk");
+    }
+
+    #[test]
     fn test_query_dimension_mismatch() {
         let dir = tempdir().unwrap();
         let idx = SemanticIndex::create(dir.path(), "m", 1, EmbeddingEngine::Candle, None).unwrap();
@@ -653,6 +701,11 @@ pub struct IndexedChunk {
     pub extraction_byte_range: ByteRange,
     pub origin: SourceOrigin,
     pub score: f32,
+}
+
+pub enum SemanticQueryScope<'a> {
+    Corpus,
+    File(&'a Path),
 }
 
 // ── SemanticIndex ─────────────────────────────────────────────────────────────
@@ -1268,6 +1321,22 @@ impl SemanticIndex {
     /// Query the index for the top-k nearest neighbours to `embedding`.
     /// Uses cosine similarity computed in Rust (O(n) over all stored vectors).
     pub fn query(&self, embedding: &[f32], top_k: usize) -> anyhow::Result<Vec<IndexedChunk>> {
+        self.query_scoped(embedding, top_k, SemanticQueryScope::Corpus)
+    }
+
+    pub fn query_scoped(
+        &self,
+        embedding: &[f32],
+        top_k: usize,
+        scope: SemanticQueryScope<'_>,
+    ) -> anyhow::Result<Vec<IndexedChunk>> {
+        match scope {
+            SemanticQueryScope::Corpus => self.query_corpus(embedding, top_k),
+            SemanticQueryScope::File(path) => self.query_file(embedding, top_k, path),
+        }
+    }
+
+    fn query_corpus(&self, embedding: &[f32], top_k: usize) -> anyhow::Result<Vec<IndexedChunk>> {
         anyhow::ensure!(
             embedding.len() == self.dimension,
             "Dimension mismatch for query vector for the \"embedding\" column. Expected {} dimensions but received {}.",
@@ -1415,6 +1484,124 @@ impl SemanticIndex {
 
         tracing::info!("[query] returning {} results", results.len());
         Ok(results)
+    }
+
+    fn query_file(
+        &self,
+        embedding: &[f32],
+        top_k: usize,
+        path: &Path,
+    ) -> anyhow::Result<Vec<IndexedChunk>> {
+        anyhow::ensure!(
+            embedding.len() == self.dimension,
+            "Dimension mismatch for query vector for the \"embedding\" column. Expected {} dimensions but received {}.",
+            self.dimension,
+            embedding.len()
+        );
+
+        let rel_path = self.to_rel_path(path);
+        let rel_path = rel_path.to_string_lossy();
+        let mut stmt = self.conn.prepare(
+            "SELECT c.file_path, c.byte_start, c.byte_end,
+                    c.origin_type, c.page, c.line, c.col,
+                    c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.chunk_text,
+                    v.embedding
+             FROM chunks c
+             JOIN vec_chunks v ON v.rowid = c.id
+             WHERE c.file_path = ?1",
+        )?;
+
+        let mut scored = Vec::new();
+        let rows = stmt.query_map(params![rel_path.as_ref()], |row| {
+            let file_path: String = row.get(0)?;
+            let byte_start: i64 = row.get(1)?;
+            let byte_end: i64 = row.get(2)?;
+            let origin_type: String = row.get(3)?;
+            let page: Option<i64> = row.get(4)?;
+            let line: Option<i64> = row.get(5)?;
+            let col: Option<i64> = row.get(6)?;
+            let bbox_x: Option<f64> = row.get(7)?;
+            let bbox_y: Option<f64> = row.get(8)?;
+            let bbox_w: Option<f64> = row.get(9)?;
+            let bbox_h: Option<f64> = row.get(10)?;
+            let chunk_text: String = row.get(11)?;
+            let embedding_blob: Vec<u8> = row.get(12)?;
+            Ok((
+                file_path,
+                byte_start,
+                byte_end,
+                origin_type,
+                page,
+                line,
+                col,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+                chunk_text,
+                embedding_blob,
+            ))
+        })?;
+
+        for row in rows {
+            let (
+                file_path,
+                byte_start,
+                byte_end,
+                origin_type,
+                page,
+                line,
+                col,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+                chunk_text,
+                embedding_blob,
+            ) = row?;
+            let chunk_embedding = f32_slice_from_bytes(&embedding_blob)?;
+            anyhow::ensure!(
+                chunk_embedding.len() == self.dimension,
+                "Stored embedding dimension mismatch for {}. Expected {}, received {}.",
+                file_path,
+                self.dimension,
+                chunk_embedding.len()
+            );
+            let Some(origin) = source_origin_from_parts(
+                &origin_type,
+                page,
+                line,
+                col,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+            ) else {
+                error!(
+                    "[query_file] unknown origin_type '{}' for {file_path}",
+                    origin_type
+                );
+                continue;
+            };
+            let score = cosine_similarity(embedding, &chunk_embedding);
+            let abs_path = self.to_abs_path(&file_path);
+            scored.push(IndexedChunk {
+                file_path: abs_path,
+                chunk_text,
+                extraction_byte_range: ByteRange {
+                    start: byte_start as usize,
+                    end: byte_end as usize,
+                },
+                origin,
+                score,
+            });
+        }
+
+        scored.sort_by(|a, b| b.score.total_cmp(&a.score));
+        if top_k > 0 && scored.len() > top_k {
+            scored.truncate(top_k);
+        }
+        Ok(scored)
     }
 
     /// Read index metadata without re-validating model_id/dimension.
@@ -1603,4 +1790,63 @@ impl SemanticIndex {
 
 fn f32_slice_to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+fn f32_slice_from_bytes(bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
+    anyhow::ensure!(
+        bytes.len() % std::mem::size_of::<f32>() == 0,
+        "Invalid embedding byte length: {}",
+        bytes.len()
+    );
+    Ok(bytes
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let (mut dot, mut norm_a, mut norm_b) = (0.0f32, 0.0f32, 0.0f32);
+    for (left, right) in a.iter().zip(b) {
+        dot += left * right;
+        norm_a += left * left;
+        norm_b += right * right;
+    }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a.sqrt() * norm_b.sqrt())
+}
+
+fn source_origin_from_parts(
+    origin_type: &str,
+    page: Option<i64>,
+    line: Option<i64>,
+    col: Option<i64>,
+    bbox_x: Option<f64>,
+    bbox_y: Option<f64>,
+    bbox_w: Option<f64>,
+    bbox_h: Option<f64>,
+) -> Option<SourceOrigin> {
+    match origin_type {
+        "text_file" => Some(SourceOrigin::TextFile {
+            line: line.unwrap_or(0) as u32,
+            col: col.unwrap_or(0) as u32,
+        }),
+        "pdf_page" => {
+            let bbox = match (bbox_x, bbox_y, bbox_w, bbox_h) {
+                (Some(x), Some(y), Some(w), Some(h)) => Some(BoundingBox {
+                    x: x as f32,
+                    y: y as f32,
+                    width: w as f32,
+                    height: h as f32,
+                }),
+                _ => None,
+            };
+            Some(SourceOrigin::PdfPage {
+                page: page.unwrap_or(0) as u32,
+                bbox,
+            })
+        }
+        _ => None,
+    }
 }

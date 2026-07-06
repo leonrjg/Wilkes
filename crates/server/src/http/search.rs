@@ -122,6 +122,7 @@ mod tests {
             max_file_size: 1024 * 1024,
             context_lines: 0,
             mode: SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec![],
         }
     }

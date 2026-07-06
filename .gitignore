@@ -30,6 +30,7 @@ crates/desktop/sidecars/
 
 # AI
 .claude/
+.nanocoder/
 
 # Python
 **/__pycache__/

@@ -190,7 +190,6 @@ enum SessionCommand {
         blocks: Vec<ContentBlock>,
         reply: oneshot::Sender<Result<String, String>>,
     },
-    Cancel,
     SetConfigOption {
         config_id: String,
         value: String,
@@ -303,6 +302,7 @@ pub struct ChatSession {
     pub backend: AgentBackend,
     backend_session_id: String,
     cmd_tx: mpsc::UnboundedSender<SessionCommand>,
+    cancel_tx: mpsc::UnboundedSender<()>,
     state: ContextStateHandle,
     config_options: Arc<Mutex<Vec<ChatConfigOption>>>,
     pending_permissions: PendingPermissions,
@@ -368,8 +368,12 @@ impl ChatSession {
     }
 
     pub fn cancel(&self) -> anyhow::Result<()> {
-        self.cmd_tx
-            .send(SessionCommand::Cancel)
+        // Cancel must bypass the command loop: during an in-flight prompt that
+        // loop is blocked awaiting PromptResponse, so queued commands cannot
+        // interrupt the turn.
+        drain_pending_permissions(&self.pending_permissions);
+        self.cancel_tx
+            .send(())
             .map_err(|_| anyhow::anyhow!("chat session is closed"))
     }
 
@@ -420,8 +424,8 @@ impl ChatSession {
             .map_err(|message| anyhow::anyhow!(message))
     }
 
-    /// Ends the subprocess. `session/cancel` any in-flight turn first if one
-    /// exists -- callers close in-flight turns via `cancel()` before `close()`.
+    /// Ends the subprocess. Callers close in-flight turns via `cancel()` before
+    /// `close()` when they need graceful turn cancellation.
     pub fn close(&self) {
         let _ = self.cmd_tx.send(SessionCommand::Close);
     }
@@ -487,6 +491,7 @@ async fn spawn_with_mode(
 
     let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<()>();
     let (ready_tx, ready_rx) = oneshot::channel::<anyhow::Result<SessionReady>>();
 
     let state = ContextStateHandle::default();
@@ -707,6 +712,18 @@ async fn spawn_with_mode(
                     replay_messages: replay_messages.lock().unwrap().clone(),
                 }));
 
+                let cancel_session_id = session_id.clone();
+                let cancel_cx = cx.clone();
+                let cancel_task = tokio::spawn(async move {
+                    while cancel_rx.recv().await.is_some() {
+                        if let Err(e) = cancel_cx
+                            .send_notification(CancelNotification::new(cancel_session_id.clone()))
+                        {
+                            error!("chat: session/cancel failed: {e}");
+                        }
+                    }
+                });
+
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
                         SessionCommand::Prompt {
@@ -729,14 +746,6 @@ async fn spawn_with_mode(
                                 Err(e) => Err(e.message),
                             };
                             let _ = reply.send(outcome);
-                        }
-                        SessionCommand::Cancel => {
-                            // Free any parked permission handlers first so the
-                            // cancelled turn tears down cleanly.
-                            drain_pending_permissions(&pending_for_loop);
-                            if let Err(e) = cx.send_notification(CancelNotification::new(session_id.clone())) {
-                                error!("chat: session/cancel failed: {e}");
-                            }
                         }
                         SessionCommand::SetConfigOption {
                             config_id,
@@ -771,6 +780,7 @@ async fn spawn_with_mode(
                         }
                     }
                 }
+                cancel_task.abort();
                 Ok(())
             })
             .await;
@@ -801,6 +811,7 @@ async fn spawn_with_mode(
             backend,
             backend_session_id: ready.backend_session_id,
             cmd_tx,
+            cancel_tx,
             state,
             config_options,
             pending_permissions,

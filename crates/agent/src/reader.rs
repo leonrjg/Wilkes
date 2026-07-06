@@ -3,6 +3,7 @@
 //! search: there is no second text-extraction path.
 
 use std::path::Path;
+use std::time::Instant;
 
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
@@ -48,7 +49,9 @@ pub fn read_text_range(
     line: Option<u32>,
     limit: Option<u32>,
 ) -> anyhow::Result<String> {
-    let text = if is_pdf(path) {
+    let started_at = Instant::now();
+    let pdf = is_pdf(path);
+    let text = if pdf {
         let registry = registry();
         let extractor = registry
             .find(path, None)
@@ -62,10 +65,21 @@ pub fn read_text_range(
         std::fs::read_to_string(path)?
     };
 
-    Ok(match (line, limit) {
+    let output = match (line, limit) {
         (None, None) => text,
         (line, limit) => slice_lines(&text, line.unwrap_or(1), limit),
-    })
+    };
+    tracing::info!(
+        path = %path.display(),
+        is_pdf = pdf,
+        page_range = ?page_range,
+        line = ?line,
+        limit = ?limit,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        output_bytes = output.len(),
+        "chat: read_text_range completed"
+    );
+    Ok(output)
 }
 
 /// Extract a bounded text excerpt for the active document that Wilkes pushes

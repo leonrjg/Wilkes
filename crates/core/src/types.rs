@@ -28,6 +28,16 @@ pub enum SearchMode {
     Semantic,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SearchScope {
+    #[default]
+    Corpus,
+    File {
+        path: PathBuf,
+    },
+}
+
 // ── Query ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -50,6 +60,9 @@ pub struct SearchQuery {
     /// Which search backend to use.
     #[serde(default)]
     pub mode: SearchMode,
+    /// Optional result scope inside `root`.
+    #[serde(default)]
+    pub scope: SearchScope,
     /// The global list of supported extensions from settings.
     #[serde(default)]
     pub supported_extensions: Vec<String>,

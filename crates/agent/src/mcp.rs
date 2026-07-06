@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use agent_client_protocol::schema::v1::{HttpHeader, McpServer, McpServerHttp};
 use axum::{
@@ -172,12 +173,22 @@ struct GetDocumentTextParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SearchParams {
+    /// Text to search for.
     query: String,
+    /// Use exact for literal/regex matching, semantic for meaning-based search.
     mode: Option<SearchModeParam>,
+    /// Corpus/index root. Omit unless searching a different root is intentional.
     root: Option<String>,
+    /// Restrict search to this single file inside root. Use this for questions
+    /// about the open/current document or a concrete context document.
+    file: Option<String>,
+    /// Maximum matches to return.
     max_results: Option<usize>,
+    /// Exact search only.
     case_sensitive: Option<bool>,
+    /// Exact search only.
     is_regex: Option<bool>,
+    /// Exact search context lines.
     context_lines: Option<u32>,
 }
 
@@ -188,7 +199,7 @@ enum SearchModeParam {
     Semantic,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
 struct PageRange {
     #[serde(alias = "start_page")]
     start: u32,
@@ -228,6 +239,7 @@ struct SearchResponse {
     query: String,
     mode: SearchModeParam,
     root: String,
+    file: Option<String>,
     matches: Vec<SearchFileResponse>,
     stats: wilkes_core::types::SearchStats,
     truncated: bool,
@@ -277,7 +289,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Search Wilkes-readable documents. Use mode='exact' for literal/regex text search, or mode='semantic' to search the semantic index when it is available."
+        description = "Search Wilkes-readable documents. Use mode='exact' for literal/regex text search, or mode='semantic' to search the semantic index when it is available. If the user asks about the open/current document or a specific context file, set file to that document path; omit file only for corpus-wide searches."
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         match search_documents(&self.context, self.search.clone(), &self.cwd, params).await {
@@ -317,6 +329,7 @@ fn get_document_text(
     context: &ContextStateHandle,
     params: GetDocumentTextParams,
 ) -> Result<GetDocumentTextResponse, String> {
+    let started_at = Instant::now();
     let snapshot = context.snapshot();
     let (path, default_page) = match params.path {
         Some(path) => (PathBuf::from(path), None),
@@ -335,21 +348,30 @@ fn get_document_text(
         return Err(format!("{} is not in this chat's context.", path.display()));
     }
 
-    let requested_page = params.page.or(default_page);
-    let page_range = match (requested_page, params.page_range) {
+    let page_range = match (params.page, params.page_range) {
         (Some(page), None) => Some((page, page)),
         (None, Some(range)) => Some((range.start, range.end)),
-        (None, None) => None,
-        (Some(_), Some(_)) => unreachable!("validated above"),
+        (None, None) => default_page.map(|page| (page, page)),
+        (Some(_), Some(_)) => return Err("Pass either page or page_range, not both.".to_string()),
     };
-    let text = reader::read_text_range(&path, page_range, None, None)
-        .map_err(|err| format!("Failed to extract text from {}: {err:#}", path.display()))?;
+    let read_started_at = Instant::now();
+    let text = reader::read_text_range(&path, page_range, None, None).map_err(|err| {
+        info!(
+            path = %path.display(),
+            page_range = ?page_range,
+            error = %err,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "chat: get_document_text failed"
+        );
+        format!("Failed to extract text from {}: {err:#}", path.display())
+    })?;
+    let read_elapsed_ms = read_started_at.elapsed().as_millis();
     let max_chars = params
         .max_chars
         .unwrap_or(DEFAULT_TEXT_CHAR_LIMIT)
         .min(MAX_TEXT_CHAR_LIMIT);
     let excerpt = reader::limit_excerpt(&text, max_chars);
-    Ok(GetDocumentTextResponse {
+    let response = GetDocumentTextResponse {
         path: display_path(&path),
         page: page_range.and_then(|(start, end)| (start == end).then_some(start)),
         page_range: page_range.and_then(|(start, end)| {
@@ -360,7 +382,20 @@ fn get_document_text(
         }),
         text: excerpt.text,
         truncated: excerpt.truncated,
-    })
+    };
+    let serialized_bytes = serde_json::to_vec(&response).map(|bytes| bytes.len()).ok();
+    info!(
+        path = %path.display(),
+        page_range = ?page_range,
+        read_elapsed_ms,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        extracted_bytes = text.len(),
+        response_text_bytes = response.text.len(),
+        response_serialized_bytes = ?serialized_bytes,
+        truncated = response.truncated,
+        "chat: get_document_text completed"
+    );
+    Ok(response)
 }
 
 async fn search_documents(
@@ -385,6 +420,10 @@ async fn search_documents(
     };
     let (query, max_files) = build_search_query(root, params, mode)?;
     let root = display_path(&query.root);
+    let file = match &query.scope {
+        wilkes_core::types::SearchScope::Corpus => None,
+        wilkes_core::types::SearchScope::File { path } => Some(display_path(path)),
+    };
     let query_text = query.pattern.clone();
     let collected = search.search(query, max_files).await?;
 
@@ -392,6 +431,7 @@ async fn search_documents(
         query: query_text,
         mode,
         root,
+        file,
         matches: collected
             .files
             .into_iter()
@@ -434,6 +474,12 @@ fn build_search_query(
                 SearchModeParam::Exact => wilkes_core::types::SearchMode::Grep,
                 SearchModeParam::Semantic => wilkes_core::types::SearchMode::Semantic,
             },
+            scope: params
+                .file
+                .map(|path| wilkes_core::types::SearchScope::File {
+                    path: PathBuf::from(path),
+                })
+                .unwrap_or_default(),
             supported_extensions: Vec::new(),
         },
         max_results,
@@ -492,7 +538,8 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
     use wilkes_core::types::{
-        FileMatches, FileType, Match, SearchMode, SearchQuery, SearchStats, SourceOrigin,
+        FileMatches, FileType, Match, SearchMode, SearchQuery, SearchScope, SearchStats,
+        SourceOrigin,
     };
 
     struct FakeSearch {
@@ -610,6 +657,30 @@ mod tests {
     }
 
     #[test]
+    fn explicit_page_range_overrides_active_document_page() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("active.txt");
+        std::fs::write(&path, "active document text").unwrap();
+        let context = ContextStateHandle::default();
+        context.set_active_doc(Some(path.to_string_lossy().into_owned()), Some(3));
+
+        let response = get_document_text(
+            &context,
+            GetDocumentTextParams {
+                path: None,
+                page: None,
+                page_range: Some(PageRange { start: 1, end: 5 }),
+                max_chars: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.page, None);
+        assert_eq!(response.page_range, Some(PageRange { start: 1, end: 5 }));
+        assert_eq!(response.text, "active document text");
+    }
+
+    #[test]
     fn builds_bounded_exact_search_query() {
         let dir = tempdir().unwrap();
         let explicit_root = dir.path().join("root");
@@ -619,6 +690,7 @@ mod tests {
                 query: "  IO programming  ".to_string(),
                 mode: Some(SearchModeParam::Exact),
                 root: None,
+                file: None,
                 max_results: Some(500),
                 case_sensitive: Some(true),
                 is_regex: Some(true),
@@ -649,6 +721,7 @@ mod tests {
                 query: "definitions".to_string(),
                 mode: Some(SearchModeParam::Semantic),
                 root: None,
+                file: None,
                 max_results: None,
                 case_sensitive: None,
                 is_regex: Some(true),
@@ -662,6 +735,33 @@ mod tests {
         assert_eq!(query.root, dir.path());
         assert!(!query.is_regex);
         assert_eq!(query.max_results, DEFAULT_SEARCH_MAX_RESULTS);
+    }
+
+    #[test]
+    fn builds_file_scoped_search_query() {
+        let dir = tempdir().unwrap();
+        let (query, _) = build_search_query(
+            dir.path().to_path_buf(),
+            SearchParams {
+                query: "definitions".to_string(),
+                mode: None,
+                root: None,
+                file: Some("paper.pdf".to_string()),
+                max_results: None,
+                case_sensitive: None,
+                is_regex: None,
+                context_lines: None,
+            },
+            SearchModeParam::Exact,
+        )
+        .unwrap();
+
+        assert_eq!(
+            query.scope,
+            SearchScope::File {
+                path: PathBuf::from("paper.pdf")
+            }
+        );
     }
 
     #[tokio::test]
@@ -709,6 +809,7 @@ mod tests {
                 query: "IO".to_string(),
                 mode: Some(SearchModeParam::Semantic),
                 root: None,
+                file: None,
                 max_results: Some(3),
                 case_sensitive: None,
                 is_regex: None,
@@ -759,6 +860,7 @@ mod tests {
                 query: "multi-turn".to_string(),
                 mode: None,
                 root: Some(explicit_root.to_string_lossy().into_owned()),
+                file: None,
                 max_results: None,
                 case_sensitive: None,
                 is_regex: None,
@@ -784,6 +886,7 @@ mod tests {
                 query: "anything".to_string(),
                 mode: None,
                 root: None,
+                file: None,
                 max_results: None,
                 case_sensitive: None,
                 is_regex: None,

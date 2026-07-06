@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   ChevronDown,
   Clock,
@@ -497,7 +498,7 @@ export default function ChatPane({ onClose }: Props) {
   );
 }
 
-function MessageBubble({
+export function MessageBubble({
   message,
   nowMs,
   onNavigate,
@@ -613,7 +614,18 @@ function MessageBubble({
           <span className="whitespace-pre-wrap">{message.text}</span>
         ) : (
           <div className="prose-chat">
-            <ReactMarkdown>{message.text || (message.streaming ? "…" : "")}</ReactMarkdown>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={{
+                a: ({ children, href }) => (
+                  <a href={href} target="_blank" rel="noreferrer">
+                    {children}
+                  </a>
+                ),
+              }}
+            >
+              {message.text || (message.streaming ? "…" : "")}
+            </ReactMarkdown>
             {message.streaming && <span className="animate-pulse">▍</span>}
           </div>
         )}

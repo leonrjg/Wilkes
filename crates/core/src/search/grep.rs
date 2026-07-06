@@ -1,6 +1,7 @@
 use crate::extract::ExtractorRegistry;
 use crate::types::{
-    ByteRange, FileMatches, FileType, Match, SearchCapabilities, SearchQuery, SourceOrigin,
+    ByteRange, FileMatches, FileType, Match, SearchCapabilities, SearchQuery, SearchScope,
+    SourceOrigin,
 };
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -47,75 +48,53 @@ impl SearchProvider for GrepSearchProvider {
         tx: SearchResultTx,
     ) -> anyhow::Result<Vec<String>> {
         let matcher = Self::build_matcher(query)?;
-
-        let walk = WalkBuilder::new(&query.root)
-            .git_ignore(query.respect_gitignore)
-            .hidden(false)
-            .build();
-
         let mut total_matches: usize = 0;
         let mut errors: Vec<String> = Vec::new();
 
-        for entry in walk {
-            if tx.is_closed() {
-                break;
-            }
+        match &query.scope {
+            SearchScope::Corpus => {
+                let walk = WalkBuilder::new(&query.root)
+                    .git_ignore(query.respect_gitignore)
+                    .hidden(false)
+                    .build();
 
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+                for entry in walk {
+                    if tx.is_closed() {
+                        break;
+                    }
 
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
 
-            // File size filter
-            if query.max_file_size > 0 {
-                if let Ok(meta) = path.metadata() {
-                    if meta.len() > query.max_file_size {
+                    let path = entry.path();
+                    if !path.is_file() {
                         continue;
+                    }
+                    if search_path(
+                        path,
+                        query,
+                        extractors,
+                        &matcher,
+                        &tx,
+                        &mut total_matches,
+                        &mut errors,
+                    )? {
+                        break;
                     }
                 }
             }
-
-            let Some(file_type) = FileType::detect(path, &query.supported_extensions) else {
-                continue;
-            };
-
-            let matches = match &file_type {
-                FileType::PlainText => {
-                    search_text_file(path, &matcher, query.context_lines as u64)?
-                }
-                FileType::Pdf => match extractors.find(path, None) {
-                    Some(extractor) => match extractor.extract(path) {
-                        Ok(content) => search_extracted_content(&content, &matcher)?,
-                        Err(e) => {
-                            errors.push(format!("{}: {e:#}", path.display()));
-                            continue;
-                        }
-                    },
-                    None => {
-                        errors.push(format!("{}: no extractor registered", path.display()));
-                        continue;
-                    }
-                },
-            };
-
-            if !matches.is_empty() {
-                total_matches += matches.len();
-                let file_matches = FileMatches {
-                    path: path.to_path_buf(),
-                    file_type,
-                    matches,
-                };
-                if tx.blocking_send(file_matches).is_err() {
-                    break;
-                }
-                if query.max_results > 0 && total_matches >= query.max_results {
-                    break;
-                }
+            SearchScope::File { path } => {
+                let _ = search_path(
+                    path,
+                    query,
+                    extractors,
+                    &matcher,
+                    &tx,
+                    &mut total_matches,
+                    &mut errors,
+                )?;
             }
         }
 
@@ -143,6 +122,69 @@ impl SearchProvider for GrepSearchProvider {
             supported_engines: crate::types::EmbeddingEngine::supported_engines(),
         }
     }
+}
+
+fn search_path(
+    path: &Path,
+    query: &SearchQuery,
+    extractors: &ExtractorRegistry,
+    matcher: &RegexMatcher,
+    tx: &SearchResultTx,
+    total_matches: &mut usize,
+    errors: &mut Vec<String>,
+) -> anyhow::Result<bool> {
+    if tx.is_closed() {
+        return Ok(true);
+    }
+
+    if !path.is_file() {
+        return Ok(false);
+    }
+
+    if query.max_file_size > 0 {
+        if let Ok(meta) = path.metadata() {
+            if meta.len() > query.max_file_size {
+                return Ok(false);
+            }
+        }
+    }
+
+    let Some(file_type) = FileType::detect(path, &query.supported_extensions) else {
+        return Ok(false);
+    };
+
+    let matches = match &file_type {
+        FileType::PlainText => search_text_file(path, matcher, query.context_lines as u64)?,
+        FileType::Pdf => match extractors.find(path, None) {
+            Some(extractor) => match extractor.extract(path) {
+                Ok(content) => search_extracted_content(&content, matcher)?,
+                Err(e) => {
+                    errors.push(format!("{}: {e:#}", path.display()));
+                    return Ok(false);
+                }
+            },
+            None => {
+                errors.push(format!("{}: no extractor registered", path.display()));
+                return Ok(false);
+            }
+        },
+    };
+
+    if matches.is_empty() {
+        return Ok(false);
+    }
+
+    *total_matches += matches.len();
+    let file_matches = FileMatches {
+        path: path.to_path_buf(),
+        file_type,
+        matches,
+    };
+    if tx.blocking_send(file_matches).is_err() {
+        return Ok(true);
+    }
+
+    Ok(query.max_results > 0 && *total_matches >= query.max_results)
 }
 
 // ── Text file search ──────────────────────────────────────────────────────────
@@ -320,6 +362,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec![],
         };
 
@@ -356,6 +399,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
         };
 
@@ -386,6 +430,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
         };
 
@@ -413,6 +458,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 1, // One line of context
             mode: crate::types::SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
         };
 
@@ -456,6 +502,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec![],
         };
         let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
@@ -485,6 +532,7 @@ mod tests {
             max_file_size: 10, // Max 10 bytes
             context_lines: 0,
             mode: crate::types::SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
         };
 
@@ -503,6 +551,47 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].path.ends_with("small.txt"));
+    }
+
+    #[test]
+    fn test_search_file_scope_ignores_siblings() {
+        let dir = tempdir().unwrap();
+        let scoped = dir.path().join("scoped.txt");
+        let sibling = dir.path().join("sibling.txt");
+        fs::write(&scoped, "match here").unwrap();
+        fs::write(&sibling, "match elsewhere").unwrap();
+
+        let query = SearchQuery {
+            pattern: "match".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            scope: SearchScope::File {
+                path: scoped.clone(),
+            },
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let provider = GrepSearchProvider::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let extractors = ExtractorRegistry::new();
+        std::thread::spawn(move || {
+            provider.search(&query, &extractors, tx).unwrap();
+        });
+
+        let mut results = Vec::new();
+        while let Some(m) = rx.blocking_recv() {
+            results.push(m);
+        }
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, scoped);
+        assert_eq!(results[0].matches.len(), 1);
     }
 
     struct FailingPdfExtractor;
@@ -533,6 +622,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec!["pdf".to_string()],
         };
 
@@ -565,6 +655,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec![],
         };
 
@@ -591,6 +682,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
         };
 
@@ -628,6 +720,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec!["rs".to_string()],
         };
 
@@ -687,6 +780,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
         };
 
@@ -715,6 +809,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec!["pdf".to_string()],
         };
 
@@ -776,6 +871,7 @@ mod tests {
             max_file_size: 0,
             context_lines: 0,
             mode: crate::types::SearchMode::Grep,
+            scope: Default::default(),
             supported_extensions: vec![],
         };
 
