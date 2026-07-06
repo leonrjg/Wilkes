@@ -15,7 +15,7 @@ use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
     AddOutcome, AgentBackend, Bookmark, CitationResult, DataPaths, DocumentMetadata,
     EmbeddingEngine, FileListResponse, IndexStatus, IntegrationStatus, ModelDescriptor,
-    NewBookmark, SelectedEmbedder, Settings,
+    NewBookmark, SelectedEmbedder, SemanticScholarPaper, Settings,
 };
 
 mod platform;
@@ -106,6 +106,23 @@ async fn update_bookmark_note_for_ctx(
 
 async fn zotero_status_for_ctx(ctx: Arc<AppContext>) -> Result<IntegrationStatus, String> {
     ctx.zotero_status().await.map_err(|e| e.to_string())
+}
+
+async fn semantic_scholar_status_for_ctx(
+    ctx: Arc<AppContext>,
+) -> Result<IntegrationStatus, String> {
+    ctx.semantic_scholar_status()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn semantic_scholar_lookup_for_ctx(
+    ctx: Arc<AppContext>,
+    doi: String,
+) -> Result<SemanticScholarPaper, String> {
+    ctx.semantic_scholar_lookup(doi)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn resolve_file_metadata_for_ctx(
@@ -1005,6 +1022,19 @@ async fn zotero_generate_citation(path: String, app: AppHandle) -> Result<Citati
 }
 
 #[tauri::command]
+async fn semantic_scholar_status(app: AppHandle) -> Result<IntegrationStatus, String> {
+    semantic_scholar_status_for_ctx(app_context(&app)).await
+}
+
+#[tauri::command]
+async fn semantic_scholar_lookup(
+    doi: String,
+    app: AppHandle,
+) -> Result<SemanticScholarPaper, String> {
+    semantic_scholar_lookup_for_ctx(app_context(&app), doi).await
+}
+
+#[tauri::command]
 fn is_semantic_ready(app: AppHandle) -> bool {
     is_semantic_ready_for_ctx(app_context(&app))
 }
@@ -1140,6 +1170,8 @@ pub fn run() {
             refresh_file_metadata,
             zotero_add_item,
             zotero_generate_citation,
+            semantic_scholar_status,
+            semantic_scholar_lookup,
             pick_directory,
             download_model,
             build_index,

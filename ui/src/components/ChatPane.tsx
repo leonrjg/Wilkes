@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -71,12 +71,27 @@ function messageElapsedLabel(message: ChatMessage, nowMs: number) {
   return formatElapsedTime((message.endedAtMs ?? nowMs) - message.startedAtMs);
 }
 
+export function contextFileMatchRef(path: string, page: number | null = null): MatchRef {
+  if (path.toLowerCase().endsWith(".pdf")) {
+    return { path, origin: { PdfPage: { page: page ?? 1, bbox: null } } };
+  }
+  return { path, origin: { TextFile: { line: 0, col: 0 } } };
+}
+
+export function isTranscriptNearBottom(
+  scroll: { scrollHeight: number; scrollTop: number; clientHeight: number },
+  thresholdPx = 48,
+) {
+  return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight <= thresholdPx;
+}
+
 interface Props {
   onClose: () => void;
 }
 
 export default function ChatPane({ onClose }: Props) {
   const parentRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
   const [draft, setDraft] = useState("");
 
   const backends = useChatStore((s) => s.backends);
@@ -122,10 +137,13 @@ export default function ChatPane({ onClose }: Props) {
   });
 
   useEffect(() => {
-    if (messages.length > 0) {
-      virtualizer.scrollToIndex(messages.length - 1, { align: "end" });
-    }
-  }, [messages.length, virtualizer]);
+    stickToBottomRef.current = true;
+  }, [conversationId, sessionId]);
+
+  useLayoutEffect(() => {
+    if (messages.length === 0 || !stickToBottomRef.current) return;
+    virtualizer.scrollToIndex(messages.length - 1, { align: "end" });
+  }, [messages, virtualizer]);
 
   useEffect(() => {
     loadConversations().catch((e) => console.error("chat: failed to load history", e));
@@ -312,11 +330,18 @@ export default function ChatPane({ onClose }: Props) {
       <div className="p-2 border-b border-[var(--border-main)] flex flex-wrap gap-1.5">
         {activeDoc && (
           <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-[var(--accent-blue-muted)] text-[var(--text-main)] border border-[var(--border-main)]">
-            <FileText size={10} />
-            <span className="truncate max-w-[140px]" title={activeDoc.path}>
-              {fileName(activeDoc.path)}
-            </span>
-            {activeDoc.page != null && <span className="text-[var(--text-dim)]">· p.{activeDoc.page}</span>}
+            <button
+              type="button"
+              onClick={() => selectMatch(contextFileMatchRef(activeDoc.path, activeDoc.page))}
+              title={`Open ${activeDoc.path}`}
+              className="min-w-0 inline-flex items-center gap-1 rounded text-left hover:text-[var(--accent-blue)]"
+            >
+              <FileText size={10} className="flex-shrink-0" />
+              <span className="truncate max-w-[140px]">{fileName(activeDoc.path)}</span>
+              {activeDoc.page != null && (
+                <span className="text-[var(--text-dim)] flex-shrink-0">· p.{activeDoc.page}</span>
+              )}
+            </button>
             <button
               type="button"
               onClick={() =>
@@ -343,10 +368,15 @@ export default function ChatPane({ onClose }: Props) {
               key={file.path}
               className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-[var(--bg-active)] text-[var(--text-muted)] border border-[var(--border-main)]"
             >
-              <FileText size={10} />
-              <span className="truncate max-w-[140px]" title={file.path}>
-                {fileName(file.path)}
-              </span>
+              <button
+                type="button"
+                onClick={() => selectMatch(contextFileMatchRef(file.path))}
+                title={`Open ${file.path}`}
+                className="min-w-0 inline-flex items-center gap-1 rounded text-left hover:text-[var(--accent-blue)]"
+              >
+                <FileText size={10} className="flex-shrink-0" />
+                <span className="truncate max-w-[140px]">{fileName(file.path)}</span>
+              </button>
               <button
                 type="button"
                 onClick={() => removeContext(file.path)}
@@ -418,7 +448,14 @@ export default function ChatPane({ onClose }: Props) {
           </button>
         </div>
       ) : (
-        <div ref={parentRef} className="flex-1 overflow-auto custom-scrollbar">
+        <div
+          ref={parentRef}
+          className="flex-1 overflow-auto custom-scrollbar"
+          style={{ overflowAnchor: "none" }}
+          onScroll={(event) => {
+            stickToBottomRef.current = isTranscriptNearBottom(event.currentTarget);
+          }}
+        >
           <div style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}>
             {virtualizer.getVirtualItems().map((item) => {
               const message = messages[item.index];
@@ -513,11 +550,33 @@ export function MessageBubble({
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
   const hasThought = !isUser && message.thought.trim().length > 0;
   const elapsedLabel = messageElapsedLabel(message, nowMs);
+  const copyMessage = () => {
+    if (!message.text) return;
+    navigator.clipboard?.writeText(message.text).catch((e) =>
+      console.error("chat: copy message failed", e),
+    );
+  };
   return (
     <div className={isUser ? "text-right" : "text-left"}>
-      <div className="text-[10px] text-[var(--text-dim)] mb-0.5">
-        {isUser ? "You" : "Assistant"}
-        {elapsedLabel && <span> · {elapsedLabel}</span>}
+      <div
+        className={`mb-0.5 flex items-center gap-1 ${
+          isUser ? "justify-end" : "justify-start"
+        }`}
+      >
+        <span className="text-[10px] text-[var(--text-dim)]">
+          {isUser ? "You" : "Assistant"}
+          {elapsedLabel && <span> · {elapsedLabel}</span>}
+        </span>
+        <button
+          type="button"
+          onClick={copyMessage}
+          disabled={!message.text}
+          title="Copy message"
+          aria-label={`Copy ${isUser ? "your" : "assistant"} message`}
+          className="inline-flex h-4 w-4 items-center justify-center rounded text-[var(--text-dim)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-30"
+        >
+          <Copy size={10} />
+        </button>
       </div>
       <div
         className={`inline-block max-w-full text-left rounded px-2.5 py-1.5 text-xs ${

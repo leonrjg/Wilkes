@@ -17,6 +17,7 @@ import type {
   NewBookmark,
   PreviewData,
   SelectedEmbedder,
+  SemanticScholarPaper,
   SearchQuery,
   SearchStats,
   Settings,
@@ -53,6 +54,8 @@ export interface SearchApi {
   zoteroStatus(): Promise<IntegrationStatus>;
   zoteroAddItem(path: string): Promise<AddOutcome>;
   zoteroGenerateCitation(path: string): Promise<CitationResult>;
+  semanticScholarStatus(): Promise<IntegrationStatus>;
+  semanticScholarLookup(doi: string): Promise<SemanticScholarPaper>;
   resolvePdfUrl(path: string): string;
   getLogs(): Promise<string[]>;
   clearLogs(): Promise<void>;

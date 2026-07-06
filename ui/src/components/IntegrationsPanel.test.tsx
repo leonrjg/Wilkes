@@ -28,6 +28,11 @@ function settings(enabled = false): Settings {
         base_url: "http://127.0.0.1:23119",
         citation_style: "chicago-note-bibliography",
       },
+      semantic_scholar: {
+        enabled: false,
+        base_url: "https://api.semanticscholar.org",
+        api_key: null,
+      },
     },
     supported_extensions: ["pdf"],
     max_results: 50,
@@ -54,6 +59,11 @@ describe("IntegrationsPanel", () => {
     await waitFor(() => {
       expect(onUpdate).toHaveBeenCalledWith({
         integrations: {
+          semantic_scholar: {
+            enabled: false,
+            base_url: "https://api.semanticscholar.org",
+            api_key: null,
+          },
           zotero: {
             enabled: true,
             base_url: "http://127.0.0.1:23119",
@@ -99,6 +109,11 @@ describe("IntegrationsPanel", () => {
     await waitFor(() => {
       expect(onUpdate).toHaveBeenCalledWith({
         integrations: {
+          semantic_scholar: {
+            enabled: false,
+            base_url: "https://api.semanticscholar.org",
+            api_key: null,
+          },
           zotero: {
             enabled: false,
             base_url: "http://127.0.0.1:23119",
@@ -108,5 +123,79 @@ describe("IntegrationsPanel", () => {
       });
     });
     expect(api.zoteroStatus).not.toHaveBeenCalled();
+  });
+
+  it("enables Semantic Scholar only after a ready API check", async () => {
+    const api = {
+      semanticScholarStatus: vi.fn().mockResolvedValue({
+        id: "semantic_scholar",
+        enabled: true,
+        state: "ready",
+        message: "Semantic Scholar API is reachable.",
+        version: null,
+      }),
+    } as any;
+    const onUpdate = vi.fn();
+
+    render(<IntegrationsPanel api={api} settings={settings(false)} onUpdate={onUpdate} />);
+    fireEvent.click(screen.getByLabelText("Enable Semantic Scholar integration"));
+
+    await waitFor(() => {
+      expect(api.semanticScholarStatus).toHaveBeenCalled();
+    });
+    expect(onUpdate).toHaveBeenCalledWith({
+      integrations: {
+        zotero: {
+          enabled: false,
+          base_url: "http://127.0.0.1:23119",
+          citation_style: "chicago-note-bibliography",
+        },
+        semantic_scholar: {
+          enabled: true,
+          base_url: "https://api.semanticscholar.org",
+          api_key: null,
+        },
+      },
+    });
+  });
+
+  it("keeps Semantic Scholar enabled when the status probe is rate limited", async () => {
+    const api = {
+      semanticScholarStatus: vi.fn().mockResolvedValue({
+        id: "semantic_scholar",
+        enabled: true,
+        state: "rate_limited",
+        message:
+          "Semantic Scholar API is reachable, but the public rate limit is currently reached.",
+        version: null,
+      }),
+    } as any;
+    const onUpdate = vi.fn();
+
+    render(<IntegrationsPanel api={api} settings={settings(false)} onUpdate={onUpdate} />);
+    fireEvent.click(screen.getByLabelText("Enable Semantic Scholar integration"));
+
+    await waitFor(() => {
+      expect(screen.getByText(/public rate limit/)).toBeInTheDocument();
+    });
+    expect(onUpdate).toHaveBeenCalledWith({
+      integrations: {
+        zotero: {
+          enabled: false,
+          base_url: "http://127.0.0.1:23119",
+          citation_style: "chicago-note-bibliography",
+        },
+        semantic_scholar: {
+          enabled: true,
+          base_url: "https://api.semanticscholar.org",
+          api_key: null,
+        },
+      },
+    });
+    expect(onUpdate).not.toHaveBeenCalledWith(expect.objectContaining({
+      integrations: expect.objectContaining({
+        semantic_scholar: expect.objectContaining({ enabled: false }),
+      }),
+    }));
   });
 });

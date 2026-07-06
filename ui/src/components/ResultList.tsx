@@ -87,15 +87,24 @@ const FILE_DISPLAY_FIELDS: FileDisplayFieldDef[] = [
   { key: "created", label: "Created", get: (e) => (e.created_at_ms != null ? formatTimestamp(e.created_at_ms) : null) },
   { key: "modified", label: "Modified", get: (e) => (e.modified_at_ms != null ? formatTimestamp(e.modified_at_ms) : null) },
   { key: "publication", label: "Publication date", get: (e) => e.publication_date },
+  {
+    key: "citations",
+    label: "Citations",
+    get: (e) =>
+      e.semantic_scholar_citation_count != null
+        ? e.semantic_scholar_citation_count.toLocaleString()
+        : null,
+  },
   { key: "size", label: "Size", get: (e) => formatSize(e.size_bytes) },
 ];
 
-const SORT_KEYS: FileSortKey[] = ["filename", "created", "modified", "publication", "size"];
+const SORT_KEYS: FileSortKey[] = ["filename", "created", "modified", "publication", "citations", "size"];
 const SORT_KEY_LABELS: Record<FileSortKey, string> = {
   filename: "Name",
   created: "Created",
   modified: "Modified",
   publication: "Publication date",
+  citations: "Citations",
   size: "Size",
 };
 
@@ -151,6 +160,18 @@ function sortFileEntries<T extends FileEntry>(
       result = compareOptionalString(a.publication_date, b.publication_date);
       // Keep files with no publication date last regardless of direction.
       if (direction === "desc" && !isBlank(a.publication_date) && !isBlank(b.publication_date)) {
+        result *= -1;
+      }
+    } else if (key === "citations") {
+      result = compareOptionalNumber(
+        a.semantic_scholar_citation_count,
+        b.semantic_scholar_citation_count,
+      );
+      if (
+        direction === "desc" &&
+        a.semantic_scholar_citation_count != null &&
+        b.semantic_scholar_citation_count != null
+      ) {
         result *= -1;
       }
     } else {

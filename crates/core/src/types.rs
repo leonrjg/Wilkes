@@ -270,6 +270,8 @@ pub struct DocumentMetadata {
     pub author: Option<String>,
     pub doi: Option<String>,
     pub created_at: Option<String>,
+    #[serde(default)]
+    pub semantic_scholar: Option<SemanticScholarPaper>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -794,6 +796,7 @@ pub enum FileSortKey {
     Modified,
     Size,
     Publication,
+    Citations,
 }
 
 /// Optional document-metadata field that can be shown as a column in the file
@@ -805,6 +808,7 @@ pub enum FileDisplayField {
     Created,
     Modified,
     Publication,
+    Citations,
     Size,
 }
 
@@ -827,6 +831,8 @@ pub enum BookmarkDock {
 pub struct IntegrationsSettings {
     #[serde(default)]
     pub zotero: ZoteroSettings,
+    #[serde(default)]
+    pub semantic_scholar: SemanticScholarSettings,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -858,11 +864,37 @@ fn default_zotero_citation_style() -> String {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SemanticScholarSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_semantic_scholar_base_url")]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+impl Default for SemanticScholarSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_semantic_scholar_base_url(),
+            api_key: None,
+        }
+    }
+}
+
+fn default_semantic_scholar_base_url() -> String {
+    "https://api.semanticscholar.org".to_string()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegrationState {
     Disabled,
     ZoteroDown,
     LocalApiDisabled,
+    RemoteApiDown,
+    RateLimited,
     Ready,
 }
 
@@ -894,6 +926,19 @@ pub struct CitationResult {
     pub low_confidence: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SemanticScholarPaper {
+    pub doi: String,
+    pub paper_id: String,
+    pub title: Option<String>,
+    pub year: Option<i64>,
+    pub publication_date: Option<String>,
+    pub venue: Option<String>,
+    pub citation_count: i64,
+    pub external_ids: HashMap<String, serde_json::Value>,
+    pub cached_at_ms: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub enum Theme {
     #[default]
@@ -916,6 +961,11 @@ pub struct FileEntry {
     /// `None` until the metadata cache has processed this file.
     #[serde(default)]
     pub publication_date: Option<String>,
+    /// Semantic Scholar citation count from cached document metadata. `None`
+    /// until metadata extraction has found a DOI and the integration has
+    /// enriched it.
+    #[serde(default)]
+    pub semantic_scholar_citation_count: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

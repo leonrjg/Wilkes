@@ -154,6 +154,7 @@ fn document_metadata_from_item(
         // Zotero's normalized ISO date; the raw `data.date` is often unpadded or
         // non-numeric and would fail the viewer's date parser.
         created_at: item.meta.parsed_date.clone(),
+        ..DocumentMetadata::default()
     }
 }
 

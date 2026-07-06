@@ -67,6 +67,7 @@ mod tests {
                 author: None,
                 doi: None,
                 created_at: None,
+                ..DocumentMetadata::default()
             })
         }
     }

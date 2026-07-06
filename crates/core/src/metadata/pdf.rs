@@ -32,6 +32,7 @@ impl FileMetadataExtractor for PdfMetadataExtractor {
             doi: extract_pdf_doi(&doc),
             created_at: read_non_empty_metadata(&doc, MetadataName::CreationDate)
                 .and_then(|value| normalize_pdf_creation_date(&value)),
+            ..DocumentMetadata::default()
         })
     }
 }

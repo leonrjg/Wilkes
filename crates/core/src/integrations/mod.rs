@@ -2,6 +2,7 @@ use async_trait::async_trait;
 
 use crate::types::{IntegrationStatus, Settings};
 
+pub mod semantic_scholar;
 pub mod zotero;
 
 #[async_trait]
@@ -35,6 +36,7 @@ impl Default for IntegrationRegistry {
     fn default() -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(zotero::ZoteroIntegration));
+        registry.register(Box::new(semantic_scholar::SemanticScholarIntegration));
         registry
     }
 }

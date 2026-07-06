@@ -17,6 +17,7 @@ import type {
   NewBookmark,
   PreviewData,
   SelectedEmbedder,
+  SemanticScholarPaper,
   SearchQuery,
   SearchStats,
   Settings,
@@ -232,6 +233,22 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw new Error(`zoteroGenerateCitation failed: ${res.status}`);
     return res.json() as Promise<CitationResult>;
+  }
+
+  async semanticScholarStatus(): Promise<IntegrationStatus> {
+    const res = await fetch("/api/integrations/semantic-scholar/status");
+    if (!res.ok) throw new Error(`semanticScholarStatus failed: ${res.status}`);
+    return res.json() as Promise<IntegrationStatus>;
+  }
+
+  async semanticScholarLookup(doi: string): Promise<SemanticScholarPaper> {
+    const res = await fetch("/api/integrations/semantic-scholar/lookup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ doi }),
+    });
+    if (!res.ok) throw new Error(`semanticScholarLookup failed: ${res.status}`);
+    return res.json() as Promise<SemanticScholarPaper>;
   }
 
   resolvePdfUrl(path: string): string {

@@ -43,6 +43,7 @@ impl FileMetadataExtractor for TextMetadataExtractor {
             author: None,
             doi: find_doi(&head).or_else(|| find_arxiv_doi(&head)),
             created_at: None,
+            ..DocumentMetadata::default()
         })
     }
 }

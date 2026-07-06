@@ -57,6 +57,7 @@ pub async fn list_files(
                             created_at_ms,
                             modified_at_ms,
                             publication_date: None,
+                            semantic_scholar_citation_count: None,
                         },
                         reason: OmittedFileReason::UnsupportedExtension,
                     });
@@ -74,6 +75,7 @@ pub async fn list_files(
                             created_at_ms,
                             modified_at_ms,
                             publication_date: None,
+                            semantic_scholar_citation_count: None,
                         },
                         reason: OmittedFileReason::TooLarge,
                     });
@@ -88,6 +90,7 @@ pub async fn list_files(
                     created_at_ms,
                     modified_at_ms,
                     publication_date: None,
+                    semantic_scholar_citation_count: None,
                 });
             }
         }

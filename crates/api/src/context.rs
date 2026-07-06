@@ -18,6 +18,7 @@ use wilkes_core::embed::worker::manager::{
 use wilkes_core::embed::{dispatch, Embedder};
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
+use wilkes_core::integrations::semantic_scholar::SemanticScholarClient;
 use wilkes_core::integrations::zotero::model::ZoteroItem;
 use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
@@ -349,7 +350,11 @@ impl AppContext {
                     continue;
                 };
                 match guard.get_valid(&entry.path, identity) {
-                    Ok(Some(meta)) => entry.publication_date = meta.created_at,
+                    Ok(Some(meta)) => {
+                        entry.publication_date = meta.created_at;
+                        entry.semantic_scholar_citation_count =
+                            meta.semantic_scholar.map(|paper| paper.citation_count);
+                    }
                     Ok(None) => misses.push(entry.path.clone()),
                     Err(e) => error!("metadata cache read {}: {e:#}", entry.path.display()),
                 }
@@ -436,34 +441,76 @@ impl AppContext {
                 events.emit("file-metadata-updated", serde_json::json!(updates));
             }
 
-            // Pass 2: authoritative Zotero override (async). Fetch the attachment
-            // list once for the whole batch, then resolve each file locally.
-            if !settings.integrations.zotero.enabled || eligible.is_empty() {
+            if eligible.is_empty() {
                 return;
             }
-            let client = ZoteroClient::from_settings(&settings.integrations.zotero);
-            let attachments = match client.attachment_items().await {
-                Ok(a) => a,
-                Err(e) => {
-                    info!("metadata fill: zotero attachment fetch failed: {e:#}");
-                    return;
-                }
-            };
-            let mut z_updates: Vec<serde_json::Value> = Vec::new();
-            for (path, identity, file_based) in eligible {
-                if let Some(z) =
-                    zotero_override_for(&client, &path, &file_based, &attachments).await
-                {
-                    if let Ok(guard) = cache.lock() {
-                        if let Err(e) = guard.upsert(&path, identity, &z, MetadataSource::Zotero) {
-                            error!("metadata cache zotero upsert {}: {e:#}", path.display());
+
+            let mut composed = eligible;
+
+            // Pass 2: authoritative Zotero override (async). Fetch the attachment
+            // list once for the whole batch, then resolve each file locally.
+            if settings.integrations.zotero.enabled {
+                let client = ZoteroClient::from_settings(&settings.integrations.zotero);
+                let attachments = match client.attachment_items().await {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        info!("metadata fill: zotero attachment fetch failed: {e:#}");
+                        None
+                    }
+                };
+                if let Some(attachments) = attachments {
+                    let mut z_updates: Vec<serde_json::Value> = Vec::new();
+                    for (path, identity, metadata) in composed.iter_mut() {
+                        if let Some(z) =
+                            zotero_override_for(&client, path, metadata, &attachments).await
+                        {
+                            if let Ok(guard) = cache.lock() {
+                                if let Err(e) =
+                                    guard.upsert(path, *identity, &z, MetadataSource::Zotero)
+                                {
+                                    error!(
+                                        "metadata cache zotero upsert {}: {e:#}",
+                                        path.display()
+                                    );
+                                }
+                            }
+                            *metadata = z;
+                            z_updates.push(metadata_update_json(path, metadata));
                         }
                     }
-                    z_updates.push(metadata_update_json(&path, &z));
+                    if !z_updates.is_empty() {
+                        events.emit("file-metadata-updated", serde_json::json!(z_updates));
+                    }
                 }
             }
-            if !z_updates.is_empty() {
-                events.emit("file-metadata-updated", serde_json::json!(z_updates));
+
+            // Pass 3: Semantic Scholar citation enrichment. This writes into
+            // the same file_metadata rows as publication_date, keyed by the
+            // composed DOI for each file.
+            if settings.integrations.semantic_scholar.enabled {
+                let client =
+                    SemanticScholarClient::from_settings(&settings.integrations.semantic_scholar);
+                let mut s2_updates: Vec<serde_json::Value> = Vec::new();
+                for (path, identity, metadata) in composed.iter_mut() {
+                    if let Some(enriched) = semantic_scholar_enrichment_for(&client, metadata).await
+                    {
+                        metadata.semantic_scholar = Some(enriched);
+                        if let Ok(guard) = cache.lock() {
+                            if let Err(e) =
+                                guard.upsert(path, *identity, metadata, MetadataSource::File)
+                            {
+                                error!(
+                                    "metadata cache semantic scholar upsert {}: {e:#}",
+                                    path.display()
+                                );
+                            }
+                        }
+                        s2_updates.push(metadata_update_json(path, metadata));
+                    }
+                }
+                if !s2_updates.is_empty() {
+                    events.emit("file-metadata-updated", serde_json::json!(s2_updates));
+                }
             }
         });
     }
@@ -494,6 +541,26 @@ impl AppContext {
     pub async fn zotero_status(&self) -> anyhow::Result<wilkes_core::types::IntegrationStatus> {
         let s = self.get_settings().await;
         crate::commands::integrations::zotero::zotero_status(s).await
+    }
+
+    pub async fn semantic_scholar_status(
+        &self,
+    ) -> anyhow::Result<wilkes_core::types::IntegrationStatus> {
+        let s = self.get_settings().await;
+        crate::commands::integrations::semantic_scholar::semantic_scholar_status(s).await
+    }
+
+    pub async fn semantic_scholar_lookup(
+        &self,
+        doi: String,
+    ) -> anyhow::Result<wilkes_core::types::SemanticScholarPaper> {
+        let s = self.get_settings().await;
+        crate::commands::integrations::semantic_scholar::semantic_scholar_lookup(
+            s,
+            self.metadata_cache(),
+            doi,
+        )
+        .await
     }
 
     /// Authoritative document metadata: file-based extraction overridden by the
@@ -660,6 +727,7 @@ impl AppContext {
             (before, updated)
         };
         self.on_zotero_settings_maybe_changed(&before, &updated);
+        self.on_semantic_scholar_settings_maybe_changed(&before, &updated);
         self.on_semantic_pref_maybe_changed(&before, &updated);
         Ok(updated)
     }
@@ -729,6 +797,42 @@ impl AppContext {
 
         if z_after.enabled {
             self.spawn_zotero_backfill(after.clone());
+        }
+    }
+
+    fn on_semantic_scholar_settings_maybe_changed(&self, before: &Settings, after: &Settings) {
+        let s_before = &before.integrations.semantic_scholar;
+        let s_after = &after.integrations.semantic_scholar;
+        let relevant_changed = s_before.enabled != s_after.enabled
+            || s_before.base_url != s_after.base_url
+            || s_before.api_key != s_after.api_key;
+        if !relevant_changed {
+            return;
+        }
+
+        if let Some(cache) = self.metadata_cache() {
+            if let Ok(guard) = cache.lock() {
+                if let Err(e) = guard.invalidate_semantic_scholar() {
+                    error!("metadata cache invalidate_semantic_scholar: {e:#}");
+                }
+            }
+        }
+
+        if s_after.enabled {
+            self.spawn_semantic_scholar_backfill(after.clone());
+        }
+    }
+
+    fn spawn_semantic_scholar_backfill(&self, settings: Settings) {
+        let Some(cache) = self.metadata_cache() else {
+            return;
+        };
+        let paths = match cache.lock() {
+            Ok(guard) => guard.all_paths().unwrap_or_default(),
+            Err(_) => return,
+        };
+        if !paths.is_empty() {
+            self.spawn_metadata_fill(paths, settings, cache);
         }
     }
 
@@ -1807,6 +1911,10 @@ fn metadata_update_json(path: &Path, metadata: &DocumentMetadata) -> serde_json:
     serde_json::json!({
         "path": path.to_string_lossy(),
         "publication_date": metadata.created_at,
+        "semantic_scholar_citation_count": metadata
+            .semantic_scholar
+            .as_ref()
+            .map(|paper| paper.citation_count),
     })
 }
 
@@ -1861,6 +1969,20 @@ async fn zotero_override_for(
         Ok(opt) => opt,
         Err(e) => {
             info!("zotero override {}: {e:#}", path.display());
+            None
+        }
+    }
+}
+
+async fn semantic_scholar_enrichment_for(
+    client: &SemanticScholarClient,
+    metadata: &DocumentMetadata,
+) -> Option<wilkes_core::types::SemanticScholarPaper> {
+    let doi = metadata.doi.as_deref()?;
+    match client.lookup_by_doi(doi).await {
+        Ok(paper) => Some(paper),
+        Err(e) => {
+            info!("semantic scholar lookup {doi}: {e:#}");
             None
         }
     }

@@ -177,10 +177,15 @@ export const useSettingsStore = create<SettingsStore>()(
 
     applyMetadataUpdates: (updates: FileMetadataUpdate[]) => {
       if (updates.length === 0) return;
-      const byPath = new Map(updates.map((u) => [u.path, u.publication_date]));
+      const byPath = new Map(updates.map((u) => [u.path, u]));
       const patch = <T extends FileEntry>(entry: T): T =>
         byPath.has(entry.path)
-          ? { ...entry, publication_date: byPath.get(entry.path) ?? null }
+          ? {
+              ...entry,
+              publication_date: byPath.get(entry.path)?.publication_date ?? null,
+              semantic_scholar_citation_count:
+                byPath.get(entry.path)?.semantic_scholar_citation_count ?? null,
+            }
           : entry;
       set((state) => ({
         fileList: state.fileList.map(patch),

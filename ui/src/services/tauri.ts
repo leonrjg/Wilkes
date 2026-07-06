@@ -21,6 +21,7 @@ import type {
   NewBookmark,
   PreviewData,
   SelectedEmbedder,
+  SemanticScholarPaper,
   SearchQuery,
   SearchStats,
   Settings,
@@ -123,6 +124,14 @@ export class TauriSearchApi implements SearchApi {
 
   async zoteroGenerateCitation(path: string): Promise<CitationResult> {
     return invoke<CitationResult>("zotero_generate_citation", { path });
+  }
+
+  async semanticScholarStatus(): Promise<IntegrationStatus> {
+    return invoke<IntegrationStatus>("semantic_scholar_status");
+  }
+
+  async semanticScholarLookup(doi: string): Promise<SemanticScholarPaper> {
+    return invoke<SemanticScholarPaper>("semantic_scholar_lookup", { doi });
   }
 
   resolvePdfUrl(path: string): string {

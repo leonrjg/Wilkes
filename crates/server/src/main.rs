@@ -29,7 +29,7 @@ use wilkes_api::context::AppContext;
 use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::types::{
     AddOutcome, CitationResult, DocumentMetadata, EmbeddingEngine, IntegrationStatus, MatchRef,
-    ModelDescriptor, NewBookmark, SearchQuery, SelectedEmbedder,
+    ModelDescriptor, NewBookmark, SearchQuery, SelectedEmbedder, SemanticScholarPaper,
 };
 
 fn confine_to_uploads(
@@ -246,6 +246,11 @@ struct RenameFileBody {
     new_name: String,
 }
 
+#[derive(Deserialize)]
+struct DoiBody {
+    doi: String,
+}
+
 async fn open_file_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<OpenFileBody>,
@@ -294,6 +299,29 @@ async fn zotero_status_handler(
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(status))
+}
+
+async fn semantic_scholar_status_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<IntegrationStatus>, (StatusCode, Json<ErrorBody>)> {
+    let status = state
+        .ctx
+        .semantic_scholar_status()
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(status))
+}
+
+async fn semantic_scholar_lookup_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DoiBody>,
+) -> Result<Json<SemanticScholarPaper>, (StatusCode, Json<ErrorBody>)> {
+    let paper = state
+        .ctx
+        .semantic_scholar_lookup(body.doi)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(paper))
 }
 
 async fn resolve_file_metadata_handler(
@@ -809,6 +837,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/integrations/zotero/citation",
             post(zotero_generate_citation_handler),
+        )
+        .route(
+            "/api/integrations/semantic-scholar/status",
+            get(semantic_scholar_status_handler),
+        )
+        .route(
+            "/api/integrations/semantic-scholar/lookup",
+            post(semantic_scholar_lookup_handler),
         )
         .route("/api/embed/ready", get(is_semantic_ready_handler))
         .route("/api/logs", get(get_logs_handler))

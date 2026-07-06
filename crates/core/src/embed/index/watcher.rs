@@ -921,6 +921,7 @@ mod tests {
                     author: None,
                     doi: None,
                     created_at: Some("2020-01".into()),
+                    ..crate::types::DocumentMetadata::default()
                 },
                 crate::metadata::cache::MetadataSource::File,
             )

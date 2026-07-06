@@ -1188,23 +1188,43 @@ fn to_chat_config_option(option: SessionConfigOption) -> ChatConfigOption {
 }
 
 /// True when a permission request targets Wilkes's own read-only MCP server.
-/// The ACP request carries no dedicated tool-name field, so match the
-/// distinctive Wilkes tool names against the human-readable title and the raw
-/// input the adapter forwards. Those names are unique to `crate::mcp`, so a
-/// match is unambiguous; a miss only costs one extra user prompt, never a wrong
+/// The ACP request carries no dedicated tool-name field, so match the tool
+/// identity from the human-readable title and the raw input the adapter
+/// forwards. Claude Code and Codex currently spell MCP tool names differently
+/// (`mcp__wilkes__search` vs. `mcp.wilkes.search`), so normalize both forms
+/// through one matcher. A miss only costs one extra user prompt, never a wrong
 /// auto-allow -- the failure mode is safe.
 fn is_wilkes_mcp_call(tool_call: &ToolCallUpdate) -> bool {
-    let mut haystack = String::new();
     if let Some(title) = &tool_call.fields.title {
-        haystack.push_str(title);
+        if is_wilkes_mcp_tool_text(title, true) {
+            return true;
+        }
     }
     if let Some(raw_input) = &tool_call.fields.raw_input {
-        haystack.push_str(&raw_input.to_string());
+        if is_wilkes_mcp_tool_text(&raw_input.to_string(), false) {
+            return true;
+        }
     }
-    let haystack = haystack.to_ascii_lowercase();
+    false
+}
+
+fn is_wilkes_mcp_tool_text(text: &str, allow_bare_tool_name: bool) -> bool {
+    let normalized = text.to_ascii_lowercase().replace("__", ".");
+    let tokens: Vec<&str> = normalized
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+        .filter(|token| !token.is_empty())
+        .collect();
+
+    tokens.iter().any(|token| is_wilkes_mcp_tool_token(token))
+        || (allow_bare_tool_name
+            && tokens.len() == 1
+            && crate::mcp::WILKES_MCP_TOOL_NAMES.contains(&tokens[0]))
+}
+
+fn is_wilkes_mcp_tool_token(token: &str) -> bool {
     crate::mcp::WILKES_MCP_TOOL_NAMES
         .iter()
-        .any(|name| haystack.contains(name))
+        .any(|name| token == format!("wilkes.{name}") || token == format!("mcp.wilkes.{name}"))
 }
 
 /// Select an agent-offered allow option (once or always), if any. Used only to
@@ -1290,6 +1310,7 @@ fn active_doc_text_for_context(doc: &ActiveDoc) -> ActiveDocText {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::ToolCallUpdateFields;
 
     #[test]
     fn replay_user_text_drops_wilkes_context_only_chunk() {
@@ -1326,5 +1347,49 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text, "What does the paper say?");
+    }
+
+    #[test]
+    fn wilkes_mcp_call_matches_codex_dotted_tool_name() {
+        let tool_call = ToolCallUpdate::new(
+            "tc_1",
+            ToolCallUpdateFields::new().title("mcp.wilkes.search"),
+        );
+
+        assert!(is_wilkes_mcp_call(&tool_call));
+    }
+
+    #[test]
+    fn wilkes_mcp_call_matches_claude_double_underscore_tool_name() {
+        let tool_call = ToolCallUpdate::new(
+            "tc_1",
+            ToolCallUpdateFields::new().title("mcp__wilkes__get_document_text"),
+        );
+
+        assert!(is_wilkes_mcp_call(&tool_call));
+    }
+
+    #[test]
+    fn wilkes_mcp_call_matches_raw_input_tool_name() {
+        let tool_call = ToolCallUpdate::new(
+            "tc_1",
+            ToolCallUpdateFields::new().raw_input(serde_json::json!({
+                "tool": "mcp.wilkes.list_context"
+            })),
+        );
+
+        assert!(is_wilkes_mcp_call(&tool_call));
+    }
+
+    #[test]
+    fn wilkes_mcp_call_rejects_non_wilkes_search_text() {
+        let tool_call = ToolCallUpdate::new(
+            "tc_1",
+            ToolCallUpdateFields::new().raw_input(serde_json::json!({
+                "query": "search the web"
+            })),
+        );
+
+        assert!(!is_wilkes_mcp_call(&tool_call));
     }
 }

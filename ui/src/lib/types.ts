@@ -113,9 +113,16 @@ export interface DocumentMetadata {
   author: string | null;
   doi: string | null;
   created_at: string | null;
+  semantic_scholar?: SemanticScholarPaper | null;
 }
 
-export type IntegrationState = "disabled" | "zotero_down" | "local_api_disabled" | "ready";
+export type IntegrationState =
+  | "disabled"
+  | "zotero_down"
+  | "local_api_disabled"
+  | "remote_api_down"
+  | "rate_limited"
+  | "ready";
 
 export interface IntegrationStatus {
   id: string;
@@ -139,6 +146,18 @@ export interface CitationResult {
   low_confidence: boolean;
 }
 
+export interface SemanticScholarPaper {
+  doi: string;
+  paper_id: string;
+  title: string | null;
+  year: number | null;
+  publication_date: string | null;
+  venue: string | null;
+  citation_count: number;
+  external_ids: Record<string, unknown>;
+  cached_at_ms: number;
+}
+
 export type ViewerMetadataStatus = "idle" | "loading" | "ready" | "failed";
 
 export interface FileEntry {
@@ -151,6 +170,8 @@ export interface FileEntry {
   /** Document publication date ("YYYY-MM") from cached extracted metadata.
    *  Absent until the metadata cache has processed this file. */
   publication_date?: string | null;
+  /** Semantic Scholar citation count from cached extracted metadata. */
+  semantic_scholar_citation_count?: number | null;
 }
 
 /** Payload entry of the `file-metadata-updated` event: cached document metadata
@@ -158,6 +179,7 @@ export interface FileEntry {
 export interface FileMetadataUpdate {
   path: string;
   publication_date: string | null;
+  semantic_scholar_citation_count?: number | null;
 }
 
 export interface FileListResponse {
@@ -170,10 +192,10 @@ export interface OmittedFileEntry extends FileEntry {
 }
 
 export type OmittedFileReason = "TooLarge" | "UnsupportedExtension";
-export type FileSortKey = "filename" | "created" | "modified" | "size" | "publication";
+export type FileSortKey = "filename" | "created" | "modified" | "size" | "publication" | "citations";
 /** Optional document-metadata field that can be shown as a column in the file
  *  list. Extend alongside FILE_DISPLAY_FIELDS as FileEntry gains more fields. */
-export type FileDisplayField = "created" | "modified" | "size" | "publication";
+export type FileDisplayField = "created" | "modified" | "size" | "publication" | "citations";
 export type FileSortDirection = "asc" | "desc";
 
 /** HuggingFace model code, e.g. "BAAI/bge-base-en-v1.5". */
@@ -223,8 +245,15 @@ export interface ZoteroSettings {
   citation_style: string;
 }
 
+export interface SemanticScholarSettings {
+  enabled: boolean;
+  base_url: string;
+  api_key: string | null;
+}
+
 export interface IntegrationsSettings {
   zotero: ZoteroSettings;
+  semantic_scholar: SemanticScholarSettings;
 }
 
 export interface WorkerStatus {

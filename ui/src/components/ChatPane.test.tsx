@@ -1,7 +1,30 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
-import { MessageBubble } from "./ChatPane";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import ChatPane, { contextFileMatchRef, isTranscriptNearBottom, MessageBubble } from "./ChatPane";
 import type { ChatMessage } from "../stores/useChatStore";
+import { useChatStore } from "../stores/useChatStore";
+import { useSearchStore } from "../stores/useSearchStore";
+
+vi.mock("../services/chat", () => ({
+  chatApi: {
+    listBackends: vi.fn().mockResolvedValue([]),
+    listConversations: vi.fn().mockResolvedValue([]),
+    installBackend: vi.fn(),
+    start: vi.fn(),
+    openConversation: vi.fn(),
+    forgetConversation: vi.fn(),
+    setConfigOption: vi.fn(),
+    onConfigOptionsUpdated: vi.fn().mockResolvedValue(() => {}),
+    addContext: vi.fn(),
+    removeContext: vi.fn(),
+    setActiveDoc: vi.fn(),
+    newTurnId: vi.fn(),
+    send: vi.fn(),
+    cancel: vi.fn(),
+    close: vi.fn(),
+    onSessionError: vi.fn().mockResolvedValue(() => {}),
+  },
+}));
 
 function message(overrides: Partial<ChatMessage>): ChatMessage {
   return {
@@ -20,6 +43,10 @@ function message(overrides: Partial<ChatMessage>): ChatMessage {
 }
 
 describe("MessageBubble", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("renders assistant replies as GitHub-flavored Markdown", () => {
     render(
       <MessageBubble
@@ -58,5 +85,114 @@ describe("MessageBubble", () => {
     expect(screen.getByText(/\*\*literal\*\*/)).toBeInTheDocument();
     expect(screen.queryByText("literal")).not.toBeInTheDocument();
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  });
+
+  it("copies the raw assistant message text", () => {
+    render(
+      <MessageBubble
+        message={message({
+          text: "**Result**\n\nCopied as Markdown.",
+        })}
+        nowMs={0}
+        onNavigate={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy assistant message" }));
+
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
+      "**Result**\n\nCopied as Markdown.",
+    );
+  });
+
+  it("copies user message text", () => {
+    render(
+      <MessageBubble
+        message={message({
+          role: "user",
+          text: "plain user query",
+        })}
+        nowMs={0}
+        onNavigate={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy your message" }));
+
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("plain user query");
+  });
+});
+
+describe("isTranscriptNearBottom", () => {
+  it("treats the transcript as stuck when it is within the bottom threshold", () => {
+    expect(
+      isTranscriptNearBottom({ scrollHeight: 1000, scrollTop: 452, clientHeight: 500 }),
+    ).toBe(true);
+  });
+
+  it("stops sticking once the user scrolls away from the bottom", () => {
+    expect(
+      isTranscriptNearBottom({ scrollHeight: 1000, scrollTop: 300, clientHeight: 500 }),
+    ).toBe(false);
+  });
+});
+
+describe("contextFileMatchRef", () => {
+  it("opens PDFs on the requested page", () => {
+    expect(contextFileMatchRef("/tmp/paper.pdf", 7)).toEqual({
+      path: "/tmp/paper.pdf",
+      origin: { PdfPage: { page: 7, bbox: null } },
+    });
+  });
+
+  it("opens non-PDF files without a highlighted line", () => {
+    expect(contextFileMatchRef("/tmp/notes.md")).toEqual({
+      path: "/tmp/notes.md",
+      origin: { TextFile: { line: 0, col: 0 } },
+    });
+  });
+});
+
+describe("ChatPane context badges", () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      paneOpen: true,
+      paneOpening: false,
+      backends: [{ backend: "ClaudeCode", label: "Claude Code", available: true, auth_note: "", unavailable_reason: null, installable: false }],
+      backendsLoaded: true,
+      backendsLoading: false,
+      installingBackend: null,
+      hasAvailableBackend: true,
+      sessionId: "session-1",
+      conversationId: null,
+      backendSessionId: null,
+      backend: "ClaudeCode",
+      conversations: [],
+      conversationsLoading: false,
+      messages: [],
+      contextFiles: [{ path: "/tmp/notes.md", pages: null }],
+      activeDoc: { path: "/tmp/paper.pdf", page: 7 },
+      streaming: false,
+      currentTurnId: null,
+      sessionError: null,
+      configOptions: [],
+    });
+    useSearchStore.setState({ selectMatch: vi.fn() });
+  });
+
+  it("opens active and pinned context files through selectMatch", () => {
+    render(<ChatPane onClose={vi.fn()} />);
+
+    fireEvent.click(screen.getByTitle("Open /tmp/paper.pdf"));
+    fireEvent.click(screen.getByTitle("Open /tmp/notes.md"));
+
+    expect(useSearchStore.getState().selectMatch).toHaveBeenNthCalledWith(1, {
+      path: "/tmp/paper.pdf",
+      origin: { PdfPage: { page: 7, bbox: null } },
+    });
+    expect(useSearchStore.getState().selectMatch).toHaveBeenNthCalledWith(2, {
+      path: "/tmp/notes.md",
+      origin: { TextFile: { line: 0, col: 0 } },
+    });
   });
 });
