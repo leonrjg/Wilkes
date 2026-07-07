@@ -16,6 +16,7 @@ import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import LogsPanel from "./LogsPanel";
 import {CornerLeftDown, CornerRightUp} from "react-feather";
+import { Tooltip } from "./Tooltip";
 
 // ---------------------------------------------------------------------------
 // State & reducer
@@ -703,22 +704,22 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
           {ALL_ENGINES.map((e) => {
             const isSupported = supportedEngines.includes(e);
             return (
-            <button
-              key={e}
-              type="button"
-              disabled={isActive || (!isEngineAvailable && currentEngine === e) || !isSupported}
-              onClick={() => handleEngineChange(e)}
-              title={!isSupported ? "Feature disabled in this build" : undefined}
-              className={`flex-1 px-3 py-1 rounded-md text-xs transition-all ${
-                currentEngine === e
-                  ? "bg-[var(--bg-app)] text-[var(--text-main)] shadow-sm"
-                  : !isSupported
-                    ? "text-[var(--text-muted)]/50 opacity-50 cursor-not-allowed"
-                    : "text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50"
-              }`}
-            >
-              {e}
-            </button>
+            <Tooltip key={e} content={!isSupported ? "Feature disabled in this build" : undefined}>
+              <button
+                type="button"
+                disabled={isActive || (!isEngineAvailable && currentEngine === e) || !isSupported}
+                onClick={() => handleEngineChange(e)}
+                className={`flex-1 px-3 py-1 rounded-md text-xs transition-all ${
+                  currentEngine === e
+                    ? "bg-[var(--bg-app)] text-[var(--text-main)] shadow-sm"
+                    : !isSupported
+                      ? "text-[var(--text-muted)]/50 opacity-50 cursor-not-allowed"
+                      : "text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50"
+                }`}
+              >
+                {e}
+              </button>
+            </Tooltip>
             );
           })}
         </div>

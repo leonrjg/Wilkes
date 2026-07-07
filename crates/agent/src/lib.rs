@@ -300,7 +300,7 @@ mod tests {
         let nanocoder = package_spec(AgentBackend::Nanocoder);
         assert_eq!(nanocoder.package, "@nanocollective/nanocoder");
         assert_eq!(nanocoder.bin, "nanocoder");
-        assert_eq!(nanocoder.args, &["--acp", "--provider", "Ollama"]);
+        assert_eq!(nanocoder.args, &["--acp"]);
         assert!(!nanocoder.version.is_empty());
         assert_eq!(label(AgentBackend::Nanocoder), "Nanocoder");
         assert!(!auth_note(AgentBackend::Nanocoder).is_empty());

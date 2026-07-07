@@ -10,6 +10,7 @@ import { useBookmarksStore } from "../stores/useBookmarksStore";
 vi.mock("../services", () => ({
   api: {
     onManagerEvent: vi.fn().mockResolvedValue(vi.fn()),
+    onFileListChanged: vi.fn().mockResolvedValue(vi.fn()),
     onFileMetadataUpdated: vi.fn().mockResolvedValue(vi.fn()),
   },
 }));
@@ -47,7 +48,11 @@ describe("useGlobalEvents", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     (useToasts as any).mockReturnValue({ addToast, removeToast });
-    (useSettingsStore.getState as any).mockReturnValue({ refreshFileList, applyMetadataUpdates });
+    (useSettingsStore.getState as any).mockReturnValue({
+      directory: "/docs",
+      refreshFileList,
+      applyMetadataUpdates,
+    });
     (useSemanticStore.getState as any).mockReturnValue({ handleIndexUpdated });
     (useBookmarksStore.getState as any).mockReturnValue({ load: loadBookmarks });
   });
@@ -73,7 +78,7 @@ describe("useGlobalEvents", () => {
     expect(addToast).toHaveBeenCalledWith(expect.stringContaining("Starting worker"), expect.any(Object));
   });
 
-  it("handles Reindexing and ReindexingDone events", async () => {
+  it("handles Reindexing and ReindexingDone events without refreshing the file list", async () => {
     let handler: any;
     (api.onManagerEvent as any).mockImplementation((h: any) => {
       handler = h;
@@ -89,7 +94,7 @@ describe("useGlobalEvents", () => {
     act(() => {
       handler("Reindexing");
     });
-    expect(refreshFileList).toHaveBeenCalled();
+    expect(refreshFileList).not.toHaveBeenCalled();
     expect(addToast).toHaveBeenCalledWith(expect.stringContaining("Indexing..."), expect.any(Object));
 
     act(() => {
@@ -97,6 +102,46 @@ describe("useGlobalEvents", () => {
     });
     expect(removeToast).toHaveBeenCalledWith("toast-id");
     expect(handleIndexUpdated).toHaveBeenCalled();
+  });
+
+  it("refreshes the file list on matching file-list-changed events", async () => {
+    let fileListHandler: any;
+    (api.onFileListChanged as any).mockImplementation((h: any) => {
+      fileListHandler = h;
+      return Promise.resolve(vi.fn());
+    });
+
+    renderHook(() => useGlobalEvents());
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    act(() => {
+      fileListHandler({ root: "/docs" });
+    });
+
+    expect(refreshFileList).toHaveBeenCalled();
+  });
+
+  it("ignores file-list-changed events for other roots", async () => {
+    let fileListHandler: any;
+    (api.onFileListChanged as any).mockImplementation((h: any) => {
+      fileListHandler = h;
+      return Promise.resolve(vi.fn());
+    });
+
+    renderHook(() => useGlobalEvents());
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    act(() => {
+      fileListHandler({ root: "/other" });
+    });
+
+    expect(refreshFileList).not.toHaveBeenCalled();
   });
 
   it("applies metadata updates and reloads bookmarks on file-metadata-updated", async () => {

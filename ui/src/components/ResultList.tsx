@@ -1,12 +1,29 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowDown, ArrowUp, ChevronDown, File, RefreshCw } from "react-feather";
+import {
+  ArrowDown,
+  ArrowUp,
+  Calendar,
+  ChevronDown,
+  Clock,
+  File,
+  FileText,
+  Folder,
+  HardDrive,
+  Hash,
+  Info,
+  RefreshCw,
+  Tag,
+  User,
+} from "react-feather";
 import { buildRows, COLLAPSED_LIMIT, type Row } from "../lib/utils/flattenResults";
 import { useToasts } from "./Toast";
 import { ContextMenu, useContextMenu } from "./ContextMenu";
+import { Tooltip } from "./Tooltip";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { MetadataField } from "../lib/types";
 import type {
   FileDisplayField,
   FileEntry,
@@ -19,6 +36,11 @@ import type {
 } from "../lib/types";
 import { api, isTauri } from "../services";
 import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileActions";
+import {
+  formatDocumentFullDate,
+  formatDocumentMonthYear,
+  formatTimestampFullDate,
+} from "../lib/dateFormatting";
 
 function originLabel(origin: SourceOrigin): string {
   if ("TextFile" in origin) return `L${origin.TextFile.line}`;
@@ -55,20 +77,10 @@ function validateNewFileName(name: string): string | null {
   return null;
 }
 
-function dirName(path: string): string {
-  const parts = path.split(/[/\\]/);
-  parts.pop();
-  return parts.join("/");
-}
-
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function formatTimestamp(ms: number): string {
-  return new Date(ms).toLocaleDateString();
 }
 
 /**
@@ -81,26 +93,44 @@ interface FileDisplayFieldDef {
   key: FileDisplayField;
   label: string;
   get: (entry: FileEntry) => string | null | undefined;
+  fullWidth?: boolean;
+  monospace?: boolean;
 }
 
 const FILE_DISPLAY_FIELDS: FileDisplayFieldDef[] = [
-  { key: "created", label: "Created", get: (e) => (e.created_at_ms != null ? formatTimestamp(e.created_at_ms) : null) },
-  { key: "modified", label: "Modified", get: (e) => (e.modified_at_ms != null ? formatTimestamp(e.modified_at_ms) : null) },
-  { key: "publication", label: "Publication date", get: (e) => e.publication_date },
+  { key: "title", label: "Title", get: (e) => e.title, fullWidth: true, monospace: false },
+  { key: "author", label: "Author", get: (e) => e.author, fullWidth: false, monospace: false },
+  { key: "created", label: "Created", get: (e) => (e.created_at_ms != null ? formatTimestampFullDate(e.created_at_ms) : null) },
+  { key: "modified", label: "Modified", get: (e) => (e.modified_at_ms != null ? formatTimestampFullDate(e.modified_at_ms) : null) },
+  { key: "publication", label: "Publication date", get: (e) => formatDocumentMonthYear(e.publication_date) },
   {
     key: "citations",
     label: "Citations",
     get: (e) =>
-      e.semantic_scholar_citation_count != null
-        ? e.semantic_scholar_citation_count.toLocaleString()
+      e.citation_count != null
+        ? e.citation_count.toLocaleString()
         : null,
   },
   { key: "size", label: "Size", get: (e) => formatSize(e.size_bytes) },
 ];
 
-const SORT_KEYS: FileSortKey[] = ["filename", "created", "modified", "publication", "citations", "size"];
+type DetailIcon = React.ComponentType<React.SVGProps<SVGSVGElement> & { size?: number }>;
+
+const FILE_DETAIL_ICONS: Record<FileDisplayField, DetailIcon> = {
+  title: FileText,
+  author: User,
+  created: Calendar,
+  modified: Clock,
+  publication: Calendar,
+  citations: Hash,
+  size: HardDrive,
+};
+
+const SORT_KEYS: FileSortKey[] = ["filename", "title", "author", "created", "modified", "publication", "citations", "size"];
 const SORT_KEY_LABELS: Record<FileSortKey, string> = {
   filename: "Name",
+  title: "Title",
+  author: "Author",
   created: "Created",
   modified: "Modified",
   publication: "Publication date",
@@ -112,6 +142,100 @@ function displayFieldValue(entry: FileEntry, field: FileDisplayField): string | 
   const def = FILE_DISPLAY_FIELDS.find((f) => f.key === field);
   const value = def?.get(entry);
   return value && value.trim() !== "" ? value : null;
+}
+
+function displayFieldTitle(entry: FileEntry, field: FileDisplayField): string | undefined {
+  if (field === "title") return normalizedDetailValue(entry.title) ?? undefined;
+  if (field === "author") return normalizedDetailValue(entry.author) ?? undefined;
+  if (field !== "publication") return undefined;
+  return formatDocumentFullDate(entry.publication_date) ?? undefined;
+}
+
+const DISPLAY_FIELD_METADATA_KEYS: Partial<Record<FileDisplayField, string>> = {
+  title: MetadataField.Title,
+  author: MetadataField.Author,
+  publication: MetadataField.PublicationDate,
+  citations: MetadataField.CitationCount,
+};
+
+const METADATA_SOURCE_LABELS: Record<string, string> = {
+  file: "File",
+  zotero: "Zotero",
+  semantic_scholar: "Semantic Scholar",
+  openalex: "OpenAlex",
+};
+
+interface MetadataConflictGroup {
+  value: string;
+  sources: string[];
+  selected: boolean;
+}
+
+function groupMetadataConflictValues(
+  values: Array<{ source: string; value: string }>,
+  displayedValue: string,
+): MetadataConflictGroup[] {
+  const groups = new Map<string, MetadataConflictGroup>();
+  for (const item of values) {
+    const value = String(item.value);
+    const sourceLabel = METADATA_SOURCE_LABELS[item.source] ?? item.source;
+    const group = groups.get(value);
+    if (group) {
+      group.sources.push(sourceLabel);
+    } else {
+      groups.set(value, {
+        value,
+        sources: [sourceLabel],
+        selected: value === displayedValue,
+      });
+    }
+  }
+  return Array.from(groups.values());
+}
+
+function metadataConflictTooltip(
+  entry: FileEntry,
+  field: FileDisplayField,
+  displayedValue: string,
+): React.ReactNode | undefined {
+  const metadataKey = DISPLAY_FIELD_METADATA_KEYS[field];
+  const values = metadataKey ? entry.metadata_conflicts?.[metadataKey] : undefined;
+  if (!values || values.length < 2) return undefined;
+  const groupedValues = groupMetadataConflictValues(values, displayedValue);
+
+  return (
+    <div className="flex min-w-[220px] flex-col gap-1.5">
+      <div className="font-semibold text-[var(--text-main)]">Sources</div>
+      <div className="mt-0.5 flex flex-col gap-1">
+        {groupedValues.map((group) => (
+          <div key={group.value} className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5">
+            <span className={group.selected ? "text-[var(--accent-blue)]" : "text-[var(--text-dim)]"}>
+              {group.sources.join(", ")}:{"\u00a0"}
+            </span>
+            <span className="min-w-0 break-words text-[var(--text-main)]">
+              {group.value}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+interface FileDetail {
+  key: string;
+  label: string;
+  value: string;
+  valueTitle?: string;
+  icon: DetailIcon;
+  fullWidth?: boolean;
+  monospace?: boolean;
+  conflictTooltip?: React.ReactNode;
+}
+
+function normalizedDetailValue(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
 }
 
 function compareFileNames(a: string, b: string): number {
@@ -156,21 +280,23 @@ function sortFileEntries<T extends FileEntry>(
     } else if (key === "size") {
       result = a.size_bytes - b.size_bytes;
       if (direction === "desc") result *= -1;
-    } else if (key === "publication") {
-      result = compareOptionalString(a.publication_date, b.publication_date);
-      // Keep files with no publication date last regardless of direction.
-      if (direction === "desc" && !isBlank(a.publication_date) && !isBlank(b.publication_date)) {
+    } else if (key === "title" || key === "author" || key === "publication") {
+      const left = key === "title" ? a.title : key === "author" ? a.author : a.publication_date;
+      const right = key === "title" ? b.title : key === "author" ? b.author : b.publication_date;
+      result = compareOptionalString(left, right);
+      // Keep files with no value last regardless of direction.
+      if (direction === "desc" && !isBlank(left) && !isBlank(right)) {
         result *= -1;
       }
     } else if (key === "citations") {
       result = compareOptionalNumber(
-        a.semantic_scholar_citation_count,
-        b.semantic_scholar_citation_count,
+        a.citation_count,
+        b.citation_count,
       );
       if (
         direction === "desc" &&
-        a.semantic_scholar_citation_count != null &&
-        b.semantic_scholar_citation_count != null
+        a.citation_count != null &&
+        b.citation_count != null
       ) {
         result *= -1;
       }
@@ -390,7 +516,8 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
     const matchesFilter = (entry: FileEntry) => {
       if (!filterText) return true;
       const search = filterText.toLowerCase();
-      return entry.path.toLowerCase().includes(search);
+      return [entry.path, entry.title, entry.author]
+        .some((value) => value?.toLowerCase().includes(search));
     };
     const filteredVisibleFiles = sortedFileList.filter(matchesFilter);
     const filteredOmittedFiles = sortedOmittedFileList.filter((entry) => matchesFilter(entry));
@@ -410,28 +537,31 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
           </div>
         )}
         <div className="px-2 py-1.5 text-xs text-[var(--text-muted)] border-b border-[var(--border-main)] flex-shrink-0 flex items-center gap-1">
-          <div
-            className="flex flex-shrink-0 items-center gap-1 whitespace-nowrap"
-            aria-label={
-              indexing
-                ? "Indexing files"
-                : `${sortedFileList.length} file${sortedFileList.length === 1 ? "" : "s"}`
-            }
-            title={
+          <Tooltip
+            content={
               indexing
                 ? "Indexing files"
                 : `${sortedFileList.length} file${sortedFileList.length === 1 ? "" : "s"}`
             }
           >
-            {indexing ? (
-              "Indexing..."
-            ) : (
-              <>
-                <File size={12} aria-hidden="true" />
-                <span className="tabular-nums">{sortedFileList.length}</span>
-              </>
-            )}
-          </div>
+            <div
+              className="flex flex-shrink-0 items-center gap-1 whitespace-nowrap"
+              aria-label={
+                indexing
+                  ? "Indexing files"
+                  : `${sortedFileList.length} file${sortedFileList.length === 1 ? "" : "s"}`
+              }
+            >
+              {indexing ? (
+                "Indexing..."
+              ) : (
+                <>
+                  <File size={12} aria-hidden="true" />
+                  <span className="tabular-nums">{sortedFileList.length}</span>
+                </>
+              )}
+            </div>
+          </Tooltip>
           <input
             type="text"
             placeholder="Filter files..."
@@ -460,33 +590,35 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
             displayFields={fileDisplayFields}
             onToggleDisplayField={toggleFileDisplayField}
           />
-          <button
-            type="button"
-            aria-label="Toggle file sort direction"
-            title={`Sort ${fileSortDirection === "asc" ? "ascending" : "descending"}`}
-            onClick={() => setFileSortDirection(fileSortDirection === "asc" ? "desc" : "asc")}
-            className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-main)] hover:bg-[var(--bg-hover)]"
-          >
-            {fileSortDirection === "asc" ? (
-              <ArrowUp size={12} aria-hidden="true" />
-            ) : (
-              <ArrowDown size={12} aria-hidden="true" />
-            )}
-          </button>
-          <button
-            type="button"
-            aria-label="Refresh file metadata"
-            title="Refresh metadata (re-derive titles, publication dates, Zotero)"
-            onClick={() => {
-              void api
-                .refreshFileMetadata()
-                .catch(() => {})
-                .finally(() => useSettingsStore.getState().refreshFileList());
-            }}
-            className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-main)] hover:bg-[var(--bg-hover)]"
-          >
-            <RefreshCw size={12} aria-hidden="true" />
-          </button>
+          <Tooltip content={`Sort ${fileSortDirection === "asc" ? "ascending" : "descending"}`}>
+            <button
+              type="button"
+              aria-label="Toggle file sort direction"
+              onClick={() => setFileSortDirection(fileSortDirection === "asc" ? "desc" : "asc")}
+              className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-main)] hover:bg-[var(--bg-hover)]"
+            >
+              {fileSortDirection === "asc" ? (
+                <ArrowUp size={12} aria-hidden="true" />
+              ) : (
+                <ArrowDown size={12} aria-hidden="true" />
+              )}
+            </button>
+          </Tooltip>
+          <Tooltip content="Refresh metadata (re-derive titles, publication dates, Zotero)">
+            <button
+              type="button"
+              aria-label="Refresh file metadata"
+              onClick={() => {
+                void api
+                  .refreshFileMetadata()
+                  .catch(() => {})
+                  .finally(() => useSettingsStore.getState().refreshFileList());
+              }}
+              className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-main)] hover:bg-[var(--bg-hover)]"
+            >
+              <RefreshCw size={12} aria-hidden="true" />
+            </button>
+          </Tooltip>
         </div>
         <div className="flex-1 overflow-y-auto">
           {filteredVisibleFiles.map((entry) => (
@@ -578,9 +710,11 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
                 : "Ready"}
         </span>
         {stats && stats.errors.length > 0 && (
-          <span className="text-red-500 font-medium" title={stats.errors.join("\n")}>
-            {stats.errors.length} file{stats.errors.length === 1 ? "" : "s"} failed (hover for details)
-          </span>
+          <Tooltip content={<span className="whitespace-pre-line">{stats.errors.join("\n")}</span>}>
+            <span className="text-red-500 font-medium">
+              {stats.errors.length} file{stats.errors.length === 1 ? "" : "s"} failed (hover for details)
+            </span>
+          </Tooltip>
         )}
       </div>
 
@@ -839,41 +973,167 @@ function FileEntryRow({
   onClick: () => void;
   onContextMenu: (event: React.MouseEvent) => void;
 }) {
-  const activeFields = FILE_DISPLAY_FIELDS.filter((f) => displayFields.includes(f.key));
+  const details: FileDetail[] = [
+    ...(detail ? [{ key: "detail", label: "Detail", value: detail, icon: Info }] : []),
+    ...FILE_DISPLAY_FIELDS.filter((f) => displayFields.includes(f.key)).map((field) => {
+      const value = displayFieldValue(entry, field.key) ?? "—";
+      return {
+        key: field.key,
+        label: field.label,
+        value,
+        valueTitle: displayFieldTitle(entry, field.key),
+        icon: FILE_DETAIL_ICONS[field.key],
+        fullWidth: field.fullWidth,
+        monospace: field.monospace ?? true,
+        conflictTooltip: metadataConflictTooltip(entry, field.key, value),
+      };
+    }),
+  ];
+  const inlineDetails = details.filter((field) => !field.fullWidth);
+  const fullWidthDetails = details
+    .filter((field) => field.fullWidth)
+    .filter((field) => field.value.trim() !== "" && field.value !== "—");
+  const inlineDetailsRef = useRef<HTMLSpanElement>(null);
+  const [inlineDetailsExpanded, setInlineDetailsExpanded] = useState(false);
+  const [inlineDetailsOverflow, setInlineDetailsOverflow] = useState(false);
+  const inlineDetailsSignature = inlineDetails
+    .map((field) => `${field.key}:${field.value}:${field.valueTitle ?? ""}`)
+    .join("|");
+
+  useLayoutEffect(() => {
+    if (inlineDetailsExpanded) return;
+    const element = inlineDetailsRef.current;
+    if (!element) {
+      setInlineDetailsOverflow(false);
+      return;
+    }
+
+    const measure = () => {
+      setInlineDetailsOverflow(element.scrollWidth > element.clientWidth + 1);
+    };
+
+    measure();
+    const resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(element);
+    return () => resizeObserver.disconnect();
+  }, [inlineDetailsExpanded, inlineDetailsSignature]);
+
+  useEffect(() => {
+    setInlineDetailsExpanded(false);
+  }, [entry.path, inlineDetailsSignature]);
+
   return (
     <button
       onClick={onClick}
       onContextMenu={onContextMenu}
-      className={`w-full flex select-none items-baseline gap-2 px-3 py-1.5 text-left hover:bg-[var(--bg-hover)] transition-colors ${
+      className={`w-full flex select-none flex-col gap-1 px-3 py-1.5 text-left hover:bg-[var(--bg-hover)] transition-colors ${
         selected ? "bg-[var(--bg-active)]" : ""
       }`}
     >
-      <span
-        className={`text-sm font-medium truncate ${
-          muted ? "text-[var(--text-muted)]" : "text-[var(--text-main)]"
-        }`}
-      >
-        {fileName(entry.path)}
-      </span>
-      <span className="text-xs text-[var(--text-muted)] truncate flex-1">
-        {detail ?? dirName(entry.path)}
-      </span>
-      <div className="flex items-baseline gap-1 flex-shrink-0">
-        {activeFields.map((field) => (
-          <React.Fragment key={field.key}>
-            <span className="text-xs text-[var(--text-dim)] select-none">·</span>
-            <span className="text-xs text-[var(--text-muted)] font-mono tabular-nums">
-              {displayFieldValue(entry, field.key) ?? "—"}
-            </span>
-          </React.Fragment>
-        ))}
+      <span className="flex w-full min-w-0 items-center gap-1.5">
+        <span
+          className={`min-w-0 truncate text-sm font-medium ${
+            muted ? "text-[var(--text-muted)]" : "text-[var(--text-main)]"
+          }`}
+        >
+          {fileName(entry.path)}
+        </span>
+        <span className="min-w-0 flex-1" aria-hidden="true" />
         {entry.file_type === "Pdf" && (
-          <>
-            <span className="text-xs text-[var(--text-dim)] select-none">·</span>
-            <span className="text-xs text-[var(--accent-blue)] font-mono">PDF</span>
-          </>
+          <Tooltip content="Type">
+            <span
+              className="inline-flex flex-shrink-0 items-center gap-1 text-xs font-mono tabular-nums text-[var(--accent-blue)]"
+              aria-label="Type"
+            >
+              <Tag size={11} aria-hidden="true" />
+              PDF
+            </span>
+          </Tooltip>
         )}
-      </div>
+        <Tooltip content={entry.path} className="font-mono break-all">
+          <span
+            className="flex h-5 w-5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
+            aria-label={`Path: ${entry.path}`}
+          >
+            <Folder size={12} aria-hidden="true" />
+          </span>
+        </Tooltip>
+      </span>
+      {inlineDetails.length > 0 && (
+        <span className="flex w-full min-w-0 items-start gap-1.5 pl-0.5">
+          <span
+            ref={inlineDetailsRef}
+            className={`flex min-w-0 flex-1 items-center gap-x-2 gap-y-0.5 ${
+              inlineDetailsExpanded ? "flex-wrap" : "overflow-hidden whitespace-nowrap"
+            }`}
+          >
+            {inlineDetails.map((field) => (
+              <span key={field.key} className="inline-flex min-w-0 flex-shrink-0 items-center gap-1 text-xs">
+                <Tooltip content={field.label}>
+                  <span
+                    className="flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
+                    aria-label={field.label}
+                  >
+                    <field.icon size={11} aria-hidden="true" />
+                  </span>
+                </Tooltip>
+                <Tooltip content={field.conflictTooltip ?? field.valueTitle}>
+                  <span
+                    className={`min-w-0 truncate text-[var(--text-muted)] ${
+                      field.monospace ? "font-mono tabular-nums" : ""
+                    } ${field.key === "file-type" ? "text-[var(--accent-blue)]" : ""} ${
+                      field.conflictTooltip ? "underline decoration-wavy decoration-[var(--accent-blue)] underline-offset-2" : ""
+                    }`}
+                  >
+                    {field.value}
+                  </span>
+                </Tooltip>
+              </span>
+            ))}
+          </span>
+          {inlineDetailsOverflow && !inlineDetailsExpanded && (
+            <span
+              role="button"
+              tabIndex={0}
+              aria-label="Show hidden file details"
+              onClick={(event) => {
+                event.stopPropagation();
+                setInlineDetailsExpanded(true);
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" && event.key !== " ") return;
+                event.preventDefault();
+                event.stopPropagation();
+                setInlineDetailsExpanded(true);
+              }}
+              className="flex h-4 flex-shrink-0 items-center rounded border border-[var(--border-main)] px-1 text-[10px] leading-none text-[var(--text-dim)] hover:border-[var(--border-strong)] hover:text-[var(--text-muted)]"
+            >
+              ...
+            </span>
+          )}
+        </span>
+      )}
+      {fullWidthDetails.map((field) => (
+        <span key={field.key} className="flex w-full min-w-0 items-center gap-1.5 pl-0.5 text-xs">
+          <Tooltip content={field.label}>
+            <span
+              className="flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
+              aria-label={field.label}
+            >
+              <field.icon size={11} aria-hidden="true" />
+            </span>
+          </Tooltip>
+          <Tooltip content={field.conflictTooltip ?? field.valueTitle ?? field.value}>
+            <span
+              className={`min-w-0 flex-1 truncate text-[var(--text-muted)] ${
+                field.conflictTooltip ? "underline decoration-wavy decoration-[var(--accent-blue)] underline-offset-2" : ""
+              }`}
+            >
+              {field.value}
+            </span>
+          </Tooltip>
+        </span>
+      ))}
     </button>
   );
 }

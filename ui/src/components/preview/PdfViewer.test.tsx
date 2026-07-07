@@ -422,7 +422,7 @@ describe("PdfViewer", () => {
 
     fireEvent.mouseUp(scrollContainer);
 
-    const button = screen.getByRole("button", { name: "+ Bookmark" });
+    const button = screen.getByRole("button", { name: "Bookmark" });
     expect(button.closest(".absolute")).toHaveStyle({ top: "83px", left: "40px" });
   });
 

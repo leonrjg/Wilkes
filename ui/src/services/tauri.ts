@@ -8,6 +8,7 @@ import type {
   EmbedProgress,
   EmbeddingEngine,
   Bookmark,
+  FileListChanged,
   FileListResponse,
   FileMatches,
   FileMetadataUpdate,
@@ -19,6 +20,7 @@ import type {
   DocumentMetadata,
   ModelDescriptor,
   NewBookmark,
+  OpenAlexWork,
   PreviewData,
   SelectedEmbedder,
   SemanticScholarPaper,
@@ -110,8 +112,8 @@ export class TauriSearchApi implements SearchApi {
     return invoke<DocumentMetadata>("resolve_file_metadata", { path });
   }
 
-  async refreshFileMetadata(): Promise<void> {
-    await invoke("refresh_file_metadata");
+  async refreshFileMetadata(path?: string): Promise<void> {
+    await invoke("refresh_file_metadata", { path });
   }
 
   async zoteroStatus(): Promise<IntegrationStatus> {
@@ -132,6 +134,14 @@ export class TauriSearchApi implements SearchApi {
 
   async semanticScholarLookup(doi: string): Promise<SemanticScholarPaper> {
     return invoke<SemanticScholarPaper>("semantic_scholar_lookup", { doi });
+  }
+
+  async openAlexStatus(): Promise<IntegrationStatus> {
+    return invoke<IntegrationStatus>("openalex_status");
+  }
+
+  async openAlexLookup(doi: string): Promise<OpenAlexWork> {
+    return invoke<OpenAlexWork>("openalex_lookup", { doi });
   }
 
   resolvePdfUrl(path: string): string {
@@ -236,6 +246,12 @@ export class TauriSearchApi implements SearchApi {
 
   async onManagerEvent(handler: (event: string) => void): Promise<() => void> {
     return listen<string>("manager-event", (e) => handler(e.payload));
+  }
+
+  async onFileListChanged(
+    handler: (event: FileListChanged) => void,
+  ): Promise<() => void> {
+    return listen<FileListChanged>("file-list-changed", (e) => handler(e.payload));
   }
 
   async onFileMetadataUpdated(

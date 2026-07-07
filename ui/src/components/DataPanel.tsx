@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import type { SearchApi, DataPaths } from "../services/api";
 import { isTauri } from "../services";
 import { useSemanticStore } from "../stores/useSemanticStore";
+import { Tooltip } from "./Tooltip";
 
 interface Props {
   api: SearchApi;
@@ -123,7 +124,9 @@ export default function DataPanel({ api, isActive }: Props) {
                 </div>
                 <div className="flex flex-col gap-1">
                   <span className="text-[10px] text-[var(--text-dim)] uppercase font-bold tracking-tighter">Model</span>
-                  <span className="text-[10px] text-[var(--text-main)] truncate" title={indexStatus.model_id}>{indexStatus.model_id.split('/').pop()}</span>
+                  <Tooltip content={indexStatus.model_id}>
+                    <span className="text-[10px] text-[var(--text-main)] truncate">{indexStatus.model_id.split('/').pop()}</span>
+                  </Tooltip>
                 </div>
               </div>
               

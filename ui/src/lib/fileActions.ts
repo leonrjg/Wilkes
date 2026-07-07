@@ -5,7 +5,8 @@ import type { MenuContributor } from "./integrations/types";
 import type { Settings } from "./types";
 import { isTauri } from "../services";
 import { useChatStore } from "../stores/useChatStore";
-import { Copy, Edit2, ExternalLink, Folder, MessageSquare } from "react-feather";
+import { useSettingsStore } from "../stores/useSettingsStore";
+import { Copy, Edit2, ExternalLink, Folder, MessageSquare, RefreshCw } from "react-feather";
 
 export type ContextMenuTarget =
   | { kind: "file" | "match"; path: string; open: () => void }
@@ -63,6 +64,22 @@ export function buildFileContextMenuItems({
       label: "Rename",
       icon: Edit2,
       run: () => onRenameRequest?.(target.path),
+    });
+
+    items.push({
+      id: "refresh-metadata",
+      label: "Refresh metadata",
+      icon: RefreshCw,
+      run: async () => {
+        try {
+          await api.refreshFileMetadata(target.path);
+          useSettingsStore.getState().refreshFileList();
+          onToast("Metadata refresh started", "success");
+        } catch (error) {
+          console.error("Failed to refresh metadata:", error);
+          onToast("Failed to refresh metadata", "error");
+        }
+      },
     });
 
     if (isTauri) {

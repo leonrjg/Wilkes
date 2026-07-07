@@ -33,6 +33,11 @@ function settings(enabled = false): Settings {
         base_url: "https://api.semanticscholar.org",
         api_key: null,
       },
+      openalex: {
+        enabled: false,
+        base_url: "https://api.openalex.org",
+        email: null,
+      },
     },
     supported_extensions: ["pdf"],
     max_results: 50,
@@ -63,6 +68,11 @@ describe("IntegrationsPanel", () => {
             enabled: false,
             base_url: "https://api.semanticscholar.org",
             api_key: null,
+          },
+          openalex: {
+            enabled: false,
+            base_url: "https://api.openalex.org",
+            email: null,
           },
           zotero: {
             enabled: true,
@@ -114,6 +124,11 @@ describe("IntegrationsPanel", () => {
             base_url: "https://api.semanticscholar.org",
             api_key: null,
           },
+          openalex: {
+            enabled: false,
+            base_url: "https://api.openalex.org",
+            email: null,
+          },
           zotero: {
             enabled: false,
             base_url: "http://127.0.0.1:23119",
@@ -155,6 +170,11 @@ describe("IntegrationsPanel", () => {
           base_url: "https://api.semanticscholar.org",
           api_key: null,
         },
+        openalex: {
+          enabled: false,
+          base_url: "https://api.openalex.org",
+          email: null,
+        },
       },
     });
   });
@@ -190,6 +210,11 @@ describe("IntegrationsPanel", () => {
           base_url: "https://api.semanticscholar.org",
           api_key: null,
         },
+        openalex: {
+          enabled: false,
+          base_url: "https://api.openalex.org",
+          email: null,
+        },
       },
     });
     expect(onUpdate).not.toHaveBeenCalledWith(expect.objectContaining({
@@ -197,5 +222,44 @@ describe("IntegrationsPanel", () => {
         semantic_scholar: expect.objectContaining({ enabled: false }),
       }),
     }));
+  });
+
+  it("enables OpenAlex only after a ready API check", async () => {
+    const api = {
+      openAlexStatus: vi.fn().mockResolvedValue({
+        id: "openalex",
+        enabled: true,
+        state: "ready",
+        message: "OpenAlex API is reachable.",
+        version: null,
+      }),
+    } as any;
+    const onUpdate = vi.fn();
+
+    render(<IntegrationsPanel api={api} settings={settings(false)} onUpdate={onUpdate} />);
+    fireEvent.click(screen.getByLabelText("Enable OpenAlex integration"));
+
+    await waitFor(() => {
+      expect(api.openAlexStatus).toHaveBeenCalled();
+    });
+    expect(onUpdate).toHaveBeenCalledWith({
+      integrations: {
+        zotero: {
+          enabled: false,
+          base_url: "http://127.0.0.1:23119",
+          citation_style: "chicago-note-bibliography",
+        },
+        semantic_scholar: {
+          enabled: false,
+          base_url: "https://api.semanticscholar.org",
+          api_key: null,
+        },
+        openalex: {
+          enabled: true,
+          base_url: "https://api.openalex.org",
+          email: null,
+        },
+      },
+    });
   });
 });

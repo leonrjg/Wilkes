@@ -272,6 +272,8 @@ pub struct DocumentMetadata {
     pub created_at: Option<String>,
     #[serde(default)]
     pub semantic_scholar: Option<SemanticScholarPaper>,
+    #[serde(default)]
+    pub openalex: Option<OpenAlexWork>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -673,6 +675,8 @@ pub struct Settings {
     pub semantic: SemanticSettings,
     #[serde(default)]
     pub integrations: IntegrationsSettings,
+    #[serde(default)]
+    pub primary_metadata_source: MetadataSourcePreference,
     #[serde(default = "default_supported_extensions")]
     pub supported_extensions: Vec<String>,
     #[serde(default)]
@@ -727,6 +731,7 @@ impl Default for Settings {
             search_prefer_semantic: false,
             semantic: SemanticSettings::default(),
             integrations: IntegrationsSettings::default(),
+            primary_metadata_source: MetadataSourcePreference::default(),
             supported_extensions: default_supported_extensions(),
             max_results: 50,
             bookmarks_dock: BookmarkDock::default(),
@@ -792,6 +797,8 @@ pub struct ChatBackendConfig {
 pub enum FileSortKey {
     #[default]
     Filename,
+    Title,
+    Author,
     Created,
     Modified,
     Size,
@@ -805,11 +812,23 @@ pub enum FileSortKey {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FileDisplayField {
+    Title,
+    Author,
     Created,
     Modified,
     Publication,
     Citations,
     Size,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataSourcePreference {
+    File,
+    #[default]
+    Zotero,
+    SemanticScholar,
+    OpenAlex,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -833,6 +852,8 @@ pub struct IntegrationsSettings {
     pub zotero: ZoteroSettings,
     #[serde(default)]
     pub semantic_scholar: SemanticScholarSettings,
+    #[serde(default)]
+    pub openalex: OpenAlexSettings,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -888,6 +909,30 @@ fn default_semantic_scholar_base_url() -> String {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenAlexSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_openalex_base_url")]
+    pub base_url: String,
+    #[serde(default)]
+    pub email: Option<String>,
+}
+
+impl Default for OpenAlexSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_openalex_base_url(),
+            email: None,
+        }
+    }
+}
+
+fn default_openalex_base_url() -> String {
+    "https://api.openalex.org".to_string()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegrationState {
     Disabled,
@@ -939,6 +984,19 @@ pub struct SemanticScholarPaper {
     pub cached_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenAlexWork {
+    pub doi: String,
+    pub work_id: String,
+    pub title: Option<String>,
+    pub year: Option<i64>,
+    pub publication_date: Option<String>,
+    pub venue: Option<String>,
+    pub citation_count: i64,
+    pub external_ids: HashMap<String, serde_json::Value>,
+    pub cached_at_ms: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub enum Theme {
     #[default]
@@ -957,6 +1015,14 @@ pub struct FileEntry {
     pub extension: String,
     pub created_at_ms: Option<i64>,
     pub modified_at_ms: Option<i64>,
+    /// Document title from cached extracted metadata. `None` until the metadata
+    /// cache has processed this file.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Document author from cached extracted metadata. `None` until the metadata
+    /// cache has processed this file.
+    #[serde(default)]
+    pub author: Option<String>,
     /// Document publication date ("YYYY-MM") from cached extracted metadata.
     /// `None` until the metadata cache has processed this file.
     #[serde(default)]
@@ -965,7 +1031,15 @@ pub struct FileEntry {
     /// until metadata extraction has found a DOI and the integration has
     /// enriched it.
     #[serde(default)]
-    pub semantic_scholar_citation_count: Option<i64>,
+    pub citation_count: Option<i64>,
+    #[serde(default)]
+    pub metadata_conflicts: HashMap<String, Vec<MetadataConflictValue>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetadataConflictValue {
+    pub source: String,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

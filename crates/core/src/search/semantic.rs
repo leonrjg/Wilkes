@@ -2,7 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::extract::ExtractorRegistry;
 use crate::types::{
-    FileMatches, FileType, Match, SearchCapabilities, SearchQuery, SearchScope, SourceOrigin,
+    FileMatches, FileType, IndexingConfig, Match, SearchCapabilities, SearchQuery, SearchScope,
+    SourceOrigin,
 };
 use tracing::{error, info};
 
@@ -13,19 +14,19 @@ use crate::embed::Embedder;
 pub struct SemanticSearchProvider {
     embedder: Arc<dyn Embedder>,
     index: Arc<Mutex<Option<SemanticIndex>>>,
-    supported_extensions: Vec<String>,
+    indexing: IndexingConfig,
 }
 
 impl SemanticSearchProvider {
     pub fn new(
         embedder: Arc<dyn Embedder>,
         index: Arc<Mutex<Option<SemanticIndex>>>,
-        supported_extensions: Vec<String>,
+        indexing: IndexingConfig,
     ) -> Self {
         Self {
             embedder,
             index,
-            supported_extensions,
+            indexing,
         }
     }
 }
@@ -37,7 +38,23 @@ impl SearchProvider for SemanticSearchProvider {
         _extractors: &ExtractorRegistry,
         tx: SearchResultTx,
     ) -> anyhow::Result<Vec<String>> {
-        // 1. Embed the query string.
+        // 1. Reconcile the index with the current root before returning semantic
+        // results. This blocks the first stale search so callers never see known-
+        // stale paths after offline creates/renames/deletes.
+        let reconcile_errors = {
+            let mut guard = self.index.lock().unwrap();
+            let idx = guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Semantic index is not built yet"))?;
+            idx.reconcile_root(
+                &query.root,
+                _extractors,
+                self.embedder.as_ref(),
+                &self.indexing,
+            )?
+        };
+
+        // 2. Embed the query string.
         info!("[semantic] embedding query...");
         let query_vecs = self
             .embedder
@@ -52,7 +69,7 @@ impl SearchProvider for SemanticSearchProvider {
             .next()
             .ok_or_else(|| anyhow::anyhow!("Embedder returned no vector for the query"))?;
 
-        // 2. Lock the index and run the nearest-neighbour query.
+        // 3. Lock the index and run the nearest-neighbour query.
         let guard = self.index.lock().unwrap();
         let idx = guard
             .as_ref()
@@ -66,7 +83,7 @@ impl SearchProvider for SemanticSearchProvider {
         let results = idx.query_scoped(&query_vec, top_k, scope)?;
         drop(guard);
 
-        // 3. Convert IndexedChunk results into FileMatches / Match.
+        // 4. Convert IndexedChunk results into FileMatches / Match.
         //    Group by file path, preserving score-ranked order across files.
         use std::collections::HashMap;
         let mut by_file: HashMap<std::path::PathBuf, (FileType, Vec<Match>)> = HashMap::new();
@@ -116,7 +133,7 @@ impl SearchProvider for SemanticSearchProvider {
             }
         }
 
-        Ok(Vec::new())
+        Ok(reconcile_errors)
     }
 
     fn capabilities(&self) -> SearchCapabilities {
@@ -126,7 +143,7 @@ impl SearchProvider for SemanticSearchProvider {
             supports_regex: false,
             supports_case_sensitivity: false,
             is_indexed: true,
-            supported_file_types: self.supported_extensions.clone(),
+            supported_file_types: self.indexing.supported_extensions.clone(),
             requires_index: true,
             semantic_index_built: index_built,
             supported_engines: crate::types::EmbeddingEngine::supported_engines(),
@@ -155,12 +172,20 @@ mod tests {
         }
     }
 
+    fn indexing_config(extensions: Vec<String>) -> IndexingConfig {
+        IndexingConfig {
+            chunk_size: 100,
+            chunk_overlap: 0,
+            supported_extensions: extensions,
+        }
+    }
+
     #[test]
     fn test_capabilities_without_index() {
         let embedder = Arc::new(MockEmbedder);
         let index = Arc::new(Mutex::new(None));
         let extensions = vec!["pdf".to_string(), "txt".to_string()];
-        let provider = SemanticSearchProvider::new(embedder, index, extensions);
+        let provider = SemanticSearchProvider::new(embedder, index, indexing_config(extensions));
 
         let caps = provider.capabilities();
         assert!(!caps.supports_regex);
@@ -175,7 +200,7 @@ mod tests {
     async fn test_search_unbuilt_index() {
         let embedder = Arc::new(MockEmbedder);
         let index = Arc::new(Mutex::new(None));
-        let provider = SemanticSearchProvider::new(embedder, index, vec![]);
+        let provider = SemanticSearchProvider::new(embedder, index, indexing_config(vec![]));
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let query = SearchQuery {
@@ -206,7 +231,7 @@ mod tests {
             "mock",
             768,
             crate::types::EmbeddingEngine::SBERT,
-            None,
+            Some(dir.path()),
         )
         .unwrap();
 
@@ -231,15 +256,18 @@ mod tests {
 
         let embedder = Arc::new(MockEmbedder);
         let index = Arc::new(Mutex::new(Some(idx)));
-        let provider =
-            SemanticSearchProvider::new(embedder, index.clone(), vec!["txt".to_string()]);
+        let provider = SemanticSearchProvider::new(
+            embedder,
+            index.clone(),
+            indexing_config(vec!["txt".to_string()]),
+        );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let query = SearchQuery {
             pattern: "test".to_string(),
             is_regex: false,
             case_sensitive: false,
-            root: std::path::PathBuf::from("/"),
+            root: dir.path().to_path_buf(),
             max_results: 10,
             respect_gitignore: false,
             max_file_size: 0,
@@ -296,7 +324,7 @@ mod tests {
             "tiny-mock",
             2,
             crate::types::EmbeddingEngine::Candle,
-            None,
+            Some(dir.path()),
         )
         .unwrap();
 
@@ -353,14 +381,15 @@ mod tests {
 
         let embedder = Arc::new(TinyMockEmbedder);
         let index = Arc::new(Mutex::new(Some(idx)));
-        let provider = SemanticSearchProvider::new(embedder, index, vec!["txt".to_string()]);
+        let provider =
+            SemanticSearchProvider::new(embedder, index, indexing_config(vec!["txt".to_string()]));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let query = SearchQuery {
             pattern: "alpha".to_string(),
             is_regex: false,
             case_sensitive: false,
-            root: std::path::PathBuf::from("/"),
+            root: dir.path().to_path_buf(),
             max_results: 10,
             respect_gitignore: false,
             max_file_size: 0,

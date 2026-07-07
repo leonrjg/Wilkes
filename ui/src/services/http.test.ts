@@ -224,6 +224,25 @@ describe("HttpSearchApi", () => {
     expect(res).toEqual(mockData);
   });
 
+  it("refreshFileMetadata refreshes all metadata without a body", async () => {
+    (fetch as any).mockResolvedValue({ ok: true });
+
+    await api.refreshFileMetadata();
+
+    expect(fetch).toHaveBeenCalledWith("/api/file/metadata/refresh", { method: "POST" });
+  });
+
+  it("refreshFileMetadata sends a path for single-file refresh", async () => {
+    (fetch as any).mockResolvedValue({ ok: true });
+
+    await api.refreshFileMetadata("/root/paper.pdf");
+
+    expect(fetch).toHaveBeenCalledWith("/api/file/metadata/refresh", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ path: "/root/paper.pdf" }),
+    }));
+  });
+
   it("resolvePdfUrl returns correctly formatted URL", () => {
     const url = api.resolvePdfUrl("/path/to/test.pdf");
     expect(url).toBe("/asset?path=%2Fpath%2Fto%2Ftest.pdf");

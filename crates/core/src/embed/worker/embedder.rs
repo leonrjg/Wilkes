@@ -19,7 +19,7 @@ pub struct WorkerEmbedderConfig {
 pub struct WorkerEmbedder {
     manager: WorkerManager,
     /// Captured at construction time (always in an async context) so that
-    /// `send_embed` can be called safely from non-Tokio threads (e.g. IndexWatcher).
+    /// `send_embed` can be called safely from non-Tokio threads.
     tokio_handle: tokio::runtime::Handle,
     model_id: String,
     dimension: usize,

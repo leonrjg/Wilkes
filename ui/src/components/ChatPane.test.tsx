@@ -183,8 +183,8 @@ describe("ChatPane context badges", () => {
   it("opens active and pinned context files through selectMatch", () => {
     render(<ChatPane onClose={vi.fn()} />);
 
-    fireEvent.click(screen.getByTitle("Open /tmp/paper.pdf"));
-    fireEvent.click(screen.getByTitle("Open /tmp/notes.md"));
+    fireEvent.click(screen.getByText("paper.pdf"));
+    fireEvent.click(screen.getByText("notes.md"));
 
     expect(useSearchStore.getState().selectMatch).toHaveBeenNthCalledWith(1, {
       path: "/tmp/paper.pdf",

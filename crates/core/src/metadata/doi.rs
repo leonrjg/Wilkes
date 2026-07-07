@@ -13,10 +13,15 @@ fn doi_regex_ref() -> &'static Regex {
 }
 
 pub fn find_doi(text: &str) -> Option<String> {
+    find_dois(text).into_iter().next()
+}
+
+pub fn find_dois(text: &str) -> Vec<String> {
     doi_regex_ref()
         .captures_iter(text)
         .filter_map(|captures| captures.get(1).map(|m| m.as_str()))
-        .find_map(normalize_doi)
+        .filter_map(normalize_doi)
+        .collect()
 }
 
 pub fn normalize_doi(value: &str) -> Option<String> {
@@ -140,6 +145,17 @@ mod tests {
         assert_eq!(
             find_doi("bad 10.1 nope and then 10.1000/xyz123"),
             Some("10.1000/xyz123".into())
+        );
+    }
+
+    #[test]
+    fn test_find_dois_returns_all_valid_candidates() {
+        assert_eq!(
+            find_dois("See 10.1000/xyz123 and 10.1145/3544548.3581349"),
+            vec![
+                "10.1000/xyz123".to_string(),
+                "10.1145/3544548.3581349".to_string()
+            ]
         );
     }
 

@@ -153,6 +153,18 @@ describe("TauriSearchApi", () => {
     expect(result).toEqual({ title: "Test Title", author: "Test Author", doi: null, created_at: "2025-04" });
   });
 
+  it("should call refresh_file_metadata without a path", async () => {
+    (invoke as any).mockResolvedValue(undefined);
+    await api.refreshFileMetadata();
+    expect(invoke).toHaveBeenCalledWith("refresh_file_metadata", { path: undefined });
+  });
+
+  it("should call refresh_file_metadata with a path", async () => {
+    (invoke as any).mockResolvedValue(undefined);
+    await api.refreshFileMetadata("/path/to/file.pdf");
+    expect(invoke).toHaveBeenCalledWith("refresh_file_metadata", { path: "/path/to/file.pdf" });
+  });
+
   it("should call get_data_paths", async () => {
     (invoke as any).mockResolvedValue({ app_data: "/app" });
     const result = await api.getDataPaths();

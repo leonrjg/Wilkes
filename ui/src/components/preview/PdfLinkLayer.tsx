@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import type { PdfDestination } from "./pdfDestinations";
+import { Tooltip } from "../Tooltip";
 import "./pdfLinkLayer.css";
 
 interface LinkRect {
@@ -90,27 +91,27 @@ export default function PdfLinkLayer({
   return (
     <>
       {links.map((link) => (
-        <a
-          key={link.key}
-          data-testid="pdf-link"
-          href={link.url ?? "#"}
-          onClick={(event) => {
-            event.preventDefault();
-            if (link.url) onOpenExternal(link.url);
-            else if (link.dest) onNavigateToDestination(link.dest);
-          }}
-          title={link.url ?? undefined}
-          style={{
-            position: "absolute",
-            left: `${link.left}px`,
-            top: `${link.top}px`,
-            width: `${Math.max(link.width, 4)}px`,
-            height: `${Math.max(link.height, 4)}px`,
-            cursor: "pointer",
-            // Transparent hit target; a faint tint appears on hover via CSS below.
-          }}
-          className="pdf-link-overlay"
-        />
+        <Tooltip key={link.key} content={link.url} className="break-all">
+          <a
+            data-testid="pdf-link"
+            href={link.url ?? "#"}
+            onClick={(event) => {
+              event.preventDefault();
+              if (link.url) onOpenExternal(link.url);
+              else if (link.dest) onNavigateToDestination(link.dest);
+            }}
+            style={{
+              position: "absolute",
+              left: `${link.left}px`,
+              top: `${link.top}px`,
+              width: `${Math.max(link.width, 4)}px`,
+              height: `${Math.max(link.height, 4)}px`,
+              cursor: "pointer",
+              // Transparent hit target; a faint tint appears on hover via CSS below.
+            }}
+            className="pdf-link-overlay"
+          />
+        </Tooltip>
       ))}
     </>
   );

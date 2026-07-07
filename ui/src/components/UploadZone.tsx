@@ -2,6 +2,7 @@ import { useCallback, useRef, useState } from "react";
 import { File, Folder } from "react-feather";
 import type { WebSourceApi } from "../services/api";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { Tooltip } from "./Tooltip";
 
 interface Props {
   source: WebSourceApi;
@@ -140,22 +141,24 @@ export default function UploadZone({ source, onRootChange }: Props) {
           onDragLeave={() => setDragOver(false)}
           className={`flex items-center gap-0.5 rounded transition-colors ${dragOver ? "ring-1 ring-[var(--accent-blue)]" : ""}`}
         >
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            title="Upload files"
-            className="flex items-center gap-1.5 text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] px-2 py-1 rounded-l border border-[var(--border-main)] hover:border-[var(--border-strong)] transition-colors"
-          >
-            <File size={11} />
-            <span>Files</span>
-          </button>
-          <button
-            onClick={() => dirInputRef.current?.click()}
-            title="Upload folder"
-            className="flex items-center gap-1.5 text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] px-2 py-1 rounded-r border border-l-0 border-[var(--border-main)] hover:border-[var(--border-strong)] transition-colors"
-          >
-            <Folder size={11} />
-            <span>Folder</span>
-          </button>
+          <Tooltip content="Upload files">
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="flex items-center gap-1.5 text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] px-2 py-1 rounded-l border border-[var(--border-main)] hover:border-[var(--border-strong)] transition-colors"
+            >
+              <File size={11} />
+              <span>Files</span>
+            </button>
+          </Tooltip>
+          <Tooltip content="Upload folder">
+            <button
+              onClick={() => dirInputRef.current?.click()}
+              className="flex items-center gap-1.5 text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] px-2 py-1 rounded-r border border-l-0 border-[var(--border-main)] hover:border-[var(--border-strong)] transition-colors"
+            >
+              <Folder size={11} />
+              <span>Folder</span>
+            </button>
+          </Tooltip>
         </div>
       )}
 
@@ -185,27 +188,31 @@ export default function UploadZone({ source, onRootChange }: Props) {
           <div className="max-h-[200px] overflow-y-auto flex flex-col gap-0.5 hidden">
             {fileList.map((f) => (
               <div key={f.path} className="flex items-center gap-1 text-xs text-neutral-400">
-                <span className="truncate max-w-[200px]" title={f.path}>
-                  {f.path.split(/[/\\]/).pop()}
-                </span>
+                <Tooltip content={f.path} className="font-mono break-all">
+                  <span className="truncate max-w-[200px]">
+                    {f.path.split(/[/\\]/).pop()}
+                  </span>
+                </Tooltip>
                 <span className="text-neutral-600">{formatBytes(f.size_bytes)}</span>
-                <button
-                  onClick={() => handleDeleteFile(f.path)}
-                  className="text-neutral-600 hover:text-red-400 ml-1"
-                  title="Remove file"
-                >
-                  ×
-                </button>
+                <Tooltip content="Remove file">
+                  <button
+                    onClick={() => handleDeleteFile(f.path)}
+                    className="text-neutral-600 hover:text-red-400 ml-1"
+                  >
+                    ×
+                  </button>
+                </Tooltip>
               </div>
             ))}
           </div>
-          <button
-            onClick={handleDeleteAll}
-            title="Clear all uploaded files"
-            className="text-xs text-neutral-600 hover:text-red-400 px-1"
-          >
-            Clear all
-          </button>
+          <Tooltip content="Clear all uploaded files">
+            <button
+              onClick={handleDeleteAll}
+              className="text-xs text-neutral-600 hover:text-red-400 px-1"
+            >
+              Clear all
+            </button>
+          </Tooltip>
         </div>
       )}
     </div>

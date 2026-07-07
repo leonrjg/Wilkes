@@ -10,7 +10,7 @@ use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::search::grep::GrepSearchProvider;
 use wilkes_core::search::semantic::SemanticSearchProvider;
 use wilkes_core::search::SearchProvider;
-use wilkes_core::types::{FileMatches, SearchMode, SearchQuery, SearchStats};
+use wilkes_core::types::{FileMatches, IndexingConfig, SearchMode, SearchQuery, SearchStats};
 
 /// Handle to a running search. Dropping the handle cancels the search.
 pub struct SearchHandle {
@@ -69,6 +69,7 @@ pub fn start_search(
     query: SearchQuery,
     embedder: Option<Arc<dyn Embedder>>,
     index: Option<Arc<Mutex<Option<SemanticIndex>>>>,
+    indexing: Option<IndexingConfig>,
 ) -> SearchHandle {
     let (tx, rx) = mpsc::channel::<FileMatches>(64);
 
@@ -81,7 +82,11 @@ pub fn start_search(
                 (Some(emb), Some(idx)) => Box::new(SemanticSearchProvider::new(
                     emb,
                     idx,
-                    query.supported_extensions.clone(),
+                    indexing.unwrap_or_else(|| IndexingConfig {
+                        chunk_size: 1000,
+                        chunk_overlap: 200,
+                        supported_extensions: query.supported_extensions.clone(),
+                    }),
                 )),
                 _ => {
                     return vec![
@@ -126,7 +131,7 @@ mod tests {
             supported_extensions: vec!["txt".to_string()],
         };
 
-        let mut handle = start_search(query, None, None);
+        let mut handle = start_search(query, None, None, None);
         let mut matches = Vec::new();
         while let Some(m) = handle.rx.recv().await {
             matches.push(m);
@@ -158,7 +163,7 @@ mod tests {
             supported_extensions: vec![],
         };
 
-        let handle = start_search(query, None, None);
+        let handle = start_search(query, None, None, None);
         let errors = handle.finish().await;
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("Semantic search requires"));
@@ -185,7 +190,7 @@ mod tests {
             supported_extensions: vec!["txt".to_string()],
         };
 
-        let handle = start_search(query, None, None);
+        let handle = start_search(query, None, None, None);
 
         let stats = handle
             .run(|fm| async move {
@@ -220,7 +225,7 @@ mod tests {
             supported_extensions: vec!["txt".to_string()],
         };
 
-        let handle = start_search(query, None, None);
+        let handle = start_search(query, None, None, None);
 
         let stats = handle
             .run(|_fm| async move {
@@ -252,7 +257,7 @@ mod tests {
             supported_extensions: vec!["txt".to_string()],
         };
 
-        let handle = start_search(query, None, None);
+        let handle = start_search(query, None, None, None);
         let errors = handle.finish().await;
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("search failed"));

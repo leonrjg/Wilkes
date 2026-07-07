@@ -14,7 +14,7 @@ The explicit machines covered here are:
 4. `AppContext` startup restore machine
 5. `WorkerRuntime` / `WorkerManager` lifecycle
 6. Worker request mode dispatch
-7. `IndexWatcher` incremental reindex flow
+7. Directory watcher and semantic update flow
 
 ## 1. Semantic Panel Machine
 
@@ -267,20 +267,24 @@ This machine selects which worker behavior to execute for a single request.
 - The Rust IPC struct comments still mention `"build" or "embed"`, but runtime dispatch also supports `"info"`.
 - The Python worker does not implement `build`; unknown modes become errors there.
 
-## 7. IndexWatcher Incremental Reindex Flow
+## 7. Directory Watcher and Semantic Update Flow
 
 Code:
 
-- `crates/core/src/embed/index/watcher.rs`
+- `crates/core/src/directory_watcher.rs`
+- `crates/core/src/embed/index/semantic_updater.rs`
 
-This machine reacts to debounced filesystem events and updates the index incrementally.
+This machine reacts to debounced filesystem events for the selected directory.
+The generic watcher owns folder membership invalidation; semantic indexing is a
+consumer of the resulting batches when semantic state is active.
 
 ### States
 
 | State | Meaning |
 | --- | --- |
-| `Watching` | Watcher is active and waiting for debounced fs events. |
+| `Watching` | Directory watcher is active and waiting for debounced fs events. |
 | `Classifying` | Debounced event batch is being classified into changed vs removed paths. |
+| `InvalidatingFileList` | `file-list-changed` is emitted for the watched root. |
 | `Removing` | Removed files are being deleted from the index. |
 | `Reindexing` | Changed files are being re-extracted and re-embedded. |
 | `WatchError` | A watcher event batch returned an error. |
@@ -291,11 +295,13 @@ This machine reacts to debounced filesystem events and updates the index increme
 | Current state | Event / trigger | Guard | Next state | Notes |
 | --- | --- | --- | --- | --- |
 | `Watching` | Debounced event batch received | None | `Classifying` | Batch may contain mixed change/remove paths. |
-| `Classifying` | Removed paths present | None | `Removing` | Removes stale files from index first. |
+| `Classifying` | Relevant paths present | None | `InvalidatingFileList` | Emits `file-list-changed` for the watched root. |
+| `InvalidatingFileList` | Semantic state inactive | No resident embedder/index | `Watching` | File list refresh still happens; semantic update is skipped. |
+| `InvalidatingFileList` | Removed paths present | Semantic state active | `Removing` | Removes stale files from index first. |
 | `Removing` | Changed paths also present | None | `Reindexing` | Removal and reindex can happen in same batch. |
-| `Classifying` | Changed paths present, none removed | None | `Reindexing` | Emits `on_reindex()` before processing files. |
+| `InvalidatingFileList` | Changed paths present, none removed | Semantic state active | `Reindexing` | Emits `Reindexing` before processing files. |
 | `Classifying` | No relevant paths | None | `Watching` | Batch is ignored. |
-| `Reindexing` | All changed paths processed | None | `Watching` | Emits `on_reindex_done()` after processing batch. |
+| `Reindexing` | All changed paths processed | None | `Watching` | Emits `ReindexingDone` after processing batch. |
 | `Watching` | Watch result is `Err(...)` | None | `WatchError` | Logs watcher error. |
 | `WatchError` | Error handled | None | `Watching` | Watcher thread continues. |
 | Any non-stopped state | `stop()` / drop | None | `Stopped` | Drops debouncer and joins worker thread. |
@@ -303,7 +309,7 @@ This machine reacts to debounced filesystem events and updates the index increme
 ### Notes
 
 - Within `Reindexing`, each path has its own micro-flow: wait for exclusive open, extract, write to index, or log error.
-- `on_reindex` and `on_reindex_done` are the hooks that become manager events in higher layers.
+- `file-list-changed` is independent of semantic manager events; the UI refreshes the file list from this dedicated invalidation event.
 
 ## Cross-machine relationships
 
@@ -312,7 +318,7 @@ These machines are coupled in a few important places:
 - `WorkerRuntime` supports `AppContext` download/build tasks.
 - `AppContext` emits embed and manager events consumed by `SemanticPanel` and `useGlobalEvents`.
 - `useSemanticStore` reacts to completed builds and unlocks deferred semantic searches.
-- `IndexWatcher` produces `Reindexing` / `ReindexingDone`, which drive both UI toast behavior and semantic-store refresh.
+- `DirectoryWatcher` produces `file-list-changed`; semantic batch processing separately produces `Reindexing` / `ReindexingDone`.
 
 ## Suggested follow-ups
 

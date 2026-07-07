@@ -4,6 +4,7 @@ import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import type { SearchQuery } from "../lib/types";
+import { Tooltip } from "./Tooltip";
 
 interface Props {
   sourceSlot: React.ReactNode;
@@ -148,14 +149,14 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     <div className="flex flex-col gap-2 p-3 border-b border-[var(--border-main)] bg-[var(--bg-app)]">
       {/* Top row: toggles + pattern */}
       <div className="flex items-center gap-2">
-        <Toggle title="Regular expression" active={isRegex} onToggle={handleToggleRegex}>
+        <Toggle tooltip="Regular expression" active={isRegex} onToggle={handleToggleRegex}>
           <span className="font-mono text-[10px] w-4">.*</span>
         </Toggle>
-        <Toggle title="Case sensitive" active={caseSensitive} onToggle={handleToggleCaseSensitive}>
+        <Toggle tooltip="Case sensitive" active={caseSensitive} onToggle={handleToggleCaseSensitive}>
           <span className="text-[11px] font-bold tracking-tight">Aa</span>
         </Toggle>
         <Toggle
-          title={semanticReady ? "Semantic search" : "Set up semantic search in Settings"}
+          tooltip={semanticReady ? "Semantic search" : "Set up semantic search in Settings"}
           active={isSemanticMode}
           onToggle={handleToggleSemantic}
           className="px-3 min-w-[100px]"
@@ -205,33 +206,34 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
 
 function Toggle({
   children,
-  title,
+  tooltip,
   active,
   disabled,
   onToggle,
   className = "min-w-[32px]",
 }: {
   children: React.ReactNode;
-  title: string;
+  tooltip: string;
   active: boolean;
   disabled?: boolean;
   onToggle: () => void;
   className?: string;
 }) {
   return (
-    <button
-      onClick={onToggle}
-      title={title}
-      disabled={disabled}
-      className={`h-[32px] px-2 py-1 rounded text-xs font-mono font-semibold transition-all border flex items-center justify-center ${className} ${
-        disabled
-          ? "bg-[var(--bg-active)] text-[var(--text-dim)] border-transparent cursor-not-allowed"
-          : active
-            ? "bg-[var(--accent-blue)] text-white border-[var(--accent-blue)]"
-            : "bg-[var(--bg-active)] text-[var(--text-muted)] border-[var(--border-main)] hover:text-[var(--text-main)] hover:border-[var(--border-strong)]"
-      }`}
-    >
-      {children}
-    </button>
+    <Tooltip content={tooltip}>
+      <button
+        onClick={onToggle}
+        disabled={disabled}
+        className={`h-[32px] px-2 py-1 rounded text-xs font-mono font-semibold transition-all border flex items-center justify-center ${className} ${
+          disabled
+            ? "bg-[var(--bg-active)] text-[var(--text-dim)] border-transparent cursor-not-allowed"
+            : active
+              ? "bg-[var(--accent-blue)] text-white border-[var(--accent-blue)]"
+              : "bg-[var(--bg-active)] text-[var(--text-muted)] border-[var(--border-main)] hover:text-[var(--text-main)] hover:border-[var(--border-strong)]"
+        }`}
+      >
+        {children}
+      </button>
+    </Tooltip>
   );
 }

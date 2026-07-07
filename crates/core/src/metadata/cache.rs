@@ -10,16 +10,30 @@
 //! fingerprint but changes the path, so identity lets callers re-key an existing
 //! row instead of re-extracting identical content.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::types::{DocumentMetadata, SemanticScholarPaper};
+use super::MetadataField;
+use crate::types::{DocumentMetadata, OpenAlexWork, SemanticScholarPaper};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
+const FIELD_TITLE: &str = MetadataField::Title.as_str();
+const FIELD_EXTRACTED_AT_MS: &str = MetadataField::ExtractedAtMs.as_str();
+const FIELD_AUTHOR: &str = MetadataField::Author.as_str();
+const FIELD_DOI: &str = MetadataField::Doi.as_str();
+const FIELD_PUBLICATION_DATE: &str = MetadataField::PublicationDate.as_str();
+const FIELD_PAPER_ID: &str = MetadataField::PaperId.as_str();
+const FIELD_YEAR: &str = MetadataField::Year.as_str();
+const FIELD_VENUE: &str = MetadataField::Venue.as_str();
+const FIELD_CITATION_COUNT: &str = MetadataField::CitationCount.as_str();
+const FIELD_EXTERNAL_IDS_JSON: &str = MetadataField::ExternalIdsJson.as_str();
+const FIELD_CACHED_AT_MS: &str = MetadataField::CachedAtMs.as_str();
 
 fn cache_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("file_metadata.db")
@@ -32,22 +46,40 @@ fn cache_path(data_dir: &Path) -> std::path::PathBuf {
 pub enum MetadataSource {
     File,
     Zotero,
+    SemanticScholar,
+    OpenAlex,
 }
 
 impl MetadataSource {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             MetadataSource::File => "file",
             MetadataSource::Zotero => "zotero",
+            MetadataSource::SemanticScholar => "semantic_scholar",
+            MetadataSource::OpenAlex => "openalex",
         }
     }
 
-    fn from_str(value: &str) -> Self {
+    pub fn from_str(value: &str) -> Self {
         match value {
             "zotero" => MetadataSource::Zotero,
+            "semantic_scholar" => MetadataSource::SemanticScholar,
+            "openalex" => MetadataSource::OpenAlex,
             _ => MetadataSource::File,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MetadataFieldValue {
+    pub source: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedMetadata {
+    pub metadata: DocumentMetadata,
+    pub conflicts: HashMap<String, Vec<MetadataFieldValue>>,
 }
 
 /// A cached row reconstructed for re-processing (e.g. Zotero backfill).
@@ -160,6 +192,8 @@ impl MetadataCache {
         }
         let conn = Connection::open(&path)
             .with_context(|| format!("Failed to open metadata cache at {}", path.display()))?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .context("Failed to configure metadata cache busy timeout")?;
 
         let stored_version: Option<i64> = conn
             .query_row(
@@ -174,7 +208,11 @@ impl MetadataCache {
             .unwrap_or(None);
 
         if stored_version != Some(SCHEMA_VERSION) {
-            conn.execute_batch("DROP TABLE IF EXISTS file_metadata; DROP TABLE IF EXISTS meta;")?;
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS file_metadata;
+                 DROP TABLE IF EXISTS files;
+                 DROP TABLE IF EXISTS meta;",
+            )?;
         }
         Self::create_schema(&conn)?;
 
@@ -189,29 +227,29 @@ impl MetadataCache {
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS file_metadata (
-                path             TEXT PRIMARY KEY,
-                size_bytes       INTEGER NOT NULL,
-                modified_at_ms   INTEGER NOT NULL,
-                extracted_at_ms  INTEGER NOT NULL,
-                source           TEXT NOT NULL DEFAULT 'file',
-                title            TEXT,
-                author           TEXT,
-                doi              TEXT,
-                publication_date TEXT,
-                semantic_scholar_paper_id TEXT,
-                semantic_scholar_title TEXT,
-                semantic_scholar_year INTEGER,
-                semantic_scholar_publication_date TEXT,
-                semantic_scholar_venue TEXT,
-                semantic_scholar_citation_count INTEGER,
-                semantic_scholar_external_ids_json TEXT,
-                semantic_scholar_cached_at_ms INTEGER
+            CREATE TABLE IF NOT EXISTS files (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path      TEXT    NOT NULL UNIQUE,
+                size_bytes     INTEGER NOT NULL,
+                modified_at_ms INTEGER NOT NULL,
+                indexed_at_ms  INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_file_metadata_identity
-                ON file_metadata(size_bytes, modified_at_ms);
-            CREATE INDEX IF NOT EXISTS idx_file_metadata_doi
-                ON file_metadata(doi);
+            CREATE TABLE IF NOT EXISTS file_metadata (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                key     TEXT NOT NULL,
+                value   TEXT NOT NULL,
+                source  TEXT NOT NULL DEFAULT 'file'
+            );
+            CREATE INDEX IF NOT EXISTS idx_files_identity
+                ON files(size_bytes, modified_at_ms);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_file_metadata_file_key_source
+                ON file_metadata(file_id, key, source);
+            CREATE INDEX IF NOT EXISTS idx_file_metadata_source
+                ON file_metadata(source);
+            CREATE INDEX IF NOT EXISTS idx_file_metadata_key_value
+                ON file_metadata(key, value);
+            PRAGMA foreign_keys = ON;
             ",
         )?;
         conn.execute(
@@ -225,6 +263,241 @@ impl MetadataCache {
         path.to_string_lossy().into_owned()
     }
 
+    fn file_id(&self, path: &Path) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM files WHERE file_path = ?1",
+                params![Self::key(path)],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn upsert_metadata_value(
+        &self,
+        file_id: i64,
+        key: &str,
+        value: Option<&str>,
+        source: MetadataSource,
+    ) -> anyhow::Result<()> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(());
+        };
+        self.conn.execute(
+            "INSERT INTO file_metadata (file_id, key, value, source)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_id, key, source) DO UPDATE SET value = excluded.value",
+            params![file_id, key, value, source.as_str()],
+        )?;
+        Ok(())
+    }
+
+    fn upsert_metadata_i64(
+        &self,
+        file_id: i64,
+        key: &str,
+        value: Option<i64>,
+        source: MetadataSource,
+    ) -> anyhow::Result<()> {
+        self.upsert_metadata_value(
+            file_id,
+            key,
+            value.map(|v| v.to_string()).as_deref(),
+            source,
+        )
+    }
+
+    fn metadata_value(
+        &self,
+        file_id: i64,
+        key: &str,
+        source: MetadataSource,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM file_metadata
+                 WHERE file_id = ?1 AND key = ?2 AND source = ?3",
+                params![file_id, key, source.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn source_preference(primary: MetadataSource) -> Vec<MetadataSource> {
+        let mut sources = vec![primary];
+        if !sources.contains(&MetadataSource::File) {
+            sources.push(MetadataSource::File);
+        }
+        for source in [
+            MetadataSource::Zotero,
+            MetadataSource::SemanticScholar,
+            MetadataSource::OpenAlex,
+        ] {
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+        }
+        sources
+    }
+
+    fn preferred_metadata_value(
+        &self,
+        file_id: i64,
+        key: &str,
+        primary: MetadataSource,
+    ) -> anyhow::Result<Option<String>> {
+        for source in Self::source_preference(primary) {
+            if let Some(value) = self.metadata_value(file_id, key, source)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    fn metadata_conflicts(
+        &self,
+        file_id: i64,
+    ) -> anyhow::Result<HashMap<String, Vec<MetadataFieldValue>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, source, value FROM file_metadata
+             WHERE file_id = ?1 AND value <> ''
+             ORDER BY key, source",
+        )?;
+        let rows = stmt
+            .query_map(params![file_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    MetadataFieldValue {
+                        source: row.get(1)?,
+                        value: row.get(2)?,
+                    },
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut by_key: HashMap<String, Vec<MetadataFieldValue>> = HashMap::new();
+        for (key, value) in rows {
+            by_key.entry(key).or_default().push(value);
+        }
+        by_key.retain(|_, values| values.len() > 1);
+        Ok(by_key)
+    }
+
+    fn document_metadata_for_file(
+        &self,
+        file_id: i64,
+        primary: MetadataSource,
+    ) -> anyhow::Result<Option<CachedMetadata>> {
+        let has_metadata: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM file_metadata WHERE file_id = ?1 LIMIT 1",
+                params![file_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if has_metadata.is_none() {
+            return Ok(None);
+        }
+
+        let doi = self.preferred_metadata_value(file_id, FIELD_DOI, primary)?;
+        let paper_id =
+            self.metadata_value(file_id, FIELD_PAPER_ID, MetadataSource::SemanticScholar)?;
+        let semantic_scholar = match paper_id {
+            Some(paper_id) => Some(SemanticScholarPaper {
+                doi: doi.clone().unwrap_or_default(),
+                paper_id,
+                title: self.metadata_value(
+                    file_id,
+                    FIELD_TITLE,
+                    MetadataSource::SemanticScholar,
+                )?,
+                year: self
+                    .metadata_value(file_id, FIELD_YEAR, MetadataSource::SemanticScholar)?
+                    .and_then(|value| value.parse::<i64>().ok()),
+                publication_date: self.metadata_value(
+                    file_id,
+                    FIELD_PUBLICATION_DATE,
+                    MetadataSource::SemanticScholar,
+                )?,
+                venue: self.metadata_value(
+                    file_id,
+                    FIELD_VENUE,
+                    MetadataSource::SemanticScholar,
+                )?,
+                citation_count: self
+                    .metadata_value(
+                        file_id,
+                        FIELD_CITATION_COUNT,
+                        MetadataSource::SemanticScholar,
+                    )?
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or_default(),
+                external_ids: self
+                    .metadata_value(
+                        file_id,
+                        FIELD_EXTERNAL_IDS_JSON,
+                        MetadataSource::SemanticScholar,
+                    )?
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default(),
+                cached_at_ms: self
+                    .metadata_value(file_id, FIELD_CACHED_AT_MS, MetadataSource::SemanticScholar)?
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or_default(),
+            }),
+            None => None,
+        };
+        let openalex_work_id =
+            self.metadata_value(file_id, FIELD_PAPER_ID, MetadataSource::OpenAlex)?;
+        let openalex = match openalex_work_id {
+            Some(work_id) => Some(OpenAlexWork {
+                doi: doi.clone().unwrap_or_default(),
+                work_id,
+                title: self.metadata_value(file_id, FIELD_TITLE, MetadataSource::OpenAlex)?,
+                year: self
+                    .metadata_value(file_id, FIELD_YEAR, MetadataSource::OpenAlex)?
+                    .and_then(|value| value.parse::<i64>().ok()),
+                publication_date: self.metadata_value(
+                    file_id,
+                    FIELD_PUBLICATION_DATE,
+                    MetadataSource::OpenAlex,
+                )?,
+                venue: self.metadata_value(file_id, FIELD_VENUE, MetadataSource::OpenAlex)?,
+                citation_count: self
+                    .metadata_value(file_id, FIELD_CITATION_COUNT, MetadataSource::OpenAlex)?
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or_default(),
+                external_ids: self
+                    .metadata_value(file_id, FIELD_EXTERNAL_IDS_JSON, MetadataSource::OpenAlex)?
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default(),
+                cached_at_ms: self
+                    .metadata_value(file_id, FIELD_CACHED_AT_MS, MetadataSource::OpenAlex)?
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or_default(),
+            }),
+            None => None,
+        };
+
+        Ok(Some(CachedMetadata {
+            metadata: DocumentMetadata {
+                title: self.preferred_metadata_value(file_id, FIELD_TITLE, primary)?,
+                author: self.preferred_metadata_value(file_id, FIELD_AUTHOR, primary)?,
+                doi,
+                created_at: self.preferred_metadata_value(
+                    file_id,
+                    FIELD_PUBLICATION_DATE,
+                    primary,
+                )?,
+                semantic_scholar,
+                openalex,
+            },
+            conflicts: self.metadata_conflicts(file_id)?,
+        }))
+    }
+
     /// Return cached metadata for `path` only if the stored identity still
     /// matches — i.e. the file has not been edited since extraction.
     pub fn get_valid(
@@ -232,26 +505,34 @@ impl MetadataCache {
         path: &Path,
         identity: FileIdentity,
     ) -> anyhow::Result<Option<DocumentMetadata>> {
-        let row = self
+        Ok(self
+            .get_valid_with_primary(path, identity, MetadataSource::Zotero)?
+            .map(|cached| cached.metadata))
+    }
+
+    pub fn get_valid_with_primary(
+        &self,
+        path: &Path,
+        identity: FileIdentity,
+        primary: MetadataSource,
+    ) -> anyhow::Result<Option<CachedMetadata>> {
+        let Some(file_id) = self
             .conn
             .query_row(
-                "SELECT title, author, doi, publication_date,
-                        semantic_scholar_paper_id, semantic_scholar_title,
-                        semantic_scholar_year, semantic_scholar_publication_date,
-                        semantic_scholar_venue, semantic_scholar_citation_count,
-                        semantic_scholar_external_ids_json,
-                        semantic_scholar_cached_at_ms
-                 FROM file_metadata
-                 WHERE path = ?1 AND size_bytes = ?2 AND modified_at_ms = ?3",
+                "SELECT id FROM files
+                 WHERE file_path = ?1 AND size_bytes = ?2 AND modified_at_ms = ?3",
                 params![
                     Self::key(path),
                     identity.size_bytes,
                     identity.modified_at_ms
                 ],
-                |row| document_metadata_from_row(row),
+                |row| row.get(0),
             )
-            .optional()?;
-        Ok(row)
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        self.document_metadata_for_file(file_id, primary)
     }
 
     /// Find the prior path of a file that was renamed *to* `current`: the unique
@@ -267,7 +548,7 @@ impl MetadataCache {
         identity: FileIdentity,
     ) -> anyhow::Result<Option<PathBuf>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path FROM file_metadata
+            "SELECT file_path FROM files
              WHERE size_bytes = ?1 AND modified_at_ms = ?2",
         )?;
         let candidates = stmt
@@ -306,7 +587,7 @@ impl MetadataCache {
         preferred_roots: &[PathBuf],
     ) -> anyhow::Result<Option<PathBuf>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path FROM file_metadata
+            "SELECT file_path FROM files
              WHERE size_bytes = ?1 AND modified_at_ms = ?2",
         )?;
         let candidates = stmt
@@ -338,11 +619,11 @@ impl MetadataCache {
     pub fn rename(&self, old: &Path, new: &Path) -> anyhow::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "DELETE FROM file_metadata WHERE path = ?1",
+            "DELETE FROM files WHERE file_path = ?1",
             params![Self::key(new)],
         )?;
         tx.execute(
-            "UPDATE file_metadata SET path = ?1 WHERE path = ?2",
+            "UPDATE files SET file_path = ?1 WHERE file_path = ?2",
             params![Self::key(new), Self::key(old)],
         )?;
         tx.commit()?;
@@ -380,78 +661,96 @@ impl MetadataCache {
             .ok()
             .and_then(|d| i64::try_from(d.as_millis()).ok())
             .unwrap_or(0);
-        // Per-field merge expression: when the existing row is Zotero and the
-        // incoming write is File, the stored (Zotero) value wins and File may
-        // only backfill a blank; otherwise the incoming value wins but a blank
-        // incoming falls back to what is already stored. `NULLIF(x, '')` folds
-        // blank strings into the same "absent" case as SQL NULL.
         self.conn.execute(
-            "INSERT INTO file_metadata
-                (path, size_bytes, modified_at_ms, extracted_at_ms, source,
-                 title, author, doi, publication_date,
-                 semantic_scholar_paper_id, semantic_scholar_title,
-                 semantic_scholar_year, semantic_scholar_publication_date,
-                 semantic_scholar_venue, semantic_scholar_citation_count,
-                 semantic_scholar_external_ids_json, semantic_scholar_cached_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
-             ON CONFLICT(path) DO UPDATE SET
-                size_bytes      = excluded.size_bytes,
-                modified_at_ms  = excluded.modified_at_ms,
-                extracted_at_ms = excluded.extracted_at_ms,
-                source = CASE
-                    WHEN excluded.source = 'zotero' OR file_metadata.source = 'zotero'
-                    THEN 'zotero' ELSE 'file' END,
-                title = CASE
-                    WHEN file_metadata.source = 'zotero' AND excluded.source = 'file'
-                    THEN COALESCE(NULLIF(file_metadata.title, ''), NULLIF(excluded.title, ''))
-                    ELSE COALESCE(NULLIF(excluded.title, ''), NULLIF(file_metadata.title, '')) END,
-                author = CASE
-                    WHEN file_metadata.source = 'zotero' AND excluded.source = 'file'
-                    THEN COALESCE(NULLIF(file_metadata.author, ''), NULLIF(excluded.author, ''))
-                    ELSE COALESCE(NULLIF(excluded.author, ''), NULLIF(file_metadata.author, '')) END,
-                doi = CASE
-                    WHEN file_metadata.source = 'zotero' AND excluded.source = 'file'
-                    THEN COALESCE(NULLIF(file_metadata.doi, ''), NULLIF(excluded.doi, ''))
-                    ELSE COALESCE(NULLIF(excluded.doi, ''), NULLIF(file_metadata.doi, '')) END,
-                publication_date = CASE
-                    WHEN file_metadata.source = 'zotero' AND excluded.source = 'file'
-                    THEN COALESCE(NULLIF(file_metadata.publication_date, ''), NULLIF(excluded.publication_date, ''))
-                    ELSE COALESCE(NULLIF(excluded.publication_date, ''), NULLIF(file_metadata.publication_date, '')) END,
-                semantic_scholar_paper_id = COALESCE(NULLIF(excluded.semantic_scholar_paper_id, ''), NULLIF(file_metadata.semantic_scholar_paper_id, '')),
-                semantic_scholar_title = COALESCE(NULLIF(excluded.semantic_scholar_title, ''), NULLIF(file_metadata.semantic_scholar_title, '')),
-                semantic_scholar_year = COALESCE(excluded.semantic_scholar_year, file_metadata.semantic_scholar_year),
-                semantic_scholar_publication_date = COALESCE(NULLIF(excluded.semantic_scholar_publication_date, ''), NULLIF(file_metadata.semantic_scholar_publication_date, '')),
-                semantic_scholar_venue = COALESCE(NULLIF(excluded.semantic_scholar_venue, ''), NULLIF(file_metadata.semantic_scholar_venue, '')),
-                semantic_scholar_citation_count = COALESCE(excluded.semantic_scholar_citation_count, file_metadata.semantic_scholar_citation_count),
-                semantic_scholar_external_ids_json = COALESCE(NULLIF(excluded.semantic_scholar_external_ids_json, ''), NULLIF(file_metadata.semantic_scholar_external_ids_json, '')),
-                semantic_scholar_cached_at_ms = COALESCE(excluded.semantic_scholar_cached_at_ms, file_metadata.semantic_scholar_cached_at_ms)",
+            "INSERT INTO files (file_path, size_bytes, modified_at_ms, indexed_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_path) DO UPDATE SET
+                size_bytes = excluded.size_bytes,
+                modified_at_ms = excluded.modified_at_ms,
+                indexed_at_ms = excluded.indexed_at_ms",
             params![
                 Self::key(path),
                 identity.size_bytes,
                 identity.modified_at_ms,
-                now_ms,
-                source.as_str(),
-                metadata.title,
-                metadata.author,
-                metadata.doi,
-                metadata.created_at,
-                metadata.semantic_scholar.as_ref().map(|p| &p.paper_id),
-                metadata.semantic_scholar.as_ref().and_then(|p| p.title.as_ref()),
-                metadata.semantic_scholar.as_ref().and_then(|p| p.year),
-                metadata
-                    .semantic_scholar
-                    .as_ref()
-                    .and_then(|p| p.publication_date.as_ref()),
-                metadata.semantic_scholar.as_ref().and_then(|p| p.venue.as_ref()),
-                metadata.semantic_scholar.as_ref().map(|p| p.citation_count),
-                metadata
-                    .semantic_scholar
-                    .as_ref()
-                    .map(|p| serde_json::to_string(&p.external_ids))
-                    .transpose()?,
-                metadata.semantic_scholar.as_ref().map(|p| p.cached_at_ms),
+                now_ms
             ],
         )?;
+        let file_id = self
+            .file_id(path)?
+            .context("metadata cache file row missing after upsert")?;
+
+        self.upsert_metadata_i64(file_id, FIELD_EXTRACTED_AT_MS, Some(now_ms), source)?;
+        if !matches!(
+            source,
+            MetadataSource::SemanticScholar | MetadataSource::OpenAlex
+        ) {
+            self.upsert_metadata_value(file_id, FIELD_TITLE, metadata.title.as_deref(), source)?;
+            self.upsert_metadata_value(file_id, FIELD_AUTHOR, metadata.author.as_deref(), source)?;
+            self.upsert_metadata_value(file_id, FIELD_DOI, metadata.doi.as_deref(), source)?;
+            self.upsert_metadata_value(
+                file_id,
+                FIELD_PUBLICATION_DATE,
+                metadata.created_at.as_deref(),
+                source,
+            )?;
+        }
+        if let Some(paper) = metadata.semantic_scholar.as_ref() {
+            self.upsert_metadata_value(file_id, FIELD_DOI, Some(&paper.doi), source)?;
+            self.upsert_metadata_value(file_id, FIELD_PAPER_ID, Some(&paper.paper_id), source)?;
+            self.upsert_metadata_value(file_id, FIELD_TITLE, paper.title.as_deref(), source)?;
+            self.upsert_metadata_i64(file_id, FIELD_YEAR, paper.year, source)?;
+            self.upsert_metadata_value(
+                file_id,
+                FIELD_PUBLICATION_DATE,
+                paper.publication_date.as_deref(),
+                source,
+            )?;
+            self.upsert_metadata_value(file_id, FIELD_VENUE, paper.venue.as_deref(), source)?;
+            self.upsert_metadata_i64(
+                file_id,
+                FIELD_CITATION_COUNT,
+                Some(paper.citation_count),
+                source,
+            )?;
+            self.upsert_metadata_value(
+                file_id,
+                FIELD_EXTERNAL_IDS_JSON,
+                Some(&serde_json::to_string(&paper.external_ids)?),
+                source,
+            )?;
+            self.upsert_metadata_i64(
+                file_id,
+                FIELD_CACHED_AT_MS,
+                Some(paper.cached_at_ms),
+                source,
+            )?;
+        }
+        if let Some(work) = metadata.openalex.as_ref() {
+            self.upsert_metadata_value(file_id, FIELD_DOI, Some(&work.doi), source)?;
+            self.upsert_metadata_value(file_id, FIELD_PAPER_ID, Some(&work.work_id), source)?;
+            self.upsert_metadata_value(file_id, FIELD_TITLE, work.title.as_deref(), source)?;
+            self.upsert_metadata_i64(file_id, FIELD_YEAR, work.year, source)?;
+            self.upsert_metadata_value(
+                file_id,
+                FIELD_PUBLICATION_DATE,
+                work.publication_date.as_deref(),
+                source,
+            )?;
+            self.upsert_metadata_value(file_id, FIELD_VENUE, work.venue.as_deref(), source)?;
+            self.upsert_metadata_i64(
+                file_id,
+                FIELD_CITATION_COUNT,
+                Some(work.citation_count),
+                source,
+            )?;
+            self.upsert_metadata_value(
+                file_id,
+                FIELD_EXTERNAL_IDS_JSON,
+                Some(&serde_json::to_string(&work.external_ids)?),
+                source,
+            )?;
+            self.upsert_metadata_i64(file_id, FIELD_CACHED_AT_MS, Some(work.cached_at_ms), source)?;
+        }
         Ok(())
     }
 
@@ -459,54 +758,122 @@ impl MetadataCache {
     /// upgrading `File` rows to `Zotero` after the integration is enabled).
     pub fn list_by_source(&self, source: MetadataSource) -> anyhow::Result<Vec<CachedRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, size_bytes, modified_at_ms, source, title, author, doi, publication_date,
-                    semantic_scholar_paper_id, semantic_scholar_title,
-                    semantic_scholar_year, semantic_scholar_publication_date,
-                    semantic_scholar_venue, semantic_scholar_citation_count,
-                    semantic_scholar_external_ids_json,
-                    semantic_scholar_cached_at_ms
-             FROM file_metadata WHERE source = ?1",
+            "SELECT DISTINCT f.id, f.file_path, f.size_bytes, f.modified_at_ms
+             FROM files f
+             JOIN file_metadata m ON m.file_id = f.id
+             WHERE m.source = ?1",
         )?;
         let rows = stmt
             .query_map(params![source.as_str()], |row| {
-                let path: String = row.get(0)?;
-                Ok(CachedRow {
-                    path: std::path::PathBuf::from(path),
-                    identity: FileIdentity {
-                        size_bytes: row.get(1)?,
-                        modified_at_ms: row.get(2)?,
+                let path: String = row.get(1)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    std::path::PathBuf::from(path),
+                    FileIdentity {
+                        size_bytes: row.get(2)?,
+                        modified_at_ms: row.get(3)?,
                     },
-                    source: MetadataSource::from_str(&row.get::<_, String>(3)?),
-                    metadata: document_metadata_from_row_offset(row, 4)?,
-                })
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        rows.into_iter()
+            .map(|(file_id, path, identity)| {
+                Ok(CachedRow {
+                    path,
+                    identity,
+                    source,
+                    metadata: self
+                        .document_metadata_for_file(file_id, MetadataSource::Zotero)?
+                        .map(|cached| cached.metadata)
+                        .unwrap_or_default(),
+                })
+            })
+            .collect()
     }
 
     /// Drop all Zotero-sourced rows. Used when the integration is disabled so
     /// those files revert to file-based extraction on the next listing.
     pub fn invalidate_zotero(&self) -> anyhow::Result<usize> {
-        Ok(self.conn.execute(
+        let affected_files: usize = self.conn.query_row(
+            "SELECT COUNT(DISTINCT file_id) FROM file_metadata WHERE source = ?1",
+            params![MetadataSource::Zotero.as_str()],
+            |row| row.get(0),
+        )?;
+        self.conn.execute(
             "DELETE FROM file_metadata WHERE source = ?1",
             params![MetadataSource::Zotero.as_str()],
-        )?)
+        )?;
+        Ok(affected_files)
     }
 
     pub fn invalidate_semantic_scholar(&self) -> anyhow::Result<usize> {
-        Ok(self.conn.execute(
-            "UPDATE file_metadata SET
-                semantic_scholar_paper_id = NULL,
-                semantic_scholar_title = NULL,
-                semantic_scholar_year = NULL,
-                semantic_scholar_publication_date = NULL,
-                semantic_scholar_venue = NULL,
-                semantic_scholar_citation_count = NULL,
-                semantic_scholar_external_ids_json = NULL,
-                semantic_scholar_cached_at_ms = NULL
-             WHERE semantic_scholar_paper_id IS NOT NULL",
-            [],
-        )?)
+        let affected_files: usize = self.conn.query_row(
+            "SELECT COUNT(DISTINCT file_id) FROM file_metadata
+             WHERE source = ?1 AND key IN (?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                MetadataSource::SemanticScholar.as_str(),
+                FIELD_PAPER_ID,
+                FIELD_TITLE,
+                FIELD_YEAR,
+                FIELD_PUBLICATION_DATE,
+                FIELD_VENUE,
+                FIELD_CITATION_COUNT,
+                FIELD_EXTERNAL_IDS_JSON,
+                FIELD_CACHED_AT_MS,
+            ],
+            |row| row.get(0),
+        )?;
+        self.conn.execute(
+            "DELETE FROM file_metadata
+             WHERE source = ?1 AND key IN (?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                MetadataSource::SemanticScholar.as_str(),
+                FIELD_PAPER_ID,
+                FIELD_TITLE,
+                FIELD_YEAR,
+                FIELD_PUBLICATION_DATE,
+                FIELD_VENUE,
+                FIELD_CITATION_COUNT,
+                FIELD_EXTERNAL_IDS_JSON,
+                FIELD_CACHED_AT_MS,
+            ],
+        )?;
+        Ok(affected_files)
+    }
+
+    pub fn invalidate_openalex(&self) -> anyhow::Result<usize> {
+        let affected_files: usize = self.conn.query_row(
+            "SELECT COUNT(DISTINCT file_id) FROM file_metadata
+             WHERE source = ?1 AND key IN (?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                MetadataSource::OpenAlex.as_str(),
+                FIELD_PAPER_ID,
+                FIELD_TITLE,
+                FIELD_YEAR,
+                FIELD_PUBLICATION_DATE,
+                FIELD_VENUE,
+                FIELD_CITATION_COUNT,
+                FIELD_EXTERNAL_IDS_JSON,
+                FIELD_CACHED_AT_MS,
+            ],
+            |row| row.get(0),
+        )?;
+        self.conn.execute(
+            "DELETE FROM file_metadata
+             WHERE source = ?1 AND key IN (?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                MetadataSource::OpenAlex.as_str(),
+                FIELD_PAPER_ID,
+                FIELD_TITLE,
+                FIELD_YEAR,
+                FIELD_PUBLICATION_DATE,
+                FIELD_VENUE,
+                FIELD_CITATION_COUNT,
+                FIELD_EXTERNAL_IDS_JSON,
+                FIELD_CACHED_AT_MS,
+            ],
+        )?;
+        Ok(affected_files)
     }
 
     /// Every cached path, regardless of provenance. Backs the manual "refresh
@@ -514,7 +881,7 @@ impl MetadataCache {
     /// through [`upsert`](Self::upsert)) rather than clearing and repopulating —
     /// so no row is ever deleted along the way.
     pub fn all_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
-        let mut stmt = self.conn.prepare("SELECT path FROM file_metadata")?;
+        let mut stmt = self.conn.prepare("SELECT file_path FROM files")?;
         let paths = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .map(|r| r.map(PathBuf::from))
@@ -525,7 +892,7 @@ impl MetadataCache {
     /// Remove any cached row for `path`.
     pub fn remove(&self, path: &Path) -> anyhow::Result<()> {
         self.conn.execute(
-            "DELETE FROM file_metadata WHERE path = ?1",
+            "DELETE FROM files WHERE file_path = ?1",
             params![Self::key(path)],
         )?;
         Ok(())
@@ -538,103 +905,191 @@ impl MetadataCache {
         let row = self
             .conn
             .query_row(
-                "SELECT semantic_scholar_paper_id, semantic_scholar_title,
-                        semantic_scholar_year, semantic_scholar_publication_date,
-                        semantic_scholar_venue, semantic_scholar_citation_count,
-                        semantic_scholar_external_ids_json,
-                        semantic_scholar_cached_at_ms
-                 FROM file_metadata
-                 WHERE doi = ?1 AND semantic_scholar_paper_id IS NOT NULL
-                 ORDER BY semantic_scholar_cached_at_ms DESC
+                "SELECT f.id
+                 FROM files f
+                 JOIN file_metadata doi
+                    ON doi.file_id = f.id AND doi.key = ?1 AND doi.value = ?2
+                 JOIN file_metadata paper
+                    ON paper.file_id = f.id AND paper.key = ?3 AND paper.source = ?4
+                 LEFT JOIN file_metadata cached
+                    ON cached.file_id = f.id AND cached.key = ?5 AND cached.source = ?4
+                 ORDER BY CAST(cached.value AS INTEGER) DESC
                  LIMIT 1",
-                params![doi],
-                |row| {
-                    Ok(SemanticScholarPaper {
-                        doi: doi.to_string(),
-                        paper_id: row.get(0)?,
-                        title: row.get(1)?,
-                        year: row.get(2)?,
-                        publication_date: row.get(3)?,
-                        venue: row.get(4)?,
-                        citation_count: row.get(5)?,
-                        external_ids: row
-                            .get::<_, Option<String>>(6)?
-                            .and_then(|json| serde_json::from_str(&json).ok())
-                            .unwrap_or_default(),
-                        cached_at_ms: row.get(7)?,
-                    })
-                },
+                params![
+                    FIELD_DOI,
+                    doi,
+                    FIELD_PAPER_ID,
+                    MetadataSource::SemanticScholar.as_str(),
+                    FIELD_CACHED_AT_MS
+                ],
+                |row| row.get::<_, i64>(0),
             )
             .optional()?;
-        Ok(row)
+        Ok(row.and_then(|file_id| {
+            self.document_metadata_for_file(file_id, MetadataSource::SemanticScholar)
+                .ok()
+                .flatten()
+                .and_then(|cached| cached.metadata.semantic_scholar)
+        }))
     }
 
     pub fn upsert_semantic_scholar_by_doi(
         &self,
         paper: &SemanticScholarPaper,
     ) -> anyhow::Result<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT file_id FROM file_metadata
+             WHERE key = ?1 AND value = ?2",
+        )?;
+        let file_ids = stmt
+            .query_map(params![FIELD_DOI, paper.doi], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
         let external_ids_json = serde_json::to_string(&paper.external_ids)?;
-        Ok(self.conn.execute(
-            "UPDATE file_metadata SET
-                semantic_scholar_paper_id = ?2,
-                semantic_scholar_title = ?3,
-                semantic_scholar_year = ?4,
-                semantic_scholar_publication_date = ?5,
-                semantic_scholar_venue = ?6,
-                semantic_scholar_citation_count = ?7,
-                semantic_scholar_external_ids_json = ?8,
-                semantic_scholar_cached_at_ms = ?9
-             WHERE doi = ?1",
-            params![
-                paper.doi,
-                paper.paper_id,
-                paper.title,
+        for file_id in &file_ids {
+            self.upsert_metadata_value(
+                *file_id,
+                FIELD_PAPER_ID,
+                Some(&paper.paper_id),
+                MetadataSource::SemanticScholar,
+            )?;
+            self.upsert_metadata_value(
+                *file_id,
+                FIELD_TITLE,
+                paper.title.as_deref(),
+                MetadataSource::SemanticScholar,
+            )?;
+            self.upsert_metadata_i64(
+                *file_id,
+                FIELD_YEAR,
                 paper.year,
-                paper.publication_date,
-                paper.venue,
-                paper.citation_count,
-                external_ids_json,
-                paper.cached_at_ms,
-            ],
-        )?)
+                MetadataSource::SemanticScholar,
+            )?;
+            self.upsert_metadata_value(
+                *file_id,
+                FIELD_PUBLICATION_DATE,
+                paper.publication_date.as_deref(),
+                MetadataSource::SemanticScholar,
+            )?;
+            self.upsert_metadata_value(
+                *file_id,
+                FIELD_VENUE,
+                paper.venue.as_deref(),
+                MetadataSource::SemanticScholar,
+            )?;
+            self.upsert_metadata_i64(
+                *file_id,
+                FIELD_CITATION_COUNT,
+                Some(paper.citation_count),
+                MetadataSource::SemanticScholar,
+            )?;
+            self.upsert_metadata_value(
+                *file_id,
+                FIELD_EXTERNAL_IDS_JSON,
+                Some(&external_ids_json),
+                MetadataSource::SemanticScholar,
+            )?;
+            self.upsert_metadata_i64(
+                *file_id,
+                FIELD_CACHED_AT_MS,
+                Some(paper.cached_at_ms),
+                MetadataSource::SemanticScholar,
+            )?;
+        }
+        Ok(file_ids.len())
     }
-}
 
-fn document_metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentMetadata> {
-    document_metadata_from_row_offset(row, 0)
-}
+    pub fn get_openalex_by_doi(&self, doi: &str) -> anyhow::Result<Option<OpenAlexWork>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT f.id
+                 FROM files f
+                 JOIN file_metadata doi
+                    ON doi.file_id = f.id AND doi.key = ?1 AND doi.value = ?2
+                 JOIN file_metadata work
+                    ON work.file_id = f.id AND work.key = ?3 AND work.source = ?4
+                 LEFT JOIN file_metadata cached
+                    ON cached.file_id = f.id AND cached.key = ?5 AND cached.source = ?4
+                 ORDER BY CAST(cached.value AS INTEGER) DESC
+                 LIMIT 1",
+                params![
+                    FIELD_DOI,
+                    doi,
+                    FIELD_PAPER_ID,
+                    MetadataSource::OpenAlex.as_str(),
+                    FIELD_CACHED_AT_MS
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(row.and_then(|file_id| {
+            self.document_metadata_for_file(file_id, MetadataSource::OpenAlex)
+                .ok()
+                .flatten()
+                .and_then(|cached| cached.metadata.openalex)
+        }))
+    }
 
-fn document_metadata_from_row_offset(
-    row: &rusqlite::Row<'_>,
-    offset: usize,
-) -> rusqlite::Result<DocumentMetadata> {
-    let doi: Option<String> = row.get(offset + 2)?;
-    let paper_id: Option<String> = row.get(offset + 4)?;
-    let semantic_scholar = match paper_id {
-        Some(paper_id) => Some(SemanticScholarPaper {
-            doi: doi.clone().unwrap_or_default(),
-            paper_id,
-            title: row.get(offset + 5)?,
-            year: row.get(offset + 6)?,
-            publication_date: row.get(offset + 7)?,
-            venue: row.get(offset + 8)?,
-            citation_count: row.get(offset + 9)?,
-            external_ids: row
-                .get::<_, Option<String>>(offset + 10)?
-                .and_then(|json| serde_json::from_str(&json).ok())
-                .unwrap_or_default(),
-            cached_at_ms: row.get(offset + 11)?,
-        }),
-        None => None,
-    };
+    pub fn upsert_openalex_by_doi(&self, work: &OpenAlexWork) -> anyhow::Result<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT file_id FROM file_metadata
+             WHERE key = ?1 AND value = ?2",
+        )?;
+        let file_ids = stmt
+            .query_map(params![FIELD_DOI, work.doi], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
 
-    Ok(DocumentMetadata {
-        title: row.get(offset)?,
-        author: row.get(offset + 1)?,
-        doi,
-        created_at: row.get(offset + 3)?,
-        semantic_scholar,
-    })
+        let external_ids_json = serde_json::to_string(&work.external_ids)?;
+        for file_id in &file_ids {
+            self.upsert_metadata_value(
+                *file_id,
+                FIELD_PAPER_ID,
+                Some(&work.work_id),
+                MetadataSource::OpenAlex,
+            )?;
+            self.upsert_metadata_value(
+                *file_id,
+                FIELD_TITLE,
+                work.title.as_deref(),
+                MetadataSource::OpenAlex,
+            )?;
+            self.upsert_metadata_i64(*file_id, FIELD_YEAR, work.year, MetadataSource::OpenAlex)?;
+            self.upsert_metadata_value(
+                *file_id,
+                FIELD_PUBLICATION_DATE,
+                work.publication_date.as_deref(),
+                MetadataSource::OpenAlex,
+            )?;
+            self.upsert_metadata_value(
+                *file_id,
+                FIELD_VENUE,
+                work.venue.as_deref(),
+                MetadataSource::OpenAlex,
+            )?;
+            self.upsert_metadata_i64(
+                *file_id,
+                FIELD_CITATION_COUNT,
+                Some(work.citation_count),
+                MetadataSource::OpenAlex,
+            )?;
+            self.upsert_metadata_value(
+                *file_id,
+                FIELD_EXTERNAL_IDS_JSON,
+                Some(&external_ids_json),
+                MetadataSource::OpenAlex,
+            )?;
+            self.upsert_metadata_i64(
+                *file_id,
+                FIELD_CACHED_AT_MS,
+                Some(work.cached_at_ms),
+                MetadataSource::OpenAlex,
+            )?;
+        }
+        Ok(file_ids.len())
+    }
 }
 
 #[cfg(test)]
@@ -667,6 +1122,20 @@ mod tests {
             .upsert(path, id, &sample(), MetadataSource::File)
             .unwrap();
         assert_eq!(cache.get_valid(path, id).unwrap(), Some(sample()));
+    }
+
+    #[test]
+    fn test_open_waits_for_transient_database_lock() {
+        let dir = tempdir().unwrap();
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        cache.conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let path = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || MetadataCache::open(&path));
+        std::thread::sleep(Duration::from_millis(100));
+
+        cache.conn.execute_batch("COMMIT").unwrap();
+        handle.join().unwrap().unwrap();
     }
 
     #[test]
@@ -905,6 +1374,16 @@ mod tests {
                 &DocumentMetadata {
                     title: Some("Title".into()),
                     doi: Some("10.1145/1".into()),
+                    ..DocumentMetadata::default()
+                },
+                MetadataSource::File,
+            )
+            .unwrap();
+        cache
+            .upsert(
+                path,
+                id,
+                &DocumentMetadata {
                     semantic_scholar: Some(SemanticScholarPaper {
                         doi: "10.1145/1".into(),
                         paper_id: "abc".into(),
@@ -918,7 +1397,7 @@ mod tests {
                     }),
                     ..DocumentMetadata::default()
                 },
-                MetadataSource::File,
+                MetadataSource::SemanticScholar,
             )
             .unwrap();
 
@@ -1055,6 +1534,71 @@ mod tests {
     }
 
     #[test]
+    fn test_primary_source_selects_display_value_and_reports_conflicts() {
+        let dir = tempdir().unwrap();
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        let id = FileIdentity {
+            size_bytes: 1,
+            modified_at_ms: 1,
+        };
+        let path = Path::new("/doc.pdf");
+
+        cache
+            .upsert(
+                path,
+                id,
+                &DocumentMetadata {
+                    title: Some("File Title".into()),
+                    ..DocumentMetadata::default()
+                },
+                MetadataSource::File,
+            )
+            .unwrap();
+        cache
+            .upsert(
+                path,
+                id,
+                &DocumentMetadata {
+                    title: Some("Zotero Title".into()),
+                    ..DocumentMetadata::default()
+                },
+                MetadataSource::Zotero,
+            )
+            .unwrap();
+
+        let file_primary = cache
+            .get_valid_with_primary(path, id, MetadataSource::File)
+            .unwrap()
+            .unwrap();
+        assert_eq!(file_primary.metadata.title.as_deref(), Some("File Title"));
+        assert_eq!(
+            file_primary
+                .conflicts
+                .get(FIELD_TITLE)
+                .map(|values| values.len()),
+            Some(2)
+        );
+
+        let zotero_primary = cache
+            .get_valid_with_primary(path, id, MetadataSource::Zotero)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            zotero_primary.metadata.title.as_deref(),
+            Some("Zotero Title")
+        );
+
+        let missing_primary = cache
+            .get_valid_with_primary(path, id, MetadataSource::OpenAlex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            missing_primary.metadata.title.as_deref(),
+            Some("File Title")
+        );
+    }
+
+    #[test]
     fn test_schema_rebuild_on_version_mismatch() {
         let dir = tempdir().unwrap();
         {
@@ -1109,8 +1653,33 @@ mod tests {
         let path = Path::new("/doc.pdf");
 
         cache
-            .upsert(path, identity, &metadata, MetadataSource::File)
+            .upsert(
+                path,
+                identity,
+                &DocumentMetadata {
+                    doi: Some("10.1145/1".into()),
+                    ..DocumentMetadata::default()
+                },
+                MetadataSource::File,
+            )
             .unwrap();
+        cache
+            .upsert(path, identity, &metadata, MetadataSource::SemanticScholar)
+            .unwrap();
+        let semantic_keys = cache
+            .conn
+            .prepare("SELECT key FROM file_metadata WHERE source = ?1 ORDER BY key")
+            .unwrap()
+            .query_map(params![MetadataSource::SemanticScholar.as_str()], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(semantic_keys
+            .iter()
+            .all(|key| !key.starts_with("semantic_scholar_")));
+        assert!(semantic_keys.contains(&FIELD_CITATION_COUNT.to_string()));
 
         assert_eq!(
             cache

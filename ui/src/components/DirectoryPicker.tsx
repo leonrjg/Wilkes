@@ -6,6 +6,7 @@ import { ContextMenu, useContextMenu } from "./ContextMenu";
 import { api, isTauri } from "../services";
 import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileActions";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { Tooltip } from "./Tooltip";
 
 interface Props {
   directory: string;
@@ -59,14 +60,15 @@ export default function DirectoryPicker({
   return (
     <div className="flex items-center gap-1 min-w-0 w-full">
       <div className="flex h-6 items-center gap-0.5 bg-[var(--bg-active)] rounded overflow-hidden">
-        <button
-          onClick={onPickDirectory}
-          title={directory || "Choose directory"}
-          className="h-full text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] px-3 flex-shrink-0 flex items-center gap-1.5"
-        >
-          <Folder size={12} />
-          <span>Open folder</span>
-        </button>
+        <Tooltip content={directory || "Choose directory"}>
+          <button
+            onClick={onPickDirectory}
+            className="h-full text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] px-3 flex-shrink-0 flex items-center gap-1.5"
+          >
+            <Folder size={12} />
+            <span>Open folder</span>
+          </button>
+        </Tooltip>
       </div>
 
       {/* Folders list (Favorites + History) */}
@@ -94,44 +96,47 @@ export default function DirectoryPicker({
                   })}
               >
                 {onForgetDirectory && (
-                  <button
-                    onClick={async (e) => {
-                      e.stopPropagation();
-                      const confirmed = await confirmDialog(`Remove "${shortPath(b)}" from your history?`);
-                      if (confirmed) onForgetDirectory(b);
-                    }}
-                    title="Remove from history"
-                    className="h-full text-[10px] pl-1.5 pr-1 text-[var(--text-dim)] hover:text-[var(--text-error)] transition-colors"
-                  >
-                    <X size={12} />
-                  </button>
+                  <Tooltip content="Remove from history">
+                    <button
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        const confirmed = await confirmDialog(`Remove "${shortPath(b)}" from your history?`);
+                        if (confirmed) onForgetDirectory(b);
+                      }}
+                      className="h-full text-[10px] pl-1.5 pr-1 text-[var(--text-dim)] hover:text-[var(--text-error)] transition-colors"
+                    >
+                      <X size={12} />
+                    </button>
+                  </Tooltip>
                 )}
-                <button
-                  onClick={() => onChange(b)}
-                  title={b}
-                  className={`h-full text-xs px-2 flex-shrink-0 truncate max-w-[100px] transition-colors ${
-                    active
-                      ? "text-[var(--text-main)] font-bold"
-                      : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
-                  }`}
-                >
-                  {shortPath(b).split("/").pop() || shortPath(b)}
-                </button>
-                {onFavoriteAdd && onFavoriteRemove && (
+                <Tooltip content={b} className="font-mono break-all">
                   <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      favorite ? onFavoriteRemove(b) : onFavoriteAdd(b);
-                    }}
-                    title={favorite ? "Remove favorite" : "Favorite this directory"}
-                    className={`h-full text-[10px] px-1.5 transition-colors ${
-                      favorite
-                        ? "text-[var(--accent-blue)]"
-                        : "text-[var(--text-dim)] hover:text-[var(--accent-blue)]"
+                    onClick={() => onChange(b)}
+                    className={`h-full text-xs px-2 flex-shrink-0 truncate max-w-[100px] transition-colors ${
+                      active
+                        ? "text-[var(--text-main)] font-bold"
+                        : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
                     }`}
                   >
-                    <Star size={10} fill={favorite ? "currentColor" : "none"} />
+                    {shortPath(b).split("/").pop() || shortPath(b)}
                   </button>
+                </Tooltip>
+                {onFavoriteAdd && onFavoriteRemove && (
+                  <Tooltip content={favorite ? "Remove favorite" : "Favorite this directory"}>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        favorite ? onFavoriteRemove(b) : onFavoriteAdd(b);
+                      }}
+                      className={`h-full text-[10px] px-1.5 transition-colors ${
+                        favorite
+                          ? "text-[var(--accent-blue)]"
+                          : "text-[var(--text-dim)] hover:text-[var(--accent-blue)]"
+                      }`}
+                    >
+                      <Star size={10} fill={favorite ? "currentColor" : "none"} />
+                    </button>
+                  </Tooltip>
                 )}
               </div>
             );

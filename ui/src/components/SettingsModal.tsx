@@ -16,12 +16,19 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import { indentWithTab } from "@codemirror/commands";
 import {Tool} from "react-feather";
 import { isTauri } from "../services";
-import type { AgentBackend } from "../lib/types";
+import type { AgentBackend, MetadataSourcePreference } from "../lib/types";
 
 const CHAT_BACKENDS: { value: AgentBackend; label: string }[] = [
   { value: "ClaudeCode", label: "Claude Code" },
   { value: "Codex", label: "Codex" },
   { value: "Nanocoder", label: "Nanocoder" },
+];
+
+const METADATA_SOURCES: { value: MetadataSourcePreference; label: string }[] = [
+  { value: "file", label: "File" },
+  { value: "zotero", label: "Zotero" },
+  { value: "semantic_scholar", label: "Semantic Scholar" },
+  { value: "openalex", label: "OpenAlex" },
 ];
 
 interface SettingsModalProps {
@@ -274,6 +281,28 @@ export default function SettingsModal({
                           onChange={(e) => handleUpdateSettings({ max_results: parseInt(e.target.value) || 0 })}
                           className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
                         />
+                      </div>
+
+                      <div className="space-y-1">
+                        <div className="flex justify-between items-baseline">
+                          <label className="text-xs text-[var(--text-muted)]">Primary metadata source</label>
+                          <p className="text-[10px] text-[var(--text-dim)] italic">Displayed first</p>
+                        </div>
+                        <select
+                          value={settings.primary_metadata_source ?? "zotero"}
+                          onChange={(e) =>
+                            handleUpdateSettings({
+                              primary_metadata_source: e.target.value as MetadataSourcePreference,
+                            })
+                          }
+                          className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
+                        >
+                          {METADATA_SOURCES.map((source) => (
+                            <option key={source.value} value={source.value}>
+                              {source.label}
+                            </option>
+                          ))}
+                        </select>
                       </div>
                     </div>
                   </section>

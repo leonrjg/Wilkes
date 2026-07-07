@@ -4,6 +4,7 @@ import type {
   EmbedProgress,
   EmbeddingEngine,
   Bookmark,
+  FileListChanged,
   FileListResponse,
   FileMatches,
   FileMetadataUpdate,
@@ -15,6 +16,7 @@ import type {
   DocumentMetadata,
   ModelDescriptor,
   NewBookmark,
+  OpenAlexWork,
   PreviewData,
   SelectedEmbedder,
   SemanticScholarPaper,
@@ -204,8 +206,15 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<DocumentMetadata>;
   }
 
-  async refreshFileMetadata(): Promise<void> {
-    const res = await fetch("/api/file/metadata/refresh", { method: "POST" });
+  async refreshFileMetadata(path?: string): Promise<void> {
+    const init: RequestInit = path
+      ? {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path }),
+        }
+      : { method: "POST" };
+    const res = await fetch("/api/file/metadata/refresh", init);
     if (!res.ok) throw new Error(`refreshFileMetadata failed: ${res.status}`);
   }
 
@@ -249,6 +258,22 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw new Error(`semanticScholarLookup failed: ${res.status}`);
     return res.json() as Promise<SemanticScholarPaper>;
+  }
+
+  async openAlexStatus(): Promise<IntegrationStatus> {
+    const res = await fetch("/api/integrations/openalex/status");
+    if (!res.ok) throw new Error(`openAlexStatus failed: ${res.status}`);
+    return res.json() as Promise<IntegrationStatus>;
+  }
+
+  async openAlexLookup(doi: string): Promise<OpenAlexWork> {
+    const res = await fetch("/api/integrations/openalex/lookup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ doi }),
+    });
+    if (!res.ok) throw new Error(`openAlexLookup failed: ${res.status}`);
+    return res.json() as Promise<OpenAlexWork>;
   }
 
   resolvePdfUrl(path: string): string {
@@ -432,6 +457,15 @@ export class HttpSearchApi implements SearchApi {
     const listener = (e: any) => handler(JSON.parse(e.data));
     es.addEventListener("manager-event", listener);
     return () => this.releaseEmbedEventSource("manager-event", listener);
+  }
+
+  async onFileListChanged(
+    handler: (event: FileListChanged) => void,
+  ): Promise<() => void> {
+    const es = this.acquireEmbedEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("file-list-changed", listener);
+    return () => this.releaseEmbedEventSource("file-list-changed", listener);
   }
 
   async onFileMetadataUpdated(

@@ -217,6 +217,37 @@ describe("useSettingsStore", () => {
     expect(useSettingsStore.getState().indexing).toBe(true);
   });
 
+  it("should apply cached metadata updates to file list entries", () => {
+    useSettingsStore.setState({
+      fileList: [
+        {
+          path: "/docs/paper.pdf",
+          size_bytes: 10,
+          file_type: "Pdf",
+          extension: "pdf",
+          title: "Old title",
+          author: null,
+        },
+      ],
+      omittedFileList: [],
+    });
+
+    useSettingsStore.getState().applyMetadataUpdates([
+      {
+        path: "/docs/paper.pdf",
+        title: "New title",
+        author: "Smith et al.",
+        publication_date: "2021-05",
+      },
+    ]);
+
+    expect(useSettingsStore.getState().fileList[0]).toMatchObject({
+      title: "New title",
+      author: "Smith et al.",
+      publication_date: "2021-05",
+    });
+  });
+
   it("should apply settings patch for extensions", () => {
     useSettingsStore.getState().applySettingsPatch({ supported_extensions: ["rs"] });
     expect(useSettingsStore.getState().supportedExtensions).toEqual(["rs"]);

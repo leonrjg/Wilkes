@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { Settings } from "../lib/types";
+import { Tooltip } from "./Tooltip";
 
 interface ExtensionsPanelProps {
   settings: Settings;
@@ -61,13 +62,14 @@ export default function ExtensionsPanel({ settings, onUpdate }: ExtensionsPanelP
               className="flex items-center justify-between px-2 py-1 bg-[var(--bg-active)]/50 border border-[var(--border-main)] rounded group hover:border-[var(--border-strong)] transition-colors"
             >
               <span className="text-xs text-[var(--text-main)] font-mono">.{ext}</span>
-              <button
-                onClick={() => handleRemove(ext)}
-                className="text-[var(--text-dim)] hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all p-0.5"
-                title="Remove"
-              >
-                ✕
-              </button>
+              <Tooltip content="Remove">
+                <button
+                  onClick={() => handleRemove(ext)}
+                  className="text-[var(--text-dim)] hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all p-0.5"
+                >
+                  ✕
+                </button>
+              </Tooltip>
             </div>
           ))}
         </div>

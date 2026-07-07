@@ -15,7 +15,7 @@ use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
     AddOutcome, AgentBackend, Bookmark, CitationResult, DataPaths, DocumentMetadata,
     EmbeddingEngine, FileListResponse, IndexStatus, IntegrationStatus, ModelDescriptor,
-    NewBookmark, SelectedEmbedder, SemanticScholarPaper, Settings,
+    NewBookmark, OpenAlexWork, SelectedEmbedder, SemanticScholarPaper, Settings,
 };
 
 mod platform;
@@ -123,6 +123,17 @@ async fn semantic_scholar_lookup_for_ctx(
     ctx.semantic_scholar_lookup(doi)
         .await
         .map_err(|e| e.to_string())
+}
+
+async fn openalex_status_for_ctx(ctx: Arc<AppContext>) -> Result<IntegrationStatus, String> {
+    ctx.openalex_status().await.map_err(|e| e.to_string())
+}
+
+async fn openalex_lookup_for_ctx(
+    ctx: Arc<AppContext>,
+    doi: String,
+) -> Result<OpenAlexWork, String> {
+    ctx.openalex_lookup(doi).await.map_err(|e| e.to_string())
 }
 
 async fn resolve_file_metadata_for_ctx(
@@ -1004,9 +1015,9 @@ async fn resolve_file_metadata(path: String, app: AppHandle) -> Result<DocumentM
 }
 
 #[tauri::command]
-async fn refresh_file_metadata(app: AppHandle) -> Result<(), String> {
+async fn refresh_file_metadata(path: Option<String>, app: AppHandle) -> Result<(), String> {
     app_context(&app)
-        .refresh_file_metadata()
+        .refresh_file_metadata(path.map(Into::into))
         .await
         .map_err(|e| e.to_string())
 }
@@ -1032,6 +1043,16 @@ async fn semantic_scholar_lookup(
     app: AppHandle,
 ) -> Result<SemanticScholarPaper, String> {
     semantic_scholar_lookup_for_ctx(app_context(&app), doi).await
+}
+
+#[tauri::command]
+async fn openalex_status(app: AppHandle) -> Result<IntegrationStatus, String> {
+    openalex_status_for_ctx(app_context(&app)).await
+}
+
+#[tauri::command]
+async fn openalex_lookup(doi: String, app: AppHandle) -> Result<OpenAlexWork, String> {
+    openalex_lookup_for_ctx(app_context(&app), doi).await
 }
 
 #[tauri::command]
@@ -1172,6 +1193,8 @@ pub fn run() {
             zotero_generate_citation,
             semantic_scholar_status,
             semantic_scholar_lookup,
+            openalex_status,
+            openalex_lookup,
             pick_directory,
             download_model,
             build_index,

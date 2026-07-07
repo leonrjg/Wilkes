@@ -23,6 +23,7 @@ import { useSearchStore } from "../stores/useSearchStore";
 import { useContextMenu, ContextMenu } from "./ContextMenu";
 import { confirmDialog } from "../lib/utils/dialog";
 import type { AgentBackend, MatchRef } from "../lib/types";
+import { Tooltip } from "./Tooltip";
 
 function fileName(path: string) {
   return path.split(/[/\\]/).pop() || path;
@@ -38,12 +39,6 @@ function toolStatusIcon(status: string) {
   if (status === "completed") return "✓";
   if (status === "failed") return "✗";
   return "…";
-}
-
-function compactOptionName(name: string) {
-  const compact = name.replace(/\s+(level|mode|setting)$/i, "");
-  if (/^(reasoning|thought)$/i.test(compact)) return "Think";
-  return compact;
 }
 
 function formatConversationTime(value: string) {
@@ -218,76 +213,82 @@ export default function ChatPane({ onClose }: Props) {
       {/* Header */}
       <div className="px-2 py-1.5 border-b border-[var(--border-main)] bg-[var(--bg-header)] flex flex-col gap-1">
         <div className="h-7 flex items-center gap-1.5 min-w-0">
-          <button
-            type="button"
-            onClick={(e) => openMenu({ event: e, target: null, items: backendMenuItems })}
-            title="Switch agent"
-            className="h-7 max-w-[170px] flex items-center gap-1.5 px-1.5 text-xs rounded border border-transparent text-[var(--text-main)] hover:bg-[var(--bg-active)] hover:border-[var(--border-main)] min-w-0"
-          >
-            <span className={statusDotClassName(activeBackendStatus?.available ?? false)} />
-            <span className="truncate font-medium">{activeBackendStatus?.label ?? "Select agent"}</span>
-            {paneOpening ? (
-              <Loader size={12} className="flex-shrink-0 text-[var(--accent-blue)] animate-spin" />
-            ) : (
-              <ChevronDown size={12} className="flex-shrink-0 text-[var(--text-dim)]" />
-            )}
-          </button>
-          <button
-            type="button"
-            onClick={() => newChat().catch((e) => console.error("chat: new chat failed", e))}
-            title="New chat"
-            disabled={!sessionId || paneOpening}
-            className="w-7 h-7 ml-auto flex items-center justify-center rounded border border-transparent text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-active)] disabled:opacity-40 flex-shrink-0"
-          >
-            <Plus size={13} />
-          </button>
-          <button
-            type="button"
-            onClick={(e) => openMenu({ event: e, target: null, items: historyMenuItems })}
-            title="Chat history"
-            disabled={paneOpening}
-            className="w-7 h-7 flex items-center justify-center rounded border border-transparent text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-active)] disabled:opacity-40 flex-shrink-0"
-          >
-            <Clock size={13} />
-          </button>
-          <button
-            type="button"
-            onClick={() => backendSessionId && navigator.clipboard?.writeText(backendSessionId)}
-            title="Copy backend session id"
-            disabled={!backendSessionId}
-            className="w-7 h-7 flex items-center justify-center rounded border border-transparent text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-active)] disabled:opacity-40 flex-shrink-0"
-          >
-            <Copy size={13} />
-          </button>
-          <button
-            type="button"
-            onClick={async () => {
-              if (!conversationId) return;
-              const title = conversations.find(
-                (c) => c.conversation_id === conversationId,
-              )?.title;
-              const confirmed = await confirmDialog(
-                `Delete ${title ? `"${title}"` : "this chat"}? This cannot be undone.`,
-              );
-              if (!confirmed) return;
-              forgetConversation(conversationId).catch((e) =>
-                console.error("chat: forget failed", e),
-              );
-            }}
-            title="Forget this chat from Wilkes"
-            disabled={!conversationId}
-            className="w-7 h-7 flex items-center justify-center rounded border border-transparent text-[var(--text-muted)] hover:text-[var(--text-error)] hover:bg-[var(--bg-active)] disabled:opacity-40 flex-shrink-0"
-          >
-            <Trash2 size={13} />
-          </button>
-          <button
-            type="button"
-            onClick={onClose}
-            title="Close chat"
-            className="w-7 h-7 flex items-center justify-center rounded border border-transparent text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-active)] flex-shrink-0"
-          >
-            <X size={14} />
-          </button>
+          <Tooltip content="Switch agent">
+            <button
+              type="button"
+              onClick={(e) => openMenu({ event: e, target: null, items: backendMenuItems })}
+              className="h-7 max-w-[170px] flex items-center gap-1.5 px-1.5 text-xs rounded border border-transparent text-[var(--text-main)] hover:bg-[var(--bg-active)] hover:border-[var(--border-main)] min-w-0"
+            >
+              <span className={statusDotClassName(activeBackendStatus?.available ?? false)} />
+              <span className="truncate font-medium">{activeBackendStatus?.label ?? "Select agent"}</span>
+              {paneOpening ? (
+                <Loader size={12} className="flex-shrink-0 text-[var(--accent-blue)] animate-spin" />
+              ) : (
+                <ChevronDown size={12} className="flex-shrink-0 text-[var(--text-dim)]" />
+              )}
+            </button>
+          </Tooltip>
+          <Tooltip content="New chat">
+            <button
+              type="button"
+              onClick={() => newChat().catch((e) => console.error("chat: new chat failed", e))}
+              disabled={!sessionId || paneOpening}
+              className="w-7 h-7 ml-auto flex items-center justify-center rounded border border-transparent text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-active)] disabled:opacity-40 flex-shrink-0"
+            >
+              <Plus size={13} />
+            </button>
+          </Tooltip>
+          <Tooltip content="Chat history">
+            <button
+              type="button"
+              onClick={(e) => openMenu({ event: e, target: null, items: historyMenuItems })}
+              disabled={paneOpening}
+              className="w-7 h-7 flex items-center justify-center rounded border border-transparent text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-active)] disabled:opacity-40 flex-shrink-0"
+            >
+              <Clock size={13} />
+            </button>
+          </Tooltip>
+          <Tooltip content="Copy backend session id">
+            <button
+              type="button"
+              onClick={() => backendSessionId && navigator.clipboard?.writeText(backendSessionId)}
+              disabled={!backendSessionId}
+              className="w-7 h-7 flex items-center justify-center rounded border border-transparent text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-active)] disabled:opacity-40 flex-shrink-0"
+            >
+              <Copy size={13} />
+            </button>
+          </Tooltip>
+          <Tooltip content="Forget this chat from Wilkes">
+            <button
+              type="button"
+              onClick={async () => {
+                if (!conversationId) return;
+                const title = conversations.find(
+                  (c) => c.conversation_id === conversationId,
+                )?.title;
+                const confirmed = await confirmDialog(
+                  `Delete ${title ? `"${title}"` : "this chat"}? This cannot be undone.`,
+                );
+                if (!confirmed) return;
+                forgetConversation(conversationId).catch((e) =>
+                  console.error("chat: forget failed", e),
+                );
+              }}
+              disabled={!conversationId}
+              className="w-7 h-7 flex items-center justify-center rounded border border-transparent text-[var(--text-muted)] hover:text-[var(--text-error)] hover:bg-[var(--bg-active)] disabled:opacity-40 flex-shrink-0"
+            >
+              <Trash2 size={13} />
+            </button>
+          </Tooltip>
+          <Tooltip content="Close chat">
+            <button
+              type="button"
+              onClick={onClose}
+              className="w-7 h-7 flex items-center justify-center rounded border border-transparent text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-active)] flex-shrink-0"
+            >
+              <X size={14} />
+            </button>
+          </Tooltip>
         </div>
 
         {configOptions.length > 0 && (
@@ -298,21 +299,21 @@ export default function ChatPane({ onClose }: Props) {
             {configOptions.map((option) => (
               <label
                 key={option.id}
-                className="h-6 min-w-0 flex items-center gap-1 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1.5 text-[10px] text-[var(--text-dim)]"
+                className="h-6 min-w-0 flex items-center rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1.5 text-[10px] text-[var(--text-dim)]"
               >
-                <span className="font-medium flex-shrink-0">{compactOptionName(option.name)}</span>
-                <select
-                  value={option.current_value}
-                  onChange={(e) => setConfigOption(option.id, e.target.value)}
-                  title={option.name}
-                  className="min-w-0 flex-1 bg-transparent text-[11px] font-medium text-[var(--text-main)] outline-none focus:text-[var(--accent-blue)]"
-                >
-                  {option.choices.map((choice) => (
-                    <option key={choice.value} value={choice.value}>
-                      {choice.name}
-                    </option>
-                  ))}
-                </select>
+                <Tooltip content={option.name}>
+                  <select
+                    value={option.current_value}
+                    onChange={(e) => setConfigOption(option.id, e.target.value)}
+                    className="min-w-0 w-full bg-transparent text-[11px] font-medium text-[var(--text-main)] outline-none focus:text-[var(--accent-blue)]"
+                  >
+                    {option.choices.map((choice) => (
+                      <option key={choice.value} value={choice.value}>
+                        {choice.name}
+                      </option>
+                    ))}
+                  </select>
+                </Tooltip>
               </label>
             ))}
           </div>
@@ -330,35 +331,37 @@ export default function ChatPane({ onClose }: Props) {
       <div className="p-2 border-b border-[var(--border-main)] flex flex-wrap gap-1.5">
         {activeDoc && (
           <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-[var(--accent-blue-muted)] text-[var(--text-main)] border border-[var(--border-main)]">
-            <button
-              type="button"
-              onClick={() => selectMatch(contextFileMatchRef(activeDoc.path, activeDoc.page))}
-              title={`Open ${activeDoc.path}`}
-              className="min-w-0 inline-flex items-center gap-1 rounded text-left hover:text-[var(--accent-blue)]"
-            >
-              <FileText size={10} className="flex-shrink-0" />
-              <span className="truncate max-w-[140px]">{fileName(activeDoc.path)}</span>
-              {activeDoc.page != null && (
-                <span className="text-[var(--text-dim)] flex-shrink-0">· p.{activeDoc.page}</span>
-              )}
-            </button>
-            <button
-              type="button"
-              onClick={() =>
-                currentDocInContext ? removeContext(activeDoc.path) : addContext(activeDoc.path)
-              }
-              className={`ml-0.5 inline-flex items-center justify-center rounded p-0.5 transition-colors ${
-                currentDocInContext
-                  ? "text-[var(--accent-blue)] hover:text-[var(--text-error)]"
-                  : "text-[var(--text-dim)] hover:text-[var(--accent-blue)]"
-              }`}
-              title={currentDocInContext ? "Unpin current document" : "Pin current document to context"}
-              aria-label={
-                currentDocInContext ? "Unpin current document" : "Pin current document to context"
-              }
-            >
-              <MapPin size={10} fill={currentDocInContext ? "currentColor" : "none"} />
-            </button>
+            <Tooltip content={`Open ${activeDoc.path}`} className="font-mono break-all">
+              <button
+                type="button"
+                onClick={() => selectMatch(contextFileMatchRef(activeDoc.path, activeDoc.page))}
+                className="min-w-0 inline-flex items-center gap-1 rounded text-left hover:text-[var(--accent-blue)]"
+              >
+                <FileText size={10} className="flex-shrink-0" />
+                <span className="truncate max-w-[140px]">{fileName(activeDoc.path)}</span>
+                {activeDoc.page != null && (
+                  <span className="text-[var(--text-dim)] flex-shrink-0">· p.{activeDoc.page}</span>
+                )}
+              </button>
+            </Tooltip>
+            <Tooltip content={currentDocInContext ? "Unpin current document" : "Pin current document to context"}>
+              <button
+                type="button"
+                onClick={() =>
+                  currentDocInContext ? removeContext(activeDoc.path) : addContext(activeDoc.path)
+                }
+                className={`ml-0.5 inline-flex items-center justify-center rounded p-0.5 transition-colors ${
+                  currentDocInContext
+                    ? "text-[var(--accent-blue)] hover:text-[var(--text-error)]"
+                    : "text-[var(--text-dim)] hover:text-[var(--accent-blue)]"
+                }`}
+                aria-label={
+                  currentDocInContext ? "Unpin current document" : "Pin current document to context"
+                }
+              >
+                <MapPin size={10} fill={currentDocInContext ? "currentColor" : "none"} />
+              </button>
+            </Tooltip>
           </span>
         )}
         {contextFiles
@@ -368,23 +371,25 @@ export default function ChatPane({ onClose }: Props) {
               key={file.path}
               className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-[var(--bg-active)] text-[var(--text-muted)] border border-[var(--border-main)]"
             >
-              <button
-                type="button"
-                onClick={() => selectMatch(contextFileMatchRef(file.path))}
-                title={`Open ${file.path}`}
-                className="min-w-0 inline-flex items-center gap-1 rounded text-left hover:text-[var(--accent-blue)]"
-              >
-                <FileText size={10} className="flex-shrink-0" />
-                <span className="truncate max-w-[140px]">{fileName(file.path)}</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => removeContext(file.path)}
-                className="hover:text-[var(--text-error)]"
-                title="Remove from context"
-              >
-                <X size={10} />
-              </button>
+              <Tooltip content={`Open ${file.path}`} className="font-mono break-all">
+                <button
+                  type="button"
+                  onClick={() => selectMatch(contextFileMatchRef(file.path))}
+                  className="min-w-0 inline-flex items-center gap-1 rounded text-left hover:text-[var(--accent-blue)]"
+                >
+                  <FileText size={10} className="flex-shrink-0" />
+                  <span className="truncate max-w-[140px]">{fileName(file.path)}</span>
+                </button>
+              </Tooltip>
+              <Tooltip content="Remove from context">
+                <button
+                  type="button"
+                  onClick={() => removeContext(file.path)}
+                  className="hover:text-[var(--text-error)]"
+                >
+                  <X size={10} />
+                </button>
+              </Tooltip>
             </span>
           ))}
         {!activeDoc && contextFiles.length === 0 && (
@@ -394,9 +399,11 @@ export default function ChatPane({ onClose }: Props) {
 
       {sessionError && (
         <div className="px-2 py-1.5 border-b border-[var(--border-main)] bg-[var(--text-error)]/10 flex items-center gap-2 text-[11px] text-[var(--text-error)]">
-          <span className="flex-1 truncate" title={sessionError}>
-            {activeBackendStatus?.label ?? "Agent"} error — {sessionError}
-          </span>
+          <Tooltip content={sessionError}>
+            <span className="flex-1 truncate">
+              {activeBackendStatus?.label ?? "Agent"} error — {sessionError}
+            </span>
+          </Tooltip>
           <button
             type="button"
             onClick={() => backend && switchBackend(backend).catch((e) => console.error(e))}
@@ -567,16 +574,17 @@ export function MessageBubble({
           {isUser ? "You" : "Assistant"}
           {elapsedLabel && <span> · {elapsedLabel}</span>}
         </span>
-        <button
-          type="button"
-          onClick={copyMessage}
-          disabled={!message.text}
-          title="Copy message"
-          aria-label={`Copy ${isUser ? "your" : "assistant"} message`}
-          className="inline-flex h-4 w-4 items-center justify-center rounded text-[var(--text-dim)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-30"
-        >
-          <Copy size={10} />
-        </button>
+        <Tooltip content="Copy message">
+          <button
+            type="button"
+            onClick={copyMessage}
+            disabled={!message.text}
+            aria-label={`Copy ${isUser ? "your" : "assistant"} message`}
+            className="inline-flex h-4 w-4 items-center justify-center rounded text-[var(--text-dim)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-30"
+          >
+            <Copy size={10} />
+          </button>
+        </Tooltip>
       </div>
       <div
         className={`inline-block max-w-full text-left rounded px-2.5 py-1.5 text-xs ${

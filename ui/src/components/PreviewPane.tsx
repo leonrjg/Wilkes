@@ -9,7 +9,9 @@ import { useChatStore } from "../stores/useChatStore";
 import { api, isTauri } from "../services";
 import type { BoundingBox, DocumentMetadata } from "../lib/types";
 import { buildExternalLinks } from "../lib/externalLinks";
+import { formatDocumentMonthYear } from "../lib/dateFormatting";
 import { useToasts } from "./Toast";
+import { Tooltip } from "./Tooltip";
 
 interface Props {
   canGoBack?: boolean;
@@ -25,41 +27,6 @@ function fileName(path: string) {
 function headerTitle(path: string, metadata: DocumentMetadata | null) {
   const title = metadata?.title?.trim();
   return title && title.length > 0 ? title : fileName(path);
-}
-
-function parseYearMonth(createdAt: string): { year: number; month?: number } | null {
-  const value = createdAt.trim();
-  // Local PDF metadata: "YYYY-MM" or "YYYY-MM-DD".
-  let m = /^(\d{4})-(\d{2})(?:-\d{2})?$/.exec(value);
-  if (m) return { year: Number(m[1]), month: Number(m[2]) };
-  // Zotero stores dates as "MM/YYYY" (or "M/YYYY").
-  m = /^(\d{1,2})\/(\d{4})$/.exec(value);
-  if (m) return { year: Number(m[2]), month: Number(m[1]) };
-  // Bare year.
-  m = /^(\d{4})$/.exec(value);
-  if (m) return { year: Number(m[1]) };
-  return null;
-}
-
-function formatCreatedAt(createdAt: string | null | undefined) {
-  if (!createdAt) return null;
-
-  const parsed = parseYearMonth(createdAt);
-  if (!parsed) return null;
-
-  const { year, month } = parsed;
-  if (month === undefined || month < 1 || month > 12) {
-    return String(year);
-  }
-
-  const date = new Date(Date.UTC(year, month - 1, 1));
-  if (Number.isNaN(date.getTime())) return null;
-
-  return new Intl.DateTimeFormat("en", {
-    month: "short",
-    year: "numeric",
-    timeZone: "UTC",
-  }).format(date);
 }
 
 function actionButtonClassName(compact = false) {
@@ -198,7 +165,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
         bboxesEqual(bookmark.origin.PdfPage.bbox, pdfBbox),
     )?.rects ?? null;
   const author = viewerMetadata?.author?.trim() || null;
-  const createdAt = formatCreatedAt(viewerMetadata?.created_at);
+  const createdAt = formatDocumentMonthYear(viewerMetadata?.created_at);
   const links = buildExternalLinks(viewerMetadata?.doi, viewerMetadata?.title);
   const doi = links?.doi ?? null;
 
@@ -271,22 +238,24 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
       {/* Header */}
       <div className="px-3 py-2 border-b border-[var(--border-main)] flex items-center gap-3 flex-shrink-0 bg-[var(--bg-header)]">
         <div className="flex items-center gap-1">
-          <button
-            onClick={onGoBack}
-            disabled={!canGoBack}
-            className="p-1 hover:bg-[var(--bg-active)] rounded text-[var(--text-dim)] disabled:opacity-30"
-            title="Go back"
-          >
-            <ArrowLeft size={14} />
-          </button>
-          <button
-            onClick={onGoForward}
-            disabled={!canGoForward}
-            className="p-1 hover:bg-[var(--bg-active)] rounded text-[var(--text-dim)] disabled:opacity-30"
-            title="Go forward"
-          >
-            <ArrowRight size={14} />
-          </button>
+          <Tooltip content="Go back">
+            <button
+              onClick={onGoBack}
+              disabled={!canGoBack}
+              className="p-1 hover:bg-[var(--bg-active)] rounded text-[var(--text-dim)] disabled:opacity-30"
+            >
+              <ArrowLeft size={14} />
+            </button>
+          </Tooltip>
+          <Tooltip content="Go forward">
+            <button
+              onClick={onGoForward}
+              disabled={!canGoForward}
+              className="p-1 hover:bg-[var(--bg-active)] rounded text-[var(--text-dim)] disabled:opacity-30"
+            >
+              <ArrowRight size={14} />
+            </button>
+          </Tooltip>
         </div>
 
         <div className="flex flex-col min-w-0 flex-1 selectable">
@@ -294,13 +263,14 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
             <span className="text-xs font-medium text-[var(--text-main)] truncate leading-tight">
               {headerTitle(selectedMatch.path, viewerMetadata)}
             </span>
-            <button
-              onClick={handleCopyTitle}
-              className="p-0.5 hover:bg-[var(--bg-active)] rounded text-[var(--text-dim)] hover:text-[var(--text-main)] flex-shrink-0"
-              title="Copy title"
-            >
-              <Copy size={10} />
-            </button>
+            <Tooltip content="Copy title">
+              <button
+                onClick={handleCopyTitle}
+                className="p-0.5 hover:bg-[var(--bg-active)] rounded text-[var(--text-dim)] hover:text-[var(--text-main)] flex-shrink-0"
+              >
+                <Copy size={10} />
+              </button>
+            </Tooltip>
           </div>
           <div className="flex items-center gap-1 min-w-0 text-[10px] text-[var(--text-dim)] leading-tight">
             {createdAt && <span className={metadataBadgeClassName()}>{createdAt}</span>}
@@ -309,33 +279,36 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
             {(createdAt || author || viewerMetadataStatus === "loading") && <span aria-hidden="true">·</span>}
             {doi && (
               <div className={groupedActionClassName()}>
-                <button
-                  onClick={handleOpenDoi}
-                  className={groupedActionSegmentClassName()}
-                  title={`Open DOI ${doi}`}
-                >
-                  <span className="truncate max-w-[140px]">DOI: {doi}</span>
-                  <ExternalLink size={10} />
-                </button>
-                <button
-                  onClick={handleCopyDoi}
-                  className={`${groupedActionSegmentClassName()} border-l border-[var(--border-main)]`}
-                  title={`Copy DOI ${doi}`}
-                >
-                  <Copy size={10} />
-                </button>
+                <Tooltip content={`Open DOI ${doi}`}>
+                  <button
+                    onClick={handleOpenDoi}
+                    className={groupedActionSegmentClassName()}
+                  >
+                    <span className="truncate max-w-[140px]">DOI: {doi}</span>
+                    <ExternalLink size={10} />
+                  </button>
+                </Tooltip>
+                <Tooltip content={`Copy DOI ${doi}`}>
+                  <button
+                    onClick={handleCopyDoi}
+                    className={`${groupedActionSegmentClassName()} border-l border-[var(--border-main)]`}
+                  >
+                    <Copy size={10} />
+                  </button>
+                </Tooltip>
               </div>
             )}
             {links && (
               <>
-                <button
-                  onClick={handleOpenScholar}
-                  className={actionButtonClassName()}
-                  title="Open Google Scholar"
-                >
-                  <span>Scholar</span>
-                  <ExternalLink size={10} />
-                </button>
+                <Tooltip content="Open Google Scholar">
+                  <button
+                    onClick={handleOpenScholar}
+                    className={actionButtonClassName()}
+                  >
+                    <span>Scholar</span>
+                    <ExternalLink size={10} />
+                  </button>
+                </Tooltip>
                 <span aria-hidden="true">·</span>
               </>
             )}
@@ -343,13 +316,14 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
           </div>
         </div>
 
-        <button
-          onClick={clearPreview}
-          className="p-1 hover:bg-red-500/10 hover:text-red-500 rounded text-[var(--text-dim)] transition-colors"
-          title="Close preview"
-        >
-          <X size={16} />
-        </button>
+        <Tooltip content="Close preview">
+          <button
+            onClick={clearPreview}
+            className="p-1 hover:bg-red-500/10 hover:text-red-500 rounded text-[var(--text-dim)] transition-colors"
+          >
+            <X size={16} />
+          </button>
+        </Tooltip>
       </div>
 
       {/* Content */}

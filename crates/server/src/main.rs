@@ -29,7 +29,8 @@ use wilkes_api::context::AppContext;
 use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::types::{
     AddOutcome, CitationResult, DocumentMetadata, EmbeddingEngine, IntegrationStatus, MatchRef,
-    ModelDescriptor, NewBookmark, SearchQuery, SelectedEmbedder, SemanticScholarPaper,
+    ModelDescriptor, NewBookmark, OpenAlexWork, SearchQuery, SelectedEmbedder,
+    SemanticScholarPaper,
 };
 
 fn confine_to_uploads(
@@ -251,6 +252,11 @@ struct DoiBody {
     doi: String,
 }
 
+#[derive(Deserialize)]
+struct RefreshFileMetadataBody {
+    path: Option<String>,
+}
+
 async fn open_file_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<OpenFileBody>,
@@ -324,6 +330,29 @@ async fn semantic_scholar_lookup_handler(
     Ok(Json(paper))
 }
 
+async fn openalex_status_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<IntegrationStatus>, (StatusCode, Json<ErrorBody>)> {
+    let status = state
+        .ctx
+        .openalex_status()
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(status))
+}
+
+async fn openalex_lookup_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DoiBody>,
+) -> Result<Json<OpenAlexWork>, (StatusCode, Json<ErrorBody>)> {
+    let work = state
+        .ctx
+        .openalex_lookup(body.doi)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(work))
+}
+
 async fn resolve_file_metadata_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<OpenFileBody>,
@@ -339,10 +368,15 @@ async fn resolve_file_metadata_handler(
 
 async fn refresh_file_metadata_handler(
     State(state): State<Arc<AppState>>,
+    body: Option<Json<RefreshFileMetadataBody>>,
 ) -> Result<Json<()>, (StatusCode, Json<ErrorBody>)> {
+    let path = body
+        .and_then(|Json(body)| body.path)
+        .map(|path| confine_to_uploads(&path, &state.uploads_dir))
+        .transpose()?;
     state
         .ctx
-        .refresh_file_metadata()
+        .refresh_file_metadata(path)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(()))
@@ -845,6 +879,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/integrations/semantic-scholar/lookup",
             post(semantic_scholar_lookup_handler),
+        )
+        .route(
+            "/api/integrations/openalex/status",
+            get(openalex_status_handler),
+        )
+        .route(
+            "/api/integrations/openalex/lookup",
+            post(openalex_lookup_handler),
         )
         .route("/api/embed/ready", get(is_semantic_ready_handler))
         .route("/api/logs", get(get_logs_handler))

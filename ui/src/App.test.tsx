@@ -4,6 +4,7 @@ import App from "./App";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useSearchStore } from "./stores/useSearchStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
+import { useChatStore } from "./stores/useChatStore";
 import { ToastProvider } from "./components/Toast";
 
 // Mock services and hooks at top level
@@ -14,6 +15,7 @@ vi.mock("./services", () => ({
     onEmbedError: vi.fn(() => Promise.resolve(() => {})),
     onManagerEvent: vi.fn(() => Promise.resolve(() => {})),
     onFileMetadataUpdated: vi.fn(() => Promise.resolve(() => {})),
+    onFileListChanged: vi.fn(() => Promise.resolve(() => {})),
     getSettings: vi.fn(() => Promise.resolve({
       favorites: [],
       recent_dirs: [],
@@ -73,6 +75,12 @@ describe("App", () => {
       searching: false,
       hasQuery: false,
     });
+    useChatStore.setState({
+      paneOpen: false,
+      paneOpening: false,
+      openPane: vi.fn().mockResolvedValue(undefined),
+      togglePane: vi.fn(),
+    });
   });
 
   it("renders correctly", async () => {
@@ -111,10 +119,37 @@ describe("App", () => {
       );
     });
     
-    const settingsButton = screen.getByTitle("Settings");
+    const settingsButton = screen.getByRole("button", { name: "Settings" });
     fireEvent.click(settingsButton);
     
     expect(screen.getByTestId("settings-modal")).toBeInTheDocument();
+  });
+
+  it("toggles the chat pane from the navbar button", async () => {
+    const openPane = vi.fn().mockResolvedValue(undefined);
+    const togglePane = vi.fn();
+    useChatStore.setState({ paneOpen: false, openPane, togglePane });
+
+    const { rerender } = render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Ask the documents" }));
+    expect(openPane).toHaveBeenCalledTimes(1);
+    expect(togglePane).not.toHaveBeenCalled();
+
+    useChatStore.setState({ paneOpen: true, openPane, togglePane });
+    rerender(
+      <ToastProvider>
+        <App />
+      </ToastProvider>
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Ask the documents" }));
+    expect(togglePane).toHaveBeenCalledTimes(1);
+    expect(openPane).toHaveBeenCalledTimes(1);
   });
 
   it("handles sidebar resizing", async () => {

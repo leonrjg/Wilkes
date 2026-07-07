@@ -56,8 +56,11 @@ pub async fn list_files(
                             extension,
                             created_at_ms,
                             modified_at_ms,
+                            title: None,
+                            author: None,
                             publication_date: None,
-                            semantic_scholar_citation_count: None,
+                            citation_count: None,
+                            metadata_conflicts: Default::default(),
                         },
                         reason: OmittedFileReason::UnsupportedExtension,
                     });
@@ -74,8 +77,11 @@ pub async fn list_files(
                             extension,
                             created_at_ms,
                             modified_at_ms,
+                            title: None,
+                            author: None,
                             publication_date: None,
-                            semantic_scholar_citation_count: None,
+                            citation_count: None,
+                            metadata_conflicts: Default::default(),
                         },
                         reason: OmittedFileReason::TooLarge,
                     });
@@ -89,8 +95,11 @@ pub async fn list_files(
                     extension,
                     created_at_ms,
                     modified_at_ms,
+                    title: None,
+                    author: None,
                     publication_date: None,
-                    semantic_scholar_citation_count: None,
+                    citation_count: None,
+                    metadata_conflicts: Default::default(),
                 });
             }
         }

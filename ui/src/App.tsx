@@ -10,6 +10,7 @@ import UploadZone from "./components/UploadZone";
 import SettingsModal from "./components/SettingsModal";
 import { useToasts } from "./components/Toast";
 import { useContextMenu, ContextMenu } from "./components/ContextMenu";
+import { Tooltip } from "./components/Tooltip";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useBookmarksStore } from "./stores/useBookmarksStore";
 import { useChatStore } from "./stores/useChatStore";
@@ -191,67 +192,83 @@ export default function App() {
       />
     );
 
+  const handleChatButtonClick = () => {
+    if (chatPaneOpen) {
+      toggleChatPane();
+      return;
+    }
+    openChatPane().catch((e) => console.error("chat: open pane failed", e));
+  };
+
   const settingsSlot = (
     <>
       {isTauri && (
         <div className="inline-flex rounded border border-[var(--border-main)] overflow-hidden">
-          <button
-            onClick={() => openChatPane().catch((e) => console.error("chat: open pane failed", e))}
-            title="Ask the documents"
-            aria-busy={chatPaneOpening}
-            className={`w-[32px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] transition-all active:scale-95 ${
-              chatPaneOpen
-                ? "text-[var(--accent-blue)] shadow-inner"
-                : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
-            }`}
-          >
-            {chatPaneOpening ? (
-              <Loader size={14} className="animate-spin" />
-            ) : (
-              <MessageSquare size={14} fill={chatPaneOpen ? "currentColor" : "none"} />
-            )}
-          </button>
-          <button
-            onClick={async (e) => {
-              const event = e;
-              await loadChatBackends().catch((error) => {
-                console.error("chat: failed to load backends", error);
-              });
-              const chatBackends = useChatStore.getState().backends;
-              openChatBackendMenu({
-                event,
-                target: null,
-                items: chatBackends.map((b) => ({
-                  id: b.backend,
-                  label: `${b.available ? "●" : "○"} ${b.label}${
-                    !b.available ? ` — ${b.unavailable_reason ?? b.auth_note}` : ""
-                  }`,
-                  disabled: !b.available,
-                  run: () => openChatPane(b.backend as AgentBackend),
-                })),
-              });
-            }}
-            title="Choose chat agent"
-            className="w-[14px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] text-[var(--text-dim)] hover:text-[var(--text-main)] transition-all border-l border-[var(--border-main)]"
-          >
-            <ChevronDown size={10} />
-          </button>
+          <Tooltip content="Ask the documents">
+            <button
+              onClick={handleChatButtonClick}
+              aria-label="Ask the documents"
+              aria-busy={chatPaneOpening}
+              className={`w-[32px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] transition-all active:scale-95 ${
+                chatPaneOpen
+                  ? "text-[var(--accent-blue)] shadow-inner"
+                  : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
+              }`}
+            >
+              {chatPaneOpening ? (
+                <Loader size={14} className="animate-spin" />
+              ) : (
+                <MessageSquare size={14} fill={chatPaneOpen ? "currentColor" : "none"} />
+              )}
+            </button>
+          </Tooltip>
+          <Tooltip content="Choose chat agent">
+            <button
+              onClick={async (e) => {
+                const event = e;
+                await loadChatBackends().catch((error) => {
+                  console.error("chat: failed to load backends", error);
+                });
+                const chatBackends = useChatStore.getState().backends;
+                openChatBackendMenu({
+                  event,
+                  target: null,
+                  items: chatBackends.map((b) => ({
+                    id: b.backend,
+                    label: `${b.available ? "●" : "○"} ${b.label}${
+                      !b.available ? ` — ${b.unavailable_reason ?? b.auth_note}` : ""
+                    }`,
+                    disabled: !b.available,
+                    run: () => openChatPane(b.backend as AgentBackend),
+                  })),
+                });
+              }}
+              aria-label="Choose chat agent"
+              className="w-[14px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] text-[var(--text-dim)] hover:text-[var(--text-main)] transition-all border-l border-[var(--border-main)]"
+            >
+              <ChevronDown size={10} />
+            </button>
+          </Tooltip>
         </div>
       )}
-      <button
-        onClick={toggleBookmarksPane}
-        title="Bookmarks"
-        className="w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all border border-[var(--border-main)] hover:border-[var(--border-strong)]"
-      >
-        <Bookmark size={14} fill={bookmarksPaneOpen ? "currentColor" : "none"} />
-      </button>
-      <button
-        onClick={() => setSettingsOpen(true)}
-        title="Settings"
-        className="w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all border border-[var(--border-main)] hover:border-[var(--border-strong)]"
-      >
-        <SettingsIcon size={14} />
-      </button>
+      <Tooltip content="Bookmarks">
+        <button
+          onClick={toggleBookmarksPane}
+          aria-label="Bookmarks"
+          className="w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all border border-[var(--border-main)] hover:border-[var(--border-strong)]"
+        >
+          <Bookmark size={14} fill={bookmarksPaneOpen ? "currentColor" : "none"} />
+        </button>
+      </Tooltip>
+      <Tooltip content="Settings">
+        <button
+          onClick={() => setSettingsOpen(true)}
+          aria-label="Settings"
+          className="w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all border border-[var(--border-main)] hover:border-[var(--border-strong)]"
+        >
+          <SettingsIcon size={14} />
+        </button>
+      </Tooltip>
       <SettingsModal
         api={api}
         isOpen={settingsOpen}

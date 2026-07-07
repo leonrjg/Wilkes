@@ -8,6 +8,47 @@ use std::path::Path;
 
 use crate::types::DocumentMetadata;
 
+/// Canonical document metadata fields stored in `file_metadata.key`.
+///
+/// Provider-specific contracts are adapted into these names at the cache
+/// boundary. The initial vocabulary follows the Semantic Scholar paper fields
+/// because it was the first external metadata provider, with file/Zotero fields
+/// folded into the same key space where they overlap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MetadataField {
+    Title,
+    Author,
+    Doi,
+    PublicationDate,
+    PaperId,
+    Year,
+    Venue,
+    CitationCount,
+    ExternalIdsJson,
+    CachedAtMs,
+    /// Internal cache bookkeeping field. Stored alongside provider fields but
+    /// not part of a provider contract.
+    ExtractedAtMs,
+}
+
+impl MetadataField {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MetadataField::Title => "title",
+            MetadataField::Author => "author",
+            MetadataField::Doi => "doi",
+            MetadataField::PublicationDate => "publication_date",
+            MetadataField::PaperId => "paper_id",
+            MetadataField::Year => "year",
+            MetadataField::Venue => "venue",
+            MetadataField::CitationCount => "citation_count",
+            MetadataField::ExternalIdsJson => "external_ids_json",
+            MetadataField::CachedAtMs => "cached_at_ms",
+            MetadataField::ExtractedAtMs => "extracted_at_ms",
+        }
+    }
+}
+
 pub trait FileMetadataExtractor: Send + Sync {
     fn can_handle(&self, path: &Path, mime: Option<&str>) -> bool;
     fn extract_metadata(&self, path: &Path) -> anyhow::Result<DocumentMetadata>;

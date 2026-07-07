@@ -7,7 +7,7 @@ use regex::Regex;
 use crate::types::DocumentMetadata;
 
 use super::arxiv::find_arxiv_doi;
-use super::doi::find_doi;
+use super::doi::{find_doi, find_dois};
 use super::FileMetadataExtractor;
 
 pub struct PdfMetadataExtractor;
@@ -105,7 +105,16 @@ fn find_embedded_identifier(doc: &Document, finder: fn(&str) -> Option<String>) 
 }
 
 fn find_first_page_doi(doc: &Document) -> Option<String> {
-    find_first_page_identifier(doc, find_doi)
+    let text = first_page_text(doc)?;
+    let dois = find_dois(&text);
+    if dois.len() > 1 {
+        dois.iter()
+            .find(|doi| !doi.chars().any(|ch| ch.is_ascii_alphabetic()))
+            .cloned()
+            .or_else(|| dois.into_iter().next())
+    } else {
+        dois.into_iter().next()
+    }
 }
 
 fn find_first_page_arxiv_doi(doc: &Document) -> Option<String> {
@@ -116,10 +125,14 @@ fn find_first_page_identifier(
     doc: &Document,
     finder: fn(&str) -> Option<String>,
 ) -> Option<String> {
+    let text = first_page_text(doc)?;
+    finder(&text)
+}
+
+fn first_page_text(doc: &Document) -> Option<String> {
     let page = doc.load_page(0).ok()?;
     let text_page = page.to_text_page(TextPageFlags::empty()).ok()?;
-    let text = text_page.to_text().ok()?;
-    finder(&text)
+    text_page.to_text().ok()
 }
 
 #[cfg(test)]
@@ -208,6 +221,32 @@ mod tests {
         let metadata = PdfMetadataExtractor.extract_metadata(&path).unwrap();
         assert_eq!(metadata.doi.as_deref(), Some("10.1000/xyz123"));
         assert_eq!(metadata.created_at, None);
+    }
+
+    #[test]
+    fn test_pdf_metadata_extractor_prefers_numeric_first_page_doi_when_multiple_exist() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("page-multiple-dois.pdf");
+        write_text_pdf(
+            &path,
+            "Code DOI: 10.1000/xyz123 Article DOI: 10.1145/3544548.3581349",
+        );
+
+        let metadata = PdfMetadataExtractor.extract_metadata(&path).unwrap();
+        assert_eq!(metadata.doi.as_deref(), Some("10.1145/3544548.3581349"));
+    }
+
+    #[test]
+    fn test_pdf_metadata_extractor_keeps_first_page_doi_when_multiple_have_letters() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("page-multiple-alpha-dois.pdf");
+        write_text_pdf(
+            &path,
+            "First DOI: 10.1000/abc123 Second DOI: 10.2000/xyz789",
+        );
+
+        let metadata = PdfMetadataExtractor.extract_metadata(&path).unwrap();
+        assert_eq!(metadata.doi.as_deref(), Some("10.1000/abc123"));
     }
 
     #[test]

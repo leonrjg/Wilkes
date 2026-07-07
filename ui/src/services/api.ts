@@ -5,6 +5,7 @@ import type {
   EmbeddingEngine,
   Bookmark,
   FileListResponse,
+  FileListChanged,
   FileMatches,
   FileMetadataUpdate,
   IndexStatus,
@@ -15,6 +16,7 @@ import type {
   DocumentMetadata,
   ModelDescriptor,
   NewBookmark,
+  OpenAlexWork,
   PreviewData,
   SelectedEmbedder,
   SemanticScholarPaper,
@@ -49,13 +51,15 @@ export interface SearchApi {
   getFileMetadata(path: string): Promise<DocumentMetadata>;
   /** Authoritative metadata: file-based overridden by Zotero when it resolves. */
   resolveFileMetadata(path: string): Promise<DocumentMetadata>;
-  /** Clear the metadata cache so listings re-derive everything. */
-  refreshFileMetadata(): Promise<void>;
+  /** Re-derive metadata for every cached file, or one file when `path` is provided. */
+  refreshFileMetadata(path?: string): Promise<void>;
   zoteroStatus(): Promise<IntegrationStatus>;
   zoteroAddItem(path: string): Promise<AddOutcome>;
   zoteroGenerateCitation(path: string): Promise<CitationResult>;
   semanticScholarStatus(): Promise<IntegrationStatus>;
   semanticScholarLookup(doi: string): Promise<SemanticScholarPaper>;
+  openAlexStatus(): Promise<IntegrationStatus>;
+  openAlexLookup(doi: string): Promise<OpenAlexWork>;
   resolvePdfUrl(path: string): string;
   getLogs(): Promise<string[]>;
   clearLogs(): Promise<void>;
@@ -88,6 +92,7 @@ export interface SearchApi {
   onEmbedDone(handler: (done: EmbedDone) => void): Promise<() => void>;
   onEmbedError(handler: (err: EmbedError) => void): Promise<() => void>;
   onManagerEvent(handler: (event: string) => void): Promise<() => void>;
+  onFileListChanged(handler: (event: FileListChanged) => void): Promise<() => void>;
   onFileMetadataUpdated(
     handler: (updates: FileMetadataUpdate[]) => void,
   ): Promise<() => void>;

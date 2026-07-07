@@ -8,7 +8,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use wilkes_core::embed::index::watcher::IndexWatcher;
+use wilkes_core::directory_watcher::{DirectoryChangeBatch, DirectoryWatcher};
+use wilkes_core::embed::index::semantic_updater::process_directory_change;
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::installer::EmbedProgress;
 use wilkes_core::embed::models::installer::EmbedderInstaller;
@@ -18,15 +19,16 @@ use wilkes_core::embed::worker::manager::{
 use wilkes_core::embed::{dispatch, Embedder};
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
+use wilkes_core::integrations::openalex::OpenAlexClient;
 use wilkes_core::integrations::semantic_scholar::SemanticScholarClient;
 use wilkes_core::integrations::zotero::model::ZoteroItem;
 use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
-    Bookmark, DocumentMetadata, EmbedderModel, FileType, IndexStatus, IndexingConfig, NewBookmark,
-    PreviewData, SearchMode, SearchQuery, SearchScope, SelectedEmbedder, SemanticSettings,
-    Settings,
+    Bookmark, DocumentMetadata, EmbedderModel, FileType, IndexStatus, IndexingConfig,
+    MetadataConflictValue, MetadataSourcePreference, NewBookmark, PreviewData, SearchMode,
+    SearchQuery, SearchScope, SelectedEmbedder, SemanticSettings, Settings,
 };
 
 use crate::commands::search::{start_search, SearchHandle};
@@ -113,7 +115,6 @@ struct DownloadModelPlan {
 
 #[derive(Clone, Debug)]
 struct RestoreStatePlan {
-    settings: Settings,
     db_status: IndexStatus,
     selected: SelectedEmbedder,
     device: String,
@@ -151,6 +152,15 @@ fn preferred_bookmark_roots(settings: &Settings) -> Vec<PathBuf> {
     roots
 }
 
+fn metadata_source_preference(source: &MetadataSourcePreference) -> MetadataSource {
+    match source {
+        MetadataSourcePreference::File => MetadataSource::File,
+        MetadataSourcePreference::Zotero => MetadataSource::Zotero,
+        MetadataSourcePreference::SemanticScholar => MetadataSource::SemanticScholar,
+        MetadataSourcePreference::OpenAlex => MetadataSource::OpenAlex,
+    }
+}
+
 // ── AppContext ────────────────────────────────────────────────────────────────
 
 /// Shared application state and lifecycle logic. Both the desktop (Tauri) and
@@ -165,7 +175,7 @@ pub struct AppContext {
     /// Persistent cache of extracted document metadata, opened lazily. Shared
     /// with the index watcher so renames re-key rather than re-extract.
     metadata_cache: PLMutex<Option<Arc<Mutex<MetadataCache>>>>,
-    watcher: PLMutex<Option<IndexWatcher>>,
+    directory_watcher: PLMutex<Option<DirectoryWatcher>>,
     embed_task: PLMutex<Option<EmbedTaskHandle>>,
     embed_cancel_in_progress: AtomicBool,
     shutting_down: AtomicBool,
@@ -194,7 +204,7 @@ impl AppContext {
             embedder: PLMutex::new(None),
             index: PLMutex::new(Arc::new(Mutex::new(None))),
             metadata_cache: PLMutex::new(None),
-            watcher: PLMutex::new(None),
+            directory_watcher: PLMutex::new(None),
             embed_task: PLMutex::new(None),
             embed_cancel_in_progress: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
@@ -337,23 +347,43 @@ impl AppContext {
         )
         .await?;
 
-        // Populate document metadata (e.g. publication date) from the cache and
+        // Populate document metadata from the cache and
         // schedule background extraction for anything not yet cached.
         let Some(cache) = self.metadata_cache() else {
             return Ok(response);
         };
 
         let mut misses: Vec<PathBuf> = Vec::new();
+        let primary_source = metadata_source_preference(&s.primary_metadata_source);
         if let Ok(guard) = cache.lock() {
             for entry in response.files.iter_mut() {
                 let Some(identity) = FileIdentity::from_entry(entry) else {
                     continue;
                 };
-                match guard.get_valid(&entry.path, identity) {
-                    Ok(Some(meta)) => {
+                match guard.get_valid_with_primary(&entry.path, identity, primary_source) {
+                    Ok(Some(cached)) => {
+                        let meta = cached.metadata;
+                        let citation_count = provider_citation_count(&meta);
+                        entry.title = meta.title;
+                        entry.author = meta.author;
                         entry.publication_date = meta.created_at;
-                        entry.semantic_scholar_citation_count =
-                            meta.semantic_scholar.map(|paper| paper.citation_count);
+                        entry.citation_count = citation_count;
+                        entry.metadata_conflicts = cached
+                            .conflicts
+                            .into_iter()
+                            .map(|(key, values)| {
+                                (
+                                    key,
+                                    values
+                                        .into_iter()
+                                        .map(|value| MetadataConflictValue {
+                                            source: value.source,
+                                            value: value.value,
+                                        })
+                                        .collect(),
+                                )
+                            })
+                            .collect();
                     }
                     Ok(None) => misses.push(entry.path.clone()),
                     Err(e) => error!("metadata cache read {}: {e:#}", entry.path.display()),
@@ -400,6 +430,7 @@ impl AppContext {
     ) {
         let events = Arc::clone(&self.events);
         tokio::spawn(async move {
+            let primary_source = metadata_source_preference(&settings.primary_metadata_source);
             // Pass 1: file-based extraction (blocking). Emits immediately so the
             // list gets publication dates fast, mirroring the on-open viewer's
             // fast first paint before the Zotero upgrade.
@@ -415,14 +446,26 @@ impl AppContext {
                     };
                     match extract_or_rekey(&cache1, &registry, &path, identity) {
                         FillOutcome::Extracted(metadata) => {
-                            updates.push(metadata_update_json(&path, &metadata));
+                            updates.push(metadata_update_json_from_cache(
+                                &cache1,
+                                &path,
+                                identity,
+                                primary_source,
+                                &metadata,
+                            ));
                             eligible.push((path, identity, metadata));
                         }
                         // A rename hit already carries composed metadata (whose
                         // Zotero source, if any, was preserved by re-keying), so
                         // it is not eligible for a fresh Zotero resolve.
                         FillOutcome::Renamed(metadata) => {
-                            updates.push(metadata_update_json(&path, &metadata));
+                            updates.push(metadata_update_json_from_cache(
+                                &cache1,
+                                &path,
+                                identity,
+                                primary_source,
+                                &metadata,
+                            ));
                         }
                     }
                 }
@@ -475,7 +518,13 @@ impl AppContext {
                                 }
                             }
                             *metadata = z;
-                            z_updates.push(metadata_update_json(path, metadata));
+                            z_updates.push(metadata_update_json_from_cache(
+                                &cache,
+                                path,
+                                *identity,
+                                primary_source,
+                                metadata,
+                            ));
                         }
                     }
                     if !z_updates.is_empty() {
@@ -496,20 +545,56 @@ impl AppContext {
                     {
                         metadata.semantic_scholar = Some(enriched);
                         if let Ok(guard) = cache.lock() {
-                            if let Err(e) =
-                                guard.upsert(path, *identity, metadata, MetadataSource::File)
-                            {
+                            if let Err(e) = guard.upsert(
+                                path,
+                                *identity,
+                                metadata,
+                                MetadataSource::SemanticScholar,
+                            ) {
                                 error!(
                                     "metadata cache semantic scholar upsert {}: {e:#}",
                                     path.display()
                                 );
                             }
                         }
-                        s2_updates.push(metadata_update_json(path, metadata));
+                        s2_updates.push(metadata_update_json_from_cache(
+                            &cache,
+                            path,
+                            *identity,
+                            primary_source,
+                            metadata,
+                        ));
                     }
                 }
                 if !s2_updates.is_empty() {
                     events.emit("file-metadata-updated", serde_json::json!(s2_updates));
+                }
+            }
+
+            if settings.integrations.openalex.enabled {
+                let client = OpenAlexClient::from_settings(&settings.integrations.openalex);
+                let mut openalex_updates: Vec<serde_json::Value> = Vec::new();
+                for (path, identity, metadata) in composed.iter_mut() {
+                    if let Some(enriched) = openalex_enrichment_for(&client, metadata).await {
+                        metadata.openalex = Some(enriched);
+                        if let Ok(guard) = cache.lock() {
+                            if let Err(e) =
+                                guard.upsert(path, *identity, metadata, MetadataSource::OpenAlex)
+                            {
+                                error!("metadata cache openalex upsert {}: {e:#}", path.display());
+                            }
+                        }
+                        openalex_updates.push(metadata_update_json_from_cache(
+                            &cache,
+                            path,
+                            *identity,
+                            primary_source,
+                            metadata,
+                        ));
+                    }
+                }
+                if !openalex_updates.is_empty() {
+                    events.emit("file-metadata-updated", serde_json::json!(openalex_updates));
                 }
             }
         });
@@ -563,6 +648,20 @@ impl AppContext {
         .await
     }
 
+    pub async fn openalex_status(&self) -> anyhow::Result<wilkes_core::types::IntegrationStatus> {
+        let s = self.get_settings().await;
+        crate::commands::integrations::openalex::openalex_status(s).await
+    }
+
+    pub async fn openalex_lookup(
+        &self,
+        doi: String,
+    ) -> anyhow::Result<wilkes_core::types::OpenAlexWork> {
+        let s = self.get_settings().await;
+        crate::commands::integrations::openalex::openalex_lookup(s, self.metadata_cache(), doi)
+            .await
+    }
+
     /// Authoritative document metadata: file-based extraction overridden by the
     /// Zotero library record when the file resolves to an item. This is the
     /// single owner of that composition — both the on-open viewer and the
@@ -587,14 +686,21 @@ impl AppContext {
     /// [`MetadataCache::upsert`], which only overwrites a field when the new
     /// derivation actually produced a value and never lets file extraction
     /// clobber authoritative Zotero fields.
-    pub async fn refresh_file_metadata(&self) -> anyhow::Result<()> {
+    pub async fn refresh_file_metadata(&self, path: Option<PathBuf>) -> anyhow::Result<()> {
         let s = self.get_settings().await;
         let Some(cache) = self.metadata_cache() else {
             return Ok(());
         };
-        let paths = match cache.lock() {
-            Ok(guard) => guard.all_paths()?,
-            Err(_) => return Ok(()),
+        let paths = if let Some(path) = path {
+            if !is_under(&path, &self.data_dir) {
+                anyhow::bail!("Access denied: path outside data directory");
+            }
+            vec![path]
+        } else {
+            match cache.lock() {
+                Ok(guard) => guard.all_paths()?,
+                Err(_) => return Ok(()),
+            }
         };
         if !paths.is_empty() {
             self.spawn_metadata_fill(paths, s, cache);
@@ -630,15 +736,90 @@ impl AppContext {
         self.get_settings().await
     }
 
-    fn stop_watcher(&self) {
-        if let Some(mut w) = self.watcher.lock().take() {
+    fn stop_directory_watcher(&self) {
+        if let Some(mut w) = self.directory_watcher.lock().take() {
             w.stop();
         }
     }
 
     fn prepare_for_full_rebuild(&self) {
-        self.stop_watcher();
         *self.index.lock() = Arc::new(Mutex::new(None));
+    }
+
+    fn start_directory_watcher(self: &Arc<Self>, root: PathBuf) {
+        self.stop_directory_watcher();
+        if !root.exists() || !root.is_dir() {
+            error!("directory watcher root is invalid: {}", root.display());
+            return;
+        }
+
+        let ctx = Arc::clone(self);
+        let runtime = tokio::runtime::Handle::current();
+        match DirectoryWatcher::start(root.clone(), move |batch| {
+            ctx.emit_file_list_changed(&batch.root);
+            let ctx = Arc::clone(&ctx);
+            runtime.spawn(async move {
+                ctx.process_directory_change_for_semantic(batch).await;
+            });
+        }) {
+            Ok(watcher) => *self.directory_watcher.lock() = Some(watcher),
+            Err(err) => error!("directory watcher start failed: {err:#}"),
+        }
+    }
+
+    fn on_directory_setting_maybe_changed(self: &Arc<Self>, before: &Settings, after: &Settings) {
+        if before.last_directory == after.last_directory {
+            return;
+        }
+        match after.last_directory.clone() {
+            Some(root) => self.start_directory_watcher(root),
+            None => self.stop_directory_watcher(),
+        }
+    }
+
+    fn emit_file_list_changed(&self, root: &Path) {
+        self.events.emit(
+            "file-list-changed",
+            serde_json::json!({ "root": root.display().to_string() }),
+        );
+    }
+
+    async fn process_directory_change_for_semantic(self: Arc<Self>, batch: DirectoryChangeBatch) {
+        let settings = self.get_settings().await;
+        if !settings.search_prefer_semantic {
+            return;
+        }
+
+        let Some(embedder) = self.embedder.lock().clone() else {
+            return;
+        };
+        let index_arc = Arc::clone(&*self.index.lock());
+        let has_index = index_arc
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false);
+        if !has_index {
+            return;
+        }
+
+        let mut registry = ExtractorRegistry::new();
+        registry.register(Box::new(PdfExtractor::new()));
+        let registry = Arc::new(registry);
+        let cache = self.metadata_cache();
+        let config = Self::restore_state_indexing_config(&settings);
+        let ev1 = Arc::clone(&self.events);
+        let ev2 = Arc::clone(&self.events);
+
+        process_directory_change(
+            batch,
+            &index_arc,
+            &cache,
+            &registry,
+            &embedder,
+            &config,
+            &move || ev1.emit("manager-event", serde_json::json!("Reindexing")),
+            &move || ev2.emit("manager-event", serde_json::json!("ReindexingDone")),
+        );
     }
 
     fn embed_task_is_running(&self) -> bool {
@@ -726,8 +907,10 @@ impl AppContext {
             let updated = update_settings(&self.settings_path, patch).await?;
             (before, updated)
         };
+        self.on_directory_setting_maybe_changed(&before, &updated);
         self.on_zotero_settings_maybe_changed(&before, &updated);
         self.on_semantic_scholar_settings_maybe_changed(&before, &updated);
+        self.on_openalex_settings_maybe_changed(&before, &updated);
         self.on_semantic_pref_maybe_changed(&before, &updated);
         Ok(updated)
     }
@@ -756,7 +939,6 @@ impl AppContext {
     /// resident embedder + index so filesystem changes no longer reindex. The
     /// on-disk DB is preserved so re-enabling is cheap.
     fn deactivate_semantic(&self) {
-        self.stop_watcher();
         *self.index.lock() = Arc::new(Mutex::new(None));
         *self.embedder.lock() = None;
     }
@@ -836,6 +1018,42 @@ impl AppContext {
         }
     }
 
+    fn on_openalex_settings_maybe_changed(&self, before: &Settings, after: &Settings) {
+        let o_before = &before.integrations.openalex;
+        let o_after = &after.integrations.openalex;
+        let relevant_changed = o_before.enabled != o_after.enabled
+            || o_before.base_url != o_after.base_url
+            || o_before.email != o_after.email;
+        if !relevant_changed {
+            return;
+        }
+
+        if let Some(cache) = self.metadata_cache() {
+            if let Ok(guard) = cache.lock() {
+                if let Err(e) = guard.invalidate_openalex() {
+                    error!("metadata cache invalidate_openalex: {e:#}");
+                }
+            }
+        }
+
+        if o_after.enabled {
+            self.spawn_openalex_backfill(after.clone());
+        }
+    }
+
+    fn spawn_openalex_backfill(&self, settings: Settings) {
+        let Some(cache) = self.metadata_cache() else {
+            return;
+        };
+        let paths = match cache.lock() {
+            Ok(guard) => guard.all_paths().unwrap_or_default(),
+            Err(_) => return,
+        };
+        if !paths.is_empty() {
+            self.spawn_metadata_fill(paths, settings, cache);
+        }
+    }
+
     /// Re-resolve every file-sourced cache row against Zotero and upgrade the
     /// matches to authoritative Zotero rows. Runs after Zotero becomes usable so
     /// already-tabulated files gain library data without re-extraction.
@@ -863,6 +1081,7 @@ impl AppContext {
                 }
             };
             let mut updates: Vec<serde_json::Value> = Vec::new();
+            let primary_source = metadata_source_preference(&settings.primary_metadata_source);
             for row in rows {
                 if let Some(z) =
                     zotero_override_for(&client, &row.path, &row.metadata, &attachments).await
@@ -874,7 +1093,13 @@ impl AppContext {
                             error!("zotero backfill upsert {}: {e:#}", row.path.display());
                         }
                     }
-                    updates.push(metadata_update_json(&row.path, &z));
+                    updates.push(metadata_update_json_from_cache(
+                        &cache,
+                        &row.path,
+                        row.identity,
+                        primary_source,
+                        &z,
+                    ));
                 }
             }
             if !updates.is_empty() {
@@ -951,6 +1176,7 @@ impl AppContext {
         let settings = self.settings().await;
         query = Self::prepare_search_query(query, settings.supported_extensions.clone())?;
 
+        let mut semantic_indexing = None;
         let (embedder, index) = if query.mode == SearchMode::Semantic {
             // Block if a build task is currently running.
             {
@@ -1022,12 +1248,17 @@ impl AppContext {
                 }
             }
 
+            semantic_indexing = Some(IndexingConfig {
+                chunk_size: settings.semantic.chunk_size,
+                chunk_overlap: settings.semantic.chunk_overlap,
+                supported_extensions: settings.supported_extensions.clone(),
+            });
             (Some(embedder), Some(index_arc))
         } else {
             (None, None)
         };
 
-        Ok(start_search(query, embedder, index))
+        Ok(start_search(query, embedder, index, semantic_indexing))
     }
 
     // ── Build index ───────────────────────────────────────────────────────────
@@ -1212,30 +1443,13 @@ impl AppContext {
     }
 
     fn start_build_watcher(
-        &self,
+        self: &Arc<Self>,
         root_path: PathBuf,
-        index_arc: Arc<Mutex<Option<SemanticIndex>>>,
-        embedder: Arc<dyn Embedder>,
-        indexing: IndexingConfig,
+        _index_arc: Arc<Mutex<Option<SemanticIndex>>>,
+        _embedder: Arc<dyn Embedder>,
+        _indexing: IndexingConfig,
     ) {
-        let mut registry = ExtractorRegistry::new();
-        registry.register(Box::new(PdfExtractor::new()));
-
-        let ev1 = Arc::clone(&self.events);
-        let ev2 = Arc::clone(&self.events);
-        match IndexWatcher::start(
-            root_path,
-            index_arc,
-            self.metadata_cache(),
-            Arc::new(registry),
-            embedder,
-            indexing,
-            move || ev1.emit("manager-event", serde_json::json!("Reindexing")),
-            move || ev2.emit("manager-event", serde_json::json!("ReindexingDone")),
-        ) {
-            Ok(watcher) => *self.watcher.lock() = Some(watcher),
-            Err(err) => error!("watcher start failed: {err:#}"),
-        }
+        self.start_directory_watcher(root_path);
     }
 
     async fn finish_build_index(
@@ -1531,13 +1745,12 @@ impl AppContext {
         if self.shutting_down.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.stop_watcher();
+        self.stop_directory_watcher();
         self.cancel_embed().await;
         self.kill_worker();
     }
 
     pub async fn delete_index(&self) -> anyhow::Result<()> {
-        self.stop_watcher();
         *self.index.lock() = Arc::new(Mutex::new(None));
         *self.embedder.lock() = None;
         crate::commands::embed::delete_index(&self.data_dir).await?;
@@ -1620,34 +1833,6 @@ impl AppContext {
         open(data_dir, model_id, expected_dim)
     }
 
-    fn start_index_watcher_with<F>(
-        root: PathBuf,
-        index_arc: Arc<Mutex<Option<SemanticIndex>>>,
-        cache: Option<Arc<Mutex<MetadataCache>>>,
-        registry: Arc<ExtractorRegistry>,
-        embedder: Arc<dyn Embedder>,
-        indexing: IndexingConfig,
-        start: F,
-    ) -> anyhow::Result<IndexWatcher>
-    where
-        F: FnOnce(
-            PathBuf,
-            Arc<Mutex<Option<SemanticIndex>>>,
-            Option<Arc<Mutex<MetadataCache>>>,
-            Arc<ExtractorRegistry>,
-            Arc<dyn Embedder>,
-            IndexingConfig,
-            Box<dyn Fn() + Send + Sync>,
-            Box<dyn Fn() + Send + Sync>,
-        ) -> anyhow::Result<IndexWatcher>,
-    {
-        let ev1: Box<dyn Fn() + Send + Sync> = Box::new(|| {});
-        let ev2: Box<dyn Fn() + Send + Sync> = Box::new(|| {});
-        start(
-            root, index_arc, cache, registry, embedder, indexing, ev1, ev2,
-        )
-    }
-
     fn prepare_restore_state_plan(
         settings: Settings,
         db_status: IndexStatus,
@@ -1661,7 +1846,6 @@ impl AppContext {
         } else {
             RestoreStatePreparation::Ready(RestoreStatePlan {
                 device: settings.semantic.device_for(selected.engine).to_string(),
-                settings,
                 db_status,
                 selected,
             })
@@ -1812,54 +1996,13 @@ impl AppContext {
         index_arc
     }
 
-    fn maybe_restore_watcher(
-        &self,
-        settings: &Settings,
-        index_arc: Arc<Mutex<Option<SemanticIndex>>>,
-        embedder: Arc<dyn Embedder>,
-    ) {
-        if let Some(root) = settings.last_directory.clone() {
-            let mut registry = ExtractorRegistry::new();
-            registry.register(Box::new(PdfExtractor::new()));
-            let indexing = Self::restore_state_indexing_config(settings);
-            match Self::start_index_watcher_with(
-                root,
-                index_arc,
-                self.metadata_cache(),
-                Arc::new(registry),
-                embedder,
-                indexing,
-                |root, index_arc, cache, registry, embedder, indexing, on_reindex, on_done| {
-                    let ev1 = Arc::clone(&self.events);
-                    let ev2 = Arc::clone(&self.events);
-                    let on_reindex = move || {
-                        on_reindex();
-                        ev1.emit("manager-event", serde_json::json!("Reindexing"))
-                    };
-                    let on_done = move || {
-                        on_done();
-                        ev2.emit("manager-event", serde_json::json!("ReindexingDone"))
-                    };
-                    IndexWatcher::start(
-                        root, index_arc, cache, registry, embedder, indexing, on_reindex, on_done,
-                    )
-                    .map_err(Into::into)
-                },
-            ) {
-                Ok(watcher) => *self.watcher.lock() = Some(watcher),
-                Err(err) => error!("restore_state: watcher: {err:#}"),
-            }
-        }
-    }
-
     async fn finish_restore_state(
         &self,
         plan: &RestoreStatePlan,
         embedder: Arc<dyn Embedder>,
         index: SemanticIndex,
     ) {
-        let index_arc = self.restore_store_loaded_state(Arc::clone(&embedder), index);
-        self.maybe_restore_watcher(&plan.settings, index_arc, embedder);
+        self.restore_store_loaded_state(Arc::clone(&embedder), index);
 
         let db_path = self.data_dir.join("semantic_index.db");
         let dim = plan.db_status.dimension;
@@ -1881,10 +2024,13 @@ impl AppContext {
                 return;
             }
         };
+        if let Some(root) = settings.last_directory.clone() {
+            self.start_directory_watcher(root);
+        }
         // `search_prefer_semantic` is the single owner of whether the semantic
         // subsystem is active. A leftover index DB on disk must not resurrect the
-        // embedder or the watcher behind a toggle the user turned off: honoring it
-        // here is what keeps a file change from silently triggering a reindex.
+        // embedder behind a toggle the user turned off. The directory watcher is
+        // independent and remains active for file-list invalidation.
         if !settings.search_prefer_semantic {
             info!("restore_state: semantic search disabled by preference, skipping restore");
             return;
@@ -1907,15 +2053,53 @@ enum FillOutcome {
 }
 
 /// JSON payload entry for the `file-metadata-updated` event.
-fn metadata_update_json(path: &Path, metadata: &DocumentMetadata) -> serde_json::Value {
+fn metadata_update_json(
+    path: &Path,
+    metadata: &DocumentMetadata,
+    metadata_conflicts: serde_json::Value,
+) -> serde_json::Value {
     serde_json::json!({
         "path": path.to_string_lossy(),
+        "title": metadata.title,
+        "author": metadata.author,
         "publication_date": metadata.created_at,
-        "semantic_scholar_citation_count": metadata
-            .semantic_scholar
-            .as_ref()
-            .map(|paper| paper.citation_count),
+        "citation_count": provider_citation_count(metadata),
+        "metadata_conflicts": metadata_conflicts,
     })
+}
+
+fn provider_citation_count(metadata: &DocumentMetadata) -> Option<i64> {
+    metadata
+        .semantic_scholar
+        .as_ref()
+        .map(|paper| paper.citation_count)
+        .or_else(|| metadata.openalex.as_ref().map(|work| work.citation_count))
+}
+
+fn metadata_update_json_from_cache(
+    cache: &Arc<Mutex<MetadataCache>>,
+    path: &Path,
+    identity: FileIdentity,
+    primary_source: MetadataSource,
+    fallback: &DocumentMetadata,
+) -> serde_json::Value {
+    match cache
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .get_valid_with_primary(path, identity, primary_source)
+                .ok()
+        })
+        .flatten()
+    {
+        Some(cached) => metadata_update_json(
+            path,
+            &cached.metadata,
+            serde_json::to_value(cached.conflicts).unwrap_or_else(|_| serde_json::json!({})),
+        ),
+        None => metadata_update_json(path, fallback, serde_json::json!({})),
+    }
 }
 
 /// Fill one file's file-based metadata. Prefers a cheap re-key when the same
@@ -1983,6 +2167,20 @@ async fn semantic_scholar_enrichment_for(
         Ok(paper) => Some(paper),
         Err(e) => {
             info!("semantic scholar lookup {doi}: {e:#}");
+            None
+        }
+    }
+}
+
+async fn openalex_enrichment_for(
+    client: &OpenAlexClient,
+    metadata: &DocumentMetadata,
+) -> Option<wilkes_core::types::OpenAlexWork> {
+    let doi = metadata.doi.as_deref()?;
+    match client.lookup_by_doi(doi).await {
+        Ok(work) => Some(work),
+        Err(e) => {
+            info!("openalex lookup {doi}: {e:#}");
             None
         }
     }
@@ -2423,33 +2621,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_start_index_watcher_with_error() {
+    #[tokio::test]
+    async fn test_start_directory_watcher_invalid_root_leaves_no_watcher() {
         let dir = tempdir().unwrap();
-        let index_arc = Arc::new(Mutex::new(None));
-        let registry = Arc::new(ExtractorRegistry::new());
-        let embedder = Arc::new(MockEmbedder::default());
-
-        let result = AppContext::start_index_watcher_with(
-            dir.path().to_path_buf(),
-            index_arc,
-            None,
-            registry,
-            embedder,
-            IndexingConfig {
-                chunk_size: 64,
-                chunk_overlap: 16,
-                supported_extensions: vec!["txt".to_string()],
-            },
-            |_root, _index_arc, _cache, _registry, _embedder, _indexing, _on_reindex, _on_done| {
-                Err(anyhow::anyhow!("watcher failed"))
-            },
-        );
-
-        match result {
-            Ok(_) => panic!("expected watcher error"),
-            Err(err) => assert!(err.to_string().contains("watcher failed")),
-        }
+        let (_tmp, ctx) = test_ctx();
+        ctx.start_directory_watcher(dir.path().join("missing"));
+        assert!(ctx.directory_watcher.lock().is_none());
     }
 
     fn running_embed_task() -> EmbedTaskHandle {
@@ -2845,35 +3022,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_maybe_restore_watcher_and_finish_restore_state() {
-        let (dir, ctx) = test_ctx();
-        let data_dir = ctx.data_dir.clone();
-        let index = SemanticIndex::create(
-            &data_dir,
-            "restore-model",
-            384,
-            EmbeddingEngine::Candle,
-            Some(dir.path()),
-        )
-        .unwrap();
-        let index_arc = Arc::new(Mutex::new(Some(index)));
-        let bad_root = dir.path().join("not-a-dir.txt");
-        std::fs::write(&bad_root, "nope").unwrap();
-        let settings = Settings {
-            last_directory: Some(bad_root),
-            supported_extensions: vec!["txt".to_string()],
-            semantic: SemanticSettings {
-                chunk_size: 64,
-                chunk_overlap: 8,
-                ..SemanticSettings::default()
-            },
-            ..Settings::default()
-        };
-        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
-        ctx.maybe_restore_watcher(&settings, index_arc, Arc::clone(&embedder));
-        ctx.stop_watcher();
-        assert!(ctx.watcher.lock().is_none());
-
+    async fn test_finish_restore_state_persists_semantic_state() {
         let (_dir2, ctx2) = test_ctx();
         let data_dir2 = ctx2.data_dir.clone();
         let index = SemanticIndex::create(
@@ -2885,7 +3034,6 @@ mod tests {
         )
         .unwrap();
         let plan = RestoreStatePlan {
-            settings: Settings::default(),
             db_status: IndexStatus {
                 indexed_files: 1,
                 total_chunks: 1,
@@ -2904,6 +3052,7 @@ mod tests {
             },
             device: "cpu".to_string(),
         };
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
         ctx2.finish_restore_state(&plan, embedder, index).await;
 
         let settings = ctx2.get_settings().await;
@@ -2914,6 +3063,8 @@ mod tests {
     #[tokio::test]
     async fn test_restore_state_skips_when_semantic_pref_off() {
         let (dir, ctx) = test_ctx();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
 
         // A fully restorable index DB sits on disk with the default selection,
         // so the only thing that can prevent restore is the user's toggle.
@@ -2932,6 +3083,7 @@ mod tests {
         // after building and then unchecking semantic search).
         let disabled = Settings {
             search_prefer_semantic: false,
+            last_directory: Some(root),
             semantic: SemanticSettings {
                 enabled: true,
                 index_path: Some(ctx.data_dir.join("semantic_index.db")),
@@ -2963,16 +3115,42 @@ mod tests {
 
         Arc::clone(&ctx).restore_state().await;
 
-        // The watcher must not run behind a disabled toggle, and restore must not
-        // load the embedder/index behind the user's back.
-        assert!(ctx.watcher.lock().is_none());
+        // Directory watching is independent of semantic restore, so it starts
+        // for file-list invalidation even when semantic search is disabled.
+        assert!(ctx.directory_watcher.lock().is_some());
         assert!(ctx.embedder.lock().is_none());
         assert!(!ctx.get_settings().await.search_prefer_semantic);
     }
 
     #[tokio::test]
-    async fn test_update_settings_pref_off_tears_down_watcher() {
+    async fn test_update_settings_last_directory_restarts_directory_watcher() {
         let (dir, ctx) = test_ctx();
+        let root1 = dir.path().join("root1");
+        let root2 = dir.path().join("root2");
+        std::fs::create_dir_all(&root1).unwrap();
+        std::fs::create_dir_all(&root2).unwrap();
+
+        ctx.update_settings(serde_json::json!({ "last_directory": root1 }))
+            .await
+            .unwrap();
+        assert!(ctx.directory_watcher.lock().is_some());
+
+        ctx.update_settings(serde_json::json!({ "last_directory": root2 }))
+            .await
+            .unwrap();
+        assert!(ctx.directory_watcher.lock().is_some());
+
+        ctx.update_settings(serde_json::json!({ "last_directory": null }))
+            .await
+            .unwrap();
+        assert!(ctx.directory_watcher.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_settings_pref_off_keeps_directory_watcher_and_tears_down_semantic() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
 
         // Seed persisted settings with the toggle already ON so the update below
         // is a pure ON->OFF transition (no stray activate spawn to race with).
@@ -2980,6 +3158,7 @@ mod tests {
             dir.path().join("settings.json"),
             serde_json::to_string(&Settings {
                 search_prefer_semantic: true,
+                last_directory: Some(root.clone()),
                 ..Settings::default()
             })
             .unwrap(),
@@ -2997,30 +3176,16 @@ mod tests {
         .unwrap();
         *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
         *ctx.embedder.lock() = Some(Arc::new(MockEmbedder::default()) as Arc<dyn Embedder>);
-        let watcher = IndexWatcher::start(
-            ctx.data_dir.clone(),
-            Arc::clone(&*ctx.index.lock()),
-            ctx.metadata_cache(),
-            Arc::new(ExtractorRegistry::new()),
-            Arc::new(MockEmbedder::default()),
-            IndexingConfig {
-                chunk_size: 64,
-                chunk_overlap: 8,
-                supported_extensions: vec!["txt".to_string()],
-            },
-            || {},
-            || {},
-        )
-        .unwrap();
-        *ctx.watcher.lock() = Some(watcher);
+        ctx.start_directory_watcher(root);
+        assert!(ctx.directory_watcher.lock().is_some());
 
         ctx.update_settings(serde_json::json!({ "search_prefer_semantic": false }))
             .await
             .unwrap();
 
-        // Turning the toggle off must stop the watcher and release the resident
-        // embedder + index so file changes no longer reindex.
-        assert!(ctx.watcher.lock().is_none());
+        // Turning the toggle off must leave file-list watching active while
+        // releasing resident semantic state so file changes no longer reindex.
+        assert!(ctx.directory_watcher.lock().is_some());
         assert!(ctx.embedder.lock().is_none());
         assert!(ctx
             .index
@@ -3087,7 +3252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_finish_build_index_starts_watcher_and_persists_state() {
+    async fn test_finish_build_index_starts_directory_watcher_and_persists_state() {
         let (dir, ctx) = test_ctx();
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -3120,7 +3285,7 @@ mod tests {
 
         assert!(ctx.embedder.lock().is_some());
         assert!(ctx.index.lock().lock().unwrap().is_some());
-        assert!(ctx.watcher.lock().is_some());
+        assert!(ctx.directory_watcher.lock().is_some());
 
         let settings = ctx.get_settings().await;
         assert!(settings.semantic.enabled);
@@ -3129,8 +3294,8 @@ mod tests {
             Some(data_dir.join("semantic_index.db"))
         );
 
-        ctx.stop_watcher();
-        assert!(ctx.watcher.lock().is_none());
+        ctx.stop_directory_watcher();
+        assert!(ctx.directory_watcher.lock().is_none());
         drop(index);
     }
 
@@ -3160,7 +3325,7 @@ mod tests {
             },
         );
 
-        assert!(ctx.watcher.lock().is_none());
+        assert!(ctx.directory_watcher.lock().is_none());
     }
 
     #[tokio::test]
@@ -3369,7 +3534,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn test_stop_watcher() {
+    async fn test_stop_directory_watcher() {
         let dir = tempdir().unwrap();
         let emitter = Arc::new(MockEmitter {
             events: Arc::new(Mutex::new(Vec::new())),
@@ -3388,29 +3553,14 @@ exit 0
             emitter,
         );
 
-        let watcher = IndexWatcher::start(
-            dir.path().to_path_buf(),
-            ctx.index.lock().clone(),
-            None,
-            Arc::new(ExtractorRegistry::new()),
-            Arc::new(MockEmbedder::default()),
-            IndexingConfig {
-                chunk_size: 100,
-                chunk_overlap: 10,
-                supported_extensions: vec![],
-            },
-            || {},
-            || {},
-        )
-        .unwrap();
-
-        *ctx.watcher.lock() = Some(watcher);
-        ctx.stop_watcher();
-        assert!(ctx.watcher.lock().is_none());
+        ctx.start_directory_watcher(dir.path().to_path_buf());
+        assert!(ctx.directory_watcher.lock().is_some());
+        ctx.stop_directory_watcher();
+        assert!(ctx.directory_watcher.lock().is_none());
     }
 
     #[tokio::test]
-    async fn test_prepare_for_full_rebuild_stops_watcher_and_drops_resident_index() {
+    async fn test_prepare_for_full_rebuild_keeps_directory_watcher_and_drops_resident_index() {
         let dir = tempdir().unwrap();
         let emitter = Arc::new(MockEmitter {
             events: Arc::new(Mutex::new(Vec::new())),
@@ -3439,26 +3589,11 @@ exit 0
         .unwrap();
         *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
 
-        let watcher = IndexWatcher::start(
-            dir.path().to_path_buf(),
-            ctx.index.lock().clone(),
-            None,
-            Arc::new(ExtractorRegistry::new()),
-            Arc::new(MockEmbedder::default()),
-            IndexingConfig {
-                chunk_size: 100,
-                chunk_overlap: 10,
-                supported_extensions: vec![],
-            },
-            || {},
-            || {},
-        )
-        .unwrap();
-        *ctx.watcher.lock() = Some(watcher);
+        ctx.start_directory_watcher(dir.path().to_path_buf());
 
         ctx.prepare_for_full_rebuild();
 
-        assert!(ctx.watcher.lock().is_none());
+        assert!(ctx.directory_watcher.lock().is_some());
         assert!(ctx.index.lock().lock().unwrap().is_none());
     }
 
@@ -3560,22 +3695,7 @@ exit 0
             emitter,
         );
 
-        let watcher = IndexWatcher::start(
-            dir.path().to_path_buf(),
-            ctx.index.lock().clone(),
-            None,
-            Arc::new(ExtractorRegistry::new()),
-            Arc::new(MockEmbedder::default()),
-            IndexingConfig {
-                chunk_size: 100,
-                chunk_overlap: 10,
-                supported_extensions: vec![],
-            },
-            || {},
-            || {},
-        )
-        .unwrap();
-        *ctx.watcher.lock() = Some(watcher);
+        ctx.start_directory_watcher(dir.path().to_path_buf());
 
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
@@ -3592,7 +3712,7 @@ exit 0
 
         ctx.shutdown().await;
 
-        assert!(ctx.watcher.lock().is_none());
+        assert!(ctx.directory_watcher.lock().is_none());
         assert!(ctx.embed_task.lock().is_none());
     }
 
@@ -4063,7 +4183,7 @@ exit 0
 
         assert!(ctx.embedder.lock().is_none());
         assert!(ctx.index.lock().lock().unwrap().is_none());
-        assert!(ctx.watcher.lock().is_none());
+        assert!(ctx.directory_watcher.lock().is_none());
     }
 
     #[tokio::test]

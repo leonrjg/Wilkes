@@ -18,6 +18,7 @@ import {
 } from "./pdfScrollMemory";
 import { usePdfDocument } from "./pdfDocumentCache";
 import { api } from "../../services";
+import { Tooltip } from "../Tooltip";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -718,28 +719,30 @@ export default function PdfViewer({
 
         <div className="flex items-center gap-1 bg-[var(--bg-app)] border border-[var(--border-main)] rounded-lg shadow-lg px-2 py-1 text-xs text-[var(--text-main)]">
           {pdf && (
-            <button
-              onClick={() => setIsOutlineOpen((open) => !open)}
-              disabled={!outline}
-              className={`p-1 transition-colors mr-1 border-r border-[var(--border-main)] pr-2 ${
-                outline ? "hover:text-[var(--accent-blue)]" : "opacity-40 cursor-default"
-              } ${isOutlineOpen ? "text-[var(--accent-blue)]" : ""}`}
-              title={outline ? "Table of contents" : "This document has no table of contents"}
-            >
-              <List size={12} />
-            </button>
+            <Tooltip content={outline ? "Table of contents" : "This document has no table of contents"}>
+              <button
+                onClick={() => setIsOutlineOpen((open) => !open)}
+                disabled={!outline}
+                className={`p-1 transition-colors mr-1 border-r border-[var(--border-main)] pr-2 ${
+                  outline ? "hover:text-[var(--accent-blue)]" : "opacity-40 cursor-default"
+                } ${isOutlineOpen ? "text-[var(--accent-blue)]" : ""}`}
+              >
+                <List size={12} />
+              </button>
+            </Tooltip>
           )}
           {!isSearchOpen && (
-            <button
-              onClick={() => {
-                setIsSearchOpen(true);
-                setTimeout(() => searchInputRef.current?.focus(), 50);
-              }}
-              className="p-1 hover:text-[var(--accent-blue)] transition-colors mr-1 border-r border-[var(--border-main)] pr-2"
-              title="Find in document (Cmd+F)"
-            >
-              <SearchIcon size={12} />
-            </button>
+            <Tooltip content="Find in document (Cmd+F)">
+              <button
+                onClick={() => {
+                  setIsSearchOpen(true);
+                  setTimeout(() => searchInputRef.current?.focus(), 50);
+                }}
+                className="p-1 hover:text-[var(--accent-blue)] transition-colors mr-1 border-r border-[var(--border-main)] pr-2"
+              >
+                <SearchIcon size={12} />
+              </button>
+            </Tooltip>
           )}
           {numPages && <span className="w-16 text-center font-mono">{currentPage}/{numPages}</span>}
           {numPages && <span className="text-[var(--text-dim)]">|</span>}
@@ -1014,7 +1017,7 @@ export default function PdfViewer({
                     }}
                     className="px-2 py-1 hover:bg-[var(--bg-active)]"
                   >
-                    + Bookmark
+                    Bookmark
                   </button>
                 )}
                 {showChatSelectionActions && onExplainSelection && (

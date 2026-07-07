@@ -2,6 +2,7 @@ use async_trait::async_trait;
 
 use crate::types::{IntegrationStatus, Settings};
 
+pub mod openalex;
 pub mod semantic_scholar;
 pub mod zotero;
 
@@ -37,6 +38,7 @@ impl Default for IntegrationRegistry {
         let mut registry = Self::new();
         registry.register(Box::new(zotero::ZoteroIntegration));
         registry.register(Box::new(semantic_scholar::SemanticScholarIntegration));
+        registry.register(Box::new(openalex::OpenAlexIntegration));
         registry
     }
 }

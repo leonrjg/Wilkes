@@ -114,6 +114,7 @@ export interface DocumentMetadata {
   doi: string | null;
   created_at: string | null;
   semantic_scholar?: SemanticScholarPaper | null;
+  openalex?: OpenAlexWork | null;
 }
 
 export type IntegrationState =
@@ -158,6 +159,18 @@ export interface SemanticScholarPaper {
   cached_at_ms: number;
 }
 
+export interface OpenAlexWork {
+  doi: string;
+  work_id: string;
+  title: string | null;
+  year: number | null;
+  publication_date: string | null;
+  venue: string | null;
+  citation_count: number;
+  external_ids: Record<string, unknown>;
+  cached_at_ms: number;
+}
+
 export type ViewerMetadataStatus = "idle" | "loading" | "ready" | "failed";
 
 export interface FileEntry {
@@ -167,19 +180,53 @@ export interface FileEntry {
   extension: string;
   created_at_ms?: number | null;
   modified_at_ms?: number | null;
+  /** Document title from cached extracted metadata. Absent until metadata has
+   * processed this file. */
+  title?: string | null;
+  /** Document author from cached extracted metadata. */
+  author?: string | null;
   /** Document publication date ("YYYY-MM") from cached extracted metadata.
    *  Absent until the metadata cache has processed this file. */
   publication_date?: string | null;
   /** Semantic Scholar citation count from cached extracted metadata. */
-  semantic_scholar_citation_count?: number | null;
+  citation_count?: number | null;
+  metadata_conflicts?: Record<string, MetadataConflictValue[]>;
 }
+
+export interface MetadataConflictValue {
+  source: MetadataSourcePreference;
+  value: string;
+}
+
+export const MetadataField = {
+  Title: "title",
+  Author: "author",
+  Doi: "doi",
+  PublicationDate: "publication_date",
+  PaperId: "paper_id",
+  Year: "year",
+  Venue: "venue",
+  CitationCount: "citation_count",
+  ExternalIdsJson: "external_ids_json",
+  CachedAtMs: "cached_at_ms",
+  ExtractedAtMs: "extracted_at_ms",
+} as const;
+
+export type MetadataField = (typeof MetadataField)[keyof typeof MetadataField];
 
 /** Payload entry of the `file-metadata-updated` event: cached document metadata
  *  filled in for a file after its background extraction completes. */
 export interface FileMetadataUpdate {
   path: string;
+  title?: string | null;
+  author?: string | null;
   publication_date: string | null;
-  semantic_scholar_citation_count?: number | null;
+  citation_count?: number | null;
+  metadata_conflicts?: Record<string, MetadataConflictValue[]>;
+}
+
+export interface FileListChanged {
+  root: string;
 }
 
 export interface FileListResponse {
@@ -192,10 +239,25 @@ export interface OmittedFileEntry extends FileEntry {
 }
 
 export type OmittedFileReason = "TooLarge" | "UnsupportedExtension";
-export type FileSortKey = "filename" | "created" | "modified" | "size" | "publication" | "citations";
+export type FileSortKey =
+  | "filename"
+  | "title"
+  | "author"
+  | "created"
+  | "modified"
+  | "size"
+  | "publication"
+  | "citations";
 /** Optional document-metadata field that can be shown as a column in the file
  *  list. Extend alongside FILE_DISPLAY_FIELDS as FileEntry gains more fields. */
-export type FileDisplayField = "created" | "modified" | "size" | "publication" | "citations";
+export type FileDisplayField =
+  | "title"
+  | "author"
+  | "created"
+  | "modified"
+  | "size"
+  | "publication"
+  | "citations";
 export type FileSortDirection = "asc" | "desc";
 
 /** HuggingFace model code, e.g. "BAAI/bge-base-en-v1.5". */
@@ -251,10 +313,19 @@ export interface SemanticScholarSettings {
   api_key: string | null;
 }
 
+export interface OpenAlexSettings {
+  enabled: boolean;
+  base_url: string;
+  email: string | null;
+}
+
 export interface IntegrationsSettings {
   zotero: ZoteroSettings;
   semantic_scholar: SemanticScholarSettings;
+  openalex: OpenAlexSettings;
 }
+
+export type MetadataSourcePreference = "file" | "zotero" | "semantic_scholar" | "openalex";
 
 export interface WorkerStatus {
   active: boolean;
@@ -276,6 +347,7 @@ export interface Settings {
   search_prefer_semantic: boolean;
   semantic: SemanticSettings;
   integrations: IntegrationsSettings;
+  primary_metadata_source?: MetadataSourcePreference;
   supported_extensions: string[];
   /** 0 = unlimited */
   max_results: number;

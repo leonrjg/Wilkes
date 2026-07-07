@@ -11,6 +11,7 @@ export function useGlobalEvents() {
 
   useEffect(() => {
     let managerUnlisten: (() => void) | undefined;
+    let fileListUnlisten: (() => void) | undefined;
     let metadataUnlisten: (() => void) | undefined;
     let mounted = true;
 
@@ -26,7 +27,6 @@ export function useGlobalEvents() {
       if (payload === "WorkerStarting") {
         addToast("Starting worker... Next queries will be faster", { type: "info" });
       } else if (payload === "Reindexing") {
-        useSettingsStore.getState().refreshFileList();
         if (!reindexToastId.current) {
           reindexToastId.current = addToast(
             "Indexing... Semantic search is temporarily unavailable",
@@ -44,6 +44,20 @@ export function useGlobalEvents() {
         u();
       } else {
         managerUnlisten = u;
+      }
+    });
+
+    api.onFileListChanged((payload) => {
+      if (!mounted) return;
+      const settings = useSettingsStore.getState();
+      if (settings.directory === payload.root) {
+        settings.refreshFileList();
+      }
+    }).then((u) => {
+      if (!mounted) {
+        u();
+      } else {
+        fileListUnlisten = u;
       }
     });
 
@@ -66,6 +80,7 @@ export function useGlobalEvents() {
     return () => {
       mounted = false;
       if (managerUnlisten) managerUnlisten();
+      if (fileListUnlisten) fileListUnlisten();
       if (metadataUnlisten) metadataUnlisten();
     };
   }, [addToast, removeToast]);

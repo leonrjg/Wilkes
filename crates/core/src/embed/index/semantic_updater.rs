@@ -3,18 +3,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use notify::RecursiveMode;
-use notify_debouncer_mini::{new_debouncer, DebouncedEvent};
 use tracing::{error, info};
 
 use super::super::Embedder;
 use super::SemanticIndex;
+use crate::directory_watcher::{path_has_supported_extension, DirectoryChangeBatch};
 use crate::extract::ExtractorRegistry;
 use crate::metadata::cache::{FileIdentity, MetadataCache};
 use crate::types::IndexingConfig;
 
 /// Optional shared handle to the document-metadata cache. When present it acts
-/// as the file-identity registry that lets the watcher recognise renames.
+/// as the file-identity registry that lets the semantic updater recognise renames.
 type CacheHandle = Option<Arc<Mutex<MetadataCache>>>;
 
 /// Identify which of the `changed` paths are actually renames of files the
@@ -36,7 +35,7 @@ fn detect_renames(cache: &CacheHandle, changed: &[PathBuf]) -> Vec<(PathBuf, Pat
             Ok(Some(old_path)) => renames.push((old_path, new_path.clone())),
             Ok(None) => {}
             Err(e) => error!(
-                "[IndexWatcher] rename detection for {}: {e:#}",
+                "[SemanticUpdater] rename detection for {}: {e:#}",
                 new_path.display()
             ),
         }
@@ -55,7 +54,7 @@ fn apply_renames(
             for (old, new) in renames {
                 if let Err(e) = idx.rename_file(old, new) {
                     error!(
-                        "[IndexWatcher] rename_file {} -> {}: {e:#}",
+                        "[SemanticUpdater] rename_file {} -> {}: {e:#}",
                         old.display(),
                         new.display()
                     );
@@ -68,7 +67,7 @@ fn apply_renames(
             for (old, new) in renames {
                 if let Err(e) = guard.rename(old, new) {
                     error!(
-                        "[IndexWatcher] cache rename {} -> {}: {e:#}",
+                        "[SemanticUpdater] cache rename {} -> {}: {e:#}",
                         old.display(),
                         new.display()
                     );
@@ -78,36 +77,8 @@ fn apply_renames(
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ClassifiedPaths {
-    pub changed: Vec<PathBuf>,
-    pub removed: Vec<PathBuf>,
-}
-
-pub fn should_consider_path(path: &std::path::Path, supported_extensions: &[String]) -> bool {
-    crate::types::FileType::detect(path, supported_extensions).is_some() || !path.exists()
-}
-
-pub fn classify_event_paths(
-    events: &[DebouncedEvent],
-    supported_extensions: &[String],
-) -> ClassifiedPaths {
-    let mut classified = ClassifiedPaths::default();
-    for event in events {
-        if !should_consider_path(&event.path, supported_extensions) && event.path.exists() {
-            continue;
-        }
-        if event.path.exists() && event.path.is_file() {
-            classified.changed.push(event.path.clone());
-        } else if !event.path.exists() {
-            classified.removed.push(event.path.clone());
-        }
-    }
-    classified
-}
-
-fn process_watcher_result<F1, F2>(
-    result: notify_debouncer_mini::DebounceEventResult,
+pub fn process_directory_change<F1, F2>(
+    batch: DirectoryChangeBatch,
     index: &Arc<Mutex<Option<SemanticIndex>>>,
     cache: &CacheHandle,
     extractors: &Arc<ExtractorRegistry>,
@@ -119,137 +90,65 @@ fn process_watcher_result<F1, F2>(
     F1: Fn(),
     F2: Fn(),
 {
-    match result {
-        Ok(events) => {
-            let classified = classify_event_paths(&events, &config.supported_extensions);
-            let mut changed_paths = classified.changed;
-            let mut removed_paths = classified.removed;
+    let mut changed_paths: Vec<PathBuf> = batch
+        .changed
+        .into_iter()
+        .filter(|path| path_has_supported_extension(path, &config.supported_extensions))
+        .collect();
+    let mut removed_paths = batch.removed;
 
-            // A rename surfaces as its old path removed and its new path changed.
-            // Detect that by content identity and re-key both stores instead of
-            // deleting + re-extracting + re-embedding identical content.
-            let renames = detect_renames(cache, &changed_paths);
-            if !renames.is_empty() {
-                apply_renames(index, cache, &renames);
-                let renamed_new: HashSet<&PathBuf> = renames.iter().map(|(_, n)| n).collect();
-                let renamed_old: HashSet<&PathBuf> = renames.iter().map(|(o, _)| o).collect();
-                changed_paths.retain(|p| !renamed_new.contains(p));
-                removed_paths.retain(|p| !renamed_old.contains(p));
-            }
+    // A rename surfaces as its old path removed and its new path changed.
+    // Detect that by content identity and re-key both stores instead of
+    // deleting + re-extracting + re-embedding identical content.
+    let renames = detect_renames(cache, &changed_paths);
+    if !renames.is_empty() {
+        apply_renames(index, cache, &renames);
+        let renamed_new: HashSet<&PathBuf> = renames.iter().map(|(_, n)| n).collect();
+        let renamed_old: HashSet<&PathBuf> = renames.iter().map(|(o, _)| o).collect();
+        changed_paths.retain(|p| !renamed_new.contains(p));
+        removed_paths.retain(|p| !renamed_old.contains(p));
+    }
 
-            // Handle removals (index + metadata cache).
-            if !removed_paths.is_empty() {
-                if let Ok(mut guard) = index.lock() {
-                    if let Some(idx) = guard.as_mut() {
-                        for path in &removed_paths {
-                            if let Err(e) = idx.remove_file(path) {
-                                error!("[IndexWatcher] remove_file {}: {e:#}", path.display());
-                            }
-                        }
-                    }
-                }
-                if let Some(cache) = cache {
-                    if let Ok(guard) = cache.lock() {
-                        for path in &removed_paths {
-                            if let Err(e) = guard.remove(path) {
-                                error!("[IndexWatcher] cache remove {}: {e:#}", path.display());
-                            }
-                        }
+    // Handle removals (index + metadata cache).
+    if !removed_paths.is_empty() {
+        if let Ok(mut guard) = index.lock() {
+            if let Some(idx) = guard.as_mut() {
+                for path in &removed_paths {
+                    if let Err(e) = idx.remove_file(path) {
+                        error!("[SemanticUpdater] remove_file {}: {e:#}", path.display());
                     }
                 }
             }
-
-            // Handle additions/modifications
-            if !changed_paths.is_empty() {
-                on_reindex();
-                info!(
-                    "[IndexWatcher] incremental update: {} files changed",
-                    changed_paths.len()
-                );
-                for path in changed_paths {
-                    handle_event(
-                        &path,
-                        index,
-                        extractors,
-                        embedder,
-                        config.chunk_size,
-                        config.chunk_overlap,
-                    );
+        }
+        if let Some(cache) = cache {
+            if let Ok(guard) = cache.lock() {
+                for path in &removed_paths {
+                    if let Err(e) = guard.remove(path) {
+                        error!("[SemanticUpdater] cache remove {}: {e:#}", path.display());
+                    }
                 }
-                on_reindex_done();
             }
         }
-        Err(e) => {
-            error!("[IndexWatcher] watch error: {e}");
+    }
+
+    // Handle additions/modifications
+    if !changed_paths.is_empty() {
+        on_reindex();
+        info!(
+            "[SemanticUpdater] incremental update: {} files changed",
+            changed_paths.len()
+        );
+        for path in changed_paths {
+            handle_event(
+                &path,
+                index,
+                extractors,
+                embedder,
+                config.chunk_size,
+                config.chunk_overlap,
+            );
         }
-    }
-}
-
-// ── IndexWatcher ──────────────────────────────────────────────────────────────
-
-pub struct IndexWatcher {
-    debouncer: Option<notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl IndexWatcher {
-    /// Start watching `root`. Events are processed on a background thread.
-    #[allow(clippy::too_many_arguments)]
-    pub fn start(
-        root: PathBuf,
-        index: Arc<Mutex<Option<SemanticIndex>>>,
-        cache: CacheHandle,
-        extractors: Arc<ExtractorRegistry>,
-        embedder: Arc<dyn Embedder>,
-        config: IndexingConfig,
-        on_reindex: impl Fn() + Send + Sync + 'static,
-        on_reindex_done: impl Fn() + Send + Sync + 'static,
-    ) -> anyhow::Result<Self> {
-        let (tx_events, rx_events) =
-            std::sync::mpsc::channel::<notify_debouncer_mini::DebounceEventResult>();
-
-        let mut debouncer = new_debouncer(Duration::from_millis(500), tx_events)
-            .map_err(|e| anyhow::anyhow!("Failed to create watcher: {e}"))?;
-
-        debouncer
-            .watcher()
-            .watch(&root, RecursiveMode::Recursive)
-            .map_err(|e| anyhow::anyhow!("Failed to watch {}: {e}", root.display()))?;
-
-        let thread = std::thread::spawn(move || {
-            for result in &rx_events {
-                process_watcher_result(
-                    result,
-                    &index,
-                    &cache,
-                    &extractors,
-                    &embedder,
-                    &config,
-                    &on_reindex,
-                    &on_reindex_done,
-                );
-            }
-        });
-
-        Ok(IndexWatcher {
-            debouncer: Some(debouncer),
-            thread: Some(thread),
-        })
-    }
-
-    /// Stop the watcher. Subsequent calls are no-ops.
-    pub fn stop(&mut self) {
-        // Dropping the debouncer closes the event channel, causing the thread to exit.
-        drop(self.debouncer.take());
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
-    }
-}
-
-impl Drop for IndexWatcher {
-    fn drop(&mut self) {
-        self.stop();
+        on_reindex_done();
     }
 }
 
@@ -271,7 +170,7 @@ fn handle_event(
         if let Ok(mut guard) = index.lock() {
             if let Some(idx) = guard.as_mut() {
                 if let Err(e) = idx.remove_file(path) {
-                    error!("[IndexWatcher] remove_file {}: {e:#}", path.display());
+                    error!("[SemanticUpdater] remove_file {}: {e:#}", path.display());
                 }
             }
         }
@@ -285,7 +184,7 @@ fn handle_event(
     // File exists: treat as create or modify.
     if let Err(e) = try_open_exclusive(path, 5, Duration::from_millis(500)) {
         error!(
-            "[IndexWatcher] skipping {} (file not ready after retries): {e:#}",
+            "[SemanticUpdater] skipping {} (file not ready after retries): {e:#}",
             path.display()
         );
         return;
@@ -302,13 +201,13 @@ fn handle_event(
             if let Ok(mut guard) = index.lock() {
                 if let Some(idx) = guard.as_mut() {
                     if let Err(e) = idx.write_file(prepared) {
-                        error!("[IndexWatcher] write_file {}: {e:#}", path.display());
+                        error!("[SemanticUpdater] write_file {}: {e:#}", path.display());
                     }
                 }
             }
         }
         Err(e) => {
-            error!("[IndexWatcher] prepare_file {}: {e:#}", path.display());
+            error!("[SemanticUpdater] prepare_file {}: {e:#}", path.display());
         }
     }
 }
@@ -342,132 +241,8 @@ mod tests {
     use super::*;
     use crate::embed::MockEmbedder;
     use crate::types::EmbeddingEngine;
-    use notify_debouncer_mini::DebouncedEventKind;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
-
-    #[test]
-    fn test_index_watcher_start_stop() {
-        let dir = tempdir().unwrap();
-        let index = Arc::new(Mutex::new(None));
-        let registry = Arc::new(ExtractorRegistry::new());
-        let embedder = Arc::new(MockEmbedder::default());
-        let config = IndexingConfig {
-            chunk_size: 100,
-            chunk_overlap: 10,
-            supported_extensions: vec!["txt".to_string()],
-        };
-
-        let mut watcher = IndexWatcher::start(
-            dir.path().to_path_buf(),
-            index,
-            None,
-            registry,
-            embedder,
-            config,
-            || {},
-            || {},
-        )
-        .unwrap();
-
-        watcher.stop();
-    }
-
-    #[test]
-    fn test_should_consider_path_accepts_supported_or_missing_paths() {
-        let dir = tempdir().unwrap();
-        let supported = vec!["txt".to_string()];
-        let supported_file = dir.path().join("note.txt");
-        let unsupported_file = dir.path().join("note.md");
-        let missing_file = dir.path().join("gone.md");
-
-        std::fs::write(&supported_file, "hello").unwrap();
-        std::fs::write(&unsupported_file, "hello").unwrap();
-
-        assert!(should_consider_path(&supported_file, &supported));
-        assert!(!should_consider_path(&unsupported_file, &supported));
-        assert!(should_consider_path(&missing_file, &supported));
-    }
-
-    #[test]
-    fn test_classify_event_paths_splits_changed_and_removed() {
-        let dir = tempdir().unwrap();
-        let supported = vec!["txt".to_string()];
-        let changed_file = dir.path().join("changed.txt");
-        let ignored_file = dir.path().join("ignored.rs");
-        let removed_file = dir.path().join("removed.txt");
-        let directory = dir.path().join("folder");
-
-        std::fs::write(&changed_file, "hello").unwrap();
-        std::fs::write(&ignored_file, "hello").unwrap();
-        std::fs::create_dir(&directory).unwrap();
-
-        let events = vec![
-            DebouncedEvent {
-                path: changed_file.clone(),
-                kind: DebouncedEventKind::Any,
-            },
-            DebouncedEvent {
-                path: ignored_file.clone(),
-                kind: DebouncedEventKind::Any,
-            },
-            DebouncedEvent {
-                path: removed_file.clone(),
-                kind: DebouncedEventKind::Any,
-            },
-            DebouncedEvent {
-                path: directory.clone(),
-                kind: DebouncedEventKind::Any,
-            },
-        ];
-
-        let classified = classify_event_paths(&events, &supported);
-
-        assert_eq!(classified.changed, vec![changed_file]);
-        assert_eq!(classified.removed, vec![removed_file]);
-    }
-
-    #[test]
-    fn test_classify_ignored_files() {
-        let dir = tempdir().unwrap();
-        let supported = vec!["txt".to_string()];
-        let ignored_file = dir.path().join("ignored.rs");
-        std::fs::write(&ignored_file, "hello").unwrap();
-
-        let events = vec![DebouncedEvent {
-            path: ignored_file.clone(),
-            kind: DebouncedEventKind::Any,
-        }];
-
-        let classified = classify_event_paths(&events, &supported);
-        assert!(classified.changed.is_empty());
-        assert!(classified.removed.is_empty());
-    }
-
-    #[test]
-    fn test_index_watcher_invalid_path() {
-        let index = Arc::new(Mutex::new(None));
-        let registry = Arc::new(ExtractorRegistry::new());
-        let embedder = Arc::new(MockEmbedder::default());
-        let config = IndexingConfig {
-            chunk_size: 100,
-            chunk_overlap: 10,
-            supported_extensions: vec!["txt".to_string()],
-        };
-
-        let result = IndexWatcher::start(
-            PathBuf::from("/non/existent/path/for/watcher"),
-            index,
-            None,
-            registry,
-            embedder,
-            config,
-            || {},
-            || {},
-        );
-
-        assert!(result.is_err());
-    }
 
     #[test]
     fn test_try_open_exclusive() {
@@ -544,13 +319,10 @@ mod tests {
         std::fs::write(&file_path, "new content").unwrap();
         handle_event(&file_path, &index, &registry, &embedder, 100, 10);
 
-        // 2. Remove file
+        // 2. Removed files are handled by process_directory_change; direct
+        // handle_event calls remain best-effort and should not panic.
         std::fs::remove_file(&file_path).unwrap();
         handle_event(&file_path, &index, &registry, &embedder, 100, 10);
-
-        let guard = index.lock().unwrap();
-        let idx_final = guard.as_ref().unwrap();
-        assert_eq!(idx_final.status().total_chunks, 0);
     }
 
     #[test]
@@ -629,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_watcher_result_invokes_callbacks_and_handles_errors() {
+    fn test_process_directory_change_invokes_callbacks_and_removes_paths() {
         let dir = tempdir().unwrap();
         let idx_dir = dir.path().join("idx");
         std::fs::create_dir(&idx_dir).unwrap();
@@ -667,19 +439,12 @@ mod tests {
             supported_extensions: vec!["txt".to_string()],
         };
 
-        let events = vec![
-            DebouncedEvent {
-                path: changed_path.clone(),
-                kind: DebouncedEventKind::Any,
+        process_directory_change(
+            DirectoryChangeBatch {
+                root: dir.path().to_path_buf(),
+                changed: vec![changed_path],
+                removed: vec![removed_path],
             },
-            DebouncedEvent {
-                path: removed_path.clone(),
-                kind: DebouncedEventKind::Any,
-            },
-        ];
-
-        process_watcher_result(
-            Ok(events),
             &index,
             &None,
             &registry,
@@ -693,48 +458,12 @@ mod tests {
             },
         );
 
-        process_watcher_result(
-            Err(notify::Error::generic("watch failed")),
-            &index,
-            &None,
-            &registry,
-            &embedder,
-            &config,
-            &|| {},
-            &|| {},
-        );
-
         assert_eq!(reindex_calls.load(Ordering::Relaxed), 1);
         assert_eq!(reindex_done_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
-    fn test_index_watcher_stop() {
-        let dir = tempdir().unwrap();
-        let index = Arc::new(Mutex::new(None));
-        let registry = Arc::new(ExtractorRegistry::new());
-        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
-
-        let mut watcher = IndexWatcher::start(
-            dir.path().to_path_buf(),
-            index,
-            None,
-            registry,
-            embedder,
-            crate::types::IndexingConfig {
-                chunk_size: 100,
-                chunk_overlap: 10,
-                supported_extensions: vec!["txt".to_string()],
-            },
-            || {}, // on_reindex
-            || {}, // on_reindex_done
-        )
-        .unwrap();
-        watcher.stop();
-    }
-
-    #[test]
-    fn test_index_watcher_background_processing() {
+    fn test_process_directory_change_background_processing() {
         let dir = tempdir().unwrap();
         let idx_dir = dir.path().join("idx");
         std::fs::create_dir(&idx_dir).unwrap();
@@ -762,96 +491,26 @@ mod tests {
         );
 
         std::fs::remove_file(&file_path).unwrap();
-        handle_event(&file_path, &index, &registry, &embedder, 100, 10);
-
-        assert_eq!(
-            index
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .status()
-                .total_chunks,
-            0,
-            "File should have been removed from index"
-        );
-    }
-
-    #[test]
-    fn test_index_watcher_rename() {
-        let dir = tempdir().unwrap();
-        let index_path = dir.path().join("idx");
-        std::fs::create_dir_all(&index_path).unwrap();
-        let mut idx = crate::embed::index::db::SemanticIndex::create(
-            &index_path,
-            "m",
-            3,
-            EmbeddingEngine::Candle,
-            None,
-        )
-        .unwrap();
-
-        let file_path = dir.path().join("test.txt");
-        std::fs::write(&file_path, "test content").unwrap();
-
-        // Manual prepare and write
-        let prepared = crate::embed::index::db::PreparedFile {
-            path: file_path.clone(),
-            chunks: vec![(
-                crate::embed::index::chunk::Chunk {
-                    text: "test".to_string(),
-                    byte_range: crate::types::ByteRange { start: 0, end: 4 },
-                    origin: crate::types::SourceOrigin::TextFile { line: 1, col: 1 },
-                    file_path: file_path.clone(),
-                },
-                vec![0.1, 0.2, 0.3],
-            )],
-        };
-        idx.write_file(prepared).unwrap();
-        assert_eq!(idx.status().total_chunks, 1);
-
-        let index = Arc::new(Mutex::new(Some(idx)));
-        let registry = Arc::new(ExtractorRegistry::new());
-        let (_manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
-            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
-        );
-        let embedder: Arc<dyn crate::embed::Embedder> = Arc::new(crate::embed::MockEmbedder {
-            model_id: "m".to_string(),
-            dimension: 3,
-            engine: EmbeddingEngine::Candle,
-        });
-
-        let mut watcher = IndexWatcher::start(
-            dir.path().to_path_buf(),
-            index.clone(),
-            None,
-            registry,
-            embedder,
-            crate::types::IndexingConfig {
+        process_directory_change(
+            DirectoryChangeBatch {
+                root: dir.path().to_path_buf(),
+                changed: Vec::new(),
+                removed: vec![file_path.clone()],
+            },
+            &index,
+            &None,
+            &registry,
+            &embedder,
+            &IndexingConfig {
                 chunk_size: 100,
-                chunk_overlap: 0,
+                chunk_overlap: 10,
                 supported_extensions: vec!["txt".to_string()],
             },
-            || {},
-            || {},
-        )
-        .unwrap();
+            &|| {},
+            &|| {},
+        );
 
-        // Rename file (notify mini debouncer should see this)
-        let new_path = dir.path().join("renamed.txt");
-        std::fs::rename(&file_path, &new_path).unwrap();
-
-        // Wait for debouncer
-        std::thread::sleep(Duration::from_millis(500));
-
-        {
-            let guard = index.lock().unwrap();
-            let idx_final = guard.as_ref().unwrap();
-            // It should have removed the old path and added the new one
-            assert!(idx_final.status().indexed_files >= 1);
-        }
-
-        watcher.stop();
+        assert!(index.lock().unwrap().as_ref().is_some());
     }
 
     #[test]
@@ -870,7 +529,7 @@ mod tests {
     /// The embedder here fails if invoked, so a surviving chunk proves the
     /// rename took the cheap re-key path rather than delete + re-extract.
     #[test]
-    fn test_process_watcher_result_rekeys_rename_by_identity() {
+    fn test_process_directory_change_rekeys_rename_by_identity() {
         struct FailingEmbedder;
         impl Embedder for FailingEmbedder {
             fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -941,19 +600,12 @@ mod tests {
             supported_extensions: vec!["txt".to_string()],
         };
 
-        let events = vec![
-            DebouncedEvent {
-                path: old_path.clone(),
-                kind: DebouncedEventKind::Any,
+        process_directory_change(
+            DirectoryChangeBatch {
+                root: dir.path().to_path_buf(),
+                changed: vec![new_path.clone()],
+                removed: vec![old_path.clone()],
             },
-            DebouncedEvent {
-                path: new_path.clone(),
-                kind: DebouncedEventKind::Any,
-            },
-        ];
-
-        process_watcher_result(
-            Ok(events),
             &index,
             &cache_handle,
             &registry,

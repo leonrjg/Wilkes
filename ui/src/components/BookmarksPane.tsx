@@ -7,6 +7,7 @@ import { useSettingsStore } from "../stores/useSettingsStore";
 import { toMarkdown } from "../lib/utils/bookmarkMarkdown";
 import { api } from "../services";
 import { useToasts } from "./Toast";
+import { Tooltip } from "./Tooltip";
 import type { Bookmark } from "../lib/types";
 
 function fileName(path: string) {
@@ -130,14 +131,15 @@ export default function BookmarksPane() {
             placeholder="Filter bookmarks"
             className="min-w-0 flex-1 bg-[var(--bg-app)] border border-[var(--border-main)] rounded px-2 py-1 text-xs outline-none focus:border-[var(--accent-blue)]"
           />
-          <button
-            type="button"
-            onClick={closePane}
-            title="Close bookmarks"
-            className="w-7 h-7 flex items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
-          >
-            <X size={14} />
-          </button>
+          <Tooltip content="Close bookmarks">
+            <button
+              type="button"
+              onClick={closePane}
+              className="w-7 h-7 flex items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
+            >
+              <X size={14} />
+            </button>
+          </Tooltip>
         </div>
         <div className="flex items-center justify-between gap-2">
           <div className="inline-flex rounded border border-[var(--border-main)] overflow-hidden bg-[var(--bg-active)]">
@@ -157,14 +159,15 @@ export default function BookmarksPane() {
               All
             </button>
           </div>
-          <button
-            type="button"
-            onClick={() => setDock(dock === "Left" ? "Right" : "Left")}
-            title={dock === "Left" ? "Dock right" : "Dock left"}
-            className="w-7 h-7 flex-shrink-0 flex items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
-          >
-            <Sidebar size={13} />
-          </button>
+          <Tooltip content={dock === "Left" ? "Dock right" : "Dock left"}>
+            <button
+              type="button"
+              onClick={() => setDock(dock === "Left" ? "Right" : "Left")}
+              className="w-7 h-7 flex-shrink-0 flex items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
+            >
+              <Sidebar size={13} />
+            </button>
+          </Tooltip>
         </div>
       </div>
 
@@ -252,52 +255,56 @@ export default function BookmarksPane() {
                   )}
                   <div className="mt-2 flex items-center gap-1 text-[10px] text-[var(--text-dim)]">
                     <span className="truncate flex-1">{fileName(bookmark.path)}</span>
-                    <button
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        startEditingNote(bookmark);
-                      }}
-                      title={bookmark.note ? "Edit note" : "Add note"}
-                      className={`p-1 hover:text-[var(--accent-blue)] ${bookmark.note ? "text-[var(--accent-blue)]" : ""}`}
-                    >
-                      <Edit2 size={12} />
-                    </button>
-                    {zoteroEnabled && (
+                    <Tooltip content={bookmark.note ? "Edit note" : "Add note"}>
                       <button
                         type="button"
                         onClick={(event) => {
                           event.stopPropagation();
-                          handleCopyCitation(bookmark).catch(console.error);
+                          startEditingNote(bookmark);
                         }}
-                        title="Get citation from Zotero"
+                        className={`p-1 hover:text-[var(--accent-blue)] ${bookmark.note ? "text-[var(--accent-blue)]" : ""}`}
+                      >
+                        <Edit2 size={12} />
+                      </button>
+                    </Tooltip>
+                    {zoteroEnabled && (
+                      <Tooltip content="Get citation from Zotero">
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            handleCopyCitation(bookmark).catch(console.error);
+                          }}
+                          className="p-1 hover:text-[var(--accent-blue)]"
+                        >
+                          <FileText size={12} />
+                        </button>
+                      </Tooltip>
+                    )}
+                    <Tooltip content="Copy as markdown">
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          api.writeClipboard(toMarkdown(bookmark)).catch(console.error);
+                        }}
                         className="p-1 hover:text-[var(--accent-blue)]"
                       >
-                        <FileText size={12} />
+                        <Copy size={12} />
                       </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        api.writeClipboard(toMarkdown(bookmark)).catch(console.error);
-                      }}
-                      title="Copy as markdown"
-                      className="p-1 hover:text-[var(--accent-blue)]"
-                    >
-                      <Copy size={12} />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        remove(bookmark.id).catch(console.error);
-                      }}
-                      title="Delete bookmark"
-                      className="p-1 hover:text-[var(--text-error)]"
-                    >
-                      <Trash2 size={12} />
-                    </button>
+                    </Tooltip>
+                    <Tooltip content="Delete bookmark">
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          remove(bookmark.id).catch(console.error);
+                        }}
+                        className="p-1 hover:text-[var(--text-error)]"
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    </Tooltip>
                   </div>
                 </div>
               </div>

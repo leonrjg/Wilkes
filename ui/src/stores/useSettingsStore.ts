@@ -178,15 +178,22 @@ export const useSettingsStore = create<SettingsStore>()(
     applyMetadataUpdates: (updates: FileMetadataUpdate[]) => {
       if (updates.length === 0) return;
       const byPath = new Map(updates.map((u) => [u.path, u]));
-      const patch = <T extends FileEntry>(entry: T): T =>
-        byPath.has(entry.path)
-          ? {
-              ...entry,
-              publication_date: byPath.get(entry.path)?.publication_date ?? null,
-              semantic_scholar_citation_count:
-                byPath.get(entry.path)?.semantic_scholar_citation_count ?? null,
-            }
-          : entry;
+      const patch = <T extends FileEntry>(entry: T): T => {
+        const update = byPath.get(entry.path);
+        if (!update) return entry;
+        return {
+          ...entry,
+          title: Object.prototype.hasOwnProperty.call(update, "title")
+            ? update.title ?? null
+            : entry.title,
+          author: Object.prototype.hasOwnProperty.call(update, "author")
+            ? update.author ?? null
+            : entry.author,
+          publication_date: update.publication_date ?? null,
+          citation_count: update.citation_count ?? null,
+          metadata_conflicts: update.metadata_conflicts ?? entry.metadata_conflicts,
+        };
+      };
       set((state) => ({
         fileList: state.fileList.map(patch),
         omittedFileList: state.omittedFileList.map(patch),
@@ -217,6 +224,14 @@ export const useSettingsStore = create<SettingsStore>()(
                     ...settings.integrations.zotero,
                     ...patch.integrations.zotero,
                   },
+                  semantic_scholar: {
+                    ...settings.integrations.semantic_scholar,
+                    ...patch.integrations.semantic_scholar,
+                  },
+                  openalex: {
+                    ...settings.integrations.openalex,
+                    ...patch.integrations.openalex,
+                  },
                 }
               : settings.integrations,
           },
@@ -246,6 +261,9 @@ export const useSettingsStore = create<SettingsStore>()(
       }
       if (patch.chat_backend) {
         set({ chatBackend: patch.chat_backend });
+      }
+      if (patch.primary_metadata_source) {
+        get().refreshFileList();
       }
     },
 
