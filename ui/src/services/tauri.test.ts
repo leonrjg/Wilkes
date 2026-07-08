@@ -56,6 +56,17 @@ describe("TauriSearchApi", () => {
     expect(path).toBe("/some/new.txt");
   });
 
+  it("should call import_dropped_files", async () => {
+    const source = new TauriSourceApi();
+    (invoke as any).mockResolvedValue(["/root/file.pdf"]);
+    const paths = await source.importDroppedFiles(["/external/file.pdf"], "/root");
+    expect(invoke).toHaveBeenCalledWith("import_dropped_files", {
+      paths: ["/external/file.pdf"],
+      root: "/root",
+    });
+    expect(paths).toEqual(["/root/file.pdf"]);
+  });
+
   it("should perform a search with listeners", async () => {
     const mockQuery = { pattern: "test" } as any;
     const onResult = vi.fn();

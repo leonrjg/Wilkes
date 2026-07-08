@@ -1,14 +1,33 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import PreviewPane from "./PreviewPane";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
+import { useSemanticStore } from "../stores/useSemanticStore";
+import { useSettingsStore } from "../stores/useSettingsStore";
+import { api } from "../services";
 
 vi.mock("./preview/CodeViewer", () => ({ default: () => <div data-testid="code-viewer">CodeViewer</div> }));
 
 const mockPdfViewer = vi.fn(() => <div data-testid="pdf-viewer">PdfViewer</div>);
 vi.mock("./preview/PdfViewer", () => ({ default: (props: any) => mockPdfViewer(props) }));
 vi.mock("./Toast", () => ({ useToasts: () => ({ addToast: vi.fn() }) }));
+vi.mock("../services", () => ({
+  isTauri: false,
+  api: {
+    openPath: vi.fn((url: string) => {
+      window.open(url, "_blank", "noopener,noreferrer");
+      return Promise.resolve();
+    }),
+    writeClipboard: vi.fn((text: string) => {
+      navigator.clipboard.writeText(text);
+      return Promise.resolve();
+    }),
+    resolvePdfUrl: vi.fn((path: string) => path),
+    relatedDocuments: vi.fn(() => Promise.resolve([])),
+    listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
+  },
+}));
 
 describe("PreviewPane", () => {
   beforeEach(() => {
@@ -29,6 +48,12 @@ describe("PreviewPane", () => {
     useBookmarksStore.setState({
       bookmarks: [],
     });
+    (api.relatedDocuments as any).mockResolvedValue([]);
+    useSettingsStore.setState({ directory: "/docs" });
+    useSemanticStore.setState({
+      readyForCurrentRoot: false,
+      indexStatus: null,
+    } as any);
   });
 
   it("renders empty state when no match is selected", () => {
@@ -305,5 +330,100 @@ describe("PreviewPane", () => {
     fireEvent.click(closeButton);
 
     expect(clearPreviewMock).toHaveBeenCalled();
+  });
+
+  it("renders related documents and opens them through the provided navigation", async () => {
+    const onFileOpen = vi.fn();
+    (api.relatedDocuments as any).mockResolvedValueOnce([
+      {
+        path: "/docs/related.txt",
+        file_type: "PlainText",
+        score: 0.88,
+        indexed_chunks: 3,
+      },
+    ]);
+    useSemanticStore.setState({
+      readyForCurrentRoot: true,
+      indexStatus: {
+        indexed_files: 2,
+        total_chunks: 4,
+        built_at: 123,
+        build_duration_ms: 10,
+        engine: "Candle",
+        model_id: "model",
+        dimension: 2,
+        root_path: "/docs",
+        db_size_bytes: 100,
+      },
+    } as any);
+    useSearchStore.setState({
+      selectedMatch: { path: "/docs/source.txt", origin: { TextFile: { line: 1, col: 1 } } } as any,
+      previewData: {
+        Text: {
+          content: "source",
+          language: "text",
+          highlight_line: 1,
+          highlight_range: { start: 0, end: 6 },
+        },
+      },
+    });
+
+    render(<PreviewPane onFileOpen={onFileOpen} />);
+
+    await waitFor(() => expect(screen.getByText("related.txt")).toBeInTheDocument());
+    expect(api.relatedDocuments).toHaveBeenCalledWith({
+      root: "/docs",
+      path: "/docs/source.txt",
+      limit: 8,
+    });
+
+    fireEvent.click(screen.getByText("related.txt"));
+    expect(onFileOpen).toHaveBeenCalledWith("/docs/related.txt");
+  });
+
+  it("toggles the related documents pane", async () => {
+    (api.relatedDocuments as any).mockResolvedValueOnce([
+      {
+        path: "/docs/related.txt",
+        file_type: "PlainText",
+        score: 0.88,
+        indexed_chunks: 3,
+      },
+    ]);
+    useSemanticStore.setState({
+      readyForCurrentRoot: true,
+      indexStatus: {
+        indexed_files: 2,
+        total_chunks: 4,
+        built_at: 123,
+        build_duration_ms: 10,
+        engine: "Candle",
+        model_id: "model",
+        dimension: 2,
+        root_path: "/docs",
+        db_size_bytes: 100,
+      },
+    } as any);
+    useSearchStore.setState({
+      selectedMatch: { path: "/docs/source.txt", origin: { TextFile: { line: 1, col: 1 } } } as any,
+      previewData: {
+        Text: {
+          content: "source",
+          language: "text",
+          highlight_line: 1,
+          highlight_range: { start: 0, end: 6 },
+        },
+      },
+    });
+
+    render(<PreviewPane />);
+
+    await waitFor(() => expect(screen.getByText("related.txt")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTitle("Hide related documents"));
+    expect(screen.queryByText("related.txt")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle("Show related documents"));
+    expect(screen.getByText("related.txt")).toBeInTheDocument();
   });
 });

@@ -1,27 +1,27 @@
 import { useEffect, useRef, useState } from "react";
-import { X, ArrowLeft, ArrowRight, ExternalLink, Copy } from "react-feather";
+import { X, ArrowLeft, ArrowRight, ExternalLink, Copy, Hash, Percent, Sidebar } from "react-feather";
 import CodeViewer from "./preview/CodeViewer";
 import PdfViewer from "./preview/PdfViewer";
 import type { PdfSelection } from "./preview/PdfViewer";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useChatStore } from "../stores/useChatStore";
+import { useSemanticStore } from "../stores/useSemanticStore";
+import { useSettingsStore } from "../stores/useSettingsStore";
 import { api, isTauri } from "../services";
-import type { BoundingBox, DocumentMetadata } from "../lib/types";
+import type { BoundingBox, DocumentMetadata, RelatedDocument } from "../lib/types";
 import { buildExternalLinks } from "../lib/externalLinks";
 import { formatDocumentMonthYear } from "../lib/dateFormatting";
 import { useToasts } from "./Toast";
 import { Tooltip } from "./Tooltip";
+import { DocumentEntryRow, fileName, type DocumentDetail } from "./DocumentEntryRow";
 
 interface Props {
   canGoBack?: boolean;
   canGoForward?: boolean;
   onGoBack?: () => void;
   onGoForward?: () => void;
-}
-
-function fileName(path: string) {
-  return path.split(/[/\\]/).pop() ?? path;
+  onFileOpen?: (path: string) => void;
 }
 
 function headerTitle(path: string, metadata: DocumentMetadata | null) {
@@ -58,7 +58,9 @@ function metadataBadgeClassName() {
   ].join(" ");
 }
 
-export default function PreviewPane({ canGoBack = false, canGoForward = false, onGoBack, onGoForward }: Props) {
+type RelatedStatus = "idle" | "loading" | "ready" | "empty" | "error" | "unavailable";
+
+export default function PreviewPane({ canGoBack = false, canGoForward = false, onGoBack, onGoForward, onFileOpen }: Props) {
   const selectedMatch = useSearchStore((s) => s.selectedMatch);
   const previewData = useSearchStore((s) => s.previewData);
   const previewLoading = useSearchStore((s) => s.previewLoading);
@@ -71,7 +73,14 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   const chatBackendsLoaded = useChatStore((s) => s.backendsLoaded);
   const hasAvailableChatBackend = useChatStore((s) => s.hasAvailableBackend);
   const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
+  const directory = useSettingsStore((s) => s.directory);
+  const relatedIndexReady = useSemanticStore((s) => s.readyForCurrentRoot);
+  const indexStatus = useSemanticStore((s) => s.indexStatus);
   const { addToast } = useToasts();
+  const relatedCacheRef = useRef<Map<string, RelatedDocument[]>>(new Map());
+  const [relatedStatus, setRelatedStatus] = useState<RelatedStatus>("idle");
+  const [relatedDocuments, setRelatedDocuments] = useState<RelatedDocument[]>([]);
+  const [relatedPanelOpen, setRelatedPanelOpen] = useState(true);
 
   // The chat pane's "open document" badge (spec §6.1, §7.4): PreviewPane is
   // the single owner of "what's currently being viewed" since it's the only
@@ -91,6 +100,58 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   const handleChatPageChange = (page: number) => {
     if (isTauri && selectedMatch) setChatActiveDoc(selectedMatch.path, page);
   };
+
+  useEffect(() => {
+    if (!relatedPanelOpen) return;
+    if (!selectedMatch || !directory) {
+      setRelatedStatus("idle");
+      setRelatedDocuments([]);
+      return;
+    }
+    if (!relatedIndexReady || !indexStatus) {
+      setRelatedStatus("unavailable");
+      setRelatedDocuments([]);
+      return;
+    }
+
+    const indexKey = `${indexStatus.model_id}:${indexStatus.built_at ?? "unknown"}`;
+    const cacheKey = `${directory}\n${selectedMatch.path}\n${indexKey}`;
+    const cached = relatedCacheRef.current.get(cacheKey);
+    if (cached) {
+      setRelatedDocuments(cached);
+      setRelatedStatus(cached.length > 0 ? "ready" : "empty");
+      return;
+    }
+
+    let cancelled = false;
+    setRelatedStatus("loading");
+    setRelatedDocuments([]);
+    api
+      .relatedDocuments({ root: directory, path: selectedMatch.path, limit: 8 })
+      .then((docs) => {
+        if (cancelled) return;
+        relatedCacheRef.current.set(cacheKey, docs);
+        setRelatedDocuments(docs);
+        setRelatedStatus(docs.length > 0 ? "ready" : "empty");
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        console.debug("Related documents unavailable:", e);
+        setRelatedDocuments([]);
+        setRelatedStatus("error");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    selectedMatch?.path,
+    directory,
+    relatedIndexReady,
+    indexStatus?.model_id,
+    indexStatus?.built_at,
+    relatedPanelOpen,
+  ]);
 
   // Keep the last valid previewData so the content stays mounted while a new
   // match is loading. This prevents PdfViewer from unmounting/remounting on
@@ -282,6 +343,8 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
                 <Tooltip content={`Open DOI ${doi}`}>
                   <button
                     onClick={handleOpenDoi}
+                    aria-label={`Open DOI ${doi}`}
+                    title={`Open DOI ${doi}`}
                     className={groupedActionSegmentClassName()}
                   >
                     <span className="truncate max-w-[140px]">DOI: {doi}</span>
@@ -291,6 +354,8 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
                 <Tooltip content={`Copy DOI ${doi}`}>
                   <button
                     onClick={handleCopyDoi}
+                    aria-label={`Copy DOI ${doi}`}
+                    title={`Copy DOI ${doi}`}
                     className={`${groupedActionSegmentClassName()} border-l border-[var(--border-main)]`}
                   >
                     <Copy size={10} />
@@ -303,6 +368,8 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
                 <Tooltip content="Open Google Scholar">
                   <button
                     onClick={handleOpenScholar}
+                    aria-label="Open Google Scholar"
+                    title="Open Google Scholar"
                     className={actionButtonClassName()}
                   >
                     <span>Scholar</span>
@@ -316,9 +383,24 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
           </div>
         </div>
 
+        <Tooltip content={relatedPanelOpen ? "Hide related documents" : "Show related documents"}>
+          <button
+            onClick={() => setRelatedPanelOpen((open) => !open)}
+            aria-label={relatedPanelOpen ? "Hide related documents" : "Show related documents"}
+            title={relatedPanelOpen ? "Hide related documents" : "Show related documents"}
+            className={`hidden p-1 rounded text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] md:inline-flex ${
+              relatedPanelOpen ? "bg-[var(--bg-active)] text-[var(--text-main)]" : ""
+            }`}
+          >
+            <Sidebar size={16} />
+          </button>
+        </Tooltip>
+
         <Tooltip content="Close preview">
           <button
             onClick={clearPreview}
+            aria-label="Close preview"
+            title="Close preview"
             className="p-1 hover:bg-red-500/10 hover:text-red-500 rounded text-[var(--text-dim)] transition-colors"
           >
             <X size={16} />
@@ -327,39 +409,114 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
       </div>
 
       {/* Content */}
-      <div className="flex-1 min-h-0 overflow-hidden relative bg-[var(--bg-app)]">
-        {(previewLoading || isPdfRendering) && (
-          <div className="absolute inset-0 flex items-center justify-center bg-[var(--bg-app)] z-30 pointer-events-none">
-            <div className="flex flex-col items-center gap-3">
-              <div className="w-6 h-6 border-2 border-[var(--accent-blue)] border-t-transparent rounded-full animate-spin" />
-              <span className="text-[var(--text-muted)] text-sm animate-pulse">Loading document…</span>
-            </div>
+      <div className="flex-1 min-h-0 overflow-hidden bg-[var(--bg-app)]">
+        <div className="flex h-full min-h-0">
+          <div className="relative min-w-0 flex-1 overflow-hidden">
+            {(previewLoading || isPdfRendering) && (
+              <div className="absolute inset-0 flex items-center justify-center bg-[var(--bg-app)] z-30 pointer-events-none">
+                <div className="flex flex-col items-center gap-3">
+                  <div className="w-6 h-6 border-2 border-[var(--accent-blue)] border-t-transparent rounded-full animate-spin" />
+                  <span className="text-[var(--text-muted)] text-sm animate-pulse">Loading document…</span>
+                </div>
+              </div>
+            )}
+            {isPdfFile ? (
+              <PdfViewer
+                key={api.resolvePdfUrl(selectedMatch.path)}
+                url={api.resolvePdfUrl(selectedMatch.path)}
+                page={pdfPage}
+                highlight_bbox={pdfBbox}
+                highlight_rects={targetBookmarkRects}
+                bookmarkHighlights={bookmarkHighlights}
+                onRenderSuccess={() => setIsPdfRendering(false)}
+                onAddBookmark={handleAddBookmark}
+                showChatSelectionActions={chatSelectionActionsAvailable}
+                onExplainSelection={handleExplainSelection}
+                onAskSelection={handleAskSelection}
+                onPageChange={handleChatPageChange}
+              />
+            ) : displayData && "Text" in displayData ? (
+              <CodeViewer
+                content={displayData.Text.content}
+                language={displayData.Text.language}
+                highlightLine={displayData.Text.highlight_line}
+                highlightRange={displayData.Text.highlight_range}
+              />
+            ) : null}
           </div>
-        )}
-        {isPdfFile ? (
-          <PdfViewer
-            key={api.resolvePdfUrl(selectedMatch.path)}
-            url={api.resolvePdfUrl(selectedMatch.path)}
-            page={pdfPage}
-            highlight_bbox={pdfBbox}
-            highlight_rects={targetBookmarkRects}
-            bookmarkHighlights={bookmarkHighlights}
-            onRenderSuccess={() => setIsPdfRendering(false)}
-            onAddBookmark={handleAddBookmark}
-            showChatSelectionActions={chatSelectionActionsAvailable}
-            onExplainSelection={handleExplainSelection}
-            onAskSelection={handleAskSelection}
-            onPageChange={handleChatPageChange}
-          />
-        ) : displayData && "Text" in displayData ? (
-          <CodeViewer
-            content={displayData.Text.content}
-            language={displayData.Text.language}
-            highlightLine={displayData.Text.highlight_line}
-            highlightRange={displayData.Text.highlight_range}
-          />
-        ) : null}
+          {relatedPanelOpen && (
+            <RelatedDocumentsPanel
+              status={relatedStatus}
+              documents={relatedDocuments}
+              onOpen={(path) => onFileOpen?.(path)}
+            />
+          )}
+        </div>
       </div>
     </div>
+  );
+}
+
+function scoreLabel(score: number) {
+  return `${Math.max(0, Math.min(100, Math.round(score * 100)))}%`;
+}
+
+function relatedDocumentDetails(doc: RelatedDocument): DocumentDetail[] {
+  return [
+    {
+      key: "score",
+      label: "Score",
+      value: scoreLabel(doc.score),
+      valueTitle: `${doc.score.toFixed(3)} cosine similarity`,
+      icon: Percent,
+      monospace: true,
+    },
+    {
+      key: "indexed-chunks",
+      label: "Indexed chunks",
+      value: doc.indexed_chunks.toLocaleString(),
+      icon: Hash,
+      monospace: true,
+    },
+  ];
+}
+
+function RelatedDocumentsPanel({
+  status,
+  documents,
+  onOpen,
+}: {
+  status: RelatedStatus;
+  documents: RelatedDocument[];
+  onOpen: (path: string) => void;
+}) {
+  return (
+    <aside className="hidden w-64 flex-shrink-0 border-l border-[var(--border-main)] bg-[var(--bg-sidebar)] md:flex md:flex-col">
+      <div className="border-b border-[var(--border-main)] px-3 py-2 text-xs font-medium text-[var(--text-main)]">
+        Related
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto py-1">
+        {status === "loading" && (
+          <div className="px-3 py-3 text-xs text-[var(--text-muted)]">Loading…</div>
+        )}
+        {status === "unavailable" && (
+          <div className="px-3 py-3 text-xs text-[var(--text-dim)]">Semantic index unavailable</div>
+        )}
+        {status === "error" && (
+          <div className="px-3 py-3 text-xs text-red-500">Related documents unavailable</div>
+        )}
+        {status === "empty" && (
+          <div className="px-3 py-3 text-xs text-[var(--text-dim)]">No related documents</div>
+        )}
+        {documents.map((doc) => (
+          <DocumentEntryRow
+            key={doc.path}
+            entry={doc}
+            details={relatedDocumentDetails(doc)}
+            onClick={() => onOpen(doc.path)}
+          />
+        ))}
+      </div>
+    </aside>
   );
 }

@@ -22,6 +22,8 @@ import type {
   NewBookmark,
   OpenAlexWork,
   PreviewData,
+  RelatedDocument,
+  RelatedDocumentsQuery,
   SelectedEmbedder,
   SemanticScholarPaper,
   SearchQuery,
@@ -62,6 +64,10 @@ export class TauriSearchApi implements SearchApi {
 
   async cancelSearch(searchId: string): Promise<void> {
     await invoke("cancel_search", { searchId });
+  }
+
+  async relatedDocuments(query: RelatedDocumentsQuery): Promise<RelatedDocument[]> {
+    return invoke<RelatedDocument[]>("related_documents", { query });
   }
 
   async preview(matchRef: MatchRef): Promise<PreviewData> {
@@ -266,5 +272,9 @@ export class TauriSourceApi implements DesktopSourceApi {
 
   async pickDirectory(): Promise<string | null> {
     return invoke<string | null>("pick_directory");
+  }
+
+  async importDroppedFiles(paths: string[], root: string): Promise<string[]> {
+    return invoke<string[]>("import_dropped_files", { paths, root });
   }
 }

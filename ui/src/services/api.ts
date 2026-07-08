@@ -18,6 +18,8 @@ import type {
   NewBookmark,
   OpenAlexWork,
   PreviewData,
+  RelatedDocument,
+  RelatedDocumentsQuery,
   SelectedEmbedder,
   SemanticScholarPaper,
   SearchQuery,
@@ -37,6 +39,7 @@ export interface SearchApi {
     onComplete: (stats: SearchStats) => void,
   ): Promise<string>;
   cancelSearch(searchId: string): Promise<void>;
+  relatedDocuments(query: RelatedDocumentsQuery): Promise<RelatedDocument[]>;
   preview(matchRef: MatchRef): Promise<PreviewData>;
   getSettings(): Promise<Settings>;
   updateSettings(patch: Partial<Settings>): Promise<Settings>;
@@ -107,6 +110,7 @@ export interface SourceApi {
 export interface DesktopSourceApi extends SourceApi {
   type: "desktop";
   pickDirectory(): Promise<string | null>;
+  importDroppedFiles(paths: string[], root: string): Promise<string[]>;
 }
 
 export interface WebSourceApi extends SourceApi {

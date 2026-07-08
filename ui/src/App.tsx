@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from "react";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Bookmark, MessageSquare, Settings as SettingsIcon, ChevronDown, Loader } from "react-feather";
 import SearchBar from "./components/SearchBar";
 import ResultList from "./components/ResultList";
@@ -37,6 +38,7 @@ export default function App() {
   const addFavorite = useSettingsStore((s) => s.addFavorite);
   const removeFavorite = useSettingsStore((s) => s.removeFavorite);
   const forgetDirectory = useSettingsStore((s) => s.forgetDirectory);
+  const refreshFileList = useSettingsStore((s) => s.refreshFileList);
   const applySettingsPatch = useSettingsStore((s) => s.applySettingsPatch);
   const setIndexing = useSettingsStore((s) => s.setIndexing);
   const refreshSemanticReady = useSemanticStore((s) => s.refreshCurrentRootStatus);
@@ -70,6 +72,44 @@ export default function App() {
     loadSettings().catch(() => {});
     loadBookmarks().catch(() => {});
   }, [loadSettings, loadBookmarks]);
+
+  useEffect(() => {
+    if (!isTauri) return;
+
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    getCurrentWebview().onDragDropEvent(async (event) => {
+      if (event.payload.type !== "drop") return;
+      const paths = event.payload.paths;
+      if (paths.length === 0) return;
+      if (!directory) {
+        addToast("Choose a directory before dropping files", { type: "error" });
+        return;
+      }
+
+      try {
+        const imported = await (source as DesktopSourceApi).importDroppedFiles(paths, directory);
+        refreshFileList();
+        addToast(`Imported ${imported.length} file${imported.length === 1 ? "" : "s"}`, {
+          type: "success",
+        });
+      } catch (e) {
+        console.error("Drop import failed:", e);
+        addToast(e instanceof Error ? e.message : "Import failed", { type: "error" });
+      }
+    }).then((u) => {
+      if (disposed) u();
+      else unlisten = u;
+    }).catch((e) => {
+      console.error("Failed to subscribe to file drops:", e);
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [addToast, directory, refreshFileList]);
 
   useEffect(() => {
     let mounted = true;
@@ -370,6 +410,7 @@ export default function App() {
             canGoForward={canGoForward}
             onGoBack={goBack}
             onGoForward={goForward}
+            onFileOpen={handleFileClick}
           />
         </div>
 

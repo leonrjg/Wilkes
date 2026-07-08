@@ -99,6 +99,22 @@ pub struct FileMatches {
     pub matches: Vec<Match>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelatedDocumentsQuery {
+    pub root: PathBuf,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelatedDocument {
+    pub path: PathBuf,
+    pub file_type: FileType,
+    pub score: f32,
+    pub indexed_chunks: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileType {
     PlainText,

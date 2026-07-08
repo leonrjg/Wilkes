@@ -27,8 +27,9 @@ use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
     Bookmark, DocumentMetadata, EmbedderModel, FileType, IndexStatus, IndexingConfig,
-    MetadataConflictValue, MetadataSourcePreference, NewBookmark, PreviewData, SearchMode,
-    SearchQuery, SearchScope, SelectedEmbedder, SemanticSettings, Settings,
+    MetadataConflictValue, MetadataSourcePreference, NewBookmark, PreviewData, RelatedDocument,
+    RelatedDocumentsQuery, SearchMode, SearchQuery, SearchScope, SelectedEmbedder,
+    SemanticSettings, Settings,
 };
 
 use crate::commands::search::{start_search, SearchHandle};
@@ -132,6 +133,17 @@ enum RestoreStatePreparation {
         db_status: IndexStatus,
         selected: SelectedEmbedder,
     },
+}
+
+enum SemanticRootPolicy {
+    AllowCorpusAndTriggerReindex,
+    RequireCurrentRoot,
+}
+
+struct SemanticRuntime {
+    embedder: Arc<dyn Embedder>,
+    index: Arc<Mutex<Option<SemanticIndex>>>,
+    indexing: IndexingConfig,
 }
 
 fn preferred_bookmark_roots(settings: &Settings) -> Vec<PathBuf> {
@@ -613,6 +625,38 @@ impl AppContext {
             anyhow::bail!("Access denied: path outside data directory");
         }
         crate::commands::files::rename_file(path, new_name).await
+    }
+
+    pub async fn move_files_into_current_root(
+        &self,
+        paths: Vec<PathBuf>,
+        root: PathBuf,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let s = self.get_settings().await;
+        let Some(current_root) = s.last_directory.clone() else {
+            anyhow::bail!("Choose a directory before dropping files");
+        };
+        let root_canonical = std::fs::canonicalize(&root).map_err(|err| {
+            anyhow::anyhow!("Root directory not found: {} ({err})", root.display())
+        })?;
+        let current_root_canonical = std::fs::canonicalize(&current_root).map_err(|err| {
+            anyhow::anyhow!(
+                "Current root directory not found: {} ({err})",
+                current_root.display()
+            )
+        })?;
+        if root_canonical != current_root_canonical {
+            anyhow::bail!(
+                "Drop target must be the current root: {}",
+                current_root.display()
+            );
+        }
+
+        let imported =
+            crate::commands::files::move_files_into_root(paths, root, s.supported_extensions)
+                .await?;
+        self.emit_file_list_changed(&root_canonical);
+        Ok(imported)
     }
 
     pub async fn get_file_metadata(&self, path: PathBuf) -> anyhow::Result<DocumentMetadata> {
@@ -1120,51 +1164,169 @@ impl AppContext {
 
     // ── Search ────────────────────────────────────────────────────────────────
 
+    fn canonicalize_search_root(root: &Path) -> Result<PathBuf, String> {
+        std::fs::canonicalize(root).map_err(|err| {
+            format!(
+                "Search root does not exist or cannot be accessed: {} ({err})",
+                root.display()
+            )
+        })
+    }
+
+    fn canonicalize_supported_file_under_root(
+        root: &Path,
+        path: &Path,
+        supported_extensions: &[String],
+        label: &str,
+    ) -> Result<(PathBuf, FileType), String> {
+        let requested = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let file = std::fs::canonicalize(&requested).map_err(|err| {
+            format!(
+                "{label} file does not exist or cannot be accessed: {} ({err})",
+                requested.display()
+            )
+        })?;
+        if !file.is_file() {
+            return Err(format!("{label} file is not a file: {}", file.display()));
+        }
+        if !is_under(&file, root) {
+            return Err(format!(
+                "{label} file must be inside the search root: {} is outside {}",
+                file.display(),
+                root.display()
+            ));
+        }
+        let file_type = FileType::detect(&file, supported_extensions)
+            .ok_or_else(|| format!("{label} file type is not supported: {}", file.display()))?;
+        Ok((file, file_type))
+    }
+
     fn prepare_search_query(
         mut query: SearchQuery,
         supported_extensions: Vec<String>,
     ) -> Result<SearchQuery, String> {
         query.supported_extensions = supported_extensions;
-        let root = std::fs::canonicalize(&query.root).map_err(|err| {
-            format!(
-                "Search root does not exist or cannot be accessed: {} ({err})",
-                query.root.display()
-            )
-        })?;
-        query.root = root;
+        query.root = Self::canonicalize_search_root(&query.root)?;
 
         if let SearchScope::File { path } = &query.scope {
-            let requested = if path.is_absolute() {
-                path.clone()
-            } else {
-                query.root.join(path)
-            };
-            let file = std::fs::canonicalize(&requested).map_err(|err| {
-                format!(
-                    "Search file does not exist or cannot be accessed: {} ({err})",
-                    requested.display()
-                )
-            })?;
-            if !file.is_file() {
-                return Err(format!("Search file is not a file: {}", file.display()));
-            }
-            if !is_under(&file, &query.root) {
-                return Err(format!(
-                    "Search file must be inside the search root: {} is outside {}",
-                    file.display(),
-                    query.root.display()
-                ));
-            }
-            if FileType::detect(&file, &query.supported_extensions).is_none() {
-                return Err(format!(
-                    "Search file type is not supported: {}",
-                    file.display()
-                ));
-            }
+            let (file, _) = Self::canonicalize_supported_file_under_root(
+                &query.root,
+                path,
+                &query.supported_extensions,
+                "Search",
+            )?;
             query.scope = SearchScope::File { path: file };
         }
 
         Ok(query)
+    }
+
+    fn ensure_no_active_embed_task(&self, message: &str) -> Result<(), String> {
+        if self.embed_cancel_in_progress.load(Ordering::Acquire) {
+            return Err(message.to_string());
+        }
+        let mut guard = self.embed_task.lock();
+        if let Some(task) = guard.as_ref() {
+            if !task.join.is_finished() {
+                return Err(message.to_string());
+            }
+            *guard = None;
+        }
+        Ok(())
+    }
+
+    async fn prepare_semantic_runtime(
+        self: &Arc<Self>,
+        root: &Path,
+        settings: &Settings,
+        root_policy: SemanticRootPolicy,
+    ) -> Result<SemanticRuntime, String> {
+        self.ensure_no_active_embed_task("Semantic index is currently being built. Please wait.")?;
+
+        let embedder = self
+            .embedder
+            .lock()
+            .clone()
+            .ok_or_else(|| "No semantic index found. Build the index first.".to_string())?;
+        let index_arc = self.index.lock().clone();
+        let query_root_canonical =
+            std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let root_mismatch = {
+            let guard = index_arc.lock().unwrap_or_else(|p| p.into_inner());
+            match guard.as_ref() {
+                Some(idx) => match idx.status().root_path {
+                    Some(p) => std::fs::canonicalize(&p).unwrap_or(p) != query_root_canonical,
+                    None => true,
+                },
+                None => true,
+            }
+        };
+
+        if root_mismatch {
+            self.request_semantic_reindex_for_root(
+                &index_arc,
+                Arc::clone(&embedder),
+                &query_root_canonical,
+            );
+            if matches!(root_policy, SemanticRootPolicy::RequireCurrentRoot) {
+                return Err(format!(
+                    "Semantic index is not ready for search root {}. Reindexing has been requested; please try again when indexing finishes.",
+                    root.display()
+                ));
+            }
+        }
+
+        Ok(SemanticRuntime {
+            embedder,
+            index: index_arc,
+            indexing: IndexingConfig {
+                chunk_size: settings.semantic.chunk_size,
+                chunk_overlap: settings.semantic.chunk_overlap,
+                supported_extensions: settings.supported_extensions.clone(),
+            },
+        })
+    }
+
+    fn request_semantic_reindex_for_root(
+        self: &Arc<Self>,
+        index_arc: &Arc<Mutex<Option<SemanticIndex>>>,
+        embedder: Arc<dyn Embedder>,
+        root: &Path,
+    ) {
+        let already_building = {
+            let guard = self.embed_task.lock();
+            guard.as_ref().is_some_and(|t| !t.join.is_finished())
+                || self.embed_cancel_in_progress.load(Ordering::Acquire)
+        };
+        if already_building {
+            info!("semantic read: root changed but reindex already in progress, skipping");
+            return;
+        }
+
+        info!("semantic read: root changed, triggering background reindex");
+        let engine = {
+            let guard = index_arc.lock().unwrap_or_else(|p| p.into_inner());
+            guard
+                .as_ref()
+                .map(|idx| idx.status().engine)
+                .unwrap_or_default()
+        };
+        let selected = SelectedEmbedder {
+            engine,
+            model: EmbedderModel(embedder.model_id().to_string()),
+            dimension: embedder.dimension(),
+        };
+        let ctx = Arc::clone(self);
+        let root_str = root.to_string_lossy().to_string();
+        tokio::spawn(async move {
+            if let Err(e) = ctx.start_build_index(root_str, selected).await {
+                error!("background reindex failed: {e}");
+            }
+        });
     }
 
     /// Resolve semantic state (if needed) and start the search. Handles both
@@ -1178,87 +1340,58 @@ impl AppContext {
 
         let mut semantic_indexing = None;
         let (embedder, index) = if query.mode == SearchMode::Semantic {
-            // Block if a build task is currently running.
-            {
-                let mut guard = self.embed_task.lock();
-                if let Some(task) = guard.as_ref() {
-                    if !task.join.is_finished() {
-                        return Err("Semantic index is currently being built. Please wait.".into());
-                    }
-                    *guard = None;
-                }
-            }
-
-            let embedder = self
-                .embedder
-                .lock()
-                .clone()
-                .ok_or_else(|| "No semantic index found. Build the index first.".to_string())?;
-
-            let index_arc = self.index.lock().clone();
-
-            // If the query root differs from the indexed root, trigger a
-            // background reindex and continue with the current index.
-            let query_root_canonical =
-                std::fs::canonicalize(&query.root).unwrap_or_else(|_| query.root.clone());
-            let root_mismatch = {
-                let guard = index_arc.lock().unwrap_or_else(|p| p.into_inner());
-                match guard.as_ref() {
-                    Some(idx) => match idx.status().root_path {
-                        Some(p) => std::fs::canonicalize(&p).unwrap_or(p) != query_root_canonical,
-                        None => true,
-                    },
-                    None => true,
-                }
+            let policy = if matches!(query.scope, SearchScope::File { .. }) {
+                SemanticRootPolicy::RequireCurrentRoot
+            } else {
+                SemanticRootPolicy::AllowCorpusAndTriggerReindex
             };
-            if root_mismatch {
-                let already_building = {
-                    let guard = self.embed_task.lock();
-                    guard.as_ref().is_some_and(|t| !t.join.is_finished())
-                };
-                if already_building {
-                    info!("start_search: root changed but reindex already in progress, skipping");
-                } else {
-                    info!("start_search: root changed, triggering background reindex");
-                    let engine = {
-                        let guard = index_arc.lock().unwrap_or_else(|p| p.into_inner());
-                        guard
-                            .as_ref()
-                            .map(|idx| idx.status().engine)
-                            .unwrap_or_default()
-                    };
-                    let selected = SelectedEmbedder {
-                        engine,
-                        model: EmbedderModel(embedder.model_id().to_string()),
-                        dimension: embedder.dimension(),
-                    };
-                    let ctx = Arc::clone(&self);
-                    let root_str = query_root_canonical.to_string_lossy().to_string();
-                    tokio::spawn(async move {
-                        if let Err(e) = ctx.start_build_index(root_str, selected).await {
-                            error!("background reindex failed: {e}");
-                        }
-                    });
-                }
-                if matches!(query.scope, SearchScope::File { .. }) {
-                    return Err(format!(
-                        "Semantic index is not ready for search root {}. Reindexing has been requested; please try again when indexing finishes.",
-                        query.root.display()
-                    ));
-                }
-            }
-
-            semantic_indexing = Some(IndexingConfig {
-                chunk_size: settings.semantic.chunk_size,
-                chunk_overlap: settings.semantic.chunk_overlap,
-                supported_extensions: settings.supported_extensions.clone(),
-            });
-            (Some(embedder), Some(index_arc))
+            let runtime = self
+                .prepare_semantic_runtime(&query.root, &settings, policy)
+                .await?;
+            semantic_indexing = Some(runtime.indexing);
+            (Some(runtime.embedder), Some(runtime.index))
         } else {
             (None, None)
         };
 
         Ok(start_search(query, embedder, index, semantic_indexing))
+    }
+
+    pub async fn related_documents(
+        self: Arc<Self>,
+        mut query: RelatedDocumentsQuery,
+    ) -> Result<Vec<RelatedDocument>, String> {
+        const DEFAULT_LIMIT: usize = 8;
+        const MAX_LIMIT: usize = 25;
+
+        let settings = self.settings().await;
+        query.root = Self::canonicalize_search_root(&query.root)?;
+        let (source_path, _) = Self::canonicalize_supported_file_under_root(
+            &query.root,
+            &query.path,
+            &settings.supported_extensions,
+            "Related documents",
+        )?;
+        let runtime = self
+            .prepare_semantic_runtime(
+                &query.root,
+                &settings,
+                SemanticRootPolicy::RequireCurrentRoot,
+            )
+            .await?;
+        let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+        let supported_extensions = settings.supported_extensions.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let guard = runtime.index.lock().unwrap_or_else(|p| p.into_inner());
+            let idx = guard
+                .as_ref()
+                .ok_or_else(|| "No semantic index found. Build the index first.".to_string())?;
+            idx.related_documents(&source_path, limit, &supported_extensions)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("related documents task panicked: {e}"))?
     }
 
     // ── Build index ───────────────────────────────────────────────────────────
@@ -2199,8 +2332,8 @@ mod tests {
     use wilkes_core::embed::MockEmbedder;
     use wilkes_core::types::EmbeddingEngine;
     use wilkes_core::types::{
-        BookmarkDock, EmbedderModel, IndexStatus, SearchMode, SelectedEmbedder, SemanticSettings,
-        Settings, SourceOrigin, Theme,
+        BookmarkDock, ByteRange, EmbedderModel, IndexStatus, SearchMode, SelectedEmbedder,
+        SemanticSettings, Settings, SourceOrigin, Theme,
     };
 
     #[cfg(unix)]
@@ -4308,6 +4441,123 @@ exit 0
             Err(e) => assert!(e.contains("Semantic index is currently being built")),
             Ok(_) => panic!("Expected error but got Ok"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_related_documents_requires_current_semantic_root() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let (ctx, _rx, _loop) = AppContext::new(
+            data_dir.clone(),
+            dir.path().join("settings.json"),
+            WorkerPaths::resolve(&data_dir),
+            Arc::new(MockEmitter {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+
+        let embedder = Arc::new(MockEmbedder {
+            dimension: 2,
+            ..MockEmbedder::default()
+        });
+        let model_id = embedder.model_id().to_string();
+        *ctx.embedder.lock() = Some(embedder);
+        let indexed_root = dir.path().join("indexed");
+        let requested_root = dir.path().join("requested");
+        std::fs::create_dir_all(&indexed_root).unwrap();
+        std::fs::create_dir_all(&requested_root).unwrap();
+        let requested_file = requested_root.join("source.txt");
+        std::fs::write(&requested_file, "source").unwrap();
+        let idx = SemanticIndex::create(
+            &data_dir,
+            &model_id,
+            2,
+            EmbeddingEngine::Candle,
+            Some(&indexed_root),
+        )
+        .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(idx)));
+
+        let err = ctx
+            .clone()
+            .related_documents(RelatedDocumentsQuery {
+                root: requested_root,
+                path: requested_file,
+                limit: Some(8),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("Semantic index is not ready"));
+    }
+
+    #[tokio::test]
+    async fn test_related_documents_returns_index_results() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.txt");
+        let related = root.join("related.txt");
+        std::fs::write(&source, "source").unwrap();
+        std::fs::write(&related, "related").unwrap();
+        let (ctx, _rx, _loop) = AppContext::new(
+            data_dir.clone(),
+            dir.path().join("settings.json"),
+            WorkerPaths::resolve(&data_dir),
+            Arc::new(MockEmitter {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+
+        let embedder = Arc::new(MockEmbedder {
+            dimension: 2,
+            ..MockEmbedder::default()
+        });
+        let model_id = embedder.model_id().to_string();
+        *ctx.embedder.lock() = Some(embedder);
+        let mut idx = SemanticIndex::create(
+            &data_dir,
+            &model_id,
+            2,
+            EmbeddingEngine::Candle,
+            Some(&root),
+        )
+        .unwrap();
+        let chunk = |path: &Path, text: &str| wilkes_core::embed::index::chunk::Chunk {
+            file_path: path.to_path_buf(),
+            text: text.to_string(),
+            byte_range: ByteRange {
+                start: 0,
+                end: text.len(),
+            },
+            origin: SourceOrigin::TextFile { line: 1, col: 1 },
+        };
+        idx.write_file(wilkes_core::embed::index::db::PreparedFile {
+            path: source.clone(),
+            chunks: vec![(chunk(&source, "source"), vec![1.0, 0.0])],
+        })
+        .unwrap();
+        idx.write_file(wilkes_core::embed::index::db::PreparedFile {
+            path: related.clone(),
+            chunks: vec![(chunk(&related, "related"), vec![0.9, 0.1])],
+        })
+        .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(idx)));
+
+        let docs = ctx
+            .related_documents(RelatedDocumentsQuery {
+                root,
+                path: source,
+                limit: Some(8),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].path, related);
     }
 
     #[tokio::test]

@@ -37,8 +37,15 @@ vi.mock("./services", () => ({
   source: {
     type: "desktop",
     pickDirectory: vi.fn(),
+    importDroppedFiles: vi.fn(() => Promise.resolve([])),
   },
   isTauri: true,
+}));
+
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: vi.fn(() => ({
+    onDragDropEvent: vi.fn(() => Promise.resolve(() => {})),
+  })),
 }));
 
 vi.mock("./hooks/useTauriEvents", () => ({ useTauriEvents: vi.fn() }));

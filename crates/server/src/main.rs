@@ -29,8 +29,8 @@ use wilkes_api::context::AppContext;
 use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::types::{
     AddOutcome, CitationResult, DocumentMetadata, EmbeddingEngine, IntegrationStatus, MatchRef,
-    ModelDescriptor, NewBookmark, OpenAlexWork, SearchQuery, SelectedEmbedder,
-    SemanticScholarPaper,
+    ModelDescriptor, NewBookmark, OpenAlexWork, RelatedDocumentsQuery, SearchQuery,
+    SelectedEmbedder, SemanticScholarPaper,
 };
 
 fn confine_to_uploads(
@@ -104,6 +104,25 @@ async fn search_handler(
     });
 
     Ok(Sse::new(ReceiverStream::new(rx)))
+}
+
+async fn related_documents_handler(
+    State(state): State<Arc<AppState>>,
+    Json(mut query): Json<RelatedDocumentsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    query.root = crate::http::state::confined_root_for_search(
+        &query.root.to_string_lossy(),
+        &state.uploads_dir,
+        &TokioServerFs,
+    )
+    .await?;
+    let related = state
+        .ctx
+        .clone()
+        .related_documents(query)
+        .await
+        .map_err(server_err)?;
+    Ok(Json(related))
 }
 
 // ── Preview ───────────────────────────────────────────────────────────────────
@@ -853,6 +872,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health_handler))
         // Core
         .route("/api/search", post(search_handler))
+        .route("/api/related-documents", post(related_documents_handler))
         .route("/api/preview", post(preview_handler))
         .route("/api/settings", get(get_settings_handler))
         .route("/api/settings", patch(update_settings_handler))

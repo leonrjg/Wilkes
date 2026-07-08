@@ -12,7 +12,8 @@ use tracing::error;
 use crate::extract::ExtractorRegistry;
 use crate::metadata::cache::FileIdentity;
 use crate::types::{
-    BoundingBox, ByteRange, EmbeddingEngine, IndexStatus, IndexingConfig, SourceOrigin,
+    BoundingBox, ByteRange, EmbeddingEngine, FileType, IndexStatus, IndexingConfig,
+    RelatedDocument, SourceOrigin,
 };
 
 use super::super::models::installer::{EmbedProgress, IndexBuildProgress, ProgressTx};
@@ -59,6 +60,7 @@ fn configure_connection(conn: &Connection, path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
     use std::sync::atomic::AtomicUsize;
     use tempfile::tempdir;
 
@@ -572,6 +574,84 @@ mod tests {
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].file_path, scoped_path);
         assert_eq!(scoped[0].chunk_text, "scoped chunk");
+    }
+
+    #[test]
+    fn test_related_documents_ranks_by_centroid_similarity_and_filters() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut idx =
+            SemanticIndex::create(root, "m", 2, EmbeddingEngine::Candle, Some(root)).unwrap();
+        let source = root.join("source.txt");
+        let close = root.join("close.txt");
+        let far = root.join("far.txt");
+        let unsupported = root.join("image.bin");
+        for path in [&source, &close, &far, &unsupported] {
+            fs::write(path, "content").unwrap();
+        }
+
+        let chunk = |path: &Path, text: &str| Chunk {
+            file_path: path.to_path_buf(),
+            text: text.to_string(),
+            byte_range: ByteRange {
+                start: 0,
+                end: text.len(),
+            },
+            origin: SourceOrigin::TextFile { line: 1, col: 1 },
+        };
+
+        idx.write_file(PreparedFile {
+            path: source.clone(),
+            chunks: vec![
+                (chunk(&source, "source one"), vec![1.0, 0.0]),
+                (chunk(&source, "source two"), vec![1.0, 0.0]),
+            ],
+        })
+        .unwrap();
+        idx.write_file(PreparedFile {
+            path: close.clone(),
+            chunks: vec![(chunk(&close, "close"), vec![0.9, 0.1])],
+        })
+        .unwrap();
+        idx.write_file(PreparedFile {
+            path: far.clone(),
+            chunks: vec![(chunk(&far, "far"), vec![0.0, 1.0])],
+        })
+        .unwrap();
+        idx.write_file(PreparedFile {
+            path: unsupported.clone(),
+            chunks: vec![(chunk(&unsupported, "unsupported"), vec![1.0, 0.0])],
+        })
+        .unwrap();
+
+        let related = idx
+            .related_documents(&source, 10, &["txt".to_string()])
+            .unwrap();
+
+        assert_eq!(
+            related
+                .iter()
+                .map(|doc| doc.path.clone())
+                .collect::<Vec<_>>(),
+            vec![close, far]
+        );
+        assert!(related[0].score > related[1].score);
+        assert_eq!(related[0].indexed_chunks, 1);
+    }
+
+    #[test]
+    fn test_related_documents_missing_source_errors() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let idx = SemanticIndex::create(root, "m", 2, EmbeddingEngine::Candle, Some(root)).unwrap();
+        let source = root.join("source.txt");
+        fs::write(&source, "content").unwrap();
+
+        let err = idx
+            .related_documents(&source, 10, &["txt".to_string()])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("not present"));
     }
 
     #[test]
@@ -1836,6 +1916,108 @@ impl SemanticIndex {
         }
     }
 
+    pub fn related_documents(
+        &self,
+        source_path: &Path,
+        limit: usize,
+        supported_extensions: &[String],
+    ) -> anyhow::Result<Vec<RelatedDocument>> {
+        let source_key = self
+            .path_key_for_existing_path(source_path)
+            .to_string_lossy()
+            .into_owned();
+        let limit = if limit == 0 { 8 } else { limit };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT f.file_path, v.embedding
+             FROM chunks c
+             JOIN vec_chunks v ON v.rowid = c.id
+             JOIN files f ON f.id = c.file_id",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let file_path: String = row.get(0)?;
+            let embedding_blob: Vec<u8> = row.get(1)?;
+            Ok((file_path, embedding_blob))
+        })?;
+
+        #[derive(Default)]
+        struct Accumulator {
+            sum: Vec<f32>,
+            chunks: usize,
+        }
+
+        let mut by_file: HashMap<String, Accumulator> = HashMap::new();
+        for row in rows {
+            let (file_path, embedding_blob) = row?;
+            let embedding = f32_slice_from_bytes(&embedding_blob)?;
+            anyhow::ensure!(
+                embedding.len() == self.dimension,
+                "Stored embedding dimension mismatch for {}. Expected {}, received {}.",
+                file_path,
+                self.dimension,
+                embedding.len()
+            );
+            let normalized = normalized_vector(&embedding);
+            let entry = by_file.entry(file_path).or_insert_with(|| Accumulator {
+                sum: vec![0.0; self.dimension],
+                chunks: 0,
+            });
+            for (total, value) in entry.sum.iter_mut().zip(normalized) {
+                *total += value;
+            }
+            entry.chunks += 1;
+        }
+
+        let Some(source_acc) = by_file.get(&source_key) else {
+            anyhow::bail!(
+                "Source file is not present in the semantic index: {}",
+                source_path.display()
+            );
+        };
+        let source_centroid = centroid(&source_acc.sum, source_acc.chunks);
+
+        let mut related = Vec::new();
+        for (file_path, acc) in by_file {
+            if file_path == source_key || acc.chunks == 0 {
+                continue;
+            }
+            let abs_path = self.key_to_display_path(&file_path);
+            let Some(file_type) = FileType::detect(&abs_path, supported_extensions) else {
+                continue;
+            };
+            let candidate_centroid = centroid(&acc.sum, acc.chunks);
+            let score = cosine_similarity(&source_centroid, &candidate_centroid);
+            related.push(RelatedDocument {
+                path: abs_path,
+                file_type,
+                score,
+                indexed_chunks: acc.chunks,
+            });
+        }
+
+        related.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| {
+                    let left = a
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default();
+                    let right = b
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default();
+                    left.cmp(right)
+                })
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        related.truncate(limit);
+        Ok(related)
+    }
+
     fn query_corpus(&self, embedding: &[f32], top_k: usize) -> anyhow::Result<Vec<IndexedChunk>> {
         anyhow::ensure!(
             embedding.len() == self.dimension,
@@ -2343,6 +2525,22 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
     dot / (norm_a.sqrt() * norm_b.sqrt())
+}
+
+fn normalized_vector(v: &[f32]) -> Vec<f32> {
+    let norm = v.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm == 0.0 {
+        return vec![0.0; v.len()];
+    }
+    v.iter().map(|value| value / norm).collect()
+}
+
+fn centroid(sum: &[f32], count: usize) -> Vec<f32> {
+    if count == 0 {
+        return vec![0.0; sum.len()];
+    }
+    let count = count as f32;
+    sum.iter().map(|value| value / count).collect()
 }
 
 fn source_origin_from_parts(

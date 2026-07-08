@@ -18,6 +18,8 @@ import type {
   NewBookmark,
   OpenAlexWork,
   PreviewData,
+  RelatedDocument,
+  RelatedDocumentsQuery,
   SelectedEmbedder,
   SemanticScholarPaper,
   SearchQuery,
@@ -101,6 +103,16 @@ export class HttpSearchApi implements SearchApi {
   async cancelSearch(searchId: string): Promise<void> {
     this.controllers.get(searchId)?.abort();
     this.controllers.delete(searchId);
+  }
+
+  async relatedDocuments(query: RelatedDocumentsQuery): Promise<RelatedDocument[]> {
+    const res = await fetch("/api/related-documents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(query),
+    });
+    if (!res.ok) throw new Error(`relatedDocuments failed: ${res.status}`);
+    return res.json() as Promise<RelatedDocument[]>;
   }
 
   async preview(matchRef: MatchRef): Promise<PreviewData> {

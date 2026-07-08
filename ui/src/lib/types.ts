@@ -59,6 +59,19 @@ export interface FileMatches {
   matches: Match[];
 }
 
+export interface RelatedDocumentsQuery {
+  root: string;
+  path: string;
+  limit?: number | null;
+}
+
+export interface RelatedDocument {
+  path: string;
+  file_type: FileType;
+  score: number;
+  indexed_chunks: number;
+}
+
 export interface MatchRef {
   path: string;
   origin: SourceOrigin;

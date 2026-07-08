@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -179,6 +180,70 @@ pub async fn rename_file(path: PathBuf, new_name: String) -> anyhow::Result<Path
 
     tokio::fs::rename(&path, &target).await?;
     Ok(target)
+}
+
+pub async fn move_files_into_root(
+    paths: Vec<PathBuf>,
+    root: PathBuf,
+    supported_extensions: Vec<String>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let root = tokio::fs::canonicalize(&root)
+        .await
+        .map_err(|err| anyhow::anyhow!("Root directory not found: {} ({err})", root.display()))?;
+    let root_meta = tokio::fs::metadata(&root).await?;
+    if !root_meta.is_dir() {
+        anyhow::bail!("Root is not a directory: {}", root.display());
+    }
+
+    let mut moves = Vec::with_capacity(paths.len());
+    let mut targets = HashSet::with_capacity(paths.len());
+    for path in paths {
+        let source = tokio::fs::canonicalize(&path)
+            .await
+            .map_err(|err| anyhow::anyhow!("Dropped file not found: {} ({err})", path.display()))?;
+        let metadata = tokio::fs::metadata(&source).await?;
+        if !metadata.is_file() {
+            anyhow::bail!("Can only import files: {}", source.display());
+        }
+        if FileType::detect(&source, &supported_extensions).is_none() {
+            anyhow::bail!("Dropped file type is not supported: {}", source.display());
+        }
+        let file_name = source.file_name().ok_or_else(|| {
+            anyhow::anyhow!("Dropped file has no file name: {}", source.display())
+        })?;
+        let target = root.join(file_name);
+        if source == target {
+            anyhow::bail!(
+                "Dropped file is already in the current root: {}",
+                source.display()
+            );
+        }
+        if tokio::fs::try_exists(&target).await? {
+            anyhow::bail!(
+                "A file or folder with that name already exists: {}",
+                target.display()
+            );
+        }
+        if !targets.insert(target.clone()) {
+            anyhow::bail!(
+                "Multiple dropped files would import as the same name: {}",
+                target.display()
+            );
+        }
+        moves.push((source, target));
+    }
+
+    let mut imported = Vec::with_capacity(moves.len());
+    for (source, target) in moves {
+        tokio::fs::rename(&source, &target).await?;
+        imported.push(target);
+    }
+
+    Ok(imported)
 }
 
 fn validate_new_file_name(name: &str) -> anyhow::Result<()> {
@@ -364,5 +429,119 @@ mod tests {
 
         let err = rename_file(path, "taken.txt".into()).await.unwrap_err();
         assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_move_files_into_root_moves_supported_files() {
+        let source_dir = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let source = source_dir.path().join("paper.pdf");
+        fs::write(&source, "pdf").unwrap();
+
+        let imported = move_files_into_root(
+            vec![source.clone()],
+            root_dir.path().to_path_buf(),
+            vec!["pdf".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let target = root_dir.path().join("paper.pdf");
+        assert_eq!(imported, vec![target.canonicalize().unwrap()]);
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(target).unwrap(), "pdf");
+    }
+
+    #[tokio::test]
+    async fn test_move_files_into_root_rejects_unsupported_files() {
+        let source_dir = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let source = source_dir.path().join("program.exe");
+        fs::write(&source, "binary").unwrap();
+
+        let err = move_files_into_root(
+            vec![source.clone()],
+            root_dir.path().to_path_buf(),
+            vec!["pdf".to_string()],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("not supported"));
+        assert!(source.exists());
+    }
+
+    #[tokio::test]
+    async fn test_move_files_into_root_rejects_existing_target() {
+        let source_dir = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let source = source_dir.path().join("paper.pdf");
+        fs::write(&source, "new").unwrap();
+        fs::write(root_dir.path().join("paper.pdf"), "existing").unwrap();
+
+        let err = move_files_into_root(
+            vec![source.clone()],
+            root_dir.path().to_path_buf(),
+            vec!["pdf".to_string()],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("already exists"));
+        assert!(source.exists());
+        assert_eq!(
+            fs::read_to_string(root_dir.path().join("paper.pdf")).unwrap(),
+            "existing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_move_files_into_root_rejects_duplicate_import_names_before_moving() {
+        let source_dir_1 = tempdir().unwrap();
+        let source_dir_2 = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let source_1 = source_dir_1.path().join("paper.pdf");
+        let source_2 = source_dir_2.path().join("paper.pdf");
+        fs::write(&source_1, "one").unwrap();
+        fs::write(&source_2, "two").unwrap();
+
+        let err = move_files_into_root(
+            vec![source_1.clone(), source_2.clone()],
+            root_dir.path().to_path_buf(),
+            vec!["pdf".to_string()],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("same name"));
+        assert!(source_1.exists());
+        assert!(source_2.exists());
+        assert!(!root_dir.path().join("paper.pdf").exists());
+    }
+
+    #[tokio::test]
+    async fn test_move_files_into_root_rejects_directories_and_missing_roots() {
+        let source_dir = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+
+        let err = move_files_into_root(
+            vec![source_dir.path().to_path_buf()],
+            root_dir.path().to_path_buf(),
+            vec!["pdf".to_string()],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Can only import files"));
+
+        let source = source_dir.path().join("paper.pdf");
+        fs::write(&source, "pdf").unwrap();
+        let err = move_files_into_root(
+            vec![source],
+            root_dir.path().join("missing"),
+            vec!["pdf".to_string()],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Root directory not found"));
     }
 }

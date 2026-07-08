@@ -58,6 +58,23 @@ async fn rename_file_for_path(path: String, new_name: String) -> Result<String, 
         .map_err(|e| e.to_string())
 }
 
+async fn move_files_into_current_root_for_ctx(
+    ctx: Arc<AppContext>,
+    paths: Vec<String>,
+    root: String,
+) -> Result<Vec<String>, String> {
+    let paths = paths.into_iter().map(PathBuf::from).collect();
+    ctx.move_files_into_current_root(paths, root.into())
+        .await
+        .map(|paths| {
+            paths
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
 async fn get_file_metadata_for_path(
     ctx: Arc<AppContext>,
     path: String,
@@ -543,6 +560,14 @@ async fn cancel_search(search_id: String, app: AppHandle) -> Result<(), String> 
     Ok(())
 }
 
+#[tauri::command]
+async fn related_documents(
+    query: wilkes_core::types::RelatedDocumentsQuery,
+    app: AppHandle,
+) -> Result<Vec<wilkes_core::types::RelatedDocument>, String> {
+    app_context(&app).related_documents(query).await
+}
+
 // ── Chat commands ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -966,6 +991,15 @@ async fn rename_file(path: String, new_name: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn import_dropped_files(
+    paths: Vec<String>,
+    root: String,
+    app: AppHandle,
+) -> Result<Vec<String>, String> {
+    move_files_into_current_root_for_ctx(app_context(&app), paths, root).await
+}
+
+#[tauri::command]
 async fn get_file_metadata(path: String, app: AppHandle) -> Result<DocumentMetadata, String> {
     get_file_metadata_for_path(app_context(&app), path).await
 }
@@ -1173,10 +1207,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             search,
             cancel_search,
+            related_documents,
             preview,
             list_files,
             open_file,
             rename_file,
+            import_dropped_files,
             get_file_metadata,
             get_python_info,
             get_supported_engines,
@@ -1475,6 +1511,38 @@ mod tests {
         assert_eq!(renamed, renamed_path.display().to_string());
         assert!(!outside.exists());
         assert_eq!(std::fs::read_to_string(renamed_path).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn test_move_files_into_current_root_for_ctx_moves_external_file() {
+        let (_dir, ctx) = test_ctx();
+        let source_dir = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let source = source_dir.path().join("paper.pdf");
+        std::fs::write(&source, "pdf").unwrap();
+
+        ctx.update_settings(serde_json::json!({
+            "last_directory": root_dir.path().display().to_string(),
+            "supported_extensions": ["pdf"]
+        }))
+        .await
+        .unwrap();
+
+        let imported = move_files_into_current_root_for_ctx(
+            ctx,
+            vec![source.display().to_string()],
+            root_dir.path().display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        let target = root_dir.path().join("paper.pdf");
+        assert_eq!(
+            imported,
+            vec![target.canonicalize().unwrap().display().to_string()]
+        );
+        assert!(!source.exists());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "pdf");
     }
 
     #[tokio::test]

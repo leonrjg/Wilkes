@@ -9,12 +9,10 @@ import {
   Clock,
   File,
   FileText,
-  Folder,
   HardDrive,
   Hash,
   Info,
   RefreshCw,
-  Tag,
   User,
 } from "react-feather";
 import { buildRows, COLLAPSED_LIMIT, type Row } from "../lib/utils/flattenResults";
@@ -41,6 +39,12 @@ import {
   formatDocumentMonthYear,
   formatTimestampFullDate,
 } from "../lib/dateFormatting";
+import {
+  DocumentEntryRow,
+  fileName,
+  type DetailIcon,
+  type DocumentDetail,
+} from "./DocumentEntryRow";
 
 function originLabel(origin: SourceOrigin): string {
   if ("TextFile" in origin) return `L${origin.TextFile.line}`;
@@ -59,10 +63,6 @@ function highlightMatch(contextBefore: string, matchedText: string, contextAfter
       <span className="text-[var(--text-muted)]">{contextAfter}</span>
     </>
   );
-}
-
-function fileName(path: string): string {
-  return path.split(/[/\\]/).pop() ?? path;
 }
 
 function editableNameEnd(name: string): number {
@@ -95,11 +95,12 @@ interface FileDisplayFieldDef {
   get: (entry: FileEntry) => string | null | undefined;
   fullWidth?: boolean;
   monospace?: boolean;
+  hideWhenMissing?: boolean;
 }
 
 const FILE_DISPLAY_FIELDS: FileDisplayFieldDef[] = [
-  { key: "title", label: "Title", get: (e) => e.title, fullWidth: true, monospace: false },
-  { key: "author", label: "Author", get: (e) => e.author, fullWidth: false, monospace: false },
+  { key: "title", label: "Title", get: (e) => e.title, fullWidth: true, monospace: false, hideWhenMissing: true },
+  { key: "author", label: "Author", get: (e) => e.author, fullWidth: false, monospace: false, hideWhenMissing: true },
   { key: "created", label: "Created", get: (e) => (e.created_at_ms != null ? formatTimestampFullDate(e.created_at_ms) : null) },
   { key: "modified", label: "Modified", get: (e) => (e.modified_at_ms != null ? formatTimestampFullDate(e.modified_at_ms) : null) },
   { key: "publication", label: "Publication date", get: (e) => formatDocumentMonthYear(e.publication_date) },
@@ -113,8 +114,6 @@ const FILE_DISPLAY_FIELDS: FileDisplayFieldDef[] = [
   },
   { key: "size", label: "Size", get: (e) => formatSize(e.size_bytes) },
 ];
-
-type DetailIcon = React.ComponentType<React.SVGProps<SVGSVGElement> & { size?: number }>;
 
 const FILE_DETAIL_ICONS: Record<FileDisplayField, DetailIcon> = {
   title: FileText,
@@ -214,7 +213,7 @@ function metadataConflictTooltip(
                 group.selected ? "text-[var(--accent-blue)]" : "text-[var(--text-dim)]"
               }`}
             >
-              {group.sources.join(", ")}
+              {group.sources.join(", ")}:{" "}
             </span>
             <span className="min-w-0 break-words text-[var(--text-main)]">
               {group.value}
@@ -224,17 +223,6 @@ function metadataConflictTooltip(
       </div>
     </div>
   );
-}
-
-interface FileDetail {
-  key: string;
-  label: string;
-  value: string;
-  valueTitle?: string;
-  icon: DetailIcon;
-  fullWidth?: boolean;
-  monospace?: boolean;
-  conflictTooltip?: React.ReactNode;
 }
 
 function normalizedDetailValue(value: string | null | undefined): string | null {
@@ -626,7 +614,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
         </div>
         <div className="flex-1 overflow-y-auto">
           {filteredVisibleFiles.map((entry) => (
-            <FileEntryRow
+            <FileEntryRowAdapter
               key={entry.path}
               entry={entry}
               displayFields={fileDisplayFields}
@@ -662,7 +650,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
               {showOmittedFiles && (
                 <div className="mt-2">
                   {filteredOmittedFiles.map((entry) => (
-                    <FileEntryRow
+                    <FileEntryRowAdapter
                       key={entry.path}
                       entry={entry}
                       displayFields={[]}
@@ -960,7 +948,7 @@ function SortVisibilityMenu({
   );
 }
 
-function FileEntryRow({
+function FileEntryRowAdapter({
   entry,
   displayFields,
   selected,
@@ -977,7 +965,7 @@ function FileEntryRow({
   onClick: () => void;
   onContextMenu: (event: React.MouseEvent) => void;
 }) {
-  const details: FileDetail[] = [
+  const details: DocumentDetail[] = [
     ...(detail ? [{ key: "detail", label: "Detail", value: detail, icon: Info }] : []),
     ...FILE_DISPLAY_FIELDS.filter((f) => displayFields.includes(f.key)).map((field) => {
       const value = displayFieldValue(entry, field.key) ?? "—";
@@ -989,156 +977,21 @@ function FileEntryRow({
         icon: FILE_DETAIL_ICONS[field.key],
         fullWidth: field.fullWidth,
         monospace: field.monospace ?? true,
+        hideWhenMissing: field.hideWhenMissing ?? false,
         conflictTooltip: metadataConflictTooltip(entry, field.key, value),
       };
     }),
   ];
-  const inlineDetails = details.filter((field) => !field.fullWidth);
-  const fullWidthDetails = details
-    .filter((field) => field.fullWidth)
-    .filter((field) => field.value.trim() !== "" && field.value !== "—");
-  const inlineDetailsRef = useRef<HTMLSpanElement>(null);
-  const [inlineDetailsExpanded, setInlineDetailsExpanded] = useState(false);
-  const [inlineDetailsOverflow, setInlineDetailsOverflow] = useState(false);
-  const inlineDetailsSignature = inlineDetails
-    .map((field) => `${field.key}:${field.value}:${field.valueTitle ?? ""}`)
-    .join("|");
-
-  useLayoutEffect(() => {
-    if (inlineDetailsExpanded) return;
-    const element = inlineDetailsRef.current;
-    if (!element) {
-      setInlineDetailsOverflow(false);
-      return;
-    }
-
-    const measure = () => {
-      setInlineDetailsOverflow(element.scrollWidth > element.clientWidth + 1);
-    };
-
-    measure();
-    const resizeObserver = new ResizeObserver(measure);
-    resizeObserver.observe(element);
-    return () => resizeObserver.disconnect();
-  }, [inlineDetailsExpanded, inlineDetailsSignature]);
-
-  useEffect(() => {
-    setInlineDetailsExpanded(false);
-  }, [entry.path, inlineDetailsSignature]);
 
   return (
-    <button
+    <DocumentEntryRow
+      entry={entry}
+      details={details}
+      selected={selected}
+      muted={muted}
       onClick={onClick}
       onContextMenu={onContextMenu}
-      className={`w-full flex select-none flex-col gap-1 px-3 py-1.5 text-left hover:bg-[var(--bg-hover)] transition-colors ${
-        selected ? "bg-[var(--bg-active)]" : ""
-      }`}
-    >
-      <span className="flex w-full min-w-0 items-center gap-1.5">
-        <span
-          className={`min-w-0 truncate text-sm font-medium ${
-            muted ? "text-[var(--text-muted)]" : "text-[var(--text-main)]"
-          }`}
-        >
-          {fileName(entry.path)}
-        </span>
-        <span className="min-w-0 flex-1" aria-hidden="true" />
-        {entry.file_type === "Pdf" && (
-          <Tooltip content="Type">
-            <span
-              className="inline-flex flex-shrink-0 items-center gap-1 text-xs font-mono tabular-nums text-[var(--accent-blue)]"
-              aria-label="Type"
-            >
-              <Tag size={11} aria-hidden="true" />
-              PDF
-            </span>
-          </Tooltip>
-        )}
-        <Tooltip content={entry.path} className="font-mono break-all">
-          <span
-            className="flex h-5 w-5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
-            aria-label={`Path: ${entry.path}`}
-          >
-            <Folder size={12} aria-hidden="true" />
-          </span>
-        </Tooltip>
-      </span>
-      {inlineDetails.length > 0 && (
-        <span className="flex w-full min-w-0 items-start gap-1.5 pl-0.5">
-          <span
-            ref={inlineDetailsRef}
-            className={`flex min-w-0 flex-1 items-center gap-x-2 gap-y-0.5 ${
-              inlineDetailsExpanded ? "flex-wrap" : "overflow-hidden whitespace-nowrap"
-            }`}
-          >
-            {inlineDetails.map((field) => (
-              <span key={field.key} className="inline-flex min-w-0 flex-shrink-0 items-center gap-1 text-xs">
-                <Tooltip content={field.label}>
-                  <span
-                    className="flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
-                    aria-label={field.label}
-                  >
-                    <field.icon size={11} aria-hidden="true" />
-                  </span>
-                </Tooltip>
-                <Tooltip content={field.conflictTooltip ?? field.valueTitle}>
-                  <span
-                    className={`min-w-0 truncate text-[var(--text-muted)] ${
-                      field.monospace ? "font-mono tabular-nums" : ""
-                    } ${field.key === "file-type" ? "text-[var(--accent-blue)]" : ""} ${
-                      field.conflictTooltip ? "underline decoration-wavy decoration-[var(--accent-blue)] underline-offset-2" : ""
-                    }`}
-                  >
-                    {field.value}
-                  </span>
-                </Tooltip>
-              </span>
-            ))}
-          </span>
-          {inlineDetailsOverflow && !inlineDetailsExpanded && (
-            <span
-              role="button"
-              tabIndex={0}
-              aria-label="Show hidden file details"
-              onClick={(event) => {
-                event.stopPropagation();
-                setInlineDetailsExpanded(true);
-              }}
-              onKeyDown={(event) => {
-                if (event.key !== "Enter" && event.key !== " ") return;
-                event.preventDefault();
-                event.stopPropagation();
-                setInlineDetailsExpanded(true);
-              }}
-              className="flex h-4 flex-shrink-0 items-center rounded border border-[var(--border-main)] px-1 text-[10px] leading-none text-[var(--text-dim)] hover:border-[var(--border-strong)] hover:text-[var(--text-muted)]"
-            >
-              ...
-            </span>
-          )}
-        </span>
-      )}
-      {fullWidthDetails.map((field) => (
-        <span key={field.key} className="flex w-full min-w-0 items-center gap-1.5 pl-0.5 text-xs">
-          <Tooltip content={field.label}>
-            <span
-              className="flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
-              aria-label={field.label}
-            >
-              <field.icon size={11} aria-hidden="true" />
-            </span>
-          </Tooltip>
-          <Tooltip content={field.conflictTooltip ?? field.valueTitle ?? field.value}>
-            <span
-              className={`min-w-0 flex-1 truncate text-[var(--text-muted)] ${
-                field.conflictTooltip ? "underline decoration-wavy decoration-[var(--accent-blue)] underline-offset-2" : ""
-              }`}
-            >
-              {field.value}
-            </span>
-          </Tooltip>
-        </span>
-      ))}
-    </button>
+    />
   );
 }
 
