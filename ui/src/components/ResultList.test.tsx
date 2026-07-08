@@ -390,6 +390,8 @@ describe("ResultList", () => {
               { source: "file", value: "Embedded Title" },
               { source: "zotero", value: "Zotero Title" },
               { source: "openalex", value: "Zotero Title" },
+              { source: "semantic_scholar", value: "Zotero Title" },
+              { source: "custom_source", value: "Zotero Title" },
             ],
             citation_count: [
               { source: "zotero", value: "9" },
@@ -407,8 +409,11 @@ describe("ResultList", () => {
     fireEvent.mouseEnter(title);
     expect(screen.getByRole("tooltip")).toHaveTextContent("Sources");
     expect(screen.getByRole("tooltip")).toHaveTextContent("File: Embedded Title");
-    expect(screen.getByRole("tooltip")).toHaveTextContent("Zotero, OpenAlex: Zotero Title");
+    expect(screen.getByRole("tooltip")).toHaveTextContent(
+      "Zotero, OpenAlex, Semantic Scholar, custom_source: Zotero Title",
+    );
     expect(screen.getByRole("tooltip").querySelectorAll(".grid")).toHaveLength(2);
+    expect(screen.getByText(/Zotero, OpenAlex/)).toHaveClass("break-words");
     fireEvent.mouseLeave(title);
     const citations = screen.getByText("12");
     expect(citations).toHaveClass("decoration-wavy");

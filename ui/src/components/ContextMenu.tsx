@@ -20,12 +20,14 @@ interface ContextMenuState<T> {
   position: ContextMenuPosition;
   target: T;
   items: ContextMenuItem[];
+  size?: "default" | "content";
 }
 
 interface OpenContextMenuArgs<T> {
   event: ReactMouseEvent;
   target: T;
   items: ContextMenuItem[];
+  size?: "default" | "content";
 }
 
 export function useContextMenu<T>() {
@@ -35,12 +37,13 @@ export function useContextMenu<T>() {
     setMenu(null);
   }, []);
 
-  const openMenu = useCallback(({ event, target, items }: OpenContextMenuArgs<T>) => {
+  const openMenu = useCallback(({ event, target, items, size = "default" }: OpenContextMenuArgs<T>) => {
     event.preventDefault();
     setMenu({
       position: { x: event.clientX, y: event.clientY },
       target,
       items,
+      size,
     });
   }, []);
 
@@ -117,7 +120,9 @@ export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
       <div
         ref={menuRef}
         role="menu"
-        className="fixed z-[150] min-w-44 rounded-lg border border-[var(--border-main)] bg-[var(--bg-app)] p-1 shadow-2xl"
+        className={`fixed z-[150] rounded-lg border border-[var(--border-main)] bg-[var(--bg-app)] p-1 shadow-2xl ${
+          menu.size === "content" ? "w-max min-w-max" : "min-w-44"
+        }`}
         style={{
           left: `${position?.x ?? menu.position.x}px`,
           top: `${position?.y ?? menu.position.y}px`,
@@ -127,6 +132,7 @@ export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
         {menu.items.map((item) => {
           const Icon = item.icon;
           const isPending = pendingId === item.id;
+          const showIconSlot = menu.size !== "content" || Icon || isPending;
           return (
             <button
               key={item.id}
@@ -158,18 +164,22 @@ export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
                     onClose();
                   });
               }}
-              className="flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-left text-xs text-[var(--text-main)] hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+              className={`flex w-full items-center rounded-md px-3 py-1.5 text-left text-xs text-[var(--text-main)] hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50 ${
+                showIconSlot ? "gap-2" : ""
+              }`}
             >
-              <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center text-[var(--text-muted)]">
-                {isPending ? (
-                  <span
-                    data-testid="context-menu-spinner"
-                    className="h-3 w-3 rounded-full border-2 border-[var(--text-muted)] border-t-transparent animate-spin"
-                  />
-                ) : (
-                  Icon && <Icon size={13} aria-hidden="true" />
-                )}
-              </span>
+              {showIconSlot && (
+                <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center text-[var(--text-muted)]">
+                  {isPending ? (
+                    <span
+                      data-testid="context-menu-spinner"
+                      className="h-3 w-3 rounded-full border-2 border-[var(--text-muted)] border-t-transparent animate-spin"
+                    />
+                  ) : (
+                    Icon && <Icon size={13} aria-hidden="true" />
+                  )}
+                </span>
+              )}
               <span className="truncate">{item.label}</span>
             </button>
           );

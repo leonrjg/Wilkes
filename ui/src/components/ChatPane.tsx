@@ -216,7 +216,7 @@ export default function ChatPane({ onClose }: Props) {
           <Tooltip content="Switch agent">
             <button
               type="button"
-              onClick={(e) => openMenu({ event: e, target: null, items: backendMenuItems })}
+              onClick={(e) => openMenu({ event: e, target: null, items: backendMenuItems, size: "content" })}
               className="h-7 max-w-[170px] flex items-center gap-1.5 px-1.5 text-xs rounded border border-transparent text-[var(--text-main)] hover:bg-[var(--bg-active)] hover:border-[var(--border-main)] min-w-0"
             >
               <span className={statusDotClassName(activeBackendStatus?.available ?? false)} />

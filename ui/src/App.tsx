@@ -233,6 +233,7 @@ export default function App() {
                 openChatBackendMenu({
                   event,
                   target: null,
+                  size: "content",
                   items: chatBackends.map((b) => ({
                     id: b.backend,
                     label: `${b.available ? "●" : "○"} ${b.label}${

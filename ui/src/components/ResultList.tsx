@@ -208,9 +208,13 @@ function metadataConflictTooltip(
       <div className="font-semibold text-[var(--text-main)]">Sources</div>
       <div className="mt-0.5 flex flex-col gap-1">
         {groupedValues.map((group) => (
-          <div key={group.value} className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5">
-            <span className={group.selected ? "text-[var(--accent-blue)]" : "text-[var(--text-dim)]"}>
-              {group.sources.join(", ")}:{"\u00a0"}
+          <div key={group.value} className="grid grid-cols-[minmax(7rem,0.45fr)_minmax(0,1fr)] gap-x-2 gap-y-0.5">
+            <span
+              className={`min-w-0 break-words ${
+                group.selected ? "text-[var(--accent-blue)]" : "text-[var(--text-dim)]"
+              }`}
+            >
+              {group.sources.join(", ")}
             </span>
             <span className="min-w-0 break-words text-[var(--text-main)]">
               {group.value}
