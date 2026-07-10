@@ -222,16 +222,16 @@ export class TauriSearchApi implements SearchApi {
     return invoke("cancel_embed");
   }
 
-  async getIndexStatus(): Promise<IndexStatus> {
-    return invoke<IndexStatus>("get_index_status");
+  async getIndexStatus(root?: string): Promise<IndexStatus> {
+    return invoke<IndexStatus>("get_index_status", { root: root ?? null });
   }
 
   async isSemanticReady(): Promise<boolean> {
     return invoke<boolean>("is_semantic_ready");
   }
 
-  async deleteIndex(): Promise<void> {
-    return invoke("delete_index");
+  async deleteIndex(root?: string): Promise<void> {
+    return invoke("delete_index", { root: root ?? null });
   }
 
   async onEmbedProgress(
@@ -276,5 +276,9 @@ export class TauriSourceApi implements DesktopSourceApi {
 
   async importDroppedFiles(paths: string[], root: string): Promise<string[]> {
     return invoke<string[]>("import_dropped_files", { paths, root });
+  }
+
+  async moveFile(path: string, targetRoot: string): Promise<string> {
+    return invoke<string>("move_file", { path, targetRoot });
   }
 }

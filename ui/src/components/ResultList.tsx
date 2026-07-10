@@ -32,7 +32,8 @@ import type {
   OmittedFileEntry,
   SourceOrigin,
 } from "../lib/types";
-import { api, isTauri } from "../services";
+import { api, isTauri, source } from "../services";
+import type { DesktopSourceApi } from "../services/api";
 import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileActions";
 import {
   formatDocumentFullDate,
@@ -63,6 +64,10 @@ function highlightMatch(contextBefore: string, matchedText: string, contextAfter
       <span className="text-[var(--text-muted)]">{contextAfter}</span>
     </>
   );
+}
+
+function dirName(path: string): string {
+  return path.replace(/[/\\][^/\\]*$/, "");
 }
 
 function editableNameEnd(name: string): number {
@@ -347,6 +352,9 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
   const setFileSortDirection = useSettingsStore((s) => s.setFileSortDirection);
   const fileDisplayFields = useSettingsStore((s) => s.fileDisplayFields);
   const toggleFileDisplayField = useSettingsStore((s) => s.toggleFileDisplayField);
+  const directory = useSettingsStore((s) => s.directory);
+  const favorites = useSettingsStore((s) => s.favorites);
+  const recentDirs = useSettingsStore((s) => s.recentDirs);
   const { menu, openMenu, closeMenu } = useContextMenu<ContextMenuTarget>();
 
   const parentRef = useRef<HTMLDivElement>(null);
@@ -356,6 +364,11 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
   const [expandedFiles, setExpandedFiles] = useState<Set<number>>(new Set());
   const [showOmittedFiles, setShowOmittedFiles] = useState(false);
   const [renameTarget, setRenameTarget] = useState<{ path: string; name: string } | null>(null);
+  const [moveTarget, setMoveTarget] = useState<{
+    path: string;
+    root: string;
+    roots: string[];
+  } | null>(null);
 
   useEffect(() => {
     if (results.length === 0) setExpandedFiles(new Set());
@@ -389,6 +402,9 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
     event: React.MouseEvent,
     target: ContextMenuTarget,
   ) => {
+    const otherRoots = Array.from(new Set([...favorites, ...recentDirs, directory])).filter(
+      (root) => root && root !== dirName(target.path),
+    );
     openMenu({
       event,
       target,
@@ -399,6 +415,9 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
         settings,
         onToast,
         onRenameRequest: (path) => setRenameTarget({ path, name: fileName(path) }),
+        availableRoots: otherRoots,
+        onMoveRequest: (path) =>
+          setMoveTarget({ path, root: otherRoots[0] ?? "", roots: otherRoots }),
       }),
     });
   };
@@ -436,6 +455,29 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
     } catch (error) {
       console.error("Failed to rename file:", error);
       onToast("Failed to rename file", "error");
+    }
+  };
+
+  const handleMoveSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!moveTarget || !moveTarget.root) return;
+
+    const oldPath = moveTarget.path;
+    try {
+      await (source as DesktopSourceApi).moveFile(oldPath, moveTarget.root);
+      if (selectedMatch?.path === oldPath) {
+        clearPreview();
+      }
+      if (hasQuery) {
+        await replaySearch();
+      } else {
+        refreshFileList();
+      }
+      setMoveTarget(null);
+      onToast("File moved", "success");
+    } catch (error) {
+      console.error("Failed to move file:", error);
+      onToast(error instanceof Error ? error.message : "Failed to move file", "error");
     }
   };
 
@@ -481,6 +523,51 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
             className="rounded bg-[var(--accent-blue)] px-3 py-1.5 text-xs font-medium text-white hover:opacity-90"
           >
             Rename
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+
+  const moveDialog = moveTarget && (
+    <div className="fixed inset-0 z-[160] flex items-center justify-center bg-black/35 px-4">
+      <form
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="move-file-title"
+        onSubmit={handleMoveSubmit}
+        className="w-full max-w-sm rounded-lg border border-[var(--border-main)] bg-[var(--bg-app)] p-3 shadow-2xl"
+      >
+        <div id="move-file-title" className="mb-2 text-sm font-semibold text-[var(--text-main)]">
+          Move "{fileName(moveTarget.path)}" to...
+        </div>
+        <select
+          aria-label="Destination directory"
+          value={moveTarget.root}
+          onChange={(event) =>
+            setMoveTarget((target) => (target ? { ...target, root: event.target.value } : target))
+          }
+          className="mb-3 h-8 w-full rounded border border-[var(--border-main)] bg-[var(--bg-active)] px-2 text-sm text-[var(--text-main)] outline-none focus:border-[var(--accent-blue)]"
+        >
+          {moveTarget.roots.map((root) => (
+            <option key={root} value={root}>
+              {root}
+            </option>
+          ))}
+        </select>
+        <div className="flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={() => setMoveTarget(null)}
+            className="rounded border border-[var(--border-main)] px-3 py-1.5 text-xs text-[var(--text-muted)] hover:bg-[var(--bg-hover)]"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            className="rounded bg-[var(--accent-blue)] px-3 py-1.5 text-xs font-medium text-white hover:opacity-90"
+          >
+            Move
           </button>
         </div>
       </form>
@@ -673,6 +760,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
         </div>
         <ContextMenu menu={menu} onClose={closeMenu} />
         {renameDialog}
+        {moveDialog}
       </div>
     );
   }
@@ -793,6 +881,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
       </div>
       <ContextMenu menu={menu} onClose={closeMenu} />
       {renameDialog}
+      {moveDialog}
     </div>
   );
 }

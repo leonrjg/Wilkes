@@ -6,7 +6,7 @@ import type { Settings } from "./types";
 import { isTauri } from "../services";
 import { useChatStore } from "../stores/useChatStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
-import { Copy, Edit2, ExternalLink, Folder, MessageSquare, RefreshCw } from "react-feather";
+import { Copy, Edit2, ExternalLink, Folder, FolderPlus, MessageSquare, RefreshCw } from "react-feather";
 
 export type ContextMenuTarget =
   | { kind: "file" | "match"; path: string; open: () => void }
@@ -23,6 +23,9 @@ interface BuildFileContextMenuItemsArgs {
   settings?: Settings | null;
   onToast: (message: string, type: "success" | "error") => void;
   onRenameRequest?: (path: string) => void;
+  /** Other known root directories the file could be moved into. */
+  availableRoots?: string[];
+  onMoveRequest?: (path: string) => void;
 }
 
 const menuContributors: MenuContributor[] = [zoteroMenuContributor];
@@ -34,6 +37,8 @@ export function buildFileContextMenuItems({
   settings,
   onToast,
   onRenameRequest,
+  availableRoots = [],
+  onMoveRequest,
 }: BuildFileContextMenuItemsArgs): ContextMenuItem[] {
   const items: ContextMenuItem[] = [
     {
@@ -65,6 +70,15 @@ export function buildFileContextMenuItems({
       icon: Edit2,
       run: () => onRenameRequest?.(target.path),
     });
+
+    if (isTauri && availableRoots.length > 0) {
+      items.push({
+        id: "move-to",
+        label: "Move to...",
+        icon: FolderPlus,
+        run: () => onMoveRequest?.(target.path),
+      });
+    }
 
     items.push({
       id: "refresh-metadata",

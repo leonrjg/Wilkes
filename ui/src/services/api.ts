@@ -87,9 +87,9 @@ export interface SearchApi {
   downloadModel(selected: SelectedEmbedder): Promise<void>;
   buildIndex(root: string, selected: SelectedEmbedder): Promise<void>;
   cancelEmbed(): Promise<void>;
-  getIndexStatus(): Promise<IndexStatus>;
+  getIndexStatus(root?: string): Promise<IndexStatus>;
   isSemanticReady(): Promise<boolean>;
-  deleteIndex(): Promise<void>;
+  deleteIndex(root?: string): Promise<void>;
 
   onEmbedProgress(handler: (progress: EmbedProgress) => void): Promise<() => void>;
   onEmbedDone(handler: (done: EmbedDone) => void): Promise<() => void>;
@@ -111,6 +111,7 @@ export interface DesktopSourceApi extends SourceApi {
   type: "desktop";
   pickDirectory(): Promise<string | null>;
   importDroppedFiles(paths: string[], root: string): Promise<string[]>;
+  moveFile(path: string, targetRoot: string): Promise<string>;
 }
 
 export interface WebSourceApi extends SourceApi {

@@ -400,13 +400,13 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   useEffect(() => {
     if (!settings) return;
     let cancelled = false;
-    api.getIndexStatus().then((idx) => {
+    api.getIndexStatus(directory).then((idx) => {
       if (!cancelled) dispatch({ type: "index_loaded", indexStatus: idx });
     }).catch(() => {
       if (!cancelled) dispatch({ type: "index_loaded", indexStatus: null });
     });
     return () => { cancelled = true; };
-  }, [api, effectiveSelected?.engine, effectiveSelected?.model, fetchEpoch]);
+  }, [api, directory, effectiveSelected?.engine, effectiveSelected?.model, fetchEpoch]);
 
   // ---------------------------------------------------------------------------
   // Effect: python info (only for SBERT)
@@ -453,7 +453,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
           else dispatch({ type: "op_done", operation: "Download" });
         } else if (done.operation === "Build") {
           Promise.all([
-            api.getIndexStatus().catch(() => null),
+            api.getIndexStatus(directory).catch(() => null),
             refreshSettings().catch(() => null),
           ]).then(([idx]) => {
             dispatch({
@@ -481,7 +481,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       mounted = false;
       unlisteners.forEach((u) => u());
     };
-  }, [api, invalidate, pendingBuild, refreshSemanticReady, refreshSettings]);
+  }, [api, directory, invalidate, pendingBuild, refreshSemanticReady, refreshSettings]);
 
   useEffect(() => {
     if (!buildRequest) return;
@@ -638,7 +638,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
         });
       });
     } else if (phase === "indexed") {
-      api.deleteIndex().then(() => {
+      api.deleteIndex(directory).then(() => {
         dispatch({ type: "index_deleted" });
         handleCurrentRootIndexRemoved().catch(console.error);
         refreshSemanticReady().catch(console.error);

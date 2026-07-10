@@ -655,6 +655,11 @@ struct ModelSizeQuery {
     model_id: String,
 }
 
+#[derive(Deserialize)]
+struct RootQuery {
+    root: Option<String>,
+}
+
 async fn get_model_size_handler(
     Query(params): Query<ModelSizeQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
@@ -666,10 +671,17 @@ async fn get_model_size_handler(
 
 async fn get_index_status_handler(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<RootQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     let status = state
         .ctx
-        .get_index_status()
+        .get_index_status(
+            params
+                .root
+                .as_deref()
+                .map(|root| confine_to_uploads(root, &state.uploads_dir))
+                .transpose()?,
+        )
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(status))
@@ -713,10 +725,17 @@ async fn build_index_handler(
 
 async fn delete_index_handler(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<RootQuery>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     state
         .ctx
-        .delete_index()
+        .delete_index(
+            params
+                .root
+                .as_deref()
+                .map(|root| confine_to_uploads(root, &state.uploads_dir))
+                .transpose()?,
+        )
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
@@ -1680,7 +1699,8 @@ mod tests {
             set_worker_timeout_handler(State(state.clone()), Json(TimeoutBody { secs: 10 })).await;
 
         // test get_index_status_handler (will fail but covers the handler)
-        let _ = get_index_status_handler(State(state.clone())).await;
+        let _ =
+            get_index_status_handler(State(state.clone()), Query(RootQuery { root: None })).await;
 
         // test cancel_embed_handler
         let _ = cancel_embed_handler(State(state.clone())).await;
@@ -1848,7 +1868,7 @@ mod tests {
         let _ = clear_logs_handler().await;
         let _ = get_data_paths_handler(State(state.clone())).await;
         let _ = is_semantic_ready_handler(State(state.clone())).await;
-        let _ = delete_index_handler(State(state.clone())).await;
+        let _ = delete_index_handler(State(state.clone()), Query(RootQuery { root: None })).await;
         let _ = download_model_handler(
             State(state.clone()),
             Json(DownloadBody {

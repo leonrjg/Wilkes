@@ -113,7 +113,7 @@ describe("TauriSearchApi", () => {
   it("should call get_index_status", async () => {
     (invoke as any).mockResolvedValue({ engine: "SBERT" });
     const status = await api.getIndexStatus();
-    expect(invoke).toHaveBeenCalledWith("get_index_status");
+    expect(invoke).toHaveBeenCalledWith("get_index_status", { root: null });
     expect(status).toEqual({ engine: "SBERT" });
   });
 
@@ -128,7 +128,7 @@ describe("TauriSearchApi", () => {
   it("should call delete_index", async () => {
     (invoke as any).mockResolvedValue(undefined);
     await api.deleteIndex();
-    expect(invoke).toHaveBeenCalledWith("delete_index");
+    expect(invoke).toHaveBeenCalledWith("delete_index", { root: null });
   });
 
   it("should call get_worker_status", async () => {

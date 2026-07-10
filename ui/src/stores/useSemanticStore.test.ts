@@ -299,25 +299,67 @@ describe("useSemanticStore", () => {
       status: "building",
     } as any);
     (api.getIndexStatus as any).mockResolvedValue({
-      indexed_files: 5,
-      total_chunks: 10,
+      indexed_files: 0,
+      total_chunks: 0,
       built_at: null,
       build_duration_ms: null,
       engine: "SBERT",
       model_id: "intfloat/e5-small-v2",
       dimension: 384,
-      root_path: "/old-root",
+      root_path: "/new-root",
       db_size_bytes: null,
     });
 
     await useSemanticStore.getState().handleIndexUpdated();
 
     expect(useSemanticStore.getState().readyForCurrentRoot).toBe(false);
-    expect(useSemanticStore.getState().buildRoot).toBe("/new-root");
+    expect(useSemanticStore.getState().buildRoot).toBe("/old-root");
+    expect(replaySearch).not.toHaveBeenCalled();
+  });
+
+  it("clears current build root when the completed index is still unusable", async () => {
+    const replaySearch = vi.fn().mockResolvedValue(undefined);
+    useSearchStore.setState({ replaySearch } as any);
+    useSettingsStore.setState({
+      directory: "/project",
+      preferSemantic: true,
+    } as any);
+    useSemanticStore.setState({
+      buildRoot: "/project",
+      status: "building",
+    } as any);
+    (api.getIndexStatus as any).mockResolvedValue({
+      indexed_files: 0,
+      total_chunks: 0,
+      built_at: null,
+      build_duration_ms: null,
+      engine: "SBERT",
+      model_id: "intfloat/e5-small-v2",
+      dimension: 384,
+      root_path: "/project",
+      db_size_bytes: null,
+    });
+
+    await useSemanticStore.getState().handleIndexUpdated();
+
+    expect(useSemanticStore.getState().readyForCurrentRoot).toBe(false);
+    expect(useSemanticStore.getState().buildRoot).toBeNull();
+    expect(useSemanticStore.getState().status).toBe("missing");
     expect(replaySearch).not.toHaveBeenCalled();
   });
 
   it("clears stale semantic results when the current root index is removed", async () => {
+    (api.getIndexStatus as any).mockResolvedValue({
+      indexed_files: 0,
+      total_chunks: 0,
+      built_at: null,
+      build_duration_ms: null,
+      engine: "SBERT",
+      model_id: "intfloat/e5-small-v2",
+      dimension: 384,
+      root_path: "/project",
+      db_size_bytes: null,
+    });
     useSettingsStore.setState({ directory: "/project" } as any);
     useSearchStore.setState({
       lastQuery: { pattern: "hello", mode: "Semantic", root: "/project" } as any,

@@ -407,14 +407,16 @@ export class HttpSearchApi implements SearchApi {
     if (!res.ok && res.status !== 204) throw new Error(`cancelEmbed failed: ${res.status}`);
   }
 
-  async getIndexStatus(): Promise<IndexStatus> {
-    const res = await fetch("/api/embed/status");
+  async getIndexStatus(root?: string): Promise<IndexStatus> {
+    const query = root ? `?root=${encodeURIComponent(root)}` : "";
+    const res = await fetch(`/api/embed/status${query}`);
     if (!res.ok) throw new Error(`getIndexStatus failed: ${res.status}`);
     return res.json() as Promise<IndexStatus>;
   }
 
-  async deleteIndex(): Promise<void> {
-    const res = await fetch("/api/embed/index", { method: "DELETE" });
+  async deleteIndex(root?: string): Promise<void> {
+    const query = root ? `?root=${encodeURIComponent(root)}` : "";
+    const res = await fetch(`/api/embed/index${query}`, { method: "DELETE" });
     if (!res.ok && res.status !== 204) throw new Error(`deleteIndex failed: ${res.status}`);
   }
 

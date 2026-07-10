@@ -75,6 +75,22 @@ async fn move_files_into_current_root_for_ctx(
         .map_err(|e| e.to_string())
 }
 
+async fn move_file_to_root_for_ctx(
+    ctx: Arc<AppContext>,
+    path: String,
+    target_root: String,
+) -> Result<String, String> {
+    let supported_extensions = ctx.get_settings().await.supported_extensions;
+    wilkes_api::commands::files::move_files_into_root(
+        vec![path.into()],
+        target_root.into(),
+        supported_extensions,
+    )
+    .await
+    .map(|mut moved| moved.pop().unwrap_or_default().display().to_string())
+    .map_err(|e| e.to_string())
+}
+
 async fn get_file_metadata_for_path(
     ctx: Arc<AppContext>,
     path: String,
@@ -223,12 +239,19 @@ async fn cancel_embed_for_ctx(ctx: Arc<AppContext>) -> Result<(), String> {
     Ok(())
 }
 
-async fn get_index_status_for_ctx(ctx: Arc<AppContext>) -> Result<IndexStatus, String> {
-    ctx.get_index_status().await.map_err(|e| e.to_string())
+async fn get_index_status_for_ctx(
+    ctx: Arc<AppContext>,
+    root: Option<String>,
+) -> Result<IndexStatus, String> {
+    ctx.get_index_status(root.map(Into::into))
+        .await
+        .map_err(|e| e.to_string())
 }
 
-async fn delete_index_for_ctx(ctx: Arc<AppContext>) -> Result<(), String> {
-    ctx.delete_index().await.map_err(|e| e.to_string())
+async fn delete_index_for_ctx(ctx: Arc<AppContext>, root: Option<String>) -> Result<(), String> {
+    ctx.delete_index(root.map(Into::into))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 fn get_worker_status_for_ctx(ctx: Arc<AppContext>) -> WorkerStatus {
@@ -1000,6 +1023,11 @@ async fn import_dropped_files(
 }
 
 #[tauri::command]
+async fn move_file(path: String, target_root: String, app: AppHandle) -> Result<String, String> {
+    move_file_to_root_for_ctx(app_context(&app), path, target_root).await
+}
+
+#[tauri::command]
 async fn get_file_metadata(path: String, app: AppHandle) -> Result<DocumentMetadata, String> {
     get_file_metadata_for_path(app_context(&app), path).await
 }
@@ -1148,13 +1176,13 @@ async fn cancel_embed(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn get_index_status(app: AppHandle) -> Result<IndexStatus, String> {
-    get_index_status_for_ctx(app_context(&app)).await
+async fn get_index_status(app: AppHandle, root: Option<String>) -> Result<IndexStatus, String> {
+    get_index_status_for_ctx(app_context(&app), root).await
 }
 
 #[tauri::command]
-async fn delete_index(app: AppHandle) -> Result<(), String> {
-    delete_index_for_ctx(app_context(&app)).await
+async fn delete_index(app: AppHandle, root: Option<String>) -> Result<(), String> {
+    delete_index_for_ctx(app_context(&app), root).await
 }
 
 #[tauri::command]
@@ -1213,6 +1241,7 @@ pub fn run() {
             open_file,
             rename_file,
             import_dropped_files,
+            move_file,
             get_file_metadata,
             get_python_info,
             get_supported_engines,
@@ -1460,14 +1489,14 @@ mod tests {
         let db_path = ctx.data_dir.join("semantic_index.db");
         std::fs::write(&db_path, "fake db").unwrap();
 
-        delete_index_for_ctx(Arc::clone(&ctx)).await.unwrap();
+        delete_index_for_ctx(Arc::clone(&ctx), None).await.unwrap();
         assert!(!db_path.exists());
     }
 
     #[tokio::test]
     async fn test_get_index_status_for_ctx_missing() {
         let (_dir, ctx) = test_ctx();
-        let result = get_index_status_for_ctx(ctx).await;
+        let result = get_index_status_for_ctx(ctx, None).await;
         assert!(result.is_err());
     }
 

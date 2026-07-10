@@ -51,7 +51,7 @@ export const useSemanticStore = create<SemanticStore>((set, get) => ({
     }));
 
     try {
-      const indexStatus = await api.getIndexStatus();
+      const indexStatus = await api.getIndexStatus(directory);
       const ready = isUsableSemanticIndex(indexStatus, directory);
       set((state) => ({
         indexStatus,
@@ -128,7 +128,7 @@ export const useSemanticStore = create<SemanticStore>((set, get) => ({
     const ready = await get().refreshCurrentRootStatus();
 
     if (!directory || buildRoot === directory || ready) {
-      set({ buildRoot: null });
+      set({ buildRoot: null, status: ready ? "ready" : directory ? "missing" : "idle" });
     }
 
     if (ready) {

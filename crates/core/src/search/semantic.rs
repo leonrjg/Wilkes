@@ -77,7 +77,7 @@ impl SearchProvider for SemanticSearchProvider {
 
         let top_k = query.max_results;
         let scope = match &query.scope {
-            SearchScope::Corpus => SemanticQueryScope::Corpus,
+            SearchScope::Corpus => SemanticQueryScope::Root(&query.root),
             SearchScope::File { path } => SemanticQueryScope::File(path),
         };
         let results = idx.query_scoped(&query_vec, top_k, scope)?;

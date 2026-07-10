@@ -113,7 +113,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
 
     if (lastQuery.mode === "Semantic") {
       try {
-        const indexStatus = await api.getIndexStatus();
+        const indexStatus = await api.getIndexStatus(lastQuery.root);
         const usable = isUsableSemanticIndex(indexStatus, lastQuery.root);
         if (!usable) return;
       } catch {

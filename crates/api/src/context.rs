@@ -135,11 +135,6 @@ enum RestoreStatePreparation {
     },
 }
 
-enum SemanticRootPolicy {
-    AllowCorpusAndTriggerReindex,
-    RequireCurrentRoot,
-}
-
 struct SemanticRuntime {
     embedder: Arc<dyn Embedder>,
     index: Arc<Mutex<Option<SemanticIndex>>>,
@@ -786,10 +781,6 @@ impl AppContext {
         }
     }
 
-    fn prepare_for_full_rebuild(&self) {
-        *self.index.lock() = Arc::new(Mutex::new(None));
-    }
-
     fn start_directory_watcher(self: &Arc<Self>, root: PathBuf) {
         self.stop_directory_watcher();
         if !root.exists() || !root.is_dir() {
@@ -845,6 +836,17 @@ impl AppContext {
         if !has_index {
             return;
         }
+        if let Ok(mut guard) = index_arc.lock() {
+            if let Some(idx) = guard.as_mut() {
+                if let Err(e) = idx.activate_root(&batch.root) {
+                    error!(
+                        "activate semantic update root {}: {e:#}",
+                        batch.root.display()
+                    );
+                    return;
+                }
+            }
+        }
 
         let mut registry = ExtractorRegistry::new();
         registry.register(Box::new(PdfExtractor::new()));
@@ -854,16 +856,23 @@ impl AppContext {
         let ev1 = Arc::clone(&self.events);
         let ev2 = Arc::clone(&self.events);
 
-        process_directory_change(
-            batch,
-            &index_arc,
-            &cache,
-            &registry,
-            &embedder,
-            &config,
-            &move || ev1.emit("manager-event", serde_json::json!("Reindexing")),
-            &move || ev2.emit("manager-event", serde_json::json!("ReindexingDone")),
-        );
+        let result = tokio::task::spawn_blocking(move || {
+            process_directory_change(
+                batch,
+                &index_arc,
+                &cache,
+                &registry,
+                &embedder,
+                &config,
+                &move || ev1.emit("manager-event", serde_json::json!("Reindexing")),
+                &move || ev2.emit("manager-event", serde_json::json!("ReindexingDone")),
+            );
+        })
+        .await;
+
+        if let Err(err) = result {
+            error!("process_directory_change_for_semantic task panicked: {err}");
+        }
     }
 
     fn embed_task_is_running(&self) -> bool {
@@ -1243,7 +1252,6 @@ impl AppContext {
         self: &Arc<Self>,
         root: &Path,
         settings: &Settings,
-        root_policy: SemanticRootPolicy,
     ) -> Result<SemanticRuntime, String> {
         self.ensure_no_active_embed_task("Semantic index is currently being built. Please wait.")?;
 
@@ -1255,29 +1263,27 @@ impl AppContext {
         let index_arc = self.index.lock().clone();
         let query_root_canonical =
             std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let root_mismatch = {
+        let root_ready = {
             let guard = index_arc.lock().unwrap_or_else(|p| p.into_inner());
             match guard.as_ref() {
-                Some(idx) => match idx.status().root_path {
-                    Some(p) => std::fs::canonicalize(&p).unwrap_or(p) != query_root_canonical,
-                    None => true,
-                },
-                None => true,
+                Some(idx) => {
+                    let status = idx.status_for_root(Some(&query_root_canonical));
+                    status.indexed_files > 0 && status.total_chunks > 0
+                }
+                None => false,
             }
         };
 
-        if root_mismatch {
+        if !root_ready {
             self.request_semantic_reindex_for_root(
                 &index_arc,
                 Arc::clone(&embedder),
                 &query_root_canonical,
             );
-            if matches!(root_policy, SemanticRootPolicy::RequireCurrentRoot) {
-                return Err(format!(
-                    "Semantic index is not ready for search root {}. Reindexing has been requested; please try again when indexing finishes.",
-                    root.display()
-                ));
-            }
+            return Err(format!(
+                "Semantic index is not ready for search root {}. Indexing has been requested; please try again when indexing finishes.",
+                root.display()
+            ));
         }
 
         Ok(SemanticRuntime {
@@ -1340,13 +1346,8 @@ impl AppContext {
 
         let mut semantic_indexing = None;
         let (embedder, index) = if query.mode == SearchMode::Semantic {
-            let policy = if matches!(query.scope, SearchScope::File { .. }) {
-                SemanticRootPolicy::RequireCurrentRoot
-            } else {
-                SemanticRootPolicy::AllowCorpusAndTriggerReindex
-            };
             let runtime = self
-                .prepare_semantic_runtime(&query.root, &settings, policy)
+                .prepare_semantic_runtime(&query.root, &settings)
                 .await?;
             semantic_indexing = Some(runtime.indexing);
             (Some(runtime.embedder), Some(runtime.index))
@@ -1373,11 +1374,7 @@ impl AppContext {
             "Related documents",
         )?;
         let runtime = self
-            .prepare_semantic_runtime(
-                &query.root,
-                &settings,
-                SemanticRootPolicy::RequireCurrentRoot,
-            )
+            .prepare_semantic_runtime(&query.root, &settings)
             .await?;
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let supported_extensions = settings.supported_extensions.clone();
@@ -1387,7 +1384,7 @@ impl AppContext {
             let idx = guard
                 .as_ref()
                 .ok_or_else(|| "No semantic index found. Build the index first.".to_string())?;
-            idx.related_documents(&source_path, limit, &supported_extensions)
+            idx.related_documents(&query.root, &source_path, limit, &supported_extensions)
                 .map_err(|e| e.to_string())
         })
         .await
@@ -1419,7 +1416,6 @@ impl AppContext {
             }
         };
 
-        self.prepare_for_full_rebuild();
         self.events
             .emit("manager-event", serde_json::json!("Reindexing"));
 
@@ -1594,9 +1590,12 @@ impl AppContext {
     ) -> Result<(), String> {
         let dim = embedder.dimension();
         let model_id = selected.model.model_id().to_string();
-        let index = self
+        let mut index = self
             .open_built_index(data_dir.to_path_buf(), model_id, dim)
             .await?;
+        index
+            .activate_root(&plan.root_path)
+            .map_err(|e| e.to_string())?;
         let actual_dim = index.status().dimension;
         let index_arc = Arc::new(Mutex::new(Some(index)));
 
@@ -1883,20 +1882,30 @@ impl AppContext {
         self.kill_worker();
     }
 
-    pub async fn delete_index(&self) -> anyhow::Result<()> {
-        *self.index.lock() = Arc::new(Mutex::new(None));
-        *self.embedder.lock() = None;
-        crate::commands::embed::delete_index(&self.data_dir).await?;
-        self.update_semantic_settings(|s| SemanticSettings {
-            index_path: None,
-            ..s
-        })
-        .await;
+    pub async fn delete_index(&self, root: Option<PathBuf>) -> anyhow::Result<()> {
+        if let Some(root) = root {
+            crate::commands::embed::delete_index(&self.data_dir, Some(root.clone())).await?;
+            let index_arc = self.index.lock().clone();
+            if let Ok(mut guard) = index_arc.lock() {
+                if let Some(idx) = guard.as_mut() {
+                    let _ = idx.delete_root(&root);
+                }
+            };
+        } else {
+            *self.index.lock() = Arc::new(Mutex::new(None));
+            *self.embedder.lock() = None;
+            crate::commands::embed::delete_index(&self.data_dir, None).await?;
+            self.update_semantic_settings(|s| SemanticSettings {
+                index_path: None,
+                ..s
+            })
+            .await;
+        }
         Ok(())
     }
 
-    pub async fn get_index_status(&self) -> anyhow::Result<IndexStatus> {
-        crate::commands::embed::get_index_status(&self.data_dir).await
+    pub async fn get_index_status(&self, root: Option<PathBuf>) -> anyhow::Result<IndexStatus> {
+        crate::commands::embed::get_index_status(&self.data_dir, root).await
     }
 
     // ── Worker management ─────────────────────────────────────────────────────
@@ -3693,44 +3702,6 @@ exit 0
     }
 
     #[tokio::test]
-    async fn test_prepare_for_full_rebuild_keeps_directory_watcher_and_drops_resident_index() {
-        let dir = tempdir().unwrap();
-        let emitter = Arc::new(MockEmitter {
-            events: Arc::new(Mutex::new(Vec::new())),
-        });
-        let (ctx, _rx, _loop) = AppContext::new(
-            dir.path().to_path_buf(),
-            dir.path().join("settings.json"),
-            WorkerPaths {
-                python_path: PathBuf::from("p"),
-                python_package_dir: PathBuf::from("pkg"),
-                requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
-                worker_bin: PathBuf::from("w"),
-                data_dir: dir.path().to_path_buf(),
-            },
-            emitter,
-        );
-
-        let index = SemanticIndex::create(
-            &ctx.data_dir,
-            "rebuild-model",
-            384,
-            EmbeddingEngine::Candle,
-            Some(dir.path()),
-        )
-        .unwrap();
-        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
-
-        ctx.start_directory_watcher(dir.path().to_path_buf());
-
-        ctx.prepare_for_full_rebuild();
-
-        assert!(ctx.directory_watcher.lock().is_some());
-        assert!(ctx.index.lock().lock().unwrap().is_none());
-    }
-
-    #[tokio::test]
     async fn test_is_semantic_ready() {
         let dir = tempdir().unwrap();
         let emitter = Arc::new(MockEmitter {
@@ -3924,7 +3895,7 @@ exit 0
         );
 
         std::fs::write(data_dir.join("semantic_index.db"), "fake db").unwrap();
-        let res = ctx.delete_index().await;
+        let res = ctx.delete_index(None).await;
         assert!(res.is_ok());
     }
 
@@ -3948,7 +3919,7 @@ exit 0
             emitter,
         );
 
-        let res = ctx.get_index_status().await;
+        let res = ctx.get_index_status(None).await;
         assert!(res.is_err()); // No index exists
     }
 
@@ -4989,7 +4960,7 @@ exit 0
         )
         .unwrap();
 
-        ctx.delete_index().await.unwrap();
+        ctx.delete_index(None).await.unwrap();
         assert!(!data_dir.join("semantic_index.db").exists());
 
         let settings = ctx.get_settings().await;
@@ -5015,7 +4986,7 @@ exit 0
             }),
         );
 
-        let res = ctx.get_index_status().await;
+        let res = ctx.get_index_status(None).await;
         assert!(res.is_err());
     }
 
@@ -5315,10 +5286,10 @@ exit 0
         let index_path = data_dir.join("semantic_index.db");
         assert!(index_path.exists());
 
-        let status = ctx.get_index_status().await.unwrap();
+        let status = ctx.get_index_status(None).await.unwrap();
         assert_eq!(status.model_id, "test-model");
 
-        ctx.delete_index().await.unwrap();
+        ctx.delete_index(None).await.unwrap();
         assert!(!index_path.exists());
     }
 

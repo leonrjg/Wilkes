@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use ignore::WalkBuilder;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use tracing::error;
 
 use crate::extract::ExtractorRegistry;
@@ -48,11 +48,13 @@ fn db_path(data_dir: &Path) -> PathBuf {
 }
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 fn configure_connection(conn: &Connection, path: &Path) -> anyhow::Result<()> {
     conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
         .with_context(|| format!("Failed to configure busy timeout for {}", path.display()))?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .with_context(|| format!("Failed to enable foreign keys for {}", path.display()))?;
     Ok(())
 }
 
@@ -107,6 +109,22 @@ mod tests {
         }
     }
 
+    fn canon(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    fn test_chunk(path: &Path, text: &str) -> Chunk {
+        Chunk {
+            file_path: path.to_path_buf(),
+            text: text.to_string(),
+            byte_range: ByteRange {
+                start: 0,
+                end: text.len(),
+            },
+            origin: SourceOrigin::TextFile { line: 1, col: 1 },
+        }
+    }
+
     #[test]
     fn test_db_path() {
         let p = db_path(Path::new("/tmp/data"));
@@ -131,10 +149,9 @@ mod tests {
 
         let index = SemanticIndex {
             conn,
-            model_id: "test-model".to_string(),
             dimension: 128,
-            root_path: None,
-            root_canonical_path: None,
+            active_root: None,
+            active_root_id: None,
         };
 
         let status = index.status();
@@ -247,16 +264,17 @@ mod tests {
 
         // Create
         let idx = SemanticIndex::create(dir.path(), model, dim, engine, Some(root)).unwrap();
-        assert_eq!(idx.model_id, model);
+        assert_eq!(idx.status().model_id, model);
         assert_eq!(idx.dimension, dim);
-        assert_eq!(idx.root_path, Some(root.to_path_buf()));
+        assert!(idx.active_root.is_some());
+        assert!(idx.active_root_id.is_some());
         drop(idx);
 
         // Open
         let idx2 = SemanticIndex::open(dir.path(), model, dim).unwrap();
-        assert_eq!(idx2.model_id, model);
+        assert_eq!(idx2.status().model_id, model);
         assert_eq!(idx2.dimension, dim);
-        assert_eq!(idx2.root_path, Some(root.to_path_buf()));
+        assert!(idx2.active_root.is_none());
     }
 
     #[test]
@@ -358,7 +376,7 @@ mod tests {
         // The chunk (and its embedding) survives the rename and is queryable.
         let results = idx.query(&[1.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].file_path, new);
+        assert_eq!(results[0].file_path, canon(&new));
 
         // It is keyed under the new path only: removing the old path is a no-op,
         // removing the new path clears it.
@@ -461,19 +479,18 @@ mod tests {
         let root = dir.path();
         let index = SemanticIndex {
             conn: Connection::open_in_memory().unwrap(),
-            model_id: "m".to_string(),
             dimension: 1,
-            root_path: Some(root.to_path_buf()),
-            root_canonical_path: Some(std::fs::canonicalize(root).unwrap()),
+            active_root: None,
+            active_root_id: None,
         };
 
         let abs = root.join("subdir/file.txt");
         std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
         std::fs::write(&abs, "hello").unwrap();
         let rel = index.path_key_for_existing_path(&abs);
-        assert_eq!(rel, Path::new("subdir/file.txt"));
+        assert_eq!(rel, canon(&abs));
 
-        let abs2 = index.key_to_display_path("subdir/file.txt");
+        let abs2 = index.key_to_display_path(&abs.to_string_lossy());
         assert_eq!(abs2, abs);
 
         // Path outside root
@@ -566,13 +583,13 @@ mod tests {
 
         let global = idx.query(&[1.0, 0.0], 1).unwrap();
         assert_eq!(global.len(), 1);
-        assert_eq!(global[0].file_path, other_path);
+        assert_eq!(global[0].file_path, canon(&other_path));
 
         let scoped = idx
             .query_scoped(&[1.0, 0.0], 1, SemanticQueryScope::File(&scoped_path))
             .unwrap();
         assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].file_path, scoped_path);
+        assert_eq!(scoped[0].file_path, canon(&scoped_path));
         assert_eq!(scoped[0].chunk_text, "scoped chunk");
     }
 
@@ -625,7 +642,7 @@ mod tests {
         .unwrap();
 
         let related = idx
-            .related_documents(&source, 10, &["txt".to_string()])
+            .related_documents(root, &source, 10, &["txt".to_string()])
             .unwrap();
 
         assert_eq!(
@@ -633,7 +650,7 @@ mod tests {
                 .iter()
                 .map(|doc| doc.path.clone())
                 .collect::<Vec<_>>(),
-            vec![close, far]
+            vec![canon(&close), canon(&far)]
         );
         assert!(related[0].score > related[1].score);
         assert_eq!(related[0].indexed_chunks, 1);
@@ -648,7 +665,7 @@ mod tests {
         fs::write(&source, "content").unwrap();
 
         let err = idx
-            .related_documents(&source, 10, &["txt".to_string()])
+            .related_documents(root, &source, 10, &["txt".to_string()])
             .unwrap_err();
 
         assert!(err.to_string().contains("not present"));
@@ -719,7 +736,7 @@ mod tests {
 
         let results = idx.query(&[1.0], 1).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].file_path, path);
+        assert_eq!(results[0].file_path, canon(&path));
         assert_eq!(results[0].chunk_text, "new content");
     }
 
@@ -761,7 +778,7 @@ mod tests {
 
         let results = idx.query(&[1.0], 1).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].file_path, new);
+        assert_eq!(results[0].file_path, canon(&new));
         assert_eq!(idx.status().indexed_files, 1);
     }
 
@@ -839,7 +856,7 @@ mod tests {
 
         let results = idx.query(&[1.0], 1).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].file_path, path);
+        assert_eq!(results[0].file_path, canon(&path));
         assert_eq!(results[0].chunk_text, "changed content");
     }
 
@@ -897,6 +914,195 @@ mod tests {
             progress_count += 1;
         }
         assert!(progress_count >= 2);
+    }
+
+    #[test]
+    fn test_build_second_root_preserves_first_root() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let root_a = dir.path().join("a");
+        let root_b = dir.path().join("b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+        fs::write(root_a.join("a.txt"), "alpha").unwrap();
+        fs::write(root_b.join("b.txt"), "beta").unwrap();
+
+        let registry = ExtractorRegistry::new();
+        let embedder = CountingEmbedder::new();
+        let indexing = txt_indexing();
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+
+        SemanticIndex::build(
+            &data_dir,
+            &root_a,
+            &[root_a.join("a.txt")],
+            &registry,
+            &embedder,
+            tx.clone(),
+            Arc::new(AtomicBool::new(false)),
+            &indexing,
+        )
+        .unwrap();
+        let idx = SemanticIndex::build(
+            &data_dir,
+            &root_b,
+            &[root_b.join("b.txt")],
+            &registry,
+            &embedder,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            &indexing,
+        )
+        .unwrap();
+
+        assert_eq!(idx.status().indexed_files, 2);
+        assert_eq!(idx.status_for_root(Some(&root_a)).indexed_files, 1);
+        assert_eq!(idx.status_for_root(Some(&root_b)).indexed_files, 1);
+    }
+
+    #[test]
+    fn test_overlapping_roots_share_file_rows_but_keep_root_coverage() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let shared = nested.join("shared.txt");
+        fs::write(&shared, "shared").unwrap();
+
+        let registry = ExtractorRegistry::new();
+        let embedder = CountingEmbedder::new();
+        let indexing = txt_indexing();
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+
+        let idx = SemanticIndex::build(
+            dir.path(),
+            &root,
+            std::slice::from_ref(&shared),
+            &registry,
+            &embedder,
+            tx.clone(),
+            Arc::new(AtomicBool::new(false)),
+            &indexing,
+        )
+        .unwrap();
+        assert_eq!(idx.status().indexed_files, 1);
+
+        let mut idx = SemanticIndex::build(
+            dir.path(),
+            &nested,
+            std::slice::from_ref(&shared),
+            &registry,
+            &embedder,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            &indexing,
+        )
+        .unwrap();
+
+        assert_eq!(idx.status().indexed_files, 1);
+        assert_eq!(idx.status_for_root(Some(&root)).indexed_files, 1);
+        assert_eq!(idx.status_for_root(Some(&nested)).indexed_files, 1);
+
+        idx.delete_root(&nested).unwrap();
+        assert_eq!(idx.status().indexed_files, 1);
+        assert_eq!(idx.status_for_root(Some(&root)).indexed_files, 1);
+        assert_eq!(idx.status_for_root(Some(&nested)).indexed_files, 0);
+    }
+
+    #[test]
+    fn test_root_query_is_scoped_by_root_files() {
+        let dir = tempdir().unwrap();
+        let root_a = dir.path().join("a");
+        let root_b = dir.path().join("b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+        let a = root_a.join("a.txt");
+        let b = root_b.join("b.txt");
+        fs::write(&a, "alpha").unwrap();
+        fs::write(&b, "beta").unwrap();
+
+        let mut idx =
+            SemanticIndex::create(dir.path(), "m", 2, EmbeddingEngine::Candle, Some(&root_a))
+                .unwrap();
+        idx.write_file(PreparedFile {
+            path: a.clone(),
+            chunks: vec![(
+                test_chunk(&a, "close outside requested root"),
+                vec![1.0, 0.0],
+            )],
+        })
+        .unwrap();
+        idx.activate_root(&root_b).unwrap();
+        idx.write_file(PreparedFile {
+            path: b.clone(),
+            chunks: vec![(test_chunk(&b, "inside requested root"), vec![0.5, 0.5])],
+        })
+        .unwrap();
+
+        let root_results = idx
+            .query_scoped(&[1.0, 0.0], 10, SemanticQueryScope::Root(&root_b))
+            .unwrap();
+        assert_eq!(root_results.len(), 1);
+        assert_eq!(root_results[0].file_path, canon(&b));
+
+        let corpus_results = idx.query(&[1.0, 0.0], 1).unwrap();
+        assert_eq!(corpus_results[0].file_path, canon(&a));
+    }
+
+    #[test]
+    fn test_cancelled_build_preserves_existing_root_coverage() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("doc.txt");
+        fs::write(&path, "old content").unwrap();
+
+        let registry = ExtractorRegistry::new();
+        let embedder = CountingEmbedder::new();
+        let indexing = txt_indexing();
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+
+        let mut idx = SemanticIndex::create(
+            &data_dir,
+            "counting",
+            1,
+            EmbeddingEngine::Candle,
+            Some(&root),
+        )
+        .unwrap();
+        idx.write_file(PreparedFile {
+            path: path.clone(),
+            chunks: vec![(test_chunk(&path, "old content"), vec![1.0])],
+        })
+        .unwrap();
+        drop(idx);
+
+        fs::write(&path, "new content").unwrap();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let result = SemanticIndex::build(
+            &data_dir,
+            &root,
+            std::slice::from_ref(&path),
+            &registry,
+            &embedder,
+            tx,
+            cancelled,
+            &indexing,
+        );
+        let err = match result {
+            Ok(_) => panic!("expected cancelled build to fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("cancelled"));
+
+        let idx = SemanticIndex::open(&data_dir, "counting", 1).unwrap();
+        assert_eq!(idx.status_for_root(Some(&root)).indexed_files, 1);
+        let results = idx
+            .query_scoped(&[1.0], 1, SemanticQueryScope::Root(&root))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk_text, "old content");
     }
 
     #[test]
@@ -1033,6 +1239,7 @@ struct IndexedFileRecord {
 
 pub enum SemanticQueryScope<'a> {
     Corpus,
+    Root(&'a Path),
     File(&'a Path),
 }
 
@@ -1040,10 +1247,9 @@ pub enum SemanticQueryScope<'a> {
 
 pub struct SemanticIndex {
     conn: Connection,
-    model_id: String,
     dimension: usize,
-    root_path: Option<PathBuf>,
-    root_canonical_path: Option<PathBuf>,
+    active_root: Option<PathBuf>,
+    active_root_id: Option<i64>,
 }
 
 impl SemanticIndex {
@@ -1102,7 +1308,7 @@ impl SemanticIndex {
             "Index uses legacy schema (no files table); rebuild the index"
         );
 
-        let schema_version: i64 = conn
+        let mut schema_version: i64 = conn
             .query_row(
                 "SELECT value FROM meta WHERE key = 'schema_version'",
                 [],
@@ -1112,6 +1318,10 @@ impl SemanticIndex {
                 },
             )
             .unwrap_or(0);
+        if schema_version == 2 {
+            Self::migrate_v2_to_v3(&conn)?;
+            schema_version = SCHEMA_VERSION;
+        }
         anyhow::ensure!(
             schema_version == SCHEMA_VERSION,
             "Index schema version {} is not supported (expected {}); rebuild the index",
@@ -1150,37 +1360,60 @@ impl SemanticIndex {
             expected_dimension
         );
 
-        let root_path: Option<PathBuf> = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'root_path'",
-                [],
-                |row| {
-                    let s: String = row.get(0)?;
-                    Ok(Some(PathBuf::from(s)))
-                },
-            )
-            .unwrap_or(None);
-        let root_canonical_path: Option<PathBuf> = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'root_canonical_path'",
-                [],
-                |row| {
-                    let s: String = row.get(0)?;
-                    Ok(Some(PathBuf::from(s)))
-                },
-            )
-            .unwrap_or_else(|_| {
-                root_path
-                    .as_ref()
-                    .and_then(|p| std::fs::canonicalize(p).ok())
-            });
-
         Ok(Self {
             conn,
-            model_id: stored_model_id,
             dimension: stored_dimension,
-            root_path,
-            root_canonical_path,
+            active_root: None,
+            active_root_id: None,
+        })
+    }
+
+    pub fn open_for_maintenance(data_dir: &Path) -> anyhow::Result<Self> {
+        load_sqlite_vec();
+        let path = db_path(data_dir);
+        anyhow::ensure!(
+            path.exists(),
+            "No semantic index found at {}",
+            path.display()
+        );
+        let conn = Connection::open(&path)
+            .with_context(|| format!("Failed to open index at {}", path.display()))?;
+        configure_connection(&conn, &path)?;
+        let mut schema_version: i64 = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| {
+                    let s: String = row.get(0)?;
+                    Ok(s.parse::<i64>().unwrap_or(0))
+                },
+            )
+            .unwrap_or(0);
+        if schema_version == 2 {
+            Self::migrate_v2_to_v3(&conn)?;
+            schema_version = SCHEMA_VERSION;
+        }
+        anyhow::ensure!(
+            schema_version == SCHEMA_VERSION,
+            "Index schema version {} is not supported (expected {}); rebuild the index",
+            schema_version,
+            SCHEMA_VERSION
+        );
+        let dimension = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'dimension'",
+                [],
+                |row| {
+                    let s: String = row.get(0)?;
+                    Ok(s.parse::<usize>().unwrap_or(0))
+                },
+            )
+            .unwrap_or(0);
+        Ok(Self {
+            conn,
+            dimension,
+            active_root: None,
+            active_root_id: None,
         })
     }
 
@@ -1216,21 +1449,6 @@ impl SemanticIndex {
 
         Self::create_schema(&conn, model_id, dimension, engine)?;
 
-        let root_canonical_path =
-            root_path.map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
-        if let Some(rp) = root_path {
-            conn.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES ('root_path', ?1)",
-                params![rp.to_string_lossy()],
-            )?;
-        }
-        if let Some(rp) = &root_canonical_path {
-            conn.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES ('root_canonical_path', ?1)",
-                params![rp.to_string_lossy()],
-            )?;
-        }
-
         let built_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1240,13 +1458,16 @@ impl SemanticIndex {
             params![built_at.to_string()],
         )?;
 
-        Ok(Self {
+        let mut index = Self {
             conn,
-            model_id: model_id.to_string(),
             dimension,
-            root_path: root_path.map(|p| p.to_path_buf()),
-            root_canonical_path,
-        })
+            active_root: None,
+            active_root_id: None,
+        };
+        if let Some(root) = root_path {
+            index.activate_root(root)?;
+        }
+        Ok(index)
     }
 
     /// Create a new empty index at `data_dir` (schema only, no files indexed).
@@ -1361,23 +1582,7 @@ impl SemanticIndex {
             params![duration_ms.to_string()],
         )?;
 
-        // Success! Close connection and rename.
-        let model_id = idx.model_id.clone();
-        let dimension = idx.dimension;
-        drop(idx);
-
-        // Remove old files if they exist to avoid rename errors on some systems.
-        let _ = std::fs::remove_file(&final_path);
-        let _ = std::fs::remove_file(data_dir.join("semantic_index.db-wal"));
-        let _ = std::fs::remove_file(data_dir.join("semantic_index.db-shm"));
-
-        std::fs::rename(&tmp_path, &final_path).with_context(|| {
-            format!(
-                "Failed to rename {} to {}",
-                tmp_path.display(),
-                final_path.display()
-            )
-        })?;
+        idx.finish_active_root_build()?;
 
         let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
             files_processed: total_files,
@@ -1386,8 +1591,39 @@ impl SemanticIndex {
             done: true,
         }));
 
-        // Reopen at final path
-        Self::open(data_dir, &model_id, dimension)
+        let mut live = match Self::open(data_dir, embedder.model_id(), embedder.dimension()) {
+            Ok(mut live) => {
+                live.merge_root_from(&idx, root_path)?;
+                drop(idx);
+                let _ = std::fs::remove_file(&tmp_path);
+                let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp-wal"));
+                let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp-shm"));
+                live
+            }
+            Err(err) => {
+                tracing::info!(
+                    "SemanticIndex::build: replacing index because existing DB could not be reused: {err:#}"
+                );
+                let model_id = embedder.model_id().to_string();
+                let dimension = embedder.dimension();
+                drop(idx);
+
+                let _ = std::fs::remove_file(&final_path);
+                let _ = std::fs::remove_file(data_dir.join("semantic_index.db-wal"));
+                let _ = std::fs::remove_file(data_dir.join("semantic_index.db-shm"));
+
+                std::fs::rename(&tmp_path, &final_path).with_context(|| {
+                    format!(
+                        "Failed to rename {} to {}",
+                        tmp_path.display(),
+                        final_path.display()
+                    )
+                })?;
+                Self::open(data_dir, &model_id, dimension)?
+            }
+        };
+        live.activate_root(root_path)?;
+        Ok(live)
     }
 
     fn create_schema(
@@ -1410,6 +1646,18 @@ impl SemanticIndex {
                 modified_at_ms INTEGER NOT NULL,
                 indexed_at_ms  INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS indexed_roots (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                path                TEXT NOT NULL UNIQUE,
+                built_at            INTEGER,
+                last_reconciled_at  INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS root_files (
+                root_id    INTEGER NOT NULL REFERENCES indexed_roots(id) ON DELETE CASCADE,
+                file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                seen_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(root_id, file_id)
+            );
             CREATE TABLE IF NOT EXISTS chunks (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 file_id     INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -1429,6 +1677,7 @@ impl SemanticIndex {
             CREATE INDEX IF NOT EXISTS idx_files_identity
                 ON files(size_bytes, modified_at_ms);
             CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
+            CREATE INDEX IF NOT EXISTS idx_root_files_file_id ON root_files(file_id);
             PRAGMA foreign_keys = ON;
             ",
         )?;
@@ -1452,6 +1701,95 @@ impl SemanticIndex {
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('dimension', ?1)",
             params![dimension.to_string()],
         )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn migrate_v2_to_v3(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS indexed_roots (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                path                TEXT NOT NULL UNIQUE,
+                built_at            INTEGER,
+                last_reconciled_at  INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS root_files (
+                root_id    INTEGER NOT NULL REFERENCES indexed_roots(id) ON DELETE CASCADE,
+                file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                seen_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(root_id, file_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_root_files_file_id ON root_files(file_id);
+            ",
+        )?;
+
+        let root: Option<PathBuf> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'root_canonical_path'",
+                [],
+                |row| {
+                    let s: String = row.get(0)?;
+                    Ok(PathBuf::from(s))
+                },
+            )
+            .or_else(|_| {
+                conn.query_row(
+                    "SELECT value FROM meta WHERE key = 'root_path'",
+                    [],
+                    |row| {
+                        let s: String = row.get(0)?;
+                        Ok(PathBuf::from(s))
+                    },
+                )
+            })
+            .ok();
+
+        if let Some(root) = root {
+            let root = std::fs::canonicalize(&root).unwrap_or(root);
+            let root_str = root.to_string_lossy().into_owned();
+            let now = Self::now_ms();
+            conn.execute(
+                "INSERT OR IGNORE INTO indexed_roots (path, built_at, last_reconciled_at)
+                 VALUES (?1, ?2, ?2)",
+                params![root_str, now],
+            )?;
+            let root_id: i64 = conn.query_row(
+                "SELECT id FROM indexed_roots WHERE path = ?1",
+                params![root.to_string_lossy()],
+                |row| row.get(0),
+            )?;
+
+            let mut stmt = conn.prepare("SELECT id, file_path FROM files")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (file_id, stored_path) in rows {
+                let path = PathBuf::from(&stored_path);
+                let canonical = if path.is_absolute() {
+                    std::fs::canonicalize(&path).unwrap_or(path)
+                } else {
+                    let joined = root.join(path);
+                    std::fs::canonicalize(&joined).unwrap_or(joined)
+                };
+                let canonical_str = canonical.to_string_lossy().into_owned();
+                conn.execute(
+                    "UPDATE files SET file_path = ?1 WHERE id = ?2",
+                    params![canonical_str, file_id],
+                )?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO root_files (root_id, file_id, seen_at_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![root_id, file_id, now],
+                )?;
+            }
+        }
+
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
@@ -1529,48 +1867,29 @@ impl SemanticIndex {
         })
     }
 
+    fn canonical_path(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
     fn path_key_for_existing_path(&self, path: &Path) -> PathBuf {
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if let Some(root) = &self.root_canonical_path {
-            if let Ok(rel) = canonical.strip_prefix(root) {
-                return rel.to_path_buf();
-            }
-        }
-        if let Some(root) = &self.root_path {
-            if let Ok(rel) = path.strip_prefix(root) {
-                return rel.to_path_buf();
-            }
-        }
-        canonical
+        Self::canonical_path(path)
     }
 
     fn path_key_for_known_path(&self, path: &Path) -> PathBuf {
         if path.exists() {
             return self.path_key_for_existing_path(path);
         }
-        if let Some(root) = &self.root_path {
-            if let Ok(rel) = path.strip_prefix(root) {
-                return rel.to_path_buf();
-            }
-        }
-        if let Some(root) = &self.root_canonical_path {
-            if let Ok(rel) = path.strip_prefix(root) {
-                return rel.to_path_buf();
+        if let Some(file_name) = path.file_name() {
+            if let Some(parent) = path.parent() {
+                let parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+                return parent.join(file_name);
             }
         }
         path.to_path_buf()
     }
 
     fn key_to_display_path(&self, stored: &str) -> PathBuf {
-        let p = Path::new(stored);
-        if p.is_absolute() {
-            return p.to_path_buf();
-        }
-        if let Some(root) = &self.root_path {
-            root.join(p)
-        } else {
-            p.to_path_buf()
-        }
+        PathBuf::from(stored)
     }
 
     fn identity_for_path(path: &Path) -> anyhow::Result<FileIdentity> {
@@ -1603,12 +1922,255 @@ impl SemanticIndex {
         Ok(())
     }
 
-    fn indexed_files(&self) -> anyhow::Result<Vec<IndexedFileRecord>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT file_path, size_bytes, modified_at_ms FROM files")?;
+    fn delete_chunks_for_file_tx(
+        tx: &rusqlite::Transaction<'_>,
+        file_id: i64,
+    ) -> anyhow::Result<()> {
+        tx.execute(
+            "DELETE FROM vec_chunks WHERE rowid IN (
+                SELECT id FROM chunks WHERE file_id = ?1
+            )",
+            params![file_id],
+        )?;
+        tx.execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])?;
+        Ok(())
+    }
+
+    pub fn activate_root(&mut self, root: &Path) -> anyhow::Result<i64> {
+        let root = Self::canonical_path(root);
+        let root_str = root.to_string_lossy().into_owned();
+        let now = Self::now_ms();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO indexed_roots (path, built_at, last_reconciled_at)
+             VALUES (?1, ?2, ?2)",
+            params![root_str, now],
+        )?;
+        let root_id: i64 = self.conn.query_row(
+            "SELECT id FROM indexed_roots WHERE path = ?1",
+            params![root.to_string_lossy()],
+            |row| row.get(0),
+        )?;
+        self.active_root = Some(root);
+        self.active_root_id = Some(root_id);
+        Ok(root_id)
+    }
+
+    fn root_id_for_path(&self, root: &Path) -> anyhow::Result<Option<i64>> {
+        let root = Self::canonical_path(root);
+        self.conn
+            .query_row(
+                "SELECT id FROM indexed_roots WHERE path = ?1",
+                params![root.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn prune_unreferenced_files(&mut self) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM files
+             WHERE id NOT IN (SELECT DISTINCT file_id FROM root_files)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn merge_root_from(&mut self, source: &SemanticIndex, root: &Path) -> anyhow::Result<()> {
+        let target_root_id = self.activate_root(root)?;
+        let source_root_id = source.root_id_for_path(root)?.ok_or_else(|| {
+            anyhow::anyhow!("Source index has no coverage for {}", root.display())
+        })?;
+
+        let mut source_stmt = source.conn.prepare(
+            "SELECT f.id, f.file_path, f.size_bytes, f.modified_at_ms, f.indexed_at_ms
+             FROM root_files rf
+             JOIN files f ON f.id = rf.file_id
+             WHERE rf.root_id = ?1",
+        )?;
+        let source_files = source_stmt
+            .query_map(params![source_root_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM root_files WHERE root_id = ?1",
+            params![target_root_id],
+        )?;
+
+        for (source_file_id, file_path, size_bytes, modified_at_ms, indexed_at_ms) in source_files {
+            let target_file_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM files WHERE file_path = ?1",
+                    params![file_path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let target_file_id = if let Some(file_id) = target_file_id {
+                Self::delete_chunks_for_file_tx(&tx, file_id)?;
+                tx.execute(
+                    "UPDATE files
+                     SET size_bytes = ?2, modified_at_ms = ?3, indexed_at_ms = ?4
+                     WHERE id = ?1",
+                    params![file_id, size_bytes, modified_at_ms, indexed_at_ms],
+                )?;
+                file_id
+            } else {
+                tx.execute(
+                    "INSERT INTO files (file_path, size_bytes, modified_at_ms, indexed_at_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![file_path, size_bytes, modified_at_ms, indexed_at_ms],
+                )?;
+                tx.last_insert_rowid()
+            };
+
+            tx.execute(
+                "INSERT OR REPLACE INTO root_files (root_id, file_id, seen_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![target_root_id, target_file_id, Self::now_ms()],
+            )?;
+
+            let mut chunk_stmt = source.conn.prepare(
+                "SELECT c.chunk_idx, c.byte_start, c.byte_end,
+                        c.origin_type, c.page, c.line, c.col,
+                        c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.chunk_text,
+                        v.embedding
+                 FROM chunks c
+                 JOIN vec_chunks v ON v.rowid = c.id
+                 WHERE c.file_id = ?1
+                 ORDER BY c.chunk_idx",
+            )?;
+            let chunks = chunk_stmt
+                .query_map(params![source_file_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<f64>>(7)?,
+                        row.get::<_, Option<f64>>(8)?,
+                        row.get::<_, Option<f64>>(9)?,
+                        row.get::<_, Option<f64>>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, Vec<u8>>(12)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for (
+                chunk_idx,
+                byte_start,
+                byte_end,
+                origin_type,
+                page,
+                line,
+                col,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+                chunk_text,
+                embedding,
+            ) in chunks
+            {
+                tx.execute(
+                    "INSERT INTO chunks (file_id, chunk_idx, byte_start, byte_end,
+                                         origin_type, page, line, col,
+                                         bbox_x, bbox_y, bbox_w, bbox_h, chunk_text)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        target_file_id,
+                        chunk_idx,
+                        byte_start,
+                        byte_end,
+                        origin_type,
+                        page,
+                        line,
+                        col,
+                        bbox_x,
+                        bbox_y,
+                        bbox_w,
+                        bbox_h,
+                        chunk_text,
+                    ],
+                )?;
+                let chunk_id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO vec_chunks(rowid, embedding) VALUES (?1, ?2)",
+                    params![chunk_id, embedding],
+                )?;
+            }
+        }
+
+        tx.execute(
+            "DELETE FROM files
+             WHERE id NOT IN (SELECT DISTINCT file_id FROM root_files)",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE indexed_roots
+             SET built_at = COALESCE(built_at, ?2), last_reconciled_at = ?2
+             WHERE id = ?1",
+            params![target_root_id, Self::now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn finish_active_root_build(&mut self) -> anyhow::Result<()> {
+        if let Some(root_id) = self.active_root_id {
+            let now = Self::now_ms();
+            self.conn.execute(
+                "UPDATE indexed_roots
+                 SET built_at = COALESCE(built_at, ?2), last_reconciled_at = ?2
+                 WHERE id = ?1",
+                params![root_id, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_root(&mut self, root: &Path) -> anyhow::Result<()> {
+        let Some(root_id) = self.root_id_for_path(root)? else {
+            return Ok(());
+        };
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM root_files WHERE root_id = ?1",
+            params![root_id],
+        )?;
+        tx.execute("DELETE FROM indexed_roots WHERE id = ?1", params![root_id])?;
+        tx.execute(
+            "DELETE FROM files
+             WHERE id NOT IN (SELECT DISTINCT file_id FROM root_files)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn indexed_files_for_root(&self, root_id: i64) -> anyhow::Result<Vec<IndexedFileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.file_path, f.size_bytes, f.modified_at_ms
+             FROM root_files rf
+             JOIN files f ON f.id = rf.file_id
+             WHERE rf.root_id = ?1",
+        )?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params![root_id], |row| {
                 let path: String = row.get(0)?;
                 Ok(IndexedFileRecord {
                     path_key: PathBuf::from(path),
@@ -1646,7 +2208,8 @@ impl SemanticIndex {
         indexing: &IndexingConfig,
     ) -> anyhow::Result<Vec<String>> {
         let mut errors = Vec::new();
-        let indexed = self.indexed_files()?;
+        let root_id = self.activate_root(root)?;
+        let indexed = self.indexed_files_for_root(root_id)?;
         let by_path: HashMap<PathBuf, FileIdentity> = indexed
             .iter()
             .map(|row| (row.path_key.clone(), row.identity))
@@ -1747,10 +2310,17 @@ impl SemanticIndex {
             if !seen.contains(&row.path_key) {
                 let key = row.path_key.to_string_lossy().into_owned();
                 let tx = self.conn.transaction()?;
-                Self::delete_file_by_key_tx(&tx, &key)?;
+                tx.execute(
+                    "DELETE FROM root_files
+                     WHERE root_id = ?1
+                       AND file_id IN (SELECT id FROM files WHERE file_path = ?2)",
+                    params![root_id, key],
+                )?;
                 tx.commit()?;
             }
         }
+        self.prune_unreferenced_files()?;
+        self.finish_active_root_build()?;
 
         Ok(errors)
     }
@@ -1776,18 +2346,38 @@ impl SemanticIndex {
 
         let tx = self.conn.transaction()?;
 
-        Self::delete_file_by_key_tx(&tx, &key_str)?;
-        tx.execute(
-            "INSERT INTO files (file_path, size_bytes, modified_at_ms, indexed_at_ms)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                key_str,
-                identity.size_bytes,
-                identity.modified_at_ms,
-                Self::now_ms()
-            ],
-        )?;
-        let file_id = tx.last_insert_rowid();
+        let now = Self::now_ms();
+        let file_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM files WHERE file_path = ?1",
+                params![key_str],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let file_id = if let Some(file_id) = file_id {
+            Self::delete_chunks_for_file_tx(&tx, file_id)?;
+            tx.execute(
+                "UPDATE files
+                 SET size_bytes = ?2, modified_at_ms = ?3, indexed_at_ms = ?4
+                 WHERE id = ?1",
+                params![file_id, identity.size_bytes, identity.modified_at_ms, now],
+            )?;
+            file_id
+        } else {
+            tx.execute(
+                "INSERT INTO files (file_path, size_bytes, modified_at_ms, indexed_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![key_str, identity.size_bytes, identity.modified_at_ms, now],
+            )?;
+            tx.last_insert_rowid()
+        };
+        if let Some(root_id) = self.active_root_id {
+            tx.execute(
+                "INSERT OR REPLACE INTO root_files (root_id, file_id, seen_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![root_id, file_id, now],
+            )?;
+        }
         for (i, (chunk, embedding)) in prepared.chunks.into_iter().enumerate() {
             let (origin_type, page, line, col, bbox_x, bbox_y, bbox_w, bbox_h) = match &chunk.origin
             {
@@ -1866,7 +2456,22 @@ impl SemanticIndex {
         let key = self.path_key_for_known_path(path);
         let key_str = key.to_string_lossy().into_owned();
         let tx = self.conn.transaction()?;
-        Self::delete_file_by_key_tx(&tx, &key_str)?;
+        if let Some(root_id) = self.active_root_id {
+            tx.execute(
+                "DELETE FROM root_files
+                 WHERE root_id = ?1
+                   AND file_id IN (SELECT id FROM files WHERE file_path = ?2)",
+                params![root_id, key_str],
+            )?;
+            tx.execute(
+                "DELETE FROM files
+                 WHERE file_path = ?1
+                   AND id NOT IN (SELECT DISTINCT file_id FROM root_files)",
+                params![key_str],
+            )?;
+        } else {
+            Self::delete_file_by_key_tx(&tx, &key_str)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1912,12 +2517,14 @@ impl SemanticIndex {
     ) -> anyhow::Result<Vec<IndexedChunk>> {
         match scope {
             SemanticQueryScope::Corpus => self.query_corpus(embedding, top_k),
+            SemanticQueryScope::Root(root) => self.query_root(embedding, top_k, root),
             SemanticQueryScope::File(path) => self.query_file(embedding, top_k, path),
         }
     }
 
     pub fn related_documents(
         &self,
+        root: &Path,
         source_path: &Path,
         limit: usize,
         supported_extensions: &[String],
@@ -1927,15 +2534,20 @@ impl SemanticIndex {
             .to_string_lossy()
             .into_owned();
         let limit = if limit == 0 { 8 } else { limit };
+        let Some(root_id) = self.root_id_for_path(root)? else {
+            return Ok(Vec::new());
+        };
 
         let mut stmt = self.conn.prepare(
             "SELECT f.file_path, v.embedding
-             FROM chunks c
+             FROM root_files rf
+             JOIN files f ON f.id = rf.file_id
+             JOIN chunks c ON c.file_id = f.id
              JOIN vec_chunks v ON v.rowid = c.id
-             JOIN files f ON f.id = c.file_id",
+             WHERE rf.root_id = ?1",
         )?;
 
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![root_id], |row| {
             let file_path: String = row.get(0)?;
             let embedding_blob: Vec<u8> = row.get(1)?;
             Ok((file_path, embedding_blob))
@@ -2288,8 +2900,131 @@ impl SemanticIndex {
         Ok(scored)
     }
 
+    fn query_root(
+        &self,
+        embedding: &[f32],
+        top_k: usize,
+        root: &Path,
+    ) -> anyhow::Result<Vec<IndexedChunk>> {
+        anyhow::ensure!(
+            embedding.len() == self.dimension,
+            "Dimension mismatch for query vector for the \"embedding\" column. Expected {} dimensions but received {}.",
+            self.dimension,
+            embedding.len()
+        );
+
+        let Some(root_id) = self.root_id_for_path(root)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT f.file_path, c.byte_start, c.byte_end,
+                    c.origin_type, c.page, c.line, c.col,
+                    c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.chunk_text,
+                    v.embedding
+             FROM root_files rf
+             JOIN files f ON f.id = rf.file_id
+             JOIN chunks c ON c.file_id = f.id
+             JOIN vec_chunks v ON v.rowid = c.id
+             WHERE rf.root_id = ?1",
+        )?;
+
+        let rows = stmt.query_map(params![root_id], |row| {
+            let file_path: String = row.get(0)?;
+            let byte_start: i64 = row.get(1)?;
+            let byte_end: i64 = row.get(2)?;
+            let origin_type: String = row.get(3)?;
+            let page: Option<i64> = row.get(4)?;
+            let line: Option<i64> = row.get(5)?;
+            let col: Option<i64> = row.get(6)?;
+            let bbox_x: Option<f64> = row.get(7)?;
+            let bbox_y: Option<f64> = row.get(8)?;
+            let bbox_w: Option<f64> = row.get(9)?;
+            let bbox_h: Option<f64> = row.get(10)?;
+            let chunk_text: String = row.get(11)?;
+            let embedding_blob: Vec<u8> = row.get(12)?;
+            Ok((
+                file_path,
+                byte_start,
+                byte_end,
+                origin_type,
+                page,
+                line,
+                col,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+                chunk_text,
+                embedding_blob,
+            ))
+        })?;
+
+        let mut scored = Vec::new();
+        for row in rows {
+            let (
+                file_path,
+                byte_start,
+                byte_end,
+                origin_type,
+                page,
+                line,
+                col,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+                chunk_text,
+                embedding_blob,
+            ) = row?;
+            let chunk_embedding = f32_slice_from_bytes(&embedding_blob)?;
+            anyhow::ensure!(
+                chunk_embedding.len() == self.dimension,
+                "Stored embedding dimension mismatch for {}. Expected {}, received {}.",
+                file_path,
+                self.dimension,
+                chunk_embedding.len()
+            );
+            let Some(origin) = source_origin_from_parts(
+                &origin_type,
+                page,
+                line,
+                col,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+            ) else {
+                error!(
+                    "[query_root] unknown origin_type '{}' for {file_path}",
+                    origin_type
+                );
+                continue;
+            };
+            scored.push(IndexedChunk {
+                file_path: self.key_to_display_path(&file_path),
+                chunk_text,
+                extraction_byte_range: ByteRange {
+                    start: byte_start as usize,
+                    end: byte_end as usize,
+                },
+                origin,
+                score: cosine_similarity(embedding, &chunk_embedding),
+            });
+        }
+
+        scored.sort_by(|a, b| b.score.total_cmp(&a.score));
+        if top_k > 0 && scored.len() > top_k {
+            scored.truncate(top_k);
+        }
+        Ok(scored)
+    }
+
     /// Read index metadata without re-validating model_id/dimension.
     pub fn status(&self) -> IndexStatus {
+        self.status_for_root(None)
+    }
+
+    pub fn status_for_root(&self, root: Option<&Path>) -> IndexStatus {
         let engine_str: String = self
             .conn
             .query_row("SELECT value FROM meta WHERE key = 'engine'", [], |r| {
@@ -2338,25 +3073,48 @@ impl SemanticIndex {
             )
             .unwrap_or(None);
 
-        let indexed_files: usize = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-            .map(|n: i64| n as usize)
-            .unwrap_or(0);
-
-        let total_chunks: usize = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
-            .map(|n: i64| n as usize)
-            .unwrap_or(0);
-
-        let root_path: Option<PathBuf> = self
-            .conn
-            .query_row("SELECT value FROM meta WHERE key = 'root_path'", [], |r| {
-                let s: String = r.get(0)?;
-                Ok(Some(PathBuf::from(s)))
-            })
-            .unwrap_or(None);
+        let root_path = root.map(Self::canonical_path);
+        let root_id = root_path
+            .as_ref()
+            .and_then(|root| self.root_id_for_path(root).ok().flatten());
+        let (indexed_files, total_chunks) = if let Some(root_id) = root_id {
+            let indexed_files: usize = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM root_files WHERE root_id = ?1",
+                    params![root_id],
+                    |r| r.get(0),
+                )
+                .map(|n: i64| n as usize)
+                .unwrap_or(0);
+            let total_chunks: usize = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM root_files rf
+                     JOIN chunks c ON c.file_id = rf.file_id
+                     WHERE rf.root_id = ?1",
+                    params![root_id],
+                    |r| r.get(0),
+                )
+                .map(|n: i64| n as usize)
+                .unwrap_or(0);
+            (indexed_files, total_chunks)
+        } else if root_path.is_some() {
+            (0, 0)
+        } else {
+            let indexed_files: usize = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                .map(|n: i64| n as usize)
+                .unwrap_or(0);
+            let total_chunks: usize = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+                .map(|n: i64| n as usize)
+                .unwrap_or(0);
+            (indexed_files, total_chunks)
+        };
 
         IndexStatus {
             indexed_files,
@@ -2374,6 +3132,13 @@ impl SemanticIndex {
     /// Read index status directly from the DB file without opening a full SemanticIndex.
     /// Does not validate model_id/dimension against any embedder.
     pub fn read_status_from_path(data_dir: &Path) -> anyhow::Result<IndexStatus> {
+        Self::read_status_from_path_for_root(data_dir, None)
+    }
+
+    pub fn read_status_from_path_for_root(
+        data_dir: &Path,
+        root: Option<&Path>,
+    ) -> anyhow::Result<IndexStatus> {
         let path = db_path(data_dir);
         anyhow::ensure!(path.exists(), "No semantic index found");
         let conn = Connection::open(&path)
@@ -2393,7 +3158,7 @@ impl SemanticIndex {
             "Index uses legacy schema (no files table); rebuild the index"
         );
 
-        let schema_version: i64 = conn
+        let mut schema_version: i64 = conn
             .query_row(
                 "SELECT value FROM meta WHERE key = 'schema_version'",
                 [],
@@ -2403,6 +3168,10 @@ impl SemanticIndex {
                 },
             )
             .unwrap_or(0);
+        if schema_version == 2 {
+            Self::migrate_v2_to_v3(&conn)?;
+            schema_version = SCHEMA_VERSION;
+        }
         anyhow::ensure!(
             schema_version == SCHEMA_VERSION,
             "Index schema version {} is not supported (expected {}); rebuild the index",
@@ -2455,22 +3224,51 @@ impl SemanticIndex {
             )
             .unwrap_or(None);
 
-        let indexed_files: usize = conn
-            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-            .map(|n: i64| n as usize)
-            .unwrap_or(0);
-
-        let total_chunks: usize = conn
-            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
-            .map(|n: i64| n as usize)
-            .unwrap_or(0);
-
-        let root_path: Option<PathBuf> = conn
-            .query_row("SELECT value FROM meta WHERE key = 'root_path'", [], |r| {
-                let s: String = r.get(0)?;
-                Ok(Some(PathBuf::from(s)))
-            })
-            .unwrap_or(None);
+        let root_path = root.map(Self::canonical_path);
+        let root_id: Option<i64> = if let Some(root) = &root_path {
+            conn.query_row(
+                "SELECT id FROM indexed_roots WHERE path = ?1",
+                params![root.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        let (indexed_files, total_chunks) = if let Some(root_id) = root_id {
+            let indexed_files: usize = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM root_files WHERE root_id = ?1",
+                    params![root_id],
+                    |r| r.get(0),
+                )
+                .map(|n: i64| n as usize)
+                .unwrap_or(0);
+            let total_chunks: usize = conn
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM root_files rf
+                     JOIN chunks c ON c.file_id = rf.file_id
+                     WHERE rf.root_id = ?1",
+                    params![root_id],
+                    |r| r.get(0),
+                )
+                .map(|n: i64| n as usize)
+                .unwrap_or(0);
+            (indexed_files, total_chunks)
+        } else if root_path.is_some() {
+            (0, 0)
+        } else {
+            let indexed_files: usize = conn
+                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                .map(|n: i64| n as usize)
+                .unwrap_or(0);
+            let total_chunks: usize = conn
+                .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+                .map(|n: i64| n as usize)
+                .unwrap_or(0);
+            (indexed_files, total_chunks)
+        };
 
         Ok(IndexStatus {
             indexed_files,

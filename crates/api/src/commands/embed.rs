@@ -242,15 +242,30 @@ pub async fn list_models(
 }
 
 /// Read index status from disk without opening the full index.
-pub async fn get_index_status(data_dir: &Path) -> anyhow::Result<IndexStatus> {
+pub async fn get_index_status(
+    data_dir: &Path,
+    root: Option<PathBuf>,
+) -> anyhow::Result<IndexStatus> {
     let data_dir = data_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || SemanticIndex::read_status_from_path(&data_dir)).await?
+    tokio::task::spawn_blocking(move || {
+        SemanticIndex::read_status_from_path_for_root(&data_dir, root.as_deref())
+    })
+    .await?
 }
 
-/// Delete the index database from disk.
-pub async fn delete_index(data_dir: &Path) -> anyhow::Result<()> {
-    let path = data_dir.join("semantic_index.db");
-    tokio::fs::remove_file(&path).await.map_err(Into::into)
+/// Delete the whole index database or, when `root` is supplied, only that root's coverage.
+pub async fn delete_index(data_dir: &Path, root: Option<PathBuf>) -> anyhow::Result<()> {
+    let data_dir = data_dir.to_path_buf();
+    if let Some(root) = root {
+        tokio::task::spawn_blocking(move || {
+            let mut index = SemanticIndex::open_for_maintenance(&data_dir)?;
+            index.delete_root(&root)
+        })
+        .await?
+    } else {
+        let path = data_dir.join("semantic_index.db");
+        tokio::fs::remove_file(&path).await.map_err(Into::into)
+    }
 }
 
 #[cfg(test)]
@@ -262,7 +277,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_index_status_missing() {
         let dir = tempdir().unwrap();
-        let res = get_index_status(dir.path()).await;
+        let res = get_index_status(dir.path(), None).await;
         assert!(res.is_err());
     }
 
@@ -272,7 +287,7 @@ mod tests {
         let db_path = dir.path().join("semantic_index.db");
         std::fs::write(&db_path, "fake db").unwrap();
 
-        delete_index(dir.path()).await.unwrap();
+        delete_index(dir.path(), None).await.unwrap();
         assert!(!db_path.exists());
     }
 

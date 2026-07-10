@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import type { SearchApi, DataPaths } from "../services/api";
 import { isTauri } from "../services";
 import { useSemanticStore } from "../stores/useSemanticStore";
+import { useSettingsStore } from "../stores/useSettingsStore";
 import { Tooltip } from "./Tooltip";
 
 interface Props {
@@ -16,6 +17,7 @@ export default function DataPanel({ api, isActive }: Props) {
   const indexStatus = useSemanticStore((s) => s.indexStatus);
   const refreshCurrentRootStatus = useSemanticStore((s) => s.refreshCurrentRootStatus);
   const handleCurrentRootIndexRemoved = useSemanticStore((s) => s.handleCurrentRootIndexRemoved);
+  const directory = useSettingsStore((s) => s.directory);
 
   const fetchPaths = async () => {
     try {
@@ -44,12 +46,12 @@ export default function DataPanel({ api, isActive }: Props) {
   };
 
   const onDeleteIndex = async () => {
-    if (!window.confirm("Are you sure you want to delete the semantic index database? This cannot be undone and will require a full reindex.")) {
+    if (!window.confirm("Are you sure you want to delete the semantic index for the current directory? This cannot be undone and will require a reindex for this directory.")) {
       return;
     }
     setIsDeleting(true);
     try {
-      await api.deleteIndex();
+      await api.deleteIndex(directory || undefined);
       await handleCurrentRootIndexRemoved();
       await refreshCurrentRootStatus();
       await fetchPaths();

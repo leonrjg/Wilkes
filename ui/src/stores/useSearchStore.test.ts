@@ -211,9 +211,9 @@ describe("useSearchStore", () => {
     const searchMock = vi.fn();
     useSearchStore.setState({ search: searchMock });
     (api.getIndexStatus as any).mockResolvedValue({
-      indexed_files: 10,
-      total_chunks: 20,
-      root_path: "/indexed",
+      indexed_files: 0,
+      total_chunks: 0,
+      root_path: "/other",
     });
 
     await useSearchStore.getState().replaySearch();
