@@ -19,6 +19,10 @@ import {
 import { usePdfDocument } from "./pdfDocumentCache";
 import { api } from "../../services";
 import { Tooltip } from "../Tooltip";
+import SelectionActions, {
+  type DocumentSelection,
+  type PositionedSelection,
+} from "./SelectionActions";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -46,12 +50,7 @@ export interface PdfViewerProps {
   onAskSelection?: (selection: PdfSelection, question: string) => void;
 }
 
-export interface PdfSelection {
-  page: number;
-  bbox: BoundingBox;
-  rects: BoundingBox[];
-  quote: string;
-}
+export type PdfSelection = DocumentSelection;
 
 const PAGE_GAP_PX = 12;
 const ZOOM_STEP = 0.1;
@@ -173,17 +172,7 @@ export default function PdfViewer({
   const numPages = pdf?.numPages ?? null;
   const [isOutlineOpen, setIsOutlineOpen] = useState(false);
   const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
-  const [selectionBookmark, setSelectionBookmark] = useState<{
-    page: number;
-    bbox: BoundingBox;
-    rects: BoundingBox[];
-    quote: string;
-    buttonLeft: number;
-    buttonTop: number;
-  } | null>(null);
-  const [askDraft, setAskDraft] = useState("");
-  const [isAskOpen, setIsAskOpen] = useState(false);
-  const askInputRef = useRef<HTMLInputElement | null>(null);
+  const [selectionBookmark, setSelectionBookmark] = useState<PositionedSelection | null>(null);
 
   useEffect(() => {
     const observer = new MutationObserver(() => {
@@ -192,31 +181,6 @@ export default function PdfViewer({
     observer.observe(window.document.documentElement, { attributes: true, attributeFilter: ["class"] });
     return () => observer.disconnect();
   }, []);
-
-  // Dismiss the "+ Bookmark" action as soon as the selection collapses (the
-  // user clicked elsewhere, pressed a key, etc.) rather than waiting for the
-  // next mouseup inside the viewer.
-  useEffect(() => {
-    const onSelectionChange = () => {
-      // While the ask form is open, focusing its input collapses the PDF text
-      // selection, which would otherwise tear down the popup mid-typing. The
-      // form captured what it needs in selectionBookmark and owns its own
-      // dismissal (Escape/Cancel/submit), so ignore selection loss here.
-      if (isAskOpen) return;
-      const selection = window.getSelection();
-      if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
-        setSelectionBookmark(null);
-        setIsAskOpen(false);
-        setAskDraft("");
-      }
-    };
-    window.document.addEventListener("selectionchange", onSelectionChange);
-    return () => window.document.removeEventListener("selectionchange", onSelectionChange);
-  }, [isAskOpen]);
-
-  useEffect(() => {
-    if (isAskOpen) askInputRef.current?.focus();
-  }, [isAskOpen]);
 
   const renderedWidth = containerWidth * zoom;
   const { pageMetrics, hasPageMetrics } = usePdfPageMetrics(pdf, url);
@@ -498,13 +462,19 @@ export default function PdfViewer({
       return;
     }
 
+    const selectionClientRects = Array.from(range.getClientRects());
+    // Anchor actions to the end of the final selected line, matching the code
+    // viewer. The range's bounding rectangle can extend to the right edge of
+    // an earlier, longer line in a multi-line selection.
+    const selectionEndRect = selectionClientRects[selectionClientRects.length - 1] ?? selectionRect;
+
     // Highlight the exact selected text by capturing one rectangle per line
     // (getClientRects) instead of the selection's bounding box, which on a
     // multi-line selection would also cover the unselected head/tail of the
     // first and last lines. Keep only fragments centred on the start page so a
     // selection dragged across page boundaries doesn't pull in other pages.
     const rects = mergeRectsByLine(
-      Array.from(range.getClientRects())
+      selectionClientRects
         .filter((rect) => {
           if (rect.width <= 0 || rect.height <= 0) return false;
           const centerY = rect.top + rect.height / 2;
@@ -523,21 +493,20 @@ export default function PdfViewer({
     }
 
     setSelectionBookmark({
-      page: pageNumber,
-      bbox: unionBox(rects),
-      rects,
-      quote,
-      buttonLeft: Math.min(
-        Math.max(selectionRect.left - rootRect.left, 8),
+      selection: {
+        origin: { PdfPage: { page: pageNumber, bbox: unionBox(rects) } },
+        rects,
+        quote,
+      },
+      left: Math.min(
+        Math.max(selectionEndRect.right - rootRect.left, 8),
         Math.max(rootRect.width - 128, 8),
       ),
-      buttonTop: Math.min(
-        Math.max(selectionRect.bottom - rootRect.top + 3, 8),
+      top: Math.min(
+        Math.max(selectionEndRect.bottom - rootRect.top + 3, 8),
         Math.max(rootRect.height - 40, 8),
       ),
     });
-    setIsAskOpen(false);
-    setAskDraft("");
   }, [pageMetrics, renderedWidth]);
 
   const {
@@ -951,101 +920,16 @@ export default function PdfViewer({
           </div>
         </div>
       </div>
-      {selectionBookmark &&
-        (onAddBookmark ||
-          (showChatSelectionActions && (onExplainSelection || onAskSelection))) && (
-          <div
-            onMouseDown={(event) => event.preventDefault()}
-            className="absolute z-40 rounded border border-[var(--border-main)] bg-[var(--bg-app)] text-xs text-[var(--text-main)] shadow-lg"
-            style={{ left: selectionBookmark.buttonLeft, top: selectionBookmark.buttonTop }}
-          >
-            {isAskOpen ? (
-              <form
-                className="flex items-center gap-1 p-1"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  const question = askDraft.trim();
-                  if (!question || !onAskSelection) return;
-                  onAskSelection(selectionBookmark, question);
-                  setSelectionBookmark(null);
-                  setIsAskOpen(false);
-                  setAskDraft("");
-                  window.getSelection()?.removeAllRanges();
-                }}
-              >
-                <input
-                  ref={askInputRef}
-                  value={askDraft}
-                  onChange={(event) => setAskDraft(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Escape") {
-                      event.preventDefault();
-                      setIsAskOpen(false);
-                      setAskDraft("");
-                    }
-                  }}
-                  placeholder="Ask about this…"
-                  className="w-48 bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-1.5 py-0.5 text-xs outline-none focus:border-[var(--accent-blue)]"
-                />
-                <button
-                  type="submit"
-                  disabled={!askDraft.trim()}
-                  className="px-1.5 py-0.5 rounded bg-[var(--accent-blue)] text-white disabled:opacity-40"
-                >
-                  Send
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setIsAskOpen(false);
-                    setAskDraft("");
-                  }}
-                  className="px-1.5 py-0.5 rounded hover:bg-[var(--bg-active)]"
-                >
-                  Cancel
-                </button>
-              </form>
-            ) : (
-              <div className="flex items-center">
-                {onAddBookmark && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onAddBookmark(selectionBookmark);
-                      setSelectionBookmark(null);
-                      window.getSelection()?.removeAllRanges();
-                    }}
-                    className="px-2 py-1 hover:bg-[var(--bg-active)]"
-                  >
-                    Bookmark
-                  </button>
-                )}
-                {showChatSelectionActions && onExplainSelection && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onExplainSelection(selectionBookmark);
-                      setSelectionBookmark(null);
-                      window.getSelection()?.removeAllRanges();
-                    }}
-                    className="px-2 py-1 border-l border-[var(--border-main)] hover:bg-[var(--bg-active)]"
-                  >
-                    Explain
-                  </button>
-                )}
-                {showChatSelectionActions && onAskSelection && (
-                  <button
-                    type="button"
-                    onClick={() => setIsAskOpen(true)}
-                    className="px-2 py-1 border-l border-[var(--border-main)] hover:bg-[var(--bg-active)]"
-                  >
-                    Ask about this
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
-      )}
+      <SelectionActions
+        positioned={selectionBookmark}
+        onAddBookmark={onAddBookmark}
+        showChatActions={showChatSelectionActions}
+        onExplain={onExplainSelection}
+        onAsk={onAskSelection}
+        onDismiss={() => setSelectionBookmark(null)}
+        onClearSelection={() => window.getSelection()?.removeAllRanges()}
+        dismissOnCollapsedDomSelection
+      />
     </div>
   );
 }

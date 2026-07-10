@@ -6,8 +6,13 @@ import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { api } from "../services";
+import { saveMarkdownViewMode } from "./preview/textScrollMemory";
 
-vi.mock("./preview/CodeViewer", () => ({ default: () => <div data-testid="code-viewer">CodeViewer</div> }));
+const mockCodeViewer = vi.fn(() => <div data-testid="code-viewer">CodeViewer</div>);
+vi.mock("./preview/CodeViewer", () => ({ default: (props: any) => mockCodeViewer(props) }));
+
+const mockMarkdownViewer = vi.fn(() => <div data-testid="markdown-viewer">MarkdownViewer</div>);
+vi.mock("./preview/MarkdownViewer", () => ({ default: (props: any) => mockMarkdownViewer(props) }));
 
 const mockPdfViewer = vi.fn(() => <div data-testid="pdf-viewer">PdfViewer</div>);
 vi.mock("./preview/PdfViewer", () => ({ default: (props: any) => mockPdfViewer(props) }));
@@ -82,6 +87,105 @@ describe("PreviewPane", () => {
     expect(screen.getAllByText("test.txt")[0]).toBeInTheDocument();
   });
 
+  it("defaults Markdown files to source and switches to rendered view", () => {
+    useSearchStore.setState({
+      selectedMatch: { path: "markdown-toggle.md", origin: { TextFile: { line: 1, col: 0 } } },
+      previewData: {
+        Text: {
+          content: "# Notes\n\n| A | B |\n| - | - |\n| 1 | 2 |",
+          language: "markdown",
+          highlight_line: 1,
+          highlight_range: { start: 0, end: 0 },
+        },
+      },
+    });
+
+    render(<PreviewPane />);
+
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Source" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Rendered" })).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(screen.getByRole("button", { name: "Rendered" }));
+
+    expect(screen.getByTestId("markdown-viewer")).toBeInTheDocument();
+    expect(mockMarkdownViewer.mock.calls.at(-1)?.[0]).toEqual(
+      expect.objectContaining({ content: expect.stringContaining("# Notes") }),
+    );
+  });
+
+  it("restores the Markdown view selected for a previously opened document", () => {
+    saveMarkdownViewMode("markdown-restored.md", "rendered");
+    useSearchStore.setState({
+      selectedMatch: { path: "markdown-restored.md", origin: { TextFile: { line: 0, col: 0 } } },
+      previewData: {
+        Text: {
+          content: "# Notes",
+          language: "markdown",
+          highlight_line: 0,
+          highlight_range: { start: 0, end: 0 },
+        },
+      },
+    });
+
+    render(<PreviewPane />);
+
+    expect(screen.getByTestId("markdown-viewer")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rendered" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("passes text bookmark ranges to CodeViewer and persists its normalized selection", async () => {
+    const add = vi.fn().mockResolvedValue(undefined);
+    useSearchStore.setState({
+      selectedMatch: { path: "test.txt", origin: { TextFile: { line: 1, col: 0 } } },
+      previewData: {
+        Text: {
+          content: "hello world",
+          language: "text",
+          highlight_line: 1,
+          highlight_range: { start: 0, end: 0 },
+        },
+      },
+    });
+    useBookmarksStore.setState({
+      add,
+      bookmarks: [
+        {
+          id: "text-one",
+          path: "test.txt",
+          origin: { TextFile: { line: 1, col: 6 } },
+          text_range: { start: 6, end: 11 },
+          quote: "world",
+          created_at: "2026-01-01T00:00:00Z",
+          rects: [],
+        },
+      ],
+    });
+
+    render(<PreviewPane />);
+    const props = mockCodeViewer.mock.calls.at(-1)![0];
+    expect(props.bookmarkHighlights).toEqual([
+      { id: "text-one", range: { start: 6, end: 11 } },
+    ]);
+
+    props.onAddBookmark({
+      quote: "hello",
+      origin: { TextFile: { line: 1, col: 0 } },
+      text_range: { start: 0, end: 5 },
+      rects: [],
+    });
+
+    await waitFor(() =>
+      expect(add).toHaveBeenCalledWith({
+        path: "test.txt",
+        quote: "hello",
+        origin: { TextFile: { line: 1, col: 0 } },
+        text_range: { start: 0, end: 5 },
+        rects: [],
+      }),
+    );
+  });
+
   it("renders metadata title and author when available", () => {
     const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
     useSearchStore.setState({
@@ -94,7 +198,8 @@ describe("PreviewPane", () => {
     render(<PreviewPane />);
     expect(screen.getByText("A Better Title")).toBeInTheDocument();
     expect(screen.getByText("Test Author")).toBeInTheDocument();
-    expect(screen.getByText("test.pdf")).toBeInTheDocument();
+    expect(screen.queryByText("test.pdf")).not.toBeInTheDocument();
+    expect(screen.getByTitle("Copy path")).toBeInTheDocument();
   });
 
   it("formats a Zotero MM/YYYY publication date in the header", () => {
@@ -123,6 +228,21 @@ describe("PreviewPane", () => {
     render(<PreviewPane />);
     expect(screen.getByText("Loading metadata…")).toBeInTheDocument();
     expect(screen.getAllByText("test.pdf").length).toBeGreaterThan(0);
+  });
+
+  it("replaces the displayed path with a copy path action", () => {
+    useSearchStore.setState({
+      selectedMatch: { path: "/docs/paper.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: { title: "Paper", author: null, doi: null, created_at: null },
+      viewerMetadataStatus: "ready",
+    });
+
+    render(<PreviewPane />);
+
+    expect(screen.queryByText("/docs/paper.pdf")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTitle("Copy path"));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("/docs/paper.pdf");
   });
 
   it("renders DOI open and copy actions when DOI is available", () => {
@@ -370,6 +490,7 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane onFileOpen={onFileOpen} />);
 
+    fireEvent.click(screen.getByTitle("Show related documents"));
     await waitFor(() => expect(screen.getByText("related.txt")).toBeInTheDocument());
     expect(api.relatedDocuments).toHaveBeenCalledWith({
       root: "/docs",
@@ -418,6 +539,10 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
 
+    expect(screen.queryByText("related.txt")).not.toBeInTheDocument();
+    expect(api.relatedDocuments).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTitle("Show related documents"));
     await waitFor(() => expect(screen.getByText("related.txt")).toBeInTheDocument());
 
     fireEvent.click(screen.getByTitle("Hide related documents"));
@@ -425,5 +550,8 @@ describe("PreviewPane", () => {
 
     fireEvent.click(screen.getByTitle("Show related documents"));
     expect(screen.getByText("related.txt")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle("Close related documents"));
+    expect(screen.queryByText("related.txt")).not.toBeInTheDocument();
   });
 });

@@ -315,6 +315,8 @@ pub struct Bookmark {
     pub id: String,
     pub path: PathBuf,
     pub origin: SourceOrigin,
+    #[serde(default)]
+    pub text_range: Option<ByteRange>,
     pub quote: String,
     pub created_at: String,
     #[serde(default)]
@@ -335,6 +337,8 @@ pub struct Bookmark {
 pub struct NewBookmark {
     pub path: PathBuf,
     pub origin: SourceOrigin,
+    #[serde(default)]
+    pub text_range: Option<ByteRange>,
     pub quote: String,
     #[serde(default)]
     pub note: Option<String>,

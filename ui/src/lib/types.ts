@@ -82,6 +82,7 @@ export interface Bookmark {
   id: string;
   path: string;
   origin: SourceOrigin;
+  text_range?: ByteRange;
   quote: string;
   created_at: string;
   note?: string | null;
@@ -93,6 +94,7 @@ export interface Bookmark {
 export interface NewBookmark {
   path: string;
   origin: SourceOrigin;
+  text_range?: ByteRange;
   quote: string;
   note?: string | null;
   rects: BoundingBox[];

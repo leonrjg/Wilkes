@@ -2481,6 +2481,7 @@ mod tests {
                     page: 2,
                     bbox: None,
                 },
+                text_range: None,
                 quote: "important".to_string(),
                 note: None,
                 rects: Vec::new(),

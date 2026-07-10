@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import type { SearchApi } from "../services/api";
+import { CopyButton } from "./CopyButton";
 
 interface LogsPanelProps {
   api: SearchApi;
@@ -32,10 +33,6 @@ export default function LogsPanel({ api }: LogsPanelProps) {
     };
   }, [api]);
 
-  const handleCopy = () => {
-    api.writeClipboard(logs.join("\n")).catch((e) => console.error("Copy logs failed:", e));
-  };
-
   const handleClear = async () => {
     if (confirm("Are you sure you want to clear the logs?")) {
       try {
@@ -54,12 +51,13 @@ export default function LogsPanel({ api }: LogsPanelProps) {
           System Logs
         </h3>
         <div className="flex items-center gap-2">
-          <button
-            onClick={handleCopy}
+          <CopyButton
+            copy={() => api.writeClipboard(logs.join("\n"))}
+            copiedChildren="Copied"
             className="text-[10px] px-2 py-1 bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] text-[var(--text-main)] rounded border border-[var(--border-main)] transition-colors"
           >
             Copy
-          </button>
+          </CopyButton>
           <button
             onClick={handleClear}
             className="text-[10px] px-2 py-1 bg-[var(--bg-active)] hover:bg-red-500/10 hover:text-red-500 text-[var(--text-main)] rounded border border-[var(--border-main)] transition-colors"

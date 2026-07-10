@@ -1228,6 +1228,7 @@ mod tests {
                     page: 1,
                     bbox: None,
                 },
+                text_range: None,
                 quote: "q".to_string(),
                 note: None,
                 rects: Vec::new(),

@@ -5,7 +5,7 @@ import remarkGfm from "remark-gfm";
 import {
   ChevronDown,
   Clock,
-  Copy,
+  Check, Copy,
   Download,
   FileText,
   Loader,
@@ -24,6 +24,7 @@ import { useContextMenu, ContextMenu } from "./ContextMenu";
 import { confirmDialog } from "../lib/utils/dialog";
 import type { AgentBackend, MatchRef } from "../lib/types";
 import { Tooltip } from "./Tooltip";
+import { CopyButton } from "./CopyButton";
 
 function fileName(path: string) {
   return path.split(/[/\\]/).pop() || path;
@@ -249,14 +250,14 @@ export default function ChatPane({ onClose }: Props) {
             </button>
           </Tooltip>
           <Tooltip content="Copy backend session id">
-            <button
-              type="button"
-              onClick={() => backendSessionId && navigator.clipboard?.writeText(backendSessionId)}
+            <CopyButton
+              copy={() => backendSessionId ? navigator.clipboard.writeText(backendSessionId) : Promise.resolve()}
               disabled={!backendSessionId}
+              copiedChildren={<Check size={13} />}
               className="w-7 h-7 flex items-center justify-center rounded border border-transparent text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-active)] disabled:opacity-40 flex-shrink-0"
             >
               <Copy size={13} />
-            </button>
+            </CopyButton>
           </Tooltip>
           <Tooltip content="Forget this chat from Wilkes">
             <button
@@ -557,12 +558,6 @@ export function MessageBubble({
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
   const hasThought = !isUser && message.thought.trim().length > 0;
   const elapsedLabel = messageElapsedLabel(message, nowMs);
-  const copyMessage = () => {
-    if (!message.text) return;
-    navigator.clipboard?.writeText(message.text).catch((e) =>
-      console.error("chat: copy message failed", e),
-    );
-  };
   return (
     <div className={isUser ? "text-right" : "text-left"}>
       <div
@@ -575,15 +570,16 @@ export function MessageBubble({
           {elapsedLabel && <span> · {elapsedLabel}</span>}
         </span>
         <Tooltip content="Copy message">
-          <button
-            type="button"
-            onClick={copyMessage}
+          <CopyButton
+            copy={() => message.text ? navigator.clipboard.writeText(message.text) : Promise.resolve()}
             disabled={!message.text}
             aria-label={`Copy ${isUser ? "your" : "assistant"} message`}
+            copiedAriaLabel="Copied"
+            copiedChildren={<Check size={10} />}
             className="inline-flex h-4 w-4 items-center justify-center rounded text-[var(--text-dim)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-30"
           >
             <Copy size={10} />
-          </button>
+          </CopyButton>
         </Tooltip>
       </div>
       <div

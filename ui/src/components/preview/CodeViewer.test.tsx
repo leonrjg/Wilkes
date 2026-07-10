@@ -8,6 +8,13 @@ vi.mock("@codemirror/view", async () => {
   class MockView {
     destroy = vi.fn();
     dispatch = vi.fn();
+    scrollDOM = {
+      scrollHeight: 1000,
+      clientHeight: 500,
+      scrollTop: 0,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    };
     state = {
       doc: {
         length: 100,
@@ -19,6 +26,7 @@ vi.mock("@codemirror/view", async () => {
     static baseTheme = vi.fn().mockReturnValue([]);
     static lineWrapping = [];
     static scrollIntoView = vi.fn();
+    static updateListener = { of: vi.fn().mockReturnValue([]) };
   }
   return {
     ...actual as any,
@@ -48,6 +56,7 @@ describe("CodeViewer", () => {
   const defaultProps = {
     content: "test content",
     language: "typescript",
+    documentPath: "/test.ts",
     highlightLine: 1,
     highlightRange: { start: 0, end: 4 },
   };

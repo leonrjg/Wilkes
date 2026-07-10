@@ -101,6 +101,38 @@ describe("BookmarksPane", () => {
     });
   });
 
+  it("preserves a text bookmark range when navigating", () => {
+    useBookmarksStore.setState({
+      bookmarks: [
+        {
+          id: "text",
+          path: "/tmp/current.txt",
+          origin: { TextFile: { line: 3, col: 2 } },
+          text_range: { start: 12, end: 20 },
+          quote: "selected",
+          created_at: "2026-01-01T00:00:00Z",
+          rects: [],
+        },
+      ],
+    });
+    useSearchStore.setState({
+      selectedMatch: {
+        path: "/tmp/current.txt",
+        origin: { TextFile: { line: 1, col: 0 } },
+      },
+      selectMatch: vi.fn(),
+    });
+
+    renderPane();
+    fireEvent.click(screen.getByText("selected"));
+
+    expect(useSearchStore.getState().selectMatch).toHaveBeenCalledWith({
+      path: "/tmp/current.txt",
+      origin: { TextFile: { line: 3, col: 2 } },
+      text_range: { start: 12, end: 20 },
+    });
+  });
+
   it("shows all bookmarks and filters in memory", () => {
     renderPane();
 

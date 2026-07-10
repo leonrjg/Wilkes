@@ -13,18 +13,20 @@ async fn preview_text(match_ref: &MatchRef) -> anyhow::Result<PreviewData> {
     let language = detect_language(&match_ref.path);
 
     let (highlight_line, highlight_range) = if let Some(range) = &match_ref.text_range {
-        // Compute line number from byte offset
-        let line = content[..range.start.min(content.len())].lines().count() as u32;
-        // Adjust for potential missing trailing newline on last line or empty file
-        let highlight_line = if line == 0 { 1 } else { line as u32 };
+        let start = char_boundary_at_or_before(&content, range.start);
+        let end = char_boundary_at_or_before(&content, range.end.max(start));
+        // The selected line is one plus the number of newlines before it. This
+        // also handles a selection that begins exactly at the first character
+        // after a newline (where `str::lines().count()` would under-count).
+        let highlight_line = content[..start]
+            .chars()
+            .filter(|character| *character == '\n')
+            .count() as u32
+            + 1;
 
         // Convert byte range to UTF-16 code unit range for the frontend (JS/CodeMirror)
-        let utf16_start = content[..range.start.min(content.len())]
-            .encode_utf16()
-            .count();
-        let utf16_len = content[range.start.min(content.len())..range.end.min(content.len())]
-            .encode_utf16()
-            .count();
+        let utf16_start = content[..start].encode_utf16().count();
+        let utf16_len = content[start..end].encode_utf16().count();
         let highlight_range = ByteRange {
             start: utf16_start,
             end: utf16_start + utf16_len,
@@ -49,6 +51,19 @@ async fn preview_text(match_ref: &MatchRef) -> anyhow::Result<PreviewData> {
         highlight_line,
         highlight_range,
     })
+}
+
+fn char_boundary_at_or_before(content: &str, offset: usize) -> usize {
+    let capped = offset.min(content.len());
+    if content.is_char_boundary(capped) {
+        return capped;
+    }
+    content
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index < capped)
+        .last()
+        .unwrap_or(0)
 }
 
 async fn preview_pdf(
@@ -166,6 +181,47 @@ mod tests {
         } else {
             panic!("Expected Text preview");
         }
+    }
+
+    #[tokio::test]
+    async fn test_preview_text_clamps_stale_range_to_character_boundaries() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "aé🙂z").unwrap();
+        let match_ref = MatchRef {
+            path: tmp.path().to_path_buf(),
+            origin: SourceOrigin::TextFile { line: 1, col: 0 },
+            // Both offsets are inside multi-byte UTF-8 characters. A persisted
+            // bookmark can become stale after the file is edited, so preview
+            // must never slice at these raw offsets.
+            text_range: Some(ByteRange { start: 2, end: 5 }),
+        };
+
+        let preview = preview_text(&match_ref).await.unwrap();
+        let PreviewData::Text {
+            highlight_range, ..
+        } = preview
+        else {
+            panic!("Expected Text preview");
+        };
+        assert_eq!(highlight_range.start, 1);
+        assert_eq!(highlight_range.end, 2);
+    }
+
+    #[tokio::test]
+    async fn test_preview_text_reports_line_when_range_starts_after_newline() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "first\nsecond").unwrap();
+        let match_ref = MatchRef {
+            path: tmp.path().to_path_buf(),
+            origin: SourceOrigin::TextFile { line: 2, col: 0 },
+            text_range: Some(ByteRange { start: 6, end: 12 }),
+        };
+
+        let preview = preview_text(&match_ref).await.unwrap();
+        let PreviewData::Text { highlight_line, .. } = preview else {
+            panic!("Expected Text preview");
+        };
+        assert_eq!(highlight_line, 2);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Copy, Edit2, FileText, Sidebar, Trash2, X } from "react-feather";
+import { Check, Copy, Edit2, FileText, Sidebar, Trash2, X } from "react-feather";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
@@ -8,6 +8,7 @@ import { toMarkdown } from "../lib/utils/bookmarkMarkdown";
 import { api } from "../services";
 import { useToasts } from "./Toast";
 import { Tooltip } from "./Tooltip";
+import { CopyButton } from "./CopyButton";
 import type { Bookmark } from "../lib/types";
 
 function fileName(path: string) {
@@ -49,14 +50,16 @@ export default function BookmarksPane() {
     setScope(selectedPath);
   }, [selectedPath, setScope]);
 
-  const handleCopyCitation = async (bookmark: Bookmark) => {
+  const copyCitation = async (bookmark: Bookmark) => {
     const dismissPending = notifyPending("Fetching citation…");
+    let notified = false;
     try {
       const result = await api.zoteroGenerateCitation(bookmark.path);
       const citation = result.citation ? htmlToText(result.citation) : "";
       if (!citation) {
         addToast("Zotero returned no in-text citation for this file", { type: "error" });
-        return;
+        notified = true;
+        throw new Error("Zotero returned no in-text citation for this file");
       }
       await api.writeClipboard(`"${bookmark.quote}" ${citation}`);
       addToast(
@@ -67,10 +70,13 @@ export default function BookmarksPane() {
       );
     } catch (error) {
       console.error("Failed to get Zotero citation:", error);
-      addToast(
-        error instanceof Error && error.message ? error.message : "No Zotero citation found",
-        { type: "error" },
-      );
+      if (!notified) {
+        addToast(
+          error instanceof Error && error.message ? error.message : "No Zotero citation found",
+          { type: "error" },
+        );
+      }
+      throw error;
     } finally {
       dismissPending();
     }
@@ -194,10 +200,20 @@ export default function BookmarksPane() {
                 <div
                   role="button"
                   tabIndex={0}
-                  onClick={() => selectMatch({ path: bookmark.path, origin: bookmark.origin })}
+                  onClick={() =>
+                    selectMatch({
+                      path: bookmark.path,
+                      origin: bookmark.origin,
+                      text_range: bookmark.text_range,
+                    })
+                  }
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
-                      selectMatch({ path: bookmark.path, origin: bookmark.origin });
+                      selectMatch({
+                        path: bookmark.path,
+                        origin: bookmark.origin,
+                        text_range: bookmark.text_range,
+                      });
                     }
                   }}
                   className="border border-[var(--border-main)] bg-[var(--bg-app)] rounded p-2 text-left hover:border-[var(--border-strong)] cursor-pointer"
@@ -269,29 +285,25 @@ export default function BookmarksPane() {
                     </Tooltip>
                     {zoteroEnabled && (
                       <Tooltip content="Get citation from Zotero">
-                        <button
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            handleCopyCitation(bookmark).catch(console.error);
-                          }}
+                        <CopyButton
+                          copy={() => copyCitation(bookmark)}
+                          onClick={(event) => event.stopPropagation()}
+                          copiedChildren={<Check size={12} />}
                           className="p-1 hover:text-[var(--accent-blue)]"
                         >
                           <FileText size={12} />
-                        </button>
+                        </CopyButton>
                       </Tooltip>
                     )}
                     <Tooltip content="Copy as markdown">
-                      <button
-                        type="button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          api.writeClipboard(toMarkdown(bookmark)).catch(console.error);
-                        }}
+                      <CopyButton
+                        copy={() => api.writeClipboard(toMarkdown(bookmark))}
+                        onClick={(event) => event.stopPropagation()}
+                        copiedChildren={<Check size={12} />}
                         className="p-1 hover:text-[var(--accent-blue)]"
                       >
                         <Copy size={12} />
-                      </button>
+                      </CopyButton>
                     </Tooltip>
                     <Tooltip content="Delete bookmark">
                       <button

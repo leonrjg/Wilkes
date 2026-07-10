@@ -380,7 +380,7 @@ describe("PdfViewer", () => {
     });
   });
 
-  it("shows the selection action below the selected text", async () => {
+  it("shows the selection action below and to the right of the selected text", async () => {
     render(<PdfViewer {...defaultProps} onAddBookmark={vi.fn()} />);
 
     await act(async () => {
@@ -423,7 +423,46 @@ describe("PdfViewer", () => {
     fireEvent.mouseUp(scrollContainer);
 
     const button = screen.getByRole("button", { name: "Bookmark" });
-    expect(button.closest(".absolute")).toHaveStyle({ top: "83px", left: "40px" });
+    expect(button.closest(".absolute")).toHaveStyle({ top: "83px", left: "140px" });
+  });
+
+  it("anchors the selection action to the final line rather than the range bounding box", async () => {
+    render(<PdfViewer {...defaultProps} onAddBookmark={vi.fn()} />);
+
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    });
+
+    const scrollContainer = document.querySelector(".overflow-auto") as HTMLElement;
+    const root = document.querySelector(".h-full.relative") as HTMLElement;
+    const pageWrapper = document.querySelector<HTMLElement>("[data-page-number='1']")!;
+
+    root.getBoundingClientRect = () =>
+      ({ top: 10, left: 20, width: 500, height: 500, bottom: 510, right: 520, x: 20, y: 10, toJSON: () => ({}) }) as DOMRect;
+    pageWrapper.getBoundingClientRect = () =>
+      ({ top: 50, left: 40, width: 600, height: 800, bottom: 850, right: 640, x: 40, y: 50, toJSON: () => ({}) }) as DOMRect;
+
+    const firstLineRect = { top: 70, left: 60, width: 300, height: 20, bottom: 90, right: 360, x: 60, y: 70, toJSON: () => ({}) } as DOMRect;
+    const finalLineRect = { top: 95, left: 60, width: 100, height: 20, bottom: 115, right: 160, x: 60, y: 95, toJSON: () => ({}) } as DOMRect;
+    const range = {
+      startContainer: pageWrapper,
+      getBoundingClientRect: () => firstLineRect,
+      getClientRects: () => [firstLineRect, finalLineRect] as unknown as DOMRectList,
+    };
+    vi.spyOn(window, "getSelection").mockReturnValue({
+      isCollapsed: false,
+      rangeCount: 1,
+      getRangeAt: () => range,
+      toString: () => "selected text",
+      removeAllRanges: vi.fn(),
+    } as any);
+
+    fireEvent.mouseUp(scrollContainer);
+
+    expect(screen.getByRole("button", { name: "Bookmark" }).closest(".absolute")).toHaveStyle({
+      top: "108px",
+      left: "140px",
+    });
   });
 
   it("runs explain and inline ask actions for the selected text", async () => {

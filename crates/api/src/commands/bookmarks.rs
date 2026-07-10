@@ -35,6 +35,7 @@ pub async fn add(path: &Path, new_bookmark: NewBookmark) -> anyhow::Result<Bookm
         id: uuid::Uuid::new_v4().to_string(),
         path: new_bookmark.path,
         origin: new_bookmark.origin,
+        text_range: new_bookmark.text_range,
         quote: new_bookmark.quote,
         created_at: chrono::Utc::now().to_rfc3339(),
         note: normalize_note(new_bookmark.note),
@@ -85,6 +86,7 @@ mod tests {
                     height: 4.0,
                 }),
             },
+            text_range: None,
             quote: "important passage".to_string(),
             note: None,
             rects: Vec::new(),
@@ -96,6 +98,38 @@ mod tests {
         let dir = tempdir().unwrap();
         let bookmarks = load(&dir.path().join("bookmarks.json")).await.unwrap();
         assert!(bookmarks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_legacy_bookmark_without_text_range() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bookmarks.json");
+        tokio::fs::write(
+            &path,
+            r#"[{"id":"old","path":"/tmp/old.pdf","origin":{"PdfPage":{"page":1,"bbox":null}},"quote":"old quote","created_at":"2026-01-01T00:00:00Z"}]"#,
+        )
+        .await
+        .unwrap();
+
+        let loaded = load(&path).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].text_range.is_none());
+    }
+
+    #[tokio::test]
+    async fn add_persists_text_range() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bookmarks.json");
+        let mut bookmark = new_bookmark();
+        bookmark.path = "/tmp/example.txt".into();
+        bookmark.origin = SourceOrigin::TextFile { line: 2, col: 1 };
+        bookmark.text_range = Some(wilkes_core::types::ByteRange { start: 5, end: 12 });
+        bookmark.rects.clear();
+
+        let added = add(&path, bookmark).await.unwrap();
+        let range = added.text_range.expect("text range should be persisted");
+        assert_eq!(range.start, 5);
+        assert_eq!(range.end, 12);
     }
 
     #[tokio::test]

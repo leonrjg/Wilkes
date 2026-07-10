@@ -1695,6 +1695,7 @@ mod tests {
                     page: 4,
                     bbox: None,
                 },
+                text_range: None,
                 quote: "quote".to_string(),
                 note: None,
                 rects: Vec::new(),
