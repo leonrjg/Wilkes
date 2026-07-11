@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { X, ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, Percent } from "react-feather";
+import { X, ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye } from "react-feather";
 import CodeViewer from "./preview/CodeViewer";
 import MarkdownViewer from "./preview/MarkdownViewer";
 import PdfViewer from "./preview/PdfViewer";
@@ -9,17 +9,15 @@ import { readMarkdownViewMode, saveMarkdownViewMode } from "./preview/textScroll
 import { useSearchStore } from "../stores/useSearchStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useChatStore } from "../stores/useChatStore";
-import { useSemanticStore } from "../stores/useSemanticStore";
-import { useSettingsStore } from "../stores/useSettingsStore";
 import { api, isTauri } from "../services";
-import type { BoundingBox, DocumentMetadata, RelatedDocument } from "../lib/types";
+import type { BoundingBox, DocumentMetadata } from "../lib/types";
 import { buildExternalLinks } from "../lib/externalLinks";
 import { formatDocumentMonthYear } from "../lib/dateFormatting";
 import { useToasts } from "./Toast";
 import { Tooltip } from "./Tooltip";
 import { CopyButton } from "./CopyButton";
-import { fileName, type DocumentDetail } from "./DocumentEntryRow";
-import ResultList from "./ResultList";
+import { fileName } from "./DocumentEntryRow";
+import RelatedDocumentsPane from "./RelatedDocumentsPane";
 
 interface Props {
   canGoBack?: boolean;
@@ -63,8 +61,6 @@ function metadataBadgeClassName() {
   ].join(" ");
 }
 
-type RelatedStatus = "idle" | "loading" | "ready" | "empty" | "error" | "unavailable";
-
 export default function PreviewPane({ canGoBack = false, canGoForward = false, onGoBack, onGoForward, onFileOpen }: Props) {
   const selectedMatch = useSearchStore((s) => s.selectedMatch);
   const previewData = useSearchStore((s) => s.previewData);
@@ -78,13 +74,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   const chatBackendsLoaded = useChatStore((s) => s.backendsLoaded);
   const hasAvailableChatBackend = useChatStore((s) => s.hasAvailableBackend);
   const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
-  const directory = useSettingsStore((s) => s.directory);
-  const relatedIndexReady = useSemanticStore((s) => s.readyForCurrentRoot);
-  const indexStatus = useSemanticStore((s) => s.indexStatus);
   const { addToast } = useToasts();
-  const relatedCacheRef = useRef<Map<string, RelatedDocument[]>>(new Map());
-  const [relatedStatus, setRelatedStatus] = useState<RelatedStatus>("idle");
-  const [relatedDocuments, setRelatedDocuments] = useState<RelatedDocument[]>([]);
   const [relatedPanelOpen, setRelatedPanelOpen] = useState(false);
   const [markdownView, setMarkdownView] = useState<"source" | "rendered">("rendered");
 
@@ -117,58 +107,6 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   const handleChatPageChange = (page: number) => {
     if (isTauri && selectedMatch) setChatActiveDoc(selectedMatch.path, page);
   };
-
-  useEffect(() => {
-    if (!relatedPanelOpen) return;
-    if (!selectedMatch || !directory) {
-      setRelatedStatus("idle");
-      setRelatedDocuments([]);
-      return;
-    }
-    if (!relatedIndexReady || !indexStatus) {
-      setRelatedStatus("unavailable");
-      setRelatedDocuments([]);
-      return;
-    }
-
-    const indexKey = `${indexStatus.model_id}:${indexStatus.built_at ?? "unknown"}`;
-    const cacheKey = `${directory}\n${selectedMatch.path}\n${indexKey}`;
-    const cached = relatedCacheRef.current.get(cacheKey);
-    if (cached) {
-      setRelatedDocuments(cached);
-      setRelatedStatus(cached.length > 0 ? "ready" : "empty");
-      return;
-    }
-
-    let cancelled = false;
-    setRelatedStatus("loading");
-    setRelatedDocuments([]);
-    api
-      .relatedDocuments({ root: directory, path: selectedMatch.path, limit: 8 })
-      .then((docs) => {
-        if (cancelled) return;
-        relatedCacheRef.current.set(cacheKey, docs);
-        setRelatedDocuments(docs);
-        setRelatedStatus(docs.length > 0 ? "ready" : "empty");
-      })
-      .catch((e) => {
-        if (cancelled) return;
-        console.debug("Related documents unavailable:", e);
-        setRelatedDocuments([]);
-        setRelatedStatus("error");
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    selectedMatch?.path,
-    directory,
-    relatedIndexReady,
-    indexStatus?.model_id,
-    indexStatus?.built_at,
-    relatedPanelOpen,
-  ]);
 
   // Keep the last valid previewData so the content stays mounted while a new
   // match is loading. This prevents PdfViewer from unmounting/remounting on
@@ -502,91 +440,14 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
             ) : null}
           </div>
           {relatedPanelOpen && (
-            <RelatedDocumentsPanel
-              status={relatedStatus}
-              documents={relatedDocuments}
-              onOpen={(path) => onFileOpen?.(path)}
+            <RelatedDocumentsPane
+              currentPath={selectedMatch.path}
+              onOpenDocument={(path) => onFileOpen?.(path)}
               onClose={() => setRelatedPanelOpen(false)}
             />
           )}
         </div>
       </div>
     </div>
-  );
-}
-
-function RelatedDocumentsPanel({
-  status,
-  documents,
-  onOpen,
-  onClose,
-}: {
-  status: RelatedStatus;
-  documents: RelatedDocument[];
-  onOpen: (path: string) => void;
-  onClose: () => void;
-}) {
-  return (
-    <aside className="hidden w-64 flex-shrink-0 border-l border-[var(--border-main)] bg-[var(--bg-sidebar)] md:flex md:flex-col">
-      <div className="flex items-center justify-between border-b border-[var(--border-main)] px-3 py-2 text-xs font-medium text-[var(--text-main)]">
-        <span>Related</span>
-        <Tooltip content="Close related documents">
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close related documents"
-            className="inline-flex rounded p-0.5 text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)]"
-          >
-            <X size={14} />
-          </button>
-        </Tooltip>
-      </div>
-      <div className="min-h-0 flex-1 overflow-y-auto py-1">
-        {status === "loading" && (
-          <div className="px-3 py-3 text-xs text-[var(--text-muted)]">Loading…</div>
-        )}
-        {status === "unavailable" && (
-          <div className="px-3 py-3 text-xs text-[var(--text-dim)]">Semantic index unavailable</div>
-        )}
-        {status === "error" && (
-          <div className="px-3 py-3 text-xs text-red-500">Related documents unavailable</div>
-        )}
-        {status === "empty" && (
-          <div className="px-3 py-3 text-xs text-[var(--text-dim)]">No related documents</div>
-        )}
-        {status === "ready" && (
-          <ResultList
-            documents={sortRelatedDocuments(documents)}
-            preserveDocumentOrder
-            documentDetails={(entry) => relatedDocumentDetails(entry as RelatedDocument)}
-            onFileClick={onOpen}
-            onMatchClick={() => {}}
-          />
-        )}
-      </div>
-    </aside>
-  );
-}
-
-function relatedDocumentDetails(document: RelatedDocument): DocumentDetail[] {
-  return [{
-    key: "score",
-    label: "Score",
-    value: `${Math.round(document.score * 100)}%`,
-    valueTitle: `${document.score.toFixed(3)} cosine similarity`,
-    icon: Percent,
-    monospace: true,
-  }];
-}
-
-function sortRelatedDocuments(documents: RelatedDocument[]): RelatedDocument[] {
-  return [...documents].sort(
-    (a, b) =>
-      b.score - a.score ||
-      fileName(a.path).localeCompare(fileName(b.path), undefined, {
-        numeric: true,
-        sensitivity: "base",
-      }) ||
-      a.path.localeCompare(b.path),
   );
 }

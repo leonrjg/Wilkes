@@ -563,6 +563,36 @@ describe("PreviewPane", () => {
 
     fireEvent.click(screen.getByText("related.txt"));
     expect(onFileOpen).toHaveBeenCalledWith("/docs/related.txt");
+
+    useSearchStore.setState({
+      selectedMatch: {
+        path: "/docs/related.txt",
+        origin: { TextFile: { line: 1, col: 1 } },
+      },
+    });
+    expect(await screen.findByText("Related to source.txt")).toBeInTheDocument();
+    expect(api.relatedDocuments).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Use current" }));
+    await waitFor(() => expect(api.relatedDocuments).toHaveBeenLastCalledWith({
+      root: "/docs",
+      path: "/docs/related.txt",
+      limit: 8,
+    }));
+
+    useSearchStore.setState({
+      selectedMatch: {
+        path: "/docs/normal-navigation.txt",
+        origin: { TextFile: { line: 1, col: 1 } },
+      },
+    });
+    await waitFor(() => expect(api.relatedDocuments).toHaveBeenLastCalledWith({
+      root: "/docs",
+      path: "/docs/normal-navigation.txt",
+      limit: 8,
+    }));
+    expect(screen.getByText("Related to normal-navigation.txt")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Use current" })).not.toBeInTheDocument();
   });
 
   it("toggles the related documents pane", async () => {
