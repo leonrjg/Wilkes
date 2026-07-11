@@ -34,7 +34,7 @@ describe("ExtensionsPanel", () => {
 
   it("removes an extension", () => {
     render(<ExtensionsPanel settings={mockSettings} onUpdate={mockOnUpdate} />);
-    const removeButtons = screen.getAllByTitle("Remove");
+    const removeButtons = screen.getAllByRole("button", { name: "Remove" });
     
     fireEvent.click(removeButtons[0]); // Remove "ts"
 

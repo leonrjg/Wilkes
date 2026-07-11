@@ -149,6 +149,21 @@ body,
   overflow-wrap: anywhere;
 }
 
+.markdown-search-highlight {
+  background-color: rgba(250, 204, 21, 0.25);
+  border-bottom: 2px solid rgba(250, 204, 21, 0.7);
+}
+
+.markdown-bookmark-highlight {
+  background-color: rgba(59, 130, 246, 0.16);
+  box-shadow: inset 0 -1px rgba(59, 130, 246, 0.55);
+}
+
+.markdown-search-highlight.markdown-bookmark-highlight {
+  background: linear-gradient(rgba(250, 204, 21, 0.25), rgba(250, 204, 21, 0.25)),
+    linear-gradient(rgba(59, 130, 246, 0.16), rgba(59, 130, 246, 0.16));
+}
+
 .prose-document {
   max-width: 72rem;
   margin: 0 auto;

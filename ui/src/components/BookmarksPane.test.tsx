@@ -79,11 +79,11 @@ describe("BookmarksPane", () => {
     useSettingsStore.setState({ bookmarksDock: "Right", setBookmarksDock });
     renderPane();
 
-    fireEvent.click(screen.getByTitle("Close bookmarks"));
+    fireEvent.click(screen.getByRole("button", { name: "Close bookmarks" }));
     expect(togglePane).toHaveBeenCalledTimes(1);
 
     // Dock toggle still available (moved next to the scope selector).
-    fireEvent.click(screen.getByTitle("Dock left"));
+    fireEvent.click(screen.getByRole("button", { name: "Dock left" }));
     expect(setBookmarksDock).toHaveBeenCalledWith("Left");
   });
 
@@ -152,7 +152,7 @@ describe("BookmarksPane", () => {
     useBookmarksStore.setState({ updateNote });
     renderPane();
 
-    fireEvent.click(screen.getByTitle("Add note"));
+    fireEvent.click(screen.getByRole("button", { name: "Add note" }));
     fireEvent.change(screen.getByPlaceholderText("Add a note…"), {
       target: { value: "  a thought  " },
     });
@@ -177,12 +177,12 @@ describe("BookmarksPane", () => {
     renderPane();
 
     expect(screen.getByText("existing note")).toBeInTheDocument();
-    expect(screen.getByTitle("Edit note")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit note" })).toBeInTheDocument();
   });
 
   it("hides the citation action unless the Zotero integration is enabled", () => {
     renderPane();
-    expect(screen.queryByTitle("Get citation from Zotero")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Get citation from Zotero" })).not.toBeInTheDocument();
   });
 
   it("copies the plain-text in-text citation from Zotero when enabled", async () => {
@@ -196,7 +196,7 @@ describe("BookmarksPane", () => {
     });
 
     renderPane();
-    fireEvent.click(screen.getAllByTitle("Get citation from Zotero")[0]);
+    fireEvent.click(screen.getAllByRole("button", { name: "Get citation from Zotero" })[0]);
 
     await vi.waitFor(() => expect(api.writeClipboard).toHaveBeenCalledTimes(1));
     expect(api.zoteroGenerateCitation).toHaveBeenCalledWith("/tmp/current.pdf");
@@ -219,7 +219,7 @@ describe("BookmarksPane", () => {
     );
 
     renderPane();
-    fireEvent.click(screen.getAllByTitle("Get citation from Zotero")[0]);
+    fireEvent.click(screen.getAllByRole("button", { name: "Get citation from Zotero" })[0]);
 
     // Feedback appears before the network call settles.
     expect(await screen.findByText("Fetching citation…")).toBeInTheDocument();

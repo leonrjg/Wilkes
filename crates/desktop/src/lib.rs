@@ -921,13 +921,19 @@ async fn chat_send(
     let managed = managed_chat_session_or_err(&chat_manager_state(&app), &session_id)?;
     managed.session.set_search_root(search_root);
     let session = Arc::clone(&managed.session);
+    // Read this at send time so changes from Settings apply immediately to
+    // already-open conversations, not just sessions created afterwards.
+    let custom_instructions = ctx.get_settings().await.chat_custom_instructions;
     let conversation_id = ensure_chat_conversation(&ctx, &managed)?;
     let task_conversation_id = conversation_id.clone();
     let title_hint = text.clone();
 
     tokio::spawn(async move {
         let emitter = TauriEmitter(app);
-        let payload = match session.send(turn_id.clone(), text).await {
+        let payload = match session
+            .send_with_custom_instructions(turn_id.clone(), text, custom_instructions)
+            .await
+        {
             Ok(stop_reason) => {
                 if let Some(conversation_id) = &task_conversation_id {
                     if let Err(e) = wilkes_api::commands::chat::touch_conversation(

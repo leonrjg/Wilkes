@@ -339,6 +339,19 @@ impl ChatSession {
     /// arrives separately through the `ChatEvent` receiver returned by
     /// [`spawn`].
     pub async fn send(&self, turn_id: String, text: String) -> anyhow::Result<String> {
+        self.send_with_custom_instructions(turn_id, text, String::new())
+            .await
+    }
+
+    /// Same as [`Self::send`], with the current global chat instructions.
+    /// Instructions are supplied per turn so edits take effect immediately in
+    /// open sessions as well as newly started conversations.
+    pub async fn send_with_custom_instructions(
+        &self,
+        turn_id: String,
+        text: String,
+        custom_instructions: String,
+    ) -> anyhow::Result<String> {
         let (first_turn, active_doc, context_files) = self.state.prepare_turn();
         let active_doc_text = active_doc.as_ref().map(active_doc_text_for_context);
         let context_block = build_context_block(
@@ -346,6 +359,7 @@ impl ChatSession {
             active_doc.as_ref(),
             &context_files,
             active_doc_text.as_ref(),
+            &custom_instructions,
         );
         let blocks = vec![
             ContentBlock::Text(TextContent::new(context_block)),

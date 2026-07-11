@@ -18,12 +18,12 @@ export function CopyButton({
   children,
   copiedChildren,
   copiedAriaLabel = "Copied",
-  copiedTitle = "Copied",
+  copiedTitle: _copiedTitle = "Copied",
   resetAfterMs = 2_000,
   onClick,
   onCopyError = (error) => console.error("Copy failed:", error),
   "aria-label": ariaLabel,
-  title,
+  title: _title,
   ...buttonProps
 }: CopyButtonProps) {
   const [copied, setCopied] = useState(false);
@@ -53,7 +53,6 @@ export function CopyButton({
       type={buttonProps.type ?? "button"}
       onClick={handleClick}
       aria-label={copied ? copiedAriaLabel : ariaLabel}
-      title={copied ? copiedTitle : title}
     >
       {copied ? copiedChildren ?? children : children}
     </button>

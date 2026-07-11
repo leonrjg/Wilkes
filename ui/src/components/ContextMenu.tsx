@@ -8,6 +8,7 @@ export interface ContextMenuItem {
   label: string;
   icon?: Icon;
   disabled?: boolean;
+  dividerBefore?: boolean;
   run: () => Promise<void> | void;
 }
 
@@ -134,54 +135,58 @@ export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
           const isPending = pendingId === item.id;
           const showIconSlot = menu.size !== "content" || Icon || isPending;
           return (
-            <button
-              key={item.id}
-              role="menuitem"
-              disabled={item.disabled || pendingId !== null}
-              onClick={() => {
-                if (item.disabled || pendingId !== null) return;
-                let result: Promise<void> | void;
-                try {
-                  result = item.run();
-                } catch (error) {
-                  console.error("context menu action failed", error);
-                  onClose();
-                  return;
-                }
-                if (!result || typeof result.then !== "function") {
-                  onClose();
-                  return;
-                }
-                // Keep the menu open with a spinner until the action settles,
-                // so the click has immediate visible feedback.
-                setPendingId(item.id);
-                void result
-                  .catch((error) => {
-                    console.error("context menu action failed", error);
-                  })
-                  .finally(() => {
-                    setPendingId(null);
-                    onClose();
-                  });
-              }}
-              className={`flex w-full items-center rounded-md px-3 py-1.5 text-left text-xs text-[var(--text-main)] hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50 ${
-                showIconSlot ? "gap-2" : ""
-              }`}
-            >
-              {showIconSlot && (
-                <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center text-[var(--text-muted)]">
-                  {isPending ? (
-                    <span
-                      data-testid="context-menu-spinner"
-                      className="h-3 w-3 rounded-full border-2 border-[var(--text-muted)] border-t-transparent animate-spin"
-                    />
-                  ) : (
-                    Icon && <Icon size={13} aria-hidden="true" />
-                  )}
-                </span>
+            <div key={item.id}>
+              {item.dividerBefore && (
+                <div role="separator" className="my-1 border-t border-[var(--border-main)]" />
               )}
-              <span className="truncate">{item.label}</span>
-            </button>
+              <button
+                role="menuitem"
+                disabled={item.disabled || pendingId !== null}
+                onClick={() => {
+                  if (item.disabled || pendingId !== null) return;
+                  let result: Promise<void> | void;
+                  try {
+                    result = item.run();
+                  } catch (error) {
+                    console.error("context menu action failed", error);
+                    onClose();
+                    return;
+                  }
+                  if (!result || typeof result.then !== "function") {
+                    onClose();
+                    return;
+                  }
+                  // Keep the menu open with a spinner until the action settles,
+                  // so the click has immediate visible feedback.
+                  setPendingId(item.id);
+                  void result
+                    .catch((error) => {
+                      console.error("context menu action failed", error);
+                    })
+                    .finally(() => {
+                      setPendingId(null);
+                      onClose();
+                    });
+                }}
+                className={`flex w-full items-center rounded-md px-3 py-1.5 text-left text-xs text-[var(--text-main)] hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50 ${
+                  showIconSlot ? "gap-2" : ""
+                }`}
+              >
+                {showIconSlot && (
+                  <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center text-[var(--text-muted)]">
+                    {isPending ? (
+                      <span
+                        data-testid="context-menu-spinner"
+                        className="h-3 w-3 rounded-full border-2 border-[var(--text-muted)] border-t-transparent animate-spin"
+                      />
+                    ) : (
+                      Icon && <Icon size={13} aria-hidden="true" />
+                    )}
+                  </span>
+                )}
+                <span className="truncate">{item.label}</span>
+              </button>
+            </div>
           );
         })}
       </div>

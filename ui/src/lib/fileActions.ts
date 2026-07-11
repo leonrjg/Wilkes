@@ -40,7 +40,7 @@ export function buildFileContextMenuItems({
   availableRoots = [],
   onMoveRequest,
 }: BuildFileContextMenuItemsArgs): ContextMenuItem[] {
-  const items: ContextMenuItem[] = [
+  const primaryItems: ContextMenuItem[] = [
     {
       id: "open",
       label: "Open",
@@ -63,55 +63,8 @@ export function buildFileContextMenuItems({
     },
   ];
 
-  if (target.kind !== "directory") {
-    items.push({
-      id: "rename",
-      label: "Rename",
-      icon: Edit2,
-      run: () => onRenameRequest?.(target.path),
-    });
-
-    if (isTauri && availableRoots.length > 0) {
-      items.push({
-        id: "move-to",
-        label: "Move to...",
-        icon: FolderPlus,
-        run: () => onMoveRequest?.(target.path),
-      });
-    }
-
-    items.push({
-      id: "refresh-metadata",
-      label: "Refresh metadata",
-      icon: RefreshCw,
-      run: async () => {
-        try {
-          await api.refreshFileMetadata(target.path);
-          useSettingsStore.getState().refreshFileList();
-          onToast("Metadata refresh started", "success");
-        } catch (error) {
-          console.error("Failed to refresh metadata:", error);
-          onToast("Failed to refresh metadata", "error");
-        }
-      },
-    });
-
-    if (isTauri) {
-      items.push({
-        id: "ask-about-file",
-        label: "Ask about this file",
-        icon: MessageSquare,
-        run: async () => {
-          const chat = useChatStore.getState();
-          await chat.openPane();
-          chat.addContext(target.path);
-        },
-      });
-    }
-  }
-
   if (capabilities.canOpenInFileManager) {
-    items.push({
+    primaryItems.push({
       id: "open-in-file-manager",
       label: target.kind === "directory" ? "Open in file manager" : "Reveal in folder",
       icon: Folder,
@@ -125,8 +78,41 @@ export function buildFileContextMenuItems({
     });
   }
 
+  if (target.kind !== "directory" && isTauri) {
+    primaryItems.push({
+      id: "ask-about-file",
+      label: "Ask about this file",
+      icon: MessageSquare,
+      run: async () => {
+        const chat = useChatStore.getState();
+        await chat.openPane();
+        chat.addContext(target.path);
+      },
+    });
+  }
+
+  if (target.kind === "directory") return primaryItems;
+
+  const managementItems: ContextMenuItem[] = [
+    {
+      id: "rename",
+      label: "Rename",
+      icon: Edit2,
+      run: () => onRenameRequest?.(target.path),
+    },
+  ];
+
+  if (isTauri && availableRoots.length > 0) {
+    managementItems.push({
+        id: "move-to",
+        label: "Move to...",
+        icon: FolderPlus,
+        run: () => onMoveRequest?.(target.path),
+    });
+  }
+
   if (settings) {
-    items.push(
+    managementItems.push(
       ...menuContributors.flatMap((contributor) =>
         contributor({
           target,
@@ -138,5 +124,24 @@ export function buildFileContextMenuItems({
     );
   }
 
-  return items;
+  managementItems.push(
+    {
+      id: "refresh-metadata",
+      label: "Refresh metadata",
+      icon: RefreshCw,
+      run: async () => {
+        try {
+          await api.refreshFileMetadata(target.path);
+          useSettingsStore.getState().refreshFileList();
+          onToast("Metadata refresh started", "success");
+        } catch (error) {
+          console.error("Failed to refresh metadata:", error);
+          onToast("Failed to refresh metadata", "error");
+        }
+      },
+    },
+  );
+
+  managementItems[0].dividerBefore = primaryItems.length > 0;
+  return [...primaryItems, ...managementItems];
 }

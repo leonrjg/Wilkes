@@ -19,10 +19,8 @@ import {
 import { usePdfDocument } from "./pdfDocumentCache";
 import { api } from "../../services";
 import { Tooltip } from "../Tooltip";
-import SelectionActions, {
-  type DocumentSelection,
-  type PositionedSelection,
-} from "./SelectionActions";
+import SelectionActions, { type DocumentSelection } from "./SelectionActions";
+import { useDomDocumentSelection } from "./useDomDocumentSelection";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -172,7 +170,6 @@ export default function PdfViewer({
   const numPages = pdf?.numPages ?? null;
   const [isOutlineOpen, setIsOutlineOpen] = useState(false);
   const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
-  const [selectionBookmark, setSelectionBookmark] = useState<PositionedSelection | null>(null);
 
   useEffect(() => {
     const observer = new MutationObserver(() => {
@@ -426,48 +423,32 @@ export default function PdfViewer({
     }
   }, []);
 
-  const handleMouseUp = useCallback(() => {
-    const root = rootRef.current;
+  const mapPdfSelection = useCallback((range: Range, selection: Selection): DocumentSelection | null => {
     const container = containerRef.current;
-    const selection = window.getSelection();
-    if (!root || !container || !selection || selection.isCollapsed || selection.rangeCount === 0) {
-      setSelectionBookmark(null);
-      return;
-    }
-
-    const range = selection.getRangeAt(0);
+    if (!container) return null;
     const startNode = range.startContainer;
     const startElement =
       startNode instanceof Element ? startNode : startNode.parentElement ?? null;
     const pageElement = startElement?.closest<HTMLElement>("[data-page-number]");
     if (!pageElement || !container.contains(pageElement)) {
-      setSelectionBookmark(null);
-      return;
+      return null;
     }
 
     const pageNumber = Number(pageElement.dataset.pageNumber);
     const pageMetric = pageMetrics[pageNumber - 1];
     if (!pageNumber || !pageMetric) {
-      setSelectionBookmark(null);
-      return;
+      return null;
     }
 
     const selectionRect = range.getBoundingClientRect();
     const pageRect = pageElement.getBoundingClientRect();
-    const rootRect = root.getBoundingClientRect();
     const pageScale = renderedWidth / pageMetric.width;
     const quote = selection.toString().trim();
     if (!quote || selectionRect.width <= 0 || selectionRect.height <= 0) {
-      setSelectionBookmark(null);
-      return;
+      return null;
     }
 
     const selectionClientRects = Array.from(range.getClientRects());
-    // Anchor actions to the end of the final selected line, matching the code
-    // viewer. The range's bounding rectangle can extend to the right edge of
-    // an earlier, longer line in a multi-line selection.
-    const selectionEndRect = selectionClientRects[selectionClientRects.length - 1] ?? selectionRect;
-
     // Highlight the exact selected text by capturing one rectangle per line
     // (getClientRects) instead of the selection's bounding box, which on a
     // multi-line selection would also cover the unselected head/tail of the
@@ -488,26 +469,16 @@ export default function PdfViewer({
         })),
     );
     if (rects.length === 0) {
-      setSelectionBookmark(null);
-      return;
+      return null;
     }
 
-    setSelectionBookmark({
-      selection: {
-        origin: { PdfPage: { page: pageNumber, bbox: unionBox(rects) } },
-        rects,
-        quote,
-      },
-      left: Math.min(
-        Math.max(selectionEndRect.right - rootRect.left, 8),
-        Math.max(rootRect.width - 128, 8),
-      ),
-      top: Math.min(
-        Math.max(selectionEndRect.bottom - rootRect.top + 3, 8),
-        Math.max(rootRect.height - 40, 8),
-      ),
-    });
+    return {
+      origin: { PdfPage: { page: pageNumber, bbox: unionBox(rects) } },
+      rects,
+      quote,
+    };
   }, [pageMetrics, renderedWidth]);
+  const domSelection = useDomDocumentSelection({ rootRef, mapSelection: mapPdfSelection });
 
   const {
     searchInputRef,
@@ -747,7 +718,7 @@ export default function PdfViewer({
         <div
           ref={containerRef}
           className={`flex-1 min-w-0 overflow-auto bg-[var(--bg-sidebar)] pr-1 ${isDark ? "pdf-dark-mode" : ""}`}
-          onMouseUp={handleMouseUp}
+          onMouseUp={domSelection.readSelection}
           onScroll={() => {
             requestAnimationFrame(() => {
               syncCurrentPageFromScroll();
@@ -921,13 +892,13 @@ export default function PdfViewer({
         </div>
       </div>
       <SelectionActions
-        positioned={selectionBookmark}
+        positioned={domSelection.positioned}
         onAddBookmark={onAddBookmark}
         showChatActions={showChatSelectionActions}
         onExplain={onExplainSelection}
         onAsk={onAskSelection}
-        onDismiss={() => setSelectionBookmark(null)}
-        onClearSelection={() => window.getSelection()?.removeAllRanges()}
+        onDismiss={domSelection.dismiss}
+        onClearSelection={domSelection.clearSelection}
         dismissOnCollapsedDomSelection
       />
     </div>

@@ -165,7 +165,7 @@ export default function SettingsModal({
   refreshSemanticReady,
   onSettingsUpdate,
 }: SettingsModalProps) {
-  const [activeTab, setActiveTab] = useState<"general" | "extensions" | "integrations" | "models" | "chunking" | "data" | "workers" | "logs" | "technical">("general");
+  const [activeTab, setActiveTab] = useState<"general" | "chat" | "extensions" | "integrations" | "models" | "chunking" | "data" | "workers" | "logs" | "technical">("general");
   const [settings, setSettings] = useState<Settings | null>(null);
 
   useEffect(() => {
@@ -219,6 +219,7 @@ export default function SettingsModal({
           <div className="w-40 border-r border-[var(--border-main)] bg-[var(--bg-sidebar)] p-2 flex flex-col gap-3">
             <div className="flex flex-col gap-0.5">
               <TabButton id="general" label="General" />
+              {isTauri && <TabButton id="chat" label="Chat" />}
               <TabButton id="extensions" label="File extensions" />
               <TabButton id="integrations" label="Integrations" />
             </div>
@@ -326,10 +327,16 @@ export default function SettingsModal({
                       ))}
                     </div>
                   </section>
+                </div>
+              )}
+            </div>
 
-                  {isTauri && (
-                    <section>
-                      <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Chat</h3>
+            <div className={activeTab === "chat" ? "block h-full" : "hidden"}>
+              {settings && isTauri && (
+                <div className="space-y-4">
+                  <section>
+                    <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Chat</h3>
+                    <div className="space-y-3">
                       <div className="space-y-1">
                         <div className="flex justify-between items-baseline">
                           <label className="text-xs text-[var(--text-muted)]">Default chat agent</label>
@@ -349,8 +356,24 @@ export default function SettingsModal({
                           ))}
                         </select>
                       </div>
-                    </section>
-                  )}
+                      <div className="space-y-1">
+                        <div className="flex justify-between items-baseline">
+                          <label htmlFor="chat-custom-instructions" className="text-xs text-[var(--text-muted)]">
+                            Custom instructions
+                          </label>
+                          <p className="text-[10px] text-[var(--text-dim)] italic">Applied to every chat turn</p>
+                        </div>
+                        <textarea
+                          id="chat-custom-instructions"
+                          value={settings.chat_custom_instructions ?? ""}
+                          onChange={(e) => handleUpdateSettings({ chat_custom_instructions: e.target.value })}
+                          placeholder="e.g. Keep answers concise and include page references."
+                          rows={5}
+                          className="w-full resize-y bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
+                        />
+                      </div>
+                    </div>
+                  </section>
                 </div>
               )}
             </div>

@@ -38,6 +38,7 @@ pub fn build_context_block(
     active_doc: Option<&ActiveDoc>,
     context_files: &[ContextFile],
     active_doc_text: Option<&ActiveDocText>,
+    custom_instructions: &str,
 ) -> String {
     let mut out = String::new();
     out.push_str("<wilkes-context>\n");
@@ -61,6 +62,13 @@ pub fn build_context_block(
          omit path to read the open document, or pass a path listed in this context. Use \
          list_context to inspect the current Wilkes context.\n",
     );
+
+    if !custom_instructions.trim().is_empty() {
+        out.push_str("User custom instructions (follow these unless they conflict with higher-priority instructions):\n");
+        out.push_str("<wilkes-custom-instructions>\n");
+        out.push_str(custom_instructions.trim());
+        out.push_str("\n</wilkes-custom-instructions>\n");
+    }
 
     match active_doc {
         Some(doc) => match doc.page {
@@ -119,7 +127,7 @@ mod tests {
 
     #[test]
     fn first_turn_carries_preamble() {
-        let block = build_context_block(true, None, &[], None);
+        let block = build_context_block(true, None, &[], None, "");
         assert!(block.contains("You are answering questions inside Wilkes"));
         assert!(block.contains("get_document_text"));
         assert!(block.contains("Open document: none"));
@@ -128,7 +136,7 @@ mod tests {
 
     #[test]
     fn later_turn_omits_preamble() {
-        let block = build_context_block(false, None, &[], None);
+        let block = build_context_block(false, None, &[], None, "");
         assert!(!block.contains("You are answering questions inside Wilkes"));
         assert!(block.contains("pass that document path as search.file"));
         assert!(block.contains("get_document_text"));
@@ -152,7 +160,7 @@ mod tests {
                 added_this_turn: true,
             },
         ];
-        let block = build_context_block(false, Some(&doc), &files, None);
+        let block = build_context_block(false, Some(&doc), &files, None, "");
         assert!(block.contains("Open document: /tmp/paper.pdf (page 12)"));
         assert!(block.contains("/tmp/paper.pdf  (40 pages)"));
         assert!(block.contains("/tmp/appendix.pdf  (8 pages)  <- added this turn"));
@@ -169,7 +177,7 @@ mod tests {
             truncated: true,
         };
 
-        let block = build_context_block(false, Some(&doc), &[], Some(&text));
+        let block = build_context_block(false, Some(&doc), &[], Some(&text), "");
 
         assert!(block.contains("<wilkes-active-document-text truncated=\"true\">"));
         assert!(block.contains("IO programming here means input/output handling."));
@@ -183,8 +191,20 @@ mod tests {
             page: Some(7),
         };
 
-        let block = build_context_block(false, Some(&doc), &[], Some(&ActiveDocText::Unavailable));
+        let block = build_context_block(
+            false,
+            Some(&doc),
+            &[],
+            Some(&ActiveDocText::Unavailable),
+            "",
+        );
 
         assert!(block.contains("Active document text: unavailable"));
+    }
+
+    #[test]
+    fn custom_instructions_are_included_on_every_turn() {
+        let block = build_context_block(false, None, &[], None, "Answer in Spanish.");
+        assert!(block.contains("<wilkes-custom-instructions>\nAnswer in Spanish."));
     }
 }

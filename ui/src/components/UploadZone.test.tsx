@@ -178,7 +178,7 @@ describe("UploadZone", () => {
 
     render(<UploadZone {...defaultProps} root="/some/root" />);
 
-    const removeBtn = screen.getByTitle("Remove file");
+    const removeBtn = screen.getByRole("button", { name: "Remove file" });
     await act(async () => { fireEvent.click(removeBtn); });
 
     expect(mockSource.deleteFile).toHaveBeenCalledWith("test.txt");

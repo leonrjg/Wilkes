@@ -24,15 +24,7 @@ async fn preview_text(match_ref: &MatchRef) -> anyhow::Result<PreviewData> {
             .count() as u32
             + 1;
 
-        // Convert byte range to UTF-16 code unit range for the frontend (JS/CodeMirror)
-        let utf16_start = content[..start].encode_utf16().count();
-        let utf16_len = content[start..end].encode_utf16().count();
-        let highlight_range = ByteRange {
-            start: utf16_start,
-            end: utf16_start + utf16_len,
-        };
-
-        (highlight_line, highlight_range)
+        (highlight_line, ByteRange { start, end })
     } else {
         let line = match &match_ref.origin {
             SourceOrigin::TextFile { line, .. } => *line,
@@ -204,7 +196,7 @@ mod tests {
             panic!("Expected Text preview");
         };
         assert_eq!(highlight_range.start, 1);
-        assert_eq!(highlight_range.end, 2);
+        assert_eq!(highlight_range.end, 3);
     }
 
     #[tokio::test]

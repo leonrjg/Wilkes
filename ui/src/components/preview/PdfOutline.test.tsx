@@ -56,7 +56,7 @@ describe("PdfOutline", () => {
         onClose={onClose}
       />,
     );
-    fireEvent.click(screen.getByTitle("Close table of contents"));
+    fireEvent.click(screen.getByRole("button", { name: "Close table of contents" }));
     expect(onClose).toHaveBeenCalled();
   });
 });

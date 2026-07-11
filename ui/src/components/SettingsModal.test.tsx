@@ -15,6 +15,7 @@ vi.mock("codemirror", () => ({ basicSetup: [] }));
 vi.mock("@codemirror/lang-json", () => ({ json: vi.fn() }));
 vi.mock("@codemirror/theme-one-dark", () => ({ oneDark: [] }));
 vi.mock("@codemirror/commands", () => ({ indentWithTab: {} }));
+vi.mock("../services", () => ({ isTauri: true }));
 
 describe("SettingsModal", () => {
   const mockApi = {
@@ -86,6 +87,19 @@ describe("SettingsModal", () => {
     });
     fireEvent.click(screen.getByText("Dark"));
     expect(mockApi.updateSettings).toHaveBeenCalledWith({ theme: "Dark" });
+  });
+
+  it("persists chat custom instructions", async () => {
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    fireEvent.change(screen.getByLabelText("Custom instructions"), {
+      target: { value: "Answer in Spanish." },
+    });
+    expect(mockApi.updateSettings).toHaveBeenCalledWith({
+      chat_custom_instructions: "Answer in Spanish.",
+    });
   });
 
   it("switches to JSON and applies changes", async () => {

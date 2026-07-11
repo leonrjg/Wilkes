@@ -30,4 +30,9 @@ describe("CopyButton", () => {
     await waitFor(() => expect(onCopyError).toHaveBeenCalledOnce());
     expect(screen.getByRole("button", { name: "Copy" })).toHaveTextContent("Copy");
   });
+
+  it("does not render a native title tooltip", () => {
+    render(<CopyButton copy={vi.fn()} title="Copy">Copy</CopyButton>);
+    expect(screen.getByRole("button", { name: "Copy" })).not.toHaveAttribute("title");
+  });
 });

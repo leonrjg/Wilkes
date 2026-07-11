@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { X, ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Hash, Percent, Link2 } from "react-feather";
+import { X, ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, Percent } from "react-feather";
 import CodeViewer from "./preview/CodeViewer";
 import MarkdownViewer from "./preview/MarkdownViewer";
 import PdfViewer from "./preview/PdfViewer";
 import type { DocumentSelection } from "./preview/SelectionActions";
+import { utf8ByteRangeToUtf16Range } from "./preview/textOffsets";
 import { readMarkdownViewMode, saveMarkdownViewMode } from "./preview/textScrollMemory";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
@@ -17,7 +18,8 @@ import { formatDocumentMonthYear } from "../lib/dateFormatting";
 import { useToasts } from "./Toast";
 import { Tooltip } from "./Tooltip";
 import { CopyButton } from "./CopyButton";
-import { DocumentEntryRow, fileName, type DocumentDetail } from "./DocumentEntryRow";
+import { fileName, type DocumentDetail } from "./DocumentEntryRow";
+import ResultList from "./ResultList";
 
 interface Props {
   canGoBack?: boolean;
@@ -84,7 +86,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   const [relatedStatus, setRelatedStatus] = useState<RelatedStatus>("idle");
   const [relatedDocuments, setRelatedDocuments] = useState<RelatedDocument[]>([]);
   const [relatedPanelOpen, setRelatedPanelOpen] = useState(false);
-  const [markdownView, setMarkdownView] = useState<"source" | "rendered">("source");
+  const [markdownView, setMarkdownView] = useState<"source" | "rendered">("rendered");
 
   useEffect(() => {
     if (!selectedMatch || "PdfPage" in selectedMatch.origin) return;
@@ -236,6 +238,12 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
       ? [{ id: bookmark.id, range: bookmark.text_range }]
       : [],
   );
+  // Text locations stay in persisted UTF-8 document coordinates. Each renderer
+  // translates only at its boundary (CodeMirror uses UTF-16; Markdown does not).
+  const renderedHighlightRange =
+    !isPdfFile && displayData && "Text" in displayData
+      ? selectedMatch.text_range ?? displayData.Text.highlight_range
+      : { start: 0, end: 0 };
   // When the navigation target is one of this file's bookmarks, emphasise its
   // exact per-line rects instead of the union bbox the search path uses.
   const bboxesEqual = (a: BoundingBox | null, b: BoundingBox | null) =>
@@ -352,7 +360,6 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
                   <button
                     onClick={handleOpenDoi}
                     aria-label={`Open DOI ${doi}`}
-                    title={`Open DOI ${doi}`}
                     className={groupedActionSegmentClassName()}
                   >
                     <span className="truncate max-w-[140px]">DOI: {doi}</span>
@@ -363,7 +370,6 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
                   <CopyButton
                     copy={() => api.writeClipboard(doi)}
                     aria-label={`Copy DOI ${doi}`}
-                    title={`Copy DOI ${doi}`}
                     copiedChildren={<Check size={10} />}
                     className={`${groupedActionSegmentClassName()} border-l border-[var(--border-main)]`}
                   >
@@ -378,7 +384,6 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
                   <button
                     onClick={handleOpenScholar}
                     aria-label="Open Google Scholar"
-                    title="Open Google Scholar"
                     className={actionButtonClassName()}
                   >
                     <span>Scholar</span>
@@ -392,7 +397,6 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
               <CopyButton
                 copy={() => api.writeClipboard(selectedMatch.path)}
                 aria-label="Copy path"
-                title="Copy path"
                 copiedChildren={<><Check size={10} /><span>Copied</span></>}
                 className={actionButtonClassName(true)}
               >
@@ -407,7 +411,6 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
           <button
             onClick={() => setRelatedPanelOpen((open) => !open)}
             aria-label={relatedPanelOpen ? "Hide related documents" : "Show related documents"}
-            title={relatedPanelOpen ? "Hide related documents" : "Show related documents"}
             className={`hidden p-1 rounded text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] md:inline-flex ${
               relatedPanelOpen ? "bg-[var(--bg-active)] text-[var(--text-main)]" : ""
             }`}
@@ -417,42 +420,22 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
         </Tooltip>
 
         {isMarkdownFile && (
-          <div
-            className="inline-flex items-stretch overflow-hidden rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[11px]"
-            aria-label="Markdown view"
-          >
+          <Tooltip content={markdownView === "rendered" ? "View Markdown source" : "View rendered Markdown"}>
             <button
               type="button"
-              onClick={() => setRememberedMarkdownView("source")}
-              aria-pressed={markdownView === "source"}
-              className={`px-2 py-1 transition-colors ${
-                markdownView === "source"
-                  ? "bg-[var(--bg-header)] text-[var(--text-main)]"
-                  : "text-[var(--text-dim)] hover:text-[var(--text-main)]"
-              }`}
+              onClick={() => setRememberedMarkdownView(markdownView === "rendered" ? "source" : "rendered")}
+              aria-label={markdownView === "rendered" ? "View Markdown source" : "View rendered Markdown"}
+              className="inline-flex p-1 rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-header)] hover:text-[var(--text-main)]"
             >
-              Source
+              {markdownView === "rendered" ? <Code size={16} /> : <Eye size={16} />}
             </button>
-            <button
-              type="button"
-              onClick={() => setRememberedMarkdownView("rendered")}
-              aria-pressed={markdownView === "rendered"}
-              className={`border-l border-[var(--border-main)] px-2 py-1 transition-colors ${
-                markdownView === "rendered"
-                  ? "bg-[var(--bg-header)] text-[var(--text-main)]"
-                  : "text-[var(--text-dim)] hover:text-[var(--text-main)]"
-              }`}
-            >
-              Rendered
-            </button>
-          </div>
+          </Tooltip>
         )}
 
         <Tooltip content="Close preview">
           <button
             onClick={clearPreview}
             aria-label="Close preview"
-            title="Close preview"
             className="p-1 hover:bg-red-500/10 hover:text-red-500 rounded text-[var(--text-dim)] transition-colors"
           >
             <X size={16} />
@@ -488,7 +471,17 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
                 onPageChange={handleChatPageChange}
               />
             ) : isMarkdownFile && markdownView === "rendered" ? (
-              <MarkdownViewer content={displayData.Text.content} documentPath={selectedMatch.path} />
+              <MarkdownViewer
+                content={displayData.Text.content}
+                documentPath={selectedMatch.path}
+                restoreScrollPosition={shouldRestoreSourceScroll}
+                highlightRange={renderedHighlightRange}
+                bookmarkHighlights={textBookmarkHighlights}
+                onAddBookmark={handleAddBookmark}
+                showChatSelectionActions={chatSelectionActionsAvailable}
+                onExplainSelection={handleExplainSelection}
+                onAskSelection={handleAskSelection}
+              />
             ) : displayData && "Text" in displayData ? (
               <CodeViewer
                 content={displayData.Text.content}
@@ -496,7 +489,10 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
                 documentPath={selectedMatch.path}
                 restoreScrollPosition={shouldRestoreSourceScroll}
                 highlightLine={displayData.Text.highlight_line}
-                highlightRange={displayData.Text.highlight_range}
+                highlightRange={utf8ByteRangeToUtf16Range(
+                  displayData.Text.content,
+                  displayData.Text.highlight_range,
+                )}
                 bookmarkHighlights={textBookmarkHighlights}
                 onAddBookmark={handleAddBookmark}
                 showChatSelectionActions={chatSelectionActionsAvailable}
@@ -519,30 +515,6 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   );
 }
 
-function scoreLabel(score: number) {
-  return `${Math.max(0, Math.min(100, Math.round(score * 100)))}%`;
-}
-
-function relatedDocumentDetails(doc: RelatedDocument): DocumentDetail[] {
-  return [
-    {
-      key: "score",
-      label: "Score",
-      value: scoreLabel(doc.score),
-      valueTitle: `${doc.score.toFixed(3)} cosine similarity`,
-      icon: Percent,
-      monospace: true,
-    },
-    {
-      key: "indexed-chunks",
-      label: "Indexed chunks",
-      value: doc.indexed_chunks.toLocaleString(),
-      icon: Hash,
-      monospace: true,
-    },
-  ];
-}
-
 function RelatedDocumentsPanel({
   status,
   documents,
@@ -563,7 +535,6 @@ function RelatedDocumentsPanel({
             type="button"
             onClick={onClose}
             aria-label="Close related documents"
-            title="Close related documents"
             className="inline-flex rounded p-0.5 text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)]"
           >
             <X size={14} />
@@ -583,15 +554,39 @@ function RelatedDocumentsPanel({
         {status === "empty" && (
           <div className="px-3 py-3 text-xs text-[var(--text-dim)]">No related documents</div>
         )}
-        {documents.map((doc) => (
-          <DocumentEntryRow
-            key={doc.path}
-            entry={doc}
-            details={relatedDocumentDetails(doc)}
-            onClick={() => onOpen(doc.path)}
+        {status === "ready" && (
+          <ResultList
+            documents={sortRelatedDocuments(documents)}
+            preserveDocumentOrder
+            documentDetails={(entry) => relatedDocumentDetails(entry as RelatedDocument)}
+            onFileClick={onOpen}
+            onMatchClick={() => {}}
           />
-        ))}
+        )}
       </div>
     </aside>
+  );
+}
+
+function relatedDocumentDetails(document: RelatedDocument): DocumentDetail[] {
+  return [{
+    key: "score",
+    label: "Score",
+    value: `${Math.round(document.score * 100)}%`,
+    valueTitle: `${document.score.toFixed(3)} cosine similarity`,
+    icon: Percent,
+    monospace: true,
+  }];
+}
+
+function sortRelatedDocuments(documents: RelatedDocument[]): RelatedDocument[] {
+  return [...documents].sort(
+    (a, b) =>
+      b.score - a.score ||
+      fileName(a.path).localeCompare(fileName(b.path), undefined, {
+        numeric: true,
+        sensitivity: "base",
+      }) ||
+      a.path.localeCompare(b.path),
   );
 }

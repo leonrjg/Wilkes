@@ -77,7 +77,7 @@ describe("SearchBar", () => {
     useSearchStore.setState({ search: searchMock });
 
     render(<SearchBar sourceSlot={<MockSourceSlot />} />);
-    const regexToggle = screen.getByTitle("Regular expression");
+    const regexToggle = screen.getByRole("button", { name: "Regular expression" });
 
     fireEvent.click(regexToggle);
 
@@ -102,7 +102,7 @@ describe("SearchBar", () => {
     useSettingsStore.setState({ setPreferSemantic: setPreferSemanticMock });
 
     render(<SearchBar sourceSlot={<MockSourceSlot />} />);
-    const semanticToggle = screen.getByTitle("Semantic search");
+    const semanticToggle = screen.getByRole("button", { name: "Semantic search" });
 
     fireEvent.click(semanticToggle);
 
@@ -114,7 +114,7 @@ describe("SearchBar", () => {
     useSearchStore.setState({ search: searchMock });
 
     render(<SearchBar sourceSlot={<MockSourceSlot />} />);
-    const caseToggle = screen.getByTitle("Case sensitive");
+    const caseToggle = screen.getByRole("button", { name: "Case sensitive" });
 
     fireEvent.click(caseToggle);
     fireEvent.change(screen.getByPlaceholderText("Search…"), { target: { value: "test" } });

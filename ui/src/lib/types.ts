@@ -65,11 +65,8 @@ export interface RelatedDocumentsQuery {
   limit?: number | null;
 }
 
-export interface RelatedDocument {
-  path: string;
-  file_type: FileType;
+export interface RelatedDocument extends FileEntry {
   score: number;
-  indexed_chunks: number;
 }
 
 export interface MatchRef {
@@ -378,6 +375,8 @@ export interface Settings {
    *  the backend when a config option changes in the chat pane and applied to
    *  new sessions; the UI does not edit this directly. */
   chat_config?: ChatBackendConfig[];
+  /** User-authored instructions applied to every chat turn. */
+  chat_custom_instructions?: string;
 }
 
 export interface ChatBackendConfig {

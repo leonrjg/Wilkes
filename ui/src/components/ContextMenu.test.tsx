@@ -1,8 +1,8 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { ContextMenu } from "./ContextMenu";
+import { ContextMenu, type ContextMenuItem } from "./ContextMenu";
 
-function makeMenu(items: { id: string; label: string; run: () => Promise<void> | void }[]) {
+function makeMenu(items: Pick<ContextMenuItem, "id" | "label" | "dividerBefore" | "run">[]) {
   return { position: { x: 10, y: 10 }, target: null, items };
 }
 
@@ -52,6 +52,20 @@ describe("ContextMenu", () => {
 
     expect(screen.queryByTestId("context-menu-spinner")).not.toBeInTheDocument();
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders dividers before grouped actions", () => {
+    render(
+      <ContextMenu
+        menu={makeMenu([
+          { id: "open", label: "Open", run: vi.fn() },
+          { id: "rename", label: "Rename", dividerBefore: true, run: vi.fn() },
+        ])}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByRole("separator")).toHaveLength(1);
   });
 
   it("closes and handles rejected async actions", async () => {

@@ -409,6 +409,7 @@ describe("PdfViewer", () => {
     } as DOMRect;
     const range = {
       startContainer: pageWrapper,
+      endContainer: pageWrapper,
       getBoundingClientRect: () => selectionDomRect,
       getClientRects: () => [selectionDomRect] as unknown as DOMRectList,
     };
@@ -446,6 +447,7 @@ describe("PdfViewer", () => {
     const finalLineRect = { top: 95, left: 60, width: 100, height: 20, bottom: 115, right: 160, x: 60, y: 95, toJSON: () => ({}) } as DOMRect;
     const range = {
       startContainer: pageWrapper,
+      endContainer: pageWrapper,
       getBoundingClientRect: () => firstLineRect,
       getClientRects: () => [firstLineRect, finalLineRect] as unknown as DOMRectList,
     };
@@ -504,6 +506,7 @@ describe("PdfViewer", () => {
     } as DOMRect;
     const range = {
       startContainer: pageWrapper,
+      endContainer: pageWrapper,
       getBoundingClientRect: () => selectionDomRect,
       getClientRects: () => [selectionDomRect] as unknown as DOMRectList,
     };
@@ -765,7 +768,7 @@ describe("PdfViewer", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     });
 
-    const button = screen.getByTitle("This document has no table of contents");
+    const button = screen.getByRole("button", { name: "This document has no table of contents" });
     expect(button).toBeDisabled();
   });
 
@@ -778,7 +781,7 @@ describe("PdfViewer", () => {
     });
 
     expect(screen.queryByTestId("pdf-outline-panel")).not.toBeInTheDocument();
-    const button = screen.getByTitle("Table of contents");
+    const button = screen.getByRole("button", { name: "Table of contents" });
     expect(button).toBeEnabled();
 
     fireEvent.click(button);

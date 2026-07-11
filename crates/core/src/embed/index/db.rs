@@ -20,6 +20,13 @@ use super::super::models::installer::{EmbedProgress, IndexBuildProgress, Progres
 use super::super::Embedder;
 use super::chunk::{chunk_content, Chunk};
 
+fn system_time_ms(value: SystemTime) -> Option<i64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+}
+
 // ── sqlite-vec extension loading ──────────────────────────────────────────────
 
 fn load_sqlite_vec() {
@@ -648,12 +655,12 @@ mod tests {
         assert_eq!(
             related
                 .iter()
-                .map(|doc| doc.path.clone())
+                .map(|doc| doc.entry.path.clone())
                 .collect::<Vec<_>>(),
             vec![canon(&close), canon(&far)]
         );
         assert!(related[0].score > related[1].score);
-        assert_eq!(related[0].indexed_chunks, 1);
+        assert!(related[0].entry.size_bytes > 0);
     }
 
     #[test]
@@ -2600,11 +2607,27 @@ impl SemanticIndex {
             };
             let candidate_centroid = centroid(&acc.sum, acc.chunks);
             let score = cosine_similarity(&source_centroid, &candidate_centroid);
+            let metadata = std::fs::metadata(&abs_path)?;
+            let extension = abs_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string();
             related.push(RelatedDocument {
-                path: abs_path,
-                file_type,
+                entry: crate::types::FileEntry {
+                    path: abs_path,
+                    size_bytes: metadata.len(),
+                    file_type,
+                    extension,
+                    created_at_ms: metadata.created().ok().and_then(system_time_ms),
+                    modified_at_ms: metadata.modified().ok().and_then(system_time_ms),
+                    title: None,
+                    author: None,
+                    publication_date: None,
+                    citation_count: None,
+                    metadata_conflicts: Default::default(),
+                },
                 score,
-                indexed_chunks: acc.chunks,
             });
         }
 
@@ -2613,18 +2636,18 @@ impl SemanticIndex {
                 .total_cmp(&a.score)
                 .then_with(|| {
                     let left = a
-                        .path
+                        .entry.path
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or_default();
                     let right = b
-                        .path
+                        .entry.path
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or_default();
                     left.cmp(right)
                 })
-                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.entry.path.cmp(&b.entry.path))
         });
         related.truncate(limit);
         Ok(related)

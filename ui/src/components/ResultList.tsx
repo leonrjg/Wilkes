@@ -327,13 +327,23 @@ function isSelected(row: Row, selectedMatch: MatchRef | null): boolean {
 interface Props {
   onMatchClick: (ref: MatchRef) => void;
   onFileClick: (path: string) => void;
+  documents?: FileEntry[];
+  preserveDocumentOrder?: boolean;
+  documentDetails?: (entry: FileEntry) => DocumentDetail[];
 }
 
-export default function ResultList({ onMatchClick, onFileClick }: Props) {
+export default function ResultList({
+  onMatchClick,
+  onFileClick,
+  documents,
+  preserveDocumentOrder = false,
+  documentDetails,
+}: Props) {
   const results = useSearchStore((s) => s.results);
   const stats = useSearchStore((s) => s.stats);
   const searching = useSearchStore((s) => s.searching);
-  const hasQuery = useSearchStore((s) => s.hasQuery);
+  const storeHasQuery = useSearchStore((s) => s.hasQuery);
+  const hasQuery = documents ? false : storeHasQuery;
   const selectedMatch = useSearchStore((s) => s.selectedMatch);
   const replaySearch = useSearchStore((s) => s.replaySearch);
   const clearPreview = useSearchStore((s) => s.clearPreview);
@@ -393,8 +403,12 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
     });
   }, [renameTarget?.path]);
 
-  const sortedFileList = sortFileEntries(fileList, fileSortKey, fileSortDirection);
-  const sortedOmittedFileList = sortFileEntries(omittedFileList, fileSortKey, fileSortDirection);
+  const displayedFileList = documents ?? fileList;
+  const displayedOmittedFileList = documents ? [] : omittedFileList;
+  const sortedFileList = preserveDocumentOrder
+    ? displayedFileList
+    : sortFileEntries(displayedFileList, fileSortKey, fileSortDirection);
+  const sortedOmittedFileList = sortFileEntries(displayedOmittedFileList, fileSortKey, fileSortDirection);
   const rows = buildRows(results, expandedFiles);
   const onToast = (message: string, type: "success" | "error") => addToast(message, { type });
 
@@ -648,41 +662,45 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
             onChange={(e) => setFilterText(e.target.value)}
             className="flex-1 min-w-0 bg-transparent border-none outline-none text-[11px] text-[var(--text-main)] placeholder-[var(--text-dim)]"
           />
-          <button
-            ref={sortMenuTriggerRef}
-            type="button"
-            aria-label="Sort and column visibility"
-            aria-haspopup="menu"
-            aria-expanded={sortMenuOpen}
-            onClick={() => setSortMenuOpen((open) => !open)}
-            className="flex h-6 flex-shrink-0 items-center gap-0.5 rounded border border-[var(--border-main)] bg-[var(--bg-active)] px-1 text-[11px] text-[var(--text-main)] outline-none hover:bg-[var(--bg-hover)]"
-          >
-            <span className="max-w-[68px] truncate">{SORT_KEY_LABELS[fileSortKey]}</span>
-            <ChevronDown size={10} aria-hidden="true" />
-          </button>
-          <SortVisibilityMenu
-            anchorRef={sortMenuTriggerRef}
-            open={sortMenuOpen}
-            onClose={() => setSortMenuOpen(false)}
-            sortKey={fileSortKey}
-            onSortKeyChange={setFileSortKey}
-            displayFields={fileDisplayFields}
-            onToggleDisplayField={toggleFileDisplayField}
-          />
-          <Tooltip content={`Sort ${fileSortDirection === "asc" ? "ascending" : "descending"}`}>
-            <button
-              type="button"
-              aria-label="Toggle file sort direction"
-              onClick={() => setFileSortDirection(fileSortDirection === "asc" ? "desc" : "asc")}
-              className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-main)] hover:bg-[var(--bg-hover)]"
-            >
-              {fileSortDirection === "asc" ? (
-                <ArrowUp size={12} aria-hidden="true" />
-              ) : (
-                <ArrowDown size={12} aria-hidden="true" />
-              )}
-            </button>
-          </Tooltip>
+          {!preserveDocumentOrder && (
+            <>
+              <button
+                ref={sortMenuTriggerRef}
+                type="button"
+                aria-label="Sort and column visibility"
+                aria-haspopup="menu"
+                aria-expanded={sortMenuOpen}
+                onClick={() => setSortMenuOpen((open) => !open)}
+                className="flex h-6 flex-shrink-0 items-center gap-0.5 rounded border border-[var(--border-main)] bg-[var(--bg-active)] px-1 text-[11px] text-[var(--text-main)] outline-none hover:bg-[var(--bg-hover)]"
+              >
+                <span className="max-w-[68px] truncate">{SORT_KEY_LABELS[fileSortKey]}</span>
+                <ChevronDown size={10} aria-hidden="true" />
+              </button>
+              <SortVisibilityMenu
+                anchorRef={sortMenuTriggerRef}
+                open={sortMenuOpen}
+                onClose={() => setSortMenuOpen(false)}
+                sortKey={fileSortKey}
+                onSortKeyChange={setFileSortKey}
+                displayFields={fileDisplayFields}
+                onToggleDisplayField={toggleFileDisplayField}
+              />
+              <Tooltip content={`Sort ${fileSortDirection === "asc" ? "ascending" : "descending"}`}>
+                <button
+                  type="button"
+                  aria-label="Toggle file sort direction"
+                  onClick={() => setFileSortDirection(fileSortDirection === "asc" ? "desc" : "asc")}
+                  className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-main)] hover:bg-[var(--bg-hover)]"
+                >
+                  {fileSortDirection === "asc" ? (
+                    <ArrowUp size={12} aria-hidden="true" />
+                  ) : (
+                    <ArrowDown size={12} aria-hidden="true" />
+                  )}
+                </button>
+              </Tooltip>
+            </>
+          )}
           <Tooltip content="Refresh metadata (re-derive titles, publication dates, Zotero)">
             <button
               type="button"
@@ -704,6 +722,7 @@ export default function ResultList({ onMatchClick, onFileClick }: Props) {
             <FileEntryRowAdapter
               key={entry.path}
               entry={entry}
+              leadingDetails={documentDetails?.(entry) ?? []}
               displayFields={fileDisplayFields}
               selected={selectedMatch?.path === entry.path}
               onClick={() => onFileClick(entry.path)}
@@ -1039,6 +1058,7 @@ function SortVisibilityMenu({
 
 function FileEntryRowAdapter({
   entry,
+  leadingDetails = [],
   displayFields,
   selected,
   detail,
@@ -1047,6 +1067,7 @@ function FileEntryRowAdapter({
   onContextMenu,
 }: {
   entry: FileEntry;
+  leadingDetails?: DocumentDetail[];
   displayFields: FileDisplayField[];
   selected: boolean;
   detail?: string;
@@ -1055,6 +1076,7 @@ function FileEntryRowAdapter({
   onContextMenu: (event: React.MouseEvent) => void;
 }) {
   const details: DocumentDetail[] = [
+    ...leadingDetails,
     ...(detail ? [{ key: "detail", label: "Detail", value: detail, icon: Info }] : []),
     ...FILE_DISPLAY_FIELDS.filter((f) => displayFields.includes(f.key)).map((field) => {
       const value = displayFieldValue(entry, field.key) ?? "—";

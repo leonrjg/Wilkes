@@ -23,5 +23,5 @@ export function saveMarkdownViewMode(path: string, mode: TextViewerMode): void {
 }
 
 export function readMarkdownViewMode(path: string): TextViewerMode {
-  return markdownModes.get(path) ?? "source";
+  return markdownModes.get(path) ?? "rendered";
 }

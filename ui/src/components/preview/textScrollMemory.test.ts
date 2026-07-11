@@ -23,12 +23,12 @@ describe("textScrollMemory", () => {
     expect(readTextScrollPosition("/clamped.md", "rendered")).toBe(1);
   });
 
-  it("defaults Markdown documents to source while remembering their selected mode", () => {
-    expect(readMarkdownViewMode("/new.md")).toBe("source");
+  it("defaults Markdown documents to rendered while remembering their selected mode", () => {
+    expect(readMarkdownViewMode("/new.md")).toBe("rendered");
 
-    saveMarkdownViewMode("/notes.md", "rendered");
+    saveMarkdownViewMode("/notes.md", "source");
 
-    expect(readMarkdownViewMode("/notes.md")).toBe("rendered");
-    expect(readMarkdownViewMode("/other.md")).toBe("source");
+    expect(readMarkdownViewMode("/notes.md")).toBe("source");
+    expect(readMarkdownViewMode("/other.md")).toBe("rendered");
   });
 });

@@ -109,10 +109,9 @@ pub struct RelatedDocumentsQuery {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RelatedDocument {
-    pub path: PathBuf,
-    pub file_type: FileType,
+    #[serde(flatten)]
+    pub entry: FileEntry,
     pub score: f32,
-    pub indexed_chunks: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -723,6 +722,11 @@ pub struct Settings {
     /// conversation on reopen.
     #[serde(default)]
     pub chat_config: Vec<ChatBackendConfig>,
+    /// User-authored instructions prepended to every chat turn. Kept in the
+    /// global settings (rather than a conversation record) so an edit applies
+    /// consistently to new and existing conversations.
+    #[serde(default)]
+    pub chat_custom_instructions: String,
 }
 
 fn default_file_display_fields() -> Vec<FileDisplayField> {
@@ -760,6 +764,7 @@ impl Default for Settings {
             file_display_fields: default_file_display_fields(),
             chat_backend: AgentBackend::default(),
             chat_config: Vec::new(),
+            chat_custom_instructions: String::new(),
         }
     }
 }

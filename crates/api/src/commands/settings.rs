@@ -46,6 +46,7 @@ mod tests {
         assert_eq!(settings.context_lines, 2);
         assert_eq!(settings.file_sort_key, FileSortKey::Filename);
         assert_eq!(settings.file_sort_direction, FileSortDirection::Asc);
+        assert_eq!(settings.chat_custom_instructions, "");
     }
 
     #[tokio::test]
@@ -114,5 +115,25 @@ mod tests {
         let updated = update_settings(&path, patch).await.unwrap();
         assert_eq!(updated.semantic.enabled, true);
         assert_eq!(updated.semantic.chunk_size, 1000);
+    }
+
+    #[tokio::test]
+    async fn test_update_chat_custom_instructions_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let instructions = "Use concise answers and cite document pages.";
+
+        let updated = update_settings(
+            &path,
+            serde_json::json!({ "chat_custom_instructions": instructions }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated.chat_custom_instructions, instructions);
+        assert_eq!(
+            get_settings(&path).await.unwrap().chat_custom_instructions,
+            instructions
+        );
     }
 }

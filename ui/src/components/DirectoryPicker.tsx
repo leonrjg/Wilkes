@@ -112,7 +112,7 @@ export default function DirectoryPicker({
                 <Tooltip content={b} className="font-mono break-all">
                   <button
                     onClick={() => onChange(b)}
-                    className={`h-full text-xs px-2 flex-shrink-0 truncate max-w-[100px] transition-colors ${
+                    className={`h-full select-none text-xs px-2 flex-shrink-0 truncate max-w-[100px] transition-colors ${
                       active
                         ? "text-[var(--text-main)] font-bold"
                         : "text-[var(--text-muted)] hover:text-[var(--text-main)]"

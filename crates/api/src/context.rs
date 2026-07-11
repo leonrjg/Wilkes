@@ -1379,7 +1379,8 @@ impl AppContext {
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let supported_extensions = settings.supported_extensions.clone();
 
-        tokio::task::spawn_blocking(move || {
+        let root = query.root.clone();
+        let mut related = tokio::task::spawn_blocking(move || {
             let guard = runtime.index.lock().unwrap_or_else(|p| p.into_inner());
             let idx = guard
                 .as_ref()
@@ -1388,7 +1389,22 @@ impl AppContext {
                 .map_err(|e| e.to_string())
         })
         .await
-        .map_err(|e| format!("related documents task panicked: {e}"))?
+        .map_err(|e| format!("related documents task panicked: {e}"))??;
+
+        // Use the canonical file-list metadata pipeline so every document list
+        // renders and sorts the same record shape.
+        let listed = self.list_files(root).await.map_err(|e| e.to_string())?;
+        let entries = listed
+            .files
+            .into_iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect::<std::collections::HashMap<_, _>>();
+        for document in &mut related {
+            if let Some(entry) = entries.get(&document.entry.path) {
+                document.entry = entry.clone();
+            }
+        }
+        Ok(related)
     }
 
     // ── Build index ───────────────────────────────────────────────────────────
@@ -4529,7 +4545,7 @@ exit 0
             .unwrap();
 
         assert_eq!(docs.len(), 1);
-        assert_eq!(docs[0].path, related);
+        assert_eq!(docs[0].entry.path, std::fs::canonicalize(related).unwrap());
     }
 
     #[tokio::test]

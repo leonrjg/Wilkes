@@ -37,7 +37,6 @@ export function Tooltip({ content, children, className = "" }: TooltipProps) {
 
   const child = React.Children.only(children);
   const childProps = child.props;
-  const title = childProps.title ?? (typeof content === "string" ? content : undefined);
   const describedBy = [childProps["aria-describedby"], open ? id : null]
     .filter(Boolean)
     .join(" ") || undefined;
@@ -53,8 +52,8 @@ export function Tooltip({ content, children, className = "" }: TooltipProps) {
             (ref as React.MutableRefObject<HTMLElement | null>).current = node;
           }
         },
+        "aria-label": childProps["aria-label"] ?? (typeof content === "string" ? content : undefined),
         "aria-describedby": describedBy,
-        title,
         onMouseEnter: (event: React.MouseEvent<HTMLElement>) => {
           childProps.onMouseEnter?.(event);
           setOpen(true);

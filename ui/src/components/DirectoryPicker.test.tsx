@@ -52,6 +52,11 @@ describe("DirectoryPicker", () => {
     expect(screen.getByText("project")).toBeInTheDocument();
   });
 
+  it("prevents directory tab text from being selected", () => {
+    renderWithToasts();
+    expect(screen.getByRole("button", { name: "/home/user/other" })).toHaveClass("select-none");
+  });
+
   it("calls onChange when a directory is clicked", () => {
     renderWithToasts();
     const otherDir = screen.getByText("other");
@@ -70,12 +75,12 @@ describe("DirectoryPicker", () => {
     renderWithToasts();
 
     // "other" is already favorited
-    const otherFavoriteBtn = screen.getByTitle("Remove favorite");
+    const otherFavoriteBtn = screen.getByRole("button", { name: "Remove favorite" });
     fireEvent.click(otherFavoriteBtn);
     expect(defaultProps.onFavoriteRemove).toHaveBeenCalledWith("/home/user/other");
 
     // "recent" is not favorited
-    const favoriteBtns = screen.getAllByTitle("Favorite this directory");
+    const favoriteBtns = screen.getAllByRole("button", { name: "Favorite this directory" });
     fireEvent.click(favoriteBtns[0]); // Click the first one
     expect(defaultProps.onFavoriteAdd).toHaveBeenCalledWith("/home/user/recent");
   });
@@ -86,7 +91,7 @@ describe("DirectoryPicker", () => {
 
     renderWithToasts({ ...defaultProps, onForgetDirectory });
 
-    const removeBtns = screen.getAllByTitle("Remove from history");
+    const removeBtns = screen.getAllByRole("button", { name: "Remove from history" });
     expect(removeBtns).toHaveLength(3); // one for each directory
 
     fireEvent.click(removeBtns[1]); // Click the second one (recent)
