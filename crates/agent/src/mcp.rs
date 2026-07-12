@@ -16,8 +16,13 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ServerHandler,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+use wilkes_core::integrations::{
+    openalex::OpenAlexClient, semantic_scholar::SemanticScholarClient,
+};
+use wilkes_core::types::IntegrationsSettings;
 
 use crate::{
     context::{ActiveDoc, ContextFile},
@@ -33,12 +38,19 @@ const MAX_SEARCH_MAX_RESULTS: usize = 50;
 const DEFAULT_SEARCH_CONTEXT_LINES: u32 = 2;
 const MAX_SEARCH_CONTEXT_LINES: u32 = 5;
 const DEFAULT_SEARCH_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 
 /// Names of the read-only tools this server exposes. Shared with the permission
 /// boundary in `session.rs` so calls to Wilkes's *own* MCP server are
 /// auto-allowed without ever prompting the user (they are the Q&A pane's own
-/// internal plumbing). Must stay in sync with the `#[tool]` method names below.
-pub(crate) const WILKES_MCP_TOOL_NAMES: &[&str] = &["list_context", "get_document_text", "search"];
+/// internal plumbing). Mutating tools such as `download` must not be added here,
+/// so the agent's normal permission flow remains in effect.
+pub(crate) const WILKES_MCP_TOOL_NAMES: &[&str] = &[
+    "list_context",
+    "get_document_text",
+    "search",
+    "literature_search",
+];
 
 pub(crate) struct McpRuntime {
     url: String,
@@ -65,6 +77,7 @@ pub(crate) async fn start(
     context: ContextStateHandle,
     cwd: PathBuf,
     search: Option<Arc<dyn SearchService>>,
+    integrations: IntegrationsSettings,
 ) -> anyhow::Result<McpRuntime> {
     let token = uuid::Uuid::new_v4().to_string();
     let shutdown = CancellationToken::new();
@@ -77,7 +90,14 @@ pub(crate) async fn start(
         WilkesMcp,
         rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
     > = rmcp::transport::streamable_http_server::StreamableHttpService::new(
-        move || Ok(WilkesMcp::new(context.clone(), cwd.clone(), search.clone())),
+        move || {
+            Ok(WilkesMcp::new(
+                context.clone(),
+                cwd.clone(),
+                search.clone(),
+                integrations.clone(),
+            ))
+        },
         Default::default(),
         config,
     );
@@ -135,6 +155,7 @@ struct WilkesMcp {
     context: ContextStateHandle,
     cwd: PathBuf,
     search: Option<Arc<dyn SearchService>>,
+    integrations: IntegrationsSettings,
     tool_router: ToolRouter<Self>,
 }
 
@@ -143,11 +164,13 @@ impl WilkesMcp {
         context: ContextStateHandle,
         cwd: PathBuf,
         search: Option<Arc<dyn SearchService>>,
+        integrations: IntegrationsSettings,
     ) -> Self {
         Self {
             context,
             cwd,
             search,
+            integrations,
             tool_router: Self::tool_router(),
         }
     }
@@ -159,6 +182,7 @@ impl std::fmt::Debug for WilkesMcp {
             .field("context", &self.context)
             .field("cwd", &self.cwd)
             .field("search", &self.search.as_ref().map(|_| "SearchService"))
+            .field("integrations", &self.integrations)
             .finish_non_exhaustive()
     }
 }
@@ -192,6 +216,45 @@ struct SearchParams {
     is_regex: Option<bool>,
     /// Exact search context lines.
     context_lines: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct LiteratureSearchParams {
+    /// Scholarly works search query.
+    query: String,
+    /// Enabled literature provider to use.
+    provider: LiteratureProviderParam,
+    /// Maximum works to return (1-100, default 10).
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct DownloadParams {
+    /// Direct HTTP(S) URL of the file to download.
+    url: String,
+    /// File name inside the current Wilkes root. Must not contain directories.
+    filename: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LiteratureProviderParam {
+    SemanticScholar,
+    Openalex,
+}
+
+#[derive(Debug, Serialize)]
+struct LiteratureSearchResponse<T> {
+    query: String,
+    provider: LiteratureProviderParam,
+    results: Vec<T>,
+}
+
+#[derive(Debug, Serialize)]
+struct DownloadResponse {
+    path: String,
+    bytes: usize,
+    already_present: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -305,14 +368,221 @@ impl WilkesMcp {
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
     }
+
+    #[tool(
+        description = "Search scholarly literature using an enabled external integration. Set provider='semantic_scholar' or provider='openalex'."
+    )]
+    async fn literature_search(
+        &self,
+        Parameters(params): Parameters<LiteratureSearchParams>,
+    ) -> CallToolResult {
+        let query = params.query.trim().to_string();
+        if query.is_empty() {
+            return CallToolResult::error(vec![ContentBlock::text(
+                "Literature search query cannot be empty.",
+            )]);
+        }
+        let limit = params
+            .limit
+            .unwrap_or(DEFAULT_SEARCH_MAX_RESULTS)
+            .clamp(1, 100);
+        match params.provider {
+            LiteratureProviderParam::SemanticScholar => {
+                let settings = &self.integrations.semantic_scholar;
+                if !settings.enabled {
+                    return CallToolResult::error(vec![ContentBlock::text(
+                        "Semantic Scholar integration is disabled.",
+                    )]);
+                }
+                match SemanticScholarClient::from_settings(settings)
+                    .search(&query, limit)
+                    .await
+                {
+                    Ok(results) => structured(LiteratureSearchResponse {
+                        query,
+                        provider: params.provider,
+                        results,
+                    }),
+                    Err(error) => {
+                        CallToolResult::error(vec![ContentBlock::text(error.to_string())])
+                    }
+                }
+            }
+            LiteratureProviderParam::Openalex => {
+                let settings = &self.integrations.openalex;
+                if !settings.enabled {
+                    return CallToolResult::error(vec![ContentBlock::text(
+                        "OpenAlex integration is disabled.",
+                    )]);
+                }
+                match OpenAlexClient::from_settings(settings)
+                    .search(&query, limit)
+                    .await
+                {
+                    Ok(results) => structured(LiteratureSearchResponse {
+                        query,
+                        provider: params.provider,
+                        results,
+                    }),
+                    Err(error) => {
+                        CallToolResult::error(vec![ContentBlock::text(error.to_string())])
+                    }
+                }
+            }
+        }
+    }
+
+    #[tool(
+        description = "Download a direct HTTP(S) file URL into the current Wilkes root. Use only when the user explicitly asks to import or download a file. Pass filename to choose the saved name; existing files are never overwritten. Literature search results may provide pdf_url values suitable for this tool."
+    )]
+    async fn download(&self, Parameters(params): Parameters<DownloadParams>) -> CallToolResult {
+        let root = self
+            .context
+            .search_root()
+            .unwrap_or_else(|| self.cwd.clone());
+        match download_to_root(&root, params).await {
+            Ok(response) => structured(response),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for WilkesMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Read-only Wilkes document context tools.")
+            .with_instructions("Wilkes document context and literature tools. Context and search tools are read-only. The download tool writes a file into the current root and must only be used when the user explicitly asks to import or download it.")
     }
+}
+
+async fn download_to_root(root: &Path, params: DownloadParams) -> Result<DownloadResponse, String> {
+    if !root.is_dir() {
+        return Err(format!(
+            "Current Wilkes root does not exist: {}",
+            root.display()
+        ));
+    }
+    let url = reqwest::Url::parse(params.url.trim())
+        .map_err(|error| format!("Invalid download URL: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("Download URL must use HTTP or HTTPS.".to_string());
+    }
+    let filename = params
+        .filename
+        .or_else(|| {
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "download.pdf".to_string());
+    let filename_path = Path::new(&filename);
+    if filename_path.components().count() != 1
+        || !matches!(
+            filename_path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err("filename must be a single file name without directories.".to_string());
+    }
+    let target = root.join(filename_path);
+    if target.exists() {
+        return Err(format!(
+            "Refusing to overwrite existing file: {}",
+            target.display()
+        ));
+    }
+
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("Download failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Download failed: {error}"))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_DOWNLOAD_BYTES as u64)
+    {
+        return Err(format!(
+            "Download exceeds the {} MiB limit.",
+            MAX_DOWNLOAD_BYTES / 1024 / 1024
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("Failed to read download: {error}"))?;
+    if bytes.len() > MAX_DOWNLOAD_BYTES {
+        return Err(format!(
+            "Download exceeds the {} MiB limit.",
+            MAX_DOWNLOAD_BYTES / 1024 / 1024
+        ));
+    }
+    if let Some(existing) = find_file_with_content(root, &target, &bytes)? {
+        return Ok(DownloadResponse {
+            path: display_path(&existing),
+            bytes: bytes.len(),
+            already_present: true,
+        });
+    }
+    std::fs::write(&target, &bytes)
+        .map_err(|error| format!("Failed to save {}: {error}", target.display()))?;
+    Ok(DownloadResponse {
+        path: display_path(&target),
+        bytes: bytes.len(),
+        already_present: false,
+    })
+}
+
+/// Find an existing regular file with exactly the downloaded content. Size is
+/// the cheap prefilter; SHA-256 is only computed for equal-size candidates.
+/// Symlinked directories are not followed, keeping the search inside `root`.
+fn find_file_with_content(
+    root: &Path,
+    target: &Path,
+    downloaded: &[u8],
+) -> Result<Option<PathBuf>, String> {
+    let expected_len = u64::try_from(downloaded.len()).unwrap_or(u64::MAX);
+    let expected_digest = Sha256::digest(downloaded);
+    let mut directories = vec![root.to_path_buf()];
+
+    while let Some(directory) = directories.pop() {
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| format!("Failed to inspect {}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "Failed to inspect an entry in {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let file_type = entry.file_type().map_err(|error| {
+                format!("Failed to inspect {}: {error}", entry.path().display())
+            })?;
+            if file_type.is_dir() {
+                directories.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() || entry.path() == target {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = entry
+                .metadata()
+                .map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?;
+            if metadata.len() != expected_len {
+                continue;
+            }
+            let candidate = std::fs::read(&path)
+                .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+            if Sha256::digest(&candidate) == expected_digest {
+                return Ok(Some(path));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 impl ListContextResponse {
@@ -940,5 +1210,62 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("not available"));
+    }
+
+    #[tokio::test]
+    async fn download_rejects_path_traversal_and_existing_files() {
+        let dir = tempdir().unwrap();
+        let traversal = download_to_root(
+            dir.path(),
+            DownloadParams {
+                url: "https://example.test/paper.pdf".to_string(),
+                filename: Some("../paper.pdf".to_string()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(traversal.contains("single file name"));
+
+        let existing = dir.path().join("paper.pdf");
+        std::fs::write(&existing, b"existing").unwrap();
+        let overwrite = download_to_root(
+            dir.path(),
+            DownloadParams {
+                url: "https://example.test/paper.pdf".to_string(),
+                filename: Some("paper.pdf".to_string()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(overwrite.contains("Refusing to overwrite"));
+        assert_eq!(std::fs::read(existing).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn download_content_check_finds_equal_file_under_a_different_name() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("papers");
+        std::fs::create_dir(&nested).unwrap();
+        let existing = nested.join("original.pdf");
+        std::fs::write(&existing, b"same paper").unwrap();
+        std::fs::write(dir.path().join("same-size.pdf"), b"other text").unwrap();
+
+        let found =
+            find_file_with_content(dir.path(), &dir.path().join("new-name.pdf"), b"same paper")
+                .unwrap();
+
+        assert_eq!(found, Some(existing));
+    }
+
+    #[test]
+    fn download_content_check_ignores_target_and_different_content() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("new-name.pdf");
+        std::fs::write(&target, b"same paper").unwrap();
+        std::fs::write(dir.path().join("other.pdf"), b"other text").unwrap();
+
+        let found = find_file_with_content(dir.path(), &target, b"same paper").unwrap();
+
+        assert_eq!(found, None);
     }
 }

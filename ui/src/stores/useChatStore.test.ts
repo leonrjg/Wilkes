@@ -75,6 +75,33 @@ describe("useChatStore chat timing", () => {
     expect(message.streaming).toBe(true);
   });
 
+  it("coalesces adjacent text deltas but starts a new text block after a tool", async () => {
+    vi.mocked(chatApi.send).mockImplementation(async (_sessionId, _turnId, _text, _searchRoot, onUpdate) => {
+      onUpdate({ kind: "text", delta: "Before " });
+      onUpdate({ kind: "text", delta: "tool." });
+      onUpdate({
+        kind: "tool",
+        tool_call_id: "tool-1",
+        title: "Search",
+        status: "completed",
+        locations: [],
+        content: [],
+        raw_input: null,
+        raw_output: null,
+      });
+      onUpdate({ kind: "text", delta: "After tool." });
+      return { conversation_id: null };
+    });
+
+    await useChatStore.getState().sendMessage("Find it");
+
+    expect(assistantMessage().content).toEqual([
+      { kind: "text", text: "Before tool." },
+      expect.objectContaining({ kind: "tool", tool: expect.objectContaining({ toolCallId: "tool-1" }) }),
+      { kind: "text", text: "After tool." },
+    ]);
+  });
+
   it("stops timing when the turn reports done", async () => {
     let doneHandler: ((done: { stop_reason: string }) => void) | null = null;
     vi.mocked(chatApi.send).mockImplementation(async (_sessionId, _turnId, _text, _searchRoot, _onUpdate, onDone) => {

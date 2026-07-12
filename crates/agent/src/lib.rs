@@ -69,7 +69,7 @@ pub fn package_spec(backend: AgentBackend) -> NpmPackageSpec {
             package: "@nanocollective/nanocoder",
             version: "1.28.1",
             bin: "nanocoder",
-            args: &["--acp", "--provider", "Ollama"],
+            args: &["--acp"],
         },
     }
 }
@@ -86,11 +86,11 @@ pub fn label(backend: AgentBackend) -> &'static str {
 pub fn auth_note(backend: AgentBackend) -> &'static str {
     match backend {
         AgentBackend::ClaudeCode => {
-            "Install the Claude Code chat adapter, then run `claude` once to log in"
+            "Install the Claude Code ACP, then run `claude` once to log in"
         }
-        AgentBackend::Codex => "Install the Codex chat adapter, then run `codex` once to log in",
+        AgentBackend::Codex => "Install the Codex ACP, then run `codex` once to log in",
         AgentBackend::Nanocoder => {
-            "Install the Nanocoder chat adapter, configure Ollama, and ensure Ollama is running"
+            "Install the Nanocoder ACP and configure a provider"
         }
     }
 }
@@ -320,7 +320,7 @@ mod tests {
         let nano = npx_args(package_spec(AgentBackend::Nanocoder));
         assert_eq!(nano[0], "-y");
         assert_eq!(nano[1], "@nanocollective/nanocoder@1.28.1");
-        assert_eq!(&nano[2..], &["--acp", "--provider", "Ollama"]);
+        assert_eq!(&nano[2..], &["--acp"]);
     }
 
     #[test]

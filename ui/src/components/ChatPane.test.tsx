@@ -30,11 +30,10 @@ function message(overrides: Partial<ChatMessage>): ChatMessage {
   return {
     id: "message-1",
     role: "assistant",
-    text: "",
+    content: [],
     thought: "",
     streaming: false,
     error: null,
-    tools: [],
     permissions: [],
     startedAtMs: null,
     endedAtMs: null,
@@ -51,13 +50,13 @@ describe("MessageBubble", () => {
     render(
       <MessageBubble
         message={message({
-          text: [
+          content: [{ kind: "text", text: [
             "**Result**",
             "",
             "| Threshold | Precision |",
             "| --- | --- |",
             "| 50 | 100% |",
-          ].join("\n"),
+          ].join("\n") }],
         })}
         nowMs={0}
         onNavigate={vi.fn()}
@@ -75,7 +74,7 @@ describe("MessageBubble", () => {
       <MessageBubble
         message={message({
           role: "user",
-          text: "**literal**\n| not | a table |",
+          content: [{ kind: "text", text: "**literal**\n| not | a table |" }],
         })}
         nowMs={0}
         onNavigate={vi.fn()}
@@ -91,7 +90,7 @@ describe("MessageBubble", () => {
     render(
       <MessageBubble
         message={message({
-          text: "**Result**\n\nCopied as Markdown.",
+          content: [{ kind: "text", text: "**Result**\n\nCopied as Markdown." }],
         })}
         nowMs={0}
         onNavigate={vi.fn()}
@@ -110,7 +109,7 @@ describe("MessageBubble", () => {
       <MessageBubble
         message={message({
           role: "user",
-          text: "plain user query",
+          content: [{ kind: "text", text: "plain user query" }],
         })}
         nowMs={0}
         onNavigate={vi.fn()}
@@ -120,6 +119,42 @@ describe("MessageBubble", () => {
     fireEvent.click(screen.getByRole("button", { name: "Copy your message" }));
 
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith("plain user query");
+  });
+
+  it("renders and copies text blocks on opposite sides of a tool in order", () => {
+    render(
+      <MessageBubble
+        message={message({
+          content: [
+            { kind: "text", text: "Before tool." },
+            {
+              kind: "tool",
+              tool: {
+                toolCallId: "tool-1",
+                title: "Literature search",
+                status: "completed",
+                locations: [],
+                content: [],
+                rawInput: null,
+                rawOutput: null,
+              },
+            },
+            { kind: "text", text: "After tool." },
+          ],
+        })}
+        nowMs={0}
+        onNavigate={vi.fn()}
+      />,
+    );
+
+    const before = screen.getByText("Before tool.");
+    const tool = screen.getByRole("button", { name: /Literature search/ });
+    const after = screen.getByText("After tool.");
+    expect(before.compareDocumentPosition(tool) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(tool.compareDocumentPosition(after) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy assistant message" }));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("Before tool.\n\nAfter tool.");
   });
 });
 

@@ -269,6 +269,7 @@ export class TauriSearchApi implements SearchApi {
 
 export class TauriSourceApi implements DesktopSourceApi {
   type = "desktop" as const;
+  deletionKind = "trash" as const;
 
   async pickDirectory(): Promise<string | null> {
     return invoke<string | null>("pick_directory");
@@ -280,5 +281,13 @@ export class TauriSourceApi implements DesktopSourceApi {
 
   async moveFile(path: string, targetRoot: string): Promise<string> {
     return invoke<string>("move_file", { path, targetRoot });
+  }
+
+  async listDirectories(path: string): Promise<string[]> {
+    return invoke<string[]>("list_directories", { path });
+  }
+
+  async deleteFile(path: string): Promise<void> {
+    return invoke("trash_file", { path });
   }
 }

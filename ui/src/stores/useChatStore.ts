@@ -35,14 +35,17 @@ export interface ChatPermissionPrompt {
   decision: string | null;
 }
 
+export type ChatMessageContentBlock =
+  | { kind: "text"; text: string }
+  | { kind: "tool"; tool: ChatToolChip };
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
-  text: string;
+  content: ChatMessageContentBlock[];
   thought: string;
   streaming: boolean;
   error: string | null;
-  tools: ChatToolChip[];
   permissions: ChatPermissionPrompt[];
   startedAtMs: number | null;
   endedAtMs: number | null;
@@ -104,14 +107,16 @@ interface ChatStore {
 }
 
 function upsertTool(
-  tools: ChatToolChip[],
+  content: ChatMessageContentBlock[],
   update: Extract<ChatUpdate, { kind: "tool" }>,
-): ChatToolChip[] {
-  const idx = tools.findIndex((t) => t.toolCallId === update.tool_call_id);
+): ChatMessageContentBlock[] {
+  const idx = content.findIndex(
+    (block) => block.kind === "tool" && block.tool.toolCallId === update.tool_call_id,
+  );
   if (idx === -1) {
     return [
-      ...tools,
-      {
+      ...content,
+      { kind: "tool", tool: {
         toolCallId: update.tool_call_id,
         title: update.title ?? "Tool call",
         status: update.status ?? "pending",
@@ -119,12 +124,14 @@ function upsertTool(
         content: update.content ?? [],
         rawInput: update.raw_input ?? null,
         rawOutput: update.raw_output ?? null,
-      },
+      } },
     ];
   }
-  const prev = tools[idx];
-  const next = [...tools];
-  next[idx] = {
+  const block = content[idx];
+  if (block.kind !== "tool") return content;
+  const prev = block.tool;
+  const next = [...content];
+  next[idx] = { kind: "tool", tool: {
     ...prev,
     title: update.title ?? prev.title,
     status: update.status ?? prev.status,
@@ -132,8 +139,16 @@ function upsertTool(
     content: update.content ?? prev.content,
     rawInput: update.raw_input !== undefined ? update.raw_input : prev.rawInput,
     rawOutput: update.raw_output !== undefined ? update.raw_output : prev.rawOutput,
-  };
+  } };
   return next;
+}
+
+function appendText(content: ChatMessageContentBlock[], delta: string): ChatMessageContentBlock[] {
+  const last = content[content.length - 1];
+  if (last?.kind === "text") {
+    return [...content.slice(0, -1), { kind: "text", text: last.text + delta }];
+  }
+  return [...content, { kind: "text", text: delta }];
 }
 
 function upsertPermission(
@@ -163,11 +178,11 @@ function dismissUndecided(permissions: ChatPermissionPrompt[]): ChatPermissionPr
 function applyUpdate(message: ChatMessage, update: ChatUpdate): ChatMessage {
   switch (update.kind) {
     case "text":
-      return { ...message, text: message.text + update.delta };
+      return { ...message, content: appendText(message.content, update.delta) };
     case "thought":
       return { ...message, thought: message.thought + update.delta };
     case "tool":
-      return { ...message, tools: upsertTool(message.tools, update) };
+      return { ...message, content: upsertTool(message.content, update) };
     case "permission":
       return { ...message, permissions: upsertPermission(message.permissions, update) };
     case "error":
@@ -196,19 +211,21 @@ function replayMessageToChatMessage(message: ChatReplayMessage): ChatMessage {
   return {
     id: randomId(),
     role: message.role,
-    text: message.text,
+    content: message.content.map((block) => block.kind === "text" ? block : ({
+      kind: "tool" as const,
+      tool: {
+        toolCallId: block.tool.tool_call_id,
+        title: block.tool.title,
+        status: block.tool.status,
+        locations: block.tool.locations,
+        content: block.tool.content,
+        rawInput: block.tool.raw_input ?? null,
+        rawOutput: block.tool.raw_output ?? null,
+      },
+    })),
     thought: message.thought,
     streaming: false,
     error: null,
-    tools: message.tools.map((tool) => ({
-      toolCallId: tool.tool_call_id,
-      title: tool.title,
-      status: tool.status,
-      locations: tool.locations,
-      content: tool.content,
-      rawInput: tool.raw_input ?? null,
-      rawOutput: tool.raw_output ?? null,
-    })),
     permissions: [],
     startedAtMs: null,
     endedAtMs: null,
@@ -524,11 +541,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const userMessage: ChatMessage = {
       id: randomId(),
       role: "user",
-      text,
+      content: [{ kind: "text", text }],
       thought: "",
       streaming: false,
       error: null,
-      tools: [],
       permissions: [],
       startedAtMs: null,
       endedAtMs: null,
@@ -536,11 +552,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const assistantMessage: ChatMessage = {
       id: turnId,
       role: "assistant",
-      text: "",
+      content: [],
       thought: "",
       streaming: true,
       error: null,
-      tools: [],
       permissions: [],
       startedAtMs,
       endedAtMs: null,

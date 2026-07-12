@@ -492,13 +492,19 @@ async fn delete_upload_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<DeleteUploadQuery>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    let rel = sanitize_relative_upload_path(&params.path);
-    if rel.as_os_str().is_empty() {
+    let requested = PathBuf::from(&params.path);
+    if requested.as_os_str().is_empty() {
         return Err(err(
             "Cannot delete uploads root via this endpoint; use DELETE /api/upload/all",
         ));
     }
-    let target = state.uploads_dir.join(&rel);
+    let target = if requested.is_absolute() {
+        requested
+    } else {
+        state
+            .uploads_dir
+            .join(sanitize_relative_upload_path(&params.path))
+    };
     let canonical_uploads = TokioServerFs
         .canonicalize(&state.uploads_dir)
         .await
@@ -513,6 +519,11 @@ async fn delete_upload_handler(
     })?;
     if !canonical_target.starts_with(&canonical_uploads) {
         return Err(err("Path outside uploads directory"));
+    }
+    if canonical_target == canonical_uploads {
+        return Err(err(
+            "Cannot delete uploads root via this endpoint; use DELETE /api/upload/all",
+        ));
     }
     if canonical_target.is_dir() {
         TokioServerFs
@@ -1403,9 +1414,18 @@ mod tests {
         let query = DeleteUploadQuery {
             path: "test.txt".to_string(),
         };
-        let res = delete_upload_handler(State(state), Query(query)).await;
+        let res = delete_upload_handler(State(state.clone()), Query(query)).await;
         assert!(res.is_ok());
         assert!(!file_path.exists());
+
+        let absolute_path = uploads_dir.join("absolute.txt");
+        tokio::fs::write(&absolute_path, "content").await.unwrap();
+        let query = DeleteUploadQuery {
+            path: absolute_path.display().to_string(),
+        };
+        let res = delete_upload_handler(State(state), Query(query)).await;
+        assert!(res.is_ok());
+        assert!(!absolute_path.exists());
     }
 
     #[tokio::test]

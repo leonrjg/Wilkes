@@ -4,12 +4,14 @@ use anyhow::anyhow;
 
 use crate::metadata::doi::normalize_doi;
 use crate::network::{ProviderHttpClient, ProviderHttpErrorKind};
-use crate::types::{IntegrationState, IntegrationStatus, OpenAlexSettings, OpenAlexWork};
+use crate::types::{
+    IntegrationState, IntegrationStatus, LiteratureSearchResult, OpenAlexSettings, OpenAlexWork,
+};
 
-use super::model::OpenAlexWorksResponse;
+use super::model::{OpenAlexWorkResponse, OpenAlexWorksResponse};
 
 const LOOKUP_SELECT: &str =
-    "id,doi,display_name,publication_year,publication_date,cited_by_count,ids,primary_location";
+    "id,doi,display_name,publication_year,publication_date,cited_by_count,ids,primary_location,best_oa_location,open_access";
 const STATUS_PROBE_DOI: &str = "10.1145/3801158";
 
 #[derive(Clone)]
@@ -95,6 +97,31 @@ impl OpenAlexClient {
             .ok_or_else(|| anyhow!("OpenAlex work not found for DOI {doi}"))
     }
 
+    pub async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<LiteratureSearchResult>> {
+        let query = query.trim();
+        if query.is_empty() {
+            anyhow::bail!("OpenAlex search query cannot be empty");
+        }
+        let limit = limit.clamp(1, 100);
+        let mut url = format!(
+            "{}/works?search={}&per-page={limit}&select={LOOKUP_SELECT}",
+            self.base_url,
+            urlencoding::encode(query)
+        );
+        self.append_mailto(&mut url);
+        Ok(self
+            .lookup_works(url)
+            .await?
+            .results
+            .into_iter()
+            .map(OpenAlexWorkResponse::into_search_result)
+            .collect())
+    }
+
     async fn lookup_works(&self, url: String) -> anyhow::Result<OpenAlexWorksResponse> {
         match self.http.get_json::<OpenAlexWorksResponse>(url, &[]).await {
             Ok(body) => Ok(body),
@@ -111,10 +138,7 @@ impl OpenAlexClient {
             self.base_url,
             urlencoding::encode(&format!("https://doi.org/{doi}")),
         );
-        if let Some(email) = &self.email {
-            url.push_str("&mailto=");
-            url.push_str(&urlencoding::encode(email));
-        }
+        self.append_mailto(&mut url);
         url
     }
 
@@ -132,11 +156,15 @@ impl OpenAlexClient {
             field,
             urlencoding::encode(value),
         );
+        self.append_mailto(&mut url);
+        url
+    }
+
+    fn append_mailto(&self, url: &mut String) {
         if let Some(email) = &self.email {
             url.push_str("&mailto=");
             url.push_str(&urlencoding::encode(email));
         }
-        url
     }
 }
 
@@ -251,5 +279,33 @@ mod tests {
         );
         doi_mock.assert_async().await;
         location_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn search_sends_query_limit_and_mailto() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/works")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("search".into(), "graph neural networks".into()),
+                Matcher::UrlEncoded("per-page".into(), "2".into()),
+                Matcher::UrlEncoded("select".into(), LOOKUP_SELECT.into()),
+                Matcher::UrlEncoded("mailto".into(), "team@example.com".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"results":[{"id":"https://openalex.org/W1","display_name":"T","ids":{"doi":"https://doi.org/10.1/example"},"open_access":{"is_oa":true,"oa_status":"gold","oa_url":"https://example.test/article"},"best_oa_location":{"is_oa":true,"pdf_url":"https://example.test/paper.pdf","landing_page_url":"https://example.test/article","license":"cc-by"}}]}"#)
+            .create_async()
+            .await;
+        let results = OpenAlexClient::new(server.url(), Some("team@example.com".into()))
+            .search(" graph neural networks ", 2)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doi.as_deref(), Some("10.1/example"));
+        assert_eq!(
+            results[0].pdf_url.as_deref(),
+            Some("https://example.test/paper.pdf")
+        );
+        mock.assert_async().await;
     }
 }

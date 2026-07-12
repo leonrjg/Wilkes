@@ -58,6 +58,21 @@ async fn rename_file_for_path(path: String, new_name: String) -> Result<String, 
         .map_err(|e| e.to_string())
 }
 
+async fn trash_file_for_path(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let path = PathBuf::from(path);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("Cannot trash {}: {error}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!("Cannot trash non-file path: {}", path.display()));
+        }
+        trash::delete(&path)
+            .map_err(|error| format!("Failed to move {} to Trash: {error}", path.display()))
+    })
+    .await
+    .map_err(|error| format!("Trash operation failed: {error}"))?
+}
+
 async fn move_files_into_current_root_for_ctx(
     ctx: Arc<AppContext>,
     paths: Vec<String>,
@@ -555,6 +570,11 @@ async fn reveal_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn trash_file(path: String) -> Result<(), String> {
+    trash_file_for_path(path).await
+}
+
+#[tauri::command]
 async fn pick_directory(app: AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
@@ -678,9 +698,11 @@ async fn chat_start(
 ) -> Result<ChatStartResult, String> {
     let ctx = app_context(&app);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-    let spawned = wilkes_api::commands::chat::start(backend, cwd.clone(), Some(ctx.clone()))
-        .await
-        .map_err(|e| e.to_string())?;
+    let integrations = ctx.get_settings().await.integrations;
+    let spawned =
+        wilkes_api::commands::chat::start(backend, cwd.clone(), Some(ctx.clone()), integrations)
+            .await
+            .map_err(|e| e.to_string())?;
     let wilkes_agent::session::SpawnedChatSession {
         session,
         events,
@@ -742,7 +764,8 @@ async fn chat_open_conversation(
     let ctx = app_context(&app);
     let record = wilkes_api::commands::chat::get_conversation(&ctx.data_dir, &conversation_id)
         .map_err(|e| e.to_string())?;
-    let spawned = wilkes_api::commands::chat::open(&record, Some(ctx.clone()))
+    let integrations = ctx.get_settings().await.integrations;
+    let spawned = wilkes_api::commands::chat::open(&record, Some(ctx.clone()), integrations)
         .await
         .map_err(|e| e.to_string())?;
     let wilkes_agent::session::SpawnedChatSession {
@@ -1034,6 +1057,29 @@ async fn move_file(path: String, target_root: String, app: AppHandle) -> Result<
 }
 
 #[tauri::command]
+async fn list_directories(path: String) -> Result<Vec<String>, String> {
+    let mut entries = tokio::fs::read_dir(&path)
+        .await
+        .map_err(|error| format!("Could not read directory {path}: {error}"))?;
+    let mut directories = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| format!("Could not read directory {path}: {error}"))?
+    {
+        let file_type = entry
+            .file_type()
+            .await
+            .map_err(|error| format!("Could not inspect {}: {error}", entry.path().display()))?;
+        if file_type.is_dir() {
+            directories.push(entry.path().display().to_string());
+        }
+    }
+    directories.sort_by_key(|directory| directory.to_lowercase());
+    Ok(directories)
+}
+
+#[tauri::command]
 async fn get_file_metadata(path: String, app: AppHandle) -> Result<DocumentMetadata, String> {
     get_file_metadata_for_path(app_context(&app), path).await
 }
@@ -1248,6 +1294,8 @@ pub fn run() {
             rename_file,
             import_dropped_files,
             move_file,
+            list_directories,
+            trash_file,
             get_file_metadata,
             get_python_info,
             get_supported_engines,
@@ -1758,6 +1806,21 @@ mod tests {
             .await
             .unwrap();
         assert!(!files.files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_trash_file_rejects_missing_and_non_file_paths() {
+        let dir = tempdir().unwrap();
+        let directory_error = trash_file_for_path(dir.path().display().to_string())
+            .await
+            .unwrap_err();
+        assert!(directory_error.contains("non-file path"));
+
+        let missing_error =
+            trash_file_for_path(dir.path().join("missing.pdf").display().to_string())
+                .await
+                .unwrap_err();
+        assert!(missing_error.contains("Cannot trash"));
     }
 
     #[tokio::test]

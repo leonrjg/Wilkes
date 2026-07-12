@@ -6,7 +6,7 @@ import type { Settings } from "./types";
 import { isTauri } from "../services";
 import { useChatStore } from "../stores/useChatStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
-import { Copy, Edit2, ExternalLink, Folder, FolderPlus, MessageSquare, RefreshCw } from "react-feather";
+import { Copy, Edit2, ExternalLink, Folder, FolderPlus, MessageSquare, RefreshCw, Trash2 } from "react-feather";
 
 export type ContextMenuTarget =
   | { kind: "file" | "match"; path: string; open: () => void }
@@ -26,6 +26,8 @@ interface BuildFileContextMenuItemsArgs {
   /** Other known root directories the file could be moved into. */
   availableRoots?: string[];
   onMoveRequest?: (path: string) => void;
+  deletionKind?: "trash" | "permanent";
+  onDeleteRequest?: (path: string) => Promise<void>;
 }
 
 const menuContributors: MenuContributor[] = [zoteroMenuContributor];
@@ -39,6 +41,8 @@ export function buildFileContextMenuItems({
   onRenameRequest,
   availableRoots = [],
   onMoveRequest,
+  deletionKind,
+  onDeleteRequest,
 }: BuildFileContextMenuItemsArgs): ContextMenuItem[] {
   const primaryItems: ContextMenuItem[] = [
     {
@@ -141,6 +145,16 @@ export function buildFileContextMenuItems({
       },
     },
   );
+
+  if (onDeleteRequest) {
+    managementItems.push({
+      id: "delete",
+      label: deletionKind === "trash" ? "Move to Trash" : "Delete permanently",
+      icon: Trash2,
+      dividerBefore: true,
+      run: () => onDeleteRequest(target.path),
+    });
+  }
 
   managementItems[0].dividerBefore = primaryItems.length > 0;
   return [...primaryItems, ...managementItems];

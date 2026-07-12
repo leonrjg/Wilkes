@@ -67,6 +67,14 @@ describe("TauriSearchApi", () => {
     expect(paths).toEqual(["/root/file.pdf"]);
   });
 
+  it("should call trash_file through the shared deleteFile abstraction", async () => {
+    const source = new TauriSourceApi();
+    (invoke as any).mockResolvedValue(undefined);
+    await source.deleteFile("/root/file.pdf");
+    expect(source.deletionKind).toBe("trash");
+    expect(invoke).toHaveBeenCalledWith("trash_file", { path: "/root/file.pdf" });
+  });
+
   it("should perform a search with listeners", async () => {
     const mockQuery = { pattern: "test" } as any;
     const onResult = vi.fn();

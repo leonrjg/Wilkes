@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use wilkes_core::types::{AgentBackend, ChatBackendConfig};
+use wilkes_core::types::{AgentBackend, ChatBackendConfig, IntegrationsSettings};
 
 pub use wilkes_agent::session::{
     ChatConfigOption, ChatEvent, ChatReplayMessage, ChatSession, SpawnedChatSession,
@@ -233,19 +233,22 @@ pub async fn start(
     backend: AgentBackend,
     cwd: PathBuf,
     search: Option<Arc<dyn wilkes_agent::search::SearchService>>,
+    integrations: IntegrationsSettings,
 ) -> anyhow::Result<SpawnedChatSession> {
-    wilkes_agent::session::spawn_with_search(backend, cwd, search).await
+    wilkes_agent::session::spawn_with_services(backend, cwd, search, integrations).await
 }
 
 pub async fn open(
     record: &ChatConversationRecord,
     search: Option<Arc<dyn wilkes_agent::search::SearchService>>,
+    integrations: IntegrationsSettings,
 ) -> anyhow::Result<SpawnedChatSession> {
-    wilkes_agent::session::load_with_search(
+    wilkes_agent::session::load_with_services(
         record.backend,
         PathBuf::from(&record.cwd),
         record.backend_session_id.clone(),
         search,
+        integrations,
     )
     .await
 }

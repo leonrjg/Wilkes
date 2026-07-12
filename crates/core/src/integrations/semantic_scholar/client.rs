@@ -5,12 +5,14 @@ use anyhow::anyhow;
 use crate::metadata::doi::normalize_doi;
 use crate::network::{ProviderHttpClient, ProviderHttpErrorKind};
 use crate::types::{
-    IntegrationState, IntegrationStatus, SemanticScholarPaper, SemanticScholarSettings,
+    IntegrationState, IntegrationStatus, LiteratureSearchResult, SemanticScholarPaper,
+    SemanticScholarSettings,
 };
 
-use super::model::SemanticScholarPaperResponse;
+use super::model::{SemanticScholarPaperResponse, SemanticScholarSearchResponse};
 
-const LOOKUP_FIELDS: &str = "title,citationCount,externalIds,year,venue,publicationDate";
+const LOOKUP_FIELDS: &str =
+    "title,citationCount,externalIds,year,venue,publicationDate,isOpenAccess,openAccessPdf";
 const STATUS_PROBE_DOI: &str = "10.1145/3801158";
 
 #[derive(Clone)]
@@ -97,6 +99,37 @@ impl SemanticScholarClient {
             Err(error) if error.kind == ProviderHttpErrorKind::NotFound => {
                 anyhow::bail!("Semantic Scholar paper not found for DOI {doi}");
             }
+            Err(error) if error.kind == ProviderHttpErrorKind::RateLimited => {
+                anyhow::bail!("Semantic Scholar API rate limit reached");
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<LiteratureSearchResult>> {
+        let query = query.trim();
+        if query.is_empty() {
+            anyhow::bail!("Semantic Scholar search query cannot be empty");
+        }
+        let limit = limit.clamp(1, 100);
+        let url = self.url(&format!(
+            "/graph/v1/paper/search?query={}&limit={limit}&fields={LOOKUP_FIELDS}",
+            urlencoding::encode(query)
+        ));
+        match self
+            .http
+            .get_json::<SemanticScholarSearchResponse>(url, &self.headers())
+            .await
+        {
+            Ok(body) => Ok(body
+                .data
+                .into_iter()
+                .map(SemanticScholarPaperResponse::into_search_result)
+                .collect()),
             Err(error) if error.kind == ProviderHttpErrorKind::RateLimited => {
                 anyhow::bail!("Semantic Scholar API rate limit reached");
             }
@@ -208,5 +241,33 @@ mod tests {
         assert_eq!(paper.citation_count, 9);
         first.assert_async().await;
         second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn search_sends_query_limit_and_api_key() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/graph/v1/paper/search")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("query".into(), "graph neural networks".into()),
+                Matcher::UrlEncoded("limit".into(), "2".into()),
+                Matcher::UrlEncoded("fields".into(), LOOKUP_FIELDS.into()),
+            ]))
+            .match_header("x-api-key", "secret")
+            .with_status(200)
+            .with_body(r#"{"data":[{"paperId":"p1","externalIds":{"DOI":"10.1/example"},"title":"T","citationCount":3,"isOpenAccess":true,"openAccessPdf":{"url":"https://example.test/paper.pdf","status":"GOLD","license":"CCBY"}}]}"#)
+            .create_async()
+            .await;
+        let results = SemanticScholarClient::new(server.url(), Some("secret".into()))
+            .search(" graph neural networks ", 2)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doi.as_deref(), Some("10.1/example"));
+        assert_eq!(
+            results[0].pdf_url.as_deref(),
+            Some("https://example.test/paper.pdf")
+        );
+        mock.assert_async().await;
     }
 }

@@ -9,6 +9,7 @@ import {
   Clock,
   File,
   FileText,
+  Folder,
   HardDrive,
   Hash,
   Info,
@@ -20,6 +21,7 @@ import { useToasts } from "./Toast";
 import { ContextMenu, useContextMenu } from "./ContextMenu";
 import { Tooltip } from "./Tooltip";
 import { useSearchStore } from "../stores/useSearchStore";
+import { useChatStore } from "../stores/useChatStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { MetadataField } from "../lib/types";
 import type {
@@ -35,6 +37,8 @@ import type {
 import { api, isTauri, source } from "../services";
 import type { DesktopSourceApi } from "../services/api";
 import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileActions";
+import { confirmDialog } from "../lib/utils/dialog";
+import { DirectoryTree } from "./DirectoryTree";
 import {
   formatDocumentFullDate,
   formatDocumentMonthYear,
@@ -432,8 +436,39 @@ export default function ResultList({
         availableRoots: otherRoots,
         onMoveRequest: (path) =>
           setMoveTarget({ path, root: otherRoots[0] ?? "", roots: otherRoots }),
+        deletionKind: source.deletionKind,
+        onDeleteRequest: handleDeleteRequest,
       }),
     });
+  };
+
+  const handleDeleteRequest = async (path: string) => {
+    const name = fileName(path);
+    const isTrash = source.deletionKind === "trash";
+    const confirmed = await confirmDialog(
+      isTrash
+        ? `Move "${name}" to Trash? You can restore it from Trash.`
+        : `Permanently delete "${name}"? This cannot be undone.`,
+    );
+    if (!confirmed) return;
+
+    try {
+      await source.deleteFile(path);
+      if (selectedMatch?.path === path) clearPreview();
+      useChatStore.getState().removeContext(path);
+      if (hasQuery) {
+        await replaySearch();
+      } else {
+        refreshFileList();
+      }
+      onToast(
+        isTrash ? `Moved "${name}" to Trash` : `Permanently deleted "${name}"`,
+        "success",
+      );
+    } catch (error) {
+      console.error("Failed to delete file:", error);
+      onToast(error instanceof Error ? error.message : "Failed to delete file", "error");
+    }
   };
 
   const handleRenameSubmit = async (event: React.FormEvent) => {
@@ -550,25 +585,19 @@ export default function ResultList({
         aria-modal="true"
         aria-labelledby="move-file-title"
         onSubmit={handleMoveSubmit}
-        className="w-full max-w-sm rounded-lg border border-[var(--border-main)] bg-[var(--bg-app)] p-3 shadow-2xl"
+        className="w-full max-w-md rounded-lg border border-[var(--border-main)] bg-[var(--bg-app)] p-3 shadow-2xl"
       >
         <div id="move-file-title" className="mb-2 text-sm font-semibold text-[var(--text-main)]">
           Move "{fileName(moveTarget.path)}" to...
         </div>
-        <select
-          aria-label="Destination directory"
-          value={moveTarget.root}
-          onChange={(event) =>
-            setMoveTarget((target) => (target ? { ...target, root: event.target.value } : target))
+        <DirectoryTree
+          roots={moveTarget.roots}
+          selected={moveTarget.root}
+          onSelect={(root) =>
+            setMoveTarget((target) => (target ? { ...target, root } : target))
           }
-          className="mb-3 h-8 w-full rounded border border-[var(--border-main)] bg-[var(--bg-active)] px-2 text-sm text-[var(--text-main)] outline-none focus:border-[var(--accent-blue)]"
-        >
-          {moveTarget.roots.map((root) => (
-            <option key={root} value={root}>
-              {root}
-            </option>
-          ))}
-        </select>
+          loadChildren={(path) => (source as DesktopSourceApi).listDirectories(path)}
+        />
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -935,7 +964,14 @@ function FileHeader({
       <span className="text-[10px] text-[var(--text-muted)] bg-[var(--bg-active)] px-1.5 py-0.5 rounded-full">
         {count}
       </span>
-      <span className="text-[10px] text-[var(--text-dim)] truncate">{path}</span>
+      <Tooltip content={path} className="font-mono break-all">
+        <span
+          className="flex h-5 w-5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
+          aria-label={`Path: ${path}`}
+        >
+          <Folder size={12} aria-hidden="true" />
+        </span>
+      </Tooltip>
     </div>
   );
 }

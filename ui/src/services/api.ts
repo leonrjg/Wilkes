@@ -105,6 +105,8 @@ export interface SearchApi {
 // Web: file upload returning a server-side root path.
 export interface SourceApi {
   type: "desktop" | "web";
+  deletionKind: "trash" | "permanent";
+  deleteFile(path: string): Promise<void>;
 }
 
 export interface DesktopSourceApi extends SourceApi {
@@ -112,11 +114,11 @@ export interface DesktopSourceApi extends SourceApi {
   pickDirectory(): Promise<string | null>;
   importDroppedFiles(paths: string[], root: string): Promise<string[]>;
   moveFile(path: string, targetRoot: string): Promise<string>;
+  listDirectories(path: string): Promise<string[]>;
 }
 
 export interface WebSourceApi extends SourceApi {
   type: "web";
   uploadFiles(files: File[]): Promise<string>;
-  deleteFile(path: string): Promise<void>;
   deleteAll(): Promise<void>;
 }

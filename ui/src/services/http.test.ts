@@ -479,6 +479,7 @@ describe("HttpSourceApi", () => {
     (fetch as any).mockResolvedValue({ ok: true, status: 204 });
     await api.deleteFile("test.txt");
     expect(fetch).toHaveBeenCalledWith("/api/upload?path=test.txt", { method: "DELETE" });
+    expect(api.deletionKind).toBe("permanent");
   });
 
   it("deleteAll sends DELETE request", async () => {

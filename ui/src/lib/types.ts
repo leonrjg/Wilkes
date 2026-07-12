@@ -547,11 +547,14 @@ export interface ChatReplayToolCall {
   raw_output: unknown;
 }
 
+export type ChatReplayContentBlock =
+  | { kind: "text"; text: string }
+  | { kind: "tool"; tool: ChatReplayToolCall };
+
 export interface ChatReplayMessage {
   role: "user" | "assistant";
-  text: string;
   thought: string;
-  tools: ChatReplayToolCall[];
+  content: ChatReplayContentBlock[];
 }
 
 export interface ChatConversationRecord {

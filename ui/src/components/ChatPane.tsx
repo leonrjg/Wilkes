@@ -67,6 +67,13 @@ function messageElapsedLabel(message: ChatMessage, nowMs: number) {
   return formatElapsedTime((message.endedAtMs ?? nowMs) - message.startedAtMs);
 }
 
+export function messageText(message: ChatMessage): string {
+  return message.content
+    .filter((block): block is Extract<(typeof message.content)[number], { kind: "text" }> => block.kind === "text")
+    .map((block) => block.text)
+    .join(message.role === "assistant" ? "\n\n" : "");
+}
+
 export function contextFileMatchRef(path: string, page: number | null = null): MatchRef {
   if (path.toLowerCase().endsWith(".pdf")) {
     return { path, origin: { PdfPage: { page: page ?? 1, bbox: null } } };
@@ -557,6 +564,7 @@ export function MessageBubble({
   const [expandedToolId, setExpandedToolId] = useState<string | null>(null);
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
   const hasThought = !isUser && message.thought.trim().length > 0;
+  const copyText = messageText(message);
   const elapsedLabel = messageElapsedLabel(message, nowMs);
   return (
     <div className={isUser ? "text-right" : "text-left"}>
@@ -571,8 +579,8 @@ export function MessageBubble({
         </span>
         <Tooltip content="Copy message">
           <CopyButton
-            copy={() => message.text ? navigator.clipboard.writeText(message.text) : Promise.resolve()}
-            disabled={!message.text}
+            copy={() => copyText ? navigator.clipboard.writeText(copyText) : Promise.resolve()}
+            disabled={!copyText}
             aria-label={`Copy ${isUser ? "your" : "assistant"} message`}
             copiedAriaLabel="Copied"
             copiedChildren={<Check size={10} />}
@@ -607,33 +615,6 @@ export function MessageBubble({
                 {message.thought}
               </pre>
             )}
-          </div>
-        )}
-        {message.tools.length > 0 && (
-          <div className="flex flex-col gap-1 mb-1.5">
-            {message.tools.map((tool) => {
-              const isExpanded = expandedToolId === tool.toolCallId;
-              const hasDetail =
-                tool.content.length > 0 || tool.rawInput != null || tool.rawOutput != null;
-              return (
-                <div key={tool.toolCallId} className="w-fit max-w-full">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setExpandedToolId(isExpanded ? null : tool.toolCallId)
-                    }
-                    className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-[var(--bg-active)] text-[10px] text-[var(--text-muted)] hover:text-[var(--text-main)] w-fit"
-                  >
-                    <FileText size={10} />
-                    <span className="truncate max-w-[180px]">{tool.title}</span>
-                    <span>{toolStatusIcon(tool.status)}</span>
-                  </button>
-                  {isExpanded && (
-                    <ToolCallDetail tool={tool} onNavigate={onNavigate} hasDetail={hasDetail} />
-                  )}
-                </div>
-              );
-            })}
           </div>
         )}
         {message.permissions.length > 0 && (
@@ -674,21 +655,52 @@ export function MessageBubble({
           </div>
         )}
         {isUser ? (
-          <span className="whitespace-pre-wrap">{message.text}</span>
+          <span className="whitespace-pre-wrap">{copyText}</span>
         ) : (
-          <div className="prose-chat">
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              components={{
-                a: ({ children, href }) => (
-                  <a href={href} target="_blank" rel="noreferrer">
-                    {children}
-                  </a>
-                ),
-              }}
-            >
-              {message.text || (message.streaming ? "…" : "")}
-            </ReactMarkdown>
+          <div className="flex flex-col gap-1.5">
+            {message.content.map((block, index) => {
+              if (block.kind === "text") {
+                return (
+                  <div className="prose-chat" key={`text-${index}`}>
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        a: ({ children, href }) => (
+                          <a href={href} target="_blank" rel="noreferrer">
+                            {children}
+                          </a>
+                        ),
+                      }}
+                    >
+                      {block.text}
+                    </ReactMarkdown>
+                  </div>
+                );
+              }
+              const tool = block.tool;
+              const isExpanded = expandedToolId === tool.toolCallId;
+              const hasDetail =
+                tool.content.length > 0 || tool.rawInput != null || tool.rawOutput != null;
+              return (
+                <div key={`tool-${tool.toolCallId}`} className="w-fit max-w-full">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setExpandedToolId(isExpanded ? null : tool.toolCallId)
+                    }
+                    className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-[var(--bg-active)] text-[10px] text-[var(--text-muted)] hover:text-[var(--text-main)] w-fit"
+                  >
+                    <FileText size={10} />
+                    <span className="truncate max-w-[180px]">{tool.title}</span>
+                    <span>{toolStatusIcon(tool.status)}</span>
+                  </button>
+                  {isExpanded && (
+                    <ToolCallDetail tool={tool} onNavigate={onNavigate} hasDetail={hasDetail} />
+                  )}
+                </div>
+              );
+            })}
+            {message.content.length === 0 && message.streaming && <span>…</span>}
             {message.streaming && <span className="animate-pulse">▍</span>}
           </div>
         )}

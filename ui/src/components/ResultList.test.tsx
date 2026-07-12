@@ -18,6 +18,8 @@ const {
   mockWriteClipboard,
   mockListFiles,
   mockUpdateSettings,
+  mockDeleteFile,
+  mockDeletionKind,
   mockIsTauri,
 } = vi.hoisted(() => ({
   mockOpenPath: vi.fn(),
@@ -27,6 +29,8 @@ const {
   mockWriteClipboard: vi.fn().mockResolvedValue(undefined),
   mockListFiles: vi.fn().mockResolvedValue({ files: [], omitted: [] }),
   mockUpdateSettings: vi.fn().mockResolvedValue({}),
+  mockDeleteFile: vi.fn().mockResolvedValue(undefined),
+  mockDeletionKind: { value: "permanent" as "trash" | "permanent" },
   mockIsTauri: { value: false },
 }));
 
@@ -40,9 +44,19 @@ vi.mock("../services", () => ({
     listFiles: mockListFiles,
     updateSettings: mockUpdateSettings,
   },
+  source: {
+    get deletionKind() {
+      return mockDeletionKind.value;
+    },
+    deleteFile: mockDeleteFile,
+  },
   get isTauri() {
     return mockIsTauri.value;
   },
+}));
+
+vi.mock("../lib/utils/dialog", () => ({
+  confirmDialog: vi.fn().mockResolvedValue(true),
 }));
 
 import ResultList from "./ResultList";
@@ -83,6 +97,7 @@ describe("ResultList", () => {
     mockRefreshFileMetadata.mockResolvedValue(undefined);
     mockListFiles.mockResolvedValue({ files: [], omitted: [] });
     mockIsTauri.value = false;
+    mockDeletionKind.value = "permanent";
     useSearchStore.setState({
       results: [],
       stats: null,
@@ -509,6 +524,9 @@ describe("ResultList", () => {
     renderWithToasts();
     expect(screen.getByText("file.txt")).toBeInTheDocument();
     expect(screen.getByText("test")).toBeInTheDocument();
+    expect(screen.queryByText("/test/file.txt")).not.toBeInTheDocument();
+    fireEvent.mouseEnter(screen.getByLabelText("Path: /test/file.txt"));
+    expect(screen.getByRole("tooltip")).toHaveTextContent("/test/file.txt");
   });
 
   it("calls onMatchClick when a match is clicked", () => {
@@ -849,5 +867,43 @@ describe("ResultList", () => {
       "/test/file.txt",
       "renamed.txt",
     );
+  });
+
+  it("permanently deletes a web file after confirmation", async () => {
+    useSettingsStore.setState({
+      directory: "/test",
+      fileList: [{ path: "/test/file.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" }],
+    });
+
+    renderWithToasts();
+    fireEvent.contextMenu(screen.getByRole("button", { name: /file\.txt/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete permanently" }));
+
+    const { confirmDialog } = await import("../lib/utils/dialog");
+    expect(confirmDialog).toHaveBeenCalledWith(
+      'Permanently delete "file.txt"? This cannot be undone.',
+    );
+    await waitFor(() => expect(mockDeleteFile).toHaveBeenCalledWith("/test/file.txt"));
+    expect(await screen.findByText('Permanently deleted "file.txt"')).toBeInTheDocument();
+  });
+
+  it("moves a desktop file to Trash without a permanent-delete fallback", async () => {
+    mockIsTauri.value = true;
+    mockDeletionKind.value = "trash";
+    useSettingsStore.setState({
+      directory: "/test",
+      fileList: [{ path: "/test/file.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" }],
+    });
+
+    renderWithToasts();
+    fireEvent.contextMenu(screen.getByRole("button", { name: /file\.txt/i }));
+    expect(screen.queryByRole("menuitem", { name: "Delete permanently" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Move to Trash" }));
+
+    const { confirmDialog } = await import("../lib/utils/dialog");
+    expect(confirmDialog).toHaveBeenCalledWith(
+      'Move "file.txt" to Trash? You can restore it from Trash.',
+    );
+    await waitFor(() => expect(mockDeleteFile).toHaveBeenCalledWith("/test/file.txt"));
   });
 });

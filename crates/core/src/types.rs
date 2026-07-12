@@ -1023,6 +1023,23 @@ pub struct OpenAlexWork {
     pub cached_at_ms: i64,
 }
 
+/// Provider-neutral result returned by external literature searches.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiteratureSearchResult {
+    pub id: String,
+    pub doi: Option<String>,
+    pub title: Option<String>,
+    pub year: Option<i64>,
+    pub publication_date: Option<String>,
+    pub venue: Option<String>,
+    pub citation_count: i64,
+    pub is_open_access: bool,
+    pub pdf_url: Option<String>,
+    pub landing_page_url: Option<String>,
+    pub open_access_status: Option<String>,
+    pub license: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub enum Theme {
     #[default]

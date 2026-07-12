@@ -494,6 +494,7 @@ export class HttpSearchApi implements SearchApi {
 
 export class HttpSourceApi implements WebSourceApi {
   type = "web" as const;
+  deletionKind = "permanent" as const;
 
   async uploadFiles(files: File[]): Promise<string> {
     const formData = new FormData();

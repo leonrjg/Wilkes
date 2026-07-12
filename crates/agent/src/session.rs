@@ -19,7 +19,7 @@ use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo, Responder};
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
-use wilkes_core::types::AgentBackend;
+use wilkes_core::types::{AgentBackend, IntegrationsSettings};
 
 use crate::context::{build_context_block, ActiveDoc, ActiveDocText, ContextFile};
 use crate::search::SearchService;
@@ -160,11 +160,17 @@ pub struct ChatReplayToolCall {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChatReplayContentBlock {
+    Text { text: String },
+    Tool { tool: ChatReplayToolCall },
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatReplayMessage {
     pub role: String,
-    pub text: String,
     pub thought: String,
-    pub tools: Vec<ChatReplayToolCall>,
+    pub content: Vec<ChatReplayContentBlock>,
 }
 
 pub struct SpawnedChatSession {
@@ -450,7 +456,14 @@ impl ChatSession {
 /// callers know immediately whether the backend is actually usable (not just
 /// installed).
 pub async fn spawn(backend: AgentBackend, cwd: PathBuf) -> anyhow::Result<SpawnedChatSession> {
-    spawn_with_mode(backend, cwd, SessionOpenMode::New, None).await
+    spawn_with_mode(
+        backend,
+        cwd,
+        SessionOpenMode::New,
+        None,
+        IntegrationsSettings::default(),
+    )
+    .await
 }
 
 pub async fn spawn_with_search(
@@ -458,7 +471,16 @@ pub async fn spawn_with_search(
     cwd: PathBuf,
     search: Option<Arc<dyn SearchService>>,
 ) -> anyhow::Result<SpawnedChatSession> {
-    spawn_with_mode(backend, cwd, SessionOpenMode::New, search).await
+    spawn_with_services(backend, cwd, search, IntegrationsSettings::default()).await
+}
+
+pub async fn spawn_with_services(
+    backend: AgentBackend,
+    cwd: PathBuf,
+    search: Option<Arc<dyn SearchService>>,
+    integrations: IntegrationsSettings,
+) -> anyhow::Result<SpawnedChatSession> {
+    spawn_with_mode(backend, cwd, SessionOpenMode::New, search, integrations).await
 }
 
 pub async fn load(
@@ -471,6 +493,7 @@ pub async fn load(
         cwd,
         SessionOpenMode::Load { backend_session_id },
         None,
+        IntegrationsSettings::default(),
     )
     .await
 }
@@ -481,11 +504,29 @@ pub async fn load_with_search(
     backend_session_id: String,
     search: Option<Arc<dyn SearchService>>,
 ) -> anyhow::Result<SpawnedChatSession> {
+    load_with_services(
+        backend,
+        cwd,
+        backend_session_id,
+        search,
+        IntegrationsSettings::default(),
+    )
+    .await
+}
+
+pub async fn load_with_services(
+    backend: AgentBackend,
+    cwd: PathBuf,
+    backend_session_id: String,
+    search: Option<Arc<dyn SearchService>>,
+    integrations: IntegrationsSettings,
+) -> anyhow::Result<SpawnedChatSession> {
     spawn_with_mode(
         backend,
         cwd,
         SessionOpenMode::Load { backend_session_id },
         search,
+        integrations,
     )
     .await
 }
@@ -495,6 +536,7 @@ async fn spawn_with_mode(
     cwd: PathBuf,
     open_mode: SessionOpenMode,
     search: Option<Arc<dyn SearchService>>,
+    integrations: IntegrationsSettings,
 ) -> anyhow::Result<SpawnedChatSession> {
     let spec = crate::resolve_launch_spec(backend)?;
     let mut command_line = vec![spec.command.display().to_string()];
@@ -510,7 +552,7 @@ async fn spawn_with_mode(
 
     let state = ContextStateHandle::default();
     let mcp_runtime = if matches!(backend, AgentBackend::ClaudeCode | AgentBackend::Codex) {
-        Some(crate::mcp::start(state.clone(), cwd.clone(), search).await?)
+        Some(crate::mcp::start(state.clone(), cwd.clone(), search, integrations).await?)
     } else {
         None
     };
@@ -980,22 +1022,24 @@ fn append_replay_update(
         }
         SessionUpdate::ToolCall(tool_call) => {
             let message = ensure_replay_assistant(messages);
-            message.tools.push(ChatReplayToolCall {
-                tool_call_id: tool_call.tool_call_id.0.to_string(),
-                title: tool_call.title,
-                status: tool_call_status_str(tool_call.status).to_string(),
-                locations: tool_call
-                    .locations
-                    .into_iter()
-                    .map(to_chat_location)
-                    .collect(),
-                content: tool_call
-                    .content
-                    .into_iter()
-                    .filter_map(to_chat_tool_content)
-                    .collect(),
-                raw_input: tool_call.raw_input,
-                raw_output: tool_call.raw_output,
+            message.content.push(ChatReplayContentBlock::Tool {
+                tool: ChatReplayToolCall {
+                    tool_call_id: tool_call.tool_call_id.0.to_string(),
+                    title: tool_call.title,
+                    status: tool_call_status_str(tool_call.status).to_string(),
+                    locations: tool_call
+                        .locations
+                        .into_iter()
+                        .map(to_chat_location)
+                        .collect(),
+                    content: tool_call
+                        .content
+                        .into_iter()
+                        .filter_map(to_chat_tool_content)
+                        .collect(),
+                    raw_input: tool_call.raw_input,
+                    raw_output: tool_call.raw_output,
+                },
             });
         }
         SessionUpdate::ToolCallUpdate(update) => {
@@ -1027,15 +1071,18 @@ fn strip_wilkes_context_prefix(text: &str) -> Option<String> {
 fn append_replay_text(messages: &mut Vec<ChatReplayMessage>, role: &str, text: String) {
     if let Some(last) = messages.last_mut() {
         if last.role == role {
-            last.text.push_str(&text);
+            if let Some(ChatReplayContentBlock::Text { text: existing }) = last.content.last_mut() {
+                existing.push_str(&text);
+            } else {
+                last.content.push(ChatReplayContentBlock::Text { text });
+            }
             return;
         }
     }
     messages.push(ChatReplayMessage {
         role: role.to_string(),
-        text,
         thought: String::new(),
-        tools: Vec::new(),
+        content: vec![ChatReplayContentBlock::Text { text }],
     });
 }
 
@@ -1047,9 +1094,8 @@ fn ensure_replay_assistant(messages: &mut Vec<ChatReplayMessage>) -> &mut ChatRe
     if needs_new {
         messages.push(ChatReplayMessage {
             role: "assistant".to_string(),
-            text: String::new(),
             thought: String::new(),
-            tools: Vec::new(),
+            content: Vec::new(),
         });
     }
     messages
@@ -1059,39 +1105,40 @@ fn ensure_replay_assistant(messages: &mut Vec<ChatReplayMessage>) -> &mut ChatRe
 
 fn upsert_replay_tool(message: &mut ChatReplayMessage, update: ToolCallUpdate) {
     let tool_call_id = update.tool_call_id.0.to_string();
-    let Some(tool) = message
-        .tools
-        .iter_mut()
-        .find(|tool| tool.tool_call_id == tool_call_id)
-    else {
-        message.tools.push(ChatReplayToolCall {
-            tool_call_id,
-            title: update
-                .fields
-                .title
-                .unwrap_or_else(|| "Tool call".to_string()),
-            status: update
-                .fields
-                .status
-                .map(tool_call_status_str)
-                .unwrap_or("pending")
-                .to_string(),
-            locations: update
-                .fields
-                .locations
-                .unwrap_or_default()
-                .into_iter()
-                .map(to_chat_location)
-                .collect(),
-            content: update
-                .fields
-                .content
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(to_chat_tool_content)
-                .collect(),
-            raw_input: update.fields.raw_input,
-            raw_output: update.fields.raw_output,
+    let Some(tool) = message.content.iter_mut().find_map(|block| match block {
+        ChatReplayContentBlock::Tool { tool } if tool.tool_call_id == tool_call_id => Some(tool),
+        _ => None,
+    }) else {
+        message.content.push(ChatReplayContentBlock::Tool {
+            tool: ChatReplayToolCall {
+                tool_call_id,
+                title: update
+                    .fields
+                    .title
+                    .unwrap_or_else(|| "Tool call".to_string()),
+                status: update
+                    .fields
+                    .status
+                    .map(tool_call_status_str)
+                    .unwrap_or("pending")
+                    .to_string(),
+                locations: update
+                    .fields
+                    .locations
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(to_chat_location)
+                    .collect(),
+                content: update
+                    .fields
+                    .content
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(to_chat_tool_content)
+                    .collect(),
+                raw_input: update.fields.raw_input,
+                raw_output: update.fields.raw_output,
+            },
         });
         return;
     };
@@ -1326,6 +1373,17 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::ToolCallUpdateFields;
 
+    fn replay_text(message: &ChatReplayMessage) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ChatReplayContentBlock::Text { text } => Some(text.as_str()),
+                ChatReplayContentBlock::Tool { .. } => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn replay_user_text_drops_wilkes_context_only_chunk() {
         let mut messages = Vec::new();
@@ -1350,7 +1408,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[0].text, "Summarize this");
+        assert_eq!(replay_text(&messages[0]), "Summarize this");
     }
 
     #[test]
@@ -1360,7 +1418,35 @@ mod tests {
         append_replay_user_text(&mut messages, "What does the paper say?".to_string());
 
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].text, "What does the paper say?");
+        assert_eq!(replay_text(&messages[0]), "What does the paper say?");
+    }
+
+    #[test]
+    fn replay_text_after_tool_starts_a_new_ordered_block() {
+        let mut messages = Vec::new();
+        append_replay_text(&mut messages, "assistant", "Before ".to_string());
+        append_replay_text(&mut messages, "assistant", "tool.".to_string());
+        messages[0].content.push(ChatReplayContentBlock::Tool {
+            tool: ChatReplayToolCall {
+                tool_call_id: "tool-1".to_string(),
+                title: "Search".to_string(),
+                status: "completed".to_string(),
+                locations: Vec::new(),
+                content: Vec::new(),
+                raw_input: None,
+                raw_output: None,
+            },
+        });
+        append_replay_text(&mut messages, "assistant", "After tool.".to_string());
+
+        assert!(matches!(
+            messages[0].content.as_slice(),
+            [
+                ChatReplayContentBlock::Text { text: before },
+                ChatReplayContentBlock::Tool { .. },
+                ChatReplayContentBlock::Text { text: after },
+            ] if before == "Before tool." && after == "After tool."
+        ));
     }
 
     #[test]
@@ -1371,6 +1457,15 @@ mod tests {
         );
 
         assert!(is_wilkes_mcp_call(&tool_call));
+    }
+
+    #[test]
+    fn wilkes_literature_search_is_read_only_but_download_is_not() {
+        assert!(is_wilkes_mcp_tool_text(
+            "mcp.wilkes.literature_search",
+            true
+        ));
+        assert!(!is_wilkes_mcp_tool_text("mcp.wilkes.download", true));
     }
 
     #[test]
