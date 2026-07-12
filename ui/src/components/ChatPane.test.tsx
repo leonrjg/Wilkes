@@ -4,6 +4,7 @@ import ChatPane, { contextFileMatchRef, isTranscriptNearBottom, MessageBubble } 
 import type { ChatMessage } from "../stores/useChatStore";
 import { useChatStore } from "../stores/useChatStore";
 import { useSearchStore } from "../stores/useSearchStore";
+import { chatApi } from "../services/chat";
 
 vi.mock("../services/chat", () => ({
   chatApi: {
@@ -17,7 +18,7 @@ vi.mock("../services/chat", () => ({
     onConfigOptionsUpdated: vi.fn().mockResolvedValue(() => {}),
     addContext: vi.fn(),
     removeContext: vi.fn(),
-    setActiveDoc: vi.fn(),
+    setActiveDoc: vi.fn().mockResolvedValue(undefined),
     newTurnId: vi.fn(),
     send: vi.fn(),
     cancel: vi.fn(),
@@ -229,5 +230,14 @@ describe("ChatPane context badges", () => {
       path: "/tmp/notes.md",
       origin: { TextFile: { line: 0, col: 0 } },
     });
+  });
+
+  it("deselects the currently open document from chat context", () => {
+    render(<ChatPane onClose={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Deselect current document" }));
+
+    expect(useChatStore.getState().activeDoc).toBeNull();
+    expect(chatApi.setActiveDoc).toHaveBeenCalledWith("session-1", null, null);
   });
 });

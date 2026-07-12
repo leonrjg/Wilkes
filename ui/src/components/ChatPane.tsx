@@ -124,6 +124,7 @@ export default function ChatPane({ onClose }: Props) {
   const newChat = useChatStore((s) => s.newChat);
   const addContext = useChatStore((s) => s.addContext);
   const removeContext = useChatStore((s) => s.removeContext);
+  const setActiveDoc = useChatStore((s) => s.setActiveDoc);
   const setConfigOption = useChatStore((s) => s.setConfigOption);
   const sendMessage = useChatStore((s) => s.sendMessage);
   const cancel = useChatStore((s) => s.cancel);
@@ -368,6 +369,16 @@ export default function ChatPane({ onClose }: Props) {
                 }
               >
                 <MapPin size={10} fill={currentDocInContext ? "currentColor" : "none"} />
+              </button>
+            </Tooltip>
+            <Tooltip content="Deselect current document">
+              <button
+                type="button"
+                onClick={() => setActiveDoc(null)}
+                className="inline-flex items-center justify-center rounded p-0.5 text-[var(--text-dim)] transition-colors hover:text-[var(--text-error)]"
+                aria-label="Deselect current document"
+              >
+                <X size={10} />
               </button>
             </Tooltip>
           </span>
