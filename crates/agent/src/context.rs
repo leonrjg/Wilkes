@@ -56,8 +56,8 @@ pub fn build_context_block(
 
     out.push_str(
         "Read tools: when the question names or clearly refers to the open/current document \
-         or a listed context document, pass that document path as search.file. Use corpus-wide \
-         search only when the question asks across the library or no concrete file is implied. \
+         or a listed context document, pass that document path as search.file. Set search.scope \
+         to `all` when the question asks across the library; otherwise omit it for the current root. \
          Use get_document_text for pages or page ranges not included here; \
          omit path to read the open document, or pass a path listed in this context. Use \
          list_context to inspect the current Wilkes context.\n",

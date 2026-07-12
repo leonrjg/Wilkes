@@ -177,6 +177,8 @@ struct SearchParams {
     query: String,
     /// Use exact for literal/regex matching, semantic for meaning-based search.
     mode: Option<SearchModeParam>,
+    /// Search location. Use all for a library-wide search; omit for the current root.
+    scope: Option<SearchScopeParam>,
     /// Corpus/index root. Omit unless searching a different root is intentional.
     root: Option<String>,
     /// Restrict search to this single file inside root. Use this for questions
@@ -197,6 +199,12 @@ struct SearchParams {
 enum SearchModeParam {
     Exact,
     Semantic,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SearchScopeParam {
+    All,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -421,7 +429,7 @@ async fn search_documents(
     let (query, max_files) = build_search_query(root, params, mode)?;
     let root = display_path(&query.root);
     let file = match &query.scope {
-        wilkes_core::types::SearchScope::Corpus => None,
+        wilkes_core::types::SearchScope::Corpus | wilkes_core::types::SearchScope::All => None,
         wilkes_core::types::SearchScope::File { path } => Some(display_path(path)),
     };
     let query_text = query.pattern.clone();
@@ -474,12 +482,18 @@ fn build_search_query(
                 SearchModeParam::Exact => wilkes_core::types::SearchMode::Grep,
                 SearchModeParam::Semantic => wilkes_core::types::SearchMode::Semantic,
             },
-            scope: params
-                .file
-                .map(|path| wilkes_core::types::SearchScope::File {
+            scope: if let Some(path) = params.file {
+                if params.scope == Some(SearchScopeParam::All) {
+                    return Err("file cannot be combined with scope='all'.".to_string());
+                }
+                wilkes_core::types::SearchScope::File {
                     path: PathBuf::from(path),
-                })
-                .unwrap_or_default(),
+                }
+            } else if params.scope == Some(SearchScopeParam::All) {
+                wilkes_core::types::SearchScope::All
+            } else {
+                wilkes_core::types::SearchScope::Corpus
+            },
             supported_extensions: Vec::new(),
         },
         max_results,
@@ -689,6 +703,7 @@ mod tests {
             SearchParams {
                 query: "  IO programming  ".to_string(),
                 mode: Some(SearchModeParam::Exact),
+                scope: None,
                 root: None,
                 file: None,
                 max_results: Some(500),
@@ -720,6 +735,7 @@ mod tests {
             SearchParams {
                 query: "definitions".to_string(),
                 mode: Some(SearchModeParam::Semantic),
+                scope: None,
                 root: None,
                 file: None,
                 max_results: None,
@@ -745,6 +761,7 @@ mod tests {
             SearchParams {
                 query: "definitions".to_string(),
                 mode: None,
+                scope: None,
                 root: None,
                 file: Some("paper.pdf".to_string()),
                 max_results: None,
@@ -762,6 +779,29 @@ mod tests {
                 path: PathBuf::from("paper.pdf")
             }
         );
+    }
+
+    #[test]
+    fn builds_all_scoped_search_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let (query, _) = build_search_query(
+            dir.path().to_path_buf(),
+            SearchParams {
+                query: "across the library".into(),
+                mode: None,
+                scope: Some(SearchScopeParam::All),
+                root: None,
+                file: None,
+                max_results: None,
+                case_sensitive: None,
+                is_regex: None,
+                context_lines: None,
+            },
+            SearchModeParam::Exact,
+        )
+        .unwrap();
+
+        assert_eq!(query.scope, SearchScope::All);
     }
 
     #[tokio::test]
@@ -808,6 +848,7 @@ mod tests {
             SearchParams {
                 query: "IO".to_string(),
                 mode: Some(SearchModeParam::Semantic),
+                scope: None,
                 root: None,
                 file: None,
                 max_results: Some(3),
@@ -859,6 +900,7 @@ mod tests {
             SearchParams {
                 query: "multi-turn".to_string(),
                 mode: None,
+                scope: None,
                 root: Some(explicit_root.to_string_lossy().into_owned()),
                 file: None,
                 max_results: None,
@@ -885,6 +927,7 @@ mod tests {
             SearchParams {
                 query: "anything".to_string(),
                 mode: None,
+                scope: None,
                 root: None,
                 file: None,
                 max_results: None,

@@ -19,6 +19,10 @@ export interface ByteRange {
 }
 
 export type SearchMode = "Grep" | "Semantic";
+export type SearchScope =
+  | { type: "corpus" }
+  | { type: "all" }
+  | { type: "file"; path: string };
 
 export interface SearchQuery {
   pattern: string;
@@ -33,6 +37,7 @@ export interface SearchQuery {
   context_lines: number;
   /** Defaults to "Grep" */
   mode: SearchMode;
+  scope: SearchScope;
   supported_extensions: string[];
 }
 

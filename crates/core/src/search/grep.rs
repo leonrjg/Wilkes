@@ -11,11 +11,27 @@ use std::path::Path;
 
 use super::{SearchProvider, SearchResultTx};
 
-pub struct GrepSearchProvider;
+pub struct GrepSearchProvider {
+    all_roots: Vec<std::path::PathBuf>,
+    all_root_errors: Vec<String>,
+}
 
 impl GrepSearchProvider {
     pub fn new() -> Self {
-        Self
+        Self {
+            all_roots: Vec::new(),
+            all_root_errors: Vec::new(),
+        }
+    }
+
+    pub fn with_all_roots(
+        all_roots: Vec<std::path::PathBuf>,
+        all_root_errors: Vec<String>,
+    ) -> Self {
+        Self {
+            all_roots,
+            all_root_errors,
+        }
     }
 
     fn build_matcher(query: &SearchQuery) -> anyhow::Result<RegexMatcher> {
@@ -49,14 +65,53 @@ impl SearchProvider for GrepSearchProvider {
     ) -> anyhow::Result<Vec<String>> {
         let matcher = Self::build_matcher(query)?;
         let mut total_matches: usize = 0;
-        let mut errors: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = if query.scope == SearchScope::All {
+            self.all_root_errors.clone()
+        } else {
+            Vec::new()
+        };
 
         match &query.scope {
             SearchScope::Corpus => {
-                let walk = WalkBuilder::new(&query.root)
-                    .git_ignore(query.respect_gitignore)
-                    .hidden(false)
-                    .build();
+                let mut builder = WalkBuilder::new(&query.root);
+                builder.git_ignore(query.respect_gitignore).hidden(false);
+                let walk = builder.build();
+
+                for entry in walk {
+                    if tx.is_closed() {
+                        break;
+                    }
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    if search_path(
+                        path,
+                        query,
+                        extractors,
+                        &matcher,
+                        &tx,
+                        &mut total_matches,
+                        &mut errors,
+                    )? {
+                        break;
+                    }
+                }
+            }
+            SearchScope::All => {
+                let Some((first, rest)) = self.all_roots.split_first() else {
+                    anyhow::bail!("No accessible library directories are configured");
+                };
+                let mut builder = WalkBuilder::new(first);
+                for root in rest {
+                    builder.add(root);
+                }
+                builder.git_ignore(query.respect_gitignore).hidden(false);
+                let walk = builder.build();
 
                 for entry in walk {
                     if tx.is_closed() {
@@ -551,6 +606,43 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].path.ends_with("small.txt"));
+    }
+
+    #[test]
+    fn test_search_all_uses_multiple_roots_and_global_limit() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("a.txt"), "needle").unwrap();
+        fs::write(second.join("b.txt"), "needle").unwrap();
+
+        let query = SearchQuery {
+            pattern: "needle".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: Path::new("unused-for-all").to_path_buf(),
+            max_results: 1,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            scope: SearchScope::All,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        let provider = GrepSearchProvider::with_all_roots(vec![first, second], Vec::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let extractors = ExtractorRegistry::new();
+        std::thread::spawn(move || provider.search(&query, &extractors, tx).unwrap());
+
+        let mut results = Vec::new();
+        while let Some(result) = rx.blocking_recv() {
+            results.push(result);
+        }
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].matches.len(), 1);
     }
 
     #[test]

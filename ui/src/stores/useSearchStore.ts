@@ -113,8 +113,9 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
 
     if (lastQuery.mode === "Semantic") {
       try {
-        const indexStatus = await api.getIndexStatus(lastQuery.root);
-        const usable = isUsableSemanticIndex(indexStatus, lastQuery.root);
+        const all = lastQuery.scope?.type === "all";
+        const indexStatus = await api.getIndexStatus(all ? undefined : lastQuery.root);
+        const usable = isUsableSemanticIndex(indexStatus, all ? undefined : lastQuery.root);
         if (!usable) return;
       } catch {
         return;
@@ -128,7 +129,8 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
 
   invalidateSemanticResultsForRoot: (root: string) =>
     set((state) => {
-      if (state.lastQuery?.mode !== "Semantic" || state.lastQuery.root !== root) {
+      if (state.lastQuery?.mode !== "Semantic" ||
+          (state.lastQuery.scope?.type !== "all" && state.lastQuery.root !== root)) {
         return {};
       }
       return {

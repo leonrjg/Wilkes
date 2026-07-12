@@ -29,6 +29,8 @@ describe("SearchBar", () => {
     });
     useSemanticStore.setState({
       readyForCurrentRoot: true,
+      readyGlobally: true,
+      refreshGlobalStatus: vi.fn().mockResolvedValue(true),
       ensureCurrentRootIndexed: vi.fn().mockResolvedValue(false),
       status: "ready",
       buildRoot: null,
@@ -127,6 +129,22 @@ describe("SearchBar", () => {
         case_sensitive: true,
       }),
     );
+  });
+
+  it("sends the backend-owned all scope without directory paths", () => {
+    const searchMock = vi.fn();
+    useSearchStore.setState({ search: searchMock });
+    render(<SearchBar sourceSlot={<MockSourceSlot />} />);
+
+    fireEvent.change(screen.getByPlaceholderText("Search…"), { target: { value: "everywhere" } });
+    act(() => vi.advanceTimersByTime(300));
+    searchMock.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Search all directories" }));
+
+    expect(searchMock).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: { type: "all" }, root: "/test/dir" }),
+    );
+    expect(searchMock.mock.calls[0][0]).not.toHaveProperty("roots");
   });
 
   it("queues a semantic search and triggers indexing when no index is ready", () => {

@@ -67,6 +67,8 @@ impl SearchHandle {
 /// an immediate error. The desktop validates presence before calling.
 pub fn start_search(
     query: SearchQuery,
+    all_roots: Vec<std::path::PathBuf>,
+    all_root_errors: Vec<String>,
     embedder: Option<Arc<dyn Embedder>>,
     index: Option<Arc<Mutex<Option<SemanticIndex>>>>,
     indexing: Option<IndexingConfig>,
@@ -94,7 +96,10 @@ pub fn start_search(
                     ];
                 }
             },
-            SearchMode::Grep => Box::new(GrepSearchProvider::new()),
+            SearchMode::Grep => Box::new(GrepSearchProvider::with_all_roots(
+                all_roots,
+                all_root_errors,
+            )),
         };
 
         provider
@@ -131,7 +136,7 @@ mod tests {
             supported_extensions: vec!["txt".to_string()],
         };
 
-        let mut handle = start_search(query, None, None, None);
+        let mut handle = start_search(query, Vec::new(), Vec::new(), None, None, None);
         let mut matches = Vec::new();
         while let Some(m) = handle.rx.recv().await {
             matches.push(m);
@@ -163,7 +168,7 @@ mod tests {
             supported_extensions: vec![],
         };
 
-        let handle = start_search(query, None, None, None);
+        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None);
         let errors = handle.finish().await;
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("Semantic search requires"));
@@ -190,7 +195,7 @@ mod tests {
             supported_extensions: vec!["txt".to_string()],
         };
 
-        let handle = start_search(query, None, None, None);
+        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None);
 
         let stats = handle
             .run(|fm| async move {
@@ -225,7 +230,7 @@ mod tests {
             supported_extensions: vec!["txt".to_string()],
         };
 
-        let handle = start_search(query, None, None, None);
+        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None);
 
         let stats = handle
             .run(|_fm| async move {
@@ -257,7 +262,7 @@ mod tests {
             supported_extensions: vec!["txt".to_string()],
         };
 
-        let handle = start_search(query, None, None, None);
+        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None);
         let errors = handle.finish().await;
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("search failed"));

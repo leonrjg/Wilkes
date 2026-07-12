@@ -141,7 +141,7 @@ struct SemanticRuntime {
     indexing: IndexingConfig,
 }
 
-fn preferred_bookmark_roots(settings: &Settings) -> Vec<PathBuf> {
+fn library_roots(settings: &Settings) -> (Vec<PathBuf>, Vec<String>) {
     let mut roots = Vec::new();
     if let Some(root) = settings.last_directory.clone() {
         roots.push(root);
@@ -156,7 +156,33 @@ fn preferred_bookmark_roots(settings: &Settings) -> Vec<PathBuf> {
             roots.push(root);
         }
     }
-    roots
+    let mut errors = Vec::new();
+    let mut canonical: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        match std::fs::canonicalize(&root) {
+            Ok(root) if root.is_dir() => {
+                if !canonical.contains(&root) {
+                    canonical.push(root);
+                }
+            }
+            Ok(_) => errors.push(format!(
+                "Library path is not a directory: {}",
+                root.display()
+            )),
+            Err(err) => errors.push(format!(
+                "Library directory is unavailable: {} ({err})",
+                root.display()
+            )),
+        }
+    }
+    canonical.sort_by_key(|root| root.components().count());
+    let mut covered = Vec::<PathBuf>::new();
+    for root in canonical {
+        if !covered.iter().any(|parent| root.starts_with(parent)) {
+            covered.push(root);
+        }
+    }
+    (covered, errors)
 }
 
 fn metadata_source_preference(source: &MetadataSourcePreference) -> MetadataSource {
@@ -299,7 +325,7 @@ impl AppContext {
         if bookmarks.iter().all(|b| b.path.exists()) {
             return;
         }
-        let preferred_roots = preferred_bookmark_roots(settings);
+        let (preferred_roots, _) = library_roots(settings);
         let Some(cache) = self.metadata_cache() else {
             return;
         };
@@ -1217,9 +1243,13 @@ impl AppContext {
     fn prepare_search_query(
         mut query: SearchQuery,
         supported_extensions: Vec<String>,
+        library_roots: &[PathBuf],
     ) -> Result<SearchQuery, String> {
         query.supported_extensions = supported_extensions;
-        query.root = Self::canonicalize_search_root(&query.root)?;
+        if query.scope != SearchScope::All {
+            query.root = Self::canonicalize_search_root(&query.root)?;
+            Self::ensure_path_in_library(&query.root, library_roots, "Search root")?;
+        }
 
         if let SearchScope::File { path } = &query.scope {
             let (file, _) = Self::canonicalize_supported_file_under_root(
@@ -1232,6 +1262,17 @@ impl AppContext {
         }
 
         Ok(query)
+    }
+
+    fn ensure_path_in_library(
+        path: &Path,
+        library_roots: &[PathBuf],
+        label: &str,
+    ) -> Result<(), String> {
+        if library_roots.iter().any(|root| path.starts_with(root)) {
+            return Ok(());
+        }
+        Err(format!("{label} is not in the library: {}", path.display()))
     }
 
     fn ensure_no_active_embed_task(&self, message: &str) -> Result<(), String> {
@@ -1297,6 +1338,39 @@ impl AppContext {
         })
     }
 
+    async fn prepare_global_semantic_runtime(
+        self: &Arc<Self>,
+        settings: &Settings,
+    ) -> Result<SemanticRuntime, String> {
+        self.ensure_no_active_embed_task("Semantic index is currently being built. Please wait.")?;
+        let embedder = self
+            .embedder
+            .lock()
+            .clone()
+            .ok_or_else(|| "No semantic index found. Build the index first.".to_string())?;
+        let index = self.index.lock().clone();
+        let ready = index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|idx| {
+                let status = idx.status();
+                status.indexed_files > 0 && status.total_chunks > 0
+            });
+        if !ready {
+            return Err("The global semantic index has no searchable documents.".to_string());
+        }
+        Ok(SemanticRuntime {
+            embedder,
+            index,
+            indexing: IndexingConfig {
+                chunk_size: settings.semantic.chunk_size,
+                chunk_overlap: settings.semantic.chunk_overlap,
+                supported_extensions: settings.supported_extensions.clone(),
+            },
+        })
+    }
+
     fn request_semantic_reindex_for_root(
         self: &Arc<Self>,
         index_arc: &Arc<Mutex<Option<SemanticIndex>>>,
@@ -1342,20 +1416,40 @@ impl AppContext {
         mut query: SearchQuery,
     ) -> Result<SearchHandle, String> {
         let settings = self.settings().await;
-        query = Self::prepare_search_query(query, settings.supported_extensions.clone())?;
+        let (resolved_library_roots, library_root_errors) = library_roots(&settings);
+        query = Self::prepare_search_query(
+            query,
+            settings.supported_extensions.clone(),
+            &resolved_library_roots,
+        )?;
 
         let mut semantic_indexing = None;
+        let (all_roots, all_root_errors) = if query.scope == SearchScope::All {
+            (resolved_library_roots, library_root_errors)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let (embedder, index) = if query.mode == SearchMode::Semantic {
-            let runtime = self
-                .prepare_semantic_runtime(&query.root, &settings)
-                .await?;
+            let runtime = if query.scope == SearchScope::All {
+                self.prepare_global_semantic_runtime(&settings).await?
+            } else {
+                self.prepare_semantic_runtime(&query.root, &settings)
+                    .await?
+            };
             semantic_indexing = Some(runtime.indexing);
             (Some(runtime.embedder), Some(runtime.index))
         } else {
             (None, None)
         };
 
-        Ok(start_search(query, embedder, index, semantic_indexing))
+        Ok(start_search(
+            query,
+            all_roots,
+            all_root_errors,
+            embedder,
+            index,
+            semantic_indexing,
+        ))
     }
 
     pub async fn related_documents(
@@ -1366,7 +1460,9 @@ impl AppContext {
         const MAX_LIMIT: usize = 25;
 
         let settings = self.settings().await;
+        let (library_roots, _) = library_roots(&settings);
         query.root = Self::canonicalize_search_root(&query.root)?;
+        Self::ensure_path_in_library(&query.root, &library_roots, "Related documents root")?;
         let (source_path, _) = Self::canonicalize_supported_file_under_root(
             &query.root,
             &query.path,
@@ -2360,6 +2456,33 @@ mod tests {
         BookmarkDock, ByteRange, EmbedderModel, IndexStatus, SearchMode, SelectedEmbedder,
         SemanticSettings, Settings, SourceOrigin, Theme,
     };
+
+    #[test]
+    fn library_roots_are_canonical_deduplicated_and_collapse_nested_paths() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let nested = root.join("nested");
+        let sibling = dir.path().join("sibling");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let missing = dir.path().join("missing");
+        let mut settings = Settings::default();
+        settings.last_directory = Some(root.clone());
+        settings.favorites = vec![nested, sibling.clone()];
+        settings.recent_dirs = vec![root.clone(), missing.clone()];
+
+        let (roots, errors) = library_roots(&settings);
+
+        assert_eq!(
+            roots,
+            vec![
+                root.canonicalize().unwrap(),
+                sibling.canonicalize().unwrap()
+            ]
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains(&missing.display().to_string()));
+    }
 
     #[cfg(unix)]
     fn write_executable(path: &Path, content: &str) {
@@ -4084,6 +4207,12 @@ exit 0
             },
             emitter,
         );
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": dir.path() }),
+        )
+        .await
+        .unwrap();
 
         let query = SearchQuery {
             pattern: "test".to_string(),
@@ -4125,7 +4254,12 @@ exit 0
             supported_extensions: vec![],
         };
 
-        let prepared = AppContext::prepare_search_query(query, vec!["txt".to_string()]).unwrap();
+        let prepared = AppContext::prepare_search_query(
+            query,
+            vec!["txt".to_string()],
+            &[dir.path().canonicalize().unwrap()],
+        )
+        .unwrap();
         assert_eq!(prepared.root, std::fs::canonicalize(dir.path()).unwrap());
         assert_eq!(
             prepared.scope,
@@ -4156,8 +4290,68 @@ exit 0
             supported_extensions: vec![],
         };
 
-        let err = AppContext::prepare_search_query(query, vec!["txt".to_string()]).unwrap_err();
+        let err = AppContext::prepare_search_query(
+            query,
+            vec!["txt".to_string()],
+            &[root.path().canonicalize().unwrap()],
+        )
+        .unwrap_err();
         assert!(err.contains("outside"));
+    }
+
+    #[test]
+    fn test_prepare_search_query_rejects_root_outside_library() {
+        let library = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let query = SearchQuery {
+            pattern: "secret".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: outside.path().to_path_buf(),
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 2,
+            mode: SearchMode::Grep,
+            scope: SearchScope::Corpus,
+            supported_extensions: vec![],
+        };
+
+        let err = AppContext::prepare_search_query(
+            query,
+            vec!["txt".to_string()],
+            &[library.path().canonicalize().unwrap()],
+        )
+        .unwrap_err();
+        assert!(err.contains("not in the library"));
+    }
+
+    #[test]
+    fn test_prepare_search_query_allows_nested_root_inside_library() {
+        let library = tempdir().unwrap();
+        let nested = library.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let query = SearchQuery {
+            pattern: "allowed".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: nested.clone(),
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 2,
+            mode: SearchMode::Grep,
+            scope: SearchScope::Corpus,
+            supported_extensions: vec![],
+        };
+
+        let prepared = AppContext::prepare_search_query(
+            query,
+            vec!["txt".to_string()],
+            &[library.path().canonicalize().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(prepared.root, nested.canonicalize().unwrap());
     }
 
     #[tokio::test]
@@ -4179,6 +4373,12 @@ exit 0
             },
             emitter,
         );
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": dir.path() }),
+        )
+        .await
+        .unwrap();
 
         let query = SearchQuery {
             pattern: "test".to_string(),
@@ -4399,10 +4599,19 @@ exit 0
                 events: Arc::new(Mutex::new(Vec::new())),
             }),
         );
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": dir.path() }),
+        )
+        .await
+        .unwrap();
 
         // Mock a task in progress
         let cancel = CancellationToken::new();
-        let join = tokio::spawn(async { Ok(()) });
+        let join = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
         *ctx.embed_task.lock() = Some(EmbedTaskHandle {
             operation: EmbedOperation::Build,
             cancel,
@@ -4457,6 +4666,12 @@ exit 0
         std::fs::create_dir_all(&requested_root).unwrap();
         let requested_file = requested_root.join("source.txt");
         std::fs::write(&requested_file, "source").unwrap();
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": requested_root.clone() }),
+        )
+        .await
+        .unwrap();
         let idx = SemanticIndex::create(
             &data_dir,
             &model_id,
@@ -4478,6 +4693,34 @@ exit 0
             .unwrap_err();
 
         assert!(err.contains("Semantic index is not ready"));
+    }
+
+    #[tokio::test]
+    async fn test_related_documents_rejects_root_outside_library() {
+        let (dir, ctx) = test_ctx();
+        let library = dir.path().join("library");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let source = outside.join("source.txt");
+        std::fs::write(&source, "source").unwrap();
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": library }),
+        )
+        .await
+        .unwrap();
+
+        let err = ctx
+            .related_documents(RelatedDocumentsQuery {
+                root: outside,
+                path: source,
+                limit: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("not in the library"));
     }
 
     #[tokio::test]
@@ -4534,6 +4777,12 @@ exit 0
         })
         .unwrap();
         *ctx.index.lock() = Arc::new(Mutex::new(Some(idx)));
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": root.clone() }),
+        )
+        .await
+        .unwrap();
 
         let docs = ctx
             .related_documents(RelatedDocumentsQuery {
@@ -4669,6 +4918,12 @@ exit 0
         let root2 = dir.path().join("root2");
         std::fs::create_dir_all(&root2).unwrap();
         std::fs::write(root2.join("file.txt"), "hello").unwrap();
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": root2.clone() }),
+        )
+        .await
+        .unwrap();
         let query = SearchQuery {
             pattern: "test".to_string(),
             is_regex: false,
@@ -4684,7 +4939,11 @@ exit 0
         };
 
         // This should trigger a background reindex because root2 != root1
-        let _handle = ctx.clone().start_search(query).await.unwrap();
+        let err = match ctx.clone().start_search(query).await {
+            Err(err) => err,
+            Ok(_) => panic!("expected semantic root mismatch"),
+        };
+        assert!(err.contains("Semantic index is not ready"));
 
         let mut saw_reindex = false;
         for _ in 0..20 {
@@ -4743,6 +5002,12 @@ exit 0
         let root2 = dir.path().join("root2");
         std::fs::create_dir_all(&root2).unwrap();
         std::fs::write(root2.join("file.txt"), "hello").unwrap();
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": root2.clone() }),
+        )
+        .await
+        .unwrap();
         let query = SearchQuery {
             pattern: "test".to_string(),
             is_regex: false,
@@ -4757,7 +5022,11 @@ exit 0
             supported_extensions: vec![],
         };
 
-        let _handle = ctx.clone().start_search(query).await.unwrap();
+        let err = match ctx.clone().start_search(query).await {
+            Err(err) => err,
+            Ok(_) => panic!("expected semantic root mismatch"),
+        };
+        assert!(err.contains("Semantic index is not ready"));
 
         let mut saw_reindex = false;
         for _ in 0..20 {

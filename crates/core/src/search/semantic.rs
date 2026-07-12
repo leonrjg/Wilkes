@@ -41,7 +41,9 @@ impl SearchProvider for SemanticSearchProvider {
         // 1. Reconcile the index with the current root before returning semantic
         // results. This blocks the first stale search so callers never see known-
         // stale paths after offline creates/renames/deletes.
-        let reconcile_errors = {
+        let reconcile_errors = if query.scope == SearchScope::All {
+            Vec::new()
+        } else {
             let mut guard = self.index.lock().unwrap();
             let idx = guard
                 .as_mut()
@@ -78,6 +80,7 @@ impl SearchProvider for SemanticSearchProvider {
         let top_k = query.max_results;
         let scope = match &query.scope {
             SearchScope::Corpus => SemanticQueryScope::Root(&query.root),
+            SearchScope::All => SemanticQueryScope::Corpus,
             SearchScope::File { path } => SemanticQueryScope::File(path),
         };
         let results = idx.query_scoped(&query_vec, top_k, scope)?;

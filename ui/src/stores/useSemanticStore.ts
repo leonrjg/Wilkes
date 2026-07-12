@@ -10,12 +10,14 @@ type SemanticRootStatus = "idle" | "checking" | "missing" | "ready" | "building"
 interface SemanticStore {
   indexStatus: IndexStatus | null;
   readyForCurrentRoot: boolean;
+  readyGlobally: boolean;
   status: SemanticRootStatus;
   buildRoot: string | null;
   blockedRoot: string | null;
   error: string | null;
 
   refreshCurrentRootStatus: () => Promise<boolean>;
+  refreshGlobalStatus: () => Promise<boolean>;
   ensureCurrentRootIndexed: (freshAttempt?: boolean) => Promise<boolean>;
   handleIndexUpdated: () => Promise<void>;
   handleCurrentRootIndexRemoved: () => Promise<void>;
@@ -24,6 +26,7 @@ interface SemanticStore {
 export const useSemanticStore = create<SemanticStore>((set, get) => ({
   indexStatus: null,
   readyForCurrentRoot: false,
+  readyGlobally: false,
   status: "idle",
   buildRoot: null,
   blockedRoot: null,
@@ -68,6 +71,18 @@ export const useSemanticStore = create<SemanticStore>((set, get) => ({
         status: buildRoot === directory ? "building" : "error",
         error: e?.toString?.() ?? "Failed to read semantic index status",
       });
+      return false;
+    }
+  },
+
+  refreshGlobalStatus: async () => {
+    try {
+      const indexStatus = await api.getIndexStatus();
+      const ready = isUsableSemanticIndex(indexStatus);
+      set({ readyGlobally: ready });
+      return ready;
+    } catch {
+      set({ readyGlobally: false });
       return false;
     }
   },
@@ -126,6 +141,7 @@ export const useSemanticStore = create<SemanticStore>((set, get) => ({
     const { directory } = useSettingsStore.getState();
     const buildRoot = get().buildRoot;
     const ready = await get().refreshCurrentRootStatus();
+    await get().refreshGlobalStatus();
 
     if (!directory || buildRoot === directory || ready) {
       set({ buildRoot: null, status: ready ? "ready" : directory ? "missing" : "idle" });

@@ -27,12 +27,15 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const setPreferSemantic = useSettingsStore((s) => s.setPreferSemantic);
   const maxResults = useSettingsStore((s) => s.maxResults);
   const semanticReady = useSemanticStore((s) => s.readyForCurrentRoot);
+  const semanticReadyGlobally = useSemanticStore((s) => s.readyGlobally);
+  const refreshGlobalStatus = useSemanticStore((s) => s.refreshGlobalStatus);
   const ensureCurrentRootIndexed = useSemanticStore((s) => s.ensureCurrentRootIndexed);
 
   const [pattern, setPattern] = useState("");
   const [isRegex, setIsRegex] = useState(false);
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [isSemanticMode, setIsSemanticMode] = useState(preferSemantic);
+  const [searchAll, setSearchAll] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevSemanticReady = useRef(semanticReady);
 
@@ -44,7 +47,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const buildQuery = useCallback(
     (
       pat: string,
-      opts: { isRegex?: boolean; caseSensitive?: boolean; isSemanticMode?: boolean } = {},
+      opts: { isRegex?: boolean; caseSensitive?: boolean; isSemanticMode?: boolean; searchAll?: boolean } = {},
     ): SearchQuery => {
       return {
         pattern: pat,
@@ -56,6 +59,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
         max_file_size: maxFileSize,
         context_lines: contextLines,
         mode: (opts.isSemanticMode ?? isSemanticMode) ? "Semantic" : "Grep",
+        scope: (opts.searchAll ?? searchAll) ? { type: "all" } : { type: "corpus" },
         supported_extensions: supportedExtensions,
       };
     },
@@ -69,26 +73,29 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
       isSemanticMode,
       supportedExtensions,
       maxResults,
+      searchAll,
     ],
   );
 
   const triggerSearch = useCallback(
     (
       pat: string,
-      opts?: { isRegex?: boolean; caseSensitive?: boolean; isSemanticMode?: boolean },
+      opts?: { isRegex?: boolean; caseSensitive?: boolean; isSemanticMode?: boolean; searchAll?: boolean },
       source: "user" | "reactive" = "reactive",
     ) => {
-      if (!pat.trim() || !directory) return;
+      const all = opts?.searchAll ?? searchAll;
+      if (!pat.trim() || (!all && !directory)) return;
       const semantic = opts?.isSemanticMode ?? isSemanticMode;
       const query = buildQuery(pat, opts);
-      if (semantic && !semanticReady) {
+      const ready = all ? semanticReadyGlobally : semanticReady;
+      if (semantic && !ready && !all) {
         deferSemanticSearch(query);
         ensureCurrentRootIndexed(source === "user").catch(console.error);
         return;
       }
       search(query);
     },
-    [search, buildQuery, deferSemanticSearch, directory, ensureCurrentRootIndexed, isSemanticMode, semanticReady],
+    [search, buildQuery, deferSemanticSearch, directory, ensureCurrentRootIndexed, isSemanticMode, searchAll, semanticReady, semanticReadyGlobally],
   );
 
   // Notify store when query presence changes
@@ -145,6 +152,13 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     }
   };
 
+  const handleToggleAll = () => {
+    const next = !searchAll;
+    setSearchAll(next);
+    if (next) refreshGlobalStatus().catch(console.error);
+    triggerSearch(pattern, { searchAll: next }, "user");
+  };
+
   return (
     <div className="flex flex-col gap-2 p-3 border-b border-[var(--border-main)] bg-[var(--bg-app)]">
       {/* Top row: toggles + pattern */}
@@ -154,6 +168,9 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
         </Toggle>
         <Toggle tooltip="Case sensitive" active={caseSensitive} onToggle={handleToggleCaseSensitive}>
           <span className="text-[11px] font-bold tracking-tight">Aa</span>
+        </Toggle>
+        <Toggle tooltip="Search all directories" active={searchAll} onToggle={handleToggleAll}>
+          <span className="text-[10px] font-bold uppercase tracking-wider">All</span>
         </Toggle>
         <Toggle
           tooltip={semanticReady ? "Semantic search" : "Set up semantic search in Settings"}

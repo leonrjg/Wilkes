@@ -57,6 +57,7 @@ describe("useSearchStore", () => {
       max_file_size: 1000,
       context_lines: 2,
       mode: "Grep",
+      scope: { type: "corpus" },
       supported_extensions: [],
     };
 

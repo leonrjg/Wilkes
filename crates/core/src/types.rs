@@ -33,6 +33,7 @@ pub enum SearchMode {
 pub enum SearchScope {
     #[default]
     Corpus,
+    All,
     File {
         path: PathBuf,
     },
