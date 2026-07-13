@@ -1,5 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { matchSorter, rankings } from "match-sorter";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   ArrowDown,
@@ -15,6 +16,7 @@ import {
   Info,
   RefreshCw,
   User,
+  X,
 } from "react-feather";
 import { buildRows, COLLAPSED_LIMIT, type Row } from "../lib/utils/flattenResults";
 import { useToasts } from "./Toast";
@@ -90,6 +92,51 @@ function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Collect every scalar value available on a file entry. Keeping this
+ * schema-agnostic means metadata added to FileEntry later is searchable without
+ * maintaining a second field list here. Returning separate values prevents a
+ * fuzzy subsequence from spanning unrelated metadata fields.
+ */
+function fileSearchValues(entry: FileEntry): string[] {
+  const values: string[] = [];
+  const visit = (value: unknown) => {
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      values.push(String(value));
+    } else if (Array.isArray(value)) {
+      value.forEach(visit);
+    } else if (value && typeof value === "object") {
+      Object.values(value).forEach(visit);
+    }
+  };
+
+  visit(entry);
+  return values;
+}
+
+function fileSearchTokens(entry: FileEntry): string[] {
+  return fileSearchValues(entry).flatMap((value) =>
+    value.split(/[^\p{L}\p{N}]+/u).filter(Boolean),
+  );
+}
+
+function filterFileEntries<T extends FileEntry>(entries: T[], filterText: string): T[] {
+  if (!filterText) return entries;
+
+  const matches = new Set(matchSorter(entries, filterText, {
+    keys: [
+      // Keep typo-like/subsequence matching useful within individual words.
+      { key: fileSearchTokens, threshold: rankings.MATCHES },
+      // Multi-word queries and identifiers may match a complete metadata value,
+      // but not through a loose subsequence spread across a long sentence.
+      { key: fileSearchValues, threshold: rankings.CONTAINS },
+    ],
+  }));
+  // match-sorter ranks by relevance; retain the user's explicit list sorting
+  // while using its result solely to decide which entries are included.
+  return entries.filter((entry) => matches.has(entry));
 }
 
 /**
@@ -331,6 +378,8 @@ function isSelected(row: Row, selectedMatch: MatchRef | null): boolean {
 interface Props {
   onMatchClick: (ref: MatchRef) => void;
   onFileClick: (path: string) => void;
+  filterText: string;
+  onFilterTextChange: (text: string) => void;
   documents?: FileEntry[];
   preserveDocumentOrder?: boolean;
   documentDetails?: (entry: FileEntry) => DocumentDetail[];
@@ -339,6 +388,8 @@ interface Props {
 export default function ResultList({
   onMatchClick,
   onFileClick,
+  filterText,
+  onFilterTextChange,
   documents,
   preserveDocumentOrder = false,
   documentDetails,
@@ -355,8 +406,6 @@ export default function ResultList({
 
   const fileList = useSettingsStore((s) => s.fileList);
   const omittedFileList = useSettingsStore((s) => s.omittedFileList);
-  const filterText = useSettingsStore((s) => s.filterText);
-  const setFilterText = useSettingsStore((s) => s.setFilterText);
   const indexing = useSettingsStore((s) => s.indexing);
   const settings = useSettingsStore((s) => s.settings);
   const refreshFileList = useSettingsStore((s) => s.refreshFileList);
@@ -635,14 +684,8 @@ export default function ResultList({
   const totalCount = results.reduce((n, fm) => n + fm.matches.length, 0);
 
   if (!hasQuery) {
-    const matchesFilter = (entry: FileEntry) => {
-      if (!filterText) return true;
-      const search = filterText.toLowerCase();
-      return [entry.path, entry.title, entry.author]
-        .some((value) => value?.toLowerCase().includes(search));
-    };
-    const filteredVisibleFiles = sortedFileList.filter(matchesFilter);
-    const filteredOmittedFiles = sortedOmittedFileList.filter((entry) => matchesFilter(entry));
+    const filteredVisibleFiles = filterFileEntries(sortedFileList, filterText);
+    const filteredOmittedFiles = filterFileEntries(sortedOmittedFileList, filterText);
 
     return (
       <div className="flex flex-col h-full overflow-hidden relative bg-[var(--bg-app)]">
@@ -688,9 +731,19 @@ export default function ResultList({
             type="text"
             placeholder="Filter files..."
             value={filterText}
-            onChange={(e) => setFilterText(e.target.value)}
+            onChange={(e) => onFilterTextChange(e.target.value)}
             className="flex-1 min-w-0 bg-transparent border-none outline-none text-[11px] text-[var(--text-main)] placeholder-[var(--text-dim)]"
           />
+          {filterText && (
+            <button
+              type="button"
+              aria-label="Clear file filter"
+              onClick={() => onFilterTextChange("")}
+              className="inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded text-[var(--text-dim)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-main)]"
+            >
+              <X size={12} aria-hidden="true" />
+            </button>
+          )}
           {!preserveDocumentOrder && (
             <>
               <button

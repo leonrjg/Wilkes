@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use ignore::WalkBuilder;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use tracing::error;
 
 use crate::extract::ExtractorRegistry;
@@ -649,7 +649,7 @@ mod tests {
         .unwrap();
 
         let related = idx
-            .related_documents(root, &source, 10, &["txt".to_string()])
+            .related_documents(root, &source, 10, &["txt".to_string()], false)
             .unwrap();
 
         assert_eq!(
@@ -672,10 +672,65 @@ mod tests {
         fs::write(&source, "content").unwrap();
 
         let err = idx
-            .related_documents(root, &source, 10, &["txt".to_string()])
+            .related_documents(root, &source, 10, &["txt".to_string()], false)
             .unwrap_err();
 
         assert!(err.to_string().contains("not present"));
+    }
+
+    #[test]
+    fn test_related_documents_can_search_the_whole_index() {
+        let dir = tempdir().unwrap();
+        let first_root = dir.path().join("first");
+        let second_root = dir.path().join("second");
+        fs::create_dir_all(&first_root).unwrap();
+        fs::create_dir_all(&second_root).unwrap();
+        let source = first_root.join("source.txt");
+        let other = second_root.join("other.txt");
+        let stale = second_root.join("stale.txt");
+        fs::write(&source, "source").unwrap();
+        fs::write(&other, "other").unwrap();
+        fs::write(&stale, "stale").unwrap();
+
+        let mut idx = SemanticIndex::create(
+            dir.path(),
+            "m",
+            2,
+            EmbeddingEngine::Candle,
+            Some(&first_root),
+        )
+        .unwrap();
+        let prepared = |path: &Path, text: &str| PreparedFile {
+            path: path.to_path_buf(),
+            chunks: vec![(
+                Chunk {
+                    file_path: path.to_path_buf(),
+                    text: text.to_string(),
+                    byte_range: ByteRange {
+                        start: 0,
+                        end: text.len(),
+                    },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![1.0, 0.0],
+            )],
+        };
+        idx.write_file(prepared(&source, "source")).unwrap();
+        idx.activate_root(&second_root).unwrap();
+        idx.write_file(prepared(&other, "other")).unwrap();
+        idx.write_file(prepared(&stale, "stale")).unwrap();
+        fs::remove_file(&stale).unwrap();
+
+        let current = idx
+            .related_documents(&first_root, &source, 10, &["txt".to_string()], false)
+            .unwrap();
+        let whole_library = idx
+            .related_documents(&first_root, &source, 10, &["txt".to_string()], true)
+            .unwrap();
+
+        assert!(current.is_empty());
+        assert_eq!(whole_library.len(), 1);
+        assert_eq!(whole_library[0].entry.path, canon(&other));
     }
 
     #[test]
@@ -2535,26 +2590,38 @@ impl SemanticIndex {
         source_path: &Path,
         limit: usize,
         supported_extensions: &[String],
+        whole_corpus: bool,
     ) -> anyhow::Result<Vec<RelatedDocument>> {
         let source_key = self
             .path_key_for_existing_path(source_path)
             .to_string_lossy()
             .into_owned();
         let limit = if limit == 0 { 8 } else { limit };
-        let Some(root_id) = self.root_id_for_path(root)? else {
-            return Ok(Vec::new());
+        let (sql, root_id) = if whole_corpus {
+            (
+                "SELECT f.file_path, v.embedding
+                 FROM files f
+                 JOIN chunks c ON c.file_id = f.id
+                 JOIN vec_chunks v ON v.rowid = c.id",
+                None,
+            )
+        } else {
+            let Some(root_id) = self.root_id_for_path(root)? else {
+                return Ok(Vec::new());
+            };
+            (
+                "SELECT f.file_path, v.embedding
+                 FROM root_files rf
+                 JOIN files f ON f.id = rf.file_id
+                 JOIN chunks c ON c.file_id = f.id
+                 JOIN vec_chunks v ON v.rowid = c.id
+                 WHERE rf.root_id = ?1",
+                Some(root_id),
+            )
         };
 
-        let mut stmt = self.conn.prepare(
-            "SELECT f.file_path, v.embedding
-             FROM root_files rf
-             JOIN files f ON f.id = rf.file_id
-             JOIN chunks c ON c.file_id = f.id
-             JOIN vec_chunks v ON v.rowid = c.id
-             WHERE rf.root_id = ?1",
-        )?;
-
-        let rows = stmt.query_map(params![root_id], |row| {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params_from_iter(root_id), |row| {
             let file_path: String = row.get(0)?;
             let embedding_blob: Vec<u8> = row.get(1)?;
             Ok((file_path, embedding_blob))
@@ -2607,7 +2674,18 @@ impl SemanticIndex {
             };
             let candidate_centroid = centroid(&acc.sum, acc.chunks);
             let score = cosine_similarity(&source_centroid, &candidate_centroid);
-            let metadata = std::fs::metadata(&abs_path)?;
+            let metadata = match std::fs::metadata(&abs_path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    error!(
+                        file = %abs_path.display(),
+                        error = %error,
+                        "Skipping missing related-document candidate"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let extension = abs_path
                 .extension()
                 .and_then(|value| value.to_str())
@@ -2636,12 +2714,14 @@ impl SemanticIndex {
                 .total_cmp(&a.score)
                 .then_with(|| {
                     let left = a
-                        .entry.path
+                        .entry
+                        .path
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or_default();
                     let right = b
-                        .entry.path
+                        .entry
+                        .path
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or_default();

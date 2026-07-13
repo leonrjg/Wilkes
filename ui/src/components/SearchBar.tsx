@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from "react";
-import { Search, Database, Check } from "react-feather";
+import { Search, Database, Check, Globe } from "react-feather";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
@@ -169,9 +169,6 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
         <Toggle tooltip="Case sensitive" active={caseSensitive} onToggle={handleToggleCaseSensitive}>
           <span className="text-[11px] font-bold tracking-tight">Aa</span>
         </Toggle>
-        <Toggle tooltip="Search all directories" active={searchAll} onToggle={handleToggleAll}>
-          <span className="text-[10px] font-bold uppercase tracking-wider">All</span>
-        </Toggle>
         <Toggle
           tooltip={semanticReady ? "Semantic search" : "Set up semantic search in Settings"}
           active={isSemanticMode}
@@ -202,15 +199,30 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
           </span>
         )}
 
-        <input
-          type="text"
-          value={pattern}
-          onChange={(e) => setPattern(e.target.value)}
-          placeholder="Search…"
-          className="flex-1 bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-3 py-1.5 text-sm outline-none focus:ring-1 focus:ring-[var(--accent-blue)] placeholder:text-[var(--text-dim)] text-[var(--text-main)] transition-colors"
-          spellCheck={false}
-          autoFocus
-        />
+        <div className="flex flex-1 items-center rounded border border-[var(--border-main)] bg-[var(--bg-input)] transition-colors focus-within:ring-1 focus-within:ring-[var(--accent-blue)]">
+          <input
+            type="text"
+            value={pattern}
+            onChange={(e) => setPattern(e.target.value)}
+            placeholder="Search…"
+            className="min-w-0 flex-1 bg-transparent px-3 py-1.5 text-sm text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
+            spellCheck={false}
+            autoFocus
+          />
+          <Tooltip content={searchAll ? "Search current directory" : "Search all directories"}>
+            <button
+              type="button"
+              onClick={handleToggleAll}
+              aria-label={searchAll ? "Search current directory" : "Search all directories"}
+              aria-pressed={searchAll}
+              className={`mr-1 inline-flex flex-shrink-0 rounded p-1 transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] ${
+                searchAll ? "bg-[var(--accent-blue-muted)] text-[var(--accent-blue)]" : "text-[var(--text-dim)]"
+              }`}
+            >
+              <Globe size={14} />
+            </button>
+          </Tooltip>
+        </div>
 
         {settingsSlot}
       </div>

@@ -23,7 +23,6 @@ describe("useSettingsStore", () => {
       supportedExtensions: [],
       fileList: [],
       omittedFileList: [],
-      filterText: "",
       preferSemantic: false,
       indexing: false,
       theme: "System",
@@ -205,11 +204,6 @@ describe("useSettingsStore", () => {
     useSettingsStore.getState().setPreferSemantic(true);
     expect(useSettingsStore.getState().preferSemantic).toBe(true);
     expect(api.updateSettings).toHaveBeenCalledWith({ search_prefer_semantic: true });
-  });
-
-  it("should update filter text", () => {
-    useSettingsStore.getState().setFilterText("new filter");
-    expect(useSettingsStore.getState().filterText).toBe("new filter");
   });
 
   it("should update indexing", () => {

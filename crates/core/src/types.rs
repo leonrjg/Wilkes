@@ -105,6 +105,8 @@ pub struct RelatedDocumentsQuery {
     pub root: PathBuf,
     pub path: PathBuf,
     #[serde(default)]
+    pub scope: SearchScope,
+    #[serde(default)]
     pub limit: Option<usize>,
 }
 

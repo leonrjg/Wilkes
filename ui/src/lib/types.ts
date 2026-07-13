@@ -67,6 +67,7 @@ export interface FileMatches {
 export interface RelatedDocumentsQuery {
   root: string;
   path: string;
+  scope?: SearchScope;
   limit?: number | null;
 }
 

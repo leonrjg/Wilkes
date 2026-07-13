@@ -1,6 +1,12 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import ChatPane, { contextFileMatchRef, isTranscriptNearBottom, MessageBubble } from "./ChatPane";
+import ChatPane, {
+  contextFileMatchRef,
+  isTranscriptNearBottom,
+  isTranscriptScrollUpKey,
+  MessageBubble,
+  shouldStickToTranscriptBottom,
+} from "./ChatPane";
 import type { ChatMessage } from "../stores/useChatStore";
 import { useChatStore } from "../stores/useChatStore";
 import { useSearchStore } from "../stores/useSearchStore";
@@ -169,6 +175,48 @@ describe("isTranscriptNearBottom", () => {
   it("stops sticking once the user scrolls away from the bottom", () => {
     expect(
       isTranscriptNearBottom({ scrollHeight: 1000, scrollTop: 300, clientHeight: 500 }),
+    ).toBe(false);
+  });
+});
+
+describe("isTranscriptScrollUpKey", () => {
+  it.each(["ArrowUp", "PageUp", "Home"])("recognizes %s as upward scroll intent", (key) => {
+    expect(isTranscriptScrollUpKey(key)).toBe(true);
+  });
+
+  it.each(["ArrowDown", "PageDown", "End", "Enter"])("does not intercept %s", (key) => {
+    expect(isTranscriptScrollUpKey(key)).toBe(false);
+  });
+});
+
+describe("shouldStickToTranscriptBottom", () => {
+  it("does not reattach after an upward gesture that remains near the bottom", () => {
+    expect(
+      shouldStickToTranscriptBottom(
+        { scrollHeight: 1000, scrollTop: 470, clientHeight: 500 },
+        480,
+        false,
+      ),
+    ).toBe(false);
+  });
+
+  it("reattaches when the user scrolls downward into the bottom zone", () => {
+    expect(
+      shouldStickToTranscriptBottom(
+        { scrollHeight: 1000, scrollTop: 480, clientHeight: 500 },
+        450,
+        false,
+      ),
+    ).toBe(true);
+  });
+
+  it("remains detached outside the bottom zone", () => {
+    expect(
+      shouldStickToTranscriptBottom(
+        { scrollHeight: 1000, scrollTop: 400, clientHeight: 500 },
+        350,
+        false,
+      ),
     ).toBe(false);
   });
 });

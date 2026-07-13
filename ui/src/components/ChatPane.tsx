@@ -88,6 +88,19 @@ export function isTranscriptNearBottom(
   return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight <= thresholdPx;
 }
 
+export function isTranscriptScrollUpKey(key: string) {
+  return key === "ArrowUp" || key === "PageUp" || key === "Home";
+}
+
+export function shouldStickToTranscriptBottom(
+  scroll: { scrollHeight: number; scrollTop: number; clientHeight: number },
+  previousScrollTop: number,
+  currentlyStuck: boolean,
+) {
+  if (!isTranscriptNearBottom(scroll)) return false;
+  return currentlyStuck || scroll.scrollTop > previousScrollTop;
+}
+
 interface Props {
   onClose: () => void;
 }
@@ -95,6 +108,8 @@ interface Props {
 export default function ChatPane({ onClose }: Props) {
   const parentRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
+  const lastScrollTopRef = useRef(0);
+  const lastTouchYRef = useRef<number | null>(null);
   const [draft, setDraft] = useState("");
 
   const backends = useChatStore((s) => s.backends);
@@ -142,6 +157,7 @@ export default function ChatPane({ onClose }: Props) {
 
   useEffect(() => {
     stickToBottomRef.current = true;
+    lastScrollTopRef.current = 0;
   }, [conversationId, sessionId]);
 
   useLayoutEffect(() => {
@@ -479,8 +495,35 @@ export default function ChatPane({ onClose }: Props) {
           className="flex-1 overflow-auto custom-scrollbar"
           style={{ overflowAnchor: "none" }}
           onScroll={(event) => {
-            stickToBottomRef.current = isTranscriptNearBottom(event.currentTarget);
+            const scroll = event.currentTarget;
+            stickToBottomRef.current = shouldStickToTranscriptBottom(
+              scroll,
+              lastScrollTopRef.current,
+              stickToBottomRef.current,
+            );
+            lastScrollTopRef.current = scroll.scrollTop;
           }}
+          onWheelCapture={(event) => {
+            if (event.deltaY < 0) stickToBottomRef.current = false;
+          }}
+          onTouchStart={(event) => {
+            lastTouchYRef.current = event.touches[0]?.clientY ?? null;
+          }}
+          onTouchMove={(event) => {
+            const touchY = event.touches[0]?.clientY;
+            if (touchY == null) return;
+            if (lastTouchYRef.current != null && touchY > lastTouchYRef.current) {
+              stickToBottomRef.current = false;
+            }
+            lastTouchYRef.current = touchY;
+          }}
+          onTouchEnd={() => {
+            lastTouchYRef.current = null;
+          }}
+          onKeyDownCapture={(event) => {
+            if (isTranscriptScrollUpKey(event.key)) stickToBottomRef.current = false;
+          }}
+          tabIndex={0}
         >
           <div style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}>
             {virtualizer.getVirtualItems().map((item) => {

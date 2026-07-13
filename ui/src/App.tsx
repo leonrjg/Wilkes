@@ -59,6 +59,7 @@ export default function App() {
   const [sidebarWidth, setSidebarWidth] = useState(320);
   const [bookmarksWidth, setBookmarksWidth] = useState(320);
   const [chatWidth, setChatWidth] = useState(320);
+  const [fileFilterText, setFileFilterText] = useState("");
   const resizeRef = useRef<{
     startX: number;
     startWidth: number;
@@ -72,6 +73,10 @@ export default function App() {
     loadSettings().catch(() => {});
     loadBookmarks().catch(() => {});
   }, [loadSettings, loadBookmarks]);
+
+  useEffect(() => {
+    setFileFilterText("");
+  }, [directory]);
 
   useEffect(() => {
     if (!isTauri) return;
@@ -388,7 +393,12 @@ export default function App() {
           className="flex-shrink-0 flex flex-col min-h-0 bg-[var(--bg-sidebar)]"
           style={{ width: `${sidebarWidth}px`, minWidth: "200px" }}
         >
-          <ResultList onMatchClick={handleMatchClick} onFileClick={handleFileClick} />
+          <ResultList
+            filterText={fileFilterText}
+            onFilterTextChange={setFileFilterText}
+            onMatchClick={handleMatchClick}
+            onFileClick={handleFileClick}
+          />
         </div>
 
         <div

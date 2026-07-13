@@ -49,6 +49,11 @@ impl wilkes_agent::search::SearchService for AppContext {
         self.get_settings().await.last_directory
     }
 
+    async fn library_roots(self: Arc<Self>) -> Vec<PathBuf> {
+        let settings = self.get_settings().await;
+        library_roots(&settings).0
+    }
+
     async fn search(
         self: Arc<Self>,
         query: SearchQuery,
@@ -73,6 +78,13 @@ impl wilkes_agent::search::SearchService for AppContext {
             stats,
             truncated,
         })
+    }
+
+    async fn related_documents(
+        self: Arc<Self>,
+        query: RelatedDocumentsQuery,
+    ) -> Result<Vec<RelatedDocument>, String> {
+        AppContext::related_documents(self, query).await
     }
 }
 
@@ -1208,7 +1220,7 @@ impl AppContext {
         })
     }
 
-    fn canonicalize_supported_file_under_root(
+    fn canonicalize_supported_file(
         root: &Path,
         path: &Path,
         supported_extensions: &[String],
@@ -1228,13 +1240,6 @@ impl AppContext {
         if !file.is_file() {
             return Err(format!("{label} file is not a file: {}", file.display()));
         }
-        if !is_under(&file, root) {
-            return Err(format!(
-                "{label} file must be inside the search root: {} is outside {}",
-                file.display(),
-                root.display()
-            ));
-        }
         let file_type = FileType::detect(&file, supported_extensions)
             .ok_or_else(|| format!("{label} file type is not supported: {}", file.display()))?;
         Ok((file, file_type))
@@ -1252,12 +1257,13 @@ impl AppContext {
         }
 
         if let SearchScope::File { path } = &query.scope {
-            let (file, _) = Self::canonicalize_supported_file_under_root(
+            let (file, _) = Self::canonicalize_supported_file(
                 &query.root,
                 path,
                 &query.supported_extensions,
                 "Search",
             )?;
+            Self::ensure_path_in_library(&file, library_roots, "Search file")?;
             query.scope = SearchScope::File { path: file };
         }
 
@@ -1463,12 +1469,13 @@ impl AppContext {
         let (library_roots, _) = library_roots(&settings);
         query.root = Self::canonicalize_search_root(&query.root)?;
         Self::ensure_path_in_library(&query.root, &library_roots, "Related documents root")?;
-        let (source_path, _) = Self::canonicalize_supported_file_under_root(
+        let (source_path, _) = Self::canonicalize_supported_file(
             &query.root,
             &query.path,
             &settings.supported_extensions,
             "Related documents",
         )?;
+        Self::ensure_path_in_library(&source_path, &library_roots, "Related documents file")?;
         let runtime = self
             .prepare_semantic_runtime(&query.root, &settings)
             .await?;
@@ -1476,25 +1483,43 @@ impl AppContext {
         let supported_extensions = settings.supported_extensions.clone();
 
         let root = query.root.clone();
+        let listing_roots = if query.scope == SearchScope::All {
+            library_roots
+        } else {
+            vec![root.clone()]
+        };
         let mut related = tokio::task::spawn_blocking(move || {
             let guard = runtime.index.lock().unwrap_or_else(|p| p.into_inner());
             let idx = guard
                 .as_ref()
                 .ok_or_else(|| "No semantic index found. Build the index first.".to_string())?;
-            idx.related_documents(&query.root, &source_path, limit, &supported_extensions)
-                .map_err(|e| e.to_string())
+            idx.related_documents(
+                &query.root,
+                &source_path,
+                limit,
+                &supported_extensions,
+                query.scope == SearchScope::All,
+            )
+            .map_err(|e| e.to_string())
         })
         .await
         .map_err(|e| format!("related documents task panicked: {e}"))??;
 
         // Use the canonical file-list metadata pipeline so every document list
         // renders and sorts the same record shape.
-        let listed = self.list_files(root).await.map_err(|e| e.to_string())?;
-        let entries = listed
-            .files
-            .into_iter()
-            .map(|entry| (entry.path.clone(), entry))
-            .collect::<std::collections::HashMap<_, _>>();
+        let mut entries = std::collections::HashMap::new();
+        for listing_root in listing_roots {
+            let listed = self
+                .list_files(listing_root)
+                .await
+                .map_err(|e| e.to_string())?;
+            entries.extend(
+                listed
+                    .files
+                    .into_iter()
+                    .map(|entry| (entry.path.clone(), entry)),
+            );
+        }
         for document in &mut related {
             if let Some(entry) = entries.get(&document.entry.path) {
                 document.entry = entry.clone();
@@ -4270,7 +4295,47 @@ exit 0
     }
 
     #[test]
-    fn test_prepare_search_query_rejects_file_outside_root() {
+    fn test_prepare_search_query_accepts_file_in_another_library_root() {
+        let root = tempdir().unwrap();
+        let other_root = tempdir().unwrap();
+        let other_file = other_root.path().join("paper.txt");
+        std::fs::write(&other_file, "hello").unwrap();
+
+        let query = SearchQuery {
+            pattern: "hello".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: root.path().to_path_buf(),
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 2,
+            mode: SearchMode::Grep,
+            scope: SearchScope::File {
+                path: other_file.clone(),
+            },
+            supported_extensions: vec![],
+        };
+
+        let prepared = AppContext::prepare_search_query(
+            query,
+            vec!["txt".to_string()],
+            &[
+                root.path().canonicalize().unwrap(),
+                other_root.path().canonicalize().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.scope,
+            SearchScope::File {
+                path: other_file.canonicalize().unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn test_prepare_search_query_rejects_file_outside_library() {
         let root = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let outside_file = outside.path().join("paper.txt");
@@ -4296,7 +4361,7 @@ exit 0
             &[root.path().canonicalize().unwrap()],
         )
         .unwrap_err();
-        assert!(err.contains("outside"));
+        assert!(err.contains("Search file is not in the library"));
     }
 
     #[test]
@@ -4687,6 +4752,7 @@ exit 0
             .related_documents(RelatedDocumentsQuery {
                 root: requested_root,
                 path: requested_file,
+                scope: SearchScope::Corpus,
                 limit: Some(8),
             })
             .await
@@ -4715,6 +4781,7 @@ exit 0
             .related_documents(RelatedDocumentsQuery {
                 root: outside,
                 path: source,
+                scope: SearchScope::Corpus,
                 limit: None,
             })
             .await
@@ -4788,6 +4855,7 @@ exit 0
             .related_documents(RelatedDocumentsQuery {
                 root,
                 path: source,
+                scope: SearchScope::Corpus,
                 limit: Some(8),
             })
             .await

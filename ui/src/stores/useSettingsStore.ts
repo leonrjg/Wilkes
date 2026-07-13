@@ -38,7 +38,6 @@ interface SettingsStore {
   supportedExtensions: string[];
   fileList: FileEntry[];
   omittedFileList: OmittedFileEntry[];
-  filterText: string;
   preferSemantic: boolean;
   indexing: boolean;
   theme: Theme;
@@ -56,7 +55,6 @@ interface SettingsStore {
   forgetDirectory: (dir: string) => void;
   refreshFileList: () => void;
   applyMetadataUpdates: (updates: FileMetadataUpdate[]) => void;
-  setFilterText: (text: string) => void;
   setPreferSemantic: (active: boolean) => void;
   setIndexing: (indexing: boolean) => void;
   applySettingsPatch: (patch: Partial<Settings>) => void;
@@ -82,7 +80,6 @@ export const useSettingsStore = create<SettingsStore>()(
     supportedExtensions: [],
     fileList: [],
     omittedFileList: [],
-    filterText: "",
     preferSemantic: false,
     indexing: false,
     theme: "System",
@@ -200,7 +197,6 @@ export const useSettingsStore = create<SettingsStore>()(
       }));
     },
 
-    setFilterText: (text: string) => set({ filterText: text }),
     setIndexing: (indexing: boolean) => set({ indexing }),
 
     setPreferSemantic: (active: boolean) => {
@@ -340,11 +336,10 @@ useSettingsStore.subscribe(
           useSettingsStore.setState({
             fileList: response.files,
             omittedFileList: response.omitted,
-            filterText: "",
           }))
         .catch(() => {});
     } else {
-      useSettingsStore.setState({ fileList: [], omittedFileList: [], filterText: "" });
+      useSettingsStore.setState({ fileList: [], omittedFileList: [] });
     }
   }
 );

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Percent, X } from "react-feather";
+import { Globe, Percent, X } from "react-feather";
 import { api } from "../services";
 import type { FileEntry, RelatedDocument } from "../lib/types";
 import { useSemanticStore } from "../stores/useSemanticStore";
@@ -24,6 +24,8 @@ export default function RelatedDocumentsPane({ currentPath, onOpenDocument, onCl
   const [anchorPath, setAnchorPath] = useState(currentPath);
   const [status, setStatus] = useState<RelatedStatus>("loading");
   const [documents, setDocuments] = useState<RelatedDocument[]>([]);
+  const [wholeLibrary, setWholeLibrary] = useState(false);
+  const [filterText, setFilterText] = useState("");
   const relatedNavigationTargetRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -44,7 +46,8 @@ export default function RelatedDocumentsPane({ currentPath, onOpenDocument, onCl
     }
 
     const indexKey = `${indexStatus.model_id}:${indexStatus.built_at ?? "unknown"}`;
-    const cacheKey = `${directory}\0${anchorPath}\0${indexKey}`;
+    const scope = wholeLibrary ? "all" : "corpus";
+    const cacheKey = `${directory}\0${anchorPath}\0${scope}\0${indexKey}`;
     const cached = relatedDocumentsCache.get(cacheKey);
     if (cached) {
       setDocuments(cached);
@@ -55,7 +58,7 @@ export default function RelatedDocumentsPane({ currentPath, onOpenDocument, onCl
     let cancelled = false;
     setStatus("loading");
     setDocuments([]);
-    api.relatedDocuments({ root: directory, path: anchorPath, limit: 8 })
+    api.relatedDocuments({ root: directory, path: anchorPath, scope: { type: scope }, limit: 8 })
       .then((result) => {
         if (cancelled) return;
         const sorted = sortRelatedDocuments(result);
@@ -73,7 +76,7 @@ export default function RelatedDocumentsPane({ currentPath, onOpenDocument, onCl
     return () => {
       cancelled = true;
     };
-  }, [anchorPath, directory, indexReady, indexStatus?.model_id, indexStatus?.built_at]);
+  }, [anchorPath, directory, indexReady, indexStatus?.model_id, indexStatus?.built_at, wholeLibrary]);
 
   return (
     <aside className="hidden w-64 flex-shrink-0 border-l border-[var(--border-main)] bg-[var(--bg-sidebar)] md:flex md:flex-col">
@@ -90,6 +93,19 @@ export default function RelatedDocumentsPane({ currentPath, onOpenDocument, onCl
             Use current
           </button>
         )}
+        <Tooltip content={wholeLibrary ? "Search related documents in current root" : "Search related documents in whole library"}>
+          <button
+            type="button"
+            onClick={() => setWholeLibrary((value) => !value)}
+            aria-label={wholeLibrary ? "Use current root for related documents" : "Use whole library for related documents"}
+            aria-pressed={wholeLibrary}
+            className={`inline-flex flex-shrink-0 rounded p-0.5 transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] ${
+              wholeLibrary ? "bg-[var(--accent-blue-muted)] text-[var(--accent-blue)]" : "text-[var(--text-dim)]"
+            }`}
+          >
+            <Globe size={14} />
+          </button>
+        </Tooltip>
         <Tooltip content="Close related documents">
           <button
             type="button"
@@ -108,6 +124,8 @@ export default function RelatedDocumentsPane({ currentPath, onOpenDocument, onCl
         {status === "empty" && <StatusMessage>No related documents</StatusMessage>}
         {status === "ready" && (
           <ResultList
+            filterText={filterText}
+            onFilterTextChange={setFilterText}
             documents={documents}
             preserveDocumentOrder
             documentDetails={relatedDocumentDetails}

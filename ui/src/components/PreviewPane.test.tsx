@@ -248,6 +248,25 @@ describe("PreviewPane", () => {
     expect(screen.getByRole("button", { name: "Copy path" })).toBeInTheDocument();
   });
 
+  it("shortens the header author to 30 characters", () => {
+    const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
+    useSearchStore.setState({
+      selectedMatch: mockMatch,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: {
+        title: "Paper",
+        author: "A Very Long Author Name That Exceeds Thirty Characters",
+        doi: null,
+        created_at: null,
+      },
+      viewerMetadataStatus: "ready",
+    });
+
+    render(<PreviewPane />);
+    expect(screen.getByText("A Very Long Author Name That …")).toBeInTheDocument();
+    expect(screen.queryByText("A Very Long Author Name That Exceeds Thirty Characters")).not.toBeInTheDocument();
+  });
+
   it("formats a Zotero MM/YYYY publication date in the header", () => {
     const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
     useSearchStore.setState({
@@ -558,6 +577,7 @@ describe("PreviewPane", () => {
     expect(api.relatedDocuments).toHaveBeenCalledWith({
       root: "/docs",
       path: "/docs/source.txt",
+      scope: { type: "corpus" },
       limit: 8,
     });
 
@@ -577,6 +597,7 @@ describe("PreviewPane", () => {
     await waitFor(() => expect(api.relatedDocuments).toHaveBeenLastCalledWith({
       root: "/docs",
       path: "/docs/related.txt",
+      scope: { type: "corpus" },
       limit: 8,
     }));
 
@@ -589,6 +610,7 @@ describe("PreviewPane", () => {
     await waitFor(() => expect(api.relatedDocuments).toHaveBeenLastCalledWith({
       root: "/docs",
       path: "/docs/normal-navigation.txt",
+      scope: { type: "corpus" },
       limit: 8,
     }));
     expect(screen.getByText("Related to normal-navigation.txt")).toBeInTheDocument();
@@ -638,6 +660,16 @@ describe("PreviewPane", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Show related documents" }));
     await waitFor(() => expect(screen.getByText("related.txt")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Use whole library for related documents" }));
+    await waitFor(() => expect(api.relatedDocuments).toHaveBeenLastCalledWith({
+      root: "/docs",
+      path: "/docs/source.txt",
+      scope: { type: "all" },
+      limit: 8,
+    }));
+    fireEvent.click(screen.getByRole("button", { name: "Use current root for related documents" }));
+    expect(screen.getByText("related.txt")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Hide related documents" }));
     expect(screen.queryByText("related.txt")).not.toBeInTheDocument();

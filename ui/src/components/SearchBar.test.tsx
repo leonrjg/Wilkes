@@ -46,7 +46,10 @@ describe("SearchBar", () => {
 
   it("renders correctly", () => {
     render(<SearchBar sourceSlot={<MockSourceSlot />} />);
-    expect(screen.getByPlaceholderText("Search…")).toBeInTheDocument();
+    const input = screen.getByPlaceholderText("Search…");
+    expect(input).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Search all directories" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByText(/^All$/i)).not.toBeInTheDocument();
     expect(screen.getByTestId("source-slot")).toBeInTheDocument();
   });
 

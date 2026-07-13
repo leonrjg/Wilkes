@@ -32,6 +32,14 @@ function headerTitle(path: string, metadata: DocumentMetadata | null) {
   return title && title.length > 0 ? title : fileName(path);
 }
 
+function headerAuthor(metadata: DocumentMetadata | null) {
+  const author = metadata?.author?.trim();
+  if (!author) return null;
+
+  const characters = Array.from(author);
+  return characters.length <= 30 ? author : `${characters.slice(0, 29).join("")}…`;
+}
+
 function actionButtonClassName(compact = false) {
   return [
     "inline-flex items-center transition-colors border border-[var(--border-main)]",
@@ -200,7 +208,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
         bookmark.origin.PdfPage.page === pdfPage &&
         bboxesEqual(bookmark.origin.PdfPage.bbox, pdfBbox),
     )?.rects ?? null;
-  const author = viewerMetadata?.author?.trim() || null;
+  const author = headerAuthor(viewerMetadata);
   const createdAt = formatDocumentMonthYear(viewerMetadata?.created_at);
   const links = buildExternalLinks(viewerMetadata?.doi, viewerMetadata?.title);
   const doi = links?.doi ?? null;
@@ -339,7 +347,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
                 className={actionButtonClassName(true)}
               >
                 <Copy size={10} />
-                <span>Copy path</span>
+                <span>Path</span>
               </CopyButton>
             </Tooltip>
           </div>

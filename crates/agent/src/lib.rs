@@ -85,13 +85,9 @@ pub fn label(backend: AgentBackend) -> &'static str {
 /// Shown next to a disabled backend in the agent selector.
 pub fn auth_note(backend: AgentBackend) -> &'static str {
     match backend {
-        AgentBackend::ClaudeCode => {
-            "Install the Claude Code ACP, then run `claude` once to log in"
-        }
+        AgentBackend::ClaudeCode => "Install the Claude Code ACP, then run `claude` once to log in",
         AgentBackend::Codex => "Install the Codex ACP, then run `codex` once to log in",
-        AgentBackend::Nanocoder => {
-            "Install the Nanocoder ACP and configure a provider"
-        }
+        AgentBackend::Nanocoder => "Install the Nanocoder ACP and configure a provider",
     }
 }
 

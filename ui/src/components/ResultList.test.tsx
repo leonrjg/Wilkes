@@ -9,6 +9,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { ToastProvider } from "./Toast";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import type { FileEntry } from "../lib/types";
 
 const {
   mockOpenPath,
@@ -81,10 +82,15 @@ describe("ResultList", () => {
   const mockOnMatchClick = vi.fn();
   const mockOnFileClick = vi.fn();
 
-  const renderWithToasts = () =>
+  const renderWithToasts = (
+    filterText = "",
+    onFilterTextChange: (text: string) => void = vi.fn(),
+  ) =>
     render(
       <ToastProvider>
         <ResultList
+          filterText={filterText}
+          onFilterTextChange={onFilterTextChange}
           onMatchClick={mockOnMatchClick}
           onFileClick={mockOnFileClick}
         />
@@ -108,8 +114,6 @@ describe("ResultList", () => {
     useSettingsStore.setState({
       fileList: [],
       omittedFileList: [],
-      filterText: "",
-      setFilterText: vi.fn(),
       indexing: false,
       fileSortKey: "filename",
       fileSortDirection: "asc",
@@ -607,18 +611,25 @@ describe("ResultList", () => {
 
   it("filters files", () => {
     const setFilterTextMock = vi.fn();
-    useSettingsStore.setState({ setFilterText: setFilterTextMock });
 
-    renderWithToasts();
+    renderWithToasts("", setFilterTextMock);
     const filterInput = screen.getByPlaceholderText("Filter files...");
 
     fireEvent.change(filterInput, { target: { value: "my-filter" } });
     expect(setFilterTextMock).toHaveBeenCalledWith("my-filter");
   });
 
-  it("filters files by cached title and author", () => {
+  it("clears only the controlled file filter", () => {
+    const setFilterTextMock = vi.fn();
+
+    renderWithToasts("metadata query", setFilterTextMock);
+    fireEvent.click(screen.getByRole("button", { name: "Clear file filter" }));
+
+    expect(setFilterTextMock).toHaveBeenCalledWith("");
+  });
+
+  it("filters files by all available metadata values", () => {
     useSettingsStore.setState({
-      filterText: "smith",
       fileList: [
         {
           path: "/test/visible.pdf",
@@ -627,6 +638,11 @@ describe("ResultList", () => {
           extension: "pdf",
           title: "Unrelated title",
           author: "Smith et al.",
+          publication_date: "2024-03",
+          citation_count: 37,
+          metadata_conflicts: {
+            doi: [{ source: "semantic_scholar", value: "10.1234/example" }],
+          },
         },
         {
           path: "/test/hidden.pdf",
@@ -647,10 +663,109 @@ describe("ResultList", () => {
       ],
     });
 
-    renderWithToasts();
+    renderWithToasts("10.1234/example");
 
     expect(screen.getByText("visible.pdf")).toBeInTheDocument();
-    expect(screen.getByText("title-match.pdf")).toBeInTheDocument();
+    expect(screen.queryByText("title-match.pdf")).not.toBeInTheDocument();
+    expect(screen.queryByText("hidden.pdf")).not.toBeInTheDocument();
+  });
+
+  it("automatically searches metadata fields added in the future", () => {
+    useSettingsStore.setState({
+      fileList: [
+        {
+          path: "/test/future.pdf",
+          size_bytes: 10,
+          file_type: "Pdf",
+          extension: "pdf",
+          future_metadata: { venue: "Future Venue" },
+        } as FileEntry,
+      ],
+    });
+
+    renderWithToasts("future venue");
+
+    expect(screen.getByText("future.pdf")).toBeInTheDocument();
+  });
+
+  it("does not fuzzy-match across unrelated metadata values", () => {
+    useSettingsStore.setState({
+      fileList: [
+        {
+          path: "/test/unrelated.pdf",
+          size_bytes: 10,
+          file_type: "Pdf",
+          extension: "pdf",
+          future_metadata: { first: "Alpha", second: "Zebra" },
+        } as FileEntry,
+      ],
+    });
+
+    renderWithToasts("az");
+
+    expect(screen.queryByText("unrelated.pdf")).not.toBeInTheDocument();
+  });
+
+  it("does not spread a fuzzy match across words in a long title", () => {
+    useSettingsStore.setState({
+      fileList: [
+        {
+          path: "/test/Harness_Engineering.pdf",
+          size_bytes: 808,
+          file_type: "Pdf",
+          extension: "pdf",
+          title: "Harness Engineering for Agentic AI Coding",
+          author: "Galster et al.",
+        },
+        {
+          path: "/test/Whats_Inside_GitHub.pdf",
+          size_bytes: 245_200,
+          file_type: "Pdf",
+          extension: "pdf",
+          title: "What's Inside a GitHub Repository?",
+          author: "Hora et al.",
+        },
+      ],
+    });
+
+    renderWithToasts("whats");
+
+    expect(screen.queryByText("Harness_Engineering.pdf")).not.toBeInTheDocument();
+    expect(screen.getByText("Whats_Inside_GitHub.pdf")).toBeInTheDocument();
+  });
+
+  it("fuzzy-filters metadata while preserving the selected sort order", () => {
+    useSettingsStore.setState({
+      fileList: [
+        {
+          path: "/test/beta.pdf",
+          size_bytes: 20,
+          file_type: "Pdf",
+          extension: "pdf",
+          author: "Smith",
+        },
+        {
+          path: "/test/alpha.pdf",
+          size_bytes: 10,
+          file_type: "Pdf",
+          extension: "pdf",
+          author: "Smithers",
+        },
+        {
+          path: "/test/hidden.pdf",
+          size_bytes: 30,
+          file_type: "Pdf",
+          extension: "pdf",
+          author: "Jones",
+        },
+      ],
+    });
+
+    renderWithToasts("smth");
+
+    const alpha = screen.getByText("alpha.pdf");
+    const beta = screen.getByText("beta.pdf");
+    expect(alpha.compareDocumentPosition(beta) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(screen.queryByText("hidden.pdf")).not.toBeInTheDocument();
   });
 

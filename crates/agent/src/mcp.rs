@@ -37,6 +37,8 @@ const DEFAULT_SEARCH_MAX_RESULTS: usize = 10;
 const MAX_SEARCH_MAX_RESULTS: usize = 50;
 const DEFAULT_SEARCH_CONTEXT_LINES: u32 = 2;
 const MAX_SEARCH_CONTEXT_LINES: u32 = 5;
+const DEFAULT_RELATED_DOCUMENTS_LIMIT: usize = 8;
+const MAX_RELATED_DOCUMENTS_LIMIT: usize = 25;
 const DEFAULT_SEARCH_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 
@@ -48,6 +50,7 @@ const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 pub(crate) const WILKES_MCP_TOOL_NAMES: &[&str] = &[
     "list_context",
     "get_document_text",
+    "get_related_documents",
     "search",
     "literature_search",
 ];
@@ -199,8 +202,8 @@ struct GetDocumentTextParams {
 struct SearchParams {
     /// Text to search for.
     query: String,
-    /// Use exact for literal/regex matching, semantic for meaning-based search.
-    mode: Option<SearchModeParam>,
+    /// Required. Use exact for literal/regex matching, semantic for meaning-based search.
+    mode: SearchModeParam,
     /// Search location. Use all for a library-wide search; omit for the current root.
     scope: Option<SearchScopeParam>,
     /// Corpus/index root. Omit unless searching a different root is intentional.
@@ -216,6 +219,18 @@ struct SearchParams {
     is_regex: Option<bool>,
     /// Exact search context lines.
     context_lines: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GetRelatedDocumentsParams {
+    /// Document to find related documents for. Omit to use the active document.
+    path: Option<String>,
+    /// Search location. Use all for the whole library; omit for the current root.
+    scope: Option<SearchScopeParam>,
+    /// Corpus/index root. Omit unless using a different root is intentional.
+    root: Option<String>,
+    /// Maximum related documents to return (1-25, default 8).
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -280,6 +295,9 @@ struct PageRange {
 
 #[derive(Debug, Serialize)]
 struct ListContextResponse {
+    current_root: Option<String>,
+    roots: Vec<String>,
+    first_files: Vec<String>,
     active_doc: Option<ActiveDocInfo>,
     context_files: Vec<ContextFileInfo>,
 }
@@ -317,6 +335,21 @@ struct SearchResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct GetRelatedDocumentsResponse {
+    path: String,
+    root: String,
+    scope: SearchScopeParamResponse,
+    documents: Vec<wilkes_core::types::RelatedDocument>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SearchScopeParamResponse {
+    CurrentRoot,
+    All,
+}
+
+#[derive(Debug, Serialize)]
 struct SearchFileResponse {
     path: String,
     file_type: wilkes_core::types::FileType,
@@ -326,8 +359,6 @@ struct SearchFileResponse {
 #[derive(Debug, Serialize)]
 struct SearchMatchResponse {
     text: String,
-    context_before: String,
-    context_after: String,
     line: Option<u32>,
     page: Option<u32>,
     score: Option<f32>,
@@ -336,13 +367,19 @@ struct SearchMatchResponse {
 #[tool_router]
 impl WilkesMcp {
     #[tool(
-        description = "List the current Wilkes chat context: active document and files explicitly added to context."
+        description = "List the current Wilkes chat context: configured library roots, active root, active document, and files explicitly added to context."
     )]
-    fn list_context(&self) -> CallToolResult {
+    async fn list_context(&self) -> CallToolResult {
         let snapshot = self.context.snapshot();
+        let roots = match &self.search {
+            Some(search) => search.clone().library_roots().await,
+            None => Vec::new(),
+        };
         structured(ListContextResponse::from_snapshot(
+            snapshot.root,
             snapshot.active_doc,
             snapshot.context_files,
+            roots,
         ))
     }
 
@@ -360,7 +397,20 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Search Wilkes-readable documents. Use mode='exact' for literal/regex text search, or mode='semantic' to search the semantic index when it is available. If the user asks about the open/current document or a specific context file, set file to that document path; omit file only for corpus-wide searches."
+        description = "Find documents semantically related to a document in Wilkes. Omit path to use the active document. Set scope='all' to search the whole library; otherwise results are limited to the current root."
+    )]
+    async fn get_related_documents(
+        &self,
+        Parameters(params): Parameters<GetRelatedDocumentsParams>,
+    ) -> CallToolResult {
+        match get_related_documents(&self.context, self.search.clone(), &self.cwd, params).await {
+            Ok(response) => structured(response),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        }
+    }
+
+    #[tool(
+        description = "Search Wilkes-readable documents. You must explicitly set mode='exact' for literal/regex text search or mode='semantic' for meaning-based search; mode has no default. If the user asks about the open/current document or a specific context file, set file to that document path; omit file only for corpus-wide searches."
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         match search_documents(&self.context, self.search.clone(), &self.cwd, params).await {
@@ -433,7 +483,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Download a direct HTTP(S) file URL into the current Wilkes root. Use only when the user explicitly asks to import or download a file. Pass filename to choose the saved name; existing files are never overwritten. Literature search results may provide pdf_url values suitable for this tool."
+        description = "Download a direct HTTP(S) file URL into the current Wilkes root. Use only when the user asks to import or download a file. Pass filename to choose the saved name; existing files are never overwritten. Literature search results may provide pdf_url values suitable for this tool."
     )]
     async fn download(&self, Parameters(params): Parameters<DownloadParams>) -> CallToolResult {
         let root = self
@@ -451,7 +501,7 @@ impl WilkesMcp {
 impl ServerHandler for WilkesMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Wilkes document context and literature tools. Context and search tools are read-only. The download tool writes a file into the current root and must only be used when the user explicitly asks to import or download it.")
+            .with_instructions("Wilkes document context and literature tools. Context and search tools are read-only. The download tool writes a file into the current root and must only be used when the user asks to import or download it.")
     }
 }
 
@@ -586,8 +636,20 @@ fn find_file_with_content(
 }
 
 impl ListContextResponse {
-    fn from_snapshot(active_doc: Option<ActiveDoc>, context_files: Vec<ContextFile>) -> Self {
+    fn from_snapshot(
+        root: crate::context::RootContext,
+        active_doc: Option<ActiveDoc>,
+        context_files: Vec<ContextFile>,
+        roots: Vec<PathBuf>,
+    ) -> Self {
         Self {
+            current_root: root.path.map(|path| path.to_string_lossy().into_owned()),
+            roots: roots.into_iter().map(|path| display_path(&path)).collect(),
+            first_files: root
+                .first_files
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
             active_doc: active_doc.map(|doc| ActiveDocInfo {
                 path: doc.path,
                 page: doc.page,
@@ -684,7 +746,7 @@ async fn search_documents(
 ) -> Result<SearchResponse, String> {
     let search =
         search.ok_or_else(|| "Wilkes search is not available in this session.".to_string())?;
-    let mode = params.mode.unwrap_or(SearchModeParam::Exact);
+    let mode = params.mode;
     let root = match params.root.take() {
         Some(root) => PathBuf::from(root),
         None => match context.search_root() {
@@ -696,7 +758,7 @@ async fn search_documents(
                 .unwrap_or_else(|| cwd.to_path_buf()),
         },
     };
-    let (query, max_files) = build_search_query(root, params, mode)?;
+    let (query, max_files) = build_search_query(root, params)?;
     let root = display_path(&query.root);
     let file = match &query.scope {
         wilkes_core::types::SearchScope::Corpus | wilkes_core::types::SearchScope::All => None,
@@ -720,11 +782,70 @@ async fn search_documents(
     })
 }
 
+async fn get_related_documents(
+    context: &ContextStateHandle,
+    search: Option<Arc<dyn SearchService>>,
+    cwd: &Path,
+    mut params: GetRelatedDocumentsParams,
+) -> Result<GetRelatedDocumentsResponse, String> {
+    let search = search
+        .ok_or_else(|| "Wilkes related-document search is not available in this session.".to_string())?;
+    let path = match params.path.take() {
+        Some(path) if !path.trim().is_empty() => PathBuf::from(path),
+        Some(_) => return Err("Document path cannot be empty.".to_string()),
+        None => context
+            .snapshot()
+            .active_doc
+            .map(|document| PathBuf::from(document.path))
+            .ok_or_else(|| "No active document is available; pass path explicitly.".to_string())?,
+    };
+    let root = match params.root.take() {
+        Some(root) if !root.trim().is_empty() => PathBuf::from(root),
+        Some(_) => return Err("Related-documents root cannot be empty.".to_string()),
+        None => match context.search_root() {
+            Some(root) => root,
+            None => search
+                .clone()
+                .default_root()
+                .await
+                .unwrap_or_else(|| cwd.to_path_buf()),
+        },
+    };
+    let scope = if params.scope == Some(SearchScopeParam::All) {
+        wilkes_core::types::SearchScope::All
+    } else {
+        wilkes_core::types::SearchScope::Corpus
+    };
+    let query = wilkes_core::types::RelatedDocumentsQuery {
+        root: root.clone(),
+        path: path.clone(),
+        scope: scope.clone(),
+        limit: Some(
+            params
+                .limit
+                .unwrap_or(DEFAULT_RELATED_DOCUMENTS_LIMIT)
+                .clamp(1, MAX_RELATED_DOCUMENTS_LIMIT),
+        ),
+    };
+    let documents = search.related_documents(query).await?;
+
+    Ok(GetRelatedDocumentsResponse {
+        path: display_path(&path),
+        root: display_path(&root),
+        scope: if scope == wilkes_core::types::SearchScope::All {
+            SearchScopeParamResponse::All
+        } else {
+            SearchScopeParamResponse::CurrentRoot
+        },
+        documents,
+    })
+}
+
 fn build_search_query(
     root: PathBuf,
     params: SearchParams,
-    mode: SearchModeParam,
 ) -> Result<(wilkes_core::types::SearchQuery, usize), String> {
+    let mode = params.mode;
     let pattern = params.query.trim().to_string();
     if pattern.is_empty() {
         return Err("Search query cannot be empty.".to_string());
@@ -753,9 +874,6 @@ fn build_search_query(
                 SearchModeParam::Semantic => wilkes_core::types::SearchMode::Semantic,
             },
             scope: if let Some(path) = params.file {
-                if params.scope == Some(SearchScopeParam::All) {
-                    return Err("file cannot be combined with scope='all'.".to_string());
-                }
                 wilkes_core::types::SearchScope::File {
                     path: PathBuf::from(path),
                 }
@@ -790,10 +908,16 @@ impl From<wilkes_core::types::Match> for SearchMatchResponse {
             wilkes_core::types::SourceOrigin::TextFile { line, .. } => (Some(line), None),
             wilkes_core::types::SourceOrigin::PdfPage { page, .. } => (None, Some(page)),
         };
+        let mut text = String::with_capacity(
+            matched.context_before.len()
+                + matched.matched_text.len()
+                + matched.context_after.len(),
+        );
+        text.push_str(&matched.context_before);
+        text.push_str(&matched.matched_text);
+        text.push_str(&matched.context_after);
         Self {
-            text: matched.matched_text,
-            context_before: matched.context_before,
-            context_after: matched.context_after,
+            text,
             line,
             page,
             score: matched.score,
@@ -822,20 +946,53 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
     use wilkes_core::types::{
-        FileMatches, FileType, Match, SearchMode, SearchQuery, SearchScope, SearchStats,
-        SourceOrigin,
+        FileMatches, FileType, Match, RelatedDocument, RelatedDocumentsQuery, SearchMode,
+        SearchQuery, SearchScope, SearchStats, SourceOrigin,
     };
 
     struct FakeSearch {
         last_query: Mutex<Option<SearchQuery>>,
+        last_related_query: Mutex<Option<RelatedDocumentsQuery>>,
         default_root: Option<PathBuf>,
         response: Mutex<Option<CollectedSearch>>,
+        related_response: Mutex<Option<Vec<RelatedDocument>>>,
+    }
+
+    #[test]
+    fn list_context_includes_root_and_first_three_files() {
+        let dir = tempdir().unwrap();
+        for name in ["04.txt", "02.txt", "01.txt", "03.txt"] {
+            std::fs::write(dir.path().join(name), name).unwrap();
+        }
+        let context = ContextStateHandle::default();
+        context.set_search_root(Some(dir.path().to_string_lossy().into_owned()));
+        let snapshot = context.snapshot();
+        let response = ListContextResponse::from_snapshot(
+            snapshot.root,
+            snapshot.active_doc,
+            snapshot.context_files,
+            vec![dir.path().to_path_buf()],
+        );
+
+        assert_eq!(response.current_root.as_deref(), dir.path().to_str());
+        assert_eq!(
+            response.roots,
+            vec![dir.path().to_string_lossy().into_owned()]
+        );
+        assert_eq!(response.first_files.len(), 3);
+        assert!(response.first_files[0].ends_with("01.txt"));
+        assert!(response.first_files[1].ends_with("02.txt"));
+        assert!(response.first_files[2].ends_with("03.txt"));
     }
 
     #[async_trait]
     impl SearchService for FakeSearch {
         async fn default_root(self: Arc<Self>) -> Option<PathBuf> {
             self.default_root.clone()
+        }
+
+        async fn library_roots(self: Arc<Self>) -> Vec<PathBuf> {
+            self.default_root.clone().into_iter().collect()
         }
 
         async fn search(
@@ -845,6 +1002,14 @@ mod tests {
         ) -> Result<CollectedSearch, String> {
             *self.last_query.lock().unwrap() = Some(query);
             Ok(self.response.lock().unwrap().take().unwrap())
+        }
+
+        async fn related_documents(
+            self: Arc<Self>,
+            query: RelatedDocumentsQuery,
+        ) -> Result<Vec<RelatedDocument>, String> {
+            *self.last_related_query.lock().unwrap() = Some(query);
+            Ok(self.related_response.lock().unwrap().take().unwrap())
         }
     }
 
@@ -972,7 +1137,7 @@ mod tests {
             explicit_root.clone(),
             SearchParams {
                 query: "  IO programming  ".to_string(),
-                mode: Some(SearchModeParam::Exact),
+                mode: SearchModeParam::Exact,
                 scope: None,
                 root: None,
                 file: None,
@@ -981,7 +1146,6 @@ mod tests {
                 is_regex: Some(true),
                 context_lines: Some(100),
             },
-            SearchModeParam::Exact,
         )
         .unwrap();
 
@@ -1004,7 +1168,7 @@ mod tests {
             dir.path().to_path_buf(),
             SearchParams {
                 query: "definitions".to_string(),
-                mode: Some(SearchModeParam::Semantic),
+                mode: SearchModeParam::Semantic,
                 scope: None,
                 root: None,
                 file: None,
@@ -1013,7 +1177,6 @@ mod tests {
                 is_regex: Some(true),
                 context_lines: None,
             },
-            SearchModeParam::Semantic,
         )
         .unwrap();
 
@@ -1030,7 +1193,7 @@ mod tests {
             dir.path().to_path_buf(),
             SearchParams {
                 query: "definitions".to_string(),
-                mode: None,
+                mode: SearchModeParam::Exact,
                 scope: None,
                 root: None,
                 file: Some("paper.pdf".to_string()),
@@ -1039,7 +1202,33 @@ mod tests {
                 is_regex: None,
                 context_lines: None,
             },
-            SearchModeParam::Exact,
+        )
+        .unwrap();
+
+        assert_eq!(
+            query.scope,
+            SearchScope::File {
+                path: PathBuf::from("paper.pdf")
+            }
+        );
+    }
+
+    #[test]
+    fn file_takes_precedence_over_all_scope() {
+        let dir = tempdir().unwrap();
+        let (query, _) = build_search_query(
+            dir.path().to_path_buf(),
+            SearchParams {
+                query: "definitions".to_string(),
+                mode: SearchModeParam::Exact,
+                scope: Some(SearchScopeParam::All),
+                root: None,
+                file: Some("paper.pdf".to_string()),
+                max_results: None,
+                case_sensitive: None,
+                is_regex: None,
+                context_lines: None,
+            },
         )
         .unwrap();
 
@@ -1058,7 +1247,7 @@ mod tests {
             dir.path().to_path_buf(),
             SearchParams {
                 query: "across the library".into(),
-                mode: None,
+                mode: SearchModeParam::Exact,
                 scope: Some(SearchScopeParam::All),
                 root: None,
                 file: None,
@@ -1067,11 +1256,49 @@ mod tests {
                 is_regex: None,
                 context_lines: None,
             },
-            SearchModeParam::Exact,
         )
         .unwrap();
 
         assert_eq!(query.scope, SearchScope::All);
+    }
+
+    #[tokio::test]
+    async fn related_documents_uses_active_document_and_all_scope() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        let active = root.join("paper.md");
+        let service = Arc::new(FakeSearch {
+            last_query: Mutex::new(None),
+            last_related_query: Mutex::new(None),
+            default_root: None,
+            response: Mutex::new(None),
+            related_response: Mutex::new(Some(Vec::new())),
+        });
+        let context = ContextStateHandle::default();
+        context.set_search_root(Some(root.to_string_lossy().into_owned()));
+        context.set_active_doc(Some(active.to_string_lossy().into_owned()), None);
+
+        let response = get_related_documents(
+            &context,
+            Some(service.clone()),
+            dir.path(),
+            GetRelatedDocumentsParams {
+                path: None,
+                scope: Some(SearchScopeParam::All),
+                root: None,
+                limit: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+
+        let query = service.last_related_query.lock().unwrap().clone().unwrap();
+        assert_eq!(query.path, active);
+        assert_eq!(query.root, root);
+        assert_eq!(query.scope, SearchScope::All);
+        assert_eq!(query.limit, Some(MAX_RELATED_DOCUMENTS_LIMIT));
+        assert_eq!(response.scope, SearchScopeParamResponse::All);
+        assert!(response.documents.is_empty());
     }
 
     #[tokio::test]
@@ -1082,6 +1309,7 @@ mod tests {
         let live_root = dir.path().join("live-ui-root");
         let service = Arc::new(FakeSearch {
             last_query: Mutex::new(None),
+            last_related_query: Mutex::new(None),
             default_root: Some(default_root.clone()),
             response: Mutex::new(Some(CollectedSearch {
                 files: vec![FileMatches {
@@ -1090,8 +1318,8 @@ mod tests {
                     matches: vec![Match {
                         text_range: None,
                         matched_text: "IO programming".to_string(),
-                        context_before: "before".to_string(),
-                        context_after: "after".to_string(),
+                        context_before: "before ".to_string(),
+                        context_after: " after".to_string(),
                         origin: SourceOrigin::PdfPage {
                             page: 3,
                             bbox: None,
@@ -1107,6 +1335,7 @@ mod tests {
                 },
                 truncated: false,
             })),
+            related_response: Mutex::new(None),
         });
         let context = ContextStateHandle::default();
         context.set_search_root(Some(live_root.to_string_lossy().into_owned()));
@@ -1117,7 +1346,7 @@ mod tests {
             dir.path(),
             SearchParams {
                 query: "IO".to_string(),
-                mode: Some(SearchModeParam::Semantic),
+                mode: SearchModeParam::Semantic,
                 scope: None,
                 root: None,
                 file: None,
@@ -1139,7 +1368,13 @@ mod tests {
         assert_eq!(response.matches.len(), 1);
         assert_eq!(response.matches[0].path, display_path(&path));
         assert_eq!(response.matches[0].matches[0].page, Some(3));
-        assert_eq!(response.matches[0].matches[0].text, "IO programming");
+        assert_eq!(
+            response.matches[0].matches[0].text,
+            "before IO programming after"
+        );
+        let serialized = serde_json::to_value(&response.matches[0].matches[0]).unwrap();
+        assert!(serialized.get("context_before").is_none());
+        assert!(serialized.get("context_after").is_none());
     }
 
     #[tokio::test]
@@ -1155,12 +1390,14 @@ mod tests {
         ));
         let service = Arc::new(FakeSearch {
             last_query: Mutex::new(None),
+            last_related_query: Mutex::new(None),
             default_root: Some(dir.path().join("active-root")),
             response: Mutex::new(Some(CollectedSearch {
                 files: Vec::new(),
                 stats: SearchStats::default(),
                 truncated: false,
             })),
+            related_response: Mutex::new(None),
         });
 
         let response = search_documents(
@@ -1169,7 +1406,7 @@ mod tests {
             Path::new("/fallback"),
             SearchParams {
                 query: "multi-turn".to_string(),
-                mode: None,
+                mode: SearchModeParam::Exact,
                 scope: None,
                 root: Some(explicit_root.to_string_lossy().into_owned()),
                 file: None,
@@ -1196,7 +1433,7 @@ mod tests {
             Path::new("/tmp"),
             SearchParams {
                 query: "anything".to_string(),
-                mode: None,
+                mode: SearchModeParam::Exact,
                 scope: None,
                 root: None,
                 file: None,

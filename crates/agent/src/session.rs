@@ -21,7 +21,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use wilkes_core::types::{AgentBackend, IntegrationsSettings};
 
-use crate::context::{build_context_block, ActiveDoc, ActiveDocText, ContextFile};
+use crate::context::{
+    build_context_block, root_context, ActiveDoc, ActiveDocText, ContextFile, RootContext,
+};
 use crate::search::SearchService;
 
 const ACTIVE_DOC_CONTEXT_CHAR_LIMIT: usize = 12_000;
@@ -216,6 +218,7 @@ struct SharedContextState {
 pub(crate) struct ContextSnapshot {
     pub active_doc: Option<ActiveDoc>,
     pub context_files: Vec<ContextFile>,
+    pub root: RootContext,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -271,19 +274,23 @@ impl ContextStateHandle {
         ContextSnapshot {
             active_doc: state.active_doc.clone(),
             context_files: state.context_files.clone(),
+            root: root_context(state.search_root.as_deref()),
         }
     }
 
-    pub(crate) fn prepare_turn(&self) -> (bool, Option<ActiveDoc>, Vec<ContextFile>) {
+    pub(crate) fn prepare_turn(&self) -> (bool, ContextSnapshot) {
         let mut state = self.state.lock().unwrap();
         let first_turn = !state.first_turn_sent;
-        let active_doc = state.active_doc.clone();
-        let context_files = state.context_files.clone();
+        let snapshot = ContextSnapshot {
+            active_doc: state.active_doc.clone(),
+            context_files: state.context_files.clone(),
+            root: root_context(state.search_root.as_deref()),
+        };
         state.first_turn_sent = true;
         for file in state.context_files.iter_mut() {
             file.added_this_turn = false;
         }
-        (first_turn, active_doc, context_files)
+        (first_turn, snapshot)
     }
 
     pub(crate) fn is_allowed(&self, path: &Path) -> bool {
@@ -358,12 +365,13 @@ impl ChatSession {
         text: String,
         custom_instructions: String,
     ) -> anyhow::Result<String> {
-        let (first_turn, active_doc, context_files) = self.state.prepare_turn();
-        let active_doc_text = active_doc.as_ref().map(active_doc_text_for_context);
+        let (first_turn, context) = self.state.prepare_turn();
+        let active_doc_text = context.active_doc.as_ref().map(active_doc_text_for_context);
         let context_block = build_context_block(
             first_turn,
-            active_doc.as_ref(),
-            &context_files,
+            &context.root,
+            context.active_doc.as_ref(),
+            &context.context_files,
             active_doc_text.as_ref(),
             &custom_instructions,
         );
