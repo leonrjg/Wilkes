@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "name": "Wilkes",
+  "color": "",
+  "dockState": {
+    "zones": {
+      "left": {
+        "position": "left",
+        "visible": false,
+        "size": 260,
+        "layout": null
+      },
+      "right": {
+        "position": "right",
+        "visible": false,
+        "size": 260,
+        "layout": null
+      },
+      "bottom": {
+        "position": "bottom",
+        "visible": false,
+        "size": 240,
+        "layout": null
+      },
+      "center": {
+        "position": "center",
+        "visible": true,
+        "size": 0,
+        "layout": {
+          "type": "tabs",
+          "id": "0072a93e-e02c-41f4-964e-65a2348658c4",
+          "panelIds": [
+            "1de7f69e-d6eb-452b-93e7-8fbf110ce6f3"
+          ],
+          "activeIndex": 0
+        }
+      }
+    },
+    "locations": {
+      "1de7f69e-d6eb-452b-93e7-8fbf110ce6f3": {
+        "type": "dock",
+        "zone": "center",
+        "stackId": "0072a93e-e02c-41f4-964e-65a2348658c4"
+      }
+    }
+  },
+  "panels": {
+    "98ca9213-3cda-4c76-9ac4-37373f5edfe7": {
+      "type": "terminal",
+      "title": "~/claude/Wilkes"
+    },
+    "1de7f69e-d6eb-452b-93e7-8fbf110ce6f3": {
+      "type": "canvas",
+      "title": "Canvas"
+    }
+  },
+  "canvases": {
+    "1de7f69e-d6eb-452b-93e7-8fbf110ce6f3": {
+      "id": "1de7f69e-d6eb-452b-93e7-8fbf110ce6f3",
+      "canvasNodes": {
+        "b7498db0-aefd-4be6-8080-f25130687ca4": {
+          "id": "b7498db0-aefd-4be6-8080-f25130687ca4",
+          "panelId": "98ca9213-3cda-4c76-9ac4-37373f5edfe7",
+          "origin": {
+            "x": 130,
+            "y": 163
+          },
+          "size": {
+            "width": 640,
+            "height": 400
+          },
+          "zOrder": 1,
+          "creationIndex": 0,
+          "animationState": "idle",
+          "dockLayout": {
+            "type": "tabs",
+            "id": "3aa3c260-aca2-4beb-93e9-f4300bd0b7e4",
+            "panelIds": [
+              "98ca9213-3cda-4c76-9ac4-37373f5edfe7"
+            ],
+            "activeIndex": 0
+          }
+        }
+      },
+      "zoomLevel": 1,
+      "viewportOffset": {
+        "x": 0,
+        "y": 0
+      }
+    }
+  }
+}

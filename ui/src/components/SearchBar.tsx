@@ -5,6 +5,7 @@ import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import type { SearchQuery } from "../lib/types";
 import { Tooltip } from "./Tooltip";
+import { api } from "../services";
 
 interface Props {
   sourceSlot: React.ReactNode;
@@ -30,6 +31,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const semanticReadyGlobally = useSemanticStore((s) => s.readyGlobally);
   const refreshGlobalStatus = useSemanticStore((s) => s.refreshGlobalStatus);
   const ensureCurrentRootIndexed = useSemanticStore((s) => s.ensureCurrentRootIndexed);
+  const semanticBuildRoot = useSemanticStore((s) => s.buildRoot);
 
   const [pattern, setPattern] = useState("");
   const [isRegex, setIsRegex] = useState(false);
@@ -145,6 +147,9 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     const next = !isSemanticMode;
     setIsSemanticMode(next);
     setPreferSemantic(next);
+    if (!next && semanticBuildRoot) {
+      api.cancelEmbed().catch((e) => console.error("Cancel semantic index failed:", e));
+    }
     if (!next || semanticReady) {
       triggerSearch(pattern, { isSemanticMode: next }, "user");
     } else if (pattern.trim()) {

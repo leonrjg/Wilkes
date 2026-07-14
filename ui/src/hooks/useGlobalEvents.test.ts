@@ -41,6 +41,7 @@ describe("useGlobalEvents", () => {
   const addToast = vi.fn().mockReturnValue("toast-id");
   const removeToast = vi.fn();
   const handleIndexUpdated = vi.fn().mockResolvedValue(undefined);
+  const handleIndexTerminated = vi.fn().mockResolvedValue(undefined);
   const refreshFileList = vi.fn();
   const applyMetadataUpdates = vi.fn();
   const loadBookmarks = vi.fn().mockResolvedValue(undefined);
@@ -53,7 +54,10 @@ describe("useGlobalEvents", () => {
       refreshFileList,
       applyMetadataUpdates,
     });
-    (useSemanticStore.getState as any).mockReturnValue({ handleIndexUpdated });
+    (useSemanticStore.getState as any).mockReturnValue({
+      handleIndexUpdated,
+      handleIndexTerminated,
+    });
     (useBookmarksStore.getState as any).mockReturnValue({ load: loadBookmarks });
   });
 
@@ -189,5 +193,6 @@ describe("useGlobalEvents", () => {
 
     expect(removeToast).toHaveBeenCalledWith("toast-id");
     expect(handleIndexUpdated).not.toHaveBeenCalled();
+    expect(handleIndexTerminated).toHaveBeenCalled();
   });
 });

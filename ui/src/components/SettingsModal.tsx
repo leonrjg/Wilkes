@@ -310,21 +310,45 @@ export default function SettingsModal({
 
                   <section>
                     <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Appearance</h3>
-                    <div className="flex p-0.5 bg-[var(--bg-active)] rounded-lg w-fit">
-                      {(["System", "Light", "Dark"] as const).map((t) => (
-                        <button
-                          key={t}
-                          type="button"
-                          onClick={() => handleUpdateSettings({ theme: t })}
-                          className={`px-3 py-1 rounded-md text-xs transition-all ${
-                            settings.theme === t
-                              ? "bg-[var(--bg-app)] text-[var(--text-main)] shadow-sm"
-                              : "text-[var(--text-dim)] hover:text-[var(--text-muted)]"
-                          }`}
-                        >
-                          {t}
-                        </button>
-                      ))}
+                    <div className="space-y-3">
+                      <div className="flex p-0.5 bg-[var(--bg-active)] rounded-lg w-fit">
+                        {(["System", "Light", "Dark"] as const).map((t) => (
+                          <button
+                            key={t}
+                            type="button"
+                            onClick={() => handleUpdateSettings({ theme: t })}
+                            className={`px-3 py-1 rounded-md text-xs transition-all ${
+                              settings.theme === t
+                                ? "bg-[var(--bg-app)] text-[var(--text-main)] shadow-sm"
+                                : "text-[var(--text-dim)] hover:text-[var(--text-muted)]"
+                            }`}
+                          >
+                            {t}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="space-y-1">
+                        <div className="flex justify-between items-baseline">
+                          <label htmlFor="pdf-auto-zoom-target" className="text-xs text-[var(--text-muted)]">
+                            PDF auto-zoom target (px)
+                          </label>
+                          <p className="text-[10px] text-[var(--text-dim)] italic">Body-text height</p>
+                        </div>
+                        <input
+                          id="pdf-auto-zoom-target"
+                          type="number"
+                          min={1}
+                          step={0.5}
+                          value={settings.pdf_auto_zoom_target_px}
+                          onChange={(e) => {
+                            const value = Number(e.target.value);
+                            if (value > 0) {
+                              handleUpdateSettings({ pdf_auto_zoom_target_px: value });
+                            }
+                          }}
+                          className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
+                        />
+                      </div>
                     </div>
                   </section>
                 </div>

@@ -711,6 +711,9 @@ pub struct Settings {
     pub file_sort_direction: FileSortDirection,
     #[serde(default = "default_file_display_fields")]
     pub file_display_fields: Vec<FileDisplayField>,
+    /// Desired CSS-pixel height for body text when a PDF is auto-zoomed.
+    #[serde(default = "default_pdf_auto_zoom_target_px")]
+    pub pdf_auto_zoom_target_px: f64,
     /// Preferred agent backend for the "Ask the documents" chat pane. The
     /// in-pane selector and header dropdown may switch a session to a
     /// different backend transiently, but this Settings field is the single
@@ -734,6 +737,10 @@ pub struct Settings {
 
 fn default_file_display_fields() -> Vec<FileDisplayField> {
     vec![FileDisplayField::Size]
+}
+
+fn default_pdf_auto_zoom_target_px() -> f64 {
+    15.5
 }
 
 fn default_supported_extensions() -> Vec<String> {
@@ -765,6 +772,7 @@ impl Default for Settings {
             file_sort_key: FileSortKey::default(),
             file_sort_direction: FileSortDirection::default(),
             file_display_fields: default_file_display_fields(),
+            pdf_auto_zoom_target_px: default_pdf_auto_zoom_target_px(),
             chat_backend: AgentBackend::default(),
             chat_config: Vec::new(),
             chat_custom_instructions: String::new(),
@@ -1490,6 +1498,7 @@ mod tests {
         assert!(s.supported_extensions.contains(&"pdf".to_string()));
         assert_eq!(s.context_lines, 2);
         assert_eq!(s.chat_backend, AgentBackend::ClaudeCode);
+        assert_eq!(s.pdf_auto_zoom_target_px, 15.5);
     }
 
     #[test]
@@ -1510,6 +1519,7 @@ mod tests {
 
         let settings: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.chat_backend, AgentBackend::ClaudeCode);
+        assert_eq!(settings.pdf_auto_zoom_target_px, 15.5);
     }
 
     #[test]

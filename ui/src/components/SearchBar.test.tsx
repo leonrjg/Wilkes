@@ -4,6 +4,7 @@ import SearchBar from "./SearchBar";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
+import { api } from "../services";
 
 // Mock the components that might be passed as slots
 const MockSourceSlot = () => <div data-testid="source-slot">Source Slot</div>;
@@ -42,6 +43,7 @@ describe("SearchBar", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it("renders correctly", () => {
@@ -112,6 +114,25 @@ describe("SearchBar", () => {
     fireEvent.click(semanticToggle);
 
     expect(setPreferSemanticMock).toHaveBeenCalledWith(true);
+  });
+
+  it("cancels an ongoing index when semantic mode is unchecked", () => {
+    const cancelEmbed = vi.spyOn(api, "cancelEmbed").mockResolvedValue(undefined);
+    const setPreferSemanticMock = vi.fn();
+    useSettingsStore.setState({
+      preferSemantic: true,
+      setPreferSemantic: setPreferSemanticMock,
+    });
+    useSemanticStore.setState({
+      buildRoot: "/test/dir",
+      status: "building",
+    } as any);
+
+    render(<SearchBar sourceSlot={<MockSourceSlot />} />);
+    fireEvent.click(screen.getByRole("button", { name: "Semantic search" }));
+
+    expect(setPreferSemanticMock).toHaveBeenCalledWith(false);
+    expect(cancelEmbed).toHaveBeenCalledOnce();
   });
 
   it("toggles case sensitivity", () => {

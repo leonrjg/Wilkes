@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { StrictMode } from "react";
 import PdfViewer from "./PdfViewer";
 import { savePdfScrollPosition } from "./pdfScrollMemory";
+import { useSettingsStore } from "../../stores/useSettingsStore";
 
 const { mockVirtualizer } = vi.hoisted(() => ({
   mockVirtualizer: {
@@ -164,6 +165,9 @@ describe("PdfViewer", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    useSettingsStore.setState({
+      settings: { pdf_auto_zoom_target_px: 15.5 } as never,
+    });
     mockPdfDoc.value = {
       numPages: 10,
       getPage: async (_pageNumber: number) => ({
@@ -250,7 +254,7 @@ describe("PdfViewer", () => {
 
   it("auto-zooms in when body text renders small at fit-to-width", async () => {
     // 9pt body on a 612pt (US Letter) page renders ~13.2px at the 900px
-    // reference fit, below the ~16.5px target -> 16.5 / 13.235 ≈ 1.25x.
+    // reference fit, below the 15.5px target -> 15.5 / 13.235 ≈ 1.17x.
     mockPdfDoc.value = sizedDoc(9, 612);
 
     // Render under StrictMode: its mount/unmount/remount cancels the first
@@ -265,7 +269,21 @@ describe("PdfViewer", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     });
 
-    await waitFor(() => expect(screen.getByText("125%")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("117%")).toBeInTheDocument());
+  });
+
+  it("uses the configured auto-zoom target", async () => {
+    useSettingsStore.setState({
+      settings: { pdf_auto_zoom_target_px: 18 } as never,
+    });
+    mockPdfDoc.value = sizedDoc(9, 612);
+
+    render(<PdfViewer {...defaultProps} url="configured-target.pdf" />);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    await waitFor(() => expect(screen.getByText("136%")).toBeInTheDocument());
   });
 
   it("leaves documents with comfortable body text at 100%", async () => {
@@ -283,7 +301,7 @@ describe("PdfViewer", () => {
 
   it("does not auto-zoom (nor flicker) when text is only marginally small", async () => {
     // 16pt body on a 900pt page renders ~16px at the reference fit -> raw zoom
-    // 16.5/16 = 1.03x, inside the deadband, so no setZoom fires.
+    // 15.5/16 < 1x, inside the deadband, so no setZoom fires.
     mockPdfDoc.value = sizedDoc(16, 900);
 
     render(<PdfViewer {...defaultProps} />);

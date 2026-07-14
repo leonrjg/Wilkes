@@ -20,6 +20,7 @@ interface SemanticStore {
   refreshGlobalStatus: () => Promise<boolean>;
   ensureCurrentRootIndexed: (freshAttempt?: boolean) => Promise<boolean>;
   handleIndexUpdated: () => Promise<void>;
+  handleIndexTerminated: () => Promise<void>;
   handleCurrentRootIndexRemoved: () => Promise<void>;
 }
 
@@ -150,6 +151,16 @@ export const useSemanticStore = create<SemanticStore>((set, get) => ({
     if (ready) {
       await useSearchStore.getState().replaySearch();
     }
+  },
+
+  handleIndexTerminated: async () => {
+    const { directory } = useSettingsStore.getState();
+    set({
+      buildRoot: null,
+      readyForCurrentRoot: false,
+      status: directory ? "checking" : "idle",
+    });
+    await get().refreshCurrentRootStatus();
   },
 
   handleCurrentRootIndexRemoved: async () => {

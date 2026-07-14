@@ -373,6 +373,8 @@ export interface Settings {
   file_sort_key?: FileSortKey;
   file_sort_direction?: FileSortDirection;
   file_display_fields?: FileDisplayField[];
+  /** Desired CSS-pixel body-text height used when PDFs are auto-zoomed. */
+  pdf_auto_zoom_target_px: number;
   /** Persisted default agent for the chat pane (`SettingsModal`). The in-pane
    *  selector and header split-button dropdown may switch a session to a
    *  different backend transiently without touching this field. */

@@ -38,6 +38,7 @@ export function useGlobalEvents() {
         void useSemanticStore.getState().handleIndexUpdated();
       } else if (payload === "ReindexingCancelled") {
         closeReindexToast();
+        void useSemanticStore.getState().handleIndexTerminated();
       }
     }).then((u) => {
       if (!mounted) {

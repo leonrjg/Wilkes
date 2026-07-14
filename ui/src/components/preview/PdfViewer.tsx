@@ -21,6 +21,7 @@ import { api } from "../../services";
 import { Tooltip } from "../Tooltip";
 import SelectionActions, { type DocumentSelection } from "./SelectionActions";
 import { useDomDocumentSelection } from "./useDomDocumentSelection";
+import { useSettingsStore } from "../../stores/useSettingsStore";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -53,11 +54,10 @@ export type PdfSelection = DocumentSelection;
 const PAGE_GAP_PX = 12;
 const ZOOM_STEP = 0.1;
 
-// Auto-zoom: bring the dominant body text of a freshly opened document up to a
-// comfortable on-screen size. TARGET is the desired CSS-pixel height of body
-// text; we only ever enlarge (floor 1.0, so already-comfortable documents are
-// left untouched) and cap the enlargement so pathological cases stay sane.
-const AUTO_ZOOM_TARGET_PX = 16.5;
+// Auto-zoom: bring the dominant body text of a freshly opened document up to
+// the user-configured CSS-pixel height. We only ever enlarge (floor 1.0, so
+// already-comfortable documents are left untouched) and cap the enlargement so
+// pathological cases stay sane.
 const AUTO_ZOOM_MAX = 1.6;
 // Deadband: only auto-zoom when it enlarges by at least this factor. Applying a
 // near-1.0x zoom still re-renders every page and recentres, which reads as a
@@ -142,6 +142,9 @@ export default function PdfViewer({
   onAskSelection,
   onPageChange,
 }: PdfViewerProps) {
+  const autoZoomTargetPx = useSettingsStore(
+    (state) => state.settings?.pdf_auto_zoom_target_px,
+  );
   const rootRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState(600);
@@ -235,7 +238,7 @@ export default function PdfViewer({
   // Runs once per document; a scanned/textless PDF yields no samples and is
   // left at 1.0.
   useEffect(() => {
-    if (!pdf) return;
+    if (!pdf || autoZoomTargetPx === undefined) return;
     if (autoZoomedUrlRef.current === url) return;
 
     let cancelled = false;
@@ -275,7 +278,7 @@ export default function PdfViewer({
         median(fontSizes) * (AUTO_ZOOM_REFERENCE_WIDTH_PX / medianPageWidth);
       if (renderedPx <= 0) return;
 
-      const rawZoom = AUTO_ZOOM_TARGET_PX / renderedPx;
+      const rawZoom = autoZoomTargetPx / renderedPx;
       // Below the deadband the text is already comfortable; leave zoom at 1.0
       // untouched rather than nudging it and flickering the page.
       if (rawZoom < AUTO_ZOOM_MIN_INCREASE) return;
@@ -289,7 +292,7 @@ export default function PdfViewer({
     return () => {
       cancelled = true;
     };
-  }, [pdf, url]);
+  }, [autoZoomTargetPx, pdf, url]);
 
   const getVirtualPageSize = useCallback(
     (index: number) => {

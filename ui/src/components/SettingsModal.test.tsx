@@ -38,6 +38,7 @@ describe("SettingsModal", () => {
     respect_gitignore: true,
     max_file_size: 1024 * 1024,
     theme: "System",
+    pdf_auto_zoom_target_px: 15.5,
     search_prefer_semantic: false,
     semantic: { enabled: true, index_path: null, worker_timeout_secs: 300 },
     supported_extensions: ["ts"],
@@ -87,6 +88,16 @@ describe("SettingsModal", () => {
     });
     fireEvent.click(screen.getByText("Dark"));
     expect(mockApi.updateSettings).toHaveBeenCalledWith({ theme: "Dark" });
+  });
+
+  it("updates the PDF auto-zoom target", async () => {
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+    fireEvent.change(screen.getByLabelText("PDF auto-zoom target (px)"), {
+      target: { value: "17" },
+    });
+    expect(mockApi.updateSettings).toHaveBeenCalledWith({ pdf_auto_zoom_target_px: 17 });
   });
 
   it("persists chat custom instructions", async () => {

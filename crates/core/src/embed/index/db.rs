@@ -1048,6 +1048,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(idx.status().indexed_files, 1);
+        assert_eq!(embedder.calls(), 1);
 
         let mut idx = SemanticIndex::build(
             dir.path(),
@@ -1064,6 +1065,7 @@ mod tests {
         assert_eq!(idx.status().indexed_files, 1);
         assert_eq!(idx.status_for_root(Some(&root)).indexed_files, 1);
         assert_eq!(idx.status_for_root(Some(&nested)).indexed_files, 1);
+        assert_eq!(embedder.calls(), 1);
 
         idx.delete_root(&nested).unwrap();
         assert_eq!(idx.status().indexed_files, 1);
@@ -1165,6 +1167,67 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk_text, "old content");
+    }
+
+    #[test]
+    fn test_cancelled_overlapping_root_retries_without_reembedding() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let shared = nested.join("shared.txt");
+        fs::write(&shared, "shared").unwrap();
+
+        let registry = ExtractorRegistry::new();
+        let embedder = CountingEmbedder::new();
+        let indexing = txt_indexing();
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+
+        SemanticIndex::build(
+            dir.path(),
+            &root,
+            std::slice::from_ref(&shared),
+            &registry,
+            &embedder,
+            tx.clone(),
+            Arc::new(AtomicBool::new(false)),
+            &indexing,
+        )
+        .unwrap();
+        assert_eq!(embedder.calls(), 1);
+
+        let cancelled = SemanticIndex::build(
+            dir.path(),
+            &nested,
+            std::slice::from_ref(&shared),
+            &registry,
+            &embedder,
+            tx.clone(),
+            Arc::new(AtomicBool::new(true)),
+            &indexing,
+        );
+        assert!(cancelled.is_err());
+
+        let idx = SemanticIndex::open(dir.path(), "counting", 1).unwrap();
+        assert_eq!(idx.status_for_root(Some(&root)).indexed_files, 1);
+        assert_eq!(idx.status_for_root(Some(&nested)).indexed_files, 0);
+        assert_eq!(embedder.calls(), 1);
+        drop(idx);
+
+        let idx = SemanticIndex::build(
+            dir.path(),
+            &nested,
+            std::slice::from_ref(&shared),
+            &registry,
+            &embedder,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            &indexing,
+        )
+        .unwrap();
+        assert_eq!(idx.status_for_root(Some(&root)).indexed_files, 1);
+        assert_eq!(idx.status_for_root(Some(&nested)).indexed_files, 1);
+        assert_eq!(embedder.calls(), 1);
     }
 
     #[test]
@@ -1563,6 +1626,10 @@ impl SemanticIndex {
         let final_path = db_path(data_dir);
         let tmp_path = data_dir.join("semantic_index.db.tmp");
 
+        // Reuse compatible global embeddings while keeping the temporary index
+        // as the atomic root-membership boundary.
+        let reusable = Self::open(data_dir, embedder.model_id(), embedder.dimension()).ok();
+
         let mut idx = Self::create_at_path(
             &tmp_path,
             embedder.model_id(),
@@ -1584,6 +1651,17 @@ impl SemanticIndex {
                 message: format!("Indexing {} of {}...", i + 1, total_files),
                 done: false,
             }));
+
+            if let Some(source) = reusable.as_ref() {
+                match idx.reuse_unchanged_file_from(source, path) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => error!(
+                        "[SemanticIndex::build] could not reuse {}: {e:#}",
+                        path.display()
+                    ),
+                }
+            }
 
             let chunks = match Self::extract_chunks(
                 path,
@@ -1927,6 +2005,124 @@ impl SemanticIndex {
             path: path.to_path_buf(),
             chunks,
         })
+    }
+
+    /// Copy an unchanged file's chunks and embeddings from another compatible
+    /// index. Returns `false` when reuse is unsafe so the caller can embed it.
+    fn reuse_unchanged_file_from(
+        &mut self,
+        source: &SemanticIndex,
+        path: &Path,
+    ) -> anyhow::Result<bool> {
+        let key = Self::canonical_path(path);
+        let key_str = key.to_string_lossy().into_owned();
+        let identity = Self::identity_for_path(path)?;
+        let source_file = source
+            .conn
+            .query_row(
+                "SELECT id, size_bytes, modified_at_ms
+                 FROM files
+                 WHERE file_path = ?1",
+                params![key_str],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((source_file_id, size_bytes, modified_at_ms)) = source_file else {
+            return Ok(false);
+        };
+        if size_bytes != identity.size_bytes || modified_at_ms != identity.modified_at_ms {
+            return Ok(false);
+        }
+
+        let mut stmt = source.conn.prepare(
+            "SELECT c.byte_start, c.byte_end,
+                    c.origin_type, c.page, c.line, c.col,
+                    c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.chunk_text,
+                    v.embedding
+             FROM chunks c
+             JOIN vec_chunks v ON v.rowid = c.id
+             WHERE c.file_id = ?1
+             ORDER BY c.chunk_idx",
+        )?;
+        let rows = stmt
+            .query_map(params![source_file_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<f64>>(6)?,
+                    row.get::<_, Option<f64>>(7)?,
+                    row.get::<_, Option<f64>>(8)?,
+                    row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Vec<u8>>(11)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.is_empty() {
+            return Ok(false);
+        }
+
+        let mut chunks = Vec::with_capacity(rows.len());
+        for (
+            byte_start,
+            byte_end,
+            origin_type,
+            page,
+            line,
+            col,
+            bbox_x,
+            bbox_y,
+            bbox_w,
+            bbox_h,
+            text,
+            embedding_blob,
+        ) in rows
+        {
+            let Some(origin) = source_origin_from_parts(
+                &origin_type,
+                page,
+                line,
+                col,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+            ) else {
+                return Ok(false);
+            };
+            let embedding = f32_slice_from_bytes(&embedding_blob)?;
+            if embedding.len() != self.dimension {
+                return Ok(false);
+            }
+            chunks.push((
+                Chunk {
+                    file_path: path.to_path_buf(),
+                    text,
+                    byte_range: ByteRange {
+                        start: byte_start as usize,
+                        end: byte_end as usize,
+                    },
+                    origin,
+                },
+                embedding,
+            ));
+        }
+
+        self.write_file(PreparedFile {
+            path: path.to_path_buf(),
+            chunks,
+        })?;
+        Ok(true)
     }
 
     fn canonical_path(path: &Path) -> PathBuf {

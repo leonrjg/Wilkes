@@ -265,6 +265,43 @@ describe("useSemanticStore", () => {
     expect(useSemanticStore.getState().status).toBe("building");
   });
 
+  it("clears a cancelled build marker so the same root can retry", async () => {
+    (api.getIndexStatus as any).mockResolvedValue({
+      indexed_files: 0,
+      total_chunks: 0,
+      built_at: null,
+      build_duration_ms: null,
+      engine: "SBERT",
+      model_id: "intfloat/e5-small-v2",
+      dimension: 384,
+      root_path: "/project",
+      db_size_bytes: null,
+    });
+    useSettingsStore.setState({
+      directory: "/project",
+      preferSemantic: false,
+    } as any);
+    await flushAsync();
+    useSemanticStore.setState({
+      buildRoot: "/project",
+      readyForCurrentRoot: false,
+      status: "building",
+    } as any);
+
+    await useSemanticStore.getState().handleIndexTerminated();
+
+    expect(useSemanticStore.getState().buildRoot).toBeNull();
+    expect(useSemanticStore.getState().status).toBe("missing");
+
+    (api.buildIndex as any).mockClear();
+    useSettingsStore.setState({ preferSemantic: true } as any);
+    await flushAsync();
+    expect(api.buildIndex).toHaveBeenCalledWith(
+      "/project",
+      expect.objectContaining({ model: "intfloat/e5-small-v2" }),
+    );
+  });
+
   it("replays the last search after the current root becomes ready", async () => {
     const replaySearch = vi.fn().mockResolvedValue(undefined);
     useSearchStore.setState({ replaySearch } as any);
