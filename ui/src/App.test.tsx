@@ -6,6 +6,7 @@ import { useSearchStore } from "./stores/useSearchStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useChatStore } from "./stores/useChatStore";
 import { ToastProvider } from "./components/Toast";
+import { source } from "./services";
 
 // Mock services and hooks at top level
 vi.mock("./services", () => ({
@@ -37,7 +38,8 @@ vi.mock("./services", () => ({
   source: {
     type: "desktop",
     pickDirectory: vi.fn(),
-    importDroppedFiles: vi.fn(() => Promise.resolve([])),
+    importFiles: vi.fn(() => Promise.resolve([])),
+    readClipboardFiles: vi.fn(() => Promise.resolve([])),
   },
   isTauri: true,
 }));
@@ -187,5 +189,44 @@ describe("App", () => {
       );
     });
     expect(screen.getByText("Open folder")).toBeInTheDocument();
+  });
+
+  it("imports files copied to the native clipboard on paste", async () => {
+    const refreshFileList = vi.fn();
+    useSettingsStore.setState({ refreshFileList });
+    vi.mocked(source.readClipboardFiles).mockResolvedValueOnce(["/external/paper.pdf"]);
+    vi.mocked(source.importFiles).mockResolvedValueOnce(["/test/dir/paper.pdf"]);
+
+    render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>
+    );
+
+    fireEvent.paste(window);
+
+    await vi.waitFor(() => {
+      expect(source.importFiles).toHaveBeenCalledWith(
+        ["/external/paper.pdf"],
+        "/test/dir",
+        "copy",
+      );
+      expect(refreshFileList).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("leaves ordinary text paste alone", async () => {
+    vi.mocked(source.readClipboardFiles).mockResolvedValueOnce([]);
+
+    render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>
+    );
+
+    fireEvent.paste(window);
+
+    await vi.waitFor(() => expect(source.readClipboardFiles).toHaveBeenCalledTimes(1));
+    expect(source.importFiles).not.toHaveBeenCalled();
   });
 });

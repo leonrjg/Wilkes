@@ -182,10 +182,18 @@ pub async fn rename_file(path: PathBuf, new_name: String) -> anyhow::Result<Path
     Ok(target)
 }
 
-pub async fn move_files_into_root(
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileImportMode {
+    Move,
+    Copy,
+}
+
+pub async fn import_files_into_root(
     paths: Vec<PathBuf>,
     root: PathBuf,
     supported_extensions: Vec<String>,
+    mode: FileImportMode,
 ) -> anyhow::Result<Vec<PathBuf>> {
     if paths.is_empty() {
         return Ok(Vec::new());
@@ -199,28 +207,25 @@ pub async fn move_files_into_root(
         anyhow::bail!("Root is not a directory: {}", root.display());
     }
 
-    let mut moves = Vec::with_capacity(paths.len());
+    let mut imports = Vec::with_capacity(paths.len());
     let mut targets = HashSet::with_capacity(paths.len());
     for path in paths {
-        let source = tokio::fs::canonicalize(&path)
-            .await
-            .map_err(|err| anyhow::anyhow!("Dropped file not found: {} ({err})", path.display()))?;
+        let source = tokio::fs::canonicalize(&path).await.map_err(|err| {
+            anyhow::anyhow!("File to import not found: {} ({err})", path.display())
+        })?;
         let metadata = tokio::fs::metadata(&source).await?;
         if !metadata.is_file() {
             anyhow::bail!("Can only import files: {}", source.display());
         }
         if FileType::detect(&source, &supported_extensions).is_none() {
-            anyhow::bail!("Dropped file type is not supported: {}", source.display());
+            anyhow::bail!("File type is not supported: {}", source.display());
         }
         let file_name = source.file_name().ok_or_else(|| {
-            anyhow::anyhow!("Dropped file has no file name: {}", source.display())
+            anyhow::anyhow!("File to import has no file name: {}", source.display())
         })?;
         let target = root.join(file_name);
         if source == target {
-            anyhow::bail!(
-                "Dropped file is already in the current root: {}",
-                source.display()
-            );
+            anyhow::bail!("File is already in the current root: {}", source.display());
         }
         if tokio::fs::try_exists(&target).await? {
             anyhow::bail!(
@@ -230,20 +235,33 @@ pub async fn move_files_into_root(
         }
         if !targets.insert(target.clone()) {
             anyhow::bail!(
-                "Multiple dropped files would import as the same name: {}",
+                "Multiple files would import as the same name: {}",
                 target.display()
             );
         }
-        moves.push((source, target));
+        imports.push((source, target));
     }
 
-    let mut imported = Vec::with_capacity(moves.len());
-    for (source, target) in moves {
-        tokio::fs::rename(&source, &target).await?;
+    let mut imported = Vec::with_capacity(imports.len());
+    for (source, target) in imports {
+        match mode {
+            FileImportMode::Move => tokio::fs::rename(&source, &target).await?,
+            FileImportMode::Copy => {
+                tokio::fs::copy(&source, &target).await?;
+            }
+        }
         imported.push(target);
     }
 
     Ok(imported)
+}
+
+pub async fn move_files_into_root(
+    paths: Vec<PathBuf>,
+    root: PathBuf,
+    supported_extensions: Vec<String>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    import_files_into_root(paths, root, supported_extensions, FileImportMode::Move).await
 }
 
 fn validate_new_file_name(name: &str) -> anyhow::Result<()> {
@@ -449,6 +467,28 @@ mod tests {
         let target = root_dir.path().join("paper.pdf");
         assert_eq!(imported, vec![target.canonicalize().unwrap()]);
         assert!(!source.exists());
+        assert_eq!(fs::read_to_string(target).unwrap(), "pdf");
+    }
+
+    #[tokio::test]
+    async fn test_import_files_into_root_copies_supported_files() {
+        let source_dir = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let source = source_dir.path().join("paper.pdf");
+        fs::write(&source, "pdf").unwrap();
+
+        let imported = import_files_into_root(
+            vec![source.clone()],
+            root_dir.path().to_path_buf(),
+            vec!["pdf".to_string()],
+            FileImportMode::Copy,
+        )
+        .await
+        .unwrap();
+
+        let target = root_dir.path().join("paper.pdf");
+        assert_eq!(imported, vec![target.canonicalize().unwrap()]);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "pdf");
         assert_eq!(fs::read_to_string(target).unwrap(), "pdf");
     }
 

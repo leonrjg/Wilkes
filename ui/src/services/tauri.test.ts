@@ -56,15 +56,24 @@ describe("TauriSearchApi", () => {
     expect(path).toBe("/some/new.txt");
   });
 
-  it("should call import_dropped_files", async () => {
+  it("should import filesystem paths", async () => {
     const source = new TauriSourceApi();
     (invoke as any).mockResolvedValue(["/root/file.pdf"]);
-    const paths = await source.importDroppedFiles(["/external/file.pdf"], "/root");
-    expect(invoke).toHaveBeenCalledWith("import_dropped_files", {
+    const paths = await source.importFiles(["/external/file.pdf"], "/root", "copy");
+    expect(invoke).toHaveBeenCalledWith("import_files", {
       paths: ["/external/file.pdf"],
       root: "/root",
+      mode: "copy",
     });
     expect(paths).toEqual(["/root/file.pdf"]);
+  });
+
+  it("should read copied filesystem paths", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(["/external/file.pdf"]);
+    const source = new TauriSourceApi();
+
+    await expect(source.readClipboardFiles()).resolves.toEqual(["/external/file.pdf"]);
+    expect(invoke).toHaveBeenCalledWith("read_clipboard_files");
   });
 
   it("should call trash_file through the shared deleteFile abstraction", async () => {

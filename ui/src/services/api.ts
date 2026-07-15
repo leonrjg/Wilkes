@@ -112,7 +112,8 @@ export interface SourceApi {
 export interface DesktopSourceApi extends SourceApi {
   type: "desktop";
   pickDirectory(): Promise<string | null>;
-  importDroppedFiles(paths: string[], root: string): Promise<string[]>;
+  importFiles(paths: string[], root: string, mode: "move" | "copy"): Promise<string[]>;
+  readClipboardFiles(): Promise<string[]>;
   moveFile(path: string, targetRoot: string): Promise<string>;
   listDirectories(path: string): Promise<string[]>;
 }

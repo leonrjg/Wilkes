@@ -660,14 +660,15 @@ impl AppContext {
         crate::commands::files::rename_file(path, new_name).await
     }
 
-    pub async fn move_files_into_current_root(
+    pub async fn import_files_into_current_root(
         &self,
         paths: Vec<PathBuf>,
         root: PathBuf,
+        mode: crate::commands::files::FileImportMode,
     ) -> anyhow::Result<Vec<PathBuf>> {
         let s = self.get_settings().await;
         let Some(current_root) = s.last_directory.clone() else {
-            anyhow::bail!("Choose a directory before dropping files");
+            anyhow::bail!("Choose a directory before importing files");
         };
         let root_canonical = std::fs::canonicalize(&root).map_err(|err| {
             anyhow::anyhow!("Root directory not found: {} ({err})", root.display())
@@ -680,14 +681,18 @@ impl AppContext {
         })?;
         if root_canonical != current_root_canonical {
             anyhow::bail!(
-                "Drop target must be the current root: {}",
+                "Import target must be the current root: {}",
                 current_root.display()
             );
         }
 
-        let imported =
-            crate::commands::files::move_files_into_root(paths, root, s.supported_extensions)
-                .await?;
+        let imported = crate::commands::files::import_files_into_root(
+            paths,
+            root,
+            s.supported_extensions,
+            mode,
+        )
+        .await?;
         self.emit_file_list_changed(&root_canonical);
         Ok(imported)
     }

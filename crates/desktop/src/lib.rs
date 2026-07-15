@@ -73,13 +73,14 @@ async fn trash_file_for_path(path: String) -> Result<(), String> {
     .map_err(|error| format!("Trash operation failed: {error}"))?
 }
 
-async fn move_files_into_current_root_for_ctx(
+async fn import_files_into_current_root_for_ctx(
     ctx: Arc<AppContext>,
     paths: Vec<String>,
     root: String,
+    mode: wilkes_api::commands::files::FileImportMode,
 ) -> Result<Vec<String>, String> {
     let paths = paths.into_iter().map(PathBuf::from).collect();
-    ctx.move_files_into_current_root(paths, root.into())
+    ctx.import_files_into_current_root(paths, root.into(), mode)
         .await
         .map(|paths| {
             paths
@@ -1043,12 +1044,33 @@ async fn rename_file(path: String, new_name: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn import_dropped_files(
+async fn import_files(
     paths: Vec<String>,
     root: String,
+    mode: wilkes_api::commands::files::FileImportMode,
     app: AppHandle,
 ) -> Result<Vec<String>, String> {
-    move_files_into_current_root_for_ctx(app_context(&app), paths, root).await
+    import_files_into_current_root_for_ctx(app_context(&app), paths, root, mode).await
+}
+
+#[tauri::command]
+async fn read_clipboard_files() -> Result<Vec<String>, String> {
+    tokio::task::spawn_blocking(|| match clipboard_files::read() {
+        Ok(paths) => paths
+            .into_iter()
+            .map(|path| {
+                path.into_os_string()
+                    .into_string()
+                    .map_err(|_| "A copied file path is not valid UTF-8".to_string())
+            })
+            .collect(),
+        Err(clipboard_files::Error::NoFiles) => Ok(Vec::new()),
+        Err(clipboard_files::Error::SystemError(error)) => {
+            Err(format!("Could not read copied files: {error}"))
+        }
+    })
+    .await
+    .map_err(|error| format!("Could not read copied files: {error}"))?
 }
 
 #[tauri::command]
@@ -1292,7 +1314,8 @@ pub fn run() {
             list_files,
             open_file,
             rename_file,
-            import_dropped_files,
+            import_files,
+            read_clipboard_files,
             move_file,
             list_directories,
             trash_file,
@@ -1597,7 +1620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_move_files_into_current_root_for_ctx_moves_external_file() {
+    async fn test_import_files_into_current_root_for_ctx_moves_external_file() {
         let (_dir, ctx) = test_ctx();
         let source_dir = tempdir().unwrap();
         let root_dir = tempdir().unwrap();
@@ -1611,10 +1634,11 @@ mod tests {
         .await
         .unwrap();
 
-        let imported = move_files_into_current_root_for_ctx(
+        let imported = import_files_into_current_root_for_ctx(
             ctx,
             vec![source.display().to_string()],
             root_dir.path().display().to_string(),
+            wilkes_api::commands::files::FileImportMode::Move,
         )
         .await
         .unwrap();
@@ -1625,6 +1649,39 @@ mod tests {
             vec![target.canonicalize().unwrap().display().to_string()]
         );
         assert!(!source.exists());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "pdf");
+    }
+
+    #[tokio::test]
+    async fn test_import_files_into_current_root_for_ctx_copies_external_file() {
+        let (_dir, ctx) = test_ctx();
+        let source_dir = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let source = source_dir.path().join("paper.pdf");
+        std::fs::write(&source, "pdf").unwrap();
+
+        ctx.update_settings(serde_json::json!({
+            "last_directory": root_dir.path().display().to_string(),
+            "supported_extensions": ["pdf"]
+        }))
+        .await
+        .unwrap();
+
+        let imported = import_files_into_current_root_for_ctx(
+            ctx,
+            vec![source.display().to_string()],
+            root_dir.path().display().to_string(),
+            wilkes_api::commands::files::FileImportMode::Copy,
+        )
+        .await
+        .unwrap();
+
+        let target = root_dir.path().join("paper.pdf");
+        assert_eq!(
+            imported,
+            vec![target.canonicalize().unwrap().display().to_string()]
+        );
+        assert_eq!(std::fs::read_to_string(source).unwrap(), "pdf");
         assert_eq!(std::fs::read_to_string(target).unwrap(), "pdf");
     }
 

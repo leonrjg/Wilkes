@@ -94,7 +94,7 @@ export default function App() {
       }
 
       try {
-        const imported = await (source as DesktopSourceApi).importDroppedFiles(paths, directory);
+        const imported = await (source as DesktopSourceApi).importFiles(paths, directory, "move");
         refreshFileList();
         addToast(`Imported ${imported.length} file${imported.length === 1 ? "" : "s"}`, {
           type: "success",
@@ -114,6 +114,34 @@ export default function App() {
       disposed = true;
       unlisten?.();
     };
+  }, [addToast, directory, refreshFileList]);
+
+  useEffect(() => {
+    if (!isTauri) return;
+
+    const handlePaste = async () => {
+      try {
+        const desktopSource = source as DesktopSourceApi;
+        const paths = await desktopSource.readClipboardFiles();
+        if (paths.length === 0) return;
+        if (!directory) {
+          addToast("Choose a directory before pasting files", { type: "error" });
+          return;
+        }
+
+        const imported = await desktopSource.importFiles(paths, directory, "copy");
+        refreshFileList();
+        addToast(`Imported ${imported.length} file${imported.length === 1 ? "" : "s"}`, {
+          type: "success",
+        });
+      } catch (e) {
+        console.error("Paste import failed:", e);
+        addToast(e instanceof Error ? e.message : "Import failed", { type: "error" });
+      }
+    };
+
+    window.addEventListener("paste", handlePaste);
+    return () => window.removeEventListener("paste", handlePaste);
   }, [addToast, directory, refreshFileList]);
 
   useEffect(() => {

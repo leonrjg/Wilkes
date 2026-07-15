@@ -275,8 +275,16 @@ export class TauriSourceApi implements DesktopSourceApi {
     return invoke<string | null>("pick_directory");
   }
 
-  async importDroppedFiles(paths: string[], root: string): Promise<string[]> {
-    return invoke<string[]>("import_dropped_files", { paths, root });
+  async importFiles(
+    paths: string[],
+    root: string,
+    mode: "move" | "copy",
+  ): Promise<string[]> {
+    return invoke<string[]>("import_files", { paths, root, mode });
+  }
+
+  async readClipboardFiles(): Promise<string[]> {
+    return invoke<string[]>("read_clipboard_files");
   }
 
   async moveFile(path: string, targetRoot: string): Promise<string> {
