@@ -18,6 +18,8 @@ import { Tooltip } from "./Tooltip";
 import { CopyButton } from "./CopyButton";
 import { fileName } from "./DocumentEntryRow";
 import RelatedDocumentsPane from "./RelatedDocumentsPane";
+import BookmarkDetails from "./preview/BookmarkDetails";
+import type { BookmarkAnchor } from "./preview/bookmarkPosition";
 
 interface Props {
   canGoBack?: boolean;
@@ -77,6 +79,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   const viewerMetadataStatus = useSearchStore((s) => s.viewerMetadataStatus);
   const clearPreview = useSearchStore((s) => s.clearPreview);
   const addBookmark = useBookmarksStore((s) => s.add);
+  const removeBookmark = useBookmarksStore((s) => s.remove);
   const bookmarks = useBookmarksStore((s) => s.bookmarks);
   const setChatActiveDoc = useChatStore((s) => s.setActiveDoc);
   const chatBackendsLoaded = useChatStore((s) => s.backendsLoaded);
@@ -85,6 +88,27 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
   const { addToast } = useToasts();
   const [relatedPanelOpen, setRelatedPanelOpen] = useState(false);
   const [markdownView, setMarkdownView] = useState<"source" | "rendered">("rendered");
+  const [openBookmarkTarget, setOpenBookmarkTarget] = useState<{
+    id: string;
+    anchor: BookmarkAnchor;
+  } | null>(null);
+  const [deletingBookmark, setDeletingBookmark] = useState(false);
+  const openBookmark = bookmarks.find(
+    (bookmark) => bookmark.id === openBookmarkTarget?.id,
+  ) ?? null;
+
+  useEffect(() => {
+    setOpenBookmarkTarget(null);
+    setDeletingBookmark(false);
+  }, [selectedMatch?.path]);
+
+  useEffect(() => {
+    if (openBookmarkTarget && !openBookmark) setOpenBookmarkTarget(null);
+  }, [openBookmark, openBookmarkTarget]);
+
+  const handleOpenBookmark = (id: string, anchor: BookmarkAnchor) => {
+    setOpenBookmarkTarget({ id, anchor });
+  };
 
   useEffect(() => {
     if (!selectedMatch || "PdfPage" in selectedMatch.origin) return;
@@ -231,6 +255,21 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
     })
       .then(() => addToast("Bookmark added", { type: "success" }))
       .catch((e) => console.error("Add bookmark failed:", e));
+  };
+
+  const handleDeleteBookmark = async () => {
+    if (!openBookmark || deletingBookmark) return;
+    setDeletingBookmark(true);
+    try {
+      await removeBookmark(openBookmark.id);
+      setOpenBookmarkTarget(null);
+      addToast("Bookmark deleted", { type: "success" });
+    } catch (error) {
+      console.error("Delete bookmark failed:", error);
+      addToast("Failed to delete bookmark", { type: "error" });
+    } finally {
+      setDeletingBookmark(false);
+    }
   };
 
   const chatSelectionActionsAvailable = isTauri && chatBackendsLoaded && hasAvailableChatBackend;
@@ -393,6 +432,15 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
       <div className="flex-1 min-h-0 overflow-hidden bg-[var(--bg-app)]">
         <div className="flex h-full min-h-0">
           <div className="relative min-w-0 flex-1 overflow-hidden">
+            {openBookmark && openBookmarkTarget && (
+              <BookmarkDetails
+                bookmark={openBookmark}
+                anchor={openBookmarkTarget.anchor}
+                deleting={deletingBookmark}
+                onClose={() => setOpenBookmarkTarget(null)}
+                onDelete={() => void handleDeleteBookmark()}
+              />
+            )}
             {(previewLoading || isPdfRendering) && (
               <div className="absolute inset-0 flex items-center justify-center bg-[var(--bg-app)] z-30 pointer-events-none">
                 <div className="flex flex-col items-center gap-3">
@@ -409,6 +457,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
                 highlight_bbox={pdfBbox}
                 highlight_rects={targetBookmarkRects}
                 bookmarkHighlights={bookmarkHighlights}
+                onBookmarkOpen={handleOpenBookmark}
                 onRenderSuccess={() => setIsPdfRendering(false)}
                 onAddBookmark={handleAddBookmark}
                 showChatSelectionActions={chatSelectionActionsAvailable}
@@ -423,6 +472,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
                 restoreScrollPosition={shouldRestoreSourceScroll}
                 highlightRange={renderedHighlightRange}
                 bookmarkHighlights={textBookmarkHighlights}
+                onBookmarkOpen={handleOpenBookmark}
                 onAddBookmark={handleAddBookmark}
                 showChatSelectionActions={chatSelectionActionsAvailable}
                 onExplainSelection={handleExplainSelection}
@@ -440,6 +490,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
                   displayData.Text.highlight_range,
                 )}
                 bookmarkHighlights={textBookmarkHighlights}
+                onBookmarkOpen={handleOpenBookmark}
                 onAddBookmark={handleAddBookmark}
                 showChatSelectionActions={chatSelectionActionsAvailable}
                 onExplainSelection={handleExplainSelection}

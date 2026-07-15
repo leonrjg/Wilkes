@@ -7,6 +7,7 @@ import { sourceBoundaryForDomPoint, sourceMappedMarkdown, type TextAnnotation } 
 import { readTextScrollPosition, saveTextScrollPosition } from "./textScrollMemory";
 import { utf8ByteOffsetToUtf16Offset } from "./textOffsets";
 import { useDomDocumentSelection } from "./useDomDocumentSelection";
+import { bookmarkAnchorFor, type BookmarkOpenHandler } from "./bookmarkPosition";
 
 interface MarkdownViewerProps {
   content: string;
@@ -14,6 +15,7 @@ interface MarkdownViewerProps {
   restoreScrollPosition?: boolean;
   highlightRange: ByteRange;
   bookmarkHighlights?: Array<{ id: string; range: ByteRange }>;
+  onBookmarkOpen?: BookmarkOpenHandler;
   onAddBookmark?: (selection: DocumentSelection) => void;
   showChatSelectionActions?: boolean;
   onExplainSelection?: (selection: DocumentSelection) => void;
@@ -26,6 +28,7 @@ export default function MarkdownViewer({
   restoreScrollPosition = true,
   highlightRange,
   bookmarkHighlights = [],
+  onBookmarkOpen,
   onAddBookmark,
   showChatSelectionActions = false,
   onExplainSelection,
@@ -94,7 +97,18 @@ export default function MarkdownViewer({
   }, [highlightRange, restoreScrollPosition, content]);
 
   return (
-    <div ref={rootRef} onMouseUp={domSelection.readSelection} className="relative h-full overflow-hidden">
+    <div
+      ref={rootRef}
+      onClick={(event) => {
+        if (!onBookmarkOpen || !(event.target instanceof Element)) return;
+        const highlight = event.target.closest<HTMLElement>("[data-bookmark-ids]");
+        const ids = highlight?.dataset.bookmarkIds;
+        const bookmarkId = ids?.split(",")[0];
+        if (bookmarkId && highlight) onBookmarkOpen(bookmarkId, bookmarkAnchorFor(highlight));
+      }}
+      onMouseUp={domSelection.readSelection}
+      className="relative h-full overflow-hidden"
+    >
       <div ref={scrollRef} className="h-full overflow-auto px-6 py-5 text-sm text-[var(--text-main)]">
         <article className="prose-document">
           <ReactMarkdown

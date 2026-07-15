@@ -23,6 +23,7 @@ import SelectionActions, {
 } from "./SelectionActions";
 import { textSelectionFromUtf16Range, utf8ByteRangeToUtf16Range } from "./textOffsets";
 import { readTextScrollPosition, saveTextScrollPosition } from "./textScrollMemory";
+import { bookmarkAnchorFor, type BookmarkOpenHandler } from "./bookmarkPosition";
 
 // ── Highlight effect / field ──────────────────────────────────────────────────
 
@@ -127,6 +128,7 @@ export interface CodeViewerProps {
   highlightLine: number;
   highlightRange: { start: number; end: number };
   bookmarkHighlights?: Array<{ id: string; range: ByteRange }>;
+  onBookmarkOpen?: BookmarkOpenHandler;
   onAddBookmark?: (selection: DocumentSelection) => void;
   showChatSelectionActions?: boolean;
   onExplainSelection?: (selection: DocumentSelection) => void;
@@ -141,6 +143,7 @@ export default function CodeViewer({
   highlightLine,
   highlightRange,
   bookmarkHighlights = [],
+  onBookmarkOpen,
   onAddBookmark,
   showChatSelectionActions = false,
   onExplainSelection,
@@ -256,6 +259,20 @@ export default function CodeViewer({
     }));
     view.dispatch({ effects: setBookmarkHighlights.of(converted) });
   }, [bookmarkHighlights, content]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || !onBookmarkOpen) return;
+    const openBookmark = (event: MouseEvent) => {
+      const target = event.target instanceof Element
+        ? event.target.closest<HTMLElement>("[data-bookmark-id]")
+        : null;
+      const bookmarkId = target?.dataset.bookmarkId;
+      if (bookmarkId && target) onBookmarkOpen(bookmarkId, bookmarkAnchorFor(target));
+    };
+    container.addEventListener("click", openBookmark);
+    return () => container.removeEventListener("click", openBookmark);
+  }, [onBookmarkOpen]);
 
   return (
     <div ref={rootRef} className="relative h-full w-full overflow-hidden">

@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import PreviewPane from "./PreviewPane";
 import { useSearchStore } from "../stores/useSearchStore";
@@ -230,6 +230,98 @@ describe("PreviewPane", () => {
         rects: [],
       }),
     );
+  });
+
+  it("shows a bookmark note from the viewer highlight and deletes the bookmark", async () => {
+    const remove = vi.fn().mockResolvedValue(undefined);
+    useSearchStore.setState({
+      selectedMatch: { path: "test.txt", origin: { TextFile: { line: 1, col: 0 } } },
+      previewData: {
+        Text: {
+          content: "hello world",
+          language: "text",
+          highlight_line: 1,
+          highlight_range: { start: 0, end: 0 },
+        },
+      },
+    });
+    useBookmarksStore.setState({
+      remove,
+      bookmarks: [{
+        id: "noted-bookmark",
+        path: "test.txt",
+        origin: { TextFile: { line: 1, col: 6 } },
+        text_range: { start: 6, end: 11 },
+        quote: "world",
+        created_at: "2026-01-01T00:00:00Z",
+        note: "Important context",
+        rects: [],
+      }],
+    });
+
+    render(<PreviewPane />);
+    act(() => {
+      mockCodeViewer.mock.calls.at(-1)![0].onBookmarkOpen("noted-bookmark", {
+        left: 100,
+        top: 100,
+        right: 140,
+        bottom: 120,
+      });
+    });
+
+    const details = await screen.findByRole("complementary", { name: "Bookmark details" });
+    expect(details).toBeInTheDocument();
+    expect(details).toHaveStyle({ left: "100px", top: "128px" });
+    expect(screen.getByText("Important context")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete bookmark" }));
+    await waitFor(() => expect(remove).toHaveBeenCalledWith("noted-bookmark"));
+    await waitFor(() =>
+      expect(screen.queryByRole("complementary", { name: "Bookmark details" }))
+        .not.toBeInTheDocument(),
+    );
+  });
+
+  it("dismisses bookmark details when clicking outside the card", async () => {
+    useSearchStore.setState({
+      selectedMatch: { path: "test.txt", origin: { TextFile: { line: 1, col: 0 } } },
+      previewData: {
+        Text: {
+          content: "hello world",
+          language: "text",
+          highlight_line: 1,
+          highlight_range: { start: 0, end: 0 },
+        },
+      },
+    });
+    useBookmarksStore.setState({
+      bookmarks: [{
+        id: "outside-dismiss",
+        path: "test.txt",
+        origin: { TextFile: { line: 1, col: 6 } },
+        text_range: { start: 6, end: 11 },
+        quote: "world",
+        created_at: "2026-01-01T00:00:00Z",
+        note: "Visible note",
+        rects: [],
+      }],
+    });
+
+    render(<PreviewPane />);
+    act(() => {
+      mockCodeViewer.mock.calls.at(-1)![0].onBookmarkOpen("outside-dismiss", {
+        left: 100,
+        top: 100,
+        right: 140,
+        bottom: 120,
+      });
+    });
+    expect(await screen.findByRole("complementary", { name: "Bookmark details" }))
+      .toBeInTheDocument();
+
+    fireEvent.pointerDown(screen.getByTestId("code-viewer"));
+    expect(screen.queryByRole("complementary", { name: "Bookmark details" }))
+      .not.toBeInTheDocument();
   });
 
   it("renders metadata title and author when available", () => {

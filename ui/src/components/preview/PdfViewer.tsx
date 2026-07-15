@@ -22,6 +22,7 @@ import { Tooltip } from "../Tooltip";
 import SelectionActions, { type DocumentSelection } from "./SelectionActions";
 import { useDomDocumentSelection } from "./useDomDocumentSelection";
 import { useSettingsStore } from "../../stores/useSettingsStore";
+import { bookmarkAnchorFor, type BookmarkOpenHandler } from "./bookmarkPosition";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -36,6 +37,7 @@ export interface PdfViewerProps {
    *  the emphasis is drawn per line instead of over `highlight_bbox`'s union. */
   highlight_rects?: BoundingBox[] | null;
   bookmarkHighlights?: Array<{ id: string; page: number; rects: BoundingBox[] }>;
+  onBookmarkOpen?: BookmarkOpenHandler;
   onRenderSuccess?: () => void;
   /** Fires (debounced) whenever the page nearest the viewport center changes
    *  -- covers scroll, page-jump, and link/outline navigation alike, since
@@ -135,6 +137,7 @@ export default function PdfViewer({
   highlight_bbox,
   highlight_rects = null,
   bookmarkHighlights = [],
+  onBookmarkOpen,
   onRenderSuccess,
   onAddBookmark,
   showChatSelectionActions = false,
@@ -834,7 +837,23 @@ export default function PdfViewer({
                               backgroundColor: "rgba(250, 204, 21, 0.16)",
                               borderBottom: "2px solid rgba(202, 138, 4, 0.75)",
                               borderRadius: "2px",
-                              pointerEvents: "none",
+                              cursor: onBookmarkOpen ? "pointer" : undefined,
+                              pointerEvents: onBookmarkOpen ? "auto" : "none",
+                            }}
+                            role={onBookmarkOpen ? "button" : undefined}
+                            tabIndex={onBookmarkOpen ? 0 : undefined}
+                            aria-label={onBookmarkOpen ? "Open bookmark" : undefined}
+                            onClick={(event) =>
+                              onBookmarkOpen?.(highlight.id, bookmarkAnchorFor(event.currentTarget))
+                            }
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" || event.key === " ") {
+                                event.preventDefault();
+                                onBookmarkOpen?.(
+                                  highlight.id,
+                                  bookmarkAnchorFor(event.currentTarget),
+                                );
+                              }
                             }}
                           />
                         );

@@ -1,4 +1,4 @@
-import { render, screen, act } from "@testing-library/react";
+import { render, screen, act, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import CodeViewer from "./CodeViewer";
 import { EditorView } from "@codemirror/view";
@@ -92,5 +92,24 @@ describe("CodeViewer", () => {
     // We need to render it to trigger the useEffect that dispatches
     render(<CodeViewer {...defaultProps} />);
     // Since we used a class, we can't easily check the instance dispatch unless we capture it.
+  });
+
+  it("opens a bookmark when its source highlight is clicked", () => {
+    const onBookmarkOpen = vi.fn();
+    const { container } = render(
+      <CodeViewer {...defaultProps} onBookmarkOpen={onBookmarkOpen} />,
+    );
+    const editorContainer = container.firstElementChild?.firstElementChild;
+    const highlight = document.createElement("span");
+    highlight.dataset.bookmarkId = "source-bookmark";
+    editorContainer?.appendChild(highlight);
+
+    fireEvent.click(highlight);
+    expect(onBookmarkOpen).toHaveBeenCalledWith("source-bookmark", {
+      left: 0,
+      top: 0,
+      right: 0,
+      bottom: 0,
+    });
   });
 });

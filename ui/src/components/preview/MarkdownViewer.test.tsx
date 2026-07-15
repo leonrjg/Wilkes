@@ -47,6 +47,27 @@ describe("MarkdownViewer", () => {
       .toHaveTextContent("🙂");
   });
 
+  it("opens a bookmark when its rendered highlight is clicked", () => {
+    const onBookmarkOpen = vi.fn();
+    render(
+      <MarkdownViewer
+        documentPath="/notes.md"
+        content="Read this note"
+        highlightRange={{ start: 0, end: 0 }}
+        bookmarkHighlights={[{ id: "note-1", range: { start: 5, end: 9 } }]}
+        onBookmarkOpen={onBookmarkOpen}
+      />,
+    );
+
+    fireEvent.click(document.querySelector(".markdown-bookmark-highlight")!);
+    expect(onBookmarkOpen).toHaveBeenCalledWith("note-1", {
+      left: 0,
+      top: 0,
+      right: 0,
+      bottom: 0,
+    });
+  });
+
   it("maps a rendered selection back to the existing text bookmark shape", () => {
     const onAddBookmark = vi.fn();
     render(

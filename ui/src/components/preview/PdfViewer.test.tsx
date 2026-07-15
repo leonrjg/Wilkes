@@ -398,6 +398,28 @@ describe("PdfViewer", () => {
     });
   });
 
+  it("opens a persisted bookmark highlight", async () => {
+    const onBookmarkOpen = vi.fn();
+    render(
+      <PdfViewer
+        {...defaultProps}
+        bookmarkHighlights={[
+          { id: "bookmark-1", page: 1, rects: [{ x: 20, y: 30, width: 40, height: 10 }] },
+        ]}
+        onBookmarkOpen={onBookmarkOpen}
+      />,
+    );
+
+    const highlight = await screen.findByTestId("bookmark-highlight");
+    fireEvent.click(highlight);
+    expect(onBookmarkOpen).toHaveBeenCalledWith("bookmark-1", {
+      left: 0,
+      top: 0,
+      right: 0,
+      bottom: 0,
+    });
+  });
+
   it("shows the selection action below and to the right of the selected text", async () => {
     render(<PdfViewer {...defaultProps} onAddBookmark={vi.fn()} />);
 
