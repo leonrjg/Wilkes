@@ -62,6 +62,7 @@ pub async fn list_files(
                             publication_date: None,
                             citation_count: None,
                             metadata_conflicts: Default::default(),
+                            tags: Vec::new(),
                         },
                         reason: OmittedFileReason::UnsupportedExtension,
                     });
@@ -83,6 +84,7 @@ pub async fn list_files(
                             publication_date: None,
                             citation_count: None,
                             metadata_conflicts: Default::default(),
+                            tags: Vec::new(),
                         },
                         reason: OmittedFileReason::TooLarge,
                     });
@@ -101,6 +103,7 @@ pub async fn list_files(
                     publication_date: None,
                     citation_count: None,
                     metadata_conflicts: Default::default(),
+                    tags: Vec::new(),
                 });
             }
         }

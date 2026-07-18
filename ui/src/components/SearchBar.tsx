@@ -1,11 +1,12 @@
 import { useState, useCallback, useEffect, useRef } from "react";
-import { Search, Database, Check, Globe } from "react-feather";
+import { Search, Database, Check, Clock, Globe, Trash2 } from "react-feather";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import type { SearchQuery } from "../lib/types";
 import { Tooltip } from "./Tooltip";
 import { api } from "../services";
+import { useResearchStore } from "../stores/useResearchStore";
 
 interface Props {
   sourceSlot: React.ReactNode;
@@ -38,8 +39,22 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [isSemanticMode, setIsSemanticMode] = useState(preferSemantic);
   const [searchAll, setSearchAll] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const collections = useResearchStore((s) => s.collections);
+  const tags = useResearchStore((s) => s.tags);
+  const history = useResearchStore((s) => s.history);
+  const selectedCollectionId = useResearchStore((s) => s.selectedCollectionId);
+  const selectedTagId = useResearchStore((s) => s.selectedTagId);
+  const setSelectedCollection = useResearchStore((s) => s.setSelectedCollection);
+  const setSelectedTag = useResearchStore((s) => s.setSelectedTag);
+  const loadHistory = useResearchStore((s) => s.loadHistory);
+  const deleteHistory = useResearchStore((s) => s.deleteHistory);
+  const clearHistory = useResearchStore((s) => s.clearHistory);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevSemanticReady = useRef(semanticReady);
+  const prevFilterKey = useRef(`${selectedCollectionId ?? ""}|${selectedTagId ?? ""}`);
+  const replayQueryRef = useRef<SearchQuery | null>(null);
+  const historyRef = useRef<HTMLDivElement | null>(null);
 
   // Sync semantic mode when the setting is loaded from the backend
   useEffect(() => {
@@ -63,6 +78,8 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
         mode: (opts.isSemanticMode ?? isSemanticMode) ? "Semantic" : "Grep",
         scope: (opts.searchAll ?? searchAll) ? { type: "all" } : { type: "corpus" },
         supported_extensions: supportedExtensions,
+        collection_id: selectedCollectionId,
+        tag_ids: selectedTagId ? [selectedTagId] : [],
       };
     },
     [
@@ -76,8 +93,26 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
       supportedExtensions,
       maxResults,
       searchAll,
+      selectedCollectionId,
+      selectedTagId,
     ],
   );
+
+  useEffect(() => {
+    if (!historyOpen) return;
+    const closeOnOutsideInteraction = (event: PointerEvent) => {
+      if (!historyRef.current?.contains(event.target as Node)) setHistoryOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setHistoryOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsideInteraction);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideInteraction);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [historyOpen]);
 
   const triggerSearch = useCallback(
     (
@@ -100,6 +135,14 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     [search, buildQuery, deferSemanticSearch, directory, ensureCurrentRootIndexed, isSemanticMode, searchAll, semanticReady, semanticReadyGlobally],
   );
 
+  useEffect(() => {
+    const key = `${selectedCollectionId ?? ""}|${selectedTagId ?? ""}`;
+    if (prevFilterKey.current === key) return;
+    prevFilterKey.current = key;
+    if (replayQueryRef.current) return;
+    if (pattern.trim()) triggerSearch(pattern, undefined, "user");
+  }, [selectedCollectionId, selectedTagId]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Notify store when query presence changes
   useEffect(() => {
     setHasQuery(pattern.trim().length > 0);
@@ -107,12 +150,19 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
 
   // Debounce pattern changes
   useEffect(() => {
+    if (replayQueryRef.current) return;
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => triggerSearch(pattern, undefined, "user"), 300);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
   }, [pattern]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Replay updates several controls in one render. Clear the guard only after
+  // their reactive effects have all observed it, preventing duplicate log rows.
+  useEffect(() => {
+    replayQueryRef.current = null;
+  });
 
   // Re-trigger when externally-driven settings change (directory)
   useEffect(() => {
@@ -162,6 +212,28 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     setSearchAll(next);
     if (next) refreshGlobalStatus().catch(console.error);
     triggerSearch(pattern, { searchAll: next }, "user");
+  };
+
+  const replayHistory = (query: SearchQuery) => {
+    const collectionId = collections.some((item) => item.id === query.collection_id)
+      ? query.collection_id ?? null
+      : null;
+    const tagId = query.tag_ids?.find((id) => tags.some((tag) => tag.id === id)) ?? null;
+    const replay = {
+      ...query,
+      collection_id: collectionId,
+      tag_ids: tagId ? [tagId] : [],
+    };
+    replayQueryRef.current = replay;
+    setPattern(query.pattern);
+    setIsRegex(query.is_regex);
+    setCaseSensitive(query.case_sensitive);
+    setIsSemanticMode(query.mode === "Semantic");
+    setSearchAll(query.scope.type === "all");
+    setSelectedCollection(collectionId);
+    setSelectedTag(tagId);
+    search(replay);
+    setHistoryOpen(false);
   };
 
   return (
@@ -229,10 +301,48 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
           </Tooltip>
         </div>
 
+        <div ref={historyRef} className="relative">
+          <Tooltip content="Search history">
+            <button
+              type="button"
+              aria-label="Search history"
+              aria-expanded={historyOpen}
+              onClick={() => {
+                const next = !historyOpen;
+                setHistoryOpen(next);
+                if (next) loadHistory().catch(console.error);
+              }}
+              className={`rounded border p-2 transition-colors ${historyOpen ? "border-[var(--accent-blue)] text-[var(--accent-blue)]" : "border-[var(--border-main)] text-[var(--text-muted)] hover:text-[var(--text-main)]"}`}
+            >
+              <Clock size={14} />
+            </button>
+          </Tooltip>
+          {historyOpen && (
+            <div className="absolute right-0 top-full z-[900] mt-1 w-[min(520px,80vw)] overflow-hidden rounded-md border border-[var(--border-main)] bg-[var(--bg-app)] shadow-2xl">
+              <div className="flex items-center border-b border-[var(--border-main)] px-3 py-2">
+                <span className="flex-1 text-xs font-semibold text-[var(--text-main)]">Search history</span>
+                {history.length > 0 && <button type="button" onClick={() => clearHistory().catch(console.error)} className="text-[10px] text-[var(--text-muted)] hover:text-[var(--text-main)]">Clear</button>}
+              </div>
+              <div className="max-h-80 overflow-auto p-1">
+                {history.length === 0 && <p className="px-3 py-5 text-center text-xs text-[var(--text-dim)]">No searches yet</p>}
+                {history.slice(0, 50).map((entry) => (
+                  <div key={entry.id} className="group flex items-center gap-2 rounded px-2 py-1.5 hover:bg-[var(--bg-hover)]">
+                    <button type="button" onClick={() => replayHistory(entry.query)} className="min-w-0 flex-1 text-left">
+                      <div className="truncate text-xs text-[var(--text-main)]">{entry.query.pattern}</div>
+                      <div className="truncate text-[10px] text-[var(--text-dim)]">{new Date(entry.started_at_ms).toLocaleString()} · {entry.query.mode} · {entry.result_count} matches · {entry.status}{entry.collection_name ? ` · ${entry.collection_name}` : ""}</div>
+                    </button>
+                    <button type="button" aria-label={`Delete search ${entry.query.pattern}`} onClick={() => deleteHistory(entry.id).catch(console.error)} className="p-1 text-[var(--text-dim)] opacity-0 hover:text-red-400 group-hover:opacity-100 focus:opacity-100"><Trash2 size={12} /></button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
         {settingsSlot}
       </div>
 
-      {/* Bottom row: source slot */}
+      {/* Bottom row: source controls */}
       <div className="flex items-center gap-2 flex-wrap">{sourceSlot}</div>
     </div>
   );

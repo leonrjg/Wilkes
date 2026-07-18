@@ -99,6 +99,11 @@ body,
   height: 100%;
 }
 
+.dark .plain-text-editor .cm-editor,
+.dark .plain-text-editor .cm-gutters {
+  background-color: #111318;
+}
+
 /* Match highlight in result list */
 .match-highlight {
   background-color: rgb(250 204 21 / 0.4);
@@ -167,6 +172,16 @@ body,
 .markdown-search-highlight.markdown-bookmark-highlight {
   background: linear-gradient(rgba(250, 204, 21, 0.25), rgba(250, 204, 21, 0.25)),
     linear-gradient(rgba(59, 130, 246, 0.16), rgba(59, 130, 246, 0.16));
+}
+
+/* In-document find (rendered Markdown), painted via the CSS Custom Highlight API. */
+::highlight(wilkes-find) {
+  background-color: rgba(249, 115, 22, 0.28);
+}
+
+::highlight(wilkes-find-active) {
+  background-color: rgba(249, 115, 22, 0.65);
+  color: #1a1a1a;
 }
 
 .prose-document {

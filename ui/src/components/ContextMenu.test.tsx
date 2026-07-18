@@ -86,4 +86,31 @@ describe("ContextMenu", () => {
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
     expect(consoleError).toHaveBeenCalledWith("context menu action failed", expect.any(Error));
   });
+
+  it("submits inline actions without opening a separate prompt", async () => {
+    const submit = vi.fn().mockResolvedValue(undefined);
+    const onClose = vi.fn();
+    render(
+      <ContextMenu
+        menu={{
+          position: { x: 10, y: 10 },
+          target: null,
+          items: [{
+            id: "new-tag",
+            label: "Create and add tag",
+            inlineInput: { placeholder: "New tag…", submitLabel: "Add", submit },
+          }],
+        }}
+        onClose={onClose}
+      />,
+    );
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Create and add tag" }), {
+      target: { value: "Reviewed" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+
+    expect(submit).toHaveBeenCalledWith("Reviewed");
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+  });
 });

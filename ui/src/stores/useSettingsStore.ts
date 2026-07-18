@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import { api } from "../services";
+import { useResearchStore } from "./useResearchStore";
 import type {
   AgentBackend,
   BookmarkDock,
@@ -24,6 +25,17 @@ function applyTheme(theme: Theme) {
     const systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
     root.classList.add(systemDark ? "dark" : "light");
   }
+}
+
+function listFilesForActiveFilters(directory: string) {
+  const { selectedCollectionId, selectedTagId, draftCollectionExpression } = useResearchStore.getState();
+  if (!selectedCollectionId && !selectedTagId && !draftCollectionExpression) return api.listFiles(directory);
+  return api.listFiles(
+    directory,
+    selectedCollectionId,
+    selectedTagId ? [selectedTagId] : [],
+    draftCollectionExpression,
+  );
 }
 
 interface SettingsStore {
@@ -53,7 +65,7 @@ interface SettingsStore {
   addFavorite: (dir: string) => void;
   removeFavorite: (dir: string) => void;
   forgetDirectory: (dir: string) => void;
-  refreshFileList: () => void;
+  refreshFileList: () => Promise<void>;
   applyMetadataUpdates: (updates: FileMetadataUpdate[]) => void;
   setPreferSemantic: (active: boolean) => void;
   setIndexing: (indexing: boolean) => void;
@@ -164,16 +176,28 @@ export const useSettingsStore = create<SettingsStore>()(
       set({ favorites: nextBookmarks, recentDirs: nextRecent, directory: nextDir });
     },
 
-    refreshFileList: () => {
+    refreshFileList: async () => {
       const { directory } = get();
       if (!directory) return;
-      api.listFiles(directory)
-        .then((response) => set({ fileList: response.files, omittedFileList: response.omitted }))
-        .catch(() => {});
+      try {
+        const response = await listFilesForActiveFilters(directory);
+        set({ fileList: response.files, omittedFileList: response.omitted });
+      } catch (error) {
+        // A failed filter must never leave the previous, now-misleading list visible.
+        set({ fileList: [], omittedFileList: [] });
+        console.error("Failed to refresh file list:", error);
+      }
     },
 
     applyMetadataUpdates: (updates: FileMetadataUpdate[]) => {
       if (updates.length === 0) return;
+      if (
+        useResearchStore.getState().selectedCollectionId ||
+        useResearchStore.getState().selectedTagId
+      ) {
+        get().refreshFileList();
+        return;
+      }
       const byPath = new Map(updates.map((u) => [u.path, u]));
       const patch = <T extends FileEntry>(entry: T): T => {
         const update = byPath.get(entry.path);
@@ -330,14 +354,16 @@ useSettingsStore.subscribe(
   (state) => state.directory,
   (directory) => {
     if (directory) {
-      api
-        .listFiles(directory)
+      listFilesForActiveFilters(directory)
         .then((response) =>
           useSettingsStore.setState({
             fileList: response.files,
             omittedFileList: response.omitted,
           }))
-        .catch(() => {});
+        .catch((error) => {
+          console.error("Failed to refresh file list:", error);
+          useSettingsStore.setState({ fileList: [], omittedFileList: [] });
+        });
     } else {
       useSettingsStore.setState({ fileList: [], omittedFileList: [] });
     }

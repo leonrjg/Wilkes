@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Serialize;
 use wilkes_core::types::{
-    FileMatches, RelatedDocument, RelatedDocumentsQuery, SearchQuery, SearchStats,
+    FileMatches, RelatedDocument, RelatedDocumentsQuery, SearchQuery, SearchStats, SmartCollection,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -26,6 +26,10 @@ pub trait SearchService: Send + Sync {
     }
 
     async fn library_roots(self: Arc<Self>) -> Vec<PathBuf>;
+
+    async fn list_smart_collections(self: Arc<Self>) -> Result<Vec<SmartCollection>, String> {
+        Ok(Vec::new())
+    }
 
     async fn search(
         self: Arc<Self>,

@@ -29,6 +29,13 @@ import type {
   SearchQuery,
   SearchStats,
   Settings,
+  Tag,
+  NewTag,
+  DocumentTagUpdate,
+  SmartCollection,
+  NewSmartCollection,
+  CollectionValidation,
+  SearchLogEntry,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type { SearchApi, DesktopSourceApi, DataPaths } from "./api";
@@ -98,9 +105,28 @@ export class TauriSearchApi implements SearchApi {
     return invoke<Bookmark>("update_bookmark_note", { id, note });
   }
 
-  async listFiles(root: string): Promise<FileListResponse> {
-    return invoke<FileListResponse>("list_files", { root });
+  async listFiles(root: string, collectionId?: string | null, tagIds: string[] = [], collectionExpression?: string | null): Promise<FileListResponse> {
+    return invoke<FileListResponse>("list_files", {
+      root,
+      ...(collectionId ? { collectionId } : {}),
+      ...(tagIds.length ? { tagIds } : {}),
+      ...(collectionExpression ? { collectionExpression } : {}),
+    });
   }
+
+  async listTags(): Promise<Tag[]> { return invoke<Tag[]>("list_tags"); }
+  async createTag(tag: NewTag): Promise<Tag> { return invoke<Tag>("create_tag", { tag }); }
+  async updateTag(id: string, tag: NewTag): Promise<Tag> { return invoke<Tag>("update_tag", { id, tag }); }
+  async deleteTag(id: string): Promise<void> { await invoke("delete_tag", { id }); }
+  async updateDocumentTags(update: DocumentTagUpdate): Promise<void> { await invoke("update_document_tags", { update }); }
+  async listSmartCollections(): Promise<SmartCollection[]> { return invoke<SmartCollection[]>("list_smart_collections"); }
+  async createSmartCollection(collection: NewSmartCollection): Promise<SmartCollection> { return invoke<SmartCollection>("create_smart_collection", { collection }); }
+  async updateSmartCollection(id: string, collection: NewSmartCollection): Promise<SmartCollection> { return invoke<SmartCollection>("update_smart_collection", { id, collection }); }
+  async deleteSmartCollection(id: string): Promise<void> { await invoke("delete_smart_collection", { id }); }
+  async validateSmartCollection(expression: string): Promise<CollectionValidation> { return invoke<CollectionValidation>("validate_smart_collection", { expression }); }
+  async listSearchLog(limit = 100): Promise<SearchLogEntry[]> { return invoke<SearchLogEntry[]>("list_search_log", { limit }); }
+  async deleteSearchLog(id: string): Promise<void> { await invoke("delete_search_log", { id }); }
+  async clearSearchLog(): Promise<void> { await invoke("clear_search_log"); }
 
   async openFile(path: string): Promise<PreviewData> {
     return invoke<PreviewData>("open_file", { path });

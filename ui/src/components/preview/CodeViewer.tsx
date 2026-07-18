@@ -276,7 +276,7 @@ export default function CodeViewer({
 
   return (
     <div ref={rootRef} className="relative h-full w-full overflow-hidden">
-      <div ref={containerRef} className="h-full w-full overflow-auto text-sm" />
+      <div ref={containerRef} className="plain-text-editor h-full w-full overflow-auto text-sm" />
       <SelectionActions
         positioned={selectionAction}
         onAddBookmark={onAddBookmark}

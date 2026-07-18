@@ -1,4 +1,3 @@
-pub mod bookmarks;
 pub mod chat;
 pub mod embed;
 pub mod files;

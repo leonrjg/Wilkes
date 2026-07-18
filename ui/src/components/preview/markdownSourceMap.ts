@@ -90,17 +90,21 @@ export function sourceMappedMarkdown(content: string, annotations: TextAnnotatio
     sourceByteBoundaries[utf16Offset] = byteOffset;
   }
   return () => (tree: HastNode) => {
-    const visit = (node: HastNode) => {
+    const visit = (node: HastNode, inPre: boolean) => {
       if (!node.children) return;
+      // Newlines inside <pre>/<code> are literal content; only soft breaks in
+      // flowing text become <br>.
+      const childInPre = inPre || node.tagName === "pre" || node.tagName === "code";
       node.children = node.children.flatMap((child): HastNode[] => {
         if (child.type !== "text" || !child.value || child.position?.start.offset == null || child.position.end.offset == null) {
-          visit(child);
+          visit(child, childInPre);
           return [child];
         }
 
+        const value = child.value;
         const boundaries = renderedBoundaries(
           content,
-          child.value,
+          value,
           child.position.start.offset,
           child.position.end.offset,
         );
@@ -132,23 +136,37 @@ export function sourceMappedMarkdown(content: string, annotations: TextAnnotatio
             search ? "markdown-search-highlight" : "",
             bookmarkIds ? "markdown-bookmark-highlight" : "",
           ].filter(Boolean);
-          runs.push({
+          const span = (from: number, to: number): HastNode => ({
             type: "element",
             tagName: "span",
             properties: {
               className: classes,
-              dataSourceBoundaries: byteBoundaries.slice(runStart, index + 1).join(","),
+              dataSourceBoundaries: byteBoundaries.slice(from, to + 1).join(","),
               ...(bookmarkIds ? { dataBookmarkIds: bookmarkIds } : {}),
             },
-            children: [{ type: "text", value: child.value.slice(runStart, index) }],
+            children: [{ type: "text", value: value.slice(from, to) }],
           });
+          if (childInPre) {
+            runs.push(span(runStart, index));
+          } else {
+            // A soft break (`\n`) renders as <br>; the newline itself carries no
+            // visible glyph, so it is dropped from the addressable spans.
+            let segmentStart = runStart;
+            for (let offset = runStart; offset < index; offset += 1) {
+              if (value[offset] !== "\n") continue;
+              if (offset > segmentStart) runs.push(span(segmentStart, offset));
+              runs.push({ type: "element", tagName: "br", properties: {}, children: [] });
+              segmentStart = offset + 1;
+            }
+            if (segmentStart < index) runs.push(span(segmentStart, index));
+          }
           runStart = index;
           key = nextKey ?? "|";
         }
         return runs;
       });
     };
-    visit(tree);
+    visit(tree, false);
   };
 }
 

@@ -6,7 +6,8 @@ import type { Settings } from "./types";
 import { isTauri } from "../services";
 import { useChatStore } from "../stores/useChatStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
-import { Copy, Edit2, ExternalLink, Folder, FolderPlus, MessageSquare, RefreshCw, Trash2 } from "react-feather";
+import { Copy, Edit2, ExternalLink, Folder, FolderPlus, MessageSquare, RefreshCw, Tag, Trash2 } from "react-feather";
+import { useResearchStore } from "../stores/useResearchStore";
 
 export type ContextMenuTarget =
   | { kind: "file" | "match"; path: string; open: () => void }
@@ -105,6 +106,55 @@ export function buildFileContextMenuItems({
       run: () => onRenameRequest?.(target.path),
     },
   ];
+
+  const research = useResearchStore.getState();
+  const currentEntry = useSettingsStore.getState().fileList.find((entry) => entry.path === target.path);
+  managementItems.push({
+    id: "tag-create-and-add",
+    label: "Create and add tag",
+    icon: Tag,
+    inlineInput: {
+      placeholder: "New tag…",
+      submitLabel: "Add",
+      submit: async (name) => {
+        try {
+          const created = await research.createTag({ name });
+          await research.updateDocumentTags({
+            paths: [target.path],
+            add_tag_ids: [created.id],
+            remove_tag_ids: [],
+          });
+          await useSettingsStore.getState().refreshFileList();
+          onToast(`Created and added ${created.name}`, "success");
+        } catch (error) {
+          console.error("Failed to create and add tag:", error);
+          onToast("Failed to create and add tag", "error");
+        }
+      },
+    },
+  });
+  for (const tag of research.tags) {
+    const assigned = currentEntry?.tags?.some((item) => item.id === tag.id) ?? false;
+    managementItems.push({
+      id: `tag-${tag.id}`,
+      label: `${assigned ? "Remove" : "Add"} tag: ${tag.name}`,
+      icon: Tag,
+      run: async () => {
+        try {
+          await research.updateDocumentTags({
+            paths: [target.path],
+            add_tag_ids: assigned ? [] : [tag.id],
+            remove_tag_ids: assigned ? [tag.id] : [],
+          });
+          await useSettingsStore.getState().refreshFileList();
+          onToast(assigned ? `Removed ${tag.name}` : `Added ${tag.name}`, "success");
+        } catch (error) {
+          console.error("Failed to update document tags:", error);
+          onToast("Failed to update tags", "error");
+        }
+      },
+    });
+  }
 
   if (isTauri && availableRoots.length > 0) {
     managementItems.push({

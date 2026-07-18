@@ -25,6 +25,13 @@ import type {
   SearchQuery,
   SearchStats,
   Settings,
+  Tag,
+  NewTag,
+  DocumentTagUpdate,
+  SmartCollection,
+  NewSmartCollection,
+  CollectionValidation,
+  SearchLogEntry,
 } from "../lib/types";
 
 export interface DataPaths {
@@ -47,7 +54,20 @@ export interface SearchApi {
   addBookmark(bookmark: NewBookmark): Promise<Bookmark>;
   removeBookmark(id: string): Promise<void>;
   updateBookmarkNote(id: string, note: string | null): Promise<Bookmark>;
-  listFiles(root: string): Promise<FileListResponse>;
+  listFiles(root: string, collectionId?: string | null, tagIds?: string[], collectionExpression?: string | null): Promise<FileListResponse>;
+  listTags(): Promise<Tag[]>;
+  createTag(tag: NewTag): Promise<Tag>;
+  updateTag(id: string, tag: NewTag): Promise<Tag>;
+  deleteTag(id: string): Promise<void>;
+  updateDocumentTags(update: DocumentTagUpdate): Promise<void>;
+  listSmartCollections(): Promise<SmartCollection[]>;
+  createSmartCollection(collection: NewSmartCollection): Promise<SmartCollection>;
+  updateSmartCollection(id: string, collection: NewSmartCollection): Promise<SmartCollection>;
+  deleteSmartCollection(id: string): Promise<void>;
+  validateSmartCollection(expression: string): Promise<CollectionValidation>;
+  listSearchLog(limit?: number): Promise<SearchLogEntry[]>;
+  deleteSearchLog(id: string): Promise<void>;
+  clearSearchLog(): Promise<void>;
   openFile(path: string): Promise<PreviewData>;
   renameFile(path: string, newName: string): Promise<string>;
   /** File-based extraction only (fast; used for the viewer's first paint). */

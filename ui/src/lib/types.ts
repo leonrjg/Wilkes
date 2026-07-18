@@ -39,6 +39,8 @@ export interface SearchQuery {
   mode: SearchMode;
   scope: SearchScope;
   supported_extensions: string[];
+  collection_id?: string | null;
+  tag_ids?: string[];
 }
 
 export type FileType = "PlainText" | "Pdf";
@@ -69,6 +71,40 @@ export interface RelatedDocumentsQuery {
   path: string;
   scope?: SearchScope;
   limit?: number | null;
+  collection_id?: string | null;
+}
+
+export interface Tag { id: string; name: string; color: string | null }
+export interface NewTag { name: string; color?: string | null }
+export interface DocumentTagUpdate {
+  paths: string[];
+  add_tag_ids: string[];
+  remove_tag_ids: string[];
+}
+export interface SmartCollection {
+  id: string;
+  name: string;
+  expression: string;
+  filter_schema_version: number;
+  revision: number;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+export interface NewSmartCollection { name: string; expression: string }
+export interface CollectionValidation { valid: boolean; error?: string | null }
+export type SearchLogStatus = "running" | "completed" | "cancelled" | "failed";
+export interface SearchLogEntry {
+  id: string;
+  query: SearchQuery;
+  collection_name?: string | null;
+  collection_revision?: number | null;
+  initiated_by: string;
+  started_at_ms: number;
+  completed_at_ms?: number | null;
+  result_count: number;
+  duration_ms?: number | null;
+  status: SearchLogStatus;
+  error_message?: string | null;
 }
 
 export interface RelatedDocument extends FileEntry {
@@ -209,6 +245,7 @@ export interface FileEntry {
   /** Semantic Scholar citation count from cached extracted metadata. */
   citation_count?: number | null;
   metadata_conflicts?: Record<string, MetadataConflictValue[]>;
+  tags?: Tag[];
 }
 
 export interface MetadataConflictValue {

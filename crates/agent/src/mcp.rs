@@ -219,6 +219,8 @@ struct SearchParams {
     is_regex: Option<bool>,
     /// Exact search context lines.
     context_lines: Option<u32>,
+    /// Optional saved smart collection ID to intersect with the chosen scope.
+    collection_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -231,6 +233,8 @@ struct GetRelatedDocumentsParams {
     root: Option<String>,
     /// Maximum related documents to return (1-25, default 8).
     limit: Option<usize>,
+    /// Optional saved smart collection ID to constrain returned documents.
+    collection_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -381,6 +385,19 @@ impl WilkesMcp {
             snapshot.context_files,
             roots,
         ))
+    }
+
+    #[tool(
+        description = "List saved Wilkes smart collections and their IDs for collection-scoped searches."
+    )]
+    async fn list_smart_collections(&self) -> CallToolResult {
+        match &self.search {
+            Some(search) => match search.clone().list_smart_collections().await {
+                Ok(collections) => structured(collections),
+                Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+            },
+            None => structured(Vec::<wilkes_core::types::SmartCollection>::new()),
+        }
     }
 
     #[tool(
@@ -788,8 +805,9 @@ async fn get_related_documents(
     cwd: &Path,
     mut params: GetRelatedDocumentsParams,
 ) -> Result<GetRelatedDocumentsResponse, String> {
-    let search = search
-        .ok_or_else(|| "Wilkes related-document search is not available in this session.".to_string())?;
+    let search = search.ok_or_else(|| {
+        "Wilkes related-document search is not available in this session.".to_string()
+    })?;
     let path = match params.path.take() {
         Some(path) if !path.trim().is_empty() => PathBuf::from(path),
         Some(_) => return Err("Document path cannot be empty.".to_string()),
@@ -826,6 +844,7 @@ async fn get_related_documents(
                 .unwrap_or(DEFAULT_RELATED_DOCUMENTS_LIMIT)
                 .clamp(1, MAX_RELATED_DOCUMENTS_LIMIT),
         ),
+        collection_id: params.collection_id,
     };
     let documents = search.related_documents(query).await?;
 
@@ -883,6 +902,8 @@ fn build_search_query(
                 wilkes_core::types::SearchScope::Corpus
             },
             supported_extensions: Vec::new(),
+            collection_id: params.collection_id,
+            tag_ids: Vec::new(),
         },
         max_results,
     ))
@@ -909,9 +930,7 @@ impl From<wilkes_core::types::Match> for SearchMatchResponse {
             wilkes_core::types::SourceOrigin::PdfPage { page, .. } => (None, Some(page)),
         };
         let mut text = String::with_capacity(
-            matched.context_before.len()
-                + matched.matched_text.len()
-                + matched.context_after.len(),
+            matched.context_before.len() + matched.matched_text.len() + matched.context_after.len(),
         );
         text.push_str(&matched.context_before);
         text.push_str(&matched.matched_text);
@@ -1145,6 +1164,7 @@ mod tests {
                 case_sensitive: Some(true),
                 is_regex: Some(true),
                 context_lines: Some(100),
+                collection_id: None,
             },
         )
         .unwrap();
@@ -1176,6 +1196,7 @@ mod tests {
                 case_sensitive: None,
                 is_regex: Some(true),
                 context_lines: None,
+                collection_id: None,
             },
         )
         .unwrap();
@@ -1201,6 +1222,7 @@ mod tests {
                 case_sensitive: None,
                 is_regex: None,
                 context_lines: None,
+                collection_id: None,
             },
         )
         .unwrap();
@@ -1228,6 +1250,7 @@ mod tests {
                 case_sensitive: None,
                 is_regex: None,
                 context_lines: None,
+                collection_id: None,
             },
         )
         .unwrap();
@@ -1255,6 +1278,7 @@ mod tests {
                 case_sensitive: None,
                 is_regex: None,
                 context_lines: None,
+                collection_id: None,
             },
         )
         .unwrap();
@@ -1287,6 +1311,7 @@ mod tests {
                 scope: Some(SearchScopeParam::All),
                 root: None,
                 limit: Some(100),
+                collection_id: None,
             },
         )
         .await
@@ -1354,6 +1379,7 @@ mod tests {
                 case_sensitive: None,
                 is_regex: None,
                 context_lines: None,
+                collection_id: None,
             },
         )
         .await
@@ -1414,6 +1440,7 @@ mod tests {
                 case_sensitive: None,
                 is_regex: None,
                 context_lines: None,
+                collection_id: None,
             },
         )
         .await
@@ -1441,6 +1468,7 @@ mod tests {
                 case_sensitive: None,
                 is_regex: None,
                 context_lines: None,
+                collection_id: None,
             },
         )
         .await

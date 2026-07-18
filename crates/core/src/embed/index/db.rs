@@ -592,6 +592,13 @@ mod tests {
         assert_eq!(global.len(), 1);
         assert_eq!(global[0].file_path, canon(&other_path));
 
+        let eligible = std::collections::HashSet::from([canon(&scoped_path)]);
+        let filtered = idx
+            .query_scoped_filtered(&[1.0, 0.0], 1, SemanticQueryScope::Corpus, Some(&eligible))
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].file_path, canon(&scoped_path));
+
         let scoped = idx
             .query_scoped(&[1.0, 0.0], 1, SemanticQueryScope::File(&scoped_path))
             .unwrap();
@@ -661,6 +668,20 @@ mod tests {
         );
         assert!(related[0].score > related[1].score);
         assert!(related[0].entry.size_bytes > 0);
+
+        let eligible = std::collections::HashSet::from([canon(&far)]);
+        let filtered = idx
+            .related_documents_filtered(
+                root,
+                &source,
+                1,
+                &["txt".to_string()],
+                false,
+                Some(&eligible),
+            )
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].entry.path, canon(&far));
     }
 
     #[test]
@@ -2780,6 +2801,28 @@ impl SemanticIndex {
         }
     }
 
+    /// Apply document eligibility before the caller's top-k boundary. The
+    /// current index implementations already scan in Rust for root/file scope;
+    /// corpus scope requests all vector candidates only when a collection is
+    /// active, then performs the single authoritative eligibility cut.
+    pub fn query_scoped_filtered(
+        &self,
+        embedding: &[f32],
+        top_k: usize,
+        scope: SemanticQueryScope<'_>,
+        eligible_paths: Option<&std::collections::HashSet<PathBuf>>,
+    ) -> anyhow::Result<Vec<IndexedChunk>> {
+        let Some(eligible_paths) = eligible_paths else {
+            return self.query_scoped(embedding, top_k, scope);
+        };
+        let mut results = self.query_scoped(embedding, 0, scope)?;
+        results.retain(|chunk| eligible_paths.contains(&chunk.file_path));
+        if top_k > 0 {
+            results.truncate(top_k);
+        }
+        Ok(results)
+    }
+
     pub fn related_documents(
         &self,
         root: &Path,
@@ -2787,6 +2830,25 @@ impl SemanticIndex {
         limit: usize,
         supported_extensions: &[String],
         whole_corpus: bool,
+    ) -> anyhow::Result<Vec<RelatedDocument>> {
+        self.related_documents_filtered(
+            root,
+            source_path,
+            limit,
+            supported_extensions,
+            whole_corpus,
+            None,
+        )
+    }
+
+    pub fn related_documents_filtered(
+        &self,
+        root: &Path,
+        source_path: &Path,
+        limit: usize,
+        supported_extensions: &[String],
+        whole_corpus: bool,
+        eligible_paths: Option<&std::collections::HashSet<PathBuf>>,
     ) -> anyhow::Result<Vec<RelatedDocument>> {
         let source_key = self
             .path_key_for_existing_path(source_path)
@@ -2865,6 +2927,9 @@ impl SemanticIndex {
                 continue;
             }
             let abs_path = self.key_to_display_path(&file_path);
+            if eligible_paths.is_some_and(|eligible| !eligible.contains(&abs_path)) {
+                continue;
+            }
             let Some(file_type) = FileType::detect(&abs_path, supported_extensions) else {
                 continue;
             };
@@ -2900,6 +2965,7 @@ impl SemanticIndex {
                     publication_date: None,
                     citation_count: None,
                     metadata_conflicts: Default::default(),
+                    tags: Vec::new(),
                 },
                 score,
             });

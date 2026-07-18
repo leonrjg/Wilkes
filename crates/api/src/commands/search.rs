@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use crate::research::SearchLogTracker;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::error;
@@ -10,12 +11,15 @@ use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::search::grep::GrepSearchProvider;
 use wilkes_core::search::semantic::SemanticSearchProvider;
 use wilkes_core::search::SearchProvider;
-use wilkes_core::types::{FileMatches, IndexingConfig, SearchMode, SearchQuery, SearchStats};
+use wilkes_core::types::{
+    FileMatches, IndexingConfig, SearchLogStatus, SearchMode, SearchQuery, SearchStats,
+};
 
 /// Handle to a running search. Dropping the handle cancels the search.
 pub struct SearchHandle {
     pub rx: mpsc::Receiver<FileMatches>,
     worker: JoinHandle<Vec<String>>,
+    log: Option<SearchLogTracker>,
 }
 
 impl SearchHandle {
@@ -25,11 +29,15 @@ impl SearchHandle {
 
     /// Wait for the worker to finish and return any non-fatal errors it collected.
     /// Must only be called after `next()` has returned `None`.
-    pub async fn finish(self) -> Vec<String> {
-        self.worker.await.unwrap_or_else(|e| {
+    pub async fn finish(mut self) -> Vec<String> {
+        let errors = self.worker.await.unwrap_or_else(|e| {
             error!("search worker panicked: {e}");
             vec![format!("search worker panicked: {e}")]
-        })
+        });
+        if let Some(log) = &mut self.log {
+            log.finish(SearchLogStatus::Completed, 0, 0, errors.first().cloned());
+        }
+        errors
     }
 
     /// Consumes the search stream, executing `on_result` for each match.
@@ -46,16 +54,35 @@ impl SearchHandle {
         while let Some(fm) = self.next().await {
             total_matches += fm.matches.len();
             files_scanned += 1;
+            if let Some(log) = &mut self.log {
+                log.observe(fm.matches.len());
+            }
             if !on_result(fm).await {
+                self.rx.close();
                 break;
             }
         }
 
+        let errors = self.worker.await.unwrap_or_else(|e| {
+            error!("search worker panicked: {e}");
+            vec![format!("search worker panicked: {e}")]
+        });
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if let Some(log) = &mut self.log {
+            let status = if errors.iter().any(|error| {
+                error.starts_with("search failed:") || error.contains("worker panicked")
+            }) {
+                SearchLogStatus::Failed
+            } else {
+                SearchLogStatus::Completed
+            };
+            log.finish(status, total_matches, elapsed_ms, errors.first().cloned());
+        }
         SearchStats {
             files_scanned,
             total_matches,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            errors: self.finish().await,
+            elapsed_ms,
+            errors,
         }
     }
 }
@@ -72,6 +99,8 @@ pub fn start_search(
     embedder: Option<Arc<dyn Embedder>>,
     index: Option<Arc<Mutex<Option<SemanticIndex>>>>,
     indexing: Option<IndexingConfig>,
+    eligible_paths: Option<std::collections::HashSet<std::path::PathBuf>>,
+    log: Option<SearchLogTracker>,
 ) -> SearchHandle {
     let (tx, rx) = mpsc::channel::<FileMatches>(64);
 
@@ -103,11 +132,11 @@ pub fn start_search(
         };
 
         provider
-            .search(&query, &registry, tx)
+            .search(&query, &registry, tx, eligible_paths.as_ref())
             .unwrap_or_else(|e| vec![format!("search failed: {e:#}")])
     });
 
-    SearchHandle { rx, worker }
+    SearchHandle { rx, worker, log }
 }
 
 #[cfg(test)]
@@ -134,9 +163,11 @@ mod tests {
             mode: SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
-        let mut handle = start_search(query, Vec::new(), Vec::new(), None, None, None);
+        let mut handle = start_search(query, Vec::new(), Vec::new(), None, None, None, None, None);
         let mut matches = Vec::new();
         while let Some(m) = handle.rx.recv().await {
             matches.push(m);
@@ -166,9 +197,11 @@ mod tests {
             mode: SearchMode::Semantic,
             scope: Default::default(),
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
-        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None);
+        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None, None, None);
         let errors = handle.finish().await;
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("Semantic search requires"));
@@ -193,9 +226,11 @@ mod tests {
             mode: SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
-        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None);
+        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None, None, None);
 
         let stats = handle
             .run(|fm| async move {
@@ -228,9 +263,11 @@ mod tests {
             mode: SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
-        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None);
+        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None, None, None);
 
         let stats = handle
             .run(|_fm| async move {
@@ -260,9 +297,11 @@ mod tests {
             mode: SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
-        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None);
+        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None, None, None);
         let errors = handle.finish().await;
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("search failed"));
@@ -270,11 +309,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_handle_worker_panic() {
-        let (tx, rx) = mpsc::channel(1);
+        let (_tx, rx) = mpsc::channel(1);
         let worker = tokio::task::spawn_blocking(|| {
             panic!("test panic");
         });
-        let handle = SearchHandle { rx, worker };
+        let handle = SearchHandle {
+            rx,
+            worker,
+            log: None,
+        };
         let errors = handle.finish().await;
         assert!(!errors.is_empty());
         assert!(errors[0].contains("search worker panicked"));

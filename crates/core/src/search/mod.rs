@@ -17,6 +17,7 @@ pub trait SearchProvider: Send + Sync {
         query: &SearchQuery,
         extractors: &ExtractorRegistry,
         tx: SearchResultTx,
+        eligible_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
     ) -> anyhow::Result<Vec<String>>;
 
     fn capabilities(&self) -> SearchCapabilities;

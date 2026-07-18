@@ -62,6 +62,7 @@ impl SearchProvider for GrepSearchProvider {
         query: &SearchQuery,
         extractors: &ExtractorRegistry,
         tx: SearchResultTx,
+        eligible_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
     ) -> anyhow::Result<Vec<String>> {
         let matcher = Self::build_matcher(query)?;
         let mut total_matches: usize = 0;
@@ -97,6 +98,7 @@ impl SearchProvider for GrepSearchProvider {
                         &tx,
                         &mut total_matches,
                         &mut errors,
+                        eligible_paths,
                     )? {
                         break;
                     }
@@ -135,6 +137,7 @@ impl SearchProvider for GrepSearchProvider {
                         &tx,
                         &mut total_matches,
                         &mut errors,
+                        eligible_paths,
                     )? {
                         break;
                     }
@@ -149,6 +152,7 @@ impl SearchProvider for GrepSearchProvider {
                     &tx,
                     &mut total_matches,
                     &mut errors,
+                    eligible_paths,
                 )?;
             }
         }
@@ -187,12 +191,17 @@ fn search_path(
     tx: &SearchResultTx,
     total_matches: &mut usize,
     errors: &mut Vec<String>,
+    eligible_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
 ) -> anyhow::Result<bool> {
     if tx.is_closed() {
         return Ok(true);
     }
 
     if !path.is_file() {
+        return Ok(false);
+    }
+
+    if eligible_paths.is_some_and(|eligible| !eligible.contains(path)) {
         return Ok(false);
     }
 
@@ -419,6 +428,8 @@ mod tests {
             mode: crate::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
@@ -456,6 +467,8 @@ mod tests {
             mode: crate::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
@@ -487,6 +500,8 @@ mod tests {
             mode: crate::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
@@ -515,6 +530,8 @@ mod tests {
             mode: crate::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
@@ -559,6 +576,8 @@ mod tests {
             mode: crate::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
         let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
         let matches = search_extracted_content(&content, &matcher).unwrap();
@@ -589,6 +608,8 @@ mod tests {
             mode: crate::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let provider = GrepSearchProvider::new();
@@ -596,7 +617,9 @@ mod tests {
         let query_clone = query.clone();
         let extractors = ExtractorRegistry::new();
         std::thread::spawn(move || {
-            provider.search(&query_clone, &extractors, tx).unwrap();
+            provider
+                .search(&query_clone, &extractors, tx, None)
+                .unwrap();
         });
 
         let mut results = Vec::new();
@@ -630,12 +653,14 @@ mod tests {
             mode: crate::types::SearchMode::Grep,
             scope: SearchScope::All,
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let provider = GrepSearchProvider::with_all_roots(vec![first, second], Vec::new());
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let extractors = ExtractorRegistry::new();
-        std::thread::spawn(move || provider.search(&query, &extractors, tx).unwrap());
+        std::thread::spawn(move || provider.search(&query, &extractors, tx, None).unwrap());
 
         let mut results = Vec::new();
         while let Some(result) = rx.blocking_recv() {
@@ -667,13 +692,15 @@ mod tests {
                 path: scoped.clone(),
             },
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let extractors = ExtractorRegistry::new();
         std::thread::spawn(move || {
-            provider.search(&query, &extractors, tx).unwrap();
+            provider.search(&query, &extractors, tx, None).unwrap();
         });
 
         let mut results = Vec::new();
@@ -716,6 +743,8 @@ mod tests {
             mode: crate::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["pdf".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let provider = GrepSearchProvider::new();
@@ -724,8 +753,11 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let query_clone = query.clone();
 
-        let handle =
-            std::thread::spawn(move || provider.search(&query_clone, &extractors, tx).unwrap());
+        let handle = std::thread::spawn(move || {
+            provider
+                .search(&query_clone, &extractors, tx, None)
+                .unwrap()
+        });
 
         assert!(rx.blocking_recv().is_none());
         let errors = handle.join().unwrap();
@@ -749,6 +781,8 @@ mod tests {
             mode: crate::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
@@ -776,13 +810,15 @@ mod tests {
             mode: crate::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let extractors = ExtractorRegistry::new();
         std::thread::spawn(move || {
-            provider.search(&query, &extractors, tx).unwrap();
+            provider.search(&query, &extractors, tx, None).unwrap();
         });
 
         let mut all_matches = Vec::new();
@@ -814,13 +850,15 @@ mod tests {
             mode: crate::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["rs".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let extractors = ExtractorRegistry::new();
         std::thread::spawn(move || {
-            provider.search(&query, &extractors, tx).unwrap();
+            provider.search(&query, &extractors, tx, None).unwrap();
         });
 
         let mut results = Vec::new();
@@ -874,6 +912,8 @@ mod tests {
             mode: crate::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let provider = GrepSearchProvider::new();
@@ -881,7 +921,7 @@ mod tests {
         drop(rx); // Close receiver immediately
 
         let extractors = ExtractorRegistry::new();
-        let res = provider.search(&query, &extractors, tx);
+        let res = provider.search(&query, &extractors, tx, None);
         assert!(res.is_ok());
     }
 
@@ -903,6 +943,8 @@ mod tests {
             mode: crate::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["pdf".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         use crate::extract::ContentExtractor;
@@ -936,7 +978,7 @@ mod tests {
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
 
-        provider.search(&query, &registry, tx).unwrap();
+        provider.search(&query, &registry, tx, None).unwrap();
 
         let mut results = Vec::new();
         while let Ok(m) = rx.try_recv() {
@@ -965,17 +1007,63 @@ mod tests {
             mode: crate::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let extractors = ExtractorRegistry::new();
-        provider.search(&query, &extractors, tx).unwrap();
+        provider.search(&query, &extractors, tx, None).unwrap();
 
         let mut results = Vec::new();
         while let Ok(m) = rx.try_recv() {
             results.push(m);
         }
         assert!(results.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod eligibility_tests {
+    use super::*;
+    use crate::extract::ExtractorRegistry;
+    use crate::types::{SearchQuery, SearchScope};
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn collection_eligibility_is_applied_before_global_limit() {
+        let dir = tempdir().unwrap();
+        let excluded = dir.path().join("a.txt");
+        let included = dir.path().join("b.txt");
+        fs::write(&excluded, "needle").unwrap();
+        fs::write(&included, "needle").unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            max_results: 1,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            scope: SearchScope::Corpus,
+            supported_extensions: vec!["txt".into()],
+            collection_id: Some("test".into()),
+            tag_ids: Vec::new(),
+        };
+        let eligible = std::collections::HashSet::from([included.clone()]);
+        let provider = GrepSearchProvider::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        std::thread::spawn(move || {
+            provider
+                .search(&query, &ExtractorRegistry::new(), tx, Some(&eligible))
+                .unwrap();
+        });
+        let result = rx.recv().await.expect("eligible result");
+        assert_eq!(result.path, included);
+        assert!(rx.recv().await.is_none());
     }
 }

@@ -25,6 +25,13 @@ import type {
   SearchQuery,
   SearchStats,
   Settings,
+  Tag,
+  NewTag,
+  DocumentTagUpdate,
+  SmartCollection,
+  NewSmartCollection,
+  CollectionValidation,
+  SearchLogEntry,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type { SearchApi, WebSourceApi } from "./api";
@@ -172,10 +179,39 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<Bookmark>;
   }
 
-  async listFiles(root: string): Promise<FileListResponse> {
-    const res = await fetch(`/api/files?root=${encodeURIComponent(root)}`);
+  async listFiles(root: string, collectionId?: string | null, tagIds: string[] = [], collectionExpression?: string | null): Promise<FileListResponse> {
+    const query = new URLSearchParams({ root });
+    if (collectionId) query.set("collection_id", collectionId);
+    if (tagIds.length) query.set("tag_ids", tagIds.join(","));
+    if (collectionExpression) query.set("collection_expression", collectionExpression);
+    const res = await fetch(`/api/files?${query.toString()}`);
     if (!res.ok) throw new Error(`listFiles failed: ${res.status}`);
     return res.json() as Promise<FileListResponse>;
+  }
+
+  async listTags(): Promise<Tag[]> { return this.json<Tag[]>("/api/tags"); }
+  async createTag(tag: NewTag): Promise<Tag> { return this.json<Tag>("/api/tags", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(tag) }); }
+  async updateTag(id: string, tag: NewTag): Promise<Tag> { return this.json<Tag>(`/api/tags/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(tag) }); }
+  async deleteTag(id: string): Promise<void> { await this.ok(`/api/tags/${encodeURIComponent(id)}`, { method: "DELETE" }); }
+  async updateDocumentTags(update: DocumentTagUpdate): Promise<void> { await this.ok("/api/documents/tags", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(update) }); }
+  async listSmartCollections(): Promise<SmartCollection[]> { return this.json<SmartCollection[]>("/api/smart-collections"); }
+  async createSmartCollection(collection: NewSmartCollection): Promise<SmartCollection> { return this.json<SmartCollection>("/api/smart-collections", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(collection) }); }
+  async updateSmartCollection(id: string, collection: NewSmartCollection): Promise<SmartCollection> { return this.json<SmartCollection>(`/api/smart-collections/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(collection) }); }
+  async deleteSmartCollection(id: string): Promise<void> { await this.ok(`/api/smart-collections/${encodeURIComponent(id)}`, { method: "DELETE" }); }
+  async validateSmartCollection(expression: string): Promise<CollectionValidation> { return this.json<CollectionValidation>("/api/smart-collections/validate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expression }) }); }
+  async listSearchLog(limit = 100): Promise<SearchLogEntry[]> { return this.json<SearchLogEntry[]>(`/api/search-log?limit=${limit}`); }
+  async deleteSearchLog(id: string): Promise<void> { await this.ok(`/api/search-log/${encodeURIComponent(id)}`, { method: "DELETE" }); }
+  async clearSearchLog(): Promise<void> { await this.ok("/api/search-log", { method: "DELETE" }); }
+
+  private async json<T>(url: string, init?: RequestInit): Promise<T> {
+    const response = await fetch(url, init);
+    if (!response.ok) throw new Error(`${url} failed: ${response.status}`);
+    return response.json() as Promise<T>;
+  }
+
+  private async ok(url: string, init?: RequestInit): Promise<void> {
+    const response = await fetch(url, init);
+    if (!response.ok) throw new Error(`${url} failed: ${response.status}`);
   }
 
   async openFile(path: string): Promise<PreviewData> {

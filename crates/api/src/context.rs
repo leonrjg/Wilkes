@@ -26,14 +26,16 @@ use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
-    Bookmark, DocumentMetadata, EmbedderModel, FileType, IndexStatus, IndexingConfig,
-    MetadataConflictValue, MetadataSourcePreference, NewBookmark, PreviewData, RelatedDocument,
-    RelatedDocumentsQuery, SearchMode, SearchQuery, SearchScope, SelectedEmbedder,
-    SemanticSettings, Settings,
+    Bookmark, CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbedderModel, FileType,
+    IndexStatus, IndexingConfig, MetadataConflictValue, MetadataSourcePreference, NewBookmark,
+    NewSmartCollection, NewTag, PreviewData, RelatedDocument, RelatedDocumentsQuery,
+    SearchLogEntry, SearchMode, SearchQuery, SearchScope, SelectedEmbedder, SemanticSettings,
+    Settings, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 
 use crate::commands::search::{start_search, SearchHandle};
 use crate::commands::settings::{get_settings, update_settings};
+use crate::research::{ResearchStore, SearchLogTracker};
 
 // ── EventEmitter ──────────────────────────────────────────────────────────────
 
@@ -54,12 +56,16 @@ impl wilkes_agent::search::SearchService for AppContext {
         library_roots(&settings).0
     }
 
+    async fn list_smart_collections(self: Arc<Self>) -> Result<Vec<SmartCollection>, String> {
+        self.list_collections().map_err(|e| e.to_string())
+    }
+
     async fn search(
         self: Arc<Self>,
         query: SearchQuery,
         max_files: usize,
     ) -> Result<wilkes_agent::search::CollectedSearch, String> {
-        let handle = self.start_search(query).await?;
+        let handle = self.start_search_as(query, "agent").await?;
         let mut files = Vec::new();
         let mut truncated = false;
         let stats = handle
@@ -220,6 +226,7 @@ pub struct AppContext {
     /// Persistent cache of extracted document metadata, opened lazily. Shared
     /// with the index watcher so renames re-key rather than re-extract.
     metadata_cache: PLMutex<Option<Arc<Mutex<MetadataCache>>>>,
+    research_store: PLMutex<Option<Arc<Mutex<ResearchStore>>>>,
     directory_watcher: PLMutex<Option<DirectoryWatcher>>,
     embed_task: PLMutex<Option<EmbedTaskHandle>>,
     embed_cancel_in_progress: AtomicBool,
@@ -249,6 +256,7 @@ impl AppContext {
             embedder: PLMutex::new(None),
             index: PLMutex::new(Arc::new(Mutex::new(None))),
             metadata_cache: PLMutex::new(None),
+            research_store: PLMutex::new(None),
             directory_watcher: PLMutex::new(None),
             embed_task: PLMutex::new(None),
             embed_cancel_in_progress: AtomicBool::new(false),
@@ -315,7 +323,11 @@ impl AppContext {
     }
 
     pub async fn list_bookmarks(&self) -> anyhow::Result<Vec<Bookmark>> {
-        let mut bookmarks = crate::commands::bookmarks::load(&self.bookmarks_path).await?;
+        let store = self.research_store()?;
+        let mut bookmarks = store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .list_bookmarks()?;
         let settings = self.get_settings().await;
         self.resolve_bookmark_paths(&mut bookmarks, &settings);
         Ok(bookmarks)
@@ -363,12 +375,18 @@ impl AppContext {
 
     pub async fn add_bookmark(&self, bookmark: NewBookmark) -> anyhow::Result<Bookmark> {
         let _guard = self.bookmarks_lock.lock().await;
-        crate::commands::bookmarks::add(&self.bookmarks_path, bookmark).await
+        self.research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .add_bookmark(bookmark)
     }
 
     pub async fn remove_bookmark(&self, id: &str) -> anyhow::Result<()> {
         let _guard = self.bookmarks_lock.lock().await;
-        crate::commands::bookmarks::remove(&self.bookmarks_path, id).await
+        self.research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove_bookmark(id)
     }
 
     pub async fn update_bookmark_note(
@@ -377,16 +395,29 @@ impl AppContext {
         note: Option<String>,
     ) -> anyhow::Result<Bookmark> {
         let _guard = self.bookmarks_lock.lock().await;
-        crate::commands::bookmarks::update_note(&self.bookmarks_path, id, note).await
+        self.research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .update_bookmark_note(id, note)
     }
 
     pub async fn list_files(
         &self,
         root: PathBuf,
     ) -> anyhow::Result<wilkes_core::types::FileListResponse> {
+        self.list_files_filtered(root, None, &[], None).await
+    }
+
+    pub async fn list_files_filtered(
+        &self,
+        root: PathBuf,
+        collection_id: Option<&str>,
+        tag_ids: &[String],
+        collection_expression: Option<&str>,
+    ) -> anyhow::Result<wilkes_core::types::FileListResponse> {
         let s = self.get_settings().await;
         let mut response = crate::commands::files::list_files(
-            root,
+            root.clone(),
             s.supported_extensions.clone(),
             s.max_file_size,
         )
@@ -394,53 +425,224 @@ impl AppContext {
 
         // Populate document metadata from the cache and
         // schedule background extraction for anything not yet cached.
-        let Some(cache) = self.metadata_cache() else {
-            return Ok(response);
-        };
-
         let mut misses: Vec<PathBuf> = Vec::new();
-        let primary_source = metadata_source_preference(&s.primary_metadata_source);
-        if let Ok(guard) = cache.lock() {
-            for entry in response.files.iter_mut() {
-                let Some(identity) = FileIdentity::from_entry(entry) else {
-                    continue;
-                };
-                match guard.get_valid_with_primary(&entry.path, identity, primary_source) {
-                    Ok(Some(cached)) => {
-                        let meta = cached.metadata;
-                        let citation_count = provider_citation_count(&meta);
-                        entry.title = meta.title;
-                        entry.author = meta.author;
-                        entry.publication_date = meta.created_at;
-                        entry.citation_count = citation_count;
-                        entry.metadata_conflicts = cached
-                            .conflicts
-                            .into_iter()
-                            .map(|(key, values)| {
-                                (
-                                    key,
-                                    values
-                                        .into_iter()
-                                        .map(|value| MetadataConflictValue {
-                                            source: value.source,
-                                            value: value.value,
-                                        })
-                                        .collect(),
-                                )
-                            })
-                            .collect();
+        if let Some(cache) = self.metadata_cache() {
+            let primary_source = metadata_source_preference(&s.primary_metadata_source);
+            if let Ok(guard) = cache.lock() {
+                for entry in response.files.iter_mut() {
+                    let Some(identity) = FileIdentity::from_entry(entry) else {
+                        continue;
+                    };
+                    match guard.get_valid_with_primary(&entry.path, identity, primary_source) {
+                        Ok(Some(cached)) => {
+                            let meta = cached.metadata;
+                            let citation_count = provider_citation_count(&meta);
+                            entry.title = meta.title;
+                            entry.author = meta.author;
+                            entry.publication_date = meta.created_at;
+                            entry.citation_count = citation_count;
+                            entry.metadata_conflicts = cached
+                                .conflicts
+                                .into_iter()
+                                .map(|(key, values)| {
+                                    (
+                                        key,
+                                        values
+                                            .into_iter()
+                                            .map(|value| MetadataConflictValue {
+                                                source: value.source,
+                                                value: value.value,
+                                            })
+                                            .collect(),
+                                    )
+                                })
+                                .collect();
+                        }
+                        Ok(None) => misses.push(entry.path.clone()),
+                        Err(e) => error!("metadata cache read {}: {e:#}", entry.path.display()),
                     }
-                    Ok(None) => misses.push(entry.path.clone()),
-                    Err(e) => error!("metadata cache read {}: {e:#}", entry.path.display()),
                 }
+            }
+
+            if !misses.is_empty() {
+                self.spawn_metadata_fill(misses, s.clone(), cache);
             }
         }
 
-        if !misses.is_empty() {
-            self.spawn_metadata_fill(misses, s, cache);
+        let store = self.research_store()?;
+        let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+        store.enrich_files(&mut response.files)?;
+        if !tag_ids.is_empty() {
+            response.files.retain(|entry| {
+                tag_ids
+                    .iter()
+                    .all(|id| entry.tags.iter().any(|tag| tag.id == *id))
+            });
+            response.omitted.retain(|entry| {
+                tag_ids
+                    .iter()
+                    .all(|id| entry.file.tags.iter().any(|tag| tag.id == *id))
+            });
+        }
+        if let Some(collection_id) = collection_id {
+            let eligible = store.eligible_paths(collection_id, &root, &response.files)?;
+            response
+                .files
+                .retain(|entry| eligible.contains(&entry.path));
+            response
+                .omitted
+                .retain(|entry| eligible.contains(&entry.file.path));
+        }
+        if let Some(expression) = collection_expression.filter(|value| !value.trim().is_empty()) {
+            let eligible =
+                store.eligible_paths_for_expression(expression, &root, &response.files)?;
+            response
+                .files
+                .retain(|entry| eligible.contains(&entry.path));
+            response
+                .omitted
+                .retain(|entry| eligible.contains(&entry.file.path));
         }
 
         Ok(response)
+    }
+
+    fn research_store(&self) -> anyhow::Result<Arc<Mutex<ResearchStore>>> {
+        let mut guard = self.research_store.lock();
+        if let Some(store) = guard.as_ref() {
+            return Ok(Arc::clone(store));
+        }
+        let store = Arc::new(Mutex::new(ResearchStore::open(
+            &self.data_dir,
+            &self.bookmarks_path,
+        )?));
+        *guard = Some(Arc::clone(&store));
+        Ok(store)
+    }
+
+    pub fn list_tags(&self) -> anyhow::Result<Vec<Tag>> {
+        self.research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .list_tags()
+    }
+
+    pub fn create_tag(&self, new: NewTag) -> anyhow::Result<Tag> {
+        let tag = self
+            .research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .create_tag(new)?;
+        self.events
+            .emit("research-state-updated", serde_json::json!({"kind":"tags"}));
+        Ok(tag)
+    }
+
+    pub fn update_tag(&self, id: &str, update: UpdateTag) -> anyhow::Result<Tag> {
+        let tag = self
+            .research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .update_tag(id, update)?;
+        self.events
+            .emit("research-state-updated", serde_json::json!({"kind":"tags"}));
+        Ok(tag)
+    }
+
+    pub fn delete_tag(&self, id: &str) -> anyhow::Result<()> {
+        self.research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .delete_tag(id)?;
+        self.events
+            .emit("research-state-updated", serde_json::json!({"kind":"tags"}));
+        Ok(())
+    }
+
+    pub fn update_document_tags(&self, update: DocumentTagUpdate) -> anyhow::Result<()> {
+        self.research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .update_document_tags(update)?;
+        self.events.emit(
+            "research-state-updated",
+            serde_json::json!({"kind":"document_tags"}),
+        );
+        Ok(())
+    }
+
+    pub fn validate_collection(&self, expression: &str) -> CollectionValidation {
+        ResearchStore::validate_collection(expression)
+    }
+
+    pub fn list_collections(&self) -> anyhow::Result<Vec<SmartCollection>> {
+        self.research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .list_collections()
+    }
+
+    pub fn create_collection(&self, new: NewSmartCollection) -> anyhow::Result<SmartCollection> {
+        let item = self
+            .research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .create_collection(new)?;
+        self.events.emit(
+            "research-state-updated",
+            serde_json::json!({"kind":"collections"}),
+        );
+        Ok(item)
+    }
+
+    pub fn update_collection(
+        &self,
+        id: &str,
+        update: UpdateSmartCollection,
+    ) -> anyhow::Result<SmartCollection> {
+        let item = self
+            .research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .update_collection(id, update)?;
+        self.events.emit(
+            "research-state-updated",
+            serde_json::json!({"kind":"collections"}),
+        );
+        Ok(item)
+    }
+
+    pub fn delete_collection(&self, id: &str) -> anyhow::Result<()> {
+        self.research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .delete_collection(id)?;
+        self.events.emit(
+            "research-state-updated",
+            serde_json::json!({"kind":"collections"}),
+        );
+        Ok(())
+    }
+
+    pub fn list_search_log(&self, limit: usize) -> anyhow::Result<Vec<SearchLogEntry>> {
+        self.research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .list_search_log(limit)
+    }
+
+    pub fn delete_search_log(&self, id: &str) -> anyhow::Result<()> {
+        self.research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .delete_search_log(id)
+    }
+
+    pub fn clear_search_log(&self) -> anyhow::Result<()> {
+        self.research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear_search_log()
     }
 
     /// Lazily open (once) the shared document-metadata cache. Returns `None` if
@@ -657,7 +859,17 @@ impl AppContext {
         if !is_under(&path, &self.data_dir) {
             anyhow::bail!("Access denied: path outside data directory");
         }
-        crate::commands::files::rename_file(path, new_name).await
+        let old = path.clone();
+        let new = crate::commands::files::rename_file(path, new_name).await?;
+        self.rekey_research_path(&old, &new)?;
+        Ok(new)
+    }
+
+    pub fn rekey_research_path(&self, old: &Path, new: &Path) -> anyhow::Result<()> {
+        self.research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .rekey_document(old, new)
     }
 
     pub async fn import_files_into_current_root(
@@ -1422,9 +1634,14 @@ impl AppContext {
 
     /// Resolve semantic state (if needed) and start the search. Handles both
     /// Grep and Semantic modes; callers do not branch on mode.
-    pub async fn start_search(
+    pub async fn start_search(self: Arc<Self>, query: SearchQuery) -> Result<SearchHandle, String> {
+        self.start_search_as(query, "app").await
+    }
+
+    pub async fn start_search_as(
         self: Arc<Self>,
         mut query: SearchQuery,
+        initiated_by: &str,
     ) -> Result<SearchHandle, String> {
         let settings = self.settings().await;
         let (resolved_library_roots, library_root_errors) = library_roots(&settings);
@@ -1433,6 +1650,30 @@ impl AppContext {
             settings.supported_extensions.clone(),
             &resolved_library_roots,
         )?;
+
+        let eligibility_roots = match &query.scope {
+            SearchScope::All => resolved_library_roots.clone(),
+            SearchScope::File { path } => resolved_library_roots
+                .iter()
+                .filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.components().count())
+                .cloned()
+                .map(|root| vec![root])
+                .unwrap_or_else(|| vec![query.root.clone()]),
+            SearchScope::Corpus => vec![query.root.clone()],
+        };
+        let eligible_paths = if query.collection_id.is_some() || !query.tag_ids.is_empty() {
+            Some(
+                self.eligible_paths_for_filters(
+                    query.collection_id.as_deref(),
+                    &query.tag_ids,
+                    &eligibility_roots,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
         let mut semantic_indexing = None;
         let (all_roots, all_root_errors) = if query.scope == SearchScope::All {
@@ -1453,6 +1694,16 @@ impl AppContext {
             (None, None)
         };
 
+        let log = {
+            let store = self.research_store().map_err(|e| e.to_string())?;
+            let id = store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .start_search_log(&query, initiated_by)
+                .map_err(|e| e.to_string())?;
+            Some(SearchLogTracker::new(store, id))
+        };
+
         Ok(start_search(
             query,
             all_roots,
@@ -1460,7 +1711,54 @@ impl AppContext {
             embedder,
             index,
             semantic_indexing,
+            eligible_paths,
+            log,
         ))
+    }
+
+    async fn eligible_paths_for_collection(
+        &self,
+        collection_id: &str,
+        roots: &[PathBuf],
+    ) -> Result<std::collections::HashSet<PathBuf>, String> {
+        self.eligible_paths_for_filters(Some(collection_id), &[], roots)
+            .await
+    }
+
+    async fn eligible_paths_for_filters(
+        &self,
+        collection_id: Option<&str>,
+        tag_ids: &[String],
+        roots: &[PathBuf],
+    ) -> Result<std::collections::HashSet<PathBuf>, String> {
+        let mut all = std::collections::HashSet::new();
+        for root in roots {
+            let listed = self
+                .list_files(root.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut eligible = listed
+                .files
+                .iter()
+                .filter(|entry| {
+                    tag_ids
+                        .iter()
+                        .all(|id| entry.tags.iter().any(|tag| tag.id == *id))
+                })
+                .map(|entry| entry.path.clone())
+                .collect::<std::collections::HashSet<_>>();
+            if let Some(collection_id) = collection_id {
+                let store = self.research_store().map_err(|e| e.to_string())?;
+                let collection_paths = store
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .eligible_paths(collection_id, root, &listed.files)
+                    .map_err(|e| e.to_string())?;
+                eligible.retain(|path| collection_paths.contains(path));
+            }
+            all.extend(eligible);
+        }
+        Ok(all)
     }
 
     pub async fn related_documents(
@@ -1493,17 +1791,25 @@ impl AppContext {
         } else {
             vec![root.clone()]
         };
+        let eligible_paths = match query.collection_id.as_deref() {
+            Some(collection_id) => Some(
+                self.eligible_paths_for_collection(collection_id, &listing_roots)
+                    .await?,
+            ),
+            None => None,
+        };
         let mut related = tokio::task::spawn_blocking(move || {
             let guard = runtime.index.lock().unwrap_or_else(|p| p.into_inner());
             let idx = guard
                 .as_ref()
                 .ok_or_else(|| "No semantic index found. Build the index first.".to_string())?;
-            idx.related_documents(
+            idx.related_documents_filtered(
                 &query.root,
                 &source_path,
                 limit,
                 &supported_extensions,
                 query.scope == SearchScope::All,
+                eligible_paths.as_ref(),
             )
             .map_err(|e| e.to_string())
         })
@@ -4256,6 +4562,8 @@ exit 0
             mode: SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let handle = ctx.clone().start_search(query).await.unwrap();
@@ -4282,6 +4590,8 @@ exit 0
                 path: PathBuf::from("paper.txt"),
             },
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let prepared = AppContext::prepare_search_query(
@@ -4320,6 +4630,8 @@ exit 0
                 path: other_file.clone(),
             },
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let prepared = AppContext::prepare_search_query(
@@ -4358,6 +4670,8 @@ exit 0
             mode: SearchMode::Grep,
             scope: SearchScope::File { path: outside_file },
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let err = AppContext::prepare_search_query(
@@ -4385,6 +4699,8 @@ exit 0
             mode: SearchMode::Grep,
             scope: SearchScope::Corpus,
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let err = AppContext::prepare_search_query(
@@ -4413,6 +4729,8 @@ exit 0
             mode: SearchMode::Grep,
             scope: SearchScope::Corpus,
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let prepared = AppContext::prepare_search_query(
@@ -4462,6 +4780,8 @@ exit 0
             mode: SearchMode::Semantic,
             scope: Default::default(),
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let res = ctx.clone().start_search(query).await;
@@ -4701,6 +5021,8 @@ exit 0
             context_lines: 0,
             scope: Default::default(),
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let res = ctx.start_search(query).await;
@@ -4759,6 +5081,7 @@ exit 0
                 path: requested_file,
                 scope: SearchScope::Corpus,
                 limit: Some(8),
+                collection_id: None,
             })
             .await
             .unwrap_err();
@@ -4788,6 +5111,7 @@ exit 0
                 path: source,
                 scope: SearchScope::Corpus,
                 limit: None,
+                collection_id: None,
             })
             .await
             .unwrap_err();
@@ -4862,6 +5186,7 @@ exit 0
                 path: source,
                 scope: SearchScope::Corpus,
                 limit: Some(8),
+                collection_id: None,
             })
             .await
             .unwrap();
@@ -5009,6 +5334,8 @@ exit 0
             mode: SearchMode::Semantic,
             scope: Default::default(),
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         // This should trigger a background reindex because root2 != root1
@@ -5093,6 +5420,8 @@ exit 0
             mode: SearchMode::Semantic,
             scope: Default::default(),
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let err = match ctx.clone().start_search(query).await {

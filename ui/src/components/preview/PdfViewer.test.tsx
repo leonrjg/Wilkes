@@ -21,17 +21,25 @@ const { mockVirtualizer } = vi.hoisted(() => ({
 const { mockUsePdfInnerSearch } = vi.hoisted(() => ({
   mockUsePdfInnerSearch: {
     value: {
-      searchInputRef: { current: null },
-      isSearchOpen: false,
-      setIsSearchOpen: vi.fn(),
-      innerQuery: "",
-      setInnerQuery: vi.fn(),
-      innerMatches: [],
-      currentMatchIdx: -1,
+      matches: [] as { page: number; bbox: unknown }[],
       isSearching: false,
-      handleNextMatch: vi.fn(),
-      handlePrevMatch: vi.fn(),
-      handleSearchInputKeyDown: vi.fn(),
+    },
+  },
+}));
+
+const { mockUseDocumentFind } = vi.hoisted(() => ({
+  mockUseDocumentFind: {
+    value: {
+      inputRef: { current: null },
+      isOpen: false,
+      open: vi.fn(),
+      close: vi.fn(),
+      query: "",
+      setQuery: vi.fn(),
+      currentIdx: -1,
+      next: vi.fn(),
+      prev: vi.fn(),
+      onInputKeyDown: vi.fn(),
     },
   },
 }));
@@ -123,6 +131,10 @@ vi.mock("./usePdfInnerSearch", () => ({
   usePdfInnerSearch: vi.fn(() => mockUsePdfInnerSearch.value),
 }));
 
+vi.mock("./useDocumentFind", () => ({
+  useDocumentFind: vi.fn(() => mockUseDocumentFind.value),
+}));
+
 // The outline hook calls pdf.getOutline(), absent from the lightweight `pdf`
 // stub; drive its return value per-test via mockUsePdfOutline.
 const { mockUsePdfOutline } = vi.hoisted(() => ({
@@ -183,17 +195,20 @@ describe("PdfViewer", () => {
       { index: 2, key: "2", start: 1800 },
     ];
     mockUsePdfInnerSearch.value = {
-      searchInputRef: { current: null },
-      isSearchOpen: false,
-      setIsSearchOpen: vi.fn(),
-      innerQuery: "",
-      setInnerQuery: vi.fn(),
-      innerMatches: [],
-      currentMatchIdx: -1,
+      matches: [],
       isSearching: false,
-      handleNextMatch: vi.fn(),
-      handlePrevMatch: vi.fn(),
-      handleSearchInputKeyDown: vi.fn(),
+    };
+    mockUseDocumentFind.value = {
+      inputRef: { current: null },
+      isOpen: false,
+      open: vi.fn(),
+      close: vi.fn(),
+      query: "",
+      setQuery: vi.fn(),
+      currentIdx: -1,
+      next: vi.fn(),
+      prev: vi.fn(),
+      onInputKeyDown: vi.fn(),
     };
     mockUsePdfPageMetrics.value = {
       pageMetrics: [
@@ -230,10 +245,10 @@ describe("PdfViewer", () => {
       await new Promise(resolve => setTimeout(resolve, 10));
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "+" }));
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
     expect(screen.getByText("110%")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "−" }));
+    fireEvent.click(screen.getByRole("button", { name: "Zoom out" }));
     expect(screen.getByText("100%")).toBeInTheDocument();
   });
 
@@ -773,9 +788,9 @@ describe("PdfViewer", () => {
   });
 
   it("does not snap back to the original page when inner search closes", async () => {
-    mockUsePdfInnerSearch.value = {
-      ...mockUsePdfInnerSearch.value,
-      isSearchOpen: true,
+    mockUseDocumentFind.value = {
+      ...mockUseDocumentFind.value,
+      isOpen: true,
     };
 
     const { rerender } = render(<PdfViewer {...defaultProps} />);
@@ -786,9 +801,9 @@ describe("PdfViewer", () => {
 
     expect(mockVirtualizer.scrollToIndex).toHaveBeenCalledTimes(0);
 
-    mockUsePdfInnerSearch.value = {
-      ...mockUsePdfInnerSearch.value,
-      isSearchOpen: false,
+    mockUseDocumentFind.value = {
+      ...mockUseDocumentFind.value,
+      isOpen: false,
     };
 
     rerender(<PdfViewer {...defaultProps} />);

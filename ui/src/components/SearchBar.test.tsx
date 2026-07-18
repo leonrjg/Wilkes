@@ -5,6 +5,7 @@ import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import { api } from "../services";
+import { useResearchStore } from "../stores/useResearchStore";
 
 // Mock the components that might be passed as slots
 const MockSourceSlot = () => <div data-testid="source-slot">Source Slot</div>;
@@ -38,6 +39,16 @@ describe("SearchBar", () => {
       blockedRoot: null,
       indexStatus: null,
       error: null,
+    } as any);
+    useResearchStore.setState({
+      tags: [],
+      collections: [],
+      history: [],
+      selectedCollectionId: null,
+      selectedTagId: null,
+      draftCollectionExpression: null,
+      load: vi.fn().mockResolvedValue(undefined),
+      loadHistory: vi.fn().mockResolvedValue(undefined),
     } as any);
   });
 
@@ -193,6 +204,57 @@ describe("SearchBar", () => {
     );
     expect(ensureCurrentRootIndexed).toHaveBeenCalled();
     expect(searchMock).not.toHaveBeenCalled();
+  });
+
+  it("uses document tags as a normal search filter", () => {
+    const searchMock = vi.fn();
+    useSearchStore.setState({ search: searchMock });
+    useSettingsStore.setState({ refreshFileList: vi.fn().mockResolvedValue(undefined) } as any);
+    useResearchStore.setState({
+      tags: [{ id: "reviewed", name: "Reviewed", color: null }],
+    });
+    render(<SearchBar sourceSlot={<MockSourceSlot />} />);
+    fireEvent.change(screen.getByPlaceholderText("Search…"), { target: { value: "methods" } });
+    act(() => vi.advanceTimersByTime(300));
+    searchMock.mockClear();
+
+    act(() => useResearchStore.setState({ selectedTagId: "reviewed" }));
+
+    expect(searchMock).toHaveBeenCalledWith(
+      expect.objectContaining({ pattern: "methods", tag_ids: ["reviewed"] }),
+    );
+  });
+
+  it("exposes search history beside the normal search input", () => {
+    useResearchStore.setState({
+      history: [{
+        id: "history-1",
+        query: {
+          pattern: "prior query",
+          is_regex: false,
+          case_sensitive: false,
+          root: "/test/dir",
+          max_results: 100,
+          respect_gitignore: true,
+          max_file_size: 0,
+          context_lines: 2,
+          mode: "Grep",
+          scope: { type: "corpus" },
+          supported_extensions: [],
+          collection_id: null,
+          tag_ids: [],
+        },
+        initiated_by: "app",
+        started_at_ms: 1,
+        result_count: 2,
+        status: "completed",
+      }],
+    } as any);
+    render(<SearchBar sourceSlot={<MockSourceSlot />} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Search history" }));
+
+    expect(screen.getByText("prior query")).toBeInTheDocument();
   });
 
   it("does not auto-trigger indexing from stale query state after semantic invalidation", () => {

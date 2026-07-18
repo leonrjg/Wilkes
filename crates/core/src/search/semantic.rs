@@ -37,6 +37,7 @@ impl SearchProvider for SemanticSearchProvider {
         query: &SearchQuery,
         _extractors: &ExtractorRegistry,
         tx: SearchResultTx,
+        eligible_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
     ) -> anyhow::Result<Vec<String>> {
         // 1. Reconcile the index with the current root before returning semantic
         // results. This blocks the first stale search so callers never see known-
@@ -83,7 +84,7 @@ impl SearchProvider for SemanticSearchProvider {
             SearchScope::All => SemanticQueryScope::Corpus,
             SearchScope::File { path } => SemanticQueryScope::File(path),
         };
-        let results = idx.query_scoped(&query_vec, top_k, scope)?;
+        let results = idx.query_scoped_filtered(&query_vec, top_k, scope, eligible_paths)?;
         drop(guard);
 
         // 4. Convert IndexedChunk results into FileMatches / Match.
@@ -218,9 +219,11 @@ mod tests {
             mode: crate::types::SearchMode::Semantic,
             scope: Default::default(),
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
-        let res = provider.search(&query, &ExtractorRegistry::new(), tx);
+        let res = provider.search(&query, &ExtractorRegistry::new(), tx, None);
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("not built yet"));
     }
@@ -278,11 +281,13 @@ mod tests {
             mode: crate::types::SearchMode::Semantic,
             scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let provider_handle = tokio::task::spawn_blocking(move || {
             provider
-                .search(&query, &ExtractorRegistry::new(), tx)
+                .search(&query, &ExtractorRegistry::new(), tx, None)
                 .unwrap();
         });
 
@@ -293,7 +298,7 @@ mod tests {
         provider_handle.await.unwrap();
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].path, path);
+        assert_eq!(results[0].path, std::fs::canonicalize(path).unwrap());
         assert_eq!(results[0].matches.len(), 1);
         assert_eq!(results[0].matches[0].matched_text, "hello world");
     }
@@ -400,11 +405,13 @@ mod tests {
             mode: crate::types::SearchMode::Semantic,
             scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let provider_handle = tokio::task::spawn_blocking(move || {
             provider
-                .search(&query, &ExtractorRegistry::new(), tx)
+                .search(&query, &ExtractorRegistry::new(), tx, None)
                 .unwrap();
         });
 
@@ -415,8 +422,8 @@ mod tests {
         provider_handle.await.unwrap();
 
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].path, file_a);
-        assert_eq!(results[1].path, file_c);
+        assert_eq!(results[0].path, std::fs::canonicalize(file_a).unwrap());
+        assert_eq!(results[1].path, std::fs::canonicalize(file_c).unwrap());
         assert_eq!(results[0].matches[0].matched_text, "alpha");
         assert_eq!(results[1].matches[0].matched_text, "gamma");
     }

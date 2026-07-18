@@ -38,7 +38,7 @@ pub async fn forward_search_results(
     query: SearchQuery,
     tx: mpsc::Sender<Result<Event, Infallible>>,
 ) {
-    let handle = match Arc::clone(&ctx).start_search(query).await {
+    let handle = match Arc::clone(&ctx).start_search_as(query, "http").await {
         Ok(h) => h,
         Err(e) => {
             let event = Event::default().event("error").data(e);
@@ -124,6 +124,8 @@ mod tests {
             mode: SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         }
     }
 
@@ -133,6 +135,12 @@ mod tests {
         let root = state.uploads_dir.join("docs");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("note.txt"), "hello world").unwrap();
+        wilkes_api::commands::settings::update_settings(
+            &state.ctx.settings_path,
+            serde_json::json!({ "last_directory": root.clone() }),
+        )
+        .await
+        .unwrap();
 
         let (tx, mut rx) = mpsc::channel(16);
         forward_search_results(Arc::clone(&state.ctx), grep_query(root.clone()), tx).await;

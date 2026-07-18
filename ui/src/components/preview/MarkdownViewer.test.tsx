@@ -68,6 +68,34 @@ describe("MarkdownViewer", () => {
     });
   });
 
+  it("zooms the rendered article font size via the controls", () => {
+    render(<MarkdownViewer documentPath="/zoom.md" content="Readable body text" highlightRange={{ start: 0, end: 0 }} />);
+    const article = document.querySelector<HTMLElement>(".prose-document")!;
+    expect(article.style.fontSize).toBe("1rem");
+
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+    expect(article.style.fontSize).toBe("1.1rem");
+
+    fireEvent.click(screen.getByRole("button", { name: "Zoom out" }));
+    fireEvent.click(screen.getByRole("button", { name: "Zoom out" }));
+    expect(article.style.fontSize).toBe("0.9rem");
+  });
+
+  it("restores a document's remembered zoom on reopen", () => {
+    const { rerender } = render(
+      <MarkdownViewer documentPath="/remember.md" content="body" highlightRange={{ start: 0, end: 0 }} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+    expect(document.querySelector<HTMLElement>(".prose-document")!.style.fontSize).toBe("1.1rem");
+
+    // Switch to another document, then back: the remembered zoom returns.
+    rerender(<MarkdownViewer documentPath="/other.md" content="body" highlightRange={{ start: 0, end: 0 }} />);
+    expect(document.querySelector<HTMLElement>(".prose-document")!.style.fontSize).toBe("1rem");
+
+    rerender(<MarkdownViewer documentPath="/remember.md" content="body" highlightRange={{ start: 0, end: 0 }} />);
+    expect(document.querySelector<HTMLElement>(".prose-document")!.style.fontSize).toBe("1.1rem");
+  });
+
   it("maps a rendered selection back to the existing text bookmark shape", () => {
     const onAddBookmark = vi.fn();
     render(

@@ -5,6 +5,10 @@ export type TextViewerMode = "source" | "rendered";
 
 const positions = new Map<string, number>();
 const markdownModes = new Map<string, TextViewerMode>();
+const markdownZooms = new Map<string, number>();
+
+export const MARKDOWN_MIN_ZOOM = 0.6;
+export const MARKDOWN_MAX_ZOOM = 2.5;
 
 function key(path: string, mode: TextViewerMode): string {
   return `${path}\u0000${mode}`;
@@ -24,4 +28,12 @@ export function saveMarkdownViewMode(path: string, mode: TextViewerMode): void {
 
 export function readMarkdownViewMode(path: string): TextViewerMode {
   return markdownModes.get(path) ?? "rendered";
+}
+
+export function saveMarkdownZoom(path: string, zoom: number): void {
+  markdownZooms.set(path, Math.min(Math.max(zoom, MARKDOWN_MIN_ZOOM), MARKDOWN_MAX_ZOOM));
+}
+
+export function readMarkdownZoom(path: string): number {
+  return markdownZooms.get(path) ?? 1;
 }

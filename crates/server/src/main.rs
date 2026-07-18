@@ -28,9 +28,10 @@ use tracing::info;
 use wilkes_api::context::AppContext;
 use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::types::{
-    AddOutcome, CitationResult, DocumentMetadata, EmbeddingEngine, IntegrationStatus, MatchRef,
-    ModelDescriptor, NewBookmark, OpenAlexWork, RelatedDocumentsQuery, SearchQuery,
-    SelectedEmbedder, SemanticScholarPaper,
+    AddOutcome, CitationResult, CollectionValidation, DocumentMetadata, DocumentTagUpdate,
+    EmbeddingEngine, IntegrationStatus, MatchRef, ModelDescriptor, NewBookmark, NewSmartCollection,
+    NewTag, OpenAlexWork, RelatedDocumentsQuery, SearchLogEntry, SearchQuery, SelectedEmbedder,
+    SemanticScholarPaper, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 
 fn confine_to_uploads(
@@ -231,6 +232,160 @@ async fn update_bookmark_note_handler(
     Ok(Json(bookmark))
 }
 
+async fn list_tags_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<Tag>>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .list_tags()
+        .map(Json)
+        .map_err(|e| server_err(e.to_string()))
+}
+
+async fn create_tag_handler(
+    State(state): State<Arc<AppState>>,
+    Json(tag): Json<NewTag>,
+) -> Result<Json<Tag>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .create_tag(tag)
+        .map(Json)
+        .map_err(|e| server_err(e.to_string()))
+}
+
+async fn update_tag_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(tag): Json<UpdateTag>,
+) -> Result<Json<Tag>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .update_tag(&id, tag)
+        .map(Json)
+        .map_err(|e| server_err(e.to_string()))
+}
+
+async fn delete_tag_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .delete_tag(&id)
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_document_tags_handler(
+    State(state): State<Arc<AppState>>,
+    Json(mut update): Json<DocumentTagUpdate>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    update.paths = update
+        .paths
+        .iter()
+        .map(|path| confine_to_uploads(&path.to_string_lossy(), &state.uploads_dir))
+        .collect::<Result<Vec<_>, _>>()?;
+    state
+        .ctx
+        .update_document_tags(update)
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_collections_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<SmartCollection>>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .list_collections()
+        .map(Json)
+        .map_err(|e| server_err(e.to_string()))
+}
+
+async fn create_collection_handler(
+    State(state): State<Arc<AppState>>,
+    Json(collection): Json<NewSmartCollection>,
+) -> Result<Json<SmartCollection>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .create_collection(collection)
+        .map(Json)
+        .map_err(|e| server_err(e.to_string()))
+}
+
+async fn update_collection_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(collection): Json<UpdateSmartCollection>,
+) -> Result<Json<SmartCollection>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .update_collection(&id, collection)
+        .map(Json)
+        .map_err(|e| server_err(e.to_string()))
+}
+
+async fn delete_collection_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .delete_collection(&id)
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct ValidateCollectionBody {
+    expression: String,
+}
+
+async fn validate_collection_handler(
+    Json(body): Json<ValidateCollectionBody>,
+) -> Json<CollectionValidation> {
+    Json(wilkes_api::research::ResearchStore::validate_collection(
+        &body.expression,
+    ))
+}
+
+#[derive(Deserialize)]
+struct SearchLogQuery {
+    limit: Option<usize>,
+}
+
+async fn list_search_log_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SearchLogQuery>,
+) -> Result<Json<Vec<SearchLogEntry>>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .list_search_log(query.limit.unwrap_or(100))
+        .map(Json)
+        .map_err(|e| server_err(e.to_string()))
+}
+
+async fn delete_search_log_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .delete_search_log(&id)
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn clear_search_log_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .clear_search_log()
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn is_semantic_ready_handler(State(state): State<Arc<AppState>>) -> Json<bool> {
     Json(state.ctx.is_semantic_ready())
 }
@@ -240,6 +395,9 @@ async fn is_semantic_ready_handler(State(state): State<Arc<AppState>>) -> Json<b
 #[derive(Deserialize)]
 struct FilesQuery {
     root: String,
+    collection_id: Option<String>,
+    tag_ids: Option<String>,
+    collection_expression: Option<String>,
 }
 
 async fn list_files_handler(
@@ -247,9 +405,25 @@ async fn list_files_handler(
     Query(params): Query<FilesQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     let root = confine_to_uploads(&params.root, &state.uploads_dir)?;
+    let tag_ids = params
+        .tag_ids
+        .as_deref()
+        .map(|value| {
+            value
+                .split(',')
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let files = state
         .ctx
-        .list_files(root)
+        .list_files_filtered(
+            root,
+            params.collection_id.as_deref(),
+            &tag_ids,
+            params.collection_expression.as_deref(),
+        )
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(files))
@@ -910,6 +1084,29 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/bookmarks", post(add_bookmark_handler))
         .route("/api/bookmarks/:id", delete(remove_bookmark_handler))
         .route("/api/bookmarks/:id", patch(update_bookmark_note_handler))
+        .route("/api/tags", get(list_tags_handler).post(create_tag_handler))
+        .route(
+            "/api/tags/:id",
+            patch(update_tag_handler).delete(delete_tag_handler),
+        )
+        .route("/api/documents/tags", patch(update_document_tags_handler))
+        .route(
+            "/api/smart-collections",
+            get(list_collections_handler).post(create_collection_handler),
+        )
+        .route(
+            "/api/smart-collections/validate",
+            post(validate_collection_handler),
+        )
+        .route(
+            "/api/smart-collections/:id",
+            patch(update_collection_handler).delete(delete_collection_handler),
+        )
+        .route(
+            "/api/search-log",
+            get(list_search_log_handler).delete(clear_search_log_handler),
+        )
+        .route("/api/search-log/:id", delete(delete_search_log_handler))
         .route(
             "/api/integrations/zotero/status",
             get(zotero_status_handler),
@@ -1104,6 +1301,9 @@ mod tests {
         // Test list_files_handler
         let params = FilesQuery {
             root: uploads_dir.to_string_lossy().to_string(),
+            collection_id: None,
+            tag_ids: None,
+            collection_expression: None,
         };
         let res = list_files_handler(State(state.clone()), Query(params)).await;
         match res {
@@ -1314,6 +1514,8 @@ mod tests {
             mode: wilkes_core::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let res = search_handler(State(state), axum::Json(query)).await;
@@ -1976,6 +2178,8 @@ mod tests {
             mode: SearchMode::Semantic,
             scope: Default::default(),
             supported_extensions: vec![],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
         let res_semantic = search_handler(State(state.clone()), Json(query_semantic)).await;
         assert!(res_semantic.is_ok());

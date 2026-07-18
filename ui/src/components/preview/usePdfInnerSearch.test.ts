@@ -17,127 +17,50 @@ describe("usePdfInnerSearch", () => {
     getPage: vi.fn().mockResolvedValue(mockPage),
   };
 
-  const scrollToPage = vi.fn();
-
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
   });
 
-  it("initializes with default values", () => {
-    const { result } = renderHook(() => usePdfInnerSearch(null, scrollToPage));
-    expect(result.current.isSearchOpen).toBe(false);
-    expect(result.current.innerQuery).toBe("");
-    expect(result.current.innerMatches).toEqual([]);
+  it("returns no matches without a query", () => {
+    const { result } = renderHook(() => usePdfInnerSearch(mockPdf as any, "", true));
+    expect(result.current.matches).toEqual([]);
+    expect(result.current.isSearching).toBe(false);
   });
 
-  it("opens search on Ctrl+F", async () => {
-    renderHook(() => usePdfInnerSearch(null, scrollToPage));
-    
-    act(() => {
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "f", ctrlKey: true }));
-    });
-    
-    // The focus timeout
-    act(() => {
-      vi.advanceTimersByTime(100);
-    });
-  });
-
-  it("performs search when query and pdf are present", async () => {
-    const { result } = renderHook(() => usePdfInnerSearch(mockPdf as any, scrollToPage));
-    
-    act(() => {
-      result.current.setIsSearchOpen(true);
-      result.current.setInnerQuery("hello");
-    });
-    
-    // Advance timer for debounce
+  it("stays idle while disabled even with a query", async () => {
+    renderHook(() => usePdfInnerSearch(mockPdf as any, "hello", false));
     await act(async () => {
       vi.advanceTimersByTime(300);
     });
-    
+    expect(mockPdf.getPage).not.toHaveBeenCalled();
+  });
+
+  it("scans every page and returns a match per page when enabled", async () => {
+    const { result } = renderHook(() => usePdfInnerSearch(mockPdf as any, "hello", true));
+
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+    });
+
     expect(mockPdf.getPage).toHaveBeenCalledWith(1);
     expect(mockPdf.getPage).toHaveBeenCalledWith(2);
-    expect(result.current.innerMatches.length).toBeGreaterThan(0);
-    expect(scrollToPage).toHaveBeenCalledWith(1);
+    expect(result.current.matches.length).toBe(2);
+    expect(result.current.matches[0].page).toBe(1);
   });
 
-  it("navigates through matches", async () => {
-    const { result } = renderHook(() => usePdfInnerSearch(mockPdf as any, scrollToPage));
-    
-    act(() => {
-      result.current.setIsSearchOpen(true);
-      result.current.setInnerQuery("hello");
-    });
-    
-    await act(async () => {
-      vi.advanceTimersByTime(300);
-    });
-    
-    expect(result.current.currentMatchIdx).toBe(0);
-    
-    act(() => {
-      result.current.handleNextMatch();
-    });
-    expect(result.current.currentMatchIdx).toBe(1); // Second match
-    
-    act(() => {
-      result.current.handleNextMatch();
-    });
-    expect(result.current.currentMatchIdx).toBe(0); // Wrapped around
-    
-    act(() => {
-      result.current.handlePrevMatch();
-    });
-    expect(result.current.currentMatchIdx).toBe(1); // Wrapped backwards
-  });
-
-  it("advances on Enter and goes backward on Shift+Enter", async () => {
-    const { result } = renderHook(() => usePdfInnerSearch(mockPdf as any, scrollToPage));
-
-    act(() => {
-      result.current.setIsSearchOpen(true);
-      result.current.setInnerQuery("hello");
-    });
+  it("clears matches when the query is emptied", async () => {
+    const { result, rerender } = renderHook(
+      ({ query }) => usePdfInnerSearch(mockPdf as any, query, true),
+      { initialProps: { query: "hello" } },
+    );
 
     await act(async () => {
       vi.advanceTimersByTime(300);
     });
+    expect(result.current.matches.length).toBe(2);
 
-    const preventDefault = vi.fn();
-
-    act(() => {
-      result.current.handleSearchInputKeyDown({
-        key: "Enter",
-        shiftKey: false,
-        preventDefault,
-      } as any);
-    });
-    expect(preventDefault).toHaveBeenCalled();
-    expect(result.current.currentMatchIdx).toBe(1);
-
-    act(() => {
-      result.current.handleSearchInputKeyDown({
-        key: "Enter",
-        shiftKey: true,
-        preventDefault: vi.fn(),
-      } as any);
-    });
-    expect(result.current.currentMatchIdx).toBe(0);
-  });
-
-  it("closes search on Escape", () => {
-    const { result } = renderHook(() => usePdfInnerSearch(null, scrollToPage));
-    
-    act(() => {
-      result.current.setIsSearchOpen(true);
-    });
-    expect(result.current.isSearchOpen).toBe(true);
-    
-    act(() => {
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
-    });
-    expect(result.current.isSearchOpen).toBe(false);
+    rerender({ query: "" });
+    expect(result.current.matches).toEqual([]);
   });
 });

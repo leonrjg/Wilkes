@@ -67,6 +67,12 @@ pub struct SearchQuery {
     /// The global list of supported extensions from settings.
     #[serde(default)]
     pub supported_extensions: Vec<String>,
+    /// Optional saved smart collection intersected with `scope` by the backend.
+    #[serde(default)]
+    pub collection_id: Option<String>,
+    /// Optional document tags. A document must contain every requested tag.
+    #[serde(default)]
+    pub tag_ids: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -108,6 +114,94 @@ pub struct RelatedDocumentsQuery {
     pub scope: SearchScope,
     #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub collection_id: Option<String>,
+}
+
+// ── Research state ───────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Tag {
+    pub id: String,
+    pub name: String,
+    pub color: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NewTag {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpdateTag {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DocumentTagUpdate {
+    pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub add_tag_ids: Vec<String>,
+    #[serde(default)]
+    pub remove_tag_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SmartCollection {
+    pub id: String,
+    pub name: String,
+    pub expression: String,
+    pub filter_schema_version: i64,
+    pub revision: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NewSmartCollection {
+    pub name: String,
+    pub expression: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpdateSmartCollection {
+    pub name: String,
+    pub expression: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CollectionValidation {
+    pub valid: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchLogStatus {
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SearchLogEntry {
+    pub id: String,
+    pub query: SearchQuery,
+    pub collection_name: Option<String>,
+    pub collection_revision: Option<i64>,
+    pub initiated_by: String,
+    pub started_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+    pub result_count: usize,
+    pub duration_ms: Option<u64>,
+    pub status: SearchLogStatus,
+    pub error_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1087,6 +1181,8 @@ pub struct FileEntry {
     pub citation_count: Option<i64>,
     #[serde(default)]
     pub metadata_conflicts: HashMap<String, Vec<MetadataConflictValue>>,
+    #[serde(default)]
+    pub tags: Vec<Tag>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

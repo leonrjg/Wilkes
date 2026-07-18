@@ -9,6 +9,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { ToastProvider } from "./Toast";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useResearchStore } from "../stores/useResearchStore";
 import type { FileEntry } from "../lib/types";
 
 const {
@@ -119,11 +120,27 @@ describe("ResultList", () => {
       fileSortDirection: "asc",
       fileDisplayFields: ["size"],
     });
+    useResearchStore.setState({
+      tags: [],
+      collections: [],
+      selectedCollectionId: null,
+      selectedTagId: null,
+      draftCollectionExpression: null,
+      load: vi.fn().mockResolvedValue(undefined),
+    } as any);
   });
 
   it("renders empty state when no query", () => {
     renderWithToasts();
     expect(screen.getByPlaceholderText("Filter files...")).toBeInTheDocument();
+  });
+
+  it("renders document-scope controls above the filename filter", () => {
+    renderWithToasts();
+    const collection = screen.getByRole("combobox", { name: "Smart collection" });
+    const fileFilter = screen.getByPlaceholderText("Filter files...");
+
+    expect(collection.compareDocumentPosition(fileFilter) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("renders omitted files in a muted footer", () => {

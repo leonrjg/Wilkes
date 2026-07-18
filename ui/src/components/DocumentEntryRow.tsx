@@ -1,8 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type React from "react";
-import { Folder, Tag } from "react-feather";
+import { Folder, Tag as TagIcon } from "react-feather";
 import { Tooltip } from "./Tooltip";
-import type { FileType } from "../lib/types";
+import type { FileType, Tag } from "../lib/types";
 
 export type DetailIcon = React.ComponentType<React.SVGProps<SVGSVGElement> & { size?: number }>;
 
@@ -21,6 +21,7 @@ export interface DocumentDetail {
 interface DocumentEntry {
   path: string;
   file_type: FileType;
+  tags?: Tag[];
 }
 
 interface Props {
@@ -30,6 +31,7 @@ interface Props {
   muted?: boolean;
   onClick: () => void;
   onContextMenu?: (event: React.MouseEvent) => void;
+  onTagClick?: (tag: Tag) => void;
 }
 
 export function fileName(path: string): string {
@@ -43,6 +45,7 @@ export function DocumentEntryRow({
   muted = false,
   onClick,
   onContextMenu,
+  onTagClick,
 }: Props) {
   const visibleDetails = details.filter(
     (field) =>
@@ -106,7 +109,7 @@ export function DocumentEntryRow({
               className="inline-flex flex-shrink-0 items-center gap-1 text-xs font-mono tabular-nums text-[var(--accent-blue)]"
               aria-label="Type"
             >
-              <Tag size={11} aria-hidden="true" />
+              <TagIcon size={11} aria-hidden="true" />
               PDF
             </span>
           </Tooltip>
@@ -120,6 +123,26 @@ export function DocumentEntryRow({
           </span>
         </Tooltip>
       </span>
+      {!!entry.tags?.length && (
+        <span className="flex flex-wrap gap-1">
+          {entry.tags.map((tag) => (
+            <span
+              key={tag.id}
+              role={onTagClick ? "button" : undefined}
+              tabIndex={onTagClick ? 0 : undefined}
+              onClick={onTagClick ? (event) => { event.stopPropagation(); onTagClick(tag); } : undefined}
+              onKeyDown={onTagClick ? (event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onTagClick(tag);
+                }
+              } : undefined}
+              className={`rounded-full bg-[var(--accent-blue-muted)] px-1.5 py-0.5 text-[10px] text-[var(--accent-blue)] ${onTagClick ? "hover:ring-1 hover:ring-[var(--accent-blue)]" : ""}`}
+            >{tag.name}</span>
+          ))}
+        </span>
+      )}
       {inlineDetails.length > 0 && (
         <span className="flex w-full min-w-0 items-start gap-1.5 pl-0.5">
           <span

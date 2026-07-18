@@ -25,6 +25,8 @@ import { Tooltip } from "./Tooltip";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useChatStore } from "../stores/useChatStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useResearchStore } from "../stores/useResearchStore";
+import { FileScopeControls } from "./FileScopeControls";
 import { MetadataField } from "../lib/types";
 import type {
   FileDisplayField,
@@ -418,6 +420,9 @@ export default function ResultList({
   const directory = useSettingsStore((s) => s.directory);
   const favorites = useSettingsStore((s) => s.favorites);
   const recentDirs = useSettingsStore((s) => s.recentDirs);
+  const selectedCollectionId = useResearchStore((s) => s.selectedCollectionId);
+  const selectedTagId = useResearchStore((s) => s.selectedTagId);
+  const draftCollectionExpression = useResearchStore((s) => s.draftCollectionExpression);
   const { menu, openMenu, closeMenu } = useContextMenu<ContextMenuTarget>();
 
   const parentRef = useRef<HTMLDivElement>(null);
@@ -432,6 +437,16 @@ export default function ResultList({
     root: string;
     roots: string[];
   } | null>(null);
+  const activeFilterKeyRef = useRef(
+    `${selectedCollectionId ?? ""}|${selectedTagId ?? ""}|${draftCollectionExpression ?? ""}`,
+  );
+
+  useEffect(() => {
+    const key = `${selectedCollectionId ?? ""}|${selectedTagId ?? ""}|${draftCollectionExpression ?? ""}`;
+    if (activeFilterKeyRef.current === key) return;
+    activeFilterKeyRef.current = key;
+    if (!documents && !hasQuery && directory) refreshFileList();
+  }, [selectedCollectionId, selectedTagId, draftCollectionExpression, documents, hasQuery, directory, refreshFileList]);
 
   useEffect(() => {
     if (results.length === 0) setExpandedFiles(new Set());
@@ -701,6 +716,7 @@ export default function ResultList({
             />
           </div>
         )}
+        {!documents && <FileScopeControls matchCount={sortedFileList.length} />}
         <div className="px-2 py-1.5 text-xs text-[var(--text-muted)] border-b border-[var(--border-main)] flex-shrink-0 flex items-center gap-1">
           <Tooltip
             content={
@@ -1191,6 +1207,7 @@ function FileEntryRowAdapter({
       muted={muted}
       onClick={onClick}
       onContextMenu={onContextMenu}
+      onTagClick={(tag) => useResearchStore.getState().setSelectedTag(tag.id)}
     />
   );
 }

@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Search as SearchIcon, ChevronUp, ChevronDown, X, List } from "react-feather";
+import { Search as SearchIcon, List } from "react-feather";
 import { Page, pdfjs } from "react-pdf";
 import type { BoundingBox } from "../../lib/types";
-import { usePdfInnerSearch } from "./usePdfInnerSearch";
+import { usePdfInnerSearch, type InnerMatch } from "./usePdfInnerSearch";
+import { useDocumentFind } from "./useDocumentFind";
+import FindBar from "./FindBar";
+import ZoomControls, { ZOOM_STEP } from "./ZoomControls";
 import { getScaledPageHeight, usePdfPageMetrics } from "./usePdfPageMetrics";
 import PdfTextLayer from "./PdfTextLayer";
 import PdfLinkLayer from "./PdfLinkLayer";
@@ -54,7 +57,6 @@ export interface PdfViewerProps {
 export type PdfSelection = DocumentSelection;
 
 const PAGE_GAP_PX = 12;
-const ZOOM_STEP = 0.1;
 
 // Auto-zoom: bring the dominant body text of a freshly opened document up to
 // the user-configured CSS-pixel height. We only ever enlarge (floor 1.0, so
@@ -486,19 +488,22 @@ export default function PdfViewer({
   }, [pageMetrics, renderedWidth]);
   const domSelection = useDomDocumentSelection({ rootRef, mapSelection: mapPdfSelection });
 
-  const {
-    searchInputRef,
-    isSearchOpen,
-    setIsSearchOpen,
-    innerQuery,
-    setInnerQuery,
-    innerMatches,
-    currentMatchIdx,
-    isSearching,
-    handleNextMatch,
-    handlePrevMatch,
-    handleSearchInputKeyDown,
-  } = usePdfInnerSearch(pdf, scrollToPage);
+  // A mirror of the matcher's output breaks the declaration cycle: the shared
+  // controller needs the match count, while the matcher needs the controller's
+  // query. The controller is declared first against this state, then synced.
+  const [innerMatches, setInnerMatches] = useState<InnerMatch[]>([]);
+  const find = useDocumentFind(innerMatches.length);
+  const { matches, isSearching } = usePdfInnerSearch(pdf, find.query, find.isOpen);
+  const isSearchOpen = find.isOpen;
+  const currentMatchIdx = find.currentIdx;
+
+  useEffect(() => setInnerMatches(matches), [matches]);
+
+  // The controller owns which match is active; bring its page into view.
+  useEffect(() => {
+    const active = innerMatches[currentMatchIdx];
+    if (active) scrollToPage(active.page);
+  }, [currentMatchIdx, innerMatches, scrollToPage]);
 
   useLayoutEffect(() => {
     const el = containerRef.current;
@@ -617,50 +622,7 @@ export default function PdfViewer({
     <div ref={rootRef} className="h-full min-h-0 relative flex flex-col overflow-hidden">
       <div className="absolute bottom-4 right-4 z-20 flex flex-col gap-2 items-end">
         {isSearchOpen && (
-          <div className="bg-[var(--bg-app)] border border-[var(--border-main)] rounded-lg shadow-xl flex items-center p-1 gap-1 animate-in fade-in slide-in-from-bottom-2 duration-200">
-            <div className="relative flex items-center pl-2 text-[var(--text-dim)]">
-              <SearchIcon size={12} />
-              <input
-                ref={searchInputRef}
-                type="text"
-                placeholder="Find in document..."
-                value={innerQuery}
-                onChange={(e) => setInnerQuery(e.target.value)}
-                onKeyDown={handleSearchInputKeyDown}
-                className="bg-transparent border-none outline-none px-2 py-1 text-xs text-[var(--text-main)] placeholder-[var(--text-dim)] w-48"
-              />
-            </div>
-            {innerMatches.length > 0 && (
-              <span className="text-[10px] text-[var(--text-muted)] font-mono px-1">
-                {currentMatchIdx + 1}/{innerMatches.length}
-              </span>
-            )}
-            {isSearching && (
-              <div className="w-3 h-3 border-2 border-[var(--accent-blue)] border-t-transparent rounded-full animate-spin mx-1" />
-            )}
-            <div className="flex border-l border-[var(--border-main)] ml-1 pl-1">
-              <button
-                onClick={handlePrevMatch}
-                disabled={innerMatches.length === 0}
-                className="p-1 hover:bg-[var(--bg-active)] rounded disabled:opacity-30"
-              >
-                <ChevronUp size={14} />
-              </button>
-              <button
-                onClick={handleNextMatch}
-                disabled={innerMatches.length === 0}
-                className="p-1 hover:bg-[var(--bg-active)] rounded disabled:opacity-30"
-              >
-                <ChevronDown size={14} />
-              </button>
-              <button
-                onClick={() => setIsSearchOpen(false)}
-                className="p-1 hover:bg-[var(--bg-active)] rounded text-[var(--text-dim)] hover:text-[var(--accent-red)]"
-              >
-                <X size={14} />
-              </button>
-            </div>
-          </div>
+          <FindBar find={find} matchCount={innerMatches.length} isSearching={isSearching} />
         )}
 
         <div className="flex items-center gap-1 bg-[var(--bg-app)] border border-[var(--border-main)] rounded-lg shadow-lg px-2 py-1 text-xs text-[var(--text-main)]">
@@ -680,10 +642,7 @@ export default function PdfViewer({
           {!isSearchOpen && (
             <Tooltip content="Find in document (Cmd+F)">
               <button
-                onClick={() => {
-                  setIsSearchOpen(true);
-                  setTimeout(() => searchInputRef.current?.focus(), 50);
-                }}
+                onClick={find.open}
                 className="p-1 hover:text-[var(--accent-blue)] transition-colors mr-1 border-r border-[var(--border-main)] pr-2"
               >
                 <SearchIcon size={12} />
@@ -692,23 +651,11 @@ export default function PdfViewer({
           )}
           {numPages && <span className="w-16 text-center font-mono">{currentPage}/{numPages}</span>}
           {numPages && <span className="text-[var(--text-dim)]">|</span>}
-          <button
-            onClick={() =>
-              setZoomKeepingHorizontalCenter((z) => Math.max(0.25, +(z - ZOOM_STEP).toFixed(2)))
-            }
-            className="px-1 hover:text-[var(--accent-blue)]"
-          >
-            −
-          </button>
-          <span className="w-10 text-center font-mono">{Math.round(zoom * 100)}%</span>
-          <button
-            onClick={() =>
-              setZoomKeepingHorizontalCenter((z) => Math.min(3.0, +(z + ZOOM_STEP).toFixed(2)))
-            }
-            className="px-1 hover:text-[var(--accent-blue)]"
-          >
-            +
-          </button>
+          <ZoomControls
+            zoom={zoom}
+            onZoomIn={() => setZoomKeepingHorizontalCenter((z) => Math.min(3.0, +(z + ZOOM_STEP).toFixed(2)))}
+            onZoomOut={() => setZoomKeepingHorizontalCenter((z) => Math.max(0.25, +(z - ZOOM_STEP).toFixed(2)))}
+          />
         </div>
       </div>
 

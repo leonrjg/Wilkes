@@ -3,14 +3,25 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { createPortal } from "react-dom";
 import type { Icon } from "react-feather";
 
-export interface ContextMenuItem {
+interface ContextMenuItemBase {
   id: string;
   label: string;
   icon?: Icon;
   disabled?: boolean;
   dividerBefore?: boolean;
-  run: () => Promise<void> | void;
 }
+
+export type ContextMenuItem = ContextMenuItemBase & (
+  | { run: () => Promise<void> | void; inlineInput?: never }
+  | {
+      run?: never;
+      inlineInput: {
+        placeholder: string;
+        submitLabel: string;
+        submit: (value: string) => Promise<void> | void;
+      };
+    }
+);
 
 interface ContextMenuPosition {
   x: number;
@@ -134,6 +145,70 @@ export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
           const Icon = item.icon;
           const isPending = pendingId === item.id;
           const showIconSlot = menu.size !== "content" || Icon || isPending;
+          const inlineInput = item.inlineInput;
+          if (inlineInput) {
+            return (
+              <div key={item.id}>
+                {item.dividerBefore && (
+                  <div role="separator" className="my-1 border-t border-[var(--border-main)]" />
+                )}
+                <form
+                  role="group"
+                  aria-label={item.label}
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    if (item.disabled || pendingId !== null) return;
+                    const form = event.currentTarget;
+                    const input = form.elements.namedItem("value") as HTMLInputElement;
+                    const value = input.value.trim();
+                    if (!value) return;
+                    let result: Promise<void> | void;
+                    try {
+                      result = inlineInput.submit(value);
+                    } catch (error) {
+                      console.error("context menu action failed", error);
+                      onClose();
+                      return;
+                    }
+                    if (!result || typeof result.then !== "function") {
+                      onClose();
+                      return;
+                    }
+                    setPendingId(item.id);
+                    void result
+                      .catch((error) => console.error("context menu action failed", error))
+                      .finally(() => {
+                        setPendingId(null);
+                        onClose();
+                      });
+                  }}
+                  className="flex items-center gap-2 rounded-md px-3 py-1.5"
+                >
+                  <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center text-[var(--text-muted)]">
+                    {isPending ? (
+                      <span data-testid="context-menu-spinner" className="h-3 w-3 animate-spin rounded-full border-2 border-[var(--text-muted)] border-t-transparent" />
+                    ) : (
+                      Icon && <Icon size={13} aria-hidden="true" />
+                    )}
+                  </span>
+                  <input
+                    name="value"
+                    aria-label={item.label}
+                    placeholder={inlineInput.placeholder}
+                    disabled={item.disabled || pendingId !== null}
+                    className="min-w-28 flex-1 rounded border border-[var(--border-main)] bg-[var(--bg-input)] px-2 py-1 text-xs text-[var(--text-main)] outline-none focus:border-[var(--accent-blue)]"
+                  />
+                  <button
+                    type="submit"
+                    disabled={item.disabled || pendingId !== null}
+                    className="rounded bg-[var(--accent-blue)] px-2 py-1 text-[10px] text-white disabled:opacity-50"
+                  >
+                    {inlineInput.submitLabel}
+                  </button>
+                </form>
+              </div>
+            );
+          }
           return (
             <div key={item.id}>
               {item.dividerBefore && (

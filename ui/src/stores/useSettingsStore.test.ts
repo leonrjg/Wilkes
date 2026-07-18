@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { useSettingsStore } from "./useSettingsStore";
 import { api } from "../services";
+import { useResearchStore } from "./useResearchStore";
 
 vi.mock("../services", () => ({
   api: {
@@ -13,6 +14,7 @@ vi.mock("../services", () => ({
 describe("useSettingsStore", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    useResearchStore.setState({ selectedCollectionId: null, selectedTagId: null, draftCollectionExpression: null });
     useSettingsStore.setState({
       favorites: [],
       recentDirs: [],
@@ -129,6 +131,35 @@ describe("useSettingsStore", () => {
 
     expect(api.listFiles).toHaveBeenCalledWith("/dir");
     expect(useSettingsStore.getState().fileList).toEqual([mockFile]);
+  });
+
+  it("applies the active tag to file listings", async () => {
+    (api.listFiles as any).mockResolvedValue({ files: [], omitted: [] });
+    useResearchStore.setState({ selectedTagId: "reviewed", selectedCollectionId: null });
+    useSettingsStore.setState({ directory: "/dir" });
+
+    await useSettingsStore.getState().refreshFileList();
+
+    expect(api.listFiles).toHaveBeenLastCalledWith("/dir", null, ["reviewed"], null);
+  });
+
+  it("previews an unsaved collection expression through the file-list API", async () => {
+    (api.listFiles as any).mockResolvedValue({ files: [], omitted: [] });
+    useResearchStore.setState({
+      selectedCollectionId: null,
+      selectedTagId: null,
+      draftCollectionExpression: "citation_count > 1",
+    });
+    useSettingsStore.setState({ directory: "/dir" });
+
+    await useSettingsStore.getState().refreshFileList();
+
+    expect(api.listFiles).toHaveBeenLastCalledWith(
+      "/dir",
+      null,
+      [],
+      "citation_count > 1",
+    );
   });
 
   it("should clear file list reactively when directory is removed", async () => {

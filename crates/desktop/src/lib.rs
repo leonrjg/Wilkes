@@ -13,9 +13,11 @@ use wilkes_api::commands::chat::{
 use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
-    AddOutcome, AgentBackend, Bookmark, CitationResult, DataPaths, DocumentMetadata,
-    EmbeddingEngine, FileListResponse, IndexStatus, IntegrationStatus, ModelDescriptor,
-    NewBookmark, OpenAlexWork, SelectedEmbedder, SemanticScholarPaper, Settings,
+    AddOutcome, AgentBackend, Bookmark, CitationResult, CollectionValidation, DataPaths,
+    DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, FileListResponse, IndexStatus,
+    IntegrationStatus, ModelDescriptor, NewBookmark, NewSmartCollection, NewTag, OpenAlexWork,
+    SearchLogEntry, SelectedEmbedder, SemanticScholarPaper, Settings, SmartCollection, Tag,
+    UpdateSmartCollection, UpdateTag,
 };
 
 mod platform;
@@ -40,8 +42,18 @@ fn data_paths_from(app_data: String) -> DataPaths {
 async fn list_files_for_ctx(
     ctx: Arc<AppContext>,
     root: String,
+    collection_id: Option<String>,
+    tag_ids: Vec<String>,
+    collection_expression: Option<String>,
 ) -> Result<FileListResponse, String> {
-    ctx.list_files(root.into()).await.map_err(|e| e.to_string())
+    ctx.list_files_filtered(
+        root.into(),
+        collection_id.as_deref(),
+        &tag_ids,
+        collection_expression.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 async fn open_file_for_ctx(
@@ -51,11 +63,18 @@ async fn open_file_for_ctx(
     ctx.open_file(path.into()).await.map_err(|e| e.to_string())
 }
 
-async fn rename_file_for_path(path: String, new_name: String) -> Result<String, String> {
-    wilkes_api::commands::files::rename_file(path.into(), new_name)
+async fn rename_file_for_path(
+    ctx: Arc<AppContext>,
+    path: String,
+    new_name: String,
+) -> Result<String, String> {
+    let old = PathBuf::from(path);
+    let new = wilkes_api::commands::files::rename_file(old.clone(), new_name)
         .await
-        .map(|path| path.display().to_string())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    ctx.rekey_research_path(&old, &new)
+        .map_err(|e| e.to_string())?;
+    Ok(new.display().to_string())
 }
 
 async fn trash_file_for_path(path: String) -> Result<(), String> {
@@ -97,14 +116,18 @@ async fn move_file_to_root_for_ctx(
     target_root: String,
 ) -> Result<String, String> {
     let supported_extensions = ctx.get_settings().await.supported_extensions;
-    wilkes_api::commands::files::move_files_into_root(
-        vec![path.into()],
+    let old = PathBuf::from(path);
+    let mut moved = wilkes_api::commands::files::move_files_into_root(
+        vec![old.clone()],
         target_root.into(),
         supported_extensions,
     )
     .await
-    .map(|mut moved| moved.pop().unwrap_or_default().display().to_string())
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    let new = moved.pop().unwrap_or_default();
+    ctx.rekey_research_path(&old, &new)
+        .map_err(|e| e.to_string())?;
+    Ok(new.display().to_string())
 }
 
 async fn get_file_metadata_for_path(
@@ -482,7 +505,7 @@ async fn search_for_ctx<E>(
 where
     E: SearchEventSink,
 {
-    let handle = Arc::clone(&ctx).start_search(query).await?;
+    let handle = Arc::clone(&ctx).start_search_as(query, "ui").await?;
 
     let search_id = search_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let id = search_id.clone();
@@ -1026,8 +1049,21 @@ async fn preview(
 }
 
 #[tauri::command]
-async fn list_files(root: String, app: AppHandle) -> Result<FileListResponse, String> {
-    list_files_for_ctx(app_context(&app), root).await
+async fn list_files(
+    root: String,
+    collection_id: Option<String>,
+    tag_ids: Option<Vec<String>>,
+    collection_expression: Option<String>,
+    app: AppHandle,
+) -> Result<FileListResponse, String> {
+    list_files_for_ctx(
+        app_context(&app),
+        root,
+        collection_id,
+        tag_ids.unwrap_or_default(),
+        collection_expression,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1039,8 +1075,8 @@ async fn open_file(
 }
 
 #[tauri::command]
-async fn rename_file(path: String, new_name: String) -> Result<String, String> {
-    rename_file_for_path(path, new_name).await
+async fn rename_file(path: String, new_name: String, app: AppHandle) -> Result<String, String> {
+    rename_file_for_path(app_context(&app), path, new_name).await
 }
 
 #[tauri::command]
@@ -1138,6 +1174,101 @@ async fn update_bookmark_note(
     app: AppHandle,
 ) -> Result<Bookmark, String> {
     update_bookmark_note_for_ctx(app_context(&app), id, note).await
+}
+
+#[tauri::command]
+async fn list_tags(app: AppHandle) -> Result<Vec<Tag>, String> {
+    app_context(&app).list_tags().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn create_tag(tag: NewTag, app: AppHandle) -> Result<Tag, String> {
+    app_context(&app).create_tag(tag).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_tag(id: String, tag: UpdateTag, app: AppHandle) -> Result<Tag, String> {
+    app_context(&app)
+        .update_tag(&id, tag)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_tag(id: String, app: AppHandle) -> Result<(), String> {
+    app_context(&app).delete_tag(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_document_tags(update: DocumentTagUpdate, app: AppHandle) -> Result<(), String> {
+    app_context(&app)
+        .update_document_tags(update)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_smart_collections(app: AppHandle) -> Result<Vec<SmartCollection>, String> {
+    app_context(&app)
+        .list_collections()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn create_smart_collection(
+    collection: NewSmartCollection,
+    app: AppHandle,
+) -> Result<SmartCollection, String> {
+    app_context(&app)
+        .create_collection(collection)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_smart_collection(
+    id: String,
+    collection: UpdateSmartCollection,
+    app: AppHandle,
+) -> Result<SmartCollection, String> {
+    app_context(&app)
+        .update_collection(&id, collection)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_smart_collection(id: String, app: AppHandle) -> Result<(), String> {
+    app_context(&app)
+        .delete_collection(&id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn validate_smart_collection(expression: String) -> Result<CollectionValidation, String> {
+    Ok(wilkes_api::research::ResearchStore::validate_collection(
+        &expression,
+    ))
+}
+
+#[tauri::command]
+async fn list_search_log(
+    limit: Option<usize>,
+    app: AppHandle,
+) -> Result<Vec<SearchLogEntry>, String> {
+    app_context(&app)
+        .list_search_log(limit.unwrap_or(100))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_search_log(id: String, app: AppHandle) -> Result<(), String> {
+    app_context(&app)
+        .delete_search_log(&id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn clear_search_log(app: AppHandle) -> Result<(), String> {
+    app_context(&app)
+        .clear_search_log()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1328,6 +1459,19 @@ pub fn run() {
             add_bookmark,
             remove_bookmark,
             update_bookmark_note,
+            list_tags,
+            create_tag,
+            update_tag,
+            delete_tag,
+            update_document_tags,
+            list_smart_collections,
+            create_smart_collection,
+            update_smart_collection,
+            delete_smart_collection,
+            validate_smart_collection,
+            list_search_log,
+            delete_search_log,
+            clear_search_log,
             zotero_status,
             resolve_file_metadata,
             refresh_file_metadata,
@@ -1445,6 +1589,12 @@ mod tests {
         };
         let active_searches = Arc::new(ActiveSearches(Mutex::new(HashMap::new())));
         let (_ctx_dir, ctx) = test_ctx();
+        wilkes_api::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": root.clone() }),
+        )
+        .await
+        .unwrap();
         let query = wilkes_core::types::SearchQuery {
             pattern: "hello".to_string(),
             is_regex: false,
@@ -1457,6 +1607,8 @@ mod tests {
             mode: wilkes_core::types::SearchMode::Grep,
             scope: Default::default(),
             supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
         };
 
         let search_id = search_for_ctx(
@@ -1605,13 +1757,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_rename_file_for_path_allows_outside_data_dir() {
+        let (_data_dir, ctx) = test_ctx();
         let outside_dir = tempdir().unwrap();
         let outside = outside_dir.path().join("outside.txt");
         std::fs::write(&outside, "hello").unwrap();
 
-        let renamed = rename_file_for_path(outside.display().to_string(), "renamed.txt".into())
-            .await
-            .unwrap();
+        let renamed =
+            rename_file_for_path(ctx, outside.display().to_string(), "renamed.txt".into())
+                .await
+                .unwrap();
 
         let renamed_path = outside_dir.path().join("renamed.txt");
         assert_eq!(renamed, renamed_path.display().to_string());
@@ -1858,11 +2012,62 @@ mod tests {
     async fn test_list_files_for_ctx() {
         let (_dir, ctx) = test_ctx();
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("example.txt"), "hello").unwrap();
-        let files = list_files_for_ctx(ctx, dir.path().display().to_string())
-            .await
-            .unwrap();
+        let path = dir.path().join("example.txt");
+        std::fs::write(&path, "hello").unwrap();
+        let files = list_files_for_ctx(
+            Arc::clone(&ctx),
+            dir.path().display().to_string(),
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
         assert!(!files.files.is_empty());
+
+        let tag = ctx
+            .create_tag(NewTag {
+                name: "Reviewed".into(),
+                color: None,
+            })
+            .unwrap();
+        ctx.update_document_tags(DocumentTagUpdate {
+            paths: vec![path],
+            add_tag_ids: vec![tag.id.clone()],
+            remove_tag_ids: vec![],
+        })
+        .unwrap();
+        let tagged = list_files_for_ctx(
+            Arc::clone(&ctx),
+            dir.path().display().to_string(),
+            None,
+            vec![tag.id],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tagged.files.len(), 1);
+        let unmatched = list_files_for_ctx(
+            Arc::clone(&ctx),
+            dir.path().display().to_string(),
+            None,
+            vec!["missing-tag".into()],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(unmatched.files.is_empty());
+
+        let preview = list_files_for_ctx(
+            ctx,
+            dir.path().display().to_string(),
+            None,
+            vec![],
+            Some("extension == 'txt'".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(preview.files.len(), 1);
     }
 
     #[tokio::test]
