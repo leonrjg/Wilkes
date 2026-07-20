@@ -167,12 +167,23 @@ export default function SettingsModal({
 }: SettingsModalProps) {
   const [activeTab, setActiveTab] = useState<"general" | "chat" | "extensions" | "integrations" | "models" | "chunking" | "data" | "workers" | "logs" | "technical">("general");
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [customInstructionsDraft, setCustomInstructionsDraft] = useState("");
+  const customInstructionsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     if (isOpen) {
-      api.getSettings().then(setSettings).catch(console.error);
+      api.getSettings().then((nextSettings) => {
+        setSettings(nextSettings);
+        setCustomInstructionsDraft(nextSettings.chat_custom_instructions ?? "");
+      }).catch(console.error);
     }
   }, [isOpen, api]);
+
+  useEffect(() => () => {
+    if (customInstructionsSaveTimer.current) {
+      clearTimeout(customInstructionsSaveTimer.current);
+    }
+  }, []);
 
   const handleUpdateSettings = async (patch: Partial<Settings>) => {
     try {
@@ -182,6 +193,25 @@ export default function SettingsModal({
     } catch (e) {
       console.error("Failed to update settings:", e);
     }
+  };
+
+  const persistCustomInstructions = (value: string) => {
+    if (customInstructionsSaveTimer.current) {
+      clearTimeout(customInstructionsSaveTimer.current);
+    }
+    customInstructionsSaveTimer.current = null;
+    void handleUpdateSettings({ chat_custom_instructions: value });
+  };
+
+  const handleCustomInstructionsChange = (value: string) => {
+    setCustomInstructionsDraft(value);
+    if (customInstructionsSaveTimer.current) {
+      clearTimeout(customInstructionsSaveTimer.current);
+    }
+    customInstructionsSaveTimer.current = setTimeout(() => {
+      customInstructionsSaveTimer.current = null;
+      void handleUpdateSettings({ chat_custom_instructions: value });
+    }, 300);
   };
 
   const TabButton = ({ id, label, indent = false }: { id: typeof activeTab; label: string; indent?: boolean }) => (
@@ -389,8 +419,9 @@ export default function SettingsModal({
                         </div>
                         <textarea
                           id="chat-custom-instructions"
-                          value={settings.chat_custom_instructions ?? ""}
-                          onChange={(e) => handleUpdateSettings({ chat_custom_instructions: e.target.value })}
+                          value={customInstructionsDraft}
+                          onChange={(e) => handleCustomInstructionsChange(e.target.value)}
+                          onBlur={(e) => persistCustomInstructions(e.target.value)}
                           placeholder="e.g. Keep answers concise and include page references."
                           rows={5}
                           className="w-full resize-y bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"

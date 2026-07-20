@@ -34,6 +34,18 @@ export const chatApi = {
     return invoke<ChatStartResult>("chat_open_conversation", { conversationId, searchRoot: searchRoot || null });
   },
 
+  forkConversation(
+    conversationId: string,
+    messageId: string,
+    includeMessage: boolean,
+  ): Promise<ChatStartResult> {
+    return invoke<ChatStartResult>("chat_fork_conversation", {
+      conversationId,
+      messageId,
+      includeMessage,
+    });
+  },
+
   forgetConversation(conversationId: string): Promise<void> {
     return invoke("chat_forget_conversation", { conversationId });
   },
@@ -78,6 +90,7 @@ export const chatApi = {
   async send(
     sessionId: string,
     turnId: string,
+    userMessageId: string,
     text: string,
     searchRoot: string | null,
     onUpdate: (update: ChatUpdate) => void,
@@ -92,7 +105,13 @@ export const chatApi = {
       onDone(event.payload);
     });
 
-    return invoke<ChatSendResult>("chat_send", { sessionId, turnId, text, searchRoot });
+    return invoke<ChatSendResult>("chat_send", {
+      sessionId,
+      turnId,
+      userMessageId,
+      text,
+      searchRoot,
+    });
   },
 
   cancel(sessionId: string, turnId: string): Promise<void> {

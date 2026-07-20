@@ -16,7 +16,7 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo, Responder};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use wilkes_core::types::{AgentBackend, IntegrationsSettings};
@@ -27,6 +27,14 @@ use crate::context::{
 use crate::search::SearchService;
 
 const ACTIVE_DOC_CONTEXT_CHAR_LIMIT: usize = 12_000;
+const READ_ACCESS_GUIDANCE: &str = "The user can either move the file to this root, switch to that root, or add it to the context using the right-click menu on the file list";
+
+pub(crate) fn read_access_error(path: &Path) -> String {
+    format!(
+        "{} is not in the current root or this chat's context. {READ_ACCESS_GUIDANCE}",
+        path.display()
+    )
+}
 
 /// One update streamed out of a `ChatSession` while a turn runs, for as long
 /// as the session (not just one turn) is open. `wilkes_api`/`wilkes_desktop`
@@ -106,7 +114,7 @@ pub struct ChatConfigOption {
     pub choices: Vec<ChatConfigChoice>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatLocation {
     pub path: String,
     pub line: Option<u32>,
@@ -134,7 +142,7 @@ type PendingPermissions = Arc<Mutex<HashMap<String, oneshot::Sender<Option<Strin
 /// Image/audio/embedded-resource content blocks are dropped -- out of scope
 /// for a read-only document Q&A pane, and none of the supported backends emit
 /// them for the file-read/search tools this pane actually exercises.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChatToolContent {
     Text {
@@ -150,7 +158,7 @@ pub enum ChatToolContent {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatReplayToolCall {
     pub tool_call_id: String,
     pub title: String,
@@ -161,14 +169,14 @@ pub struct ChatReplayToolCall {
     pub raw_output: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChatReplayContentBlock {
     Text { text: String },
     Tool { tool: ChatReplayToolCall },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatReplayMessage {
     pub role: String,
     pub thought: String,
@@ -212,6 +220,7 @@ struct SharedContextState {
     context_files: Vec<ContextFile>,
     search_root: Option<PathBuf>,
     first_turn_sent: bool,
+    branch_history: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -219,6 +228,7 @@ pub(crate) struct ContextSnapshot {
     pub active_doc: Option<ActiveDoc>,
     pub context_files: Vec<ContextFile>,
     pub root: RootContext,
+    pub branch_history: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -275,6 +285,7 @@ impl ContextStateHandle {
             active_doc: state.active_doc.clone(),
             context_files: state.context_files.clone(),
             root: root_context(state.search_root.as_deref()),
+            branch_history: state.branch_history.clone(),
         }
     }
 
@@ -285,6 +296,7 @@ impl ContextStateHandle {
             active_doc: state.active_doc.clone(),
             context_files: state.context_files.clone(),
             root: root_context(state.search_root.as_deref()),
+            branch_history: state.branch_history.clone(),
         };
         state.first_turn_sent = true;
         for file in state.context_files.iter_mut() {
@@ -306,6 +318,11 @@ impl ContextStateHandle {
         let state = self.state.lock().unwrap();
         state.context_files.iter().any(|f| matches(&f.path))
             || state.active_doc.as_ref().is_some_and(|d| matches(&d.path))
+            || state
+                .search_root
+                .as_deref()
+                .and_then(|root| root.canonicalize().ok())
+                .is_some_and(|root| canonical.starts_with(root))
     }
 }
 
@@ -347,6 +364,10 @@ impl ChatSession {
         &self.backend_session_id
     }
 
+    pub fn set_branch_history(&self, history: Option<String>) {
+        self.state.state.lock().unwrap().branch_history = history;
+    }
+
     /// Send one turn: build the pushed context block (§6.1), prepend it, and
     /// block until the agent's `PromptResponse` resolves. Streamed content
     /// arrives separately through the `ChatEvent` receiver returned by
@@ -374,6 +395,7 @@ impl ChatSession {
             &context.context_files,
             active_doc_text.as_ref(),
             &custom_instructions,
+            context.branch_history.as_deref(),
         );
         let blocks = vec![
             ContentBlock::Text(TextContent::new(context_block)),
@@ -1345,10 +1367,7 @@ fn handle_read(
     request: &ReadTextFileRequest,
 ) -> Result<String, String> {
     if !state.is_allowed(&request.path) {
-        return Err(format!(
-            "{} is not in this chat's context",
-            request.path.display()
-        ));
+        return Err(read_access_error(&request.path));
     }
     crate::reader::read_text(&request.path, None, request.line, request.limit)
         .map_err(|e| e.to_string())

@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use wilkes_core::types::{AgentBackend, ChatBackendConfig, IntegrationsSettings};
 
 pub use wilkes_agent::session::{
-    ChatConfigOption, ChatEvent, ChatReplayMessage, ChatSession, SpawnedChatSession,
+    ChatConfigOption, ChatEvent, ChatReplayContentBlock, ChatReplayMessage, ChatReplayToolCall,
+    ChatSession, SpawnedChatSession,
 };
 
 /// A persisted config selection. Aliases the canonical core type so the
@@ -73,6 +74,25 @@ pub struct ChatActiveDocRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatTurnEnvironmentRecord {
+    pub context_files: Vec<ChatContextFileRecord>,
+    pub active_doc: Option<ChatActiveDocRecord>,
+    pub search_root: Option<String>,
+    pub config_values: Vec<ChatConfigValueRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessageRecord {
+    pub message_id: String,
+    pub turn_id: Option<String>,
+    pub role: String,
+    pub thought: String,
+    pub content: Vec<ChatReplayContentBlock>,
+    pub error: Option<String>,
+    pub environment: Option<ChatTurnEnvironmentRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatConversationRecord {
     pub conversation_id: String,
     pub backend: AgentBackend,
@@ -85,6 +105,10 @@ pub struct ChatConversationRecord {
     pub context_files: Vec<ChatContextFileRecord>,
     pub active_doc: Option<ChatActiveDocRecord>,
     pub config_values: Vec<ChatConfigValueRecord>,
+    pub messages: Vec<ChatMessageRecord>,
+    pub parent_conversation_id: Option<String>,
+    pub forked_from_message_id: Option<String>,
+    pub branch_history_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,7 +120,7 @@ struct ChatConversationFile {
 impl Default for ChatConversationFile {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             conversations: Vec::new(),
         }
     }
@@ -151,6 +175,10 @@ pub fn create_conversation(
         context_files,
         active_doc,
         config_values: config_values_from_options(config_options),
+        messages: Vec::new(),
+        parent_conversation_id: None,
+        forked_from_message_id: None,
+        branch_history_pending: false,
     };
 
     mutate_store(data_dir, |store| store.conversations.push(record.clone()))?;
@@ -228,6 +256,117 @@ pub fn update_conversation_config(
     })
 }
 
+pub fn replace_conversation_messages(
+    data_dir: &Path,
+    conversation_id: &str,
+    messages: Vec<ChatMessageRecord>,
+) -> anyhow::Result<()> {
+    mutate_store(data_dir, |store| {
+        if let Some(record) = store
+            .conversations
+            .iter_mut()
+            .find(|record| record.conversation_id == conversation_id)
+        {
+            record.updated_at = now_string();
+            record.messages = messages;
+        }
+    })
+}
+
+pub fn mark_branch_history_seeded(data_dir: &Path, conversation_id: &str) -> anyhow::Result<()> {
+    mutate_store(data_dir, |store| {
+        if let Some(record) = store
+            .conversations
+            .iter_mut()
+            .find(|record| record.conversation_id == conversation_id)
+        {
+            record.branch_history_pending = false;
+            record.updated_at = now_string();
+        }
+    })
+}
+
+pub fn create_fork_conversation(
+    data_dir: &Path,
+    source_conversation_id: &str,
+    forked_from_message_id: &str,
+    include_message: bool,
+    backend_session_id: String,
+) -> anyhow::Result<ChatConversationRecord> {
+    let source = get_conversation(data_dir, source_conversation_id)?;
+    let index = source
+        .messages
+        .iter()
+        .position(|message| message.message_id == forked_from_message_id)
+        .ok_or_else(|| anyhow::anyhow!("chat message not found: {forked_from_message_id}"))?;
+    let prefix_len = if include_message { index + 1 } else { index };
+    let environment = environment_at_message(&source, forked_from_message_id)?;
+    let now = now_string();
+    let record = ChatConversationRecord {
+        conversation_id: uuid::Uuid::new_v4().to_string(),
+        backend: source.backend,
+        backend_session_id,
+        cwd: source.cwd,
+        title: format!("Fork of {}", source.title),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        last_opened_at: now,
+        context_files: environment.context_files,
+        active_doc: environment.active_doc,
+        config_values: environment.config_values,
+        messages: source.messages[..prefix_len].to_vec(),
+        parent_conversation_id: Some(source_conversation_id.to_string()),
+        forked_from_message_id: Some(forked_from_message_id.to_string()),
+        branch_history_pending: prefix_len > 0,
+    };
+    mutate_store(data_dir, |store| store.conversations.push(record.clone()))?;
+    Ok(record)
+}
+
+pub fn environment_at_message(
+    conversation: &ChatConversationRecord,
+    message_id: &str,
+) -> anyhow::Result<ChatTurnEnvironmentRecord> {
+    let index = conversation
+        .messages
+        .iter()
+        .position(|message| message.message_id == message_id)
+        .ok_or_else(|| anyhow::anyhow!("chat message not found: {message_id}"))?;
+    conversation.messages[..=index]
+        .iter()
+        .rev()
+        .find_map(|message| message.environment.clone())
+        .ok_or_else(|| anyhow::anyhow!("chat message has no turn environment: {message_id}"))
+}
+
+pub fn branch_history_text(messages: &[ChatMessageRecord]) -> String {
+    messages
+        .iter()
+        .filter_map(|message| {
+            let text = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ChatReplayContentBlock::Text { text } => Some(text.as_str()),
+                    ChatReplayContentBlock::Tool { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if text.trim().is_empty() {
+                None
+            } else {
+                let speaker = if message.role == "user" {
+                    "User"
+                } else {
+                    "Assistant"
+                };
+                Some(format!("{speaker}: {text}"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// Spawn a subprocess and complete the ACP handshake for `backend`.
 pub async fn start(
     backend: AgentBackend,
@@ -266,7 +405,13 @@ fn read_store(data_dir: &Path) -> anyhow::Result<ChatConversationFile> {
     if text.trim().is_empty() {
         return Ok(ChatConversationFile::default());
     }
-    Ok(serde_json::from_str(&text)?)
+    let store: ChatConversationFile = serde_json::from_str(&text)?;
+    anyhow::ensure!(
+        store.version == 2,
+        "unsupported chat conversation version: {}",
+        store.version
+    );
+    Ok(store)
 }
 
 fn write_store(data_dir: &Path, store: &ChatConversationFile) -> anyhow::Result<()> {
@@ -531,5 +676,136 @@ mod tests {
         assert_eq!(persisted.context_files.len(), 1);
         assert_eq!(persisted.context_files[0].path, "/tmp/paper.pdf");
         assert_eq!(persisted.active_doc.unwrap().page, Some(5));
+    }
+
+    fn text_message(id: &str, turn: &str, role: &str, text: &str) -> ChatMessageRecord {
+        ChatMessageRecord {
+            message_id: id.to_string(),
+            turn_id: Some(turn.to_string()),
+            role: role.to_string(),
+            thought: "private reasoning is not branch context".to_string(),
+            content: vec![ChatReplayContentBlock::Text {
+                text: text.to_string(),
+            }],
+            error: None,
+            environment: if role == "user" {
+                Some(ChatTurnEnvironmentRecord {
+                    context_files: Vec::new(),
+                    active_doc: None,
+                    search_root: Some("/tmp/original-root".to_string()),
+                    config_values: Vec::new(),
+                })
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn forks_an_immutable_message_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = create_conversation(
+            dir.path(),
+            AgentBackend::Codex,
+            dir.path(),
+            "source-session".to_string(),
+            &[],
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        replace_conversation_messages(
+            dir.path(),
+            &source.conversation_id,
+            vec![
+                text_message("user-1", "turn-1", "user", "Original prompt"),
+                text_message("assistant-1", "turn-1", "assistant", "Original answer"),
+            ],
+        )
+        .unwrap();
+
+        let fork = create_fork_conversation(
+            dir.path(),
+            &source.conversation_id,
+            "assistant-1",
+            true,
+            "fork-session".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(fork.messages.len(), 2);
+        assert_eq!(
+            fork.parent_conversation_id.as_deref(),
+            Some(source.conversation_id.as_str())
+        );
+        assert_eq!(fork.forked_from_message_id.as_deref(), Some("assistant-1"));
+        assert!(fork.branch_history_pending);
+        assert_eq!(
+            get_conversation(dir.path(), &source.conversation_id)
+                .unwrap()
+                .messages
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn edit_prefix_excludes_the_selected_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = create_conversation(
+            dir.path(),
+            AgentBackend::ClaudeCode,
+            dir.path(),
+            "source-session".to_string(),
+            &[],
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let messages = vec![
+            text_message("user-1", "turn-1", "user", "First"),
+            text_message("assistant-1", "turn-1", "assistant", "Answer"),
+            text_message("user-2", "turn-2", "user", "Edit me"),
+        ];
+        replace_conversation_messages(dir.path(), &source.conversation_id, messages).unwrap();
+        update_conversation_context(
+            dir.path(),
+            &source.conversation_id,
+            Some(vec![ChatContextFileRecord {
+                path: "/tmp/added-later.pdf".to_string(),
+                pages: Some(2),
+            }]),
+            None,
+        )
+        .unwrap();
+
+        let fork = create_fork_conversation(
+            dir.path(),
+            &source.conversation_id,
+            "user-2",
+            false,
+            "fork-session".to_string(),
+        )
+        .unwrap();
+        assert_eq!(fork.messages.len(), 2);
+        assert!(fork.context_files.is_empty());
+        let history = branch_history_text(&fork.messages);
+        assert_eq!(history, "User: First\n\nAssistant: Answer");
+        assert!(!history.contains("private reasoning"));
+    }
+
+    #[test]
+    fn rejects_pre_branch_conversation_files_without_migrating_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            conversation_path(dir.path()),
+            r#"{"version":1,"conversations":[]}"#,
+        )
+        .unwrap();
+
+        let error = list_conversations(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("unsupported chat conversation version: 1"));
     }
 }

@@ -597,6 +597,18 @@ export interface ChatReplayMessage {
   content: ChatReplayContentBlock[];
 }
 
+export interface ChatMessageRecord extends ChatReplayMessage {
+  message_id: string;
+  turn_id: string | null;
+  error: string | null;
+  environment: {
+    context_files: ChatContextFileRecord[];
+    active_doc: ChatActiveDocRecord | null;
+    search_root: string | null;
+    config_values: { id: string; value: string }[];
+  } | null;
+}
+
 export interface ChatConversationRecord {
   conversation_id: string;
   backend: AgentBackend;
@@ -609,6 +621,10 @@ export interface ChatConversationRecord {
   context_files: ChatContextFileRecord[];
   active_doc: ChatActiveDocRecord | null;
   config_values: { id: string; value: string }[];
+  messages: ChatMessageRecord[];
+  parent_conversation_id: string | null;
+  forked_from_message_id: string | null;
+  branch_history_pending: boolean;
 }
 
 export interface ChatStartResult {
@@ -616,7 +632,7 @@ export interface ChatStartResult {
   conversation_id: string | null;
   backend_session_id: string | null;
   config_options: ChatConfigOption[];
-  replay_messages: ChatReplayMessage[];
+  messages: ChatMessageRecord[];
   context_files: ChatContextFileRecord[];
   active_doc: ChatActiveDocRecord | null;
 }

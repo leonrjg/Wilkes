@@ -9,6 +9,7 @@ vi.mock("../services/chat", () => ({
     installBackend: vi.fn(),
     start: vi.fn(),
     openConversation: vi.fn(),
+    forkConversation: vi.fn(),
     forgetConversation: vi.fn(),
     setConfigOption: vi.fn(),
     onConfigOptionsUpdated: vi.fn(),
@@ -62,6 +63,9 @@ describe("useChatStore chat timing", () => {
     vi.spyOn(performance, "now").mockReturnValue(1000);
     vi.mocked(chatApi.newTurnId).mockReturnValue("turn-1");
     vi.mocked(chatApi.listConversations).mockResolvedValue([]);
+    vi.mocked(chatApi.close).mockResolvedValue(undefined);
+    vi.mocked(chatApi.onSessionError).mockResolvedValue(() => {});
+    vi.mocked(chatApi.onConfigOptionsUpdated).mockResolvedValue(() => {});
   });
 
   it("starts timing when the assistant turn is created", async () => {
@@ -76,7 +80,7 @@ describe("useChatStore chat timing", () => {
   });
 
   it("coalesces adjacent text deltas but starts a new text block after a tool", async () => {
-    vi.mocked(chatApi.send).mockImplementation(async (_sessionId, _turnId, _text, _searchRoot, onUpdate) => {
+    vi.mocked(chatApi.send).mockImplementation(async (_sessionId, _turnId, _userMessageId, _text, _searchRoot, onUpdate) => {
       onUpdate({ kind: "text", delta: "Before " });
       onUpdate({ kind: "text", delta: "tool." });
       onUpdate({
@@ -104,7 +108,7 @@ describe("useChatStore chat timing", () => {
 
   it("stops timing when the turn reports done", async () => {
     let doneHandler: ((done: { stop_reason: string }) => void) | null = null;
-    vi.mocked(chatApi.send).mockImplementation(async (_sessionId, _turnId, _text, _searchRoot, _onUpdate, onDone) => {
+    vi.mocked(chatApi.send).mockImplementation(async (_sessionId, _turnId, _userMessageId, _text, _searchRoot, _onUpdate, onDone) => {
       doneHandler = onDone;
       return { conversation_id: null };
     });
@@ -123,7 +127,7 @@ describe("useChatStore chat timing", () => {
 
   it("freezes the completed duration when later time passes", async () => {
     let doneHandler: ((done: { stop_reason: string }) => void) | null = null;
-    vi.mocked(chatApi.send).mockImplementation(async (_sessionId, _turnId, _text, _searchRoot, _onUpdate, onDone) => {
+    vi.mocked(chatApi.send).mockImplementation(async (_sessionId, _turnId, _userMessageId, _text, _searchRoot, _onUpdate, onDone) => {
       doneHandler = onDone;
       return { conversation_id: null };
     });
@@ -163,6 +167,10 @@ describe("useChatStore chat timing", () => {
         context_files: [],
         active_doc: null,
         config_values: [],
+        messages: [],
+        parent_conversation_id: null,
+        forked_from_message_id: null,
+        branch_history_pending: false,
       },
     ]);
 
@@ -170,5 +178,101 @@ describe("useChatStore chat timing", () => {
 
     expect(useChatStore.getState().conversationId).toBe("conversation-1");
     expect(useChatStore.getState().conversations).toHaveLength(1);
+  });
+
+  it("edits by forking before the selected user message and sending replacement text", async () => {
+    useChatStore.setState({
+      conversationId: "conversation-1",
+      messages: [
+        {
+          id: "user-1",
+          role: "user",
+          content: [{ kind: "text", text: "Original" }],
+          thought: "",
+          streaming: false,
+          error: null,
+          permissions: [],
+          startedAtMs: null,
+          endedAtMs: null,
+        },
+      ],
+    });
+    vi.mocked(chatApi.forkConversation).mockResolvedValue({
+      session_id: "session-fork",
+      conversation_id: "conversation-fork",
+      backend_session_id: "backend-fork",
+      config_options: [],
+      messages: [],
+      context_files: [],
+      active_doc: null,
+    });
+    vi.mocked(chatApi.send).mockResolvedValue({ conversation_id: "conversation-fork" });
+
+    await useChatStore.getState().editMessage("user-1", "Revised");
+
+    expect(chatApi.forkConversation).toHaveBeenCalledWith(
+      "conversation-1",
+      "user-1",
+      false,
+    );
+    expect(chatApi.send).toHaveBeenCalledWith(
+      "session-fork",
+      "turn-1",
+      expect.any(String),
+      "Revised",
+      null,
+      expect.any(Function),
+      expect.any(Function),
+    );
+    expect(useChatStore.getState().conversationId).toBe("conversation-fork");
+  });
+
+  it("preserves persisted message ids when reopening a conversation", async () => {
+    const persistedMessage = {
+      message_id: "stable-user-id",
+      turn_id: "turn-1",
+      role: "user" as const,
+      thought: "",
+      content: [{ kind: "text" as const, text: "Saved question" }],
+      error: null,
+      environment: {
+        context_files: [],
+        active_doc: null,
+        search_root: null,
+        config_values: [],
+      },
+    };
+    useChatStore.setState({
+      conversations: [{
+        conversation_id: "conversation-1",
+        backend: "ClaudeCode",
+        backend_session_id: "backend-session-1",
+        cwd: "/tmp/workspace",
+        title: "Saved chat",
+        created_at: "2026-07-18T00:00:00Z",
+        updated_at: "2026-07-18T00:00:00Z",
+        last_opened_at: "2026-07-18T00:00:00Z",
+        context_files: [],
+        active_doc: null,
+        config_values: [],
+        messages: [persistedMessage],
+        parent_conversation_id: null,
+        forked_from_message_id: null,
+        branch_history_pending: false,
+      }],
+    });
+    vi.mocked(chatApi.openConversation).mockResolvedValue({
+      session_id: "session-opened",
+      conversation_id: "conversation-1",
+      backend_session_id: "backend-session-1",
+      config_options: [],
+      messages: [persistedMessage],
+      context_files: [],
+      active_doc: null,
+    });
+
+    await useChatStore.getState().openConversation("conversation-1");
+
+    expect(useChatStore.getState().messages[0]?.id).toBe("stable-user-id");
   });
 });

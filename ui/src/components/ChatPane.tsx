@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { elementScroll, useVirtualizer } from "@tanstack/react-virtual";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -7,7 +7,9 @@ import {
   Clock,
   Check, Copy,
   Download,
+  Edit3,
   FileText,
+  GitBranch,
   Loader,
   MapPin,
   Plus,
@@ -101,6 +103,21 @@ export function shouldStickToTranscriptBottom(
   return currentlyStuck || scroll.scrollTop > previousScrollTop;
 }
 
+export function runTranscriptProgrammaticScroll(
+  currentlyStuck: boolean,
+  scroll: () => void,
+) {
+  if (currentlyStuck) scroll();
+}
+
+export function shouldAdjustTranscriptScrollForItemSizeChange(
+  currentlyStuck: boolean,
+  itemStart: number,
+  scrollOffset: number,
+) {
+  return currentlyStuck && itemStart < scrollOffset;
+}
+
 interface Props {
   onClose: () => void;
 }
@@ -142,6 +159,8 @@ export default function ChatPane({ onClose }: Props) {
   const setActiveDoc = useChatStore((s) => s.setActiveDoc);
   const setConfigOption = useChatStore((s) => s.setConfigOption);
   const sendMessage = useChatStore((s) => s.sendMessage);
+  const forkFromMessage = useChatStore((s) => s.forkFromMessage);
+  const editMessage = useChatStore((s) => s.editMessage);
   const cancel = useChatStore((s) => s.cancel);
   const selectMatch = useSearchStore((s) => s.selectMatch);
 
@@ -153,7 +172,26 @@ export default function ChatPane({ onClose }: Props) {
     estimateSize: () => 96,
     overscan: 4,
     measureElement: (el) => el.getBoundingClientRect().height,
+    // scrollToIndex starts a short reconciliation loop. Guard the underlying
+    // writes too, so a reconciliation already in flight cannot pull the user
+    // back down after an upward gesture detaches the transcript.
+    scrollToFn: (offset, options, instance) => {
+      runTranscriptProgrammaticScroll(stickToBottomRef.current, () => {
+        elementScroll(offset, options, instance);
+      });
+    },
   });
+
+  // The virtualizer normally compensates when an item that starts above the
+  // viewport changes height. A streaming reply can itself start above the
+  // viewport, so that compensation moves the transcript down on every chunk.
+  // Once detached, keeping scrollTop unchanged is the intended behavior.
+  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) =>
+    shouldAdjustTranscriptScrollForItemSizeChange(
+      stickToBottomRef.current,
+      item.start,
+      instance.scrollOffset ?? 0,
+    );
 
   useEffect(() => {
     stickToBottomRef.current = true;
@@ -228,7 +266,7 @@ export default function ChatPane({ onClose }: Props) {
     }
     return conversations.slice(0, 12).map((conversation) => ({
       id: conversation.conversation_id,
-      label: `${conversation.conversation_id === conversationId ? "● " : ""}${conversation.title} · ${formatConversationTime(conversation.updated_at)}`,
+      label: `${conversation.conversation_id === conversationId ? "● " : ""}${conversation.parent_conversation_id ? "↳ " : ""}${conversation.title} · ${formatConversationTime(conversation.updated_at)}`,
       run: () => openConversation(conversation.conversation_id),
     }));
   }, [conversations, conversationsLoading, conversationId, openConversation]);
@@ -542,7 +580,22 @@ export default function ChatPane({ onClose }: Props) {
                   }}
                   className="px-3 py-2"
                 >
-                  <MessageBubble message={message} nowMs={nowMs} onNavigate={selectMatch} />
+                  <MessageBubble
+                    message={message}
+                    nowMs={nowMs}
+                    onNavigate={selectMatch}
+                    actionsDisabled={streaming || !conversationId}
+                    onFork={(messageId) =>
+                      forkFromMessage(messageId).catch((error) =>
+                        console.error("chat: fork failed", error),
+                      )
+                    }
+                    onEdit={(messageId, text) =>
+                      editMessage(messageId, text).catch((error) =>
+                        console.error("chat: edit failed", error),
+                      )
+                    }
+                  />
                 </div>
               );
             })}
@@ -608,15 +661,24 @@ export function MessageBubble({
   message,
   nowMs,
   onNavigate,
+  onFork,
+  onEdit,
+  actionsDisabled = false,
 }: {
   message: ChatMessage;
   nowMs: number;
   onNavigate: (matchRef: MatchRef) => void;
+  onFork?: (messageId: string) => void | Promise<void>;
+  onEdit?: (messageId: string, text: string) => void | Promise<void>;
+  actionsDisabled?: boolean;
 }) {
   const isUser = message.role === "user";
   const answerPermission = useChatStore((s) => s.answerPermission);
   const [expandedToolId, setExpandedToolId] = useState<string | null>(null);
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [editText, setEditText] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
   const hasThought = !isUser && message.thought.trim().length > 0;
   const copyText = messageText(message);
   const elapsedLabel = messageElapsedLabel(message, nowMs);
@@ -643,6 +705,35 @@ export function MessageBubble({
             <Copy size={10} />
           </CopyButton>
         </Tooltip>
+        {isUser && onEdit && (
+          <Tooltip content="Edit message in a new fork">
+            <button
+              type="button"
+              aria-label="Edit your message"
+              disabled={actionsDisabled}
+              onClick={() => {
+                setEditText(copyText);
+                setEditing(true);
+              }}
+              className="inline-flex h-4 w-4 items-center justify-center rounded text-[var(--text-dim)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-30"
+            >
+              <Edit3 size={10} />
+            </button>
+          </Tooltip>
+        )}
+        {onFork && (
+          <Tooltip content="Fork conversation from this message">
+            <button
+              type="button"
+              aria-label={`Fork from ${isUser ? "your" : "assistant"} message`}
+              disabled={actionsDisabled || message.streaming}
+              onClick={() => onFork(message.id)}
+              className="inline-flex h-4 w-4 items-center justify-center rounded text-[var(--text-dim)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-30"
+            >
+              <GitBranch size={10} />
+            </button>
+          </Tooltip>
+        )}
       </div>
       <div
         className={`inline-block max-w-full text-left rounded px-2.5 py-1.5 text-xs ${
@@ -708,7 +799,44 @@ export function MessageBubble({
             ))}
           </div>
         )}
-        {isUser ? (
+        {isUser && editing ? (
+          <div className="flex min-w-[260px] flex-col gap-1.5">
+            <textarea
+              aria-label="Edit message text"
+              value={editText}
+              onChange={(event) => setEditText(event.target.value)}
+              rows={Math.max(2, Math.min(8, editText.split("\n").length))}
+              className="w-full resize-y rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2 py-1.5 text-xs outline-none focus:border-[var(--accent-blue)]"
+              autoFocus
+            />
+            <div className="flex justify-end gap-1">
+              <button
+                type="button"
+                onClick={() => setEditing(false)}
+                disabled={savingEdit}
+                className="rounded px-2 py-0.5 text-[10px] text-[var(--text-muted)] hover:bg-[var(--bg-active)]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={savingEdit || !editText.trim()}
+                onClick={async () => {
+                  if (!onEdit || !editText.trim()) return;
+                  setSavingEdit(true);
+                  try {
+                    await onEdit(message.id, editText.trim());
+                  } finally {
+                    setSavingEdit(false);
+                  }
+                }}
+                className="rounded bg-[var(--accent-blue)] px-2 py-0.5 text-[10px] text-white disabled:opacity-40"
+              >
+                Save in fork
+              </button>
+            </div>
+          </div>
+        ) : isUser ? (
           <span className="whitespace-pre-wrap">{copyText}</span>
         ) : (
           <div className="flex flex-col gap-1.5">

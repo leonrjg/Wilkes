@@ -1,10 +1,12 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import ChatPane, {
   contextFileMatchRef,
   isTranscriptNearBottom,
   isTranscriptScrollUpKey,
   MessageBubble,
+  runTranscriptProgrammaticScroll,
+  shouldAdjustTranscriptScrollForItemSizeChange,
   shouldStickToTranscriptBottom,
 } from "./ChatPane";
 import type { ChatMessage } from "../stores/useChatStore";
@@ -19,6 +21,7 @@ vi.mock("../services/chat", () => ({
     installBackend: vi.fn(),
     start: vi.fn(),
     openConversation: vi.fn(),
+    forkConversation: vi.fn(),
     forgetConversation: vi.fn(),
     setConfigOption: vi.fn(),
     onConfigOptionsUpdated: vi.fn().mockResolvedValue(() => {}),
@@ -128,6 +131,43 @@ describe("MessageBubble", () => {
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith("plain user query");
   });
 
+  it("edits a user message into a new fork", async () => {
+    const onEdit = vi.fn().mockResolvedValue(undefined);
+    render(
+      <MessageBubble
+        message={message({
+          role: "user",
+          content: [{ kind: "text", text: "Original question" }],
+        })}
+        nowMs={0}
+        onNavigate={vi.fn()}
+        onEdit={onEdit}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit your message" }));
+    const editor = screen.getByRole("textbox", { name: "Edit message text" });
+    fireEvent.change(editor, { target: { value: "Revised question" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save in fork" }));
+
+    await waitFor(() => expect(onEdit).toHaveBeenCalledWith("message-1", "Revised question"));
+  });
+
+  it("forks from an assistant message", () => {
+    const onFork = vi.fn();
+    render(
+      <MessageBubble
+        message={message({ content: [{ kind: "text", text: "Answer" }] })}
+        nowMs={0}
+        onNavigate={vi.fn()}
+        onFork={onFork}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Fork from assistant message" }));
+    expect(onFork).toHaveBeenCalledWith("message-1");
+  });
+
   it("renders and copies text blocks on opposite sides of a tool in order", () => {
     render(
       <MessageBubble
@@ -217,6 +257,39 @@ describe("shouldStickToTranscriptBottom", () => {
         350,
         false,
       ),
+    ).toBe(false);
+  });
+});
+
+describe("streaming transcript scroll corrections", () => {
+  it("blocks a pending programmatic scroll after the user detaches", () => {
+    const scroll = vi.fn();
+
+    runTranscriptProgrammaticScroll(false, scroll);
+
+    expect(scroll).not.toHaveBeenCalled();
+  });
+
+  it("allows programmatic scrolling while following the bottom", () => {
+    const scroll = vi.fn();
+
+    runTranscriptProgrammaticScroll(true, scroll);
+
+    expect(scroll).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the offset fixed when a streaming item above it grows while detached", () => {
+    expect(
+      shouldAdjustTranscriptScrollForItemSizeChange(false, 300, 500),
+    ).toBe(false);
+  });
+
+  it("retains the virtualizer's normal correction while following the bottom", () => {
+    expect(
+      shouldAdjustTranscriptScrollForItemSizeChange(true, 300, 500),
+    ).toBe(true);
+    expect(
+      shouldAdjustTranscriptScrollForItemSizeChange(true, 600, 500),
     ).toBe(false);
   });
 });

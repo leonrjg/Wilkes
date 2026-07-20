@@ -28,7 +28,7 @@ use crate::{
     context::{ActiveDoc, ContextFile},
     reader,
     search::SearchService,
-    session::ContextStateHandle,
+    session::{read_access_error, ContextStateHandle},
 };
 
 const DEFAULT_TEXT_CHAR_LIMIT: usize = 24_000;
@@ -41,6 +41,7 @@ const DEFAULT_RELATED_DOCUMENTS_LIMIT: usize = 8;
 const MAX_RELATED_DOCUMENTS_LIMIT: usize = 25;
 const DEFAULT_SEARCH_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
+const SEMANTIC_INDEX_GUIDANCE: &str = "The user can enable the semantic index in Wilkes Settings. Use exact search with mode='exact' instead in the meantime.";
 
 /// Names of the read-only tools this server exposes. Shared with the permission
 /// boundary in `session.rs` so calls to Wilkes's *own* MCP server are
@@ -401,7 +402,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Read Wilkes-extracted document text from the active document or a context file. Use page for one PDF page or page_range for an inclusive PDF page range."
+        description = "Read Wilkes-extracted document text from the active document, a context file, or any document in the current root. Use page for one PDF page or page_range for an inclusive PDF page range."
     )]
     fn get_document_text(
         &self,
@@ -702,7 +703,7 @@ fn get_document_text(
         return Err("Pass either page or page_range, not both.".to_string());
     }
     if !context.is_allowed(&path) {
-        return Err(format!("{} is not in this chat's context.", path.display()));
+        return Err(read_access_error(&path));
     }
 
     let page_range = match (params.page, params.page_range) {
@@ -782,7 +783,13 @@ async fn search_documents(
         wilkes_core::types::SearchScope::File { path } => Some(display_path(path)),
     };
     let query_text = query.pattern.clone();
-    let collected = search.search(query, max_files).await?;
+    let collected = search
+        .search(query, max_files)
+        .await
+        .map_err(|message| match mode {
+            SearchModeParam::Semantic => with_semantic_index_guidance(message),
+            SearchModeParam::Exact => message,
+        })?;
 
     Ok(SearchResponse {
         query: query_text,
@@ -846,7 +853,10 @@ async fn get_related_documents(
         ),
         collection_id: params.collection_id,
     };
-    let documents = search.related_documents(query).await?;
+    let documents = search
+        .related_documents(query)
+        .await
+        .map_err(with_semantic_index_guidance)?;
 
     Ok(GetRelatedDocumentsResponse {
         path: display_path(&path),
@@ -858,6 +868,26 @@ async fn get_related_documents(
         },
         documents,
     })
+}
+
+fn with_semantic_index_guidance(message: String) -> String {
+    let lower = message.to_ascii_lowercase();
+    let index_unavailable = [
+        "no semantic index",
+        "semantic index is not ready",
+        "semantic index is currently being built",
+        "semantic index has no searchable documents",
+        "semantic index is not built",
+        "semantic search requires a loaded embedder and built index",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    if index_unavailable {
+        format!("{message} {SEMANTIC_INDEX_GUIDANCE}")
+    } else {
+        message
+    }
 }
 
 fn build_search_query(
@@ -1004,6 +1034,24 @@ mod tests {
         assert!(response.first_files[2].ends_with("03.txt"));
     }
 
+    #[test]
+    fn semantic_index_errors_include_enablement_and_exact_search_guidance() {
+        for message in [
+            "No semantic index found. Build the index first.",
+            "Semantic index is currently being built. Please wait.",
+            "The global semantic index has no searchable documents.",
+        ] {
+            let enriched = with_semantic_index_guidance(message.to_string());
+            assert!(enriched.starts_with(message));
+            assert!(enriched.contains("The user can enable the semantic index"));
+            assert!(enriched.contains("mode='exact'"));
+            assert!(enriched.contains("in the meantime"));
+        }
+
+        let unrelated = "Search root does not exist.".to_string();
+        assert_eq!(with_semantic_index_guidance(unrelated.clone()), unrelated);
+    }
+
     #[async_trait]
     impl SearchService for FakeSearch {
         async fn default_root(self: Arc<Self>) -> Option<PathBuf> {
@@ -1078,14 +1126,40 @@ mod tests {
     }
 
     #[test]
-    fn denies_file_outside_context() {
+    fn reads_document_nested_in_current_root() {
         let dir = tempdir().unwrap();
-        let allowed = dir.path().join("allowed.txt");
-        let denied = dir.path().join("denied.txt");
-        std::fs::write(&allowed, "allowed").unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let path = nested.join("document.txt");
+        std::fs::write(&path, "root document text").unwrap();
+        let context = ContextStateHandle::default();
+        context.set_search_root(Some(dir.path().to_string_lossy().into_owned()));
+
+        let response = get_document_text(
+            &context,
+            GetDocumentTextParams {
+                path: Some(path.to_string_lossy().into_owned()),
+                page: None,
+                page_range: None,
+                max_chars: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.text, "root document text");
+    }
+
+    #[test]
+    fn denies_file_outside_current_root_and_context_with_guidance() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        let sibling = dir.path().join("library-other");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        let denied = sibling.join("denied.txt");
         std::fs::write(&denied, "denied").unwrap();
         let context = ContextStateHandle::default();
-        context.add_context(allowed.to_string_lossy().into_owned(), None);
+        context.set_search_root(Some(root.to_string_lossy().into_owned()));
 
         let err = get_document_text(
             &context,
@@ -1098,7 +1172,42 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("is not in this chat's context"));
+        assert_eq!(
+            err,
+            format!(
+                "{} is not in the current root or this chat's context. The user can either move the file to this root, switch to that root, or add it to the context using the right-click menu on the file list",
+                denied.display()
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denies_symlink_in_current_root_that_resolves_outside_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "outside").unwrap();
+        let link = root.join("linked.txt");
+        symlink(&outside, &link).unwrap();
+        let context = ContextStateHandle::default();
+        context.set_search_root(Some(root.to_string_lossy().into_owned()));
+
+        let err = get_document_text(
+            &context,
+            GetDocumentTextParams {
+                path: Some(link.to_string_lossy().into_owned()),
+                page: None,
+                page_range: None,
+                max_chars: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("The user can either move the file to this root"));
     }
 
     #[test]

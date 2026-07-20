@@ -108,9 +108,41 @@ describe("SettingsModal", () => {
     fireEvent.change(screen.getByLabelText("Custom instructions"), {
       target: { value: "Answer in Spanish." },
     });
+    fireEvent.blur(screen.getByLabelText("Custom instructions"));
     expect(mockApi.updateSettings).toHaveBeenCalledWith({
       chat_custom_instructions: "Answer in Spanish.",
     });
+  });
+
+  it("preserves the custom instructions cursor while persisting an edit", async () => {
+    mockApi.getSettings.mockResolvedValue({
+      ...mockSettings,
+      chat_custom_instructions: "Write concise answers.",
+    });
+    mockApi.updateSettings.mockResolvedValue({
+      ...mockSettings,
+      chat_custom_instructions: "Write very concise answers.",
+    });
+
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+
+    const textarea = screen.getByLabelText("Custom instructions") as HTMLTextAreaElement;
+    vi.useFakeTimers();
+    fireEvent.change(textarea, { target: { value: "Write very concise answers." } });
+    textarea.focus();
+    textarea.setSelectionRange(10, 10);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+
+    expect(textarea).toHaveValue("Write very concise answers.");
+    expect(textarea.selectionStart).toBe(10);
+    expect(textarea.selectionEnd).toBe(10);
+    vi.useRealTimers();
   });
 
   it("switches to JSON and applies changes", async () => {

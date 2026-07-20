@@ -7,7 +7,8 @@ import type {
   ChatConversationRecord,
   ChatConfigOption,
   ChatPermissionOption,
-  ChatReplayMessage,
+  ChatMessageRecord,
+  ChatStartResult,
   ChatToolContentBlock,
   ChatToolLocation,
   ChatUpdate,
@@ -102,6 +103,8 @@ interface ChatStore {
   setActiveDoc: (path: string | null, page?: number | null) => void;
   setConfigOption: (configId: string, value: string) => Promise<void>;
   sendMessage: (text: string) => Promise<void>;
+  forkFromMessage: (messageId: string) => Promise<void>;
+  editMessage: (messageId: string, text: string) => Promise<void>;
   answerPermission: (requestId: string, option: ChatPermissionOption | null) => Promise<void>;
   cancel: () => Promise<void>;
 }
@@ -207,9 +210,9 @@ function setBackendsState(backends: BackendStatus[]) {
   };
 }
 
-function replayMessageToChatMessage(message: ChatReplayMessage): ChatMessage {
+function recordToChatMessage(message: ChatMessageRecord): ChatMessage {
   return {
-    id: randomId(),
+    id: message.message_id,
     role: message.role,
     content: message.content.map((block) => block.kind === "text" ? block : ({
       kind: "tool" as const,
@@ -225,10 +228,50 @@ function replayMessageToChatMessage(message: ChatReplayMessage): ChatMessage {
     })),
     thought: message.thought,
     streaming: false,
-    error: null,
+    error: message.error,
     permissions: [],
     startedAtMs: null,
     endedAtMs: null,
+  };
+}
+
+function messageTextContent(message: ChatMessage): string {
+  return message.content
+    .filter((block): block is Extract<ChatMessageContentBlock, { kind: "text" }> => block.kind === "text")
+    .map((block) => block.text)
+    .join(message.role === "assistant" ? "\n\n" : "");
+}
+
+async function subscribeToSession(sessionId: string) {
+  await Promise.all([
+    chatApi.onSessionError(sessionId, (message) => {
+      if (useChatStore.getState().sessionId === sessionId) {
+        useChatStore.setState({ sessionError: message });
+      }
+    }),
+    chatApi.onConfigOptionsUpdated(sessionId, (options) => {
+      if (useChatStore.getState().sessionId === sessionId) {
+        useChatStore.setState({ configOptions: options });
+      }
+    }),
+  ]);
+}
+
+function startedState(started: ChatStartResult, backend: AgentBackend | null) {
+  return {
+    sessionId: started.session_id,
+    conversationId: started.conversation_id,
+    backendSessionId: started.backend_session_id,
+    backend,
+    messages: started.messages.map(recordToChatMessage),
+    contextFiles: started.context_files,
+    activeDoc: started.active_doc,
+    streaming: false,
+    currentTurnId: null,
+    sessionError: null,
+    configOptions: started.config_options,
+    paneOpen: true,
+    paneOpening: false,
   };
 }
 
@@ -380,17 +423,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       configOptions,
     });
 
-    chatApi
-      .onSessionError(sessionId, (message) => {
-        if (get().sessionId === sessionId) set({ sessionError: message });
-      })
-      .catch((e) => console.error("chat: failed to listen for session errors", e));
-
-    chatApi
-      .onConfigOptionsUpdated(sessionId, (options) => {
-        if (get().sessionId === sessionId) set({ configOptions: options });
-      })
-      .catch((e) => console.error("chat: failed to listen for config updates", e));
+    subscribeToSession(sessionId).catch((e) =>
+      console.error("chat: failed to subscribe to session", e),
+    );
 
     // The conversation resets on a backend switch, but "what am I asking
     // about" is a Wilkes-owned fact independent of which CLI answers it --
@@ -432,32 +467,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         useSettingsStore.getState().directory || null,
       );
       const opened = conversation ?? (await chatApi.listConversations()).find((c) => c.conversation_id === conversationId);
-      set({
-        sessionId: started.session_id,
-        conversationId: started.conversation_id,
-        backendSessionId: started.backend_session_id,
-        backend: opened?.backend ?? get().backend,
-        messages: started.replay_messages.map(replayMessageToChatMessage),
-        contextFiles: started.context_files,
-        activeDoc: started.active_doc,
-        streaming: false,
-        currentTurnId: null,
-        sessionError: null,
-        configOptions: started.config_options,
-        paneOpening: false,
-      });
+      set(startedState(started, opened?.backend ?? get().backend));
 
-      chatApi
-        .onSessionError(started.session_id, (message) => {
-          if (get().sessionId === started.session_id) set({ sessionError: message });
-        })
-        .catch((e) => console.error("chat: failed to listen for session errors", e));
-
-      chatApi
-        .onConfigOptionsUpdated(started.session_id, (options) => {
-          if (get().sessionId === started.session_id) set({ configOptions: options });
-        })
-        .catch((e) => console.error("chat: failed to listen for config updates", e));
+      subscribeToSession(started.session_id).catch((e) =>
+        console.error("chat: failed to subscribe to session", e),
+      );
 
       await get().loadConversations().catch((e) => console.error("chat: failed to load history", e));
     } catch (error) {
@@ -573,6 +587,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const result = await chatApi.send(
         sessionId,
         turnId,
+        userMessage.id,
         text,
         useSettingsStore.getState().directory || null,
         (update) => patchAssistant((m) => applyUpdate(m, update)),
@@ -610,6 +625,63 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       }));
       set({ streaming: false, currentTurnId: null });
     }
+  },
+
+  forkFromMessage: async (messageId) => {
+    const state = get();
+    const sourceConversationId = state.conversationId;
+    const message = state.messages.find((candidate) => candidate.id === messageId);
+    if (!sourceConversationId || !message || state.streaming || !state.backend) return;
+
+    const started = await chatApi.forkConversation(
+      sourceConversationId,
+      messageId,
+      message.role === "assistant",
+    );
+    const previousSessionId = state.sessionId;
+    set(startedState(started, state.backend));
+    if (previousSessionId) {
+      chatApi.close(previousSessionId).catch((e) => console.error("chat: close session failed", e));
+    }
+    subscribeToSession(started.session_id).catch((e) =>
+      console.error("chat: failed to subscribe to forked session", e),
+    );
+    await get().loadConversations().catch((e) =>
+      console.error("chat: failed to refresh fork history", e),
+    );
+    if (message.role === "user") await get().sendMessage(messageTextContent(message));
+  },
+
+  editMessage: async (messageId, text) => {
+    const state = get();
+    const sourceConversationId = state.conversationId;
+    const message = state.messages.find((candidate) => candidate.id === messageId);
+    if (
+      !sourceConversationId
+      || !message
+      || message.role !== "user"
+      || state.streaming
+      || !state.backend
+      || !text.trim()
+    ) return;
+
+    const started = await chatApi.forkConversation(
+      sourceConversationId,
+      messageId,
+      false,
+    );
+    const previousSessionId = state.sessionId;
+    set(startedState(started, state.backend));
+    if (previousSessionId) {
+      chatApi.close(previousSessionId).catch((e) => console.error("chat: close session failed", e));
+    }
+    subscribeToSession(started.session_id).catch((e) =>
+      console.error("chat: failed to subscribe to edited session", e),
+    );
+    await get().loadConversations().catch((e) =>
+      console.error("chat: failed to refresh fork history", e),
+    );
+    await get().sendMessage(text.trim());
   },
 
   answerPermission: async (requestId, option) => {
