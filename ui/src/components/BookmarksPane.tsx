@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Check, Copy, Edit2, FileText, Sidebar, Trash2, X } from "react-feather";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
-import { useSearchStore } from "../stores/useSearchStore";
+import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { toMarkdown } from "../lib/utils/bookmarkMarkdown";
 import { api } from "../services";
@@ -36,8 +36,8 @@ export default function BookmarksPane() {
   const updateNote = useBookmarksStore((s) => s.updateNote);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftNote, setDraftNote] = useState("");
-  const selectedPath = useSearchStore((s) => s.selectedMatch?.path ?? null);
-  const selectMatch = useSearchStore((s) => s.selectMatch);
+  const selectedPath = useViewerStore((state) => activeViewerTab(state)?.path ?? null);
+  const openMatch = useViewerStore((state) => state.openMatch);
   const dock = useSettingsStore((s) => s.bookmarksDock);
   const setDock = useSettingsStore((s) => s.setBookmarksDock);
   const closePane = useBookmarksStore((s) => s.togglePane);
@@ -201,7 +201,7 @@ export default function BookmarksPane() {
                   role="button"
                   tabIndex={0}
                   onClick={() =>
-                    selectMatch({
+                    openMatch({
                       path: bookmark.path,
                       origin: bookmark.origin,
                       text_range: bookmark.text_range,
@@ -209,7 +209,7 @@ export default function BookmarksPane() {
                   }
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
-                      selectMatch({
+                      openMatch({
                         path: bookmark.path,
                         origin: bookmark.origin,
                         text_range: bookmark.text_range,

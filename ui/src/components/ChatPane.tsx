@@ -21,7 +21,7 @@ import {
 } from "react-feather";
 import { useChatStore } from "../stores/useChatStore";
 import type { ChatMessage, ChatToolChip } from "../stores/useChatStore";
-import { useSearchStore } from "../stores/useSearchStore";
+import { useViewerStore } from "../stores/useViewerStore";
 import { useContextMenu, ContextMenu } from "./ContextMenu";
 import { confirmDialog } from "../lib/utils/dialog";
 import type { AgentBackend, MatchRef } from "../lib/types";
@@ -162,7 +162,7 @@ export default function ChatPane({ onClose }: Props) {
   const forkFromMessage = useChatStore((s) => s.forkFromMessage);
   const editMessage = useChatStore((s) => s.editMessage);
   const cancel = useChatStore((s) => s.cancel);
-  const selectMatch = useSearchStore((s) => s.selectMatch);
+  const openMatch = useViewerStore((state) => state.openMatch);
 
   const { menu, openMenu, closeMenu } = useContextMenu<null>();
 
@@ -397,7 +397,7 @@ export default function ChatPane({ onClose }: Props) {
             <Tooltip content={`Open ${activeDoc.path}`} className="font-mono break-all">
               <button
                 type="button"
-                onClick={() => selectMatch(contextFileMatchRef(activeDoc.path, activeDoc.page))}
+                onClick={() => openMatch(contextFileMatchRef(activeDoc.path, activeDoc.page))}
                 className="min-w-0 inline-flex items-center gap-1 rounded text-left hover:text-[var(--accent-blue)]"
               >
                 <FileText size={10} className="flex-shrink-0" />
@@ -447,7 +447,7 @@ export default function ChatPane({ onClose }: Props) {
               <Tooltip content={`Open ${file.path}`} className="font-mono break-all">
                 <button
                   type="button"
-                  onClick={() => selectMatch(contextFileMatchRef(file.path))}
+                  onClick={() => openMatch(contextFileMatchRef(file.path))}
                   className="min-w-0 inline-flex items-center gap-1 rounded text-left hover:text-[var(--accent-blue)]"
                 >
                   <FileText size={10} className="flex-shrink-0" />
@@ -583,7 +583,7 @@ export default function ChatPane({ onClose }: Props) {
                   <MessageBubble
                     message={message}
                     nowMs={nowMs}
-                    onNavigate={selectMatch}
+                    onNavigate={openMatch}
                     actionsDisabled={streaming || !conversationId}
                     onFork={(messageId) =>
                       forkFromMessage(messageId).catch((error) =>

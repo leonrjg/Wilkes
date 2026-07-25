@@ -1,27 +1,13 @@
 import { create } from "zustand";
 import { api } from "../services";
 import { isUsableSemanticIndex } from "../lib/semantic";
-import { useSettingsStore } from "./useSettingsStore";
-import type {
-  DocumentMetadata,
-  FileMatches,
-  MatchRef,
-  PreviewData,
-  SearchQuery,
-  SearchStats,
-  ViewerMetadataStatus,
-} from "../lib/types";
+import type { FileMatches, SearchQuery, SearchStats } from "../lib/types";
 
 interface SearchStore {
   results: FileMatches[];
   stats: SearchStats | null;
   searching: boolean;
   hasQuery: boolean;
-  selectedMatch: MatchRef | null;
-  previewData: PreviewData | null;
-  previewLoading: boolean;
-  viewerMetadata: DocumentMetadata | null;
-  viewerMetadataStatus: ViewerMetadataStatus;
   currentSearchId: string | null;
   lastQuery: SearchQuery | null;
 
@@ -30,8 +16,6 @@ interface SearchStore {
   replaySearch: () => Promise<void>;
   invalidateSemanticResultsForRoot: (root: string) => void;
   setHasQuery: (hasQuery: boolean) => void;
-  selectMatch: (matchRef: MatchRef) => void;
-  clearPreview: () => void;
   clearResults: () => void;
 }
 
@@ -40,11 +24,6 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
   stats: null,
   searching: false,
   hasQuery: false,
-  selectedMatch: null,
-  previewData: null,
-  previewLoading: false,
-  viewerMetadata: null,
-  viewerMetadataStatus: "idle",
   currentSearchId: null,
   lastQuery: null,
 
@@ -54,18 +33,10 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
       await api.cancelSearch(currentSearchId).catch(() => {});
     }
 
-    // Keep existing results visible until the first new result arrives.
-    // Clear selected match/preview immediately since they belong to the old query.
+    // Keep existing results visible until the first new result arrives. Open
+    // viewer tabs are intentionally independent from the search lifecycle.
     const hasStale = results.length > 0;
-    set({
-      stats: null,
-      searching: true,
-      lastQuery: query,
-      selectedMatch: null,
-      previewData: null,
-      viewerMetadata: null,
-      viewerMetadataStatus: "idle",
-    });
+    set({ stats: null, searching: true, lastQuery: query });
     if (!hasStale) set({ results: [] });
 
     let firstResult = true;
@@ -73,38 +44,44 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
     try {
       const searchId = await api.search(
         query,
-        (fm) => {
+        (fileMatches) => {
           if (firstResult) {
             firstResult = false;
-            set({ results: [fm] });
+            set({ results: [fileMatches] });
           } else {
-            set((state) => ({ results: [...state.results, fm] }));
+            set((state) => ({ results: [...state.results, fileMatches] }));
           }
         },
-        (s) => set({ results: firstResult ? [] : get().results, stats: s, searching: false, currentSearchId: null }),
+        (stats) =>
+          set({
+            results: firstResult ? [] : get().results,
+            stats,
+            searching: false,
+            currentSearchId: null,
+          }),
       );
       set({ currentSearchId: searchId });
-    } catch (e: any) {
-      const msg = e?.toString() ?? "Search failed";
-      console.error("Search failed:", e);
+    } catch (error: any) {
+      const message = error?.toString() ?? "Search failed";
+      console.error("Search failed:", error);
       set({
-        stats: { files_scanned: 0, total_matches: 0, elapsed_ms: 0, errors: [msg] },
+        stats: {
+          files_scanned: 0,
+          total_matches: 0,
+          elapsed_ms: 0,
+          errors: [message],
+        },
         searching: false,
       });
     }
   },
 
-  deferSemanticSearch: (query: SearchQuery) =>
+  deferSemanticSearch: (query) =>
     set({
       lastQuery: query,
       stats: null,
       searching: false,
       currentSearchId: null,
-      selectedMatch: null,
-      previewData: null,
-      previewLoading: false,
-      viewerMetadata: null,
-      viewerMetadataStatus: "idle",
     }),
 
   replaySearch: async () => {
@@ -125,12 +102,14 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
     await search(lastQuery);
   },
 
-  setHasQuery: (hasQuery: boolean) => set({ hasQuery }),
+  setHasQuery: (hasQuery) => set({ hasQuery }),
 
-  invalidateSemanticResultsForRoot: (root: string) =>
+  invalidateSemanticResultsForRoot: (root) =>
     set((state) => {
-      if (state.lastQuery?.mode !== "Semantic" ||
-          (state.lastQuery.scope?.type !== "all" && state.lastQuery.root !== root)) {
+      if (
+        state.lastQuery?.mode !== "Semantic" ||
+        (state.lastQuery.scope?.type !== "all" && state.lastQuery.root !== root)
+      ) {
         return {};
       }
       return {
@@ -138,83 +117,8 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
         stats: null,
         searching: false,
         currentSearchId: null,
-        selectedMatch: null,
-        previewData: null,
-        previewLoading: false,
-        viewerMetadata: null,
-        viewerMetadataStatus: "idle",
       };
     }),
 
-  selectMatch: (matchRef: MatchRef) => {
-    const previousPath = get().selectedMatch?.path;
-    const selectedPath = matchRef.path;
-    const sameFile = previousPath === selectedPath;
-    set({
-      selectedMatch: matchRef,
-      previewLoading: true,
-      viewerMetadata: sameFile ? get().viewerMetadata : null,
-      viewerMetadataStatus: sameFile ? get().viewerMetadataStatus : "loading",
-    });
-    api
-      .preview(matchRef)
-      .then((data) => set({ previewData: data, previewLoading: false }))
-      .catch((e) => {
-        console.error("Preview failed:", e);
-        set({ previewData: null, previewLoading: false });
-      });
-
-    if (sameFile) {
-      return;
-    }
-
-    // File-based metadata shows immediately (fast first paint). The backend then
-    // returns the authoritative value — file-based overridden by the Zotero
-    // library record when the file resolves — which the composition owner
-    // decides; the UI just replaces the header with whatever it returns. Only
-    // consulted when Zotero is enabled, since otherwise it equals the fast value.
-    const upgradeAuthoritative = () => {
-      if (!useSettingsStore.getState().settings?.integrations.zotero.enabled) return;
-      api
-        .resolveFileMetadata(selectedPath)
-        .then((metadata) => {
-          if (get().selectedMatch?.path !== selectedPath) return;
-          set({ viewerMetadata: metadata, viewerMetadataStatus: "ready" });
-        })
-        .catch((e) => {
-          // Keep the file-based metadata already shown on any resolve failure.
-          console.debug("Authoritative metadata resolve skipped:", e);
-        });
-    };
-
-    api
-      .getFileMetadata(selectedPath)
-      .then((metadata) => {
-        if (get().selectedMatch?.path !== selectedPath) return;
-        set({ viewerMetadata: metadata, viewerMetadataStatus: "ready" });
-      })
-      .catch((e) => {
-        console.error("Metadata fetch failed:", e);
-        if (get().selectedMatch?.path !== selectedPath) return;
-        set({ viewerMetadata: null, viewerMetadataStatus: "failed" });
-      })
-      .finally(upgradeAuthoritative);
-  },
-
-  clearPreview: () =>
-    set({
-      selectedMatch: null,
-      previewData: null,
-      viewerMetadata: null,
-      viewerMetadataStatus: "idle",
-    }),
-  clearResults: () =>
-    set({
-      results: [],
-      stats: null,
-      selectedMatch: null,
-      previewData: null,
-      viewerMetadata: null,
-      viewerMetadataStatus: "idle",
-    }),
+  clearResults: () => set({ results: [], stats: null }),
 }));

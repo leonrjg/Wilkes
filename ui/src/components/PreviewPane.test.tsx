@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import PreviewPane from "./PreviewPane";
-import { useSearchStore } from "../stores/useSearchStore";
+import { useViewerStore } from "../stores/useViewerStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
@@ -31,8 +31,49 @@ vi.mock("../services", () => ({
     resolvePdfUrl: vi.fn((path: string) => path),
     relatedDocuments: vi.fn(() => Promise.resolve([])),
     listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
+    preview: vi.fn(() => Promise.resolve({
+      Text: {
+        content: "",
+        language: "text",
+        highlight_line: 0,
+        highlight_range: { start: 0, end: 0 },
+      },
+    })),
+    getFileMetadata: vi.fn(() => Promise.resolve(null)),
+    resolveFileMetadata: vi.fn(() => Promise.resolve(null)),
   },
 }));
+
+function setViewerState(state: {
+  selectedMatch?: any;
+  previewData?: any;
+  previewLoading?: boolean;
+  viewerMetadata?: any;
+  viewerMetadataStatus?: any;
+}) {
+  if (!state.selectedMatch) {
+    useViewerStore.setState({ tabs: [], activeTabId: null });
+    return;
+  }
+  const match = state.selectedMatch;
+  useViewerStore.setState({
+    activeTabId: "test-tab",
+    tabs: [
+      {
+        id: "test-tab",
+        path: match.path,
+        match,
+        history: [match],
+        historyIndex: 0,
+        previewData: state.previewData ?? null,
+        previewLoading: state.previewLoading ?? false,
+        metadata: state.viewerMetadata ?? null,
+        metadataStatus: state.viewerMetadataStatus ?? "idle",
+        requestId: 1,
+      },
+    ],
+  });
+}
 
 describe("PreviewPane", () => {
   beforeEach(() => {
@@ -42,13 +83,12 @@ describe("PreviewPane", () => {
       configurable: true,
     });
     vi.stubGlobal("open", vi.fn());
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: null,
       previewData: null,
       previewLoading: false,
       viewerMetadata: null,
       viewerMetadataStatus: "idle",
-      clearPreview: vi.fn(),
     });
     useBookmarksStore.setState({
       bookmarks: [],
@@ -81,7 +121,7 @@ describe("PreviewPane", () => {
       },
     };
 
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: mockMatch,
       previewData: mockPreviewData,
     });
@@ -92,7 +132,7 @@ describe("PreviewPane", () => {
   });
 
   it("defaults Markdown files to rendered and toggles to source with an icon button", () => {
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: { path: "markdown-toggle.md", origin: { TextFile: { line: 1, col: 0 } } },
       previewData: {
         Text: {
@@ -140,7 +180,7 @@ describe("PreviewPane", () => {
 
   it("restores the Markdown view selected for a previously opened document", () => {
     saveMarkdownViewMode("markdown-restored.md", "source");
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: { path: "markdown-restored.md", origin: { TextFile: { line: 0, col: 0 } } },
       previewData: {
         Text: {
@@ -161,7 +201,7 @@ describe("PreviewPane", () => {
   it("uses the bookmark's UTF-8 range for the rendered navigation target", () => {
     const path = "markdown-unicode-bookmark.md";
     saveMarkdownViewMode(path, "rendered");
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: {
         path,
         origin: { TextFile: { line: 1, col: 14 } },
@@ -186,7 +226,7 @@ describe("PreviewPane", () => {
 
   it("passes text bookmark ranges to CodeViewer and persists its normalized selection", async () => {
     const add = vi.fn().mockResolvedValue(undefined);
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: { path: "test.txt", origin: { TextFile: { line: 1, col: 0 } } },
       previewData: {
         Text: {
@@ -238,7 +278,7 @@ describe("PreviewPane", () => {
 
   it("shows a bookmark note from the viewer highlight and deletes the bookmark", async () => {
     const remove = vi.fn().mockResolvedValue(undefined);
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: { path: "test.txt", origin: { TextFile: { line: 1, col: 0 } } },
       previewData: {
         Text: {
@@ -287,7 +327,7 @@ describe("PreviewPane", () => {
   });
 
   it("dismisses bookmark details when clicking outside the card", async () => {
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: { path: "test.txt", origin: { TextFile: { line: 1, col: 0 } } },
       previewData: {
         Text: {
@@ -330,7 +370,7 @@ describe("PreviewPane", () => {
 
   it("renders metadata title and author when available", () => {
     const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: mockMatch,
       previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
       viewerMetadata: { title: "A Better Title", author: "Test Author", doi: null, created_at: null },
@@ -340,13 +380,13 @@ describe("PreviewPane", () => {
     render(<PreviewPane />);
     expect(screen.getByText("A Better Title")).toBeInTheDocument();
     expect(screen.getByText("Test Author")).toBeInTheDocument();
-    expect(screen.queryByText("test.pdf")).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "test.pdf" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Copy path" })).toBeInTheDocument();
   });
 
   it("shortens the header author to 30 characters", () => {
     const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: mockMatch,
       previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
       viewerMetadata: {
@@ -365,7 +405,7 @@ describe("PreviewPane", () => {
 
   it("formats a Zotero MM/YYYY publication date in the header", () => {
     const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: mockMatch,
       previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
       viewerMetadata: { title: "Paper", author: "Tambon et al.", doi: null, created_at: "05/2025" },
@@ -379,7 +419,7 @@ describe("PreviewPane", () => {
 
   it("renders metadata loading placeholder while preserving the path", () => {
     const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: mockMatch,
       previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
       viewerMetadata: null,
@@ -392,7 +432,7 @@ describe("PreviewPane", () => {
   });
 
   it("replaces the displayed path with a copy path action", () => {
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: { path: "/docs/paper.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any,
       previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
       viewerMetadata: { title: "Paper", author: null, doi: null, created_at: null },
@@ -408,7 +448,7 @@ describe("PreviewPane", () => {
 
   it("renders DOI open and copy actions when DOI is available", () => {
     const mockMatch = { path: "paper.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: mockMatch,
       previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
       viewerMetadata: { title: "Paper", author: "Author", doi: "10.1000/xyz123", created_at: null },
@@ -425,7 +465,7 @@ describe("PreviewPane", () => {
 
   it("opens DOI and Google Scholar URLs and copies DOI from header actions", () => {
     const mockMatch = { path: "paper.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: mockMatch,
       previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
       viewerMetadata: { title: "Paper", author: "Author", doi: "10.1000/xyz123", created_at: null },
@@ -454,7 +494,7 @@ describe("PreviewPane", () => {
 
   it("renders Google Scholar action using title when DOI is unavailable", () => {
     const mockMatch = { path: "paper.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: mockMatch,
       previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
       viewerMetadata: { title: "A Title Without DOI", author: "Author", doi: null, created_at: null },
@@ -481,7 +521,7 @@ describe("PreviewPane", () => {
       },
     };
 
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: mockMatch,
       previewData: mockPreviewData,
     });
@@ -492,7 +532,7 @@ describe("PreviewPane", () => {
 
   it("renders created-at month and year in the metadata summary", () => {
     const mockMatch = { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: mockMatch,
       previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
       viewerMetadata: { title: "Paper", author: "Author", doi: null, created_at: "2025-04" },
@@ -508,7 +548,7 @@ describe("PreviewPane", () => {
     // Regression: page/bbox were read from displayData (which could be stale
     // data from a previously viewed file) instead of selectedMatch.origin.
     // This meant PdfViewer could mount with the wrong target page.
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: {
         path: "new-file.pdf",
         origin: { PdfPage: { page: 8, bbox: { x: 1, y: 2, width: 3, height: 4 } } },
@@ -527,7 +567,7 @@ describe("PreviewPane", () => {
   });
 
   it("passes only current-file PDF bookmarks to PdfViewer", () => {
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: {
         path: "current.pdf",
         origin: { PdfPage: { page: 1, bbox: null } },
@@ -580,7 +620,7 @@ describe("PreviewPane", () => {
     // Regression: viewer type was determined by displayData ("Text" in displayData),
     // not by selectedMatch.origin. When coming from a text file, the stale
     // displayData would show CodeViewer instead of PdfViewer.
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: {
         path: "report.pdf",
         origin: { PdfPage: { page: 3, bbox: null } },
@@ -598,23 +638,21 @@ describe("PreviewPane", () => {
     expect(screen.queryByTestId("code-viewer")).not.toBeInTheDocument();
   });
 
-  it("calls clearPreview when close button is clicked", () => {
-    const clearPreviewMock = vi.fn();
-    useSearchStore.setState({
+  it("closes the document from its tab", () => {
+    setViewerState({
       selectedMatch: { path: "test.txt", origin: { TextFile: { line: 1, col: 1 } } } as any,
       previewData: { Text: { content: "", language: null, highlight_line: 1, highlight_range: { start: 0, end: 0 } } } as any,
-      clearPreview: clearPreviewMock,
     });
 
     render(<PreviewPane />);
-    const closeButton = screen.getByRole("button", { name: "Close preview" });
+    const closeButton = screen.getByRole("button", { name: "Close test.txt" });
     fireEvent.click(closeButton);
 
-    expect(clearPreviewMock).toHaveBeenCalled();
+    expect(useViewerStore.getState().tabs).toEqual([]);
+    expect(screen.getByAltText("Wilkes")).toBeInTheDocument();
   });
 
-  it("renders related documents and opens them through the provided navigation", async () => {
-    const onFileOpen = vi.fn();
+  it("renders related documents and opens them in the viewer", async () => {
     (api.relatedDocuments as any).mockResolvedValueOnce([
       {
         path: "/docs/lower-score.txt",
@@ -645,7 +683,7 @@ describe("PreviewPane", () => {
         db_size_bytes: 100,
       },
     } as any);
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: { path: "/docs/source.txt", origin: { TextFile: { line: 1, col: 1 } } } as any,
       previewData: {
         Text: {
@@ -657,7 +695,7 @@ describe("PreviewPane", () => {
       },
     });
 
-    render(<PreviewPane onFileOpen={onFileOpen} />);
+    render(<PreviewPane />);
 
     fireEvent.click(screen.getByRole("button", { name: "Show related documents" }));
     await waitFor(() => expect(screen.getByText("related.txt")).toBeInTheDocument());
@@ -678,9 +716,12 @@ describe("PreviewPane", () => {
     });
 
     fireEvent.click(screen.getByText("related.txt"));
-    expect(onFileOpen).toHaveBeenCalledWith("/docs/related.txt");
+    expect(useViewerStore.getState().tabs).toHaveLength(2);
+    expect(useViewerStore.getState().tabs.find(
+      (tab) => tab.id === useViewerStore.getState().activeTabId,
+    )?.path).toBe("/docs/related.txt");
 
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: {
         path: "/docs/related.txt",
         origin: { TextFile: { line: 1, col: 1 } },
@@ -697,7 +738,7 @@ describe("PreviewPane", () => {
       limit: 8,
     }));
 
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: {
         path: "/docs/normal-navigation.txt",
         origin: { TextFile: { line: 1, col: 1 } },
@@ -737,7 +778,7 @@ describe("PreviewPane", () => {
         db_size_bytes: 100,
       },
     } as any);
-    useSearchStore.setState({
+    setViewerState({
       selectedMatch: { path: "/docs/source.txt", origin: { TextFile: { line: 1, col: 1 } } } as any,
       previewData: {
         Text: {

@@ -110,7 +110,6 @@ describe("ResultList", () => {
       stats: null,
       searching: false,
       hasQuery: false,
-      selectedMatch: null,
     });
     useSettingsStore.setState({
       fileList: [],

@@ -23,6 +23,7 @@ import { useToasts } from "./Toast";
 import { ContextMenu, useContextMenu } from "./ContextMenu";
 import { Tooltip } from "./Tooltip";
 import { useSearchStore } from "../stores/useSearchStore";
+import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useChatStore } from "../stores/useChatStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useResearchStore } from "../stores/useResearchStore";
@@ -401,9 +402,9 @@ export default function ResultList({
   const searching = useSearchStore((s) => s.searching);
   const storeHasQuery = useSearchStore((s) => s.hasQuery);
   const hasQuery = documents ? false : storeHasQuery;
-  const selectedMatch = useSearchStore((s) => s.selectedMatch);
+  const selectedMatch = useViewerStore((state) => activeViewerTab(state)?.match ?? null);
+  const closePath = useViewerStore((state) => state.closePath);
   const replaySearch = useSearchStore((s) => s.replaySearch);
-  const clearPreview = useSearchStore((s) => s.clearPreview);
   const { addToast } = useToasts();
 
   const fileList = useSettingsStore((s) => s.fileList);
@@ -518,7 +519,7 @@ export default function ResultList({
 
     try {
       await source.deleteFile(path);
-      if (selectedMatch?.path === path) clearPreview();
+      closePath(path);
       useChatStore.getState().removeContext(path);
       if (hasQuery) {
         await replaySearch();
@@ -555,9 +556,7 @@ export default function ResultList({
 
     try {
       await api.renameFile(oldPath, nextName);
-      if (selectedMatch?.path === oldPath) {
-        clearPreview();
-      }
+      closePath(oldPath);
       if (hasQuery) {
         await replaySearch();
       } else {
@@ -578,9 +577,7 @@ export default function ResultList({
     const oldPath = moveTarget.path;
     try {
       await (source as DesktopSourceApi).moveFile(oldPath, moveTarget.root);
-      if (selectedMatch?.path === oldPath) {
-        clearPreview();
-      }
+      closePath(oldPath);
       if (hasQuery) {
         await replaySearch();
       } else {

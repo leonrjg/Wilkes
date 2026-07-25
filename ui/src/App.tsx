@@ -16,7 +16,7 @@ import { useSettingsStore } from "./stores/useSettingsStore";
 import { useBookmarksStore } from "./stores/useBookmarksStore";
 import { useChatStore } from "./stores/useChatStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
-import { useHistory } from "./hooks/useHistory";
+import { useViewerStore } from "./stores/useViewerStore";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
 import { api, source, isTauri } from "./services";
 import type { AgentBackend } from "./lib/types";
@@ -52,8 +52,8 @@ export default function App() {
   const { menu: chatBackendMenu, openMenu: openChatBackendMenu, closeMenu: closeChatBackendMenu } =
     useContextMenu<null>();
 
-  const { canGoBack, canGoForward, goBack, goForward, handleMatchClick, handleFileClick } =
-    useHistory();
+  const openMatch = useViewerStore((state) => state.openMatch);
+  const openFile = useViewerStore((state) => state.openFile);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(320);
@@ -424,8 +424,8 @@ export default function App() {
           <ResultList
             filterText={fileFilterText}
             onFilterTextChange={setFileFilterText}
-            onMatchClick={handleMatchClick}
-            onFileClick={handleFileClick}
+            onMatchClick={openMatch}
+            onFileClick={openFile}
           />
         </div>
 
@@ -443,13 +443,7 @@ export default function App() {
         {bookmarksDock === "Left" && bookmarksColumn}
 
         <div className="flex-1 min-h-0 min-w-0 overflow-hidden bg-[var(--bg-app)]">
-          <PreviewPane
-            canGoBack={canGoBack}
-            canGoForward={canGoForward}
-            onGoBack={goBack}
-            onGoForward={goForward}
-            onFileOpen={handleFileClick}
-          />
+          <PreviewPane />
         </div>
 
         {bookmarksDock === "Right" && bookmarksColumn}

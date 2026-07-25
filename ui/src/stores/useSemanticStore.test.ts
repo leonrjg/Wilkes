@@ -402,8 +402,6 @@ describe("useSemanticStore", () => {
       lastQuery: { pattern: "hello", mode: "Semantic", root: "/project" } as any,
       results: [{ path: "/project/file.txt", file_type: "PlainText", matches: [] }],
       stats: { files_scanned: 1, total_matches: 1, elapsed_ms: 5, errors: [] },
-      selectedMatch: { path: "/project/file.txt", origin: { TextFile: { line: 1, col: 1 } } } as any,
-      previewData: { Text: { content: "hello", language: "txt", highlight_line: 1, highlight_range: { start: 0, end: 5 } } } as any,
     } as any);
 
     await useSemanticStore.getState().handleCurrentRootIndexRemoved();

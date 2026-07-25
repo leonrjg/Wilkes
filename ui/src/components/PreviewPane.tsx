@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { X, ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye } from "react-feather";
+import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye } from "react-feather";
 import CodeViewer from "./preview/CodeViewer";
 import MarkdownViewer from "./preview/MarkdownViewer";
 import PdfViewer from "./preview/PdfViewer";
 import type { DocumentSelection } from "./preview/SelectionActions";
 import { utf8ByteRangeToUtf16Range } from "./preview/textOffsets";
 import { readMarkdownViewMode, saveMarkdownViewMode } from "./preview/textScrollMemory";
-import { useSearchStore } from "../stores/useSearchStore";
+import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useChatStore } from "../stores/useChatStore";
 import { api, isTauri } from "../services";
@@ -20,14 +20,7 @@ import { fileName } from "./DocumentEntryRow";
 import RelatedDocumentsPane from "./RelatedDocumentsPane";
 import BookmarkDetails from "./preview/BookmarkDetails";
 import type { BookmarkAnchor } from "./preview/bookmarkPosition";
-
-interface Props {
-  canGoBack?: boolean;
-  canGoForward?: boolean;
-  onGoBack?: () => void;
-  onGoForward?: () => void;
-  onFileOpen?: (path: string) => void;
-}
+import ViewerTabs from "./ViewerTabs";
 
 function headerTitle(path: string, metadata: DocumentMetadata | null) {
   const title = metadata?.title?.trim();
@@ -71,13 +64,19 @@ function metadataBadgeClassName() {
   ].join(" ");
 }
 
-export default function PreviewPane({ canGoBack = false, canGoForward = false, onGoBack, onGoForward, onFileOpen }: Props) {
-  const selectedMatch = useSearchStore((s) => s.selectedMatch);
-  const previewData = useSearchStore((s) => s.previewData);
-  const previewLoading = useSearchStore((s) => s.previewLoading);
-  const viewerMetadata = useSearchStore((s) => s.viewerMetadata);
-  const viewerMetadataStatus = useSearchStore((s) => s.viewerMetadataStatus);
-  const clearPreview = useSearchStore((s) => s.clearPreview);
+export default function PreviewPane() {
+  const activeTab = useViewerStore(activeViewerTab);
+  const goBack = useViewerStore((state) => state.goBack);
+  const goForward = useViewerStore((state) => state.goForward);
+  const openFile = useViewerStore((state) => state.openFile);
+  const selectedMatch = activeTab?.match ?? null;
+  const previewData = activeTab?.previewData ?? null;
+  const previewLoading = activeTab?.previewLoading ?? false;
+  const viewerMetadata = activeTab?.metadata ?? null;
+  const viewerMetadataStatus = activeTab?.metadataStatus ?? "idle";
+  const canGoBack = activeTab != null && activeTab.historyIndex > 0;
+  const canGoForward =
+    activeTab != null && activeTab.historyIndex < activeTab.history.length - 1;
   const addBookmark = useBookmarksStore((s) => s.add);
   const removeBookmark = useBookmarksStore((s) => s.remove);
   const bookmarks = useBookmarksStore((s) => s.bookmarks);
@@ -140,15 +139,9 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
     if (isTauri && selectedMatch) setChatActiveDoc(selectedMatch.path, page);
   };
 
-  // Keep the last valid previewData so the content stays mounted while a new
-  // match is loading. This prevents PdfViewer from unmounting/remounting on
-  // every match click, which would force react-pdf to re-parse the PDF file.
-  const lastPreviewRef = useRef(previewData);
   const [isPdfRendering, setIsPdfRendering] = useState(false);
   const prevPdfUrlRef = useRef<string | null>(null);
-
-  if (previewData) lastPreviewRef.current = previewData;
-  const displayData = previewData ?? lastPreviewRef.current;
+  const displayData = previewData;
 
   // Show the loading spinner only when a new PDF file is opened, not when
   // navigating to a different match within the same file.
@@ -170,14 +163,17 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
     }
   }, [selectedMatch?.path, selectedMatch?.origin]);
 
-  if (!selectedMatch) {
+  if (!activeTab || !selectedMatch) {
     return (
-      <div className="flex flex-col items-center justify-center h-full bg-[var(--bg-app)] text-[var(--text-dim)]">
-        <img
-          src="/logo.transparent.png"
-          alt="Wilkes"
-          className="mb-8 h-auto w-[clamp(10rem,20vw,18rem)] max-w-[80vw] opacity-35 -translate-x-2"
-        />
+      <div className="flex h-full flex-col bg-[var(--bg-app)] text-[var(--text-dim)]">
+        <ViewerTabs />
+        <div className="flex flex-1 flex-col items-center justify-center">
+          <img
+            src="/logo.transparent.png"
+            alt="Wilkes"
+            className="mb-8 h-auto w-[clamp(10rem,20vw,18rem)] max-w-[80vw] opacity-35 -translate-x-2"
+          />
+        </div>
       </div>
     );
   }
@@ -286,22 +282,15 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
     );
   };
 
-  if (!isPdfFile && !displayData) {
-    return (
-      <div className="flex items-center justify-center h-full text-[var(--text-muted)] text-sm animate-pulse">
-        Loading…
-      </div>
-    );
-  }
-
   return (
     <div className="flex flex-col h-full min-h-0 overflow-hidden">
+      <ViewerTabs />
       {/* Header */}
       <div className="px-3 py-2 border-b border-[var(--border-main)] flex items-center gap-3 flex-shrink-0 bg-[var(--bg-header)]">
         <div className="flex items-center gap-1">
           <Tooltip content="Go back">
             <button
-              onClick={onGoBack}
+              onClick={goBack}
               disabled={!canGoBack}
               className="p-1 hover:bg-[var(--bg-active)] rounded text-[var(--text-dim)] disabled:opacity-30"
             >
@@ -310,7 +299,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
           </Tooltip>
           <Tooltip content="Go forward">
             <button
-              onClick={onGoForward}
+              onClick={goForward}
               disabled={!canGoForward}
               className="p-1 hover:bg-[var(--bg-active)] rounded text-[var(--text-dim)] disabled:opacity-30"
             >
@@ -417,19 +406,15 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
           </Tooltip>
         )}
 
-        <Tooltip content="Close preview">
-          <button
-            onClick={clearPreview}
-            aria-label="Close preview"
-            className="p-1 hover:bg-red-500/10 hover:text-red-500 rounded text-[var(--text-dim)] transition-colors"
-          >
-            <X size={16} />
-          </button>
-        </Tooltip>
       </div>
 
       {/* Content */}
-      <div className="flex-1 min-h-0 overflow-hidden bg-[var(--bg-app)]">
+      <div
+        id="viewer-tabpanel"
+        role="tabpanel"
+        aria-labelledby={`viewer-tab-${activeTab.id}`}
+        className="flex-1 min-h-0 overflow-hidden bg-[var(--bg-app)]"
+      >
         <div className="flex h-full min-h-0">
           <div className="relative min-w-0 flex-1 overflow-hidden">
             {openBookmark && openBookmarkTarget && (
@@ -501,7 +486,7 @@ export default function PreviewPane({ canGoBack = false, canGoForward = false, o
           {relatedPanelOpen && (
             <RelatedDocumentsPane
               currentPath={selectedMatch.path}
-              onOpenDocument={(path) => onFileOpen?.(path)}
+              onOpenDocument={openFile}
               onClose={() => setRelatedPanelOpen(false)}
             />
           )}

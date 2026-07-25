@@ -11,7 +11,7 @@ import ChatPane, {
 } from "./ChatPane";
 import type { ChatMessage } from "../stores/useChatStore";
 import { useChatStore } from "../stores/useChatStore";
-import { useSearchStore } from "../stores/useSearchStore";
+import { useViewerStore } from "../stores/useViewerStore";
 import { chatApi } from "../services/chat";
 
 vi.mock("../services/chat", () => ({
@@ -351,20 +351,20 @@ describe("ChatPane context badges", () => {
       sessionError: null,
       configOptions: [],
     });
-    useSearchStore.setState({ selectMatch: vi.fn() });
+    useViewerStore.setState({ openMatch: vi.fn() });
   });
 
-  it("opens active and pinned context files through selectMatch", () => {
+  it("opens active and pinned context files through the viewer", () => {
     render(<ChatPane onClose={vi.fn()} />);
 
     fireEvent.click(screen.getByText("paper.pdf"));
     fireEvent.click(screen.getByText("notes.md"));
 
-    expect(useSearchStore.getState().selectMatch).toHaveBeenNthCalledWith(1, {
+    expect(useViewerStore.getState().openMatch).toHaveBeenNthCalledWith(1, {
       path: "/tmp/paper.pdf",
       origin: { PdfPage: { page: 7, bbox: null } },
     });
-    expect(useSearchStore.getState().selectMatch).toHaveBeenNthCalledWith(2, {
+    expect(useViewerStore.getState().openMatch).toHaveBeenNthCalledWith(2, {
       path: "/tmp/notes.md",
       origin: { TextFile: { line: 0, col: 0 } },
     });

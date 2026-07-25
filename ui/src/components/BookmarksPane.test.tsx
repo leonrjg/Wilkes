@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import BookmarksPane from "./BookmarksPane";
 import { ToastProvider } from "./Toast";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
-import { useSearchStore } from "../stores/useSearchStore";
+import { useViewerStore } from "../stores/useViewerStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 
 const renderPane = (ui: ReactElement = <BookmarksPane />) =>
@@ -59,12 +59,25 @@ describe("BookmarksPane", () => {
       paneOpen: true,
       remove: vi.fn().mockResolvedValue(undefined),
     });
-    useSearchStore.setState({
-      selectedMatch: {
+    const match = {
         path: "/tmp/current.pdf",
         origin: { PdfPage: { page: 1, bbox: null } },
-      },
-      selectMatch: vi.fn(),
+      } as const;
+    useViewerStore.setState({
+      activeTabId: "current-tab",
+      tabs: [{
+        id: "current-tab",
+        path: match.path,
+        match,
+        history: [match],
+        historyIndex: 0,
+        previewData: null,
+        previewLoading: false,
+        metadata: null,
+        metadataStatus: "idle",
+        requestId: 1,
+      }],
+      openMatch: vi.fn(),
     });
     useSettingsStore.setState({
       bookmarksDock: "Right",
@@ -87,7 +100,7 @@ describe("BookmarksPane", () => {
     expect(setBookmarksDock).toHaveBeenCalledWith("Left");
   });
 
-  it("scopes to the current file and navigates through selectMatch", () => {
+  it("scopes to the current file and navigates through the viewer", () => {
     renderPane();
 
     expect(screen.getByText("current file quote")).toBeInTheDocument();
@@ -95,7 +108,7 @@ describe("BookmarksPane", () => {
 
     fireEvent.click(screen.getByText("current file quote"));
 
-    expect(useSearchStore.getState().selectMatch).toHaveBeenCalledWith({
+    expect(useViewerStore.getState().openMatch).toHaveBeenCalledWith({
       path: "/tmp/current.pdf",
       origin: { PdfPage: { page: 2, bbox: null } },
     });
@@ -115,18 +128,31 @@ describe("BookmarksPane", () => {
         },
       ],
     });
-    useSearchStore.setState({
-      selectedMatch: {
+    const match = {
         path: "/tmp/current.txt",
         origin: { TextFile: { line: 1, col: 0 } },
-      },
-      selectMatch: vi.fn(),
+      } as const;
+    useViewerStore.setState({
+      activeTabId: "text-tab",
+      tabs: [{
+        id: "text-tab",
+        path: match.path,
+        match,
+        history: [match],
+        historyIndex: 0,
+        previewData: null,
+        previewLoading: false,
+        metadata: null,
+        metadataStatus: "idle",
+        requestId: 1,
+      }],
+      openMatch: vi.fn(),
     });
 
     renderPane();
     fireEvent.click(screen.getByText("selected"));
 
-    expect(useSearchStore.getState().selectMatch).toHaveBeenCalledWith({
+    expect(useViewerStore.getState().openMatch).toHaveBeenCalledWith({
       path: "/tmp/current.txt",
       origin: { TextFile: { line: 3, col: 2 } },
       text_range: { start: 12, end: 20 },
