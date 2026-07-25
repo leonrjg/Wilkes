@@ -63,7 +63,11 @@ describe("PreviewPane", () => {
 
   it("renders empty state when no match is selected", () => {
     render(<PreviewPane />);
-    expect(screen.getByAltText("Wilkes")).toBeInTheDocument();
+    const logo = screen.getByAltText("Wilkes");
+    expect(logo).toBeInTheDocument();
+    expect(logo).toHaveClass("w-[clamp(10rem,20vw,18rem)]", "max-w-[80vw]", "h-auto");
+    expect(logo).toHaveClass("opacity-35");
+    expect(logo).not.toHaveClass("transition-all", "hover:opacity-35");
   });
 
   it("renders CodeViewer for text data", () => {

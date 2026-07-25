@@ -693,18 +693,6 @@ export function MessageBubble({
           {isUser ? "You" : "Assistant"}
           {elapsedLabel && <span> · {elapsedLabel}</span>}
         </span>
-        <Tooltip content="Copy message">
-          <CopyButton
-            copy={() => copyText ? navigator.clipboard.writeText(copyText) : Promise.resolve()}
-            disabled={!copyText}
-            aria-label={`Copy ${isUser ? "your" : "assistant"} message`}
-            copiedAriaLabel="Copied"
-            copiedChildren={<Check size={10} />}
-            className="inline-flex h-4 w-4 items-center justify-center rounded text-[var(--text-dim)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-30"
-          >
-            <Copy size={10} />
-          </CopyButton>
-        </Tooltip>
         {isUser && onEdit && (
           <Tooltip content="Edit message in a new fork">
             <button
@@ -718,19 +706,6 @@ export function MessageBubble({
               className="inline-flex h-4 w-4 items-center justify-center rounded text-[var(--text-dim)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-30"
             >
               <Edit3 size={10} />
-            </button>
-          </Tooltip>
-        )}
-        {onFork && (
-          <Tooltip content="Fork conversation from this message">
-            <button
-              type="button"
-              aria-label={`Fork from ${isUser ? "your" : "assistant"} message`}
-              disabled={actionsDisabled || message.streaming}
-              onClick={() => onFork(message.id)}
-              className="inline-flex h-4 w-4 items-center justify-center rounded text-[var(--text-dim)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-30"
-            >
-              <GitBranch size={10} />
             </button>
           </Tooltip>
         )}
@@ -888,6 +863,37 @@ export function MessageBubble({
         )}
         {message.error && (
           <div className="mt-1 text-[10px] text-[var(--text-error)]">{message.error}</div>
+        )}
+      </div>
+      <div
+        className={`mt-0.5 flex items-center gap-1 ${
+          isUser ? "justify-end" : "justify-start"
+        }`}
+      >
+        <Tooltip content="Copy message">
+          <CopyButton
+            copy={() => copyText ? navigator.clipboard.writeText(copyText) : Promise.resolve()}
+            disabled={!copyText}
+            aria-label={`Copy ${isUser ? "your" : "assistant"} message`}
+            copiedAriaLabel="Copied"
+            copiedChildren={<Check size={10} />}
+            className="inline-flex h-4 w-4 items-center justify-center rounded text-[var(--text-dim)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-30"
+          >
+            <Copy size={10} />
+          </CopyButton>
+        </Tooltip>
+        {onFork && (
+          <Tooltip content="Fork conversation from this message">
+            <button
+              type="button"
+              aria-label={`Fork from ${isUser ? "your" : "assistant"} message`}
+              disabled={actionsDisabled || message.streaming}
+              onClick={() => onFork(message.id)}
+              className="inline-flex h-4 w-4 items-center justify-center rounded text-[var(--text-dim)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-30"
+            >
+              <GitBranch size={10} />
+            </button>
+          </Tooltip>
         )}
       </div>
     </div>

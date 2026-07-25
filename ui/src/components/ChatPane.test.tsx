@@ -168,6 +168,23 @@ describe("MessageBubble", () => {
     expect(onFork).toHaveBeenCalledWith("message-1");
   });
 
+  it("renders copy and fork actions below the message", () => {
+    render(
+      <MessageBubble
+        message={message({ content: [{ kind: "text", text: "Answer" }] })}
+        nowMs={0}
+        onNavigate={vi.fn()}
+        onFork={vi.fn()}
+      />,
+    );
+
+    const messageText = screen.getByText("Answer");
+    const copyButton = screen.getByRole("button", { name: "Copy assistant message" });
+    const forkButton = screen.getByRole("button", { name: "Fork from assistant message" });
+    expect(messageText.compareDocumentPosition(copyButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(messageText.compareDocumentPosition(forkButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("renders and copies text blocks on opposite sides of a tool in order", () => {
     render(
       <MessageBubble
