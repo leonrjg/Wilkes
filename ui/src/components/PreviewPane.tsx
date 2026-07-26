@@ -171,7 +171,7 @@ export default function PreviewPane() {
           <img
             src="/logo.transparent.png"
             alt="Wilkes"
-            className="mb-8 h-auto w-[clamp(10rem,20vw,18rem)] max-w-[80vw] opacity-35 -translate-x-2"
+            className="mb-8 h-auto w-[clamp(10rem,20vw,18rem)] max-w-[80vw] opacity-25 -translate-x-2"
           />
         </div>
       </div>

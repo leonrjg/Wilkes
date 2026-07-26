@@ -189,9 +189,13 @@ export default function MarkdownViewer({
         onClearSelection={domSelection.clearSelection}
         dismissOnCollapsedDomSelection
       />
+      {find.isOpen && (
+        <div className="absolute top-4 right-4 z-20">
+          <FindBar find={find} matchCount={matchCount} />
+        </div>
+      )}
       <div className="absolute bottom-4 right-4 z-20 flex flex-col gap-2 items-end">
-        {find.isOpen && <FindBar find={find} matchCount={matchCount} />}
-        <div className="flex items-center gap-1 bg-[var(--bg-app)] border border-[var(--border-main)] rounded-lg shadow-lg px-2 py-1 text-xs text-[var(--text-main)]">
+        <div className="flex items-center gap-1.5 bg-[var(--bg-app)] border border-[var(--border-main)] rounded-lg shadow-lg px-2.5 py-1.5 text-sm text-[var(--text-main)]">
           <ZoomControls
             zoom={zoom}
             onZoomIn={() => changeZoom((z) => z + ZOOM_STEP)}

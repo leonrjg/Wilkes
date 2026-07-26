@@ -77,6 +77,35 @@ The app supports multiple engines to maximize model availability:
 ## Q&A
 - What model should I use?
   - You can use those marked as "Recommended", try multiple, or just use the default model. You can check the [MTEB ranking](https://huggingface.co/spaces/mteb/leaderboard) and use any model from that list (through specific engines). Note that the top 10 of the ranking are too large to run on consumer hardware.
+
+## External MCP
+
+The desktop app can expose Wilkes' document and literature tools to regular
+Claude Code and Codex sessions. In **Settings → Chat → External MCP**, enable
+the server, choose its bind address and port, and use the copy buttons for the
+client you want to configure. The bind address defaults to `127.0.0.1`; use a
+specific LAN address or a wildcard such as `0.0.0.0`/`::` only when remote
+clients need access. Bearer authentication is optional and disabled by default.
+
+The endpoint:
+
+- listens on the configured IPv4 or IPv6 address;
+- can require a persistent bearer token stored separately from `settings.json`;
+- stays available while Wilkes is running, even when its chat pane is closed;
+- reads only documents inside the current, favorite, or recent Wilkes library
+  roots.
+
+Binding beyond loopback makes the endpoint reachable from the corresponding
+network interfaces. Without token authentication, anyone who can reach the
+endpoint can use its tools. Enable the token or restrict access with host
+firewall rules where appropriate. When using `0.0.0.0` or `::`, remote clients
+must replace the wildcard in the copied endpoint with the Wilkes machine's
+reachable address. Disabling authentication keeps an existing token file so it
+can be reused if authentication is enabled again.
+
+The in-app chat continues to use its own private, session-scoped MCP server.
+Changing the external bind address or port, or rotating its token, does not
+affect open Wilkes chat sessions.
  
 ## Interface
 <img width="1312" height="903" alt="image" src="https://github.com/user-attachments/assets/d2018970-5270-467d-9cc5-49a00ad5fa53" />

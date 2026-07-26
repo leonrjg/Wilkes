@@ -6,7 +6,7 @@
 //! supported CLI backends. See docs/chat-agent-integration-spec.md.
 
 pub mod context;
-mod mcp;
+pub mod mcp;
 pub mod reader;
 pub mod search;
 pub mod session;

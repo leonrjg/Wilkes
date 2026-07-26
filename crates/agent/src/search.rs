@@ -4,7 +4,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Serialize;
 use wilkes_core::types::{
-    FileMatches, RelatedDocument, RelatedDocumentsQuery, SearchQuery, SearchStats, SmartCollection,
+    FileMatches, IntegrationsSettings, RelatedDocument, RelatedDocumentsQuery, SearchQuery,
+    SearchStats, SmartCollection,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,6 +30,13 @@ pub trait SearchService: Send + Sync {
 
     async fn list_smart_collections(self: Arc<Self>) -> Result<Vec<SmartCollection>, String> {
         Ok(Vec::new())
+    }
+
+    /// Current integration settings for long-lived MCP servers. Chat-scoped
+    /// servers receive a point-in-time snapshot directly, while an external
+    /// application-scoped server must observe settings edits without a restart.
+    async fn integrations(self: Arc<Self>) -> IntegrationsSettings {
+        IntegrationsSettings::default()
     }
 
     async fn search(

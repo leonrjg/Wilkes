@@ -1,5 +1,6 @@
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use agent_client_protocol::schema::v1::{HttpHeader, McpServer, McpServerHttp};
@@ -12,7 +13,7 @@ use axum::{
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router, ServerHandler,
 };
 use serde::{Deserialize, Serialize};
@@ -58,16 +59,30 @@ pub(crate) const WILKES_MCP_TOOL_NAMES: &[&str] = &[
 
 pub(crate) struct McpRuntime {
     url: String,
-    token: String,
+    token: Arc<RwLock<Option<String>>>,
     shutdown: CancellationToken,
     _server_task: tokio::task::JoinHandle<()>,
 }
 
 impl McpRuntime {
     pub(crate) fn server_config(&self) -> McpServer {
-        McpServer::Http(McpServerHttp::new("wilkes", self.url.clone()).headers(vec![
-            HttpHeader::new("Authorization", format!("Bearer {}", self.token)),
-        ]))
+        let token = self
+            .token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let server = McpServerHttp::new("wilkes", self.url.clone());
+        McpServer::Http(match token.as_ref() {
+            Some(token) => server.headers(vec![HttpHeader::new(
+                "Authorization",
+                format!("Bearer {token}"),
+            )]),
+            None => server,
+        })
+    }
+
+    async fn shutdown(mut self) {
+        self.shutdown.cancel();
+        let _ = (&mut self._server_task).await;
     }
 }
 
@@ -84,6 +99,97 @@ pub(crate) async fn start(
     integrations: IntegrationsSettings,
 ) -> anyhow::Result<McpRuntime> {
     let token = uuid::Uuid::new_v4().to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    start_server(
+        listener,
+        format!("/mcp/{token}"),
+        Some(token),
+        McpContext::Session(context),
+        cwd,
+        search,
+        Some(integrations),
+        "chat",
+    )
+    .await
+}
+
+/// Application-scoped MCP server for regular Claude Code and Codex clients.
+///
+/// Unlike the private chat server, this endpoint has no active-document or
+/// per-conversation context. Its readable scope is resolved dynamically from
+/// [`SearchService::library_roots`], so settings changes take effect without
+/// restarting the listener.
+pub struct ExternalMcpRuntime {
+    runtime: McpRuntime,
+}
+
+impl ExternalMcpRuntime {
+    pub fn url(&self) -> &str {
+        &self.runtime.url
+    }
+
+    pub fn set_token(&self, token: Option<String>) {
+        *self
+            .runtime
+            .token
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = token;
+    }
+
+    pub fn token(&self) -> Option<String> {
+        self.runtime
+            .token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub async fn shutdown(self) {
+        self.runtime.shutdown().await;
+    }
+}
+
+pub async fn start_external(
+    bind_address: IpAddr,
+    port: u16,
+    token: Option<String>,
+    search: Arc<dyn SearchService>,
+) -> anyhow::Result<ExternalMcpRuntime> {
+    if port == 0 {
+        anyhow::bail!("External MCP port must be between 1 and 65535");
+    }
+    let listener = tokio::net::TcpListener::bind((bind_address, port)).await?;
+    let runtime = start_server(
+        listener,
+        "/mcp".to_string(),
+        token,
+        McpContext::Library,
+        PathBuf::new(),
+        Some(search),
+        None,
+        "external",
+    )
+    .await?;
+    Ok(ExternalMcpRuntime { runtime })
+}
+
+#[derive(Clone, Debug)]
+enum McpContext {
+    Session(ContextStateHandle),
+    Library,
+}
+
+async fn start_server(
+    listener: tokio::net::TcpListener,
+    route_path: String,
+    token: Option<String>,
+    context: McpContext,
+    cwd: PathBuf,
+    search: Option<Arc<dyn SearchService>>,
+    integrations: Option<IntegrationsSettings>,
+    lifecycle: &'static str,
+) -> anyhow::Result<McpRuntime> {
+    let token = Arc::new(RwLock::new(token));
     let shutdown = CancellationToken::new();
     let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
         .with_stateful_mode(false)
@@ -106,15 +212,13 @@ pub(crate) async fn start(
         config,
     );
 
-    let route_path = format!("/mcp/{token}");
     let router =
         Router::new()
             .nest_service(&route_path, service)
             .layer(middleware::from_fn_with_state(
-                token.clone(),
+                Arc::clone(&token),
                 require_bearer_token,
             ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let url = format!("http://{addr}{route_path}");
     let shutdown_for_task = shutdown.clone();
@@ -123,11 +227,11 @@ pub(crate) async fn start(
             .with_graceful_shutdown(async move { shutdown_for_task.cancelled_owned().await })
             .await;
         if let Err(err) = result {
-            error!("chat: Wilkes MCP server exited with error: {err:#}");
+            error!(%lifecycle, "Wilkes MCP server exited with error: {err:#}");
         }
     });
 
-    info!(%url, "chat: started Wilkes MCP server");
+    info!(%url, %lifecycle, "started Wilkes MCP server");
     Ok(McpRuntime {
         url,
         token,
@@ -137,11 +241,19 @@ pub(crate) async fn start(
 }
 
 async fn require_bearer_token(
-    State(token): State<String>,
+    State(token): State<Arc<RwLock<Option<String>>>>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let expected = format!("Bearer {token}");
+    let expected = {
+        let token = token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        token.as_ref().map(|token| format!("Bearer {token}"))
+    };
+    let Some(expected) = expected else {
+        return Ok(next.run(request).await);
+    };
     let authorized = request
         .headers()
         .get("authorization")
@@ -156,19 +268,19 @@ async fn require_bearer_token(
 
 #[derive(Clone)]
 struct WilkesMcp {
-    context: ContextStateHandle,
+    context: McpContext,
     cwd: PathBuf,
     search: Option<Arc<dyn SearchService>>,
-    integrations: IntegrationsSettings,
+    integrations: Option<IntegrationsSettings>,
     tool_router: ToolRouter<Self>,
 }
 
 impl WilkesMcp {
     fn new(
-        context: ContextStateHandle,
+        context: McpContext,
         cwd: PathBuf,
         search: Option<Arc<dyn SearchService>>,
-        integrations: IntegrationsSettings,
+        integrations: Option<IntegrationsSettings>,
     ) -> Self {
         Self {
             context,
@@ -189,6 +301,87 @@ impl std::fmt::Debug for WilkesMcp {
             .field("integrations", &self.integrations)
             .finish_non_exhaustive()
     }
+}
+
+impl WilkesMcp {
+    async fn context_snapshot(&self) -> crate::session::ContextSnapshot {
+        match &self.context {
+            McpContext::Session(context) => context.snapshot(),
+            McpContext::Library => {
+                let root = match &self.search {
+                    Some(search) => search.clone().default_root().await,
+                    None => None,
+                };
+                crate::session::ContextSnapshot {
+                    active_doc: None,
+                    context_files: Vec::new(),
+                    root: crate::context::root_context(root.as_deref()),
+                    branch_history: None,
+                }
+            }
+        }
+    }
+
+    async fn library_roots(&self) -> Vec<PathBuf> {
+        match &self.search {
+            Some(search) => search.clone().library_roots().await,
+            None => Vec::new(),
+        }
+    }
+
+    async fn is_path_allowed(&self, path: &Path) -> bool {
+        match &self.context {
+            McpContext::Session(context) => context.is_allowed(path),
+            McpContext::Library => is_within_roots(path, &self.library_roots().await),
+        }
+    }
+
+    async fn current_root(&self) -> Result<PathBuf, String> {
+        match &self.context {
+            McpContext::Session(context) => {
+                if let Some(root) = context.search_root() {
+                    return Ok(root);
+                }
+                if let Some(search) = &self.search {
+                    if let Some(root) = search.clone().default_root().await {
+                        return Ok(root);
+                    }
+                }
+                Ok(self.cwd.clone())
+            }
+            McpContext::Library => {
+                let search = self
+                    .search
+                    .clone()
+                    .ok_or_else(|| "Wilkes search is not available.".to_string())?;
+                search.default_root().await.ok_or_else(|| {
+                    "No current Wilkes library root is configured. Open a directory in Wilkes first."
+                        .to_string()
+                })
+            }
+        }
+    }
+
+    async fn integrations(&self) -> IntegrationsSettings {
+        if let Some(integrations) = &self.integrations {
+            return integrations.clone();
+        }
+        match &self.search {
+            Some(search) => search.clone().integrations().await,
+            None => IntegrationsSettings::default(),
+        }
+    }
+}
+
+fn is_within_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    roots.iter().any(|root| {
+        root.canonicalize()
+            .map(|root| canonical.starts_with(root))
+            .unwrap_or(false)
+    })
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -372,14 +565,11 @@ struct SearchMatchResponse {
 #[tool_router]
 impl WilkesMcp {
     #[tool(
-        description = "List the current Wilkes chat context: configured library roots, active root, active document, and files explicitly added to context."
+        description = "List the current Wilkes context: configured library roots, active root, and, for an in-app chat, its active document and explicitly added files."
     )]
     async fn list_context(&self) -> CallToolResult {
-        let snapshot = self.context.snapshot();
-        let roots = match &self.search {
-            Some(search) => search.clone().library_roots().await,
-            None => Vec::new(),
-        };
+        let snapshot = self.context_snapshot().await;
+        let roots = self.library_roots().await;
         structured(ListContextResponse::from_snapshot(
             snapshot.root,
             snapshot.active_doc,
@@ -404,11 +594,11 @@ impl WilkesMcp {
     #[tool(
         description = "Read Wilkes-extracted document text from the active document, a context file, or any document in the current root. Use page for one PDF page or page_range for an inclusive PDF page range."
     )]
-    fn get_document_text(
+    async fn get_document_text(
         &self,
         Parameters(params): Parameters<GetDocumentTextParams>,
     ) -> CallToolResult {
-        match get_document_text(&self.context, params) {
+        match get_document_text_for_mcp(self, params).await {
             Ok(response) => structured(response),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
@@ -421,7 +611,7 @@ impl WilkesMcp {
         &self,
         Parameters(params): Parameters<GetRelatedDocumentsParams>,
     ) -> CallToolResult {
-        match get_related_documents(&self.context, self.search.clone(), &self.cwd, params).await {
+        match get_related_documents_for_mcp(self, params).await {
             Ok(response) => structured(response),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
@@ -431,7 +621,7 @@ impl WilkesMcp {
         description = "Search Wilkes-readable documents. You must explicitly set mode='exact' for literal/regex text search or mode='semantic' for meaning-based search; mode has no default. If the user asks about the open/current document or a specific context file, set file to that document path; omit file only for corpus-wide searches."
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
-        match search_documents(&self.context, self.search.clone(), &self.cwd, params).await {
+        match search_documents_for_mcp(self, params).await {
             Ok(response) => structured(response),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
@@ -454,9 +644,10 @@ impl WilkesMcp {
             .limit
             .unwrap_or(DEFAULT_SEARCH_MAX_RESULTS)
             .clamp(1, 100);
+        let integrations = self.integrations().await;
         match params.provider {
             LiteratureProviderParam::SemanticScholar => {
-                let settings = &self.integrations.semantic_scholar;
+                let settings = &integrations.semantic_scholar;
                 if !settings.enabled {
                     return CallToolResult::error(vec![ContentBlock::text(
                         "Semantic Scholar integration is disabled.",
@@ -477,7 +668,7 @@ impl WilkesMcp {
                 }
             }
             LiteratureProviderParam::Openalex => {
-                let settings = &self.integrations.openalex;
+                let settings = &integrations.openalex;
                 if !settings.enabled {
                     return CallToolResult::error(vec![ContentBlock::text(
                         "OpenAlex integration is disabled.",
@@ -504,10 +695,12 @@ impl WilkesMcp {
         description = "Download a direct HTTP(S) file URL into the current Wilkes root. Use only when the user asks to import or download a file. Pass filename to choose the saved name; existing files are never overwritten. Literature search results may provide pdf_url values suitable for this tool."
     )]
     async fn download(&self, Parameters(params): Parameters<DownloadParams>) -> CallToolResult {
-        let root = self
-            .context
-            .search_root()
-            .unwrap_or_else(|| self.cwd.clone());
+        let root = match self.current_root().await {
+            Ok(root) => root,
+            Err(message) => {
+                return CallToolResult::error(vec![ContentBlock::text(message)]);
+            }
+        };
         match download_to_root(&root, params).await {
             Ok(response) => structured(response),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
@@ -519,6 +712,11 @@ impl WilkesMcp {
 impl ServerHandler for WilkesMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(
+                Implementation::new("wilkes", env!("CARGO_PKG_VERSION"))
+                    .with_title("Wilkes")
+                    .with_description("Local document search and literature tools"),
+            )
             .with_instructions("Wilkes document context and literature tools. Context and search tools are read-only. The download tool writes a file into the current root and must only be used when the user asks to import or download it.")
     }
 }
@@ -683,13 +881,35 @@ impl ListContextResponse {
     }
 }
 
+async fn get_document_text_for_mcp(
+    mcp: &WilkesMcp,
+    params: GetDocumentTextParams,
+) -> Result<GetDocumentTextResponse, String> {
+    match &mcp.context {
+        McpContext::Session(context) => get_document_text(context, params),
+        McpContext::Library => {
+            let path = params
+                .path
+                .as_ref()
+                .filter(|path| !path.trim().is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    "External Wilkes MCP has no active document; pass path explicitly.".to_string()
+                })?;
+            if !mcp.is_path_allowed(&path).await {
+                return Err(read_access_error(&path));
+            }
+            get_document_text_at_path(path, None, params)
+        }
+    }
+}
+
 fn get_document_text(
     context: &ContextStateHandle,
     params: GetDocumentTextParams,
 ) -> Result<GetDocumentTextResponse, String> {
-    let started_at = Instant::now();
     let snapshot = context.snapshot();
-    let (path, default_page) = match params.path {
+    let (path, default_page) = match params.path.as_ref() {
         Some(path) => (PathBuf::from(path), None),
         None => {
             let active_doc = snapshot
@@ -705,7 +925,15 @@ fn get_document_text(
     if !context.is_allowed(&path) {
         return Err(read_access_error(&path));
     }
+    get_document_text_at_path(path, default_page, params)
+}
 
+fn get_document_text_at_path(
+    path: PathBuf,
+    default_page: Option<u32>,
+    params: GetDocumentTextParams,
+) -> Result<GetDocumentTextResponse, String> {
+    let started_at = Instant::now();
     let page_range = match (params.page, params.page_range) {
         (Some(page), None) => Some((page, page)),
         (None, Some(range)) => Some((range.start, range.end)),
@@ -756,6 +984,41 @@ fn get_document_text(
     Ok(response)
 }
 
+async fn search_documents_for_mcp(
+    mcp: &WilkesMcp,
+    mut params: SearchParams,
+) -> Result<SearchResponse, String> {
+    match &mcp.context {
+        McpContext::Session(context) => {
+            search_documents(context, mcp.search.clone(), &mcp.cwd, params).await
+        }
+        McpContext::Library => {
+            let root = match params.root.as_ref() {
+                Some(root) if !root.trim().is_empty() => PathBuf::from(root),
+                Some(_) => return Err("Search root cannot be empty.".to_string()),
+                None => mcp.current_root().await?,
+            };
+            if !is_within_roots(&root, &mcp.library_roots().await) {
+                return Err(read_access_error(&root));
+            }
+            if let Some(file) = params.file.as_ref() {
+                let file = PathBuf::from(file);
+                if !mcp.is_path_allowed(&file).await {
+                    return Err(read_access_error(&file));
+                }
+            }
+            params.root = Some(root.to_string_lossy().into_owned());
+            search_documents(
+                &ContextStateHandle::default(),
+                mcp.search.clone(),
+                Path::new(""),
+                params,
+            )
+            .await
+        }
+    }
+}
+
 async fn search_documents(
     context: &ContextStateHandle,
     search: Option<Arc<dyn SearchService>>,
@@ -804,6 +1067,46 @@ async fn search_documents(
         stats: collected.stats,
         truncated: collected.truncated,
     })
+}
+
+async fn get_related_documents_for_mcp(
+    mcp: &WilkesMcp,
+    mut params: GetRelatedDocumentsParams,
+) -> Result<GetRelatedDocumentsResponse, String> {
+    match &mcp.context {
+        McpContext::Session(context) => {
+            get_related_documents(context, mcp.search.clone(), &mcp.cwd, params).await
+        }
+        McpContext::Library => {
+            let path = params
+                .path
+                .as_ref()
+                .filter(|path| !path.trim().is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    "External Wilkes MCP has no active document; pass path explicitly.".to_string()
+                })?;
+            if !mcp.is_path_allowed(&path).await {
+                return Err(read_access_error(&path));
+            }
+            let root = match params.root.as_ref() {
+                Some(root) if !root.trim().is_empty() => PathBuf::from(root),
+                Some(_) => return Err("Related-documents root cannot be empty.".to_string()),
+                None => mcp.current_root().await?,
+            };
+            if !is_within_roots(&root, &mcp.library_roots().await) {
+                return Err(read_access_error(&root));
+            }
+            params.root = Some(root.to_string_lossy().into_owned());
+            get_related_documents(
+                &ContextStateHandle::default(),
+                mcp.search.clone(),
+                Path::new(""),
+                params,
+            )
+            .await
+        }
+    }
 }
 
 async fn get_related_documents(
@@ -1078,6 +1381,248 @@ mod tests {
             *self.last_related_query.lock().unwrap() = Some(query);
             Ok(self.related_response.lock().unwrap().take().unwrap())
         }
+    }
+
+    fn fake_search_with_root(root: PathBuf) -> Arc<FakeSearch> {
+        Arc::new(FakeSearch {
+            last_query: Mutex::new(None),
+            last_related_query: Mutex::new(None),
+            default_root: Some(root),
+            response: Mutex::new(None),
+            related_response: Mutex::new(None),
+        })
+    }
+
+    #[tokio::test]
+    async fn external_context_reads_only_configured_library_roots() {
+        let library = tempdir().unwrap();
+        let inside = library.path().join("inside.txt");
+        std::fs::write(&inside, "inside library").unwrap();
+        let outside_dir = tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.txt");
+        std::fs::write(&outside, "outside library").unwrap();
+        let mcp = WilkesMcp::new(
+            McpContext::Library,
+            PathBuf::new(),
+            Some(fake_search_with_root(library.path().to_path_buf())),
+            None,
+        );
+
+        let response = get_document_text_for_mcp(
+            &mcp,
+            GetDocumentTextParams {
+                path: Some(inside.to_string_lossy().into_owned()),
+                page: None,
+                page_range: None,
+                max_chars: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.text, "inside library");
+
+        let error = get_document_text_for_mcp(
+            &mcp,
+            GetDocumentTextParams {
+                path: Some(outside.to_string_lossy().into_owned()),
+                page: None,
+                page_range: None,
+                max_chars: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("not in the current root"));
+    }
+
+    #[tokio::test]
+    async fn external_context_requires_explicit_document_path() {
+        let library = tempdir().unwrap();
+        let mcp = WilkesMcp::new(
+            McpContext::Library,
+            PathBuf::new(),
+            Some(fake_search_with_root(library.path().to_path_buf())),
+            None,
+        );
+
+        let error = get_document_text_for_mcp(
+            &mcp,
+            GetDocumentTextParams {
+                path: None,
+                page: None,
+                page_range: None,
+                max_chars: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("pass path explicitly"));
+    }
+
+    #[tokio::test]
+    async fn external_search_rejects_root_outside_library() {
+        let library = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let mcp = WilkesMcp::new(
+            McpContext::Library,
+            PathBuf::new(),
+            Some(fake_search_with_root(library.path().to_path_buf())),
+            None,
+        );
+
+        let error = search_documents_for_mcp(
+            &mcp,
+            SearchParams {
+                query: "needle".to_string(),
+                mode: SearchModeParam::Exact,
+                scope: None,
+                root: Some(outside.path().to_string_lossy().into_owned()),
+                file: None,
+                max_results: None,
+                case_sensitive: None,
+                is_regex: None,
+                context_lines: None,
+                collection_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("not in the current root"));
+    }
+
+    #[tokio::test]
+    async fn bearer_middleware_requires_current_token() {
+        use axum::{body::Body, http::Request, routing::get};
+        use tower::ServiceExt;
+
+        let token = Arc::new(RwLock::new(Some("first-token".to_string())));
+        let app = Router::new()
+            .route("/", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&token),
+                require_bearer_token,
+            ));
+
+        let unauthorized = app
+            .clone()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .clone()
+            .oneshot(
+                Request::get("/")
+                    .header("Authorization", "Bearer first-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+
+        *token.write().unwrap() = Some("second-token".to_string());
+        let old = app
+            .clone()
+            .oneshot(
+                Request::get("/")
+                    .header("Authorization", "Bearer first-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old.status(), StatusCode::UNAUTHORIZED);
+        let current = app
+            .oneshot(
+                Request::get("/")
+                    .header("Authorization", "Bearer second-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bearer_middleware_allows_requests_without_configured_token() {
+        use axum::{body::Body, http::Request, routing::get};
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                Arc::new(RwLock::new(None)),
+                require_bearer_token,
+            ));
+        let response = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tokenless_external_server_initializes_and_lists_tools() {
+        let library = tempdir().unwrap();
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let runtime = start_external(
+            "127.0.0.1".parse().unwrap(),
+            port,
+            None,
+            fake_search_with_root(library.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        let send = |body: serde_json::Value| {
+            client
+                .post(runtime.url())
+                .header("Accept", "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2025-11-25")
+                .json(&body)
+                .send()
+        };
+
+        let initialize = send(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "wilkes-test", "version": "1.0" }
+            }
+        }))
+        .await
+        .unwrap();
+        assert!(initialize.status().is_success());
+        let initialize: serde_json::Value = initialize.json().await.unwrap();
+        assert_eq!(initialize["result"]["serverInfo"]["name"], "wilkes");
+
+        let tools = send(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .await
+        .unwrap();
+        assert!(tools.status().is_success());
+        let tools: serde_json::Value = tools.json().await.unwrap();
+        let names: Vec<_> = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(names.contains(&"search"));
+        assert!(names.contains(&"get_document_text"));
+        assert!(names.contains(&"download"));
     }
 
     #[test]

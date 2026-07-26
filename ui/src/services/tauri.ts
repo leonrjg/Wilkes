@@ -36,6 +36,7 @@ import type {
   NewSmartCollection,
   CollectionValidation,
   SearchLogEntry,
+  ExternalMcpStatus,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type { SearchApi, DesktopSourceApi, DataPaths } from "./api";
@@ -87,6 +88,28 @@ export class TauriSearchApi implements SearchApi {
 
   async updateSettings(patch: Partial<Settings>): Promise<Settings> {
     return invoke<Settings>("update_settings", { patch });
+  }
+
+  async getExternalMcpStatus(): Promise<ExternalMcpStatus> {
+    return invoke<ExternalMcpStatus>("get_external_mcp_status");
+  }
+
+  async configureExternalMcp(
+    enabled: boolean,
+    requireToken: boolean,
+    bindAddress: string,
+    port: number,
+  ): Promise<ExternalMcpStatus> {
+    return invoke<ExternalMcpStatus>("configure_external_mcp", {
+      enabled,
+      requireToken,
+      bindAddress,
+      port,
+    });
+  }
+
+  async rotateExternalMcpToken(): Promise<ExternalMcpStatus> {
+    return invoke<ExternalMcpStatus>("rotate_external_mcp_token");
   }
 
   async listBookmarks(): Promise<Bookmark[]> {

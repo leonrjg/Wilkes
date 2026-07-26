@@ -815,6 +815,19 @@ describe("PdfViewer", () => {
     expect(mockVirtualizer.scrollToIndex).toHaveBeenCalledTimes(0);
   });
 
+  it("positions the find bar at the top of the PDF viewer", () => {
+    mockUseDocumentFind.value = {
+      ...mockUseDocumentFind.value,
+      isOpen: true,
+    };
+
+    render(<PdfViewer {...defaultProps} />);
+
+    const input = screen.getByPlaceholderText("Find in document...");
+    expect(input.closest(".absolute")).toHaveClass("top-4");
+    expect(input.closest(".absolute")).not.toHaveClass("bottom-4");
+  });
+
   it("shows a disabled TOC button when the document has no outline", async () => {
     mockUsePdfOutline.value = null;
     render(<PdfViewer {...defaultProps} />);
@@ -825,6 +838,8 @@ describe("PdfViewer", () => {
 
     const button = screen.getByRole("button", { name: "This document has no table of contents" });
     expect(button).toBeDisabled();
+    expect(button.parentElement).toHaveClass("px-2.5", "py-1.5", "text-sm");
+    expect(button.querySelector("svg")).toHaveAttribute("width", "14");
   });
 
   it("opens the outline panel when the TOC button is clicked", async () => {

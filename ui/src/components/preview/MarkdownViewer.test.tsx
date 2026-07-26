@@ -24,6 +24,17 @@ describe("MarkdownViewer", () => {
     expect(screen.getByRole("link", { name: "Wilkes" })).toHaveAttribute("target", "_blank");
   });
 
+  it("opens the larger find bar at the top of the viewer", () => {
+    render(<MarkdownViewer documentPath="/notes.md" content="Searchable text" highlightRange={{ start: 0, end: 0 }} />);
+
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+
+    const input = screen.getByPlaceholderText("Find in document...");
+    expect(input).toHaveClass("w-56", "text-sm");
+    expect(input.closest(".absolute")).toHaveClass("top-4");
+    expect(input.closest(".absolute")).not.toHaveClass("bottom-4");
+  });
+
   it("segments overlapping search and bookmark annotations from source byte ranges", () => {
     const content = "Start **café🙂** end";
     const encoder = new TextEncoder();
@@ -71,6 +82,8 @@ describe("MarkdownViewer", () => {
   it("zooms the rendered article font size via the controls", () => {
     render(<MarkdownViewer documentPath="/zoom.md" content="Readable body text" highlightRange={{ start: 0, end: 0 }} />);
     const article = document.querySelector<HTMLElement>(".prose-document")!;
+    const controls = screen.getByRole("button", { name: "Zoom in" }).parentElement;
+    expect(controls).toHaveClass("px-2.5", "py-1.5", "text-sm");
     expect(article.style.fontSize).toBe("1rem");
 
     fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));

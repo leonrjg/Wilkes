@@ -47,6 +47,13 @@ mod tests {
         assert_eq!(settings.file_sort_key, FileSortKey::Filename);
         assert_eq!(settings.file_sort_direction, FileSortDirection::Asc);
         assert_eq!(settings.chat_custom_instructions, "");
+        assert!(!settings.external_mcp.enabled);
+        assert!(!settings.external_mcp.require_token);
+        assert_eq!(
+            settings.external_mcp.bind_address,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert!(settings.external_mcp.port > 0);
     }
 
     #[tokio::test]

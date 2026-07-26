@@ -620,22 +620,24 @@ export default function PdfViewer({
 
   return (
     <div ref={rootRef} className="h-full min-h-0 relative flex flex-col overflow-hidden">
-      <div className="absolute bottom-4 right-4 z-20 flex flex-col gap-2 items-end">
-        {isSearchOpen && (
+      {isSearchOpen && (
+        <div className="absolute top-4 right-4 z-20">
           <FindBar find={find} matchCount={innerMatches.length} isSearching={isSearching} />
-        )}
+        </div>
+      )}
 
-        <div className="flex items-center gap-1 bg-[var(--bg-app)] border border-[var(--border-main)] rounded-lg shadow-lg px-2 py-1 text-xs text-[var(--text-main)]">
+      <div className="absolute bottom-4 right-4 z-20 flex flex-col gap-2 items-end">
+        <div className="flex items-center gap-1.5 bg-[var(--bg-app)] border border-[var(--border-main)] rounded-lg shadow-lg px-2.5 py-1.5 text-sm text-[var(--text-main)]">
           {pdf && (
             <Tooltip content={outline ? "Table of contents" : "This document has no table of contents"}>
               <button
                 onClick={() => setIsOutlineOpen((open) => !open)}
                 disabled={!outline}
-                className={`p-1 transition-colors mr-1 border-r border-[var(--border-main)] pr-2 ${
+                className={`p-1.5 transition-colors mr-1 border-r border-[var(--border-main)] pr-2.5 ${
                   outline ? "hover:text-[var(--accent-blue)]" : "opacity-40 cursor-default"
                 } ${isOutlineOpen ? "text-[var(--accent-blue)]" : ""}`}
               >
-                <List size={12} />
+                <List size={14} />
               </button>
             </Tooltip>
           )}
@@ -643,13 +645,13 @@ export default function PdfViewer({
             <Tooltip content="Find in document (Cmd+F)">
               <button
                 onClick={find.open}
-                className="p-1 hover:text-[var(--accent-blue)] transition-colors mr-1 border-r border-[var(--border-main)] pr-2"
+                className="p-1.5 hover:text-[var(--accent-blue)] transition-colors mr-1 border-r border-[var(--border-main)] pr-2.5"
               >
-                <SearchIcon size={12} />
+                <SearchIcon size={14} />
               </button>
             </Tooltip>
           )}
-          {numPages && <span className="w-16 text-center font-mono">{currentPage}/{numPages}</span>}
+          {numPages && <span className="w-20 text-center font-mono">{currentPage}/{numPages}</span>}
           {numPages && <span className="text-[var(--text-dim)]">|</span>}
           <ZoomControls
             zoom={zoom}

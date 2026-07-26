@@ -60,6 +60,10 @@ impl wilkes_agent::search::SearchService for AppContext {
         self.list_collections().map_err(|e| e.to_string())
     }
 
+    async fn integrations(self: Arc<Self>) -> wilkes_core::types::IntegrationsSettings {
+        self.get_settings().await.integrations
+    }
+
     async fn search(
         self: Arc<Self>,
         query: SearchQuery,

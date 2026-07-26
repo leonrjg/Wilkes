@@ -15,11 +15,11 @@ interface ZoomControlsProps {
 export default function ZoomControls({ zoom, onZoomIn, onZoomOut }: ZoomControlsProps) {
   return (
     <>
-      <button onClick={onZoomOut} aria-label="Zoom out" className="px-1 hover:text-[var(--accent-blue)]">
+      <button onClick={onZoomOut} aria-label="Zoom out" className="px-1.5 py-0.5 hover:text-[var(--accent-blue)]">
         −
       </button>
-      <span className="w-10 text-center font-mono">{Math.round(zoom * 100)}%</span>
-      <button onClick={onZoomIn} aria-label="Zoom in" className="px-1 hover:text-[var(--accent-blue)]">
+      <span className="w-12 text-center font-mono">{Math.round(zoom * 100)}%</span>
+      <button onClick={onZoomIn} aria-label="Zoom in" className="px-1.5 py-0.5 hover:text-[var(--accent-blue)]">
         +
       </button>
     </>

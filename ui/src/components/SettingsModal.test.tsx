@@ -21,6 +21,10 @@ describe("SettingsModal", () => {
   const mockApi = {
     getSettings: vi.fn(),
     updateSettings: vi.fn(),
+    getExternalMcpStatus: vi.fn(),
+    configureExternalMcp: vi.fn(),
+    rotateExternalMcpToken: vi.fn(),
+    writeClipboard: vi.fn(),
   } as any;
 
   const defaultProps = {
@@ -42,11 +46,48 @@ describe("SettingsModal", () => {
     search_prefer_semantic: false,
     semantic: { enabled: true, index_path: null, worker_timeout_secs: 300 },
     supported_extensions: ["ts"],
+    external_mcp: {
+      enabled: false,
+      require_token: false,
+      bind_address: "127.0.0.1",
+      port: 39217,
+    },
   };
 
   beforeEach(() => {
     vi.clearAllMocks();
     mockApi.getSettings.mockResolvedValue(mockSettings);
+    mockApi.getExternalMcpStatus.mockResolvedValue({
+      enabled: false,
+      running: false,
+      require_token: false,
+      bind_address: "127.0.0.1",
+      port: 39217,
+      url: null,
+      token: null,
+      error: null,
+    });
+    mockApi.configureExternalMcp.mockResolvedValue({
+      enabled: true,
+      running: true,
+      require_token: false,
+      bind_address: "127.0.0.1",
+      port: 39217,
+      url: "http://127.0.0.1:39217/mcp",
+      token: null,
+      error: null,
+    });
+    mockApi.rotateExternalMcpToken.mockResolvedValue({
+      enabled: true,
+      running: true,
+      require_token: true,
+      bind_address: "127.0.0.1",
+      port: 39217,
+      url: "http://127.0.0.1:39217/mcp",
+      token: "rotated-token",
+      error: null,
+    });
+    mockApi.writeClipboard.mockResolvedValue(undefined);
   });
 
   it("renders when open", async () => {
@@ -112,6 +153,103 @@ describe("SettingsModal", () => {
     expect(mockApi.updateSettings).toHaveBeenCalledWith({
       chat_custom_instructions: "Answer in Spanish.",
     });
+  });
+
+  it("starts the external MCP server from Chat settings", async () => {
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Serve MCP for external clients"));
+    });
+
+    expect(mockApi.configureExternalMcp).toHaveBeenCalledWith(
+      true,
+      false,
+      "127.0.0.1",
+      39217,
+    );
+    expect(await screen.findByText("Listening")).toBeInTheDocument();
+    expect(screen.getByText("http://127.0.0.1:39217/mcp")).toBeInTheDocument();
+  });
+
+  it("copies tokenless client setup commands by default", async () => {
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Serve MCP for external clients"));
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Copy Claude setup" }));
+    expect(mockApi.writeClipboard).toHaveBeenLastCalledWith(
+      "claude mcp add --transport http --scope user wilkes http://127.0.0.1:39217/mcp",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Copy Codex setup" }));
+    expect(mockApi.writeClipboard).toHaveBeenLastCalledWith(
+      "codex mcp add --url http://127.0.0.1:39217/mcp wilkes",
+    );
+    expect(screen.queryByRole("button", { name: "Copy token" })).not.toBeInTheDocument();
+  });
+
+  it("allows a non-loopback bind address and warns about network exposure", async () => {
+    mockApi.configureExternalMcp.mockResolvedValue({
+      enabled: true,
+      running: true,
+      require_token: false,
+      bind_address: "0.0.0.0",
+      port: 39217,
+      url: "http://0.0.0.0:39217/mcp",
+      token: null,
+      error: null,
+    });
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    fireEvent.change(screen.getByLabelText("External MCP bind address"), {
+      target: { value: "0.0.0.0" },
+    });
+    expect(screen.getByText(/exposes Wilkes MCP without authentication/)).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    });
+    expect(mockApi.configureExternalMcp).toHaveBeenCalledWith(
+      false,
+      false,
+      "0.0.0.0",
+      39217,
+    );
+    expect(await screen.findByText("http://0.0.0.0:39217/mcp")).toBeInTheDocument();
+  });
+
+  it("copies client setup commands without exposing the token as text", async () => {
+    mockApi.getExternalMcpStatus.mockResolvedValue({
+      enabled: true,
+      running: true,
+      require_token: true,
+      bind_address: "127.0.0.1",
+      port: 39217,
+      url: "http://127.0.0.1:39217/mcp",
+      token: "secret-token",
+      error: null,
+    });
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Copy Claude setup" }));
+    });
+    expect(mockApi.writeClipboard).toHaveBeenCalledWith(
+      expect.stringContaining('Authorization: Bearer secret-token'),
+    );
+    expect(screen.queryByText("secret-token")).not.toBeInTheDocument();
   });
 
   it("preserves the custom instructions cursor while persisting an edit", async () => {

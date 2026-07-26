@@ -774,6 +774,37 @@ pub struct IndexStatus {
 
 // ── Settings ─────────────────────────────────────────────────────────────────
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalMcpSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub require_token: bool,
+    #[serde(default = "default_external_mcp_bind_address")]
+    pub bind_address: std::net::IpAddr,
+    #[serde(default = "default_external_mcp_port")]
+    pub port: u16,
+}
+
+fn default_external_mcp_bind_address() -> std::net::IpAddr {
+    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+}
+
+fn default_external_mcp_port() -> u16 {
+    39_217
+}
+
+impl Default for ExternalMcpSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            require_token: false,
+            bind_address: default_external_mcp_bind_address(),
+            port: default_external_mcp_port(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default, alias = "bookmarked_dirs")]
@@ -827,6 +858,11 @@ pub struct Settings {
     /// consistently to new and existing conversations.
     #[serde(default)]
     pub chat_custom_instructions: String,
+    /// Optional MCP endpoint for regular Claude Code and Codex clients.
+    /// Authentication material, when enabled, is stored separately in app data
+    /// and is intentionally never serialized as part of Settings.
+    #[serde(default)]
+    pub external_mcp: ExternalMcpSettings,
 }
 
 fn default_file_display_fields() -> Vec<FileDisplayField> {
@@ -870,6 +906,7 @@ impl Default for Settings {
             chat_backend: AgentBackend::default(),
             chat_config: Vec::new(),
             chat_custom_instructions: String::new(),
+            external_mcp: ExternalMcpSettings::default(),
         }
     }
 }
@@ -1595,6 +1632,21 @@ mod tests {
         assert_eq!(s.context_lines, 2);
         assert_eq!(s.chat_backend, AgentBackend::ClaudeCode);
         assert_eq!(s.pdf_auto_zoom_target_px, 15.5);
+    }
+
+    #[test]
+    fn external_mcp_settings_default_old_configs_to_loopback() {
+        let settings: ExternalMcpSettings =
+            serde_json::from_str(r#"{"enabled":true,"port":39217}"#).unwrap();
+        assert_eq!(
+            settings.bind_address,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert!(!settings.require_token);
+        assert!(serde_json::from_str::<ExternalMcpSettings>(
+            r#"{"enabled":true,"bind_address":"not-an-address","port":39217}"#
+        )
+        .is_err());
     }
 
     #[test]

@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -15,10 +17,10 @@ use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
     AddOutcome, AgentBackend, Bookmark, CitationResult, CollectionValidation, DataPaths,
-    DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, FileListResponse, IndexStatus,
-    IntegrationStatus, ModelDescriptor, NewBookmark, NewSmartCollection, NewTag, OpenAlexWork,
-    SearchLogEntry, SelectedEmbedder, SemanticScholarPaper, Settings, SmartCollection, Tag,
-    UpdateSmartCollection, UpdateTag,
+    DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, ExternalMcpSettings, FileListResponse,
+    IndexStatus, IntegrationStatus, ModelDescriptor, NewBookmark, NewSmartCollection, NewTag,
+    OpenAlexWork, SearchLogEntry, SelectedEmbedder, SemanticScholarPaper, Settings,
+    SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 
 mod platform;
@@ -309,6 +311,282 @@ async fn set_worker_timeout_for_ctx(ctx: Arc<AppContext>, secs: u64) -> Result<(
         .map_err(|e| e.to_string())
 }
 
+// ── External MCP lifecycle ────────────────────────────────────────────────────
+
+const EXTERNAL_MCP_TOKEN_FILENAME: &str = "external-mcp-token";
+
+struct ManagedExternalMcp {
+    bind_address: std::net::IpAddr,
+    port: u16,
+    runtime: wilkes_agent::mcp::ExternalMcpRuntime,
+}
+
+struct ExternalMcpManager {
+    token_path: PathBuf,
+    runtime: tokio::sync::Mutex<Option<ManagedExternalMcp>>,
+    last_error: Mutex<Option<String>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ExternalMcpStatus {
+    enabled: bool,
+    running: bool,
+    require_token: bool,
+    bind_address: std::net::IpAddr,
+    port: u16,
+    url: Option<String>,
+    token: Option<String>,
+    error: Option<String>,
+}
+
+impl ExternalMcpManager {
+    fn new(data_dir: PathBuf) -> Self {
+        Self {
+            token_path: data_dir.join(EXTERNAL_MCP_TOKEN_FILENAME),
+            runtime: tokio::sync::Mutex::new(None),
+            last_error: Mutex::new(None),
+        }
+    }
+
+    async fn apply(
+        &self,
+        settings: &ExternalMcpSettings,
+        ctx: Arc<AppContext>,
+    ) -> Result<(), String> {
+        if !settings.enabled {
+            let managed = self.runtime.lock().await.take();
+            if let Some(managed) = managed {
+                managed.runtime.shutdown().await;
+            }
+            *self.last_error.lock().unwrap() = None;
+            return Ok(());
+        }
+        if settings.port == 0 {
+            let message = "External MCP port must be between 1 and 65535".to_string();
+            *self.last_error.lock().unwrap() = Some(message.clone());
+            return Err(message);
+        }
+
+        let token = if settings.require_token {
+            match load_or_create_external_mcp_token(&self.token_path) {
+                Ok(token) => Some(token),
+                Err(error) => {
+                    let message = format!("Could not load the external MCP credential: {error:#}");
+                    *self.last_error.lock().unwrap() = Some(message.clone());
+                    return Err(message);
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut runtime = self.runtime.lock().await;
+        if let Some(managed) = runtime.as_ref().filter(|managed| {
+            managed.bind_address == settings.bind_address && managed.port == settings.port
+        }) {
+            managed.runtime.set_token(token);
+            *self.last_error.lock().unwrap() = None;
+            return Ok(());
+        }
+
+        let search: Arc<dyn wilkes_agent::search::SearchService> = ctx;
+        let start = || {
+            wilkes_agent::mcp::start_external(
+                settings.bind_address,
+                settings.port,
+                token.clone(),
+                Arc::clone(&search),
+            )
+        };
+        let mut next = start().await;
+        let previous = if next.is_err()
+            && runtime
+                .as_ref()
+                .is_some_and(|managed| managed.port == settings.port)
+        {
+            let previous = runtime.take().expect("checked above");
+            let previous_address = previous.bind_address;
+            let previous_port = previous.port;
+            let previous_token = previous.runtime.token();
+            previous.runtime.shutdown().await;
+            next = start().await;
+            Some((previous_address, previous_port, previous_token))
+        } else {
+            None
+        };
+
+        match next {
+            Ok(next) => {
+                *runtime = Some(ManagedExternalMcp {
+                    bind_address: settings.bind_address,
+                    port: settings.port,
+                    runtime: next,
+                });
+                *self.last_error.lock().unwrap() = None;
+                Ok(())
+            }
+            Err(error) => {
+                if let Some((previous_address, previous_port, previous_token)) = previous {
+                    match wilkes_agent::mcp::start_external(
+                        previous_address,
+                        previous_port,
+                        previous_token,
+                        search,
+                    )
+                    .await
+                    {
+                        Ok(previous_runtime) => {
+                            *runtime = Some(ManagedExternalMcp {
+                                bind_address: previous_address,
+                                port: previous_port,
+                                runtime: previous_runtime,
+                            });
+                        }
+                        Err(restore_error) => {
+                            let message = format!(
+                                "Could not start Wilkes MCP on {}:{}: {error:#}; the previous listener could not be restored: {restore_error:#}",
+                                settings.bind_address, settings.port
+                            );
+                            *self.last_error.lock().unwrap() = Some(message.clone());
+                            return Err(message);
+                        }
+                    }
+                }
+                let message = format!(
+                    "Could not start Wilkes MCP on {}:{}: {error:#}",
+                    settings.bind_address, settings.port
+                );
+                *self.last_error.lock().unwrap() = Some(message.clone());
+                Err(message)
+            }
+        }
+    }
+
+    async fn status(&self, settings: &ExternalMcpSettings) -> ExternalMcpStatus {
+        let runtime = self.runtime.lock().await;
+        let token = runtime
+            .as_ref()
+            .filter(|_| settings.require_token)
+            .and_then(|managed| managed.runtime.token());
+        ExternalMcpStatus {
+            enabled: settings.enabled,
+            running: runtime.is_some(),
+            require_token: settings.require_token,
+            bind_address: settings.bind_address,
+            port: settings.port,
+            url: runtime
+                .as_ref()
+                .map(|managed| managed.runtime.url().to_string()),
+            token,
+            error: self.last_error.lock().unwrap().clone(),
+        }
+    }
+
+    async fn rotate_token(&self, settings: &ExternalMcpSettings) -> Result<(), String> {
+        if !settings.require_token {
+            return Err("External MCP bearer authentication is not enabled".to_string());
+        }
+        let token = generate_external_mcp_token();
+        write_external_mcp_token(&self.token_path, &token).map_err(|error| error.to_string())?;
+        if let Some(runtime) = self.runtime.lock().await.as_ref() {
+            runtime.runtime.set_token(Some(token));
+        }
+        Ok(())
+    }
+
+    async fn stop(&self) {
+        let managed = self.runtime.lock().await.take();
+        if let Some(managed) = managed {
+            managed.runtime.shutdown().await;
+        }
+    }
+}
+
+fn external_mcp_manager_state(app: &AppHandle) -> Arc<ExternalMcpManager> {
+    app.state::<Arc<ExternalMcpManager>>().inner().clone()
+}
+
+fn generate_external_mcp_token() -> String {
+    format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
+}
+
+fn read_external_mcp_token(path: &std::path::Path) -> anyhow::Result<String> {
+    let mut file = OpenOptions::new().read(true).open(path)?;
+    let mut token = String::new();
+    file.read_to_string(&mut token)?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("External MCP token file is empty: {}", path.display());
+    }
+    Ok(token)
+}
+
+fn load_or_create_external_mcp_token(path: &std::path::Path) -> anyhow::Result<String> {
+    match read_external_mcp_token(path) {
+        Ok(token) => return Ok(token),
+        Err(error) if path.exists() => return Err(error),
+        Err(_) => {}
+    }
+    let token = generate_external_mcp_token();
+    write_external_mcp_token(path, &token)?;
+    Ok(token)
+}
+
+fn write_external_mcp_token(path: &std::path::Path, token: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(token.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+async fn update_settings_with_external_mcp(
+    ctx: Arc<AppContext>,
+    manager: Arc<ExternalMcpManager>,
+    patch: serde_json::Value,
+) -> Result<Settings, String> {
+    let before = ctx.get_settings().await;
+    let requested_external = patch
+        .get("external_mcp")
+        .cloned()
+        .map(serde_json::from_value::<ExternalMcpSettings>)
+        .transpose()
+        .map_err(|error| format!("Invalid external MCP settings: {error}"))?;
+
+    if requested_external.is_none() {
+        return update_settings_for_ctx(ctx, patch).await;
+    }
+
+    if let Some(requested) = &requested_external {
+        manager.apply(requested, Arc::clone(&ctx)).await?;
+    }
+
+    match ctx.update_settings(patch).await {
+        Ok(updated) => Ok(updated),
+        Err(error) => {
+            if requested_external.is_some() {
+                let _ = manager.apply(&before.external_mcp, Arc::clone(&ctx)).await;
+            }
+            Err(error.to_string())
+        }
+    }
+}
+
 fn handle_exit_event(app_handle: &AppHandle, event: tauri::RunEvent) {
     if matches!(
         event,
@@ -318,7 +596,9 @@ fn handle_exit_event(app_handle: &AppHandle, event: tauri::RunEvent) {
         // Kill any in-flight turn and the chat subprocesses themselves before
         // the process tree goes away, rather than leaving orphaned CLIs behind.
         chat_manager_state(app_handle).close_all();
+        let external_mcp = external_mcp_manager_state(app_handle);
         tauri::async_runtime::spawn(async move {
+            external_mcp.stop().await;
             ctx.shutdown().await;
         });
     }
@@ -1399,7 +1679,54 @@ async fn get_settings(app: AppHandle) -> Result<Settings, String> {
 
 #[tauri::command]
 async fn update_settings(patch: serde_json::Value, app: AppHandle) -> Result<Settings, String> {
-    update_settings_for_ctx(app_context(&app), patch).await
+    update_settings_with_external_mcp(app_context(&app), external_mcp_manager_state(&app), patch)
+        .await
+}
+
+#[tauri::command]
+async fn configure_external_mcp(
+    enabled: bool,
+    require_token: bool,
+    bind_address: String,
+    port: u16,
+    app: AppHandle,
+) -> Result<ExternalMcpStatus, String> {
+    let bind_address = bind_address.parse::<std::net::IpAddr>().map_err(|_| {
+        "External MCP bind address must be a valid IPv4 or IPv6 address".to_string()
+    })?;
+    let ctx = app_context(&app);
+    let manager = external_mcp_manager_state(&app);
+    let settings = update_settings_with_external_mcp(
+        Arc::clone(&ctx),
+        Arc::clone(&manager),
+        serde_json::json!({
+            "external_mcp": {
+                "enabled": enabled,
+                "require_token": require_token,
+                "bind_address": bind_address,
+                "port": port,
+            }
+        }),
+    )
+    .await?;
+    Ok(manager.status(&settings.external_mcp).await)
+}
+
+#[tauri::command]
+async fn get_external_mcp_status(app: AppHandle) -> Result<ExternalMcpStatus, String> {
+    let settings = app_context(&app).get_settings().await;
+    Ok(external_mcp_manager_state(&app)
+        .status(&settings.external_mcp)
+        .await)
+}
+
+#[tauri::command]
+async fn rotate_external_mcp_token(app: AppHandle) -> Result<ExternalMcpStatus, String> {
+    let ctx = app_context(&app);
+    let settings = ctx.get_settings().await;
+    let manager = external_mcp_manager_state(&app);
+    manager.rotate_token(&settings.external_mcp).await?;
+    Ok(manager.status(&settings.external_mcp).await)
 }
 
 #[tauri::command]
@@ -1673,16 +2000,28 @@ pub fn run() {
             } = build_startup_plan(&platform)?;
 
             let emitter = Arc::new(TauriEmitter(handle.clone()));
+            let external_mcp = Arc::new(ExternalMcpManager::new(data_dir.clone()));
             let (ctx, event_rx, loop_fut) =
                 AppContext::new(data_dir, settings_path, paths, emitter);
 
             app.manage(Arc::clone(&ctx));
             app.manage(Arc::new(ActiveSearches(Mutex::new(HashMap::new()))));
             app.manage(Arc::new(ChatManager(Mutex::new(HashMap::new()))));
+            app.manage(Arc::clone(&external_mcp));
 
             let ctx_c = Arc::clone(&ctx);
             tauri::async_runtime::spawn(async move {
                 ctx_c.spawn_background_tasks(event_rx, loop_fut);
+            });
+            let ctx_c = Arc::clone(&ctx);
+            tauri::async_runtime::spawn(async move {
+                let settings = ctx_c.get_settings().await;
+                if let Err(error) = external_mcp
+                    .apply(&settings.external_mcp, Arc::clone(&ctx_c))
+                    .await
+                {
+                    error!("external MCP startup failed: {error}");
+                }
             });
 
             Ok(())
@@ -1705,6 +2044,9 @@ pub fn run() {
             get_supported_engines,
             get_settings,
             update_settings,
+            configure_external_mcp,
+            get_external_mcp_status,
+            rotate_external_mcp_token,
             list_bookmarks,
             add_bookmark,
             remove_bookmark,
@@ -2300,6 +2642,184 @@ mod tests {
         .await
         .unwrap();
         assert!(updated.semantic.enabled);
+    }
+
+    #[test]
+    fn external_mcp_token_is_persistent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(EXTERNAL_MCP_TOKEN_FILENAME);
+        let first = load_or_create_external_mcp_token(&path).unwrap();
+        let second = load_or_create_external_mcp_token(&path).unwrap();
+
+        assert_eq!(first, second);
+        assert!(first.len() >= 64);
+        assert_eq!(read_external_mcp_token(&path).unwrap(), first);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_mcp_manager_starts_and_stops_with_setting() {
+        let (_dir, ctx) = test_ctx();
+        let library = tempdir().unwrap();
+        ctx.update_settings(serde_json::json!({
+            "last_directory": library.path()
+        }))
+        .await
+        .unwrap();
+        let token_dir = tempdir().unwrap();
+        let manager = ExternalMcpManager::new(token_dir.path().to_path_buf());
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let enabled = ExternalMcpSettings {
+            enabled: true,
+            require_token: false,
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port,
+        };
+
+        manager.apply(&enabled, Arc::clone(&ctx)).await.unwrap();
+        let status = manager.status(&enabled).await;
+        assert!(status.enabled);
+        assert!(status.running);
+        let expected_url = format!("http://127.0.0.1:{port}/mcp");
+        assert_eq!(status.url.as_deref(), Some(expected_url.as_str()));
+        assert!(!status.require_token);
+        assert!(status.token.is_none());
+
+        let disabled = ExternalMcpSettings {
+            enabled: false,
+            require_token: false,
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port,
+        };
+        manager.apply(&disabled, ctx).await.unwrap();
+        let status = manager.status(&disabled).await;
+        assert!(!status.running);
+        assert!(status.token.is_none());
+    }
+
+    #[tokio::test]
+    async fn external_mcp_manager_toggles_token_authentication_live() {
+        let (_dir, ctx) = test_ctx();
+        let token_dir = tempdir().unwrap();
+        let manager = ExternalMcpManager::new(token_dir.path().to_path_buf());
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let open = ExternalMcpSettings {
+            enabled: true,
+            require_token: false,
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port,
+        };
+        manager.apply(&open, Arc::clone(&ctx)).await.unwrap();
+        let url = manager.status(&open).await.url.unwrap();
+        assert!(manager.status(&open).await.token.is_none());
+        assert!(manager.rotate_token(&open).await.is_err());
+
+        let authenticated = ExternalMcpSettings {
+            require_token: true,
+            ..open.clone()
+        };
+        manager
+            .apply(&authenticated, Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let status = manager.status(&authenticated).await;
+        assert!(status.token.is_some());
+        assert_eq!(status.url.as_deref(), Some(url.as_str()));
+
+        manager.apply(&open, Arc::clone(&ctx)).await.unwrap();
+        let status = manager.status(&open).await;
+        assert_eq!(status.url.as_deref(), Some(url.as_str()));
+        assert!(status.token.is_none());
+        assert!(manager.token_path.exists());
+
+        manager
+            .apply(
+                &ExternalMcpSettings {
+                    enabled: false,
+                    ..open
+                },
+                ctx,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_mcp_manager_reports_port_collision_without_fallback() {
+        let (_dir, ctx) = test_ctx();
+        let token_dir = tempdir().unwrap();
+        let manager = ExternalMcpManager::new(token_dir.path().to_path_buf());
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let enabled = ExternalMcpSettings {
+            enabled: true,
+            require_token: false,
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port,
+        };
+
+        let error = manager.apply(&enabled, ctx).await.unwrap_err();
+        assert!(error.contains(&port.to_string()));
+        let status = manager.status(&enabled).await;
+        assert!(!status.running);
+        assert!(status.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn external_mcp_manager_switches_bind_address_on_the_same_port() {
+        let (_dir, ctx) = test_ctx();
+        let token_dir = tempdir().unwrap();
+        let manager = ExternalMcpManager::new(token_dir.path().to_path_buf());
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let loopback = ExternalMcpSettings {
+            enabled: true,
+            require_token: false,
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port,
+        };
+        manager.apply(&loopback, Arc::clone(&ctx)).await.unwrap();
+
+        let all_interfaces = ExternalMcpSettings {
+            enabled: true,
+            require_token: false,
+            bind_address: "0.0.0.0".parse().unwrap(),
+            port,
+        };
+        manager
+            .apply(&all_interfaces, Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let status = manager.status(&all_interfaces).await;
+        let expected_url = format!("http://0.0.0.0:{port}/mcp");
+        assert!(status.running);
+        assert_eq!(status.bind_address, all_interfaces.bind_address);
+        assert_eq!(status.url.as_deref(), Some(expected_url.as_str()));
+
+        manager
+            .apply(
+                &ExternalMcpSettings {
+                    enabled: false,
+                    ..all_interfaces
+                },
+                ctx,
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

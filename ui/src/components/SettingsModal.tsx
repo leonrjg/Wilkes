@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import type { SearchApi } from "../services/api";
-import type { Settings } from "../lib/types";
+import type { ExternalMcpStatus, Settings } from "../lib/types";
 import SemanticPanel from "./SemanticPanel";
 import ChunkingPanel from "./ChunkingPanel";
 import DataPanel from "./DataPanel";
@@ -168,6 +168,12 @@ export default function SettingsModal({
   const [activeTab, setActiveTab] = useState<"general" | "chat" | "extensions" | "integrations" | "models" | "chunking" | "data" | "workers" | "logs" | "technical">("general");
   const [settings, setSettings] = useState<Settings | null>(null);
   const [customInstructionsDraft, setCustomInstructionsDraft] = useState("");
+  const [externalMcpStatus, setExternalMcpStatus] = useState<ExternalMcpStatus | null>(null);
+  const [externalMcpRequireToken, setExternalMcpRequireToken] = useState(false);
+  const [externalMcpBindAddress, setExternalMcpBindAddress] = useState("127.0.0.1");
+  const [externalMcpPort, setExternalMcpPort] = useState(39217);
+  const [externalMcpBusy, setExternalMcpBusy] = useState(false);
+  const [externalMcpError, setExternalMcpError] = useState<string | null>(null);
   const customInstructionsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -175,7 +181,21 @@ export default function SettingsModal({
       api.getSettings().then((nextSettings) => {
         setSettings(nextSettings);
         setCustomInstructionsDraft(nextSettings.chat_custom_instructions ?? "");
+        setExternalMcpRequireToken(nextSettings.external_mcp?.require_token ?? false);
+        setExternalMcpBindAddress(nextSettings.external_mcp?.bind_address ?? "127.0.0.1");
+        setExternalMcpPort(nextSettings.external_mcp?.port ?? 39217);
       }).catch(console.error);
+      if (api.getExternalMcpStatus) {
+        api.getExternalMcpStatus()
+          .then((status) => {
+            setExternalMcpStatus(status);
+            setExternalMcpRequireToken(status.require_token);
+            setExternalMcpBindAddress(status.bind_address);
+            setExternalMcpPort(status.port);
+            setExternalMcpError(status.error);
+          })
+          .catch((error) => setExternalMcpError(error.toString()));
+      }
     }
   }, [isOpen, api]);
 
@@ -212,6 +232,74 @@ export default function SettingsModal({
       customInstructionsSaveTimer.current = null;
       void handleUpdateSettings({ chat_custom_instructions: value });
     }, 300);
+  };
+
+  const configureExternalMcp = async (
+    enabled: boolean,
+    bindAddress = externalMcpBindAddress,
+    port = externalMcpPort,
+    requireToken = externalMcpRequireToken,
+  ) => {
+    if (!api.configureExternalMcp) return;
+    setExternalMcpBusy(true);
+    setExternalMcpError(null);
+    try {
+      const status = await api.configureExternalMcp(
+        enabled,
+        requireToken,
+        bindAddress.trim(),
+        port,
+      );
+      setExternalMcpStatus(status);
+      setExternalMcpRequireToken(status.require_token);
+      setExternalMcpBindAddress(status.bind_address);
+      setExternalMcpPort(status.port);
+      setSettings((current) => current ? {
+        ...current,
+        external_mcp: {
+          enabled: status.enabled,
+          require_token: status.require_token,
+          bind_address: status.bind_address,
+          port: status.port,
+        },
+      } : current);
+      onSettingsUpdate?.({
+        external_mcp: {
+          enabled: status.enabled,
+          require_token: status.require_token,
+          bind_address: status.bind_address,
+          port: status.port,
+        },
+      });
+      setExternalMcpError(status.error);
+    } catch (error: any) {
+      setExternalMcpError(error.toString());
+    } finally {
+      setExternalMcpBusy(false);
+    }
+  };
+
+  const rotateExternalMcpToken = async () => {
+    if (!api.rotateExternalMcpToken) return;
+    setExternalMcpBusy(true);
+    setExternalMcpError(null);
+    try {
+      const status = await api.rotateExternalMcpToken();
+      setExternalMcpStatus(status);
+      setExternalMcpError(status.error);
+    } catch (error: any) {
+      setExternalMcpError(error.toString());
+    } finally {
+      setExternalMcpBusy(false);
+    }
+  };
+
+  const copyExternalMcpText = async (text: string) => {
+    try {
+      await api.writeClipboard(text);
+    } catch (error: any) {
+      setExternalMcpError(`Could not copy to clipboard: ${error.toString()}`);
+    }
   };
 
   const TabButton = ({ id, label, indent = false }: { id: typeof activeTab; label: string; indent?: boolean }) => (
@@ -427,6 +515,186 @@ export default function SettingsModal({
                           className="w-full resize-y bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
                         />
                       </div>
+                    </div>
+                  </section>
+                  <section className="border-t border-[var(--border-main)] pt-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <div>
+                        <h3 className="text-[10px] font-medium text-[var(--text-dim)] uppercase tracking-wider">
+                          External MCP
+                        </h3>
+                        <p className="text-[10px] text-[var(--text-dim)] mt-1">
+                          Available to Claude Code and Codex sessions while Wilkes is running.
+                        </p>
+                      </div>
+                      <span className={`text-[10px] font-medium ${
+                        externalMcpStatus?.running ? "text-emerald-500" : "text-[var(--text-dim)]"
+                      }`}>
+                        {externalMcpStatus?.running ? "Listening" : "Stopped"}
+                      </span>
+                    </div>
+
+                    <div className="space-y-3">
+                      <label className="flex items-center gap-2.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          aria-label="Serve MCP for external clients"
+                          checked={externalMcpStatus?.enabled ?? settings.external_mcp?.enabled ?? false}
+                          disabled={externalMcpBusy}
+                          onChange={(event) => void configureExternalMcp(event.target.checked)}
+                          className="w-3.5 h-3.5 accent-[var(--accent-blue)]"
+                        />
+                        <span className="text-xs text-[var(--text-muted)]">
+                          Serve MCP for external clients
+                        </span>
+                      </label>
+
+                      <label className="flex items-center gap-2.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          aria-label="Require bearer token"
+                          checked={externalMcpRequireToken}
+                          disabled={externalMcpBusy}
+                          onChange={(event) => void configureExternalMcp(
+                            externalMcpStatus?.enabled ?? settings.external_mcp?.enabled ?? false,
+                            externalMcpBindAddress,
+                            externalMcpPort,
+                            event.target.checked,
+                          )}
+                          className="w-3.5 h-3.5 accent-[var(--accent-blue)]"
+                        />
+                        <span className="text-xs text-[var(--text-muted)]">
+                          Require bearer token
+                        </span>
+                      </label>
+
+                      <div className="grid grid-cols-[minmax(0,2fr)_minmax(6rem,1fr)_auto] items-end gap-2">
+                        <label className="space-y-1">
+                          <span className="text-xs text-[var(--text-muted)]">Bind address</span>
+                          <input
+                            aria-label="External MCP bind address"
+                            type="text"
+                            value={externalMcpBindAddress}
+                            disabled={externalMcpBusy}
+                            spellCheck={false}
+                            onChange={(event) => setExternalMcpBindAddress(event.target.value)}
+                            placeholder="127.0.0.1"
+                            className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs font-mono text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)]"
+                          />
+                        </label>
+                        <label className="flex-1 space-y-1">
+                          <span className="text-xs text-[var(--text-muted)]">Port</span>
+                          <input
+                            aria-label="External MCP port"
+                            type="number"
+                            min={1}
+                            max={65535}
+                            value={externalMcpPort}
+                            disabled={externalMcpBusy}
+                            onChange={(event) => setExternalMcpPort(Number(event.target.value))}
+                            className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)]"
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          disabled={
+                            externalMcpBusy
+                            || externalMcpBindAddress.trim().length === 0
+                            || externalMcpPort < 1
+                            || externalMcpPort > 65535
+                          }
+                          onClick={() => void configureExternalMcp(
+                            externalMcpStatus?.enabled ?? settings.external_mcp?.enabled ?? false,
+                            externalMcpBindAddress,
+                            externalMcpPort,
+                            externalMcpRequireToken,
+                          )}
+                          className="px-3 py-1.5 text-xs rounded border border-[var(--border-main)] bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] disabled:opacity-50"
+                        >
+                          Apply
+                        </button>
+                      </div>
+
+                      {externalMcpBindAddress.trim() !== "::1" && !externalMcpBindAddress.trim().startsWith("127.") && (
+                        <div role="status" className="p-2 bg-amber-900/20 border border-amber-800/50 rounded text-[10px] text-amber-300">
+                          {externalMcpRequireToken
+                            ? "A non-loopback address exposes Wilkes MCP to the network. Keep the bearer token private and use host firewall rules where appropriate."
+                            : "A non-loopback address exposes Wilkes MCP without authentication. Anyone who can reach this address can use its tools; use host firewall rules to restrict access."}
+                          {(externalMcpBindAddress.trim() === "0.0.0.0" || externalMcpBindAddress.trim() === "::") && (
+                            <> Wildcard addresses listen on all interfaces; remote clients must replace the wildcard in the copied endpoint with this machine&apos;s reachable address.</>
+                          )}
+                        </div>
+                      )}
+
+                      {externalMcpStatus?.running && externalMcpStatus.url && (
+                        <div className="space-y-2 rounded border border-[var(--border-main)] bg-[var(--bg-active)]/30 p-2.5">
+                          <div>
+                            <p className="text-[10px] text-[var(--text-dim)] mb-1">Endpoint</p>
+                            <button
+                              type="button"
+                              onClick={() => void copyExternalMcpText(externalMcpStatus.url!)}
+                              className="w-full text-left text-[10px] font-mono break-all text-[var(--text-main)] hover:text-[var(--accent-blue)]"
+                              title="Copy endpoint"
+                            >
+                              {externalMcpStatus.url}
+                            </button>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            {externalMcpStatus.require_token && externalMcpStatus.token && (
+                              <button
+                                type="button"
+                                onClick={() => void copyExternalMcpText(externalMcpStatus.token!)}
+                                className="px-2.5 py-1 text-[10px] rounded border border-[var(--border-main)] hover:bg-[var(--bg-hover)]"
+                              >
+                                Copy token
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => void copyExternalMcpText(
+                                externalMcpStatus.require_token && externalMcpStatus.token
+                                  ? `claude mcp add --transport http --scope user --header "Authorization: Bearer ${externalMcpStatus.token}" wilkes ${externalMcpStatus.url}`
+                                  : `claude mcp add --transport http --scope user wilkes ${externalMcpStatus.url}`,
+                              )}
+                              className="px-2.5 py-1 text-[10px] rounded border border-[var(--border-main)] hover:bg-[var(--bg-hover)]"
+                            >
+                              Copy Claude setup
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void copyExternalMcpText(
+                                externalMcpStatus.require_token && externalMcpStatus.token
+                                  ? `export WILKES_MCP_TOKEN='${externalMcpStatus.token}'\ncodex mcp add --url ${externalMcpStatus.url} --bearer-token-env-var WILKES_MCP_TOKEN wilkes`
+                                  : `codex mcp add --url ${externalMcpStatus.url} wilkes`,
+                              )}
+                              className="px-2.5 py-1 text-[10px] rounded border border-[var(--border-main)] hover:bg-[var(--bg-hover)]"
+                            >
+                              Copy Codex setup
+                            </button>
+                            {externalMcpStatus.require_token && externalMcpStatus.token && (
+                              <button
+                                type="button"
+                                disabled={externalMcpBusy}
+                                onClick={() => void rotateExternalMcpToken()}
+                                className="px-2.5 py-1 text-[10px] rounded border border-red-900/50 text-red-400 hover:bg-red-900/20 disabled:opacity-50"
+                              >
+                                Rotate token
+                              </button>
+                            )}
+                          </div>
+                          <p className="text-[10px] text-[var(--text-dim)]">
+                            {externalMcpStatus.require_token
+                              ? "Codex needs WILKES_MCP_TOKEN in the environment of every session. Rotating the token disconnects existing clients."
+                              : "No bearer token is required. Enable token authentication before exposing this endpoint to an untrusted network."}
+                          </p>
+                        </div>
+                      )}
+
+                      {externalMcpError && (
+                        <div role="alert" className="p-2 bg-red-900/20 border border-red-900/50 rounded text-[10px] text-red-400 break-all">
+                          {externalMcpError}
+                        </div>
+                      )}
                     </div>
                   </section>
                 </div>

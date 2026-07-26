@@ -32,6 +32,7 @@ import type {
   NewSmartCollection,
   CollectionValidation,
   SearchLogEntry,
+  ExternalMcpStatus,
 } from "../lib/types";
 
 export interface DataPaths {
@@ -50,6 +51,15 @@ export interface SearchApi {
   preview(matchRef: MatchRef): Promise<PreviewData>;
   getSettings(): Promise<Settings>;
   updateSettings(patch: Partial<Settings>): Promise<Settings>;
+  /** Desktop-only lifecycle controls for the opt-in external MCP endpoint. */
+  getExternalMcpStatus?(): Promise<ExternalMcpStatus>;
+  configureExternalMcp?(
+    enabled: boolean,
+    requireToken: boolean,
+    bindAddress: string,
+    port: number,
+  ): Promise<ExternalMcpStatus>;
+  rotateExternalMcpToken?(): Promise<ExternalMcpStatus>;
   listBookmarks(): Promise<Bookmark[]>;
   addBookmark(bookmark: NewBookmark): Promise<Bookmark>;
   removeBookmark(id: string): Promise<void>;

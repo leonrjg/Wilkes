@@ -34,6 +34,25 @@ describe("TauriSearchApi", () => {
     expect(invoke).toHaveBeenCalledWith("update_settings", { patch });
   });
 
+  it("should configure the external MCP endpoint", async () => {
+    (invoke as any).mockResolvedValue({ enabled: true, running: true, port: 39217 });
+    await api.configureExternalMcp(true, false, "192.168.1.20", 39217);
+    expect(invoke).toHaveBeenCalledWith("configure_external_mcp", {
+      enabled: true,
+      requireToken: false,
+      bindAddress: "192.168.1.20",
+      port: 39217,
+    });
+  });
+
+  it("should get and rotate external MCP credentials", async () => {
+    (invoke as any).mockResolvedValue({ enabled: true, running: true, port: 39217 });
+    await api.getExternalMcpStatus();
+    expect(invoke).toHaveBeenCalledWith("get_external_mcp_status");
+    await api.rotateExternalMcpToken();
+    expect(invoke).toHaveBeenCalledWith("rotate_external_mcp_token");
+  });
+
   it("should call invoke for updateBookmarkNote", async () => {
     (invoke as any).mockResolvedValue({ id: "b1", note: "hi" });
     await api.updateBookmarkNote("b1", "hi");

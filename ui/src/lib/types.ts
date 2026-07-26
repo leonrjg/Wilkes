@@ -422,6 +422,22 @@ export interface Settings {
   chat_config?: ChatBackendConfig[];
   /** User-authored instructions applied to every chat turn. */
   chat_custom_instructions?: string;
+  /** Optional MCP endpoint for regular Claude Code and Codex clients. */
+  external_mcp?: ExternalMcpSettings;
+}
+
+export interface ExternalMcpSettings {
+  enabled: boolean;
+  require_token: boolean;
+  bind_address: string;
+  port: number;
+}
+
+export interface ExternalMcpStatus extends ExternalMcpSettings {
+  running: boolean;
+  url: string | null;
+  token: string | null;
+  error: string | null;
 }
 
 export interface ChatBackendConfig {
