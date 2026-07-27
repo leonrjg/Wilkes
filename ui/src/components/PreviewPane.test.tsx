@@ -128,7 +128,8 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
     expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
-    expect(screen.getAllByText("test.txt")[0]).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "test.txt" })).toBeInTheDocument();
+    expect(screen.getAllByText("test.txt")).toHaveLength(1);
   });
 
   it("defaults Markdown files to rendered and toggles to source with an icon button", () => {
@@ -428,7 +429,8 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
     expect(screen.getByText("Loading metadata…")).toBeInTheDocument();
-    expect(screen.getAllByText("test.pdf").length).toBeGreaterThan(0);
+    expect(screen.getByRole("tab", { name: "test.pdf" })).toBeInTheDocument();
+    expect(screen.getAllByText("test.pdf")).toHaveLength(1);
   });
 
   it("replaces the displayed path with a copy path action", () => {

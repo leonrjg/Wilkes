@@ -16,15 +16,14 @@ import { formatDocumentMonthYear } from "../lib/dateFormatting";
 import { useToasts } from "./Toast";
 import { Tooltip } from "./Tooltip";
 import { CopyButton } from "./CopyButton";
-import { fileName } from "./DocumentEntryRow";
 import RelatedDocumentsPane from "./RelatedDocumentsPane";
 import BookmarkDetails from "./preview/BookmarkDetails";
 import type { BookmarkAnchor } from "./preview/bookmarkPosition";
 import ViewerTabs from "./ViewerTabs";
 
-function headerTitle(path: string, metadata: DocumentMetadata | null) {
+function headerTitle(metadata: DocumentMetadata | null) {
   const title = metadata?.title?.trim();
-  return title && title.length > 0 ? title : fileName(path);
+  return title && title.length > 0 ? title : null;
 }
 
 function headerAuthor(metadata: DocumentMetadata | null) {
@@ -228,6 +227,7 @@ export default function PreviewPane() {
         bookmark.origin.PdfPage.page === pdfPage &&
         bboxesEqual(bookmark.origin.PdfPage.bbox, pdfBbox),
     )?.rects ?? null;
+  const title = headerTitle(viewerMetadata);
   const author = headerAuthor(viewerMetadata);
   const createdAt = formatDocumentMonthYear(viewerMetadata?.created_at);
   const links = buildExternalLinks(viewerMetadata?.doi, viewerMetadata?.title);
@@ -309,20 +309,22 @@ export default function PreviewPane() {
         </div>
 
         <div className="flex flex-col min-w-0 flex-1 selectable">
-          <div className="flex items-center gap-1 min-w-0">
-            <span className="text-xs font-medium text-[var(--text-main)] truncate leading-tight">
-              {headerTitle(selectedMatch.path, viewerMetadata)}
-            </span>
-            <Tooltip content="Copy title">
-              <CopyButton
-                copy={() => api.writeClipboard(headerTitle(selectedMatch.path, viewerMetadata))}
-                copiedChildren={<Check size={10} />}
-                className="p-0.5 hover:bg-[var(--bg-active)] rounded text-[var(--text-dim)] hover:text-[var(--text-main)] flex-shrink-0"
-              >
-                <Copy size={10} />
-              </CopyButton>
-            </Tooltip>
-          </div>
+          {title && (
+            <div className="flex items-center gap-1 min-w-0">
+              <span className="text-xs font-medium text-[var(--text-main)] truncate leading-tight">
+                {title}
+              </span>
+              <Tooltip content="Copy title">
+                <CopyButton
+                  copy={() => api.writeClipboard(title)}
+                  copiedChildren={<Check size={10} />}
+                  className="p-0.5 hover:bg-[var(--bg-active)] rounded text-[var(--text-dim)] hover:text-[var(--text-main)] flex-shrink-0"
+                >
+                  <Copy size={10} />
+                </CopyButton>
+              </Tooltip>
+            </div>
+          )}
           <div className="flex items-center gap-1 min-w-0 text-[10px] text-[var(--text-dim)] leading-tight">
             {createdAt && <span className={metadataBadgeClassName()}>{createdAt}</span>}
             {author && <span className="truncate">{author}</span>}

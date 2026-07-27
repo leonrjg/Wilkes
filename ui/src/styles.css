@@ -18,15 +18,15 @@ body,
   --bg-hover: #f9fafb;
   --bg-input: #ffffff;
   --bg-card: #f9fafb;
-  
+
   --text-main: #171717;
   --text-muted: #737373;
   --text-dim: #a3a3a3;
   --text-on-active: #000000;
-  
+
   --border-main: #e5e5e5;
   --border-strong: #d4d4d4;
-  
+
   --accent-blue: #2563eb;
   --accent-blue-hover: #1d4ed8;
   --accent-blue-muted: #dbeafe;
@@ -41,15 +41,15 @@ body,
   --bg-hover: #1c1c1c;
   --bg-input: #171717;
   --bg-card: #141414;
-  
+
   --text-main: #ededed;
   --text-muted: #a3a3a3;
   --text-dim: #737373;
   --text-on-active: #ffffff;
-  
+
   --border-main: #262626;
   --border-strong: #404040;
-  
+
   --accent-blue: #3b82f6;
   --accent-blue-hover: #60a5fa;
   --accent-blue-muted: #1e3a8a;
@@ -185,7 +185,7 @@ body,
 }
 
 .prose-document {
-  max-width: 72rem;
+  max-width: 90rem;
   margin: 0 auto;
   font-size: 1rem;
   line-height: 1.65;
@@ -312,13 +312,22 @@ body,
   white-space: pre;
 }
 
-.prose-chat table,
-.prose-document table {
+.prose-chat table {
   border-collapse: collapse;
   display: block;
   max-width: 100%;
   overflow-x: auto;
   white-space: nowrap;
+}
+
+.prose-document table {
+  border-collapse: collapse;
+  display: table;
+  max-width: 100%;
+  overflow: visible;
+  table-layout: auto;
+  white-space: normal;
+  width: 100%;
 }
 
 .prose-chat th,
@@ -327,6 +336,15 @@ body,
 .prose-document td {
   border: 1px solid var(--border-main);
   padding: 0.25rem 0.45rem;
+}
+
+.prose-document th,
+.prose-document td {
+  min-width: 7rem;
+  overflow-wrap: break-word;
+  text-align: center;
+  vertical-align: middle;
+  word-break: normal;
 }
 
 .prose-chat th,

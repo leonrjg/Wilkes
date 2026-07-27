@@ -2,24 +2,27 @@ import { create } from "zustand";
 import { api } from "../services";
 import type { Bookmark, NewBookmark } from "../lib/types";
 
+export type BookmarkScope = "current" | "all";
+
 interface BookmarksStore {
   bookmarks: Bookmark[];
   filterText: string;
-  scopePath: string | null;
+  scope: BookmarkScope;
   paneOpen: boolean;
   load: () => Promise<void>;
   add: (bookmark: NewBookmark) => Promise<Bookmark>;
   remove: (id: string) => Promise<void>;
   updateNote: (id: string, note: string | null) => Promise<void>;
   setFilter: (text: string) => void;
-  setScope: (path: string | null) => void;
-  togglePane: () => void;
+  setScope: (scope: BookmarkScope) => void;
+  openPane: (scope: BookmarkScope) => void;
+  closePane: () => void;
 }
 
 export const useBookmarksStore = create<BookmarksStore>((set) => ({
   bookmarks: [],
   filterText: "",
-  scopePath: null,
+  scope: "all",
   paneOpen: false,
 
   load: async () => {
@@ -46,6 +49,7 @@ export const useBookmarksStore = create<BookmarksStore>((set) => ({
   },
 
   setFilter: (filterText) => set({ filterText }),
-  setScope: (scopePath) => set({ scopePath }),
-  togglePane: () => set((state) => ({ paneOpen: !state.paneOpen })),
+  setScope: (scope) => set({ scope }),
+  openPane: (scope) => set({ paneOpen: true, scope }),
+  closePane: () => set({ paneOpen: false }),
 }));

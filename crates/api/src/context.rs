@@ -984,15 +984,17 @@ impl AppContext {
     /// [`MetadataCache::upsert`], which only overwrites a field when the new
     /// derivation actually produced a value and never lets file extraction
     /// clobber authoritative Zotero fields.
+    ///
+    /// Callers are responsible for confining explicit paths to the document
+    /// roots they expose. The server does this at its HTTP boundary; desktop
+    /// libraries normally live outside Wilkes' private application data
+    /// directory.
     pub async fn refresh_file_metadata(&self, path: Option<PathBuf>) -> anyhow::Result<()> {
         let s = self.get_settings().await;
         let Some(cache) = self.metadata_cache() else {
             return Ok(());
         };
         let paths = if let Some(path) = path {
-            if !is_under(&path, &self.data_dir) {
-                anyhow::bail!("Access denied: path outside data directory");
-            }
             vec![path]
         } else {
             match cache.lock() {

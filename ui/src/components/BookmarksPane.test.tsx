@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import BookmarksPane from "./BookmarksPane";
@@ -55,7 +55,7 @@ describe("BookmarksPane", () => {
         },
       ],
       filterText: "",
-      scopePath: null,
+      scope: "current",
       paneOpen: true,
       remove: vi.fn().mockResolvedValue(undefined),
     });
@@ -86,14 +86,14 @@ describe("BookmarksPane", () => {
   });
 
   it("closes the pane from the header close button and keeps the dock toggle", () => {
-    const togglePane = vi.fn();
+    const closePane = vi.fn();
     const setBookmarksDock = vi.fn();
-    useBookmarksStore.setState({ togglePane });
+    useBookmarksStore.setState({ closePane });
     useSettingsStore.setState({ bookmarksDock: "Right", setBookmarksDock });
     renderPane();
 
     fireEvent.click(screen.getByRole("button", { name: "Close bookmarks" }));
-    expect(togglePane).toHaveBeenCalledTimes(1);
+    expect(closePane).toHaveBeenCalledTimes(1);
 
     // Dock toggle still available (moved next to the scope selector).
     fireEvent.click(screen.getByRole("button", { name: "Dock left" }));
@@ -162,8 +162,12 @@ describe("BookmarksPane", () => {
   it("shows all bookmarks and filters in memory", () => {
     renderPane();
 
+    expect(screen.getByRole("heading", { name: "Bookmarks" })).toBeInTheDocument();
+    expect(screen.getByLabelText("1 bookmark")).toHaveTextContent("1");
+
     fireEvent.click(screen.getByText("All"));
     expect(screen.getByText("other file quote")).toBeInTheDocument();
+    expect(screen.getByLabelText("2 bookmarks")).toHaveTextContent("2");
 
     fireEvent.change(screen.getByPlaceholderText("Filter bookmarks"), {
       target: { value: "current" },
@@ -171,6 +175,44 @@ describe("BookmarksPane", () => {
 
     expect(screen.getByText("current file quote")).toBeInTheDocument();
     expect(screen.queryByText("other file quote")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("1 bookmark")).toHaveTextContent("1");
+  });
+
+  it("preserves the All scope when bookmark navigation changes the active file", () => {
+    renderPane();
+    fireEvent.click(screen.getByText("All"));
+
+    fireEvent.click(screen.getByText("other file quote"));
+    expect(useViewerStore.getState().openMatch).toHaveBeenCalledWith({
+      path: "/tmp/other.pdf",
+      origin: { PdfPage: { page: 9, bbox: null } },
+      text_range: undefined,
+    });
+
+    const otherMatch = {
+      path: "/tmp/other.pdf",
+      origin: { PdfPage: { page: 9, bbox: null } },
+    } as const;
+    act(() => {
+      useViewerStore.setState((state) => ({
+        tabs: state.tabs.map((tab) =>
+          tab.id === state.activeTabId
+            ? {
+                ...tab,
+                path: otherMatch.path,
+                match: otherMatch,
+                history: [otherMatch],
+                historyIndex: 0,
+              }
+            : tab,
+        ),
+      }));
+    });
+
+    expect(useBookmarksStore.getState().scope).toBe("all");
+    expect(screen.getByText("current file quote")).toBeInTheDocument();
+    expect(screen.getByText("other file quote")).toBeInTheDocument();
+    expect(screen.getByLabelText("2 bookmarks")).toHaveTextContent("2");
   });
 
   it("edits and saves a note through the store", async () => {

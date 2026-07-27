@@ -5,6 +5,8 @@ import { useSettingsStore } from "./stores/useSettingsStore";
 import { useSearchStore } from "./stores/useSearchStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useChatStore } from "./stores/useChatStore";
+import { useBookmarksStore } from "./stores/useBookmarksStore";
+import { useViewerStore } from "./stores/useViewerStore";
 import { ToastProvider } from "./components/Toast";
 import { source } from "./services";
 
@@ -55,6 +57,11 @@ vi.mock("./components/preview/CodeViewer", () => ({ default: () => <div data-tes
 vi.mock("./components/preview/PdfViewer", () => ({ default: () => <div data-testid="pdf-viewer">PdfViewer</div> }));
 vi.mock("./components/SettingsModal", () => ({ default: ({ isOpen }: any) => isOpen ? <div data-testid="settings-modal">Settings Modal</div> : null }));
 
+const bookmarkPaneActions = {
+  openPane: useBookmarksStore.getState().openPane,
+  closePane: useBookmarksStore.getState().closePane,
+};
+
 describe("App", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -89,6 +96,18 @@ describe("App", () => {
       paneOpening: false,
       openPane: vi.fn().mockResolvedValue(undefined),
       togglePane: vi.fn(),
+    });
+    useBookmarksStore.setState({
+      ...bookmarkPaneActions,
+      bookmarks: [],
+      filterText: "",
+      scope: "all",
+      paneOpen: false,
+      load: vi.fn().mockResolvedValue(undefined),
+    });
+    useViewerStore.setState({
+      activeTabId: null,
+      tabs: [],
     });
   });
 
@@ -159,6 +178,48 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Ask the documents" }));
     expect(togglePane).toHaveBeenCalledTimes(1);
     expect(openPane).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens bookmarks in This file scope when a document was opened while the pane was closed", () => {
+    const match = {
+      path: "/tmp/current.txt",
+      origin: { TextFile: { line: 1, col: 0 } },
+    } as const;
+    useViewerStore.setState({
+      activeTabId: "current-tab",
+      tabs: [{
+        id: "current-tab",
+        path: match.path,
+        match,
+        history: [match],
+        historyIndex: 0,
+        previewData: {
+          Text: {
+            content: "Current document",
+            language: "text",
+            highlight_line: 1,
+            highlight_range: { start: 0, end: 0 },
+          },
+        },
+        previewLoading: false,
+        metadata: null,
+        metadataStatus: "idle",
+        requestId: 1,
+      }],
+    });
+
+    render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Bookmarks" }));
+
+    expect(useBookmarksStore.getState()).toMatchObject({
+      paneOpen: true,
+      scope: "current",
+    });
   });
 
   it("handles sidebar resizing", async () => {

@@ -32,7 +32,7 @@ describe("useBookmarksStore", () => {
     useBookmarksStore.setState({
       bookmarks: [],
       filterText: "",
-      scopePath: null,
+      scope: "all",
       paneOpen: false,
     });
   });
@@ -75,8 +75,13 @@ describe("useBookmarksStore", () => {
     expect(useBookmarksStore.getState().bookmarks).toEqual([noted]);
   });
 
-  it("toggles pane state", () => {
-    useBookmarksStore.getState().togglePane();
+  it("opens with an explicit scope and closes without changing it", () => {
+    useBookmarksStore.getState().openPane("current");
     expect(useBookmarksStore.getState().paneOpen).toBe(true);
+    expect(useBookmarksStore.getState().scope).toBe("current");
+
+    useBookmarksStore.getState().closePane();
+    expect(useBookmarksStore.getState().paneOpen).toBe(false);
+    expect(useBookmarksStore.getState().scope).toBe("current");
   });
 });

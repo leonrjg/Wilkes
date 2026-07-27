@@ -221,6 +221,15 @@ async fn resolve_file_metadata_for_ctx(
         .map_err(|e| e.to_string())
 }
 
+async fn refresh_file_metadata_for_ctx(
+    ctx: Arc<AppContext>,
+    path: Option<String>,
+) -> Result<(), String> {
+    ctx.refresh_file_metadata(path.map(Into::into))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 async fn zotero_add_item_for_ctx(ctx: Arc<AppContext>, path: String) -> Result<AddOutcome, String> {
     let settings = ctx.get_settings().await;
     wilkes_api::commands::integrations::zotero::zotero_add_item(settings, path.into())
@@ -1860,10 +1869,7 @@ async fn resolve_file_metadata(path: String, app: AppHandle) -> Result<DocumentM
 
 #[tauri::command]
 async fn refresh_file_metadata(path: Option<String>, app: AppHandle) -> Result<(), String> {
-    app_context(&app)
-        .refresh_file_metadata(path.map(Into::into))
-        .await
-        .map_err(|e| e.to_string())
+    refresh_file_metadata_for_ctx(app_context(&app), path).await
 }
 
 #[tauri::command]
@@ -2389,6 +2395,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(metadata, DocumentMetadata::default());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_file_metadata_for_ctx_allows_outside_data_dir() {
+        let outside_dir = tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.txt");
+        std::fs::write(&outside, "hello").unwrap();
+
+        let (_data_dir, ctx) = test_ctx();
+        refresh_file_metadata_for_ctx(ctx, Some(outside.display().to_string()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

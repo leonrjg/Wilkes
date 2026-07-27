@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Check, Copy, Edit2, FileText, Sidebar, Trash2, X } from "react-feather";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
@@ -29,7 +29,7 @@ export default function BookmarksPane() {
   const parentRef = useRef<HTMLDivElement>(null);
   const bookmarks = useBookmarksStore((s) => s.bookmarks);
   const filterText = useBookmarksStore((s) => s.filterText);
-  const scopePath = useBookmarksStore((s) => s.scopePath);
+  const scope = useBookmarksStore((s) => s.scope);
   const setFilter = useBookmarksStore((s) => s.setFilter);
   const setScope = useBookmarksStore((s) => s.setScope);
   const remove = useBookmarksStore((s) => s.remove);
@@ -40,15 +40,11 @@ export default function BookmarksPane() {
   const openMatch = useViewerStore((state) => state.openMatch);
   const dock = useSettingsStore((s) => s.bookmarksDock);
   const setDock = useSettingsStore((s) => s.setBookmarksDock);
-  const closePane = useBookmarksStore((s) => s.togglePane);
+  const closePane = useBookmarksStore((s) => s.closePane);
   const zoteroEnabled = useSettingsStore(
     (s) => s.settings?.integrations.zotero.enabled ?? false,
   );
   const { addToast, notifyPending } = useToasts();
-
-  useEffect(() => {
-    setScope(selectedPath);
-  }, [selectedPath, setScope]);
 
   const copyCitation = async (bookmark: Bookmark) => {
     const dismissPending = notifyPending("Fetching citation…");
@@ -104,18 +100,20 @@ export default function BookmarksPane() {
     }
   };
 
-  const scopedToCurrentFile = scopePath !== null;
+  const scopedToCurrentFile = scope === "current";
   const filtered = useMemo(() => {
     const query = filterText.trim().toLowerCase();
     return bookmarks.filter((bookmark) => {
-      if (scopePath && bookmark.path !== scopePath) return false;
+      if (scope === "current" && bookmark.path !== selectedPath) return false;
       if (!query) return true;
       return (
         bookmark.quote.toLowerCase().includes(query) ||
         bookmark.path.toLowerCase().includes(query)
       );
     });
-  }, [bookmarks, filterText, scopePath]);
+  }, [bookmarks, filterText, scope, selectedPath]);
+  const bookmarkCountLabel =
+    `${filtered.length} ${filtered.length === 1 ? "bookmark" : "bookmarks"}`;
 
   const virtualizer = useVirtualizer({
     count: filtered.length,
@@ -130,13 +128,16 @@ export default function BookmarksPane() {
   return (
     <div className="h-full flex flex-col bg-[var(--bg-sidebar)] border-l border-[var(--border-main)]">
       <div className="p-2 border-b border-[var(--border-main)] flex flex-col gap-2">
-        <div className="flex items-center gap-2">
-          <input
-            value={filterText}
-            onChange={(e) => setFilter(e.target.value)}
-            placeholder="Filter bookmarks"
-            className="min-w-0 flex-1 bg-[var(--bg-app)] border border-[var(--border-main)] rounded px-2 py-1 text-xs outline-none focus:border-[var(--accent-blue)]"
-          />
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <h2 className="truncate text-xs font-semibold text-[var(--text-main)]">Bookmarks</h2>
+            <span
+              aria-label={bookmarkCountLabel}
+              className="inline-flex min-w-5 items-center justify-center rounded-full bg-[var(--bg-active)] px-1.5 py-0.5 text-[10px] tabular-nums text-[var(--text-muted)]"
+            >
+              {filtered.length}
+            </span>
+          </div>
           <Tooltip content="Close bookmarks">
             <button
               type="button"
@@ -147,19 +148,25 @@ export default function BookmarksPane() {
             </button>
           </Tooltip>
         </div>
+        <input
+          value={filterText}
+          onChange={(e) => setFilter(e.target.value)}
+          placeholder="Filter bookmarks"
+          className="min-w-0 w-full bg-[var(--bg-app)] border border-[var(--border-main)] rounded px-2 py-1 text-xs outline-none focus:border-[var(--accent-blue)]"
+        />
         <div className="flex items-center justify-between gap-2">
           <div className="inline-flex rounded border border-[var(--border-main)] overflow-hidden bg-[var(--bg-active)]">
             <button
               type="button"
               disabled={!selectedPath}
-              onClick={() => setScope(selectedPath)}
+              onClick={() => setScope("current")}
               className={`px-2 py-1 text-[11px] ${scopedToCurrentFile ? "text-[var(--text-main)] bg-[var(--bg-header)]" : "text-[var(--text-muted)]"} disabled:opacity-40`}
             >
               This file
             </button>
             <button
               type="button"
-              onClick={() => setScope(null)}
+              onClick={() => setScope("all")}
               className={`px-2 py-1 text-[11px] border-l border-[var(--border-main)] ${!scopedToCurrentFile ? "text-[var(--text-main)] bg-[var(--bg-header)]" : "text-[var(--text-muted)]"}`}
             >
               All

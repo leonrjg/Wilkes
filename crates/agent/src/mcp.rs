@@ -108,6 +108,7 @@ pub(crate) async fn start(
         cwd,
         search,
         Some(integrations),
+        HostValidation::LoopbackOnly,
         "chat",
     )
     .await
@@ -167,10 +168,17 @@ pub async fn start_external(
         PathBuf::new(),
         Some(search),
         None,
+        HostValidation::Any,
         "external",
     )
     .await?;
     Ok(ExternalMcpRuntime { runtime })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HostValidation {
+    LoopbackOnly,
+    Any,
 }
 
 #[derive(Clone, Debug)]
@@ -187,6 +195,7 @@ async fn start_server(
     cwd: PathBuf,
     search: Option<Arc<dyn SearchService>>,
     integrations: Option<IntegrationsSettings>,
+    host_validation: HostValidation,
     lifecycle: &'static str,
 ) -> anyhow::Result<McpRuntime> {
     let token = Arc::new(RwLock::new(token));
@@ -196,6 +205,10 @@ async fn start_server(
         .with_json_response(true)
         .with_sse_keep_alive(None)
         .with_cancellation_token(shutdown.child_token());
+    let config = match host_validation {
+        HostValidation::LoopbackOnly => config,
+        HostValidation::Any => config.disable_allowed_hosts(),
+    };
     let service: rmcp::transport::streamable_http_server::StreamableHttpService<
         WilkesMcp,
         rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
@@ -1570,6 +1583,7 @@ mod tests {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
+        let external_host = format!("192.168.1.6:{port}");
         let runtime = start_external(
             "127.0.0.1".parse().unwrap(),
             port,
@@ -1579,9 +1593,22 @@ mod tests {
         .await
         .unwrap();
         let client = reqwest::Client::new();
+
+        // A raw GET is not a valid request for this stateless MCP transport,
+        // but an external Host must reach the transport instead of being
+        // rejected by rmcp's loopback-only DNS-rebinding default.
+        let get = client
+            .get(runtime.url())
+            .header("Host", &external_host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::METHOD_NOT_ALLOWED);
+
         let send = |body: serde_json::Value| {
             client
                 .post(runtime.url())
+                .header("Host", &external_host)
                 .header("Accept", "application/json, text/event-stream")
                 .header("MCP-Protocol-Version", "2025-11-25")
                 .json(&body)
@@ -1623,6 +1650,52 @@ mod tests {
         assert!(names.contains(&"search"));
         assert!(names.contains(&"get_document_text"));
         assert!(names.contains(&"download"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_external_server_accepts_external_host_only_with_bearer_token() {
+        let library = tempdir().unwrap();
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let external_host = format!("192.168.1.6:{port}");
+        let runtime = start_external(
+            "127.0.0.1".parse().unwrap(),
+            port,
+            Some("test-token".to_string()),
+            fake_search_with_root(library.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "wilkes-test", "version": "1.0" }
+            }
+        });
+        let request = || {
+            client
+                .post(runtime.url())
+                .header("Host", &external_host)
+                .header("Accept", "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2025-11-25")
+                .json(&initialize)
+        };
+
+        let unauthorized = request().send().await.unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = request()
+            .header("Authorization", "Bearer test-token")
+            .send()
+            .await
+            .unwrap();
+        assert!(authorized.status().is_success());
     }
 
     #[test]

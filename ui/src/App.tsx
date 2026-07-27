@@ -16,7 +16,7 @@ import { useSettingsStore } from "./stores/useSettingsStore";
 import { useBookmarksStore } from "./stores/useBookmarksStore";
 import { useChatStore } from "./stores/useChatStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
-import { useViewerStore } from "./stores/useViewerStore";
+import { activeViewerTab, useViewerStore } from "./stores/useViewerStore";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
 import { api, source, isTauri } from "./services";
 import type { AgentBackend } from "./lib/types";
@@ -28,7 +28,8 @@ export default function App() {
 
   const loadSettings = useSettingsStore((s) => s.load);
   const loadBookmarks = useBookmarksStore((s) => s.load);
-  const toggleBookmarksPane = useBookmarksStore((s) => s.togglePane);
+  const openBookmarksPane = useBookmarksStore((s) => s.openPane);
+  const closeBookmarksPane = useBookmarksStore((s) => s.closePane);
   const bookmarksPaneOpen = useBookmarksStore((s) => s.paneOpen);
   const bookmarksDock = useSettingsStore((s) => s.bookmarksDock);
   const directory = useSettingsStore((s) => s.directory);
@@ -54,6 +55,7 @@ export default function App() {
 
   const openMatch = useViewerStore((state) => state.openMatch);
   const openFile = useViewerStore((state) => state.openFile);
+  const activeViewerPath = useViewerStore((state) => activeViewerTab(state)?.path ?? null);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(320);
@@ -327,7 +329,13 @@ export default function App() {
       )}
       <Tooltip content="Bookmarks">
         <button
-          onClick={toggleBookmarksPane}
+          onClick={() => {
+            if (bookmarksPaneOpen) {
+              closeBookmarksPane();
+            } else {
+              openBookmarksPane(activeViewerPath ? "current" : "all");
+            }
+          }}
           aria-label="Bookmarks"
           className="w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all border border-[var(--border-main)] hover:border-[var(--border-strong)]"
         >
