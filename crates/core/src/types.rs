@@ -430,6 +430,24 @@ pub struct Bookmark {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BookmarkClustersQuery {
+    pub bookmark_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BookmarkCluster {
+    pub bookmark_ids: Vec<String>,
+    pub representative_bookmark_id: String,
+    pub cohesion: f32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BookmarkClustersResult {
+    pub clusters: Vec<BookmarkCluster>,
+    pub unclustered_bookmark_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NewBookmark {
     pub path: PathBuf,
     pub origin: SourceOrigin,

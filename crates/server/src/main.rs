@@ -28,10 +28,10 @@ use tracing::info;
 use wilkes_api::context::AppContext;
 use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::types::{
-    AddOutcome, CitationResult, CollectionValidation, DocumentMetadata, DocumentTagUpdate,
-    EmbeddingEngine, IntegrationStatus, MatchRef, ModelDescriptor, NewBookmark, NewSmartCollection,
-    NewTag, OpenAlexWork, RelatedDocumentsQuery, SearchLogEntry, SearchQuery, SelectedEmbedder,
-    SemanticScholarPaper, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
+    AddOutcome, BookmarkClustersQuery, CitationResult, CollectionValidation, DocumentMetadata,
+    DocumentTagUpdate, EmbeddingEngine, IntegrationStatus, MatchRef, ModelDescriptor, NewBookmark,
+    NewSmartCollection, NewTag, OpenAlexWork, RelatedDocumentsQuery, SearchLogEntry, SearchQuery,
+    SelectedEmbedder, SemanticScholarPaper, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 
 fn confine_to_uploads(
@@ -200,6 +200,19 @@ async fn add_bookmark_handler(
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(bookmark))
+}
+
+async fn cluster_bookmarks_handler(
+    State(state): State<Arc<AppState>>,
+    Json(query): Json<BookmarkClustersQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let clusters = state
+        .ctx
+        .clone()
+        .cluster_bookmarks(query)
+        .await
+        .map_err(server_err)?;
+    Ok(Json(clusters))
 }
 
 async fn remove_bookmark_handler(
@@ -1082,6 +1095,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/settings", patch(update_settings_handler))
         .route("/api/bookmarks", get(list_bookmarks_handler))
         .route("/api/bookmarks", post(add_bookmark_handler))
+        .route("/api/bookmarks/clusters", post(cluster_bookmarks_handler))
         .route("/api/bookmarks/:id", delete(remove_bookmark_handler))
         .route("/api/bookmarks/:id", patch(update_bookmark_note_handler))
         .route("/api/tags", get(list_tags_handler).post(create_tag_handler))

@@ -53,6 +53,21 @@ describe("HttpSearchApi", () => {
     );
   });
 
+  it("clusterBookmarks posts bookmark IDs", async () => {
+    const result = { clusters: [], unclustered_bookmark_ids: ["b1", "b2", "b3"] };
+    (fetch as any).mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(result),
+    });
+    const query = { bookmark_ids: ["b1", "b2", "b3"] };
+
+    await expect(api.clusterBookmarks(query)).resolves.toEqual(result);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/bookmarks/clusters",
+      expect.objectContaining({ method: "POST", body: JSON.stringify(query) }),
+    );
+  });
+
   it("search streams results", async () => {
     const mockFileMatches = { path: "test.txt", matches: [] };
     const mockStats = { total_files: 1, total_matches: 0, duration_ms: 10 };

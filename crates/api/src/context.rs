@@ -1,4 +1,5 @@
 use parking_lot::Mutex as PLMutex;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,16 +27,19 @@ use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
-    Bookmark, CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbedderModel, FileType,
-    IndexStatus, IndexingConfig, MetadataConflictValue, MetadataSourcePreference, NewBookmark,
-    NewSmartCollection, NewTag, PreviewData, RelatedDocument, RelatedDocumentsQuery,
-    SearchLogEntry, SearchMode, SearchQuery, SearchScope, SelectedEmbedder, SemanticSettings,
-    Settings, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
+    Bookmark, BookmarkCluster, BookmarkClustersQuery, BookmarkClustersResult, CollectionValidation,
+    DocumentMetadata, DocumentTagUpdate, EmbedderModel, FileType, IndexStatus, IndexingConfig,
+    MetadataConflictValue, MetadataSourcePreference, NewBookmark, NewSmartCollection, NewTag,
+    PreviewData, RelatedDocument, RelatedDocumentsQuery, SearchLogEntry, SearchMode, SearchQuery,
+    SearchScope, SelectedEmbedder, SemanticSettings, Settings, SmartCollection, Tag,
+    UpdateSmartCollection, UpdateTag,
 };
 
 use crate::commands::search::{start_search, SearchHandle};
 use crate::commands::settings::{get_settings, update_settings};
-use crate::research::{ResearchStore, SearchLogTracker};
+use crate::research::{CachedBookmarkEmbedding, ResearchStore, SearchLogTracker};
+
+const BOOKMARK_EMBEDDING_RECIPE_VERSION: i64 = 1;
 
 // ── EventEmitter ──────────────────────────────────────────────────────────────
 
@@ -403,6 +407,180 @@ impl AppContext {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .update_bookmark_note(id, note)
+    }
+
+    pub async fn cluster_bookmarks(
+        self: Arc<Self>,
+        query: BookmarkClustersQuery,
+    ) -> Result<BookmarkClustersResult, String> {
+        self.ensure_no_active_embed_task(
+            "Semantic index is currently being built. Please wait before grouping bookmarks.",
+        )?;
+
+        let mut requested_ids = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in query.bookmark_ids {
+            if seen.insert(id.clone()) {
+                requested_ids.push(id);
+            }
+        }
+        if requested_ids.is_empty() {
+            return Ok(BookmarkClustersResult::default());
+        }
+
+        let bookmarks = self.list_bookmarks().await.map_err(|e| e.to_string())?;
+        let mut by_id: std::collections::HashMap<String, Bookmark> = bookmarks
+            .into_iter()
+            .map(|bookmark| (bookmark.id.clone(), bookmark))
+            .collect();
+        let mut prepared = Vec::new();
+        let mut inherently_unclustered = Vec::new();
+        for id in &requested_ids {
+            let bookmark = by_id
+                .remove(id)
+                .ok_or_else(|| format!("Bookmark not found: {id}"))?;
+            let input = bookmark_embedding_input(&bookmark);
+            if input.trim().is_empty() {
+                inherently_unclustered.push(id.clone());
+                continue;
+            }
+            let input_hash = format!("{:x}", Sha256::digest(input.as_bytes()));
+            prepared.push((id.clone(), input, input_hash));
+        }
+
+        if prepared.len() < 3 {
+            return Ok(BookmarkClustersResult {
+                clusters: Vec::new(),
+                unclustered_bookmark_ids: requested_ids,
+            });
+        }
+
+        let embedder = self.embedder.lock().clone().ok_or_else(|| {
+            "Semantic model unavailable. Build or restore the semantic index first.".to_string()
+        })?;
+        let engine = embedder.engine().as_str().to_string();
+        let model_id = embedder.model_id().to_string();
+        let dimension = embedder.dimension();
+
+        let cached = self
+            .research_store()
+            .map_err(|e| e.to_string())?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cached_bookmark_embeddings(
+                &engine,
+                &model_id,
+                dimension,
+                BOOKMARK_EMBEDDING_RECIPE_VERSION,
+            )
+            .map_err(|e| e.to_string())?;
+        let cached_by_id: std::collections::HashMap<_, _> = cached
+            .into_iter()
+            .map(|cached| (cached.bookmark_id.clone(), cached))
+            .collect();
+
+        let mut vectors: Vec<Option<Vec<f32>>> = vec![None; prepared.len()];
+        let mut misses = Vec::new();
+        for (index, (id, input, input_hash)) in prepared.iter().enumerate() {
+            match cached_by_id.get(id) {
+                Some(cached) if cached.input_hash == *input_hash => {
+                    vectors[index] = Some(cached.embedding.clone());
+                }
+                _ => misses.push((index, id.clone(), input.clone(), input_hash.clone())),
+            }
+        }
+
+        if !misses.is_empty() {
+            let texts: Vec<String> = misses
+                .iter()
+                .map(|(_, _, input, _)| input.clone())
+                .collect();
+            let embedder_for_task = Arc::clone(&embedder);
+            let embeddings = tokio::task::spawn_blocking(move || {
+                let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                embedder_for_task.embed_passages(&refs)
+            })
+            .await
+            .map_err(|e| format!("Bookmark embedding task panicked: {e}"))?
+            .map_err(|e| format!("Could not embed bookmarks: {e:#}"))?;
+            if embeddings.len() != misses.len() {
+                return Err(format!(
+                    "Embedder returned {} bookmark vectors for {} inputs",
+                    embeddings.len(),
+                    misses.len()
+                ));
+            }
+
+            let store = self.research_store().map_err(|e| e.to_string())?;
+            let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+            for ((index, id, _, input_hash), embedding) in misses.into_iter().zip(embeddings) {
+                if embedding.len() != dimension {
+                    return Err(format!(
+                        "Bookmark embedding dimension mismatch. Expected {dimension}, received {}",
+                        embedding.len()
+                    ));
+                }
+                if embedding.iter().any(|value| !value.is_finite()) {
+                    return Err("Embedder returned a non-finite bookmark vector".to_string());
+                }
+                let cached = CachedBookmarkEmbedding {
+                    bookmark_id: id,
+                    input_hash,
+                    embedding: embedding.clone(),
+                };
+                if let Err(error) = store.upsert_bookmark_embedding(
+                    &cached,
+                    &engine,
+                    &model_id,
+                    dimension,
+                    BOOKMARK_EMBEDDING_RECIPE_VERSION,
+                ) {
+                    error!("Could not cache bookmark embedding: {error:#}");
+                }
+                vectors[index] = Some(embedding);
+            }
+        }
+
+        let vectors: Vec<Vec<f32>> = vectors
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| "A bookmark embedding was not produced".to_string())?;
+        let clustered = tokio::task::spawn_blocking(move || {
+            wilkes_core::embed::cluster::cluster_embeddings(&vectors)
+        })
+        .await
+        .map_err(|e| format!("Bookmark clustering task panicked: {e}"))?
+        .map_err(|e| e.to_string())?;
+
+        let clusters = clustered
+            .clusters
+            .into_iter()
+            .map(|cluster| BookmarkCluster {
+                bookmark_ids: cluster
+                    .item_indices
+                    .into_iter()
+                    .map(|index| prepared[index].0.clone())
+                    .collect(),
+                representative_bookmark_id: prepared[cluster.representative_index].0.clone(),
+                cohesion: cluster.cohesion,
+            })
+            .collect();
+        let clustered_unassigned = clustered
+            .unclustered_indices
+            .into_iter()
+            .map(|index| prepared[index].0.clone());
+        inherently_unclustered.extend(clustered_unassigned);
+        let unclustered_set: std::collections::HashSet<_> =
+            inherently_unclustered.into_iter().collect();
+        let unclustered_bookmark_ids = requested_ids
+            .into_iter()
+            .filter(|id| unclustered_set.contains(id))
+            .collect();
+
+        Ok(BookmarkClustersResult {
+            clusters,
+            unclustered_bookmark_ids,
+        })
     }
 
     pub async fn list_files(
@@ -2640,6 +2818,19 @@ impl AppContext {
     }
 }
 
+fn bookmark_embedding_input(bookmark: &Bookmark) -> String {
+    let quote = bookmark.quote.trim();
+    let note = bookmark.note.as_deref().map(str::trim).unwrap_or_default();
+    match (quote.is_empty(), note.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("Selected passage:\n{quote}"),
+        (true, false) => format!("Research note:\n{note}"),
+        (false, false) => {
+            format!("Selected passage:\n{quote}\n\nResearch note:\n{note}")
+        }
+    }
+}
+
 /// Outcome of filling one file's metadata: either freshly extracted (and thus
 /// eligible for a Zotero upgrade), or recovered by re-keying a renamed file's
 /// existing row (already composed, so not re-resolved).
@@ -2854,6 +3045,38 @@ mod tests {
         build_should_fail: bool,
     }
 
+    struct TopicEmbedder {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Embedder for TopicEmbedder {
+        fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    if text.contains("cat") {
+                        vec![1.0, 0.0]
+                    } else {
+                        vec![0.0, 1.0]
+                    }
+                })
+                .collect())
+        }
+
+        fn model_id(&self) -> &str {
+            "topic-test"
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+
+        fn engine(&self) -> EmbeddingEngine {
+            EmbeddingEngine::Fastembed
+        }
+    }
+
     #[async_trait::async_trait]
     impl EmbedderInstaller for FakeInstaller {
         fn is_available(&self, _data_dir: &Path) -> bool {
@@ -2985,6 +3208,69 @@ mod tests {
 
         ctx.remove_bookmark(&bookmark.id).await.unwrap();
         assert!(ctx.list_bookmarks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cluster_bookmarks_embeds_passages_and_reuses_cache() {
+        let (_dir, ctx) = test_ctx();
+        let calls = Arc::new(AtomicUsize::new(0));
+        *ctx.embedder.lock() = Some(Arc::new(TopicEmbedder {
+            calls: Arc::clone(&calls),
+        }));
+
+        let mut bookmark_ids = Vec::new();
+        for quote in [
+            "cat behavior",
+            "cat nutrition",
+            "cat genetics",
+            "quantum fields",
+            "particle physics",
+            "wave functions",
+        ] {
+            let bookmark = ctx
+                .add_bookmark(NewBookmark {
+                    path: PathBuf::from("/tmp/paper.pdf"),
+                    origin: SourceOrigin::PdfPage {
+                        page: 1,
+                        bbox: None,
+                    },
+                    text_range: None,
+                    quote: quote.into(),
+                    note: None,
+                    rects: Vec::new(),
+                })
+                .await
+                .unwrap();
+            bookmark_ids.push(bookmark.id);
+        }
+        let query = BookmarkClustersQuery {
+            bookmark_ids: bookmark_ids.clone(),
+        };
+
+        let first = ctx.clone().cluster_bookmarks(query.clone()).await.unwrap();
+        assert_eq!(first.clusters.len(), 2);
+        assert_eq!(first.clusters[0].bookmark_ids, bookmark_ids[..3]);
+        assert_eq!(first.clusters[1].bookmark_ids, bookmark_ids[3..]);
+        assert!(first.unclustered_bookmark_ids.is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let second = ctx.clone().cluster_bookmarks(query.clone()).await.unwrap();
+        assert_eq!(second.clusters.len(), 2);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the second request should use persisted bookmark embeddings"
+        );
+
+        ctx.update_bookmark_note(&bookmark_ids[0], Some("updated".into()))
+            .await
+            .unwrap();
+        ctx.cluster_bookmarks(query).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "editing one note should embed only that cache miss"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import BookmarksPane from "./BookmarksPane";
@@ -6,6 +6,9 @@ import { ToastProvider } from "./Toast";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useViewerStore } from "../stores/useViewerStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useSemanticStore } from "../stores/useSemanticStore";
+
+const ensureCurrentRootIndexed = useSemanticStore.getState().ensureCurrentRootIndexed;
 
 const renderPane = (ui: ReactElement = <BookmarksPane />) =>
   render(<ToastProvider>{ui}</ToastProvider>);
@@ -15,6 +18,7 @@ vi.mock("../services", () => ({
     zoteroGenerateCitation: vi.fn(),
     writeClipboard: vi.fn().mockResolvedValue(undefined),
     updateBookmarkNote: vi.fn(),
+    clusterBookmarks: vi.fn(),
   },
 }));
 
@@ -82,7 +86,9 @@ describe("BookmarksPane", () => {
     useSettingsStore.setState({
       bookmarksDock: "Right",
       setBookmarksDock: vi.fn(),
+      preferSemantic: false,
     });
+    useSemanticStore.setState({ readyForCurrentRoot: false, ensureCurrentRootIndexed });
   });
 
   it("closes the pane from the header close button and keeps the dock toggle", () => {
@@ -213,6 +219,85 @@ describe("BookmarksPane", () => {
     expect(screen.getByText("current file quote")).toBeInTheDocument();
     expect(screen.getByText("other file quote")).toBeInTheDocument();
     expect(screen.getByLabelText("2 bookmarks")).toHaveTextContent("2");
+  });
+
+  it("groups scoped bookmarks by semantic theme and filters within stable groups", async () => {
+    useBookmarksStore.setState({
+      scope: "all",
+      bookmarks: [
+        {
+          id: "cat-1",
+          path: "/tmp/cats.pdf",
+          origin: { PdfPage: { page: 1, bbox: null } },
+          quote: "alpha cats",
+          created_at: "2026-01-01T00:00:00Z",
+          rects: [],
+        },
+        {
+          id: "cat-2",
+          path: "/tmp/cats.pdf",
+          origin: { PdfPage: { page: 2, bbox: null } },
+          quote: "feline behavior",
+          created_at: "2026-01-01T00:00:00Z",
+          rects: [],
+        },
+        {
+          id: "physics-1",
+          path: "/tmp/physics.pdf",
+          origin: { PdfPage: { page: 1, bbox: null } },
+          quote: "quantum fields",
+          created_at: "2026-01-01T00:00:00Z",
+          rects: [],
+        },
+        {
+          id: "physics-2",
+          path: "/tmp/physics.pdf",
+          origin: { PdfPage: { page: 2, bbox: null } },
+          quote: "particle interactions",
+          created_at: "2026-01-01T00:00:00Z",
+          rects: [],
+        },
+      ],
+    });
+    useSemanticStore.setState({
+      readyForCurrentRoot: true,
+      ensureCurrentRootIndexed: vi.fn().mockResolvedValue(true),
+    });
+    useSettingsStore.setState({ preferSemantic: true });
+    vi.mocked(api.clusterBookmarks).mockResolvedValue({
+      clusters: [
+        {
+          bookmark_ids: ["cat-1", "cat-2"],
+          representative_bookmark_id: "cat-1",
+          cohesion: 0.9,
+        },
+        {
+          bookmark_ids: ["physics-1", "physics-2"],
+          representative_bookmark_id: "physics-1",
+          cohesion: 0.88,
+        },
+      ],
+      unclustered_bookmark_ids: [],
+    });
+
+    renderPane();
+    fireEvent.click(screen.getByRole("button", { name: "Group bookmarks by theme" }));
+
+    expect(await screen.findByText("Around “alpha cats”")).toBeInTheDocument();
+    expect(screen.getByText("Around “quantum fields”")).toBeInTheDocument();
+    expect(api.clusterBookmarks).toHaveBeenCalledWith({
+      bookmark_ids: ["cat-1", "cat-2", "physics-1", "physics-2"],
+    });
+
+    fireEvent.change(screen.getByPlaceholderText("Filter bookmarks"), {
+      target: { value: "alpha" },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Around “alpha cats”")).toBeInTheDocument();
+      expect(screen.queryByText("Around “quantum fields”")).not.toBeInTheDocument();
+    });
+    expect(api.clusterBookmarks).toHaveBeenCalledTimes(1);
   });
 
   it("edits and saves a note through the store", async () => {

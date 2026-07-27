@@ -8,6 +8,8 @@ import type {
   EmbedProgress,
   EmbeddingEngine,
   Bookmark,
+  BookmarkClustersQuery,
+  BookmarkClustersResult,
   FileListChanged,
   FileListResponse,
   FileMatches,
@@ -126,6 +128,10 @@ export class TauriSearchApi implements SearchApi {
 
   async updateBookmarkNote(id: string, note: string | null): Promise<Bookmark> {
     return invoke<Bookmark>("update_bookmark_note", { id, note });
+  }
+
+  async clusterBookmarks(query: BookmarkClustersQuery): Promise<BookmarkClustersResult> {
+    return invoke<BookmarkClustersResult>("cluster_bookmarks", { query });
   }
 
   async listFiles(root: string, collectionId?: string | null, tagIds: string[] = [], collectionExpression?: string | null): Promise<FileListResponse> {

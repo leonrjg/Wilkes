@@ -4,6 +4,8 @@ import type {
   EmbedProgress,
   EmbeddingEngine,
   Bookmark,
+  BookmarkClustersQuery,
+  BookmarkClustersResult,
   FileListChanged,
   FileListResponse,
   FileMatches,
@@ -120,6 +122,16 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw new Error(`relatedDocuments failed: ${res.status}`);
     return res.json() as Promise<RelatedDocument[]>;
+  }
+
+  async clusterBookmarks(query: BookmarkClustersQuery): Promise<BookmarkClustersResult> {
+    const res = await fetch("/api/bookmarks/clusters", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(query),
+    });
+    if (!res.ok) throw new Error(`clusterBookmarks failed: ${res.status}`);
+    return res.json() as Promise<BookmarkClustersResult>;
   }
 
   async preview(matchRef: MatchRef): Promise<PreviewData> {

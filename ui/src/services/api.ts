@@ -4,6 +4,8 @@ import type {
   EmbedProgress,
   EmbeddingEngine,
   Bookmark,
+  BookmarkClustersQuery,
+  BookmarkClustersResult,
   FileListResponse,
   FileListChanged,
   FileMatches,
@@ -64,6 +66,7 @@ export interface SearchApi {
   addBookmark(bookmark: NewBookmark): Promise<Bookmark>;
   removeBookmark(id: string): Promise<void>;
   updateBookmarkNote(id: string, note: string | null): Promise<Bookmark>;
+  clusterBookmarks(query: BookmarkClustersQuery): Promise<BookmarkClustersResult>;
   listFiles(root: string, collectionId?: string | null, tagIds?: string[], collectionExpression?: string | null): Promise<FileListResponse>;
   listTags(): Promise<Tag[]>;
   createTag(tag: NewTag): Promise<Tag>;

@@ -59,6 +59,13 @@ describe("TauriSearchApi", () => {
     expect(invoke).toHaveBeenCalledWith("update_bookmark_note", { id: "b1", note: "hi" });
   });
 
+  it("should call invoke for clusterBookmarks", async () => {
+    (invoke as any).mockResolvedValue({ clusters: [], unclustered_bookmark_ids: [] });
+    const query = { bookmark_ids: ["b1", "b2", "b3"] };
+    await api.clusterBookmarks(query);
+    expect(invoke).toHaveBeenCalledWith("cluster_bookmarks", { query });
+  });
+
   it("should call invoke for listFiles", async () => {
     (invoke as any).mockResolvedValue({ files: [], omitted: [] });
     await api.listFiles("/some/root");

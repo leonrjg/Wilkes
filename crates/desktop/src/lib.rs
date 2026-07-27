@@ -16,11 +16,12 @@ use wilkes_api::commands::chat::{
 use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
-    AddOutcome, AgentBackend, Bookmark, CitationResult, CollectionValidation, DataPaths,
-    DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, ExternalMcpSettings, FileListResponse,
-    IndexStatus, IntegrationStatus, ModelDescriptor, NewBookmark, NewSmartCollection, NewTag,
-    OpenAlexWork, SearchLogEntry, SelectedEmbedder, SemanticScholarPaper, Settings,
-    SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
+    AddOutcome, AgentBackend, Bookmark, BookmarkClustersQuery, BookmarkClustersResult,
+    CitationResult, CollectionValidation, DataPaths, DocumentMetadata, DocumentTagUpdate,
+    EmbeddingEngine, ExternalMcpSettings, FileListResponse, IndexStatus, IntegrationStatus,
+    ModelDescriptor, NewBookmark, NewSmartCollection, NewTag, OpenAlexWork, SearchLogEntry,
+    SelectedEmbedder, SemanticScholarPaper, Settings, SmartCollection, Tag, UpdateSmartCollection,
+    UpdateTag,
 };
 
 mod platform;
@@ -177,6 +178,13 @@ async fn update_bookmark_note_for_ctx(
     ctx.update_bookmark_note(&id, note)
         .await
         .map_err(|e| e.to_string())
+}
+
+async fn cluster_bookmarks_for_ctx(
+    ctx: Arc<AppContext>,
+    query: BookmarkClustersQuery,
+) -> Result<BookmarkClustersResult, String> {
+    ctx.cluster_bookmarks(query).await
 }
 
 async fn zotero_status_for_ctx(ctx: Arc<AppContext>) -> Result<IntegrationStatus, String> {
@@ -1763,6 +1771,14 @@ async fn update_bookmark_note(
 }
 
 #[tauri::command]
+async fn cluster_bookmarks(
+    query: BookmarkClustersQuery,
+    app: AppHandle,
+) -> Result<BookmarkClustersResult, String> {
+    cluster_bookmarks_for_ctx(app_context(&app), query).await
+}
+
+#[tauri::command]
 async fn list_tags(app: AppHandle) -> Result<Vec<Tag>, String> {
     app_context(&app).list_tags().map_err(|e| e.to_string())
 }
@@ -2057,6 +2073,7 @@ pub fn run() {
             add_bookmark,
             remove_bookmark,
             update_bookmark_note,
+            cluster_bookmarks,
             list_tags,
             create_tag,
             update_tag,

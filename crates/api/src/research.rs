@@ -14,6 +14,13 @@ use wilkes_core::types::{
 const FILTER_SCHEMA_VERSION: i64 = 1;
 const MAX_EXPRESSION_BYTES: usize = 8 * 1024;
 
+#[derive(Clone, Debug)]
+pub struct CachedBookmarkEmbedding {
+    pub bookmark_id: String,
+    pub input_hash: String,
+    pub embedding: Vec<f32>,
+}
+
 pub struct ResearchStore {
     conn: Connection,
     programs: HashMap<String, (i64, Program)>,
@@ -95,7 +102,7 @@ impl ResearchStore {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(
-            version <= 1,
+            version <= 2,
             "research database schema {version} is newer than this app supports"
         );
         self.conn.execute_batch(
@@ -125,6 +132,17 @@ impl ResearchStore {
              CREATE TABLE IF NOT EXISTS bookmarks (
                id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, created_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS bookmark_embeddings (
+               bookmark_id TEXT NOT NULL REFERENCES bookmarks(id) ON DELETE CASCADE,
+               engine TEXT NOT NULL,
+               model_id TEXT NOT NULL,
+               dimension INTEGER NOT NULL,
+               recipe_version INTEGER NOT NULL,
+               input_hash TEXT NOT NULL,
+               embedding BLOB NOT NULL,
+               updated_at_ms INTEGER NOT NULL,
+               PRIMARY KEY(bookmark_id, engine, model_id, dimension, recipe_version)
+             );
              CREATE TABLE IF NOT EXISTS search_log (
                id TEXT PRIMARY KEY, query_json TEXT NOT NULL,
                collection_name TEXT, collection_revision INTEGER, initiated_by TEXT NOT NULL,
@@ -138,7 +156,11 @@ impl ResearchStore {
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(1, ?1)",
             [now_ms()],
         )?;
-        self.conn.pragma_update(None, "user_version", 1)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(2, ?1)",
+            [now_ms()],
+        )?;
+        self.conn.pragma_update(None, "user_version", 2)?;
         self.conn.execute(
             "UPDATE search_log SET status='cancelled', completed_at_ms=?1
              WHERE status='running'",
@@ -249,6 +271,70 @@ impl ResearchStore {
             params![id, serde_json::to_string(&bookmark)?],
         )?;
         Ok(bookmark)
+    }
+
+    pub fn cached_bookmark_embeddings(
+        &self,
+        engine: &str,
+        model_id: &str,
+        dimension: usize,
+        recipe_version: i64,
+    ) -> anyhow::Result<Vec<CachedBookmarkEmbedding>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT bookmark_id,input_hash,embedding
+             FROM bookmark_embeddings
+             WHERE engine=?1 AND model_id=?2 AND dimension=?3 AND recipe_version=?4",
+        )?;
+        let rows = stmt.query_map(
+            params![engine, model_id, dimension as i64, recipe_version],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )?;
+        rows.map(|row| {
+            let (bookmark_id, input_hash, bytes) = row?;
+            let embedding = decode_embedding(&bytes, dimension)?;
+            Ok(CachedBookmarkEmbedding {
+                bookmark_id,
+                input_hash,
+                embedding,
+            })
+        })
+        .collect()
+    }
+
+    pub fn upsert_bookmark_embedding(
+        &mut self,
+        embedding: &CachedBookmarkEmbedding,
+        engine: &str,
+        model_id: &str,
+        dimension: usize,
+        recipe_version: i64,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO bookmark_embeddings(
+               bookmark_id,engine,model_id,dimension,recipe_version,input_hash,embedding,updated_at_ms
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(bookmark_id,engine,model_id,dimension,recipe_version)
+             DO UPDATE SET input_hash=excluded.input_hash,
+                           embedding=excluded.embedding,
+                           updated_at_ms=excluded.updated_at_ms",
+            params![
+                embedding.bookmark_id,
+                engine,
+                model_id,
+                dimension as i64,
+                recipe_version,
+                embedding.input_hash,
+                encode_embedding(&embedding.embedding),
+                now_ms(),
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn list_tags(&self) -> anyhow::Result<Vec<Tag>> {
@@ -568,6 +654,26 @@ impl ResearchStore {
     }
 }
 
+fn encode_embedding(embedding: &[f32]) -> Vec<u8> {
+    embedding
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn decode_embedding(bytes: &[u8], dimension: usize) -> anyhow::Result<Vec<f32>> {
+    anyhow::ensure!(
+        bytes.len() == dimension.saturating_mul(std::mem::size_of::<f32>()),
+        "Cached bookmark embedding has {} bytes; expected {}",
+        bytes.len(),
+        dimension.saturating_mul(std::mem::size_of::<f32>())
+    );
+    Ok(bytes
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
 fn eligible_paths_for_program(
     program: &Program,
     root: &Path,
@@ -819,6 +925,7 @@ fn parse_status(value: &str) -> anyhow::Result<SearchLogStatus> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use wilkes_core::types::SourceOrigin;
 
     #[test]
     fn tags_and_collection_membership_round_trip() {
@@ -866,6 +973,48 @@ mod tests {
             .eligible_paths(&collection.id, dir.path(), &entries)
             .unwrap();
         assert!(eligible.contains(&path));
+    }
+
+    #[test]
+    fn bookmark_embedding_cache_round_trips_and_cascades_on_delete() {
+        let dir = tempdir().unwrap();
+        let mut store =
+            ResearchStore::open(dir.path(), &dir.path().join("bookmarks.json")).unwrap();
+        let bookmark = store
+            .add_bookmark(NewBookmark {
+                path: dir.path().join("paper.pdf"),
+                origin: SourceOrigin::PdfPage {
+                    page: 1,
+                    bbox: None,
+                },
+                text_range: None,
+                quote: "A saved passage".into(),
+                note: None,
+                rects: Vec::new(),
+            })
+            .unwrap();
+        let cached = CachedBookmarkEmbedding {
+            bookmark_id: bookmark.id.clone(),
+            input_hash: "hash".into(),
+            embedding: vec![0.25, -0.5],
+        };
+
+        store
+            .upsert_bookmark_embedding(&cached, "fastembed", "model", 2, 1)
+            .unwrap();
+        let loaded = store
+            .cached_bookmark_embeddings("fastembed", "model", 2, 1)
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].bookmark_id, bookmark.id);
+        assert_eq!(loaded[0].input_hash, "hash");
+        assert_eq!(loaded[0].embedding, vec![0.25, -0.5]);
+
+        store.remove_bookmark(&bookmark.id).unwrap();
+        assert!(store
+            .cached_bookmark_embeddings("fastembed", "model", 2, 1)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

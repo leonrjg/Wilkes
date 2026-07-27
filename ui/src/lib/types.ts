@@ -130,6 +130,21 @@ export interface Bookmark {
   rects: BoundingBox[];
 }
 
+export interface BookmarkClustersQuery {
+  bookmark_ids: string[];
+}
+
+export interface BookmarkCluster {
+  bookmark_ids: string[];
+  representative_bookmark_id: string;
+  cohesion: number;
+}
+
+export interface BookmarkClustersResult {
+  clusters: BookmarkCluster[];
+  unclustered_bookmark_ids: string[];
+}
+
 export interface NewBookmark {
   path: string;
   origin: SourceOrigin;
