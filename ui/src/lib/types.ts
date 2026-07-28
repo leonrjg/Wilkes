@@ -130,8 +130,16 @@ export interface Bookmark {
   rects: BoundingBox[];
 }
 
+export type BookmarkClusterGranularity =
+  | "much_fewer"
+  | "fewer"
+  | "balanced"
+  | "more"
+  | "much_more";
+
 export interface BookmarkClustersQuery {
   bookmark_ids: string[];
+  granularity?: BookmarkClusterGranularity;
 }
 
 export interface BookmarkCluster {

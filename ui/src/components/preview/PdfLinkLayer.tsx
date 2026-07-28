@@ -1,6 +1,10 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import type { PdfDestination } from "./pdfDestinations";
+import {
+  getPdfLinkPreview,
+  type PdfLinkPreview,
+} from "./pdfLinkPreview";
 import { Tooltip } from "../Tooltip";
 import "./pdfLinkLayer.css";
 
@@ -25,6 +29,124 @@ interface Props {
   onOpenExternal: (url: string) => void;
 }
 
+type PreviewState =
+  | { status: "idle" | "loading" | "unavailable" | "failed" }
+  | { status: "ready"; preview: PdfLinkPreview };
+
+function PdfLinkOverlay({
+  pdf,
+  link,
+  onNavigateToDestination,
+  onOpenExternal,
+}: {
+  pdf: PDFDocumentProxy;
+  link: LinkRect;
+  onNavigateToDestination: (dest: PdfDestination) => void;
+  onOpenExternal: (url: string) => void;
+}) {
+  const [previewState, setPreviewState] = useState<PreviewState>({
+    status: "idle",
+  });
+  const requestGenerationRef = useRef(0);
+
+  useEffect(
+    () => () => {
+      requestGenerationRef.current += 1;
+    },
+    [],
+  );
+
+  const loadPreview = useCallback(() => {
+    if (!link.dest) return;
+    if (
+      previewState.status === "loading" ||
+      previewState.status === "ready" ||
+      previewState.status === "unavailable"
+    ) {
+      return;
+    }
+
+    const generation = ++requestGenerationRef.current;
+    setPreviewState({ status: "loading" });
+    getPdfLinkPreview(pdf, link.dest).then(
+      (preview) => {
+        if (requestGenerationRef.current !== generation) return;
+        setPreviewState(
+          preview
+            ? { status: "ready", preview }
+            : { status: "unavailable" },
+        );
+      },
+      (error) => {
+        if (requestGenerationRef.current !== generation) return;
+        console.error("PDF link preview failed:", error);
+        setPreviewState({ status: "failed" });
+      },
+    );
+  }, [link.dest, pdf, previewState.status]);
+
+  let tooltipContent;
+  if (link.url) {
+    tooltipContent = link.url;
+  } else if (previewState.status === "ready") {
+    tooltipContent = (
+      <div className="space-y-1">
+        <div className="font-medium text-[var(--text-dim)]">
+          Page {previewState.preview.pageNumber}
+        </div>
+        <div className="whitespace-pre-line">
+          {previewState.preview.text}
+        </div>
+      </div>
+    );
+  } else if (previewState.status === "unavailable") {
+    tooltipContent = "No reliable text preview at this destination";
+  } else if (previewState.status === "failed") {
+    tooltipContent = "Link preview unavailable";
+  } else {
+    tooltipContent = "Loading link preview…";
+  }
+
+  const ariaLabel = link.url
+    ? `Open ${link.url}`
+    : previewState.status === "ready"
+      ? `Go to page ${previewState.preview.pageNumber}: ${previewState.preview.text}`
+      : "Follow internal PDF link";
+
+  return (
+    <Tooltip
+      content={tooltipContent}
+      className={link.url ? "break-all" : "text-left"}
+      delayMs={link.dest ? 300 : 0}
+      interactive={Boolean(link.dest)}
+      size={link.dest ? "wide" : "default"}
+    >
+      <a
+        data-testid="pdf-link"
+        aria-label={ariaLabel}
+        href={link.url ?? "#"}
+        onMouseEnter={loadPreview}
+        onFocus={loadPreview}
+        onClick={(event) => {
+          event.preventDefault();
+          if (link.url) onOpenExternal(link.url);
+          else if (link.dest) onNavigateToDestination(link.dest);
+        }}
+        style={{
+          position: "absolute",
+          left: `${link.left}px`,
+          top: `${link.top}px`,
+          width: `${Math.max(link.width, 4)}px`,
+          height: `${Math.max(link.height, 4)}px`,
+          cursor: "pointer",
+          // Transparent hit target; a faint tint appears on hover via CSS below.
+        }}
+        className="pdf-link-overlay"
+      />
+    </Tooltip>
+  );
+}
+
 /**
  * Renders clickable overlays for a page's Link annotations — the within-document
  * links (table-of-contents entries, cross-references) and external URLs that OS
@@ -46,6 +168,7 @@ export default function PdfLinkLayer({
 
   useEffect(() => {
     let cancelled = false;
+    setLinks([]);
 
     pdf
       .getPage(pageNumber)
@@ -91,27 +214,13 @@ export default function PdfLinkLayer({
   return (
     <>
       {links.map((link) => (
-        <Tooltip key={link.key} content={link.url} className="break-all">
-          <a
-            data-testid="pdf-link"
-            href={link.url ?? "#"}
-            onClick={(event) => {
-              event.preventDefault();
-              if (link.url) onOpenExternal(link.url);
-              else if (link.dest) onNavigateToDestination(link.dest);
-            }}
-            style={{
-              position: "absolute",
-              left: `${link.left}px`,
-              top: `${link.top}px`,
-              width: `${Math.max(link.width, 4)}px`,
-              height: `${Math.max(link.height, 4)}px`,
-              cursor: "pointer",
-              // Transparent hit target; a faint tint appears on hover via CSS below.
-            }}
-            className="pdf-link-overlay"
-          />
-        </Tooltip>
+        <PdfLinkOverlay
+          key={link.key}
+          pdf={pdf}
+          link={link}
+          onNavigateToDestination={onNavigateToDestination}
+          onOpenExternal={onOpenExternal}
+        />
       ))}
     </>
   );

@@ -429,9 +429,22 @@ pub struct Bookmark {
     pub identity: Option<crate::metadata::cache::FileIdentity>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BookmarkClusterGranularity {
+    MuchFewer,
+    Fewer,
+    #[default]
+    Balanced,
+    More,
+    MuchMore,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BookmarkClustersQuery {
     pub bookmark_ids: Vec<String>,
+    #[serde(default)]
+    pub granularity: BookmarkClusterGranularity,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1307,6 +1320,17 @@ pub struct SearchStats {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn bookmark_cluster_query_defaults_to_balanced_granularity() {
+        let query: BookmarkClustersQuery =
+            serde_json::from_str(r#"{"bookmark_ids":["bookmark-1"]}"#).unwrap();
+        assert_eq!(query.granularity, BookmarkClusterGranularity::Balanced);
+        assert_eq!(
+            serde_json::to_value(BookmarkClusterGranularity::MuchMore).unwrap(),
+            serde_json::json!("much_more")
+        );
+    }
 
     #[test]
     fn test_file_type_detect() {

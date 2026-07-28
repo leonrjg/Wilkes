@@ -9,6 +9,7 @@ import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 
 const ensureCurrentRootIndexed = useSemanticStore.getState().ensureCurrentRootIndexed;
+const virtualizerOptionsSpy = vi.hoisted(() => vi.fn());
 
 const renderPane = (ui: ReactElement = <BookmarksPane />) =>
   render(<ToastProvider>{ui}</ToastProvider>);
@@ -25,15 +26,21 @@ vi.mock("../services", () => ({
 import { api } from "../services";
 
 vi.mock("@tanstack/react-virtual", () => ({
-  useVirtualizer: ({ count }: { count: number }) => ({
-    getTotalSize: () => count * 104,
-    getVirtualItems: () =>
-      Array.from({ length: count }, (_, index) => ({
-        index,
-        key: index,
-        start: index * 104,
-      })),
-  }),
+  useVirtualizer: (options: {
+    count: number;
+    getItemKey?: (index: number) => string | number;
+  }) => {
+    virtualizerOptionsSpy(options);
+    return {
+      getTotalSize: () => options.count * 104,
+      getVirtualItems: () =>
+        Array.from({ length: options.count }, (_, index) => ({
+          index,
+          key: options.getItemKey?.(index) ?? index,
+          start: index * 104,
+        })),
+    };
+  },
 }));
 
 describe("BookmarksPane", () => {
@@ -222,6 +229,8 @@ describe("BookmarksPane", () => {
   });
 
   it("groups scoped bookmarks by semantic theme and filters within stable groups", async () => {
+    const representativeQuote =
+      "alpha cats form social bonds through repeated grooming and shared resting places";
     useBookmarksStore.setState({
       scope: "all",
       bookmarks: [
@@ -229,7 +238,7 @@ describe("BookmarksPane", () => {
           id: "cat-1",
           path: "/tmp/cats.pdf",
           origin: { PdfPage: { page: 1, bbox: null } },
-          quote: "alpha cats",
+          quote: representativeQuote,
           created_at: "2026-01-01T00:00:00Z",
           rects: [],
         },
@@ -283,10 +292,48 @@ describe("BookmarksPane", () => {
     renderPane();
     fireEvent.click(screen.getByRole("button", { name: "Group bookmarks by theme" }));
 
-    expect(await screen.findByText("Around “alpha cats”")).toBeInTheDocument();
+    const representativeHeading = await screen.findByText(`Around “${representativeQuote}”`);
+    expect(representativeHeading).toHaveClass("whitespace-pre-wrap");
+    expect(representativeHeading).not.toHaveClass("truncate");
     expect(screen.getByText("Around “quantum fields”")).toBeInTheDocument();
+    const virtualizerOptions = virtualizerOptionsSpy.mock.calls.at(-1)?.[0] as {
+      getItemKey: (index: number) => string | number;
+    };
+    expect(virtualizerOptions.getItemKey(0)).toBe("theme:cat-1");
+    expect(virtualizerOptions.getItemKey(1)).toBe("theme:physics-1");
     expect(api.clusterBookmarks).toHaveBeenCalledWith({
       bookmark_ids: ["cat-1", "cat-2", "physics-1", "physics-2"],
+      granularity: "balanced",
+    });
+    const granularity = screen.getByRole("slider", { name: "Theme granularity" });
+    expect(granularity).toHaveValue("2");
+    expect(granularity).toHaveAttribute("aria-valuetext", "Balanced");
+    expect(screen.getByText("2 themes")).toBeInTheDocument();
+
+    const expandCats = screen.getByRole("button", {
+      name: `Expand cluster: Around “${representativeQuote}”`,
+    });
+    expect(expandCats).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("feline behavior")).not.toBeInTheDocument();
+    expect(screen.queryByText("particle interactions")).not.toBeInTheDocument();
+    fireEvent.click(expandCats);
+
+    expect(
+      screen.getByRole("button", {
+        name: `Collapse cluster: Around “${representativeQuote}”`,
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("feline behavior")).toBeInTheDocument();
+    expect(screen.queryByText("particle interactions")).not.toBeInTheDocument();
+
+    fireEvent.change(granularity, { target: { value: "3" } });
+    expect(screen.queryByText("feline behavior")).not.toBeInTheDocument();
+    expect(granularity).toHaveAttribute("aria-valuetext", "More");
+    await waitFor(() => {
+      expect(api.clusterBookmarks).toHaveBeenLastCalledWith({
+        bookmark_ids: ["cat-1", "cat-2", "physics-1", "physics-2"],
+        granularity: "more",
+      });
     });
 
     fireEvent.change(screen.getByPlaceholderText("Filter bookmarks"), {
@@ -294,10 +341,10 @@ describe("BookmarksPane", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText("Around “alpha cats”")).toBeInTheDocument();
+      expect(screen.getByText(`Around “${representativeQuote}”`)).toBeInTheDocument();
       expect(screen.queryByText("Around “quantum fields”")).not.toBeInTheDocument();
     });
-    expect(api.clusterBookmarks).toHaveBeenCalledTimes(1);
+    expect(api.clusterBookmarks).toHaveBeenCalledTimes(2);
   });
 
   it("edits and saves a note through the store", async () => {

@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+use crate::types::BookmarkClusterGranularity;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EmbeddingCluster {
     pub item_indices: Vec<usize>,
@@ -53,10 +55,13 @@ impl Ord for WardEdge {
 ///
 /// Ward's merge objective minimizes the increase in within-cluster dispersion,
 /// preventing a small outlier group from leaving the rest of a collection in a
-/// single catch-all cluster. Candidate cuts are scored with cosine-distance
-/// silhouette quality. Singleton groups in the winning cut are returned as
-/// unclustered items.
-pub fn cluster_embeddings(vectors: &[Vec<f32>]) -> anyhow::Result<EmbeddingClusterResult> {
+/// single catch-all cluster. Granularity selects a deterministic cut based on
+/// collection size; silhouette quality is only used to reject a cut with no
+/// positive structure. Singleton groups are returned as unclustered items.
+pub fn cluster_embeddings(
+    vectors: &[Vec<f32>],
+    granularity: BookmarkClusterGranularity,
+) -> anyhow::Result<EmbeddingClusterResult> {
     let count = vectors.len();
     if count < 3 {
         return Ok(EmbeddingClusterResult {
@@ -113,12 +118,11 @@ pub fn cluster_embeddings(vectors: &[Vec<f32>]) -> anyhow::Result<EmbeddingClust
         }
     }
 
-    let max_candidate_clusters = integer_sqrt_ceil(count).max(2).min(count - 1);
+    let target_cluster_count = cluster_count_for_granularity(count, granularity);
     let mut active_count = count;
     let mut next_cluster = count;
-    let mut best: Option<(f32, Vec<Vec<usize>>)> = None;
 
-    while active_count > 1 {
+    while active_count > target_cluster_count {
         let Some(edge) = heap.pop() else {
             break;
         };
@@ -165,36 +169,25 @@ pub fn cluster_embeddings(vectors: &[Vec<f32>]) -> anyhow::Result<EmbeddingClust
                 right: merged,
             });
         }
-
-        if (2..=max_candidate_clusters).contains(&active_count) {
-            let mut partition: Vec<Vec<usize>> = active
-                .iter()
-                .enumerate()
-                .filter(|(_, is_active)| **is_active)
-                .map(|(index, _)| members[index].clone())
-                .collect();
-            partition.sort_by_key(|group| group[0]);
-            let score = silhouette_score(&partition, &item_similarities);
-            let should_replace = match &best {
-                None => true,
-                Some((best_score, best_partition)) => {
-                    score > *best_score + f32::EPSILON
-                        || ((score - *best_score).abs() <= f32::EPSILON
-                            && partition.len() < best_partition.len())
-                }
-            };
-            if should_replace {
-                best = Some((score, partition));
-            }
-        }
     }
 
-    let Some((_, partition)) = best.filter(|(score, _)| *score > f32::EPSILON) else {
+    anyhow::ensure!(
+        active_count == target_cluster_count,
+        "Could not produce the requested bookmark cluster cut"
+    );
+    let mut partition: Vec<Vec<usize>> = active
+        .iter()
+        .enumerate()
+        .filter(|(_, is_active)| **is_active)
+        .map(|(index, _)| members[index].clone())
+        .collect();
+    partition.sort_by_key(|group| group[0]);
+    if silhouette_score(&partition, &item_similarities) <= f32::EPSILON {
         return Ok(EmbeddingClusterResult {
             clusters: Vec::new(),
             unclustered_indices: (0..count).collect(),
         });
-    };
+    }
 
     let mut result = EmbeddingClusterResult::default();
     for mut group in partition {
@@ -337,6 +330,31 @@ fn integer_sqrt_ceil(value: usize) -> usize {
     root
 }
 
+fn cluster_count_for_granularity(
+    item_count: usize,
+    granularity: BookmarkClusterGranularity,
+) -> usize {
+    debug_assert!(item_count >= 3);
+    // Balanced groups average at least three items for small collections. The
+    // adjustable ceiling permits finer two-item themes when explicitly asked.
+    let balanced = integer_sqrt_ceil(item_count)
+        .min((item_count / 3).max(2))
+        .max(2);
+    let requested = match granularity {
+        BookmarkClusterGranularity::MuchFewer => ceil_ratio(balanced, 2),
+        BookmarkClusterGranularity::Fewer => ceil_ratio(balanced.saturating_mul(3), 4),
+        BookmarkClusterGranularity::Balanced => balanced,
+        BookmarkClusterGranularity::More => ceil_ratio(balanced.saturating_mul(3), 2),
+        BookmarkClusterGranularity::MuchMore => balanced.saturating_mul(2),
+    };
+    let maximum = (item_count / 2).max(2).min(item_count - 1);
+    requested.clamp(2, maximum)
+}
+
+fn ceil_ratio(numerator: usize, denominator: usize) -> usize {
+    numerator / denominator + usize::from(numerator % denominator != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,9 +374,13 @@ mod tests {
         normalize(&vector)
     }
 
+    fn cluster_balanced(vectors: &[Vec<f32>]) -> anyhow::Result<EmbeddingClusterResult> {
+        cluster_embeddings(vectors, BookmarkClusterGranularity::Balanced)
+    }
+
     #[test]
     fn separates_clear_groups_and_selects_medoids() {
-        let result = cluster_embeddings(&[
+        let result = cluster_balanced(&[
             vec![1.0, 0.0],
             vec![0.99, 0.05],
             vec![0.95, -0.05],
@@ -411,7 +433,7 @@ mod tests {
             );
         }
 
-        let result = cluster_embeddings(&vectors).unwrap();
+        let result = cluster_balanced(&vectors).unwrap();
         let largest_cluster = result
             .clusters
             .iter()
@@ -420,21 +442,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(vectors.len(), 70);
-        assert!(result.clusters.len() >= 6);
+        assert_eq!(result.clusters.len(), 9);
         assert!(largest_cluster <= 24);
-        assert_eq!(cluster_embeddings(&vectors).unwrap(), result);
+        assert_eq!(cluster_balanced(&vectors).unwrap(), result);
+    }
+
+    #[test]
+    fn granularity_scales_from_a_stable_balanced_default() {
+        assert_eq!(
+            cluster_count_for_granularity(71, BookmarkClusterGranularity::MuchFewer),
+            5
+        );
+        assert_eq!(
+            cluster_count_for_granularity(71, BookmarkClusterGranularity::Fewer),
+            7
+        );
+        assert_eq!(
+            cluster_count_for_granularity(71, BookmarkClusterGranularity::Balanced),
+            9
+        );
+        assert_eq!(
+            cluster_count_for_granularity(71, BookmarkClusterGranularity::More),
+            14
+        );
+        assert_eq!(
+            cluster_count_for_granularity(71, BookmarkClusterGranularity::MuchMore),
+            18
+        );
+        assert_eq!(
+            cluster_count_for_granularity(6, BookmarkClusterGranularity::Balanced),
+            2
+        );
     }
 
     #[test]
     fn leaves_too_few_items_unclustered() {
-        let result = cluster_embeddings(&[vec![1.0], vec![1.0]]).unwrap();
+        let result = cluster_balanced(&[vec![1.0], vec![1.0]]).unwrap();
         assert!(result.clusters.is_empty());
         assert_eq!(result.unclustered_indices, vec![0, 1]);
     }
 
     #[test]
     fn leaves_indistinguishable_items_unclustered() {
-        let result = cluster_embeddings(&[
+        let result = cluster_balanced(&[
             vec![1.0, 0.0],
             vec![1.0, 0.0],
             vec![1.0, 0.0],
@@ -447,6 +497,6 @@ mod tests {
 
     #[test]
     fn rejects_mismatched_dimensions() {
-        assert!(cluster_embeddings(&[vec![1.0], vec![1.0, 2.0], vec![3.0]]).is_err());
+        assert!(cluster_balanced(&[vec![1.0], vec![1.0, 2.0], vec![3.0]]).is_err());
     }
 }

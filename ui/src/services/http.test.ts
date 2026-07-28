@@ -59,7 +59,7 @@ describe("HttpSearchApi", () => {
       ok: true,
       json: () => Promise.resolve(result),
     });
-    const query = { bookmark_ids: ["b1", "b2", "b3"] };
+    const query = { bookmark_ids: ["b1", "b2", "b3"], granularity: "more" as const };
 
     await expect(api.clusterBookmarks(query)).resolves.toEqual(result);
     expect(fetch).toHaveBeenCalledWith(

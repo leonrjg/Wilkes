@@ -61,7 +61,7 @@ describe("TauriSearchApi", () => {
 
   it("should call invoke for clusterBookmarks", async () => {
     (invoke as any).mockResolvedValue({ clusters: [], unclustered_bookmark_ids: [] });
-    const query = { bookmark_ids: ["b1", "b2", "b3"] };
+    const query = { bookmark_ids: ["b1", "b2", "b3"], granularity: "more" as const };
     await api.clusterBookmarks(query);
     expect(invoke).toHaveBeenCalledWith("cluster_bookmarks", { query });
   });

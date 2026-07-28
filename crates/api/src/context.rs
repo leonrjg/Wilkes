@@ -417,6 +417,7 @@ impl AppContext {
             "Semantic index is currently being built. Please wait before grouping bookmarks.",
         )?;
 
+        let granularity = query.granularity;
         let mut requested_ids = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for id in query.bookmark_ids {
@@ -546,7 +547,7 @@ impl AppContext {
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| "A bookmark embedding was not produced".to_string())?;
         let clustered = tokio::task::spawn_blocking(move || {
-            wilkes_core::embed::cluster::cluster_embeddings(&vectors)
+            wilkes_core::embed::cluster::cluster_embeddings(&vectors, granularity)
         })
         .await
         .map_err(|e| format!("Bookmark clustering task panicked: {e}"))?
@@ -3245,6 +3246,7 @@ mod tests {
         }
         let query = BookmarkClustersQuery {
             bookmark_ids: bookmark_ids.clone(),
+            granularity: wilkes_core::types::BookmarkClusterGranularity::Balanced,
         };
 
         let first = ctx.clone().cluster_bookmarks(query.clone()).await.unwrap();
@@ -3260,6 +3262,18 @@ mod tests {
             calls.load(Ordering::Relaxed),
             1,
             "the second request should use persisted bookmark embeddings"
+        );
+
+        let mut more_granular_query = query.clone();
+        more_granular_query.granularity = wilkes_core::types::BookmarkClusterGranularity::More;
+        ctx.clone()
+            .cluster_bookmarks(more_granular_query)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "changing granularity should reuse persisted bookmark embeddings"
         );
 
         ctx.update_bookmark_note(&bookmark_ids[0], Some("updated".into()))

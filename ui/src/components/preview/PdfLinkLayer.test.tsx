@@ -1,6 +1,13 @@
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
-import { describe, it, expect, vi } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
 import PdfLinkLayer from "./PdfLinkLayer";
+
+const { mockGetPdfLinkPreview } = vi.hoisted(() => ({
+  mockGetPdfLinkPreview: vi.fn(),
+}));
+vi.mock("./pdfLinkPreview", () => ({
+  getPdfLinkPreview: mockGetPdfLinkPreview,
+}));
 
 function makePdf(annotations: unknown[]) {
   return {
@@ -15,6 +22,11 @@ function makePdf(annotations: unknown[]) {
 }
 
 describe("PdfLinkLayer", () => {
+  beforeEach(() => {
+    mockGetPdfLinkPreview.mockReset();
+    mockGetPdfLinkPreview.mockResolvedValue(null);
+  });
+
   it("renders overlays only for Link annotations that navigate somewhere", async () => {
     const pdf = makePdf([
       { subtype: "Link", dest: "sec.1", rect: [10, 20, 60, 40] },
@@ -62,5 +74,45 @@ describe("PdfLinkLayer", () => {
 
     fireEvent.click(external);
     expect(onOpen).toHaveBeenCalledWith("https://example.com");
+  });
+
+  it("loads an internal-link preview on focus without changing click navigation", async () => {
+    const onNavigate = vi.fn();
+    mockGetPdfLinkPreview.mockResolvedValue({
+      pageNumber: 12,
+      text: "Target text from an opaque destination",
+    });
+    const pdf = makePdf([
+      { subtype: "Link", dest: "opaque.destination", rect: [10, 20, 60, 40] },
+    ]);
+
+    render(
+      <PdfLinkLayer
+        pdf={pdf}
+        pageNumber={1}
+        scale={1}
+        onNavigateToDestination={onNavigate}
+        onOpenExternal={vi.fn()}
+      />,
+    );
+
+    const link = await screen.findByTestId("pdf-link");
+    fireEvent.focus(link);
+
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent(
+        "Target text from an opaque destination",
+      ),
+    );
+    const tooltip = screen.getByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Page 12");
+    expect(tooltip).toHaveClass("pointer-events-auto", "select-text");
+    expect(mockGetPdfLinkPreview).toHaveBeenCalledWith(
+      pdf,
+      "opaque.destination",
+    );
+
+    fireEvent.click(link);
+    expect(onNavigate).toHaveBeenCalledWith("opaque.destination");
   });
 });

@@ -1,6 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Check, Copy, Edit2, FileText, Layers, Sidebar, Trash2, X } from "react-feather";
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  Edit2,
+  FileText,
+  Layers,
+  Sidebar,
+  Trash2,
+  X,
+} from "react-feather";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
@@ -10,12 +21,32 @@ import { api } from "../services";
 import { useToasts } from "./Toast";
 import { Tooltip } from "./Tooltip";
 import { CopyButton } from "./CopyButton";
-import type { Bookmark, BookmarkClustersResult } from "../lib/types";
+import type {
+  Bookmark,
+  BookmarkClusterGranularity,
+  BookmarkClustersResult,
+} from "../lib/types";
 
 type ThemeStatus = "idle" | "loading" | "ready";
 type BookmarkRow =
   | { kind: "bookmark"; key: string; bookmark: Bookmark }
-  | { kind: "theme"; key: string; label: string; count: number; title?: string };
+  | { kind: "theme"; key: string; label: string; count: number; expanded: boolean };
+
+const GRANULARITY_VALUES: readonly BookmarkClusterGranularity[] = [
+  "much_fewer",
+  "fewer",
+  "balanced",
+  "more",
+  "much_more",
+];
+
+const GRANULARITY_LABELS: Record<BookmarkClusterGranularity, string> = {
+  much_fewer: "Much fewer",
+  fewer: "Fewer",
+  balanced: "Balanced",
+  more: "More",
+  much_more: "Much more",
+};
 
 function fileName(path: string) {
   return path.split(/[/\\]/).pop() || path;
@@ -57,6 +88,10 @@ export default function BookmarksPane() {
   const [themesEnabled, setThemesEnabled] = useState(false);
   const [themeStatus, setThemeStatus] = useState<ThemeStatus>("idle");
   const [themeResult, setThemeResult] = useState<BookmarkClustersResult | null>(null);
+  const [themeResultInputKey, setThemeResultInputKey] = useState<string | null>(null);
+  const [expandedThemes, setExpandedThemes] = useState<Set<string>>(() => new Set());
+  const [granularity, setGranularity] =
+    useState<BookmarkClusterGranularity>("balanced");
   const selectedPath = useViewerStore((state) => activeViewerTab(state)?.path ?? null);
   const openMatch = useViewerStore((state) => state.openMatch);
   const dock = useSettingsStore((s) => s.bookmarksDock);
@@ -124,6 +159,23 @@ export default function BookmarksPane() {
     }
   };
 
+  const toggleTheme = (key: string) => {
+    setExpandedThemes((current) => {
+      const next = new Set(current);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  };
+
+  const updateGranularity = (next: BookmarkClusterGranularity) => {
+    setGranularity(next);
+    setExpandedThemes(new Set());
+  };
+
   const scopedToCurrentFile = scope === "current";
   const scoped = useMemo(
     () =>
@@ -150,12 +202,19 @@ export default function BookmarksPane() {
       ),
     [scoped],
   );
+  const displayedThemeResult =
+    themeResultInputKey === themeInputKey ? themeResult : null;
+
+  useEffect(() => {
+    setExpandedThemes(new Set());
+  }, [themeInputKey]);
 
   useEffect(() => {
     if (themesEnabled && !themesAvailable) {
       setThemesEnabled(false);
       setThemeStatus("idle");
       setThemeResult(null);
+      setThemeResultInputKey(null);
     }
   }, [themesAvailable, themesEnabled]);
 
@@ -163,33 +222,43 @@ export default function BookmarksPane() {
     if (!themesEnabled || !themesAvailable) {
       setThemeStatus("idle");
       setThemeResult(null);
+      setThemeResultInputKey(null);
+      setExpandedThemes(new Set());
       return;
     }
 
     let cancelled = false;
     setThemeStatus("loading");
-    api.clusterBookmarks({ bookmark_ids: scoped.map((bookmark) => bookmark.id) })
-      .then((result) => {
-        if (cancelled) return;
-        setThemeResult(result);
-        setThemeStatus("ready");
+    const timeout = window.setTimeout(() => {
+      api.clusterBookmarks({
+        bookmark_ids: scoped.map((bookmark) => bookmark.id),
+        granularity,
       })
-      .catch((error) => {
-        if (cancelled) return;
-        console.error("Failed to group bookmarks by theme:", error);
-        addToast("Failed to group bookmarks by theme", { type: "error" });
-        setThemesEnabled(false);
-        setThemeStatus("idle");
-        setThemeResult(null);
-      });
+        .then((result) => {
+          if (cancelled) return;
+          setThemeResult(result);
+          setThemeResultInputKey(themeInputKey);
+          setThemeStatus("ready");
+        })
+        .catch((error) => {
+          if (cancelled) return;
+          console.error("Failed to group bookmarks by theme:", error);
+          addToast("Failed to group bookmarks by theme", { type: "error" });
+          setThemesEnabled(false);
+          setThemeStatus("idle");
+          setThemeResult(null);
+          setThemeResultInputKey(null);
+        });
+    }, 150);
 
     return () => {
       cancelled = true;
+      window.clearTimeout(timeout);
     };
-  }, [themesAvailable, themesEnabled, themeInputKey]);
+  }, [granularity, themesAvailable, themesEnabled, themeInputKey]);
 
   const rows = useMemo<BookmarkRow[]>(() => {
-    if (!themesEnabled || themeStatus !== "ready" || !themeResult) {
+    if (!themesEnabled || !displayedThemeResult) {
       return filtered.map((bookmark) => ({
         kind: "bookmark",
         key: bookmark.id,
@@ -205,7 +274,6 @@ export default function BookmarksPane() {
       key: string,
       label: string,
       ids: string[],
-      title?: string,
     ) => {
       const groupBookmarks = ids.flatMap((id) => {
         if (assignedIds.has(id)) return [];
@@ -215,40 +283,49 @@ export default function BookmarksPane() {
         return visibleIds.has(id) ? [bookmark] : [];
       });
       if (groupBookmarks.length === 0) return;
-      groupedRows.push({ kind: "theme", key: `theme:${key}`, label, count: groupBookmarks.length, title });
-      groupedRows.push(
-        ...groupBookmarks.map((bookmark) => ({
-          kind: "bookmark" as const,
-          key: bookmark.id,
-          bookmark,
-        })),
-      );
+      const themeKey = `theme:${key}`;
+      const expanded = expandedThemes.has(themeKey);
+      groupedRows.push({
+        kind: "theme",
+        key: themeKey,
+        label,
+        count: groupBookmarks.length,
+        expanded,
+      });
+      if (expanded) {
+        groupedRows.push(
+          ...groupBookmarks.map((bookmark) => ({
+            kind: "bookmark" as const,
+            key: bookmark.id,
+            bookmark,
+          })),
+        );
+      }
     };
 
-    for (const cluster of themeResult.clusters) {
+    for (const cluster of displayedThemeResult.clusters) {
       const representative = bookmarksById.get(cluster.representative_bookmark_id);
       const quote = representative?.quote.trim();
       appendGroup(
         cluster.representative_bookmark_id,
         quote ? `Around “${quote}”` : "Theme",
         cluster.bookmark_ids,
-        quote,
       );
     }
 
     const unclusteredIds = [
-      ...themeResult.unclustered_bookmark_ids,
+      ...displayedThemeResult.unclustered_bookmark_ids,
       ...scoped
         .map((bookmark) => bookmark.id)
         .filter((id) => !assignedIds.has(id)),
     ];
     appendGroup(
       "unclustered",
-      themeResult.clusters.length > 0 ? "Unclustered" : "No clear themes",
+      displayedThemeResult.clusters.length > 0 ? "Unclustered" : "No clear themes",
       unclusteredIds,
     );
     return groupedRows;
-  }, [filtered, scoped, themeResult, themeStatus, themesEnabled]);
+  }, [displayedThemeResult, expandedThemes, filtered, scoped, themesEnabled]);
 
   const bookmarkCountLabel =
     `${filtered.length} ${filtered.length === 1 ? "bookmark" : "bookmarks"}`;
@@ -258,10 +335,22 @@ export default function BookmarksPane() {
     scoped.length,
     themesEnabled,
   );
+  const granularityIndex = GRANULARITY_VALUES.indexOf(granularity);
+  const granularityStatus =
+    themeStatus === "loading"
+      ? displayedThemeResult
+        ? "Adjusting…"
+        : "Finding…"
+      : displayedThemeResult
+        ? `${displayedThemeResult.clusters.length} ${
+            displayedThemeResult.clusters.length === 1 ? "theme" : "themes"
+          }`
+        : "";
 
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => parentRef.current,
+    getItemKey: (index) => rows[index]?.key ?? index,
     estimateSize: (index) => rows[index]?.kind === "theme" ? 34 : 104,
     overscan: 5,
     // Rows vary in height (note text, inline editor); measure the real DOM so
@@ -343,11 +432,40 @@ export default function BookmarksPane() {
             </Tooltip>
           </div>
         </div>
+        {themesEnabled && (
+          <div className="flex flex-col gap-1 border-t border-[var(--border-main)] pt-2">
+            <div className="flex items-center justify-between gap-2 text-[10px] text-[var(--text-dim)]">
+              <span>{GRANULARITY_LABELS[granularity]}</span>
+              <span aria-live="polite">{granularityStatus}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[9px] text-[var(--text-dim)]">Fewer</span>
+              <input
+                type="range"
+                min={0}
+                max={GRANULARITY_VALUES.length - 1}
+                step={1}
+                value={granularityIndex}
+                aria-label="Theme granularity"
+                aria-valuetext={GRANULARITY_LABELS[granularity]}
+                onChange={(event) =>
+                  updateGranularity(
+                    GRANULARITY_VALUES[Number(event.currentTarget.value)] ?? "balanced",
+                  )
+                }
+                className="min-w-0 flex-1 accent-[var(--accent-blue)]"
+              />
+              <span className="text-[9px] text-[var(--text-dim)]">More</span>
+            </div>
+          </div>
+        )}
       </div>
 
       <div ref={parentRef} className="flex-1 overflow-auto custom-scrollbar">
         {themesEnabled && themeStatus === "loading" && (
-          <div className="p-4 text-xs text-[var(--text-dim)]">Finding themes…</div>
+          <div className="p-4 text-xs text-[var(--text-dim)]">
+            {displayedThemeResult ? "Adjusting themes…" : "Finding themes…"}
+          </div>
         )}
         <div style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}>
           {virtualizer.getVirtualItems().map((item) => {
@@ -367,13 +485,23 @@ export default function BookmarksPane() {
                 className={row.kind === "theme" ? "px-2 pt-3 pb-1" : "p-2"}
               >
                 {row.kind === "theme" ? (
-                  <div
-                    title={row.title}
-                    className="flex min-w-0 items-center gap-2 text-[10px] font-medium text-[var(--text-dim)]"
+                  <button
+                    type="button"
+                    aria-expanded={row.expanded}
+                    aria-label={`${row.expanded ? "Collapse" : "Expand"} cluster: ${row.label}`}
+                    onClick={() => toggleTheme(row.key)}
+                    className="flex w-full min-w-0 items-start gap-1.5 rounded px-1 py-1 text-left text-[var(--text-dim)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)]"
                   >
-                    <span className="truncate">{row.label}</span>
-                    <span className="ml-auto tabular-nums">{row.count}</span>
-                  </div>
+                    {row.expanded ? (
+                      <ChevronDown size={12} className="mt-0.5 flex-shrink-0" />
+                    ) : (
+                      <ChevronRight size={12} className="mt-0.5 flex-shrink-0" />
+                    )}
+                    <span className="min-w-0 flex-1 whitespace-pre-wrap break-words text-[10px] font-medium leading-snug">
+                      {row.label}
+                    </span>
+                    <span className="flex-shrink-0 text-[10px] tabular-nums">{row.count}</span>
+                  </button>
                 ) : (
                   <BookmarkCard
                     bookmark={row.bookmark}
