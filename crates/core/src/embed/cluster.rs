@@ -352,7 +352,7 @@ fn cluster_count_for_granularity(
 }
 
 fn ceil_ratio(numerator: usize, denominator: usize) -> usize {
-    numerator / denominator + usize::from(numerator % denominator != 0)
+    numerator / denominator + usize::from(!numerator.is_multiple_of(denominator))
 }
 
 #[cfg(test)]

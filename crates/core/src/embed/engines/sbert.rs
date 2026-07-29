@@ -2,13 +2,14 @@ use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
 
-use super::super::models::installer::{EmbedderInstaller, ProgressTx};
-use super::super::worker::embedder::{WorkerEmbedder, WorkerEmbedderConfig};
-use super::super::worker::ipc::{WorkerEvent, WorkerRequest};
-use super::super::worker::manager::{ManagerCommand, WorkerManager};
 use super::super::Embedder;
 use super::aux_config;
+use crate::embed::installer::EmbedderInstaller;
+use crate::models::progress::ProgressTx;
 use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
+use crate::worker::embedder::{WorkerEmbedder, WorkerEmbedderConfig};
+use crate::worker::ipc::{WorkerEvent, WorkerRequest, WorkerRole};
+use crate::worker::manager::{ManagerCommand, WorkerManager};
 
 // ── Static model catalog ──────────────────────────────────────────────────────
 
@@ -159,7 +160,7 @@ impl EmbedderInstaller for SBERTInstaller {
         let request = WorkerRequest {
             mode: "info".to_string(),
             root: std::path::PathBuf::new(),
-            engine: EmbeddingEngine::SBERT,
+            role: WorkerRole::Embed(EmbeddingEngine::SBERT),
             model: model_id.to_string(),
             data_dir: std::path::PathBuf::new(),
             chunk_size: None,
@@ -167,6 +168,7 @@ impl EmbedderInstaller for SBERTInstaller {
             device: self.device.clone(),
             paths: None,
             texts: None,
+            generate: None,
             supported_extensions: Vec::new(),
         };
 
@@ -293,8 +295,8 @@ mod tests {
     #[test]
     fn test_sbert_installer_new() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
-            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths::resolve(dir.path()),
         );
         let installer =
             SBERTInstaller::new(EmbedderModel("m".to_string()), manager, "cpu".to_string());
@@ -305,8 +307,8 @@ mod tests {
     #[tokio::test]
     async fn test_sbert_installer_install_builtin() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
-            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths::resolve(dir.path()),
         );
         let installer = SBERTInstaller::new(
             EmbedderModel("intfloat/e5-small-v2".to_string()),
@@ -321,8 +323,8 @@ mod tests {
     #[test]
     fn test_sbert_installer_is_available() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
-            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths::resolve(dir.path()),
         );
         let installer =
             SBERTInstaller::new(EmbedderModel("m".to_string()), manager, "cpu".to_string());
@@ -333,8 +335,8 @@ mod tests {
 
         let builtin = SBERTInstaller::new(
             EmbedderModel("intfloat/e5-small-v2".to_string()),
-            crate::embed::worker::manager::WorkerManager::new(
-                crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::manager::WorkerManager::new(
+                crate::worker::manager::WorkerPaths::resolve(dir.path()),
             )
             .0,
             "cpu".to_string(),
@@ -345,8 +347,8 @@ mod tests {
     #[tokio::test]
     async fn test_sbert_installer_build() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
-            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths::resolve(dir.path()),
         );
         let installer = SBERTInstaller::new(
             EmbedderModel("intfloat/e5-small-v2".to_string()),
@@ -364,8 +366,8 @@ mod tests {
     #[test]
     fn test_sbert_installer_build_without_dimension_errors() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
-            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths::resolve(dir.path()),
         );
         let installer = SBERTInstaller::new(
             EmbedderModel("custom/model".to_string()),

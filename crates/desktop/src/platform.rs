@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use tauri::{AppHandle, Emitter, Manager, Runtime};
-use wilkes_core::embed::worker::manager::WorkerPaths;
+use wilkes_core::worker::manager::WorkerPaths;
 
 pub(crate) trait DesktopPlatform {
     fn app_config_dir(&self) -> anyhow::Result<PathBuf>;

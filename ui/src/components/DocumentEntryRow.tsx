@@ -27,6 +27,9 @@ interface DocumentEntry {
 interface Props {
   entry: DocumentEntry;
   details?: DocumentDetail[];
+  /** Rendered directly below the row, outside its button so it can hold its
+   *  own controls. Absent for every caller that has nothing to attach. */
+  accessory?: React.ReactNode;
   selected?: boolean;
   muted?: boolean;
   onClick: () => void;
@@ -41,6 +44,7 @@ export function fileName(path: string): string {
 export function DocumentEntryRow({
   entry,
   details = [],
+  accessory,
   selected = false,
   muted = false,
   onClick,
@@ -85,7 +89,7 @@ export function DocumentEntryRow({
     setInlineDetailsExpanded(false);
   }, [entry.path, inlineDetailsSignature]);
 
-  return (
+  const row = (
     <button
       type="button"
       onClick={onClick}
@@ -219,5 +223,13 @@ export function DocumentEntryRow({
         </span>
       ))}
     </button>
+  );
+
+  if (!accessory) return row;
+  return (
+    <div className={selected ? "bg-[var(--bg-active)]" : ""}>
+      {row}
+      {accessory}
+    </div>
   );
 }

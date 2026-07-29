@@ -6,10 +6,9 @@ use anyhow::Context;
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 
-use super::super::models::installer::{
-    DownloadProgress, EmbedProgress, EmbedderInstaller, ProgressTx,
-};
 use super::super::Embedder;
+use crate::embed::installer::EmbedderInstaller;
+use crate::models::progress::{DownloadProgress, EmbedProgress, ProgressTx};
 use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
 
 // ── Model lookup ──────────────────────────────────────────────────────────────
@@ -272,7 +271,7 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
 pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {
     let info = find_model_info(model_id)?;
     let relevant = relevant_hf_filenames(&info);
-    let siblings = super::super::models::hf_hub::fetch_hf_siblings(&info.model_code)?;
+    let siblings = crate::models::hf_hub::fetch_hf_siblings(&info.model_code)?;
     let sibling_sizes: Vec<(String, Option<u64>)> = siblings
         .into_iter()
         .map(|s| (s.rfilename, s.size))
@@ -368,14 +367,14 @@ impl Embedder for FastEmbedder {
 
 pub struct FastembedInstaller {
     pub model: EmbedderModel,
-    pub manager: super::super::worker::manager::WorkerManager,
+    pub manager: crate::worker::manager::WorkerManager,
     pub device: String,
 }
 
 impl FastembedInstaller {
     pub fn new(
         model: EmbedderModel,
-        manager: super::super::worker::manager::WorkerManager,
+        manager: crate::worker::manager::WorkerManager,
         device: String,
     ) -> Self {
         Self {
@@ -424,20 +423,18 @@ impl EmbedderInstaller for FastembedInstaller {
     fn build(&self, data_dir: &Path) -> anyhow::Result<Arc<dyn Embedder>> {
         let info = find_model_info(&self.model.0)?;
         let prefixes = super::aux_config::load_prefixes(data_dir, &self.model.0);
-        Ok(Arc::new(
-            super::super::worker::embedder::WorkerEmbedder::new(
-                self.manager.clone(),
-                super::super::worker::embedder::WorkerEmbedderConfig {
-                    model_id: self.model.0.clone(),
-                    dimension: info.dimension,
-                    device: self.device.clone(),
-                    engine: EmbeddingEngine::Fastembed,
-                    data_dir: data_dir.to_path_buf(),
-                    query_prefix: prefixes.query_prefix,
-                    passage_prefix: prefixes.passage_prefix,
-                },
-            ),
-        ))
+        Ok(Arc::new(crate::worker::embedder::WorkerEmbedder::new(
+            self.manager.clone(),
+            crate::worker::embedder::WorkerEmbedderConfig {
+                model_id: self.model.0.clone(),
+                dimension: info.dimension,
+                device: self.device.clone(),
+                engine: EmbeddingEngine::Fastembed,
+                data_dir: data_dir.to_path_buf(),
+                query_prefix: prefixes.query_prefix,
+                passage_prefix: prefixes.passage_prefix,
+            },
+        )))
     }
 }
 
@@ -517,8 +514,8 @@ mod tests {
     #[tokio::test]
     async fn test_fastembed_installer_new() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
-            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths::resolve(dir.path()),
         );
         let installer = FastembedInstaller::new(
             EmbedderModel("BGEBaseENV15".to_string()),
@@ -556,8 +553,8 @@ mod tests {
         std::fs::create_dir_all(&refs_dir).unwrap();
         std::fs::write(refs_dir.join("main"), "main").unwrap();
 
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
-            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths::resolve(dir.path()),
         );
         let installer = FastembedInstaller::new(
             EmbedderModel("BGEBaseENV15".to_string()),
@@ -584,8 +581,8 @@ mod tests {
     #[test]
     fn test_is_available_not_cached() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
-            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths::resolve(dir.path()),
         );
         let installer = FastembedInstaller::new(
             EmbedderModel("BGEBaseENV15".to_string()),
@@ -618,8 +615,8 @@ mod tests {
         std::fs::create_dir_all(&refs).unwrap();
         std::fs::write(refs.join("main"), "main").unwrap();
 
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
-            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths::resolve(dir.path()),
         );
         let installer = FastembedInstaller::new(
             EmbedderModel("BGEBaseENV15".to_string()),

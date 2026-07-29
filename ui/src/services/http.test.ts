@@ -132,7 +132,7 @@ describe("HttpSearchApi", () => {
     vi.stubGlobal("EventSource", vi.fn(function() { return mockEventSource; }));
 
     const close = await api.onEmbedProgress(handler);
-    expect(EventSource).toHaveBeenCalledWith("/api/embed/events");
+    expect(EventSource).toHaveBeenCalledWith("/api/events");
     expect(mockEventSource.addEventListener).toHaveBeenCalledWith("embed-progress", expect.any(Function));
 
     const listener = mockEventSource.addEventListener.mock.calls[0][1];
@@ -143,7 +143,7 @@ describe("HttpSearchApi", () => {
     expect(mockEventSource.close).toHaveBeenCalled();
   });
 
-  it("shares one EventSource across all embed subscriptions", async () => {
+  it("shares one EventSource across all app event subscriptions", async () => {
     const mockEventSource = {
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),
@@ -434,6 +434,63 @@ describe("HttpSearchApi", () => {
     (fetch as any).mockResolvedValue({ ok: true, status: 204 });
     await api.deleteIndex();
     expect(fetch).toHaveBeenCalledWith("/api/embed/index", { method: "DELETE" });
+  });
+
+  it("starts generation tasks with request ids and receives their shared stream", async () => {
+    (fetch as any).mockResolvedValue({ ok: true, status: 204 });
+    await api.explainRelatedDocument("relation-1", "/docs/a.pdf", "/docs/b.pdf");
+    expect(fetch).toHaveBeenLastCalledWith(
+      "/api/generation/explain-related",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          request_id: "relation-1",
+          anchor_path: "/docs/a.pdf",
+          path: "/docs/b.pdf",
+        }),
+      }),
+    );
+    await api.summarizeDocument("summary-1", "/docs/a.pdf");
+    expect(fetch).toHaveBeenLastCalledWith(
+      "/api/generation/summarize",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          request_id: "summary-1",
+          path: "/docs/a.pdf",
+        }),
+      }),
+    );
+
+    const handler = vi.fn();
+    const eventSource = {
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      close: vi.fn(),
+    };
+    vi.stubGlobal("EventSource", vi.fn(function() { return eventSource; }));
+    const close = await api.onGenerationStream(handler);
+    expect(eventSource.addEventListener).toHaveBeenCalledWith(
+      "generation-stream",
+      expect.any(Function),
+    );
+    const listener = eventSource.addEventListener.mock.calls[0][1];
+    listener({
+      data: JSON.stringify({
+        phase: "delta",
+        request_id: "summary-1",
+        task: "document_summary",
+        delta: "Text",
+      }),
+    });
+    expect(handler).toHaveBeenCalledWith({
+      phase: "delta",
+      request_id: "summary-1",
+      task: "document_summary",
+      delta: "Text",
+    });
+    close();
+    expect(eventSource.close).toHaveBeenCalledOnce();
   });
 
   it("throws error when fetch fails", async () => {

@@ -78,8 +78,8 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::broadcast;
     use wilkes_api::context::AppContext;
-    use wilkes_core::embed::worker::manager::WorkerPaths;
     use wilkes_core::types::SearchMode;
+    use wilkes_core::worker::manager::WorkerPaths;
 
     fn test_state() -> (tempfile::TempDir, Arc<AppState>) {
         let dir = tempdir().unwrap();

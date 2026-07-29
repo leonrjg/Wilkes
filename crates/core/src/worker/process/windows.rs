@@ -9,8 +9,8 @@ use super::{
     apply_command_plan, build_command_plan, parse_worker_stdout_line, ProtocolReadOutcome,
     ROOF_KNOCK_TIMEOUT,
 };
-use crate::embed::worker::ipc::{WorkerEvent, WorkerRequest};
-use crate::embed::worker::manager::WorkerPaths;
+use crate::worker::ipc::{WorkerEvent, WorkerRequest};
+use crate::worker::manager::WorkerPaths;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 
@@ -248,6 +248,28 @@ impl WorkerProcess {
         pid_slot.store(0, Ordering::Relaxed);
     }
 
+    /// Write a single out-of-band line to worker stdin without waiting for the
+    /// current request to finish. Used only for the generation cancel signal.
+    pub(crate) async fn send_out_of_band(&self, line: &str) -> Result<(), ()> {
+        let line = line.to_string();
+        let stdin = Arc::clone(&self.stdin);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = stdin.lock().unwrap();
+            let Some(stdin) = guard.as_mut() else {
+                return Err(());
+            };
+            if stdin.write_all(line.as_bytes()).is_err()
+                || stdin.write_all(b"\n").is_err()
+                || stdin.flush().is_err()
+            {
+                return Err(());
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_or(Err(()))
+    }
+
     pub(crate) async fn send_request(
         &self,
         req_json: &str,
@@ -290,9 +312,15 @@ impl WorkerProcess {
                     }
                     Ok(_) => match parse_worker_stdout_line(&line) {
                         ProtocolReadOutcome::Emit(event) => {
-                            let is_end = matches!(event, WorkerEvent::Done | WorkerEvent::Error(_));
+                            let is_end = event.is_terminal();
                             if reply.blocking_send(event).is_err() {
-                                return Ok(());
+                                // See the unix implementation: abandoning here
+                                // would leave the worker's remaining output in
+                                // the pipe for the next request to misread.
+                                if is_end {
+                                    return Ok(());
+                                }
+                                return drain_to_request_boundary(&mut stdout);
                             }
                             if is_end {
                                 return Ok(());
@@ -330,6 +358,38 @@ impl WorkerProcess {
                     ))
                     .await;
                 Err(())
+            }
+        }
+    }
+}
+
+/// Read and discard worker output until the terminal event of the current
+/// request, leaving the pipe positioned for the next one.
+fn drain_to_request_boundary(
+    stdout: &mut std::io::BufReader<std::process::ChildStdout>,
+) -> Result<(), ()> {
+    use std::io::BufRead;
+
+    let mut line = String::new();
+    let mut discarded = 0usize;
+    loop {
+        line.clear();
+        match stdout.read_line(&mut line) {
+            Ok(0) => return Err(()),
+            Ok(_) => {
+                if let ProtocolReadOutcome::Emit(event) = parse_worker_stdout_line(&line) {
+                    discarded += 1;
+                    if event.is_terminal() {
+                        tracing::debug!(
+                            "WorkerProcess: drained {discarded} abandoned events to the request boundary"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("WorkerProcess: failed to drain abandoned request: {e}");
+                return Err(());
             }
         }
     }

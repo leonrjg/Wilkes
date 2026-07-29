@@ -11,8 +11,8 @@ use super::{
     apply_command_plan, build_command_plan, parse_worker_stdout_line, ProtocolReadOutcome,
     ROOF_KNOCK_TIMEOUT,
 };
-use crate::embed::worker::ipc::{WorkerEvent, WorkerRequest};
-use crate::embed::worker::manager::WorkerPaths;
+use crate::worker::ipc::{WorkerEvent, WorkerRequest};
+use crate::worker::manager::WorkerPaths;
 
 struct WorkerInner {
     child: tokio::process::Child,
@@ -98,6 +98,54 @@ impl WorkerProcess {
         pid_slot.store(0, Ordering::Relaxed);
     }
 
+    /// Write a single out-of-band line to worker stdin without waiting for the
+    /// current request to finish. Used only for the generation cancel signal.
+    pub(crate) async fn send_out_of_band(&self, line: &str) -> Result<(), ()> {
+        let mut guard = self.stdin.lock().await;
+        let Some(stdin) = guard.as_mut() else {
+            return Err(());
+        };
+        if stdin.write_all(line.as_bytes()).await.is_err()
+            || stdin.write_all(b"\n").await.is_err()
+            || stdin.flush().await.is_err()
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// Read and discard worker output until the terminal event of the current
+    /// request, leaving the pipe positioned for the next one.
+    async fn drain_to_request_boundary(
+        &self,
+        stdout: &mut BufReader<tokio::process::ChildStdout>,
+    ) -> Result<(), ()> {
+        let mut line = String::new();
+        let mut discarded = 0usize;
+        loop {
+            line.clear();
+            match stdout.read_line(&mut line).await {
+                // Worker died mid-drain; the process is finished either way.
+                Ok(0) => return Err(()),
+                Ok(_) => {
+                    if let ProtocolReadOutcome::Emit(event) = parse_worker_stdout_line(&line) {
+                        discarded += 1;
+                        if event.is_terminal() {
+                            tracing::debug!(
+                                "WorkerProcess: drained {discarded} abandoned events to the request boundary"
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("WorkerProcess: failed to drain abandoned request: {e}");
+                    return Err(());
+                }
+            }
+        }
+    }
+
     pub(crate) async fn send_request(
         &self,
         req_json: &str,
@@ -140,9 +188,19 @@ impl WorkerProcess {
                 },
                 Ok(_) => match parse_worker_stdout_line(&line) {
                     ProtocolReadOutcome::Emit(event) => {
-                        let is_end = matches!(event, WorkerEvent::Done | WorkerEvent::Error(_));
+                        let is_end = event.is_terminal();
                         if reply.send(event).await.is_err() {
-                            return Ok(());
+                            // The receiver is gone, but the worker is still
+                            // writing. Returning here would leave its remaining
+                            // output in the pipe for the *next* request to read
+                            // as its own — for a cancelled generation that is
+                            // hundreds of lines. `send_request` owns the
+                            // invariant "on return, the pipe is at a request
+                            // boundary", so drain to the terminal event.
+                            if is_end {
+                                return Ok(());
+                            }
+                            return self.drain_to_request_boundary(&mut stdout).await;
                         }
                         if is_end {
                             return Ok(());

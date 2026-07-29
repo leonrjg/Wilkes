@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context as _};
 use cel_interpreter::{Context, Program, Value};
 use rusqlite::{params, Connection, OptionalExtension};
+
+/// Cap on persisted cluster labels. Pruning on write is what keeps orphaned
+/// rows from accumulating: there is no cascade to hang them off.
+const MAX_CLUSTER_LABEL_ROWS: i64 = 500;
 use wilkes_core::metadata::cache::FileIdentity;
 use wilkes_core::types::{
     Bookmark, CollectionValidation, DocumentTagUpdate, FileEntry, NewBookmark, NewSmartCollection,
@@ -102,7 +106,7 @@ impl ResearchStore {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(
-            version <= 2,
+            version <= 3,
             "research database schema {version} is newer than this app supports"
         );
         self.conn.execute_batch(
@@ -143,6 +147,14 @@ impl ResearchStore {
                updated_at_ms INTEGER NOT NULL,
                PRIMARY KEY(bookmark_id, engine, model_id, dimension, recipe_version)
              );
+             CREATE TABLE IF NOT EXISTS bookmark_cluster_labels (
+               cluster_key TEXT NOT NULL,
+               model_id TEXT NOT NULL,
+               recipe_version INTEGER NOT NULL,
+               label TEXT NOT NULL,
+               updated_at_ms INTEGER NOT NULL,
+               PRIMARY KEY(cluster_key, model_id, recipe_version)
+             );
              CREATE TABLE IF NOT EXISTS search_log (
                id TEXT PRIMARY KEY, query_json TEXT NOT NULL,
                collection_name TEXT, collection_revision INTEGER, initiated_by TEXT NOT NULL,
@@ -160,7 +172,11 @@ impl ResearchStore {
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(2, ?1)",
             [now_ms()],
         )?;
-        self.conn.pragma_update(None, "user_version", 2)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(3, ?1)",
+            [now_ms()],
+        )?;
+        self.conn.pragma_update(None, "user_version", 3)?;
         self.conn.execute(
             "UPDATE search_log SET status='cancelled', completed_at_ms=?1
              WHERE status='running'",
@@ -333,6 +349,67 @@ impl ResearchStore {
                 encode_embedding(&embedding.embedding),
                 now_ms(),
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Labels for the given cluster keys, keyed by cluster key.
+    ///
+    /// `model_id` and `recipe_version` are part of the primary key for the same
+    /// reason they are on `bookmark_embeddings`: switching generation model or
+    /// changing the prompt must not serve labels produced by the old one.
+    pub fn cached_cluster_labels(
+        &self,
+        keys: &[String],
+        model_id: &str,
+        recipe_version: i64,
+    ) -> anyhow::Result<HashMap<String, String>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", keys.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT cluster_key,label FROM bookmark_cluster_labels
+             WHERE model_id=?1 AND recipe_version=?2 AND cluster_key IN ({placeholders})"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&model_id, &recipe_version];
+        for key in keys {
+            params.push(key);
+        }
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| row.map_err(anyhow::Error::from)).collect()
+    }
+
+    /// Clusters are ephemeral and have no id, so a label references N bookmarks
+    /// and has no foreign key to cascade from. Rows whose members are gone are
+    /// orphans rather than wrong answers, and a bounded cache is the cheaper
+    /// answer than invalidation machinery.
+    pub fn upsert_cluster_label(
+        &mut self,
+        key: &str,
+        label: &str,
+        model_id: &str,
+        recipe_version: i64,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO bookmark_cluster_labels(
+               cluster_key,model_id,recipe_version,label,updated_at_ms
+             ) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(cluster_key,model_id,recipe_version)
+             DO UPDATE SET label=excluded.label, updated_at_ms=excluded.updated_at_ms",
+            params![key, model_id, recipe_version, label, now_ms()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM bookmark_cluster_labels WHERE rowid NOT IN (
+               SELECT rowid FROM bookmark_cluster_labels
+               ORDER BY updated_at_ms DESC LIMIT ?1
+             )",
+            [MAX_CLUSTER_LABEL_ROWS],
         )?;
         Ok(())
     }

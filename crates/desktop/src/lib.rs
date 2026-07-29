@@ -14,7 +14,6 @@ use wilkes_api::commands::chat::{
     ChatMessageRecord, ChatReplayContentBlock, ChatReplayToolCall, ChatTurnEnvironmentRecord,
 };
 use wilkes_api::context::{AppContext, EventEmitter};
-use wilkes_core::embed::worker::manager::WorkerStatus;
 use wilkes_core::types::{
     AddOutcome, AgentBackend, Bookmark, BookmarkClustersQuery, BookmarkClustersResult,
     CitationResult, CollectionValidation, DataPaths, DocumentMetadata, DocumentTagUpdate,
@@ -23,6 +22,7 @@ use wilkes_core::types::{
     SelectedEmbedder, SemanticScholarPaper, Settings, SmartCollection, Tag, UpdateSmartCollection,
     UpdateTag,
 };
+use wilkes_core::worker::manager::WorkerStatus;
 
 mod platform;
 
@@ -315,6 +315,12 @@ async fn delete_index_for_ctx(ctx: Arc<AppContext>, root: Option<String>) -> Res
 
 fn get_worker_status_for_ctx(ctx: Arc<AppContext>) -> WorkerStatus {
     ctx.get_worker_status()
+}
+
+/// Every worker, one row per role. Two processes can die independently, so a
+/// single status would misreport a dead generation worker as healthy.
+fn get_worker_statuses_for_ctx(ctx: Arc<AppContext>) -> Vec<WorkerStatus> {
+    ctx.get_worker_statuses()
 }
 
 async fn kill_worker_for_ctx(ctx: Arc<AppContext>) -> Result<(), String> {
@@ -1995,6 +2001,65 @@ fn get_worker_status(app: AppHandle) -> WorkerStatus {
 }
 
 #[tauri::command]
+fn get_worker_statuses(app: AppHandle) -> Vec<WorkerStatus> {
+    get_worker_statuses_for_ctx(app_context(&app))
+}
+
+#[tauri::command]
+async fn is_generation_ready(app: AppHandle) -> bool {
+    app_context(&app).is_generation_ready().await
+}
+
+#[tauri::command]
+fn list_generation_models(app: AppHandle) -> Vec<wilkes_core::types::GeneratorDescriptor> {
+    app_context(&app).list_generation_models()
+}
+
+#[tauri::command]
+async fn get_generation_model_size(app: AppHandle, model_id: String) -> Result<u64, String> {
+    let ctx = app_context(&app);
+    tokio::task::spawn_blocking(move || ctx.fetch_generation_model_size(&model_id))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Download (if needed) and attach the configured generation model. Progress
+/// arrives on the generation-progress event stream, terminated by
+/// generation-done or generation-error.
+#[tauri::command]
+async fn load_generation_model(app: AppHandle) -> Result<bool, String> {
+    app_context(&app)
+        .load_generator()
+        .await
+        .map(|outcome| outcome.attached())
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn explain_related_document(
+    app: AppHandle,
+    request_id: String,
+    anchor_path: String,
+    path: String,
+) -> Result<(), String> {
+    app_context(&app)
+        .explain_related_document(request_id, anchor_path.into(), path.into())
+        .await
+}
+
+#[tauri::command]
+async fn summarize_document(
+    app: AppHandle,
+    request_id: String,
+    path: String,
+) -> Result<(), String> {
+    app_context(&app)
+        .summarize_document(request_id, path.into())
+        .await
+}
+
+#[tauri::command]
 async fn kill_worker(app: AppHandle) -> Result<(), String> {
     kill_worker_for_ctx(app_context(&app)).await
 }
@@ -2110,7 +2175,14 @@ pub fn run() {
             open_path,
             reveal_path,
             is_semantic_ready,
+            is_generation_ready,
+            list_generation_models,
+            get_generation_model_size,
+            load_generation_model,
+            explain_related_document,
+            summarize_document,
             get_worker_status,
+            get_worker_statuses,
             kill_worker,
             set_worker_timeout,
             chat_list_backends,
@@ -2140,8 +2212,8 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use wilkes_api::context::EventEmitter;
-    use wilkes_core::embed::worker::manager::WorkerPaths;
     use wilkes_core::types::SourceOrigin;
+    use wilkes_core::worker::manager::WorkerPaths;
 
     static OPEN_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

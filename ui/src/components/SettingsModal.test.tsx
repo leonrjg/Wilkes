@@ -1,9 +1,10 @@
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, act, within } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import SettingsModal from "./SettingsModal";
 
 // Mock sub-components
 vi.mock("./SemanticPanel", () => ({ default: () => <div data-testid="semantic-panel">SemanticPanel</div> }));
+vi.mock("./GenerationPanel", () => ({ default: () => <div data-testid="generation-panel">GenerationPanel</div> }));
 vi.mock("./ChunkingPanel", () => ({ default: () => <div data-testid="chunking-panel">ChunkingPanel</div> }));
 vi.mock("./DataPanel", () => ({ default: () => <div data-testid="data-panel">DataPanel</div> }));
 vi.mock("./ExtensionsPanel", () => ({ default: () => <div data-testid="extensions-panel">ExtensionsPanel</div> }));
@@ -21,6 +22,12 @@ describe("SettingsModal", () => {
   const mockApi = {
     getSettings: vi.fn(),
     updateSettings: vi.fn(),
+    listGenerationModels: vi.fn(() => Promise.resolve([])),
+    isGenerationReady: vi.fn(() => Promise.resolve(false)),
+    loadGenerationModel: vi.fn(() => Promise.resolve(false)),
+    onGenerationProgress: vi.fn(() => Promise.resolve(() => {})),
+    onGenerationDone: vi.fn(() => Promise.resolve(() => {})),
+    onGenerationError: vi.fn(() => Promise.resolve(() => {})),
     getExternalMcpStatus: vi.fn(),
     configureExternalMcp: vi.fn(),
     rotateExternalMcpToken: vi.fn(),
@@ -45,6 +52,12 @@ describe("SettingsModal", () => {
     pdf_auto_zoom_target_px: 15.5,
     search_prefer_semantic: false,
     semantic: { enabled: true, index_path: null, worker_timeout_secs: 300 },
+    generation: {
+      enabled: false,
+      model: null,
+      device: null,
+      sampling_overrides: {},
+    },
     supported_extensions: ["ts"],
     external_mcp: {
       enabled: false,
@@ -113,6 +126,25 @@ describe("SettingsModal", () => {
     });
     fireEvent.click(screen.getByText("File extensions"));
     expect(screen.getByTestId("extensions-panel")).toBeInTheDocument();
+  });
+
+  it("groups Chat and Models under Generation", async () => {
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+
+    const generationSection = screen.getByText("Generation").parentElement;
+    expect(generationSection).not.toBeNull();
+    expect(within(generationSection!).getByRole("button", { name: "Chat" })).toBeInTheDocument();
+    expect(
+      within(generationSection!).getByRole("button", { name: "Generation Models" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Generation Models" }));
+    expect(screen.getByTestId("generation-panel")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Semantic Search Models" }));
+    expect(screen.getByTestId("semantic-panel")).toBeVisible();
   });
 
   it("updates respect_gitignore", async () => {

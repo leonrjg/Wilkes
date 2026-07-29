@@ -187,6 +187,7 @@ enum McpContext {
     Library,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_server(
     listener: tokio::net::TcpListener,
     route_path: String,

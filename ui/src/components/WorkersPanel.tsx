@@ -2,6 +2,17 @@ import { useEffect, useState } from "react";
 import type { SearchApi } from "../services/api";
 import type { WorkerStatus, Settings } from "../lib/types";
 
+/** The worker roles the backend reports, in the order they are listed. */
+const ROLE_LABELS: Record<string, string> = {
+  embed: "Embedding worker",
+  generate: "Generation worker",
+};
+
+function formatMicros(micros: number | null | undefined): string {
+  if (micros == null) return "—";
+  return `${(micros / 1000).toFixed(1)} ms`;
+}
+
 interface WorkersPanelProps {
   api: SearchApi;
   settings: Settings;
@@ -9,14 +20,15 @@ interface WorkersPanelProps {
 }
 
 export default function WorkersPanel({ api, settings, onUpdateSettings }: WorkersPanelProps) {
-  const [status, setStatus] = useState<WorkerStatus | null>(null);
+  const [statuses, setStatuses] = useState<WorkerStatus[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [timeoutSecs, setTimeoutSecs] = useState<string>(settings.semantic.worker_timeout_secs.toString());
 
   const fetchStatus = async () => {
     try {
-      const s = await api.getWorkerStatus();
-      setStatus(s);
+      // One row per role: two processes can die independently, so a single
+      // status would misreport a dead generation worker as healthy.
+      setStatuses(await api.getWorkerStatuses());
       setError(null);
     } catch (e: any) {
       setError(e.toString());
@@ -72,16 +84,21 @@ export default function WorkersPanel({ api, settings, onUpdateSettings }: Worker
             </div>
           )}
           
-          {status ? (
-            <div className="space-y-4">
+          {statuses ? (
+            <div className="space-y-6">
+              {statuses.map((status, index) => (
+            <div key={status.role ?? index} className="space-y-4">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <div className={`w-2 h-2 rounded-full ${status.active ? "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]" : "bg-[var(--text-dim)]"}`} />
                   <span className="text-sm font-medium text-[var(--text-main)]">
+                    {ROLE_LABELS[status.role ?? "embed"] ?? status.role}
+                  </span>
+                  <span className="text-xs text-[var(--text-muted)]">
                     {status.active ? "Active" : "Idle"}
                   </span>
                 </div>
-                {status.active && (
+                {status.active && status.role !== "generate" && (
                   <button
                     onClick={handleKill}
                     className="px-3 py-1.5 bg-[var(--bg-active)] hover:bg-red-500/20 text-[var(--text-main)] hover:text-red-400 text-xs font-medium rounded transition-colors border border-[var(--border-main)] hover:border-red-500/30"
@@ -103,7 +120,11 @@ export default function WorkersPanel({ api, settings, onUpdateSettings }: Worker
                   </div>
                   <div>
                     <span className="text-[var(--text-muted)] block mb-1">Device</span>
-                    <span className="text-[var(--text-main)]">{status.device || "Unknown"}</span>
+                    <span className="text-[var(--text-main)]">
+                      {status.device || (status.generation
+                        ? `Initializing (${status.generation.requested_device})`
+                        : "Unknown")}
+                    </span>
                   </div>
                   <div>
                     <span className="text-[var(--text-muted)] block mb-1">Request</span>
@@ -113,8 +134,46 @@ export default function WorkersPanel({ api, settings, onUpdateSettings }: Worker
                     <span className="text-[var(--text-muted)] block mb-1">PID</span>
                     <span className="text-[var(--text-main)] font-mono text-[10px]">{status.pid ?? "Unknown"}</span>
                   </div>
+                  {status.generation?.model_load_micros != null && (
+                    <div>
+                      <span className="text-[var(--text-muted)] block mb-1">Model load</span>
+                      <span className="text-[var(--text-main)] font-mono text-[10px]">
+                        {formatMicros(status.generation.model_load_micros)}
+                      </span>
+                    </div>
+                  )}
+                  {status.generation?.timings && (
+                    <>
+                      <div>
+                        <span className="text-[var(--text-muted)] block mb-1">Prompt</span>
+                        <span className="text-[var(--text-main)] font-mono text-[10px]">
+                          {formatMicros(status.generation.timings.prompt_micros)}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-[var(--text-muted)] block mb-1">Decode</span>
+                        <span className="text-[var(--text-main)] font-mono text-[10px]">
+                          {formatMicros(status.generation.timings.decode_micros)}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-[var(--text-muted)] block mb-1">Constraint / GPU sync</span>
+                        <span className="text-[var(--text-main)] font-mono text-[10px]">
+                          {formatMicros(status.generation.timings.constraint_micros)}
+                        </span>
+                      </div>
+                    </>
+                  )}
+                  {status.generation?.fallback_reason && (
+                    <div className="col-span-2 rounded border border-amber-700/40 bg-amber-900/20 p-2 text-[10px] text-amber-300">
+                      Requested {status.generation.requested_device}; using {status.device}:{" "}
+                      {status.generation.fallback_reason}
+                    </div>
+                  )}
                 </div>
               )}
+            </div>
+              ))}
             </div>
           ) : (
             <div className="text-sm text-[var(--text-muted)]">Loading status...</div>

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use super::installer::ProgressTx;
+use super::progress::ProgressTx;
 
 /// Raw ONNX model file manager for non-fastembed backends.
 /// Not used by the fastembed path — `FastembedInstaller` relies on fastembed's

@@ -4,6 +4,7 @@ import PreviewPane from "./PreviewPane";
 import { useViewerStore } from "../stores/useViewerStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
+import { useGenerationStore } from "../stores/useGenerationStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { api } from "../services";
 import { saveMarkdownViewMode } from "./preview/textScrollMemory";
@@ -30,6 +31,9 @@ vi.mock("../services", () => ({
     }),
     resolvePdfUrl: vi.fn((path: string) => path),
     relatedDocuments: vi.fn(() => Promise.resolve([])),
+    explainRelatedDocument: vi.fn(() => Promise.resolve()),
+    summarizeDocument: vi.fn(() => Promise.resolve()),
+    onGenerationStream: vi.fn(() => Promise.resolve(vi.fn())),
     listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
     preview: vi.fn(() => Promise.resolve({
       Text: {
@@ -99,6 +103,7 @@ describe("PreviewPane", () => {
       readyForCurrentRoot: false,
       indexStatus: null,
     } as any);
+    useGenerationStore.setState({ ready: false });
   });
 
   it("renders empty state when no match is selected", () => {
@@ -818,5 +823,140 @@ describe("PreviewPane", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Close related documents" }));
     expect(screen.queryByText("related.txt")).not.toBeInTheDocument();
+  });
+
+  it("gates the summary affordance on generation readiness and keeps viewer panels exclusive", async () => {
+    setViewerState({
+      selectedMatch: {
+        path: "/docs/source.txt",
+        origin: { TextFile: { line: 1, col: 1 } },
+      } as any,
+      previewData: {
+        Text: {
+          content: "source",
+          language: "text",
+          highlight_line: 1,
+          highlight_range: { start: 0, end: 6 },
+        },
+      },
+    });
+    render(<PreviewPane />);
+
+    expect(
+      screen.queryByRole("button", { name: "Summarize document" }),
+    ).not.toBeInTheDocument();
+
+    act(() => useGenerationStore.setState({ ready: true }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Summarize document" }),
+    );
+    expect(screen.getByText("Summary")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(api.summarizeDocument).toHaveBeenCalledWith(
+        expect.stringContaining("document_summary-"),
+        "/docs/source.txt",
+      ),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show related documents" }),
+    );
+    expect(screen.queryByText("Summary")).not.toBeInTheDocument();
+    expect(screen.getByText("Semantic index unavailable")).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Hide related documents" }),
+    );
+    expect(screen.queryByText("Semantic index unavailable")).not.toBeInTheDocument();
+  });
+
+  it("streams related explanations through the shared request contract and caches completion", async () => {
+    let generationHandler: (event: any) => void = () => {};
+    (api.onGenerationStream as any).mockImplementation((handler: any) => {
+      generationHandler = handler;
+      return Promise.resolve(vi.fn());
+    });
+    (api.relatedDocuments as any).mockResolvedValue([
+      {
+        path: "/relation-stream-docs/related.txt",
+        file_type: "PlainText",
+        size_bytes: 7,
+        extension: "txt",
+        score: 0.88,
+      },
+    ]);
+    useSettingsStore.setState({ directory: "/relation-stream-docs" });
+    useSemanticStore.setState({
+      readyForCurrentRoot: true,
+      indexStatus: {
+        indexed_files: 2,
+        total_chunks: 4,
+        built_at: 987654,
+        build_duration_ms: 10,
+        engine: "Candle",
+        model_id: "stream-model",
+        dimension: 2,
+        root_path: "/relation-stream-docs",
+        db_size_bytes: 100,
+      },
+    } as any);
+    useGenerationStore.setState({ ready: true });
+    setViewerState({
+      selectedMatch: {
+        path: "/relation-stream-docs/source.txt",
+        origin: { TextFile: { line: 1, col: 1 } },
+      } as any,
+      previewData: {
+        Text: {
+          content: "source",
+          language: "text",
+          highlight_line: 1,
+          highlight_range: { start: 0, end: 6 },
+        },
+      },
+    });
+    render(<PreviewPane />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show related documents" }),
+    );
+    await screen.findByText("related.txt");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Explain why these are related" }),
+    );
+    await waitFor(() =>
+      expect(api.explainRelatedDocument).toHaveBeenCalledOnce(),
+    );
+    const requestId = (api.explainRelatedDocument as any).mock.calls[0][0];
+    expect(api.explainRelatedDocument).toHaveBeenCalledWith(
+      requestId,
+      "/relation-stream-docs/source.txt",
+      "/relation-stream-docs/related.txt",
+    );
+
+    act(() => {
+      generationHandler({
+        phase: "delta",
+        request_id: requestId,
+        task: "relation_explanation",
+        delta: "Both measure ",
+      });
+      generationHandler({
+        phase: "completed",
+        request_id: requestId,
+        task: "relation_explanation",
+        text: "Both measure cache behavior.",
+      });
+    });
+    expect(screen.getByText("Both measure cache behavior.")).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Hide why these are related" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Explain why these are related" }),
+    );
+    expect(screen.getByText("Both measure cache behavior.")).toBeInTheDocument();
+    expect(api.explainRelatedDocument).toHaveBeenCalledOnce();
   });
 });

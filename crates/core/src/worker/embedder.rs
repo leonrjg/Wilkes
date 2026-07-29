@@ -1,4 +1,4 @@
-use super::ipc::{WorkerEvent, WorkerRequest};
+use super::ipc::{WorkerEvent, WorkerRequest, WorkerRole};
 use super::manager::{ManagerCommand, WorkerManager};
 use crate::embed::Embedder;
 use crate::types::EmbeddingEngine;
@@ -49,7 +49,7 @@ impl WorkerEmbedder {
         let request = WorkerRequest {
             mode: "embed".to_string(),
             root: std::path::PathBuf::new(),
-            engine: self.engine,
+            role: WorkerRole::Embed(self.engine),
             model: self.model_id.clone(),
             data_dir: self.data_dir.clone(),
             chunk_size: None,
@@ -57,6 +57,7 @@ impl WorkerEmbedder {
             device: self.device.clone(),
             paths: None,
             texts: Some(texts.iter().map(|s| s.to_string()).collect()),
+            generate: None,
             supported_extensions: Vec::new(),
         };
 
@@ -136,7 +137,7 @@ impl Embedder for WorkerEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embed::worker::manager::WorkerPaths;
+    use crate::worker::manager::WorkerPaths;
     use std::path::PathBuf;
     use std::sync::Arc;
 

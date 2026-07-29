@@ -1,30 +1,36 @@
 use parking_lot::Mutex as PLMutex;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use wilkes_core::directory_watcher::{DirectoryChangeBatch, DirectoryWatcher};
 use wilkes_core::embed::index::semantic_updater::process_directory_change;
 use wilkes_core::embed::index::SemanticIndex;
-use wilkes_core::embed::installer::EmbedProgress;
-use wilkes_core::embed::models::installer::EmbedderInstaller;
-use wilkes_core::embed::worker::manager::{
-    ManagerCommand, ManagerEvent, WorkerManager, WorkerPaths, WorkerStatus,
-};
+use wilkes_core::embed::installer::EmbedderInstaller;
 use wilkes_core::embed::{dispatch, Embedder};
 use wilkes_core::extract::pdf::PdfExtractor;
-use wilkes_core::extract::ExtractorRegistry;
+use wilkes_core::extract::{ContentExtractor, ExtractorRegistry};
+use wilkes_core::generate::engines::dispatch as generate_dispatch;
+use wilkes_core::generate::tasks::cluster_label::cluster_label;
+use wilkes_core::generate::tasks::document_summary::{
+    summarize_document as generate_document_summary, DocumentSummaryInput,
+};
+use wilkes_core::generate::tasks::relation::{
+    explain_relation, DocumentSummary, MAX_EXCERPT_CHARS,
+};
+use wilkes_core::generate::{Generated, GenerationEngine, Generator};
 use wilkes_core::integrations::openalex::OpenAlexClient;
 use wilkes_core::integrations::semantic_scholar::SemanticScholarClient;
 use wilkes_core::integrations::zotero::model::ZoteroItem;
 use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
+use wilkes_core::models::progress::EmbedProgress;
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
     Bookmark, BookmarkCluster, BookmarkClustersQuery, BookmarkClustersResult, CollectionValidation,
@@ -34,12 +40,27 @@ use wilkes_core::types::{
     SearchScope, SelectedEmbedder, SemanticSettings, Settings, SmartCollection, Tag,
     UpdateSmartCollection, UpdateTag,
 };
+use wilkes_core::types::{
+    GenerationSettings, GenerationStreamEvent, GenerationTask, GeneratorDescriptor,
+};
+use wilkes_core::worker::manager::{
+    ManagerCommand, ManagerEvent, WorkerManager, WorkerPaths, WorkerStatus,
+};
 
 use crate::commands::search::{start_search, SearchHandle};
 use crate::commands::settings::{get_settings, update_settings};
 use crate::research::{CachedBookmarkEmbedding, ResearchStore, SearchLogTracker};
 
 const BOOKMARK_EMBEDDING_RECIPE_VERSION: i64 = 1;
+
+/// Bump whenever the cluster-label prompt or grammar changes: that is the whole
+/// point of the field, and a stale cache would otherwise serve labels produced
+/// by a recipe that no longer exists.
+const BOOKMARK_CLUSTER_LABEL_RECIPE_VERSION: i64 = 3;
+
+/// A run producing more clusters than this is not worth labelling: the worker
+/// serialises requests, so 20 labels already means several seconds of queue.
+const MAX_LABELLED_CLUSTERS: usize = 20;
 
 // ── EventEmitter ──────────────────────────────────────────────────────────────
 
@@ -220,6 +241,23 @@ fn metadata_source_preference(source: &MetadataSourcePreference) -> MetadataSour
     }
 }
 
+/// Outcome of `load_generator`. The three cases are distinct at every call
+/// site: "no model attached" for want of configuration is the normal resting
+/// state, while "superseded" means a newer load is already doing the work and
+/// this one deliberately left the generator alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeneratorLoad {
+    Attached,
+    NotConfigured,
+    Superseded,
+}
+
+impl GeneratorLoad {
+    pub fn attached(self) -> bool {
+        self == GeneratorLoad::Attached
+    }
+}
+
 // ── AppContext ────────────────────────────────────────────────────────────────
 
 /// Shared application state and lifecycle logic. Both the desktop (Tauri) and
@@ -240,6 +278,23 @@ pub struct AppContext {
     embed_cancel_in_progress: AtomicBool,
     shutting_down: AtomicBool,
     pub worker_manager: WorkerManager,
+    /// Generation runs in its own process with its own manager. Sharing the
+    /// embedding manager would evict a multi-gigabyte model on every
+    /// alternation, because the worker caches exactly one model and restarts on
+    /// role change.
+    pub generate_manager: WorkerManager,
+    generator: PLMutex<Option<Arc<dyn Generator>>>,
+    /// Serialises `load_generator`, so two settings changes cannot download and
+    /// attach concurrently.
+    generator_load_lock: tokio::sync::Mutex<()>,
+    /// Claimed by each load before it queues behind the lock. Only the newest
+    /// claim may assign the generator; an older one that finishes later would
+    /// otherwise attach a model the user has already switched away from.
+    generator_epoch: AtomicU64,
+    /// At most one labelling run in flight: a newer `cluster_bookmarks` call
+    /// makes the previous run's results describe a partition nobody is looking
+    /// at any more.
+    cluster_label_task: PLMutex<Option<JoinHandle<()>>>,
     events: Arc<dyn EventEmitter>,
     settings_lock: tokio::sync::Mutex<()>,
     bookmarks_lock: tokio::sync::Mutex<()>,
@@ -256,7 +311,8 @@ impl AppContext {
         mpsc::Receiver<ManagerEvent>,
         impl std::future::Future<Output = ()> + Send,
     ) {
-        let (worker_manager, event_rx, loop_fut) = WorkerManager::new(paths);
+        let (worker_manager, event_rx, loop_fut) = WorkerManager::new(paths.clone());
+        let (generate_manager, generate_event_rx, generate_loop_fut) = WorkerManager::new(paths);
         let ctx = Arc::new(Self {
             data_dir,
             bookmarks_path: settings_path.with_file_name("bookmarks.json"),
@@ -270,11 +326,31 @@ impl AppContext {
             embed_cancel_in_progress: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             worker_manager,
+            generate_manager,
+            generator: PLMutex::new(None),
+            generator_load_lock: tokio::sync::Mutex::new(()),
+            generator_epoch: AtomicU64::new(0),
+            cluster_label_task: PLMutex::new(None),
             events,
             settings_lock: tokio::sync::Mutex::new(()),
             bookmarks_lock: tokio::sync::Mutex::new(()),
         });
-        (ctx, event_rx, loop_fut)
+
+        // Both managers are driven by the single future `new` already returns,
+        // and both event streams are merged into the single receiver it already
+        // returns. `new` stays free of side effects — it is called outside a
+        // runtime in tests — and callers do not have to learn that there are
+        // now two workers to drive.
+        let (merged_tx, merged_rx) = mpsc::channel(64);
+        let combined = async move {
+            tokio::join!(
+                loop_fut,
+                generate_loop_fut,
+                forward_manager_events(event_rx, merged_tx.clone()),
+                forward_manager_events(generate_event_rx, merged_tx),
+            );
+        };
+        (ctx, merged_rx, combined)
     }
 
     /// Spawns the required background tasks for the application context.
@@ -553,19 +629,29 @@ impl AppContext {
         .map_err(|e| format!("Bookmark clustering task panicked: {e}"))?
         .map_err(|e| e.to_string())?;
 
-        let clusters = clustered
+        let mut clusters: Vec<BookmarkCluster> = clustered
             .clusters
             .into_iter()
-            .map(|cluster| BookmarkCluster {
-                bookmark_ids: cluster
+            .map(|cluster| {
+                let members: Vec<(String, String)> = cluster
                     .item_indices
-                    .into_iter()
-                    .map(|index| prepared[index].0.clone())
-                    .collect(),
-                representative_bookmark_id: prepared[cluster.representative_index].0.clone(),
-                cohesion: cluster.cohesion,
+                    .iter()
+                    .map(|index| (prepared[*index].0.clone(), prepared[*index].2.clone()))
+                    .collect();
+                BookmarkCluster {
+                    cluster_key: cluster_key(&members),
+                    bookmark_ids: members.iter().map(|(id, _)| id.clone()).collect(),
+                    representative_bookmark_id: prepared[cluster.representative_index].0.clone(),
+                    cohesion: cluster.cohesion,
+                    label: None,
+                }
             })
             .collect();
+
+        // Labels are asynchronous: decode is ~370ms each, so labelling inline
+        // would add seconds to a call that is otherwise pure compute.
+        self.attach_cluster_labels(&mut clusters, &prepared).await;
+
         let clustered_unassigned = clustered
             .unclustered_indices
             .into_iter()
@@ -582,6 +668,122 @@ impl AppContext {
             clusters,
             unclustered_bookmark_ids,
         })
+    }
+
+    /// Fill in cached labels, then kick off a background run for the misses.
+    /// Returns immediately; late labels arrive as `bookmark-cluster-labelled`
+    /// events, patched by `cluster_key`.
+    async fn attach_cluster_labels(
+        self: &Arc<Self>,
+        clusters: &mut [BookmarkCluster],
+        prepared: &[(String, String, String)],
+    ) {
+        // A newer run supersedes the previous one outright: its results are for
+        // a partition that is no longer displayed.
+        if let Some(previous) = self.cluster_label_task.lock().take() {
+            previous.abort();
+        }
+        if clusters.is_empty() {
+            return;
+        }
+
+        let Some(generator) = self.generator.lock().clone() else {
+            return;
+        };
+        let settings = self.generation_settings().await;
+        if !settings.enabled {
+            return;
+        }
+        let model_id = generator.model_id().to_string();
+
+        let keys: Vec<String> = clusters.iter().map(|c| c.cluster_key.clone()).collect();
+        let cached = match self.research_store() {
+            Ok(store) => store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .cached_cluster_labels(&keys, &model_id, BOOKMARK_CLUSTER_LABEL_RECIPE_VERSION),
+            Err(e) => Err(e),
+        };
+        let cached = match cached {
+            Ok(cached) => cached,
+            Err(e) => {
+                error!("Could not read cached cluster labels: {e:#}");
+                return;
+            }
+        };
+
+        let inputs: std::collections::HashMap<&str, &str> = prepared
+            .iter()
+            .map(|(id, input, _)| (id.as_str(), input.as_str()))
+            .collect();
+
+        let mut pending: Vec<(String, Vec<String>)> = Vec::new();
+        for cluster in clusters.iter_mut() {
+            if let Some(label) = cached.get(&cluster.cluster_key) {
+                cluster.label = Some(label.clone());
+                continue;
+            }
+            pending.push((cluster.cluster_key.clone(), label_inputs(cluster, &inputs)));
+        }
+
+        if pending.is_empty() {
+            return;
+        }
+        if clusters.len() > MAX_LABELLED_CLUSTERS {
+            info!(
+                "Skipping cluster labelling: {} clusters exceeds the {MAX_LABELLED_CLUSTERS} cap",
+                clusters.len()
+            );
+            return;
+        }
+
+        let ctx = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            for (key, members) in pending {
+                let generator = Arc::clone(&generator);
+                let members_for_task = members.clone();
+                let generated = tokio::task::spawn_blocking(move || {
+                    let refs: Vec<&str> = members_for_task.iter().map(String::as_str).collect();
+                    cluster_label(generator.as_ref(), &refs)
+                })
+                .await;
+
+                let label = match generated {
+                    Ok(Ok(label)) => label,
+                    // Every failure path leaves the label absent and logs: a
+                    // missing label is not something the user asked for.
+                    Ok(Err(e)) => {
+                        warn!("Could not label cluster {key}: {e:#}");
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("Cluster label task failed for {key}: {e}");
+                        continue;
+                    }
+                };
+
+                if let Ok(store) = ctx.research_store() {
+                    if let Err(e) = store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .upsert_cluster_label(
+                            &key,
+                            &label,
+                            &model_id,
+                            BOOKMARK_CLUSTER_LABEL_RECIPE_VERSION,
+                        )
+                    {
+                        error!("Could not cache cluster label: {e:#}");
+                    }
+                }
+
+                ctx.events.emit(
+                    "bookmark-cluster-labelled",
+                    serde_json::json!({ "cluster_key": key, "label": label }),
+                );
+            }
+        });
+        *self.cluster_label_task.lock() = Some(task);
     }
 
     pub async fn list_files(
@@ -1390,6 +1592,39 @@ impl AppContext {
         }
     }
 
+    /// Attach, detach or reload the generator when the generation settings
+    /// change. Both the on and off transitions matter: leaving a generator
+    /// attached after the feature is switched off would keep a multi-gigabyte
+    /// process alive behind a toggle the user turned off.
+    fn on_generation_settings_maybe_changed(self: &Arc<Self>, before: &Settings, after: &Settings) {
+        if before.generation == after.generation {
+            return;
+        }
+        let ctx = Arc::clone(self);
+        let enabled = after.generation.enabled;
+        let model_changed = before.generation.model != after.generation.model;
+        tokio::spawn(async move {
+            if !enabled {
+                info!("generation disabled; detaching the generator");
+                ctx.unload_generator();
+                return;
+            }
+            if model_changed {
+                ctx.unload_generator();
+            }
+            match ctx.load_generator().await {
+                Ok(GeneratorLoad::Attached) => info!("generation model attached"),
+                Ok(GeneratorLoad::NotConfigured) => {
+                    info!("generation enabled but no model selected")
+                }
+                Ok(GeneratorLoad::Superseded) => {
+                    info!("generation model load superseded by a newer settings change")
+                }
+                Err(e) => error!("Could not attach the generation model: {e:#}"),
+            }
+        });
+    }
+
     pub async fn update_settings(
         self: &Arc<Self>,
         patch: serde_json::Value,
@@ -1405,6 +1640,7 @@ impl AppContext {
         self.on_semantic_scholar_settings_maybe_changed(&before, &updated);
         self.on_openalex_settings_maybe_changed(&before, &updated);
         self.on_semantic_pref_maybe_changed(&before, &updated);
+        self.on_generation_settings_maybe_changed(&before, &updated);
         Ok(updated)
     }
 
@@ -1599,6 +1835,152 @@ impl AppContext {
                 events.emit("file-metadata-updated", serde_json::json!(updates));
             }
         });
+    }
+
+    // ── Generation ────────────────────────────────────────────────────────────
+
+    pub async fn generation_settings(&self) -> GenerationSettings {
+        self.get_settings().await.generation
+    }
+
+    /// The single readiness predicate every LLM-dependent affordance is gated
+    /// on. Not `settings.enabled` scattered across call sites — that is how a
+    /// feature ends up half-gated, with a spinner spinning forever because the
+    /// model was never installed.
+    pub async fn is_generation_ready(&self) -> bool {
+        let settings = self.generation_settings().await;
+        settings.enabled && settings.model.is_some() && self.generator.lock().is_some()
+    }
+
+    pub fn list_generation_models(&self) -> Vec<GeneratorDescriptor> {
+        generate_dispatch::list_models(GenerationEngine::Candle, &self.data_dir)
+    }
+
+    pub fn fetch_generation_model_size(&self, model_id: &str) -> anyhow::Result<u64> {
+        generate_dispatch::fetch_model_size(GenerationEngine::Candle, model_id)
+    }
+
+    fn generation_device(settings: &GenerationSettings) -> String {
+        settings
+            .device
+            .clone()
+            .unwrap_or_else(|| "auto".to_string())
+    }
+
+    /// Download (if needed) and attach the configured generation model.
+    ///
+    /// Loads are serialised and epoch-stamped: every settings change spawns one,
+    /// and a slow load for a model the user has since switched away from must not
+    /// win the race and attach itself. The epoch is claimed before queueing, so
+    /// the newest claim is the only one allowed to assign the generator.
+    pub async fn load_generator(self: &Arc<Self>) -> anyhow::Result<GeneratorLoad> {
+        let epoch = self.generator_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let _serialized = self.generator_load_lock.lock().await;
+        if self.generator_epoch.load(Ordering::SeqCst) != epoch {
+            info!("generation model load superseded before it started");
+            return Ok(GeneratorLoad::Superseded);
+        }
+
+        // Read after taking the lock: the settings that matter are the current
+        // ones, not the ones in force when this load was queued.
+        let settings = self.generation_settings().await;
+        if !settings.enabled {
+            *self.generator.lock() = None;
+            return Ok(GeneratorLoad::NotConfigured);
+        }
+        let Some(model) = settings.model.clone() else {
+            *self.generator.lock() = None;
+            return Ok(GeneratorLoad::NotConfigured);
+        };
+
+        let installer = generate_dispatch::get_installer(
+            GenerationEngine::Candle,
+            model.clone(),
+            self.generate_manager.clone(),
+            Self::generation_device(&settings),
+        );
+
+        // Generation download progress travels on its own event stream. The
+        // `embed-*` events are owned by the semantic index lifecycle: borrowing
+        // them here put the UI into "indexing" with no terminal event to leave it.
+        let (progress_tx, progress_rx) = mpsc::channel::<EmbedProgress>(64);
+        let forward = tokio::spawn(Self::forward_generation_progress(
+            Arc::clone(&self.events),
+            progress_rx,
+        ));
+        let install = installer.install(&self.data_dir, progress_tx).await;
+        let _ = forward.await;
+        if let Err(e) = install {
+            self.emit_generation_error(format!("{e:#}"));
+            return Err(e);
+        }
+
+        // Last check before the assignment: a newer load claimed the epoch while
+        // this one was downloading, and its model is the one the user wants.
+        if self.generator_epoch.load(Ordering::SeqCst) != epoch {
+            info!(
+                "generation model '{}' finished loading but was superseded; discarding it",
+                model.model_id()
+            );
+            self.events.emit(
+                "generation-done",
+                serde_json::json!({ "model": model.model_id() }),
+            );
+            return Ok(GeneratorLoad::Superseded);
+        }
+
+        let generator = match installer.build(&self.data_dir) {
+            Ok(generator) => generator,
+            Err(e) => {
+                self.emit_generation_error(format!("{e:#}"));
+                return Err(e);
+            }
+        };
+        *self.generator.lock() = Some(generator);
+
+        // Generation and embedding share the worker lifecycle default. Do not
+        // read a second persisted timeout here: older builds wrote 60 seconds
+        // into generation settings, causing a reload every minute even though
+        // the common worker residency is five minutes.
+        let _ = self
+            .generate_manager
+            .send(ManagerCommand::SetTimeout(
+                wilkes_core::worker::DEFAULT_IDLE_TIMEOUT_SECS,
+            ))
+            .await;
+        self.events.emit(
+            "generation-done",
+            serde_json::json!({ "model": model.model_id() }),
+        );
+        Ok(GeneratorLoad::Attached)
+    }
+
+    fn emit_generation_error(&self, message: impl Into<String>) {
+        let message = message.into();
+        error!("Generation model load failed: {message}");
+        self.events.emit(
+            "generation-error",
+            serde_json::json!({ "message": message }),
+        );
+    }
+
+    async fn forward_generation_progress(
+        events: Arc<dyn EventEmitter>,
+        mut progress_rx: mpsc::Receiver<EmbedProgress>,
+    ) {
+        while let Some(progress) = progress_rx.recv().await {
+            events.emit(
+                "generation-progress",
+                serde_json::to_value(&progress).unwrap_or_default(),
+            );
+        }
+    }
+
+    /// Detach the generator and reap its process. Called when the feature is
+    /// switched off or the model changes.
+    pub fn unload_generator(&self) {
+        *self.generator.lock() = None;
+        self.kill_generation_worker();
     }
 
     pub fn is_semantic_ready(&self) -> bool {
@@ -2022,6 +2404,187 @@ impl AppContext {
             }
         }
         Ok(related)
+    }
+
+    /// One lifecycle and event contract for every user-facing token stream.
+    /// Task closures own input preparation, prompts, and verification.
+    async fn run_generation_stream<F>(
+        self: Arc<Self>,
+        request_id: String,
+        task: GenerationTask,
+        generate: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(
+                Arc<Self>,
+                Arc<dyn Generator>,
+                &mut dyn FnMut(&str) -> std::ops::ControlFlow<()>,
+            ) -> anyhow::Result<Generated>
+            + Send
+            + 'static,
+    {
+        let result: Result<String, String> = async {
+            if request_id.trim().is_empty() || request_id.len() > 128 {
+                return Err("Invalid generation request id".to_string());
+            }
+            if !self.is_generation_ready().await {
+                return Err("Generation is not available".to_string());
+            }
+            let generator = self
+                .generator
+                .lock()
+                .clone()
+                .ok_or_else(|| "Generation model unavailable".to_string())?;
+
+            let events = Arc::clone(&self.events);
+            let delta_request_id = request_id.clone();
+            let ctx = Arc::clone(&self);
+            let generated = tokio::task::spawn_blocking(move || {
+                generate(ctx, generator, &mut |delta| {
+                    events.emit(
+                        "generation-stream",
+                        serde_json::to_value(GenerationStreamEvent::Delta {
+                            request_id: delta_request_id.clone(),
+                            task,
+                            delta: delta.to_string(),
+                        })
+                        .unwrap_or_default(),
+                    );
+                    std::ops::ControlFlow::Continue(())
+                })
+            })
+            .await
+            .map_err(|e| format!("Generation task panicked: {e}"))?
+            .map_err(|e| format!("{e:#}"))?;
+            Ok(generated.text)
+        }
+        .await;
+
+        match result {
+            Ok(text) => {
+                self.events.emit(
+                    "generation-stream",
+                    serde_json::to_value(GenerationStreamEvent::Completed {
+                        request_id,
+                        task,
+                        text,
+                    })
+                    .unwrap_or_default(),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                warn!("Generation stream {request_id} failed: {error}");
+                self.events.emit(
+                    "generation-stream",
+                    serde_json::to_value(GenerationStreamEvent::Failed {
+                        request_id,
+                        task,
+                        error: error.clone(),
+                    })
+                    .unwrap_or_default(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Stream a one-sentence explanation of why `related_path` is related to
+    /// `anchor_path`.
+    pub async fn explain_related_document(
+        self: Arc<Self>,
+        request_id: String,
+        anchor_path: PathBuf,
+        related_path: PathBuf,
+    ) -> Result<(), String> {
+        self.run_generation_stream(
+            request_id,
+            GenerationTask::RelationExplanation,
+            move |ctx, generator, sink| {
+                let anchor = ctx
+                    .document_summary(&anchor_path)
+                    .map_err(anyhow::Error::msg)?;
+                let related = ctx
+                    .document_summary(&related_path)
+                    .map_err(anyhow::Error::msg)?;
+                explain_relation(generator.as_ref(), &anchor, &related, sink)
+            },
+        )
+        .await
+    }
+
+    /// Stream a concise summary of the document currently shown in the viewer.
+    /// Extraction is on demand and independent of the semantic index.
+    pub async fn summarize_document(
+        self: Arc<Self>,
+        request_id: String,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        self.run_generation_stream(
+            request_id,
+            GenerationTask::DocumentSummary,
+            move |ctx, generator, sink| {
+                let input = ctx
+                    .document_summary_input(&path)
+                    .map_err(anyhow::Error::msg)?;
+                generate_document_summary(generator.as_ref(), &input, sink)
+            },
+        )
+        .await
+    }
+
+    /// Title plus a leading excerpt, both from caches. Returns `Err` when there
+    /// is no cached text: no fallback extraction.
+    fn document_summary(&self, path: &Path) -> Result<DocumentSummary, String> {
+        let index = self.index.lock();
+        let guard = index.lock().unwrap_or_else(|p| p.into_inner());
+        let idx = guard
+            .as_ref()
+            .ok_or_else(|| "No semantic index found".to_string())?;
+        let excerpt = idx
+            .cached_document_excerpt(path, MAX_EXCERPT_CHARS)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("No cached text for {}", path.display()))?;
+
+        Ok(DocumentSummary {
+            title: self.document_title(path),
+            excerpt,
+        })
+    }
+
+    fn document_summary_input(&self, path: &Path) -> Result<DocumentSummaryInput, String> {
+        let text = if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+        {
+            PdfExtractor::new()
+                .extract(path)
+                .map_err(|e| format!("Could not extract {}: {e:#}", path.display()))?
+                .text
+        } else {
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("Could not read {}: {e}", path.display()))?
+        };
+        Ok(DocumentSummaryInput {
+            title: self.document_title(path),
+            text,
+        })
+    }
+
+    fn document_title(&self, path: &Path) -> String {
+        FileIdentity::for_path(path)
+            .zip(self.metadata_cache())
+            .and_then(|(identity, cache)| {
+                let cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+                cache.get_valid(path, identity).ok().flatten()
+            })
+            .and_then(|metadata| metadata.title.clone())
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
     }
 
     // ── Build index ───────────────────────────────────────────────────────────
@@ -2512,7 +3075,10 @@ impl AppContext {
         }
         self.stop_directory_watcher();
         self.cancel_embed().await;
-        self.kill_worker();
+        if let Some(task) = self.cluster_label_task.lock().take() {
+            task.abort();
+        }
+        self.kill_all_workers();
     }
 
     pub async fn delete_index(&self, root: Option<PathBuf>) -> anyhow::Result<()> {
@@ -2543,12 +3109,31 @@ impl AppContext {
 
     // ── Worker management ─────────────────────────────────────────────────────
 
+    /// Status of every worker. Two processes can die independently, so a single
+    /// status would misreport a dead generation worker as healthy.
+    pub fn get_worker_statuses(&self) -> Vec<WorkerStatus> {
+        vec![self.worker_manager.status(), self.generate_manager.status()]
+    }
+
+    /// The embedding worker's status. Kept for callers that only care about
+    /// indexing; new callers should prefer `get_worker_statuses`.
     pub fn get_worker_status(&self) -> WorkerStatus {
         self.worker_manager.status()
     }
 
     pub fn kill_worker(&self) {
         self.worker_manager.request_shutdown();
+    }
+
+    pub fn kill_generation_worker(&self) {
+        self.generate_manager.request_shutdown();
+    }
+
+    /// Shut down every worker. A missed one leaks a multi-gigabyte process past
+    /// app exit.
+    pub fn kill_all_workers(&self) {
+        self.kill_worker();
+        self.kill_generation_worker();
     }
 
     pub async fn set_worker_timeout(&self, secs: u64) -> anyhow::Result<()> {
@@ -2802,6 +3387,16 @@ impl AppContext {
         if let Some(root) = settings.last_directory.clone() {
             self.start_directory_watcher(root);
         }
+        // Independent of the semantic toggle below: generation has its own
+        // enable flag and must restore whether or not semantic search is on.
+        if settings.generation.enabled && settings.generation.model.is_some() {
+            let ctx = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Err(e) = ctx.load_generator().await {
+                    error!("restore_state: could not attach the generation model: {e:#}");
+                }
+            });
+        }
         // `search_prefer_semantic` is the single owner of whether the semantic
         // subsystem is active. A leftover index DB on disk must not resurrect the
         // embedder behind a toggle the user turned off. The directory watcher is
@@ -2816,6 +3411,58 @@ impl AppContext {
 
         self.finish_restore_state(&loaded.plan, loaded.embedder, loaded.index)
             .await;
+    }
+}
+
+/// Content-derived cluster identity.
+///
+/// Same members and same text yields the same key, even across a granularity
+/// change that happens to reproduce the group; any edit, addition or removal
+/// yields a different one. That is exactly the invalidation wanted, with no
+/// invalidation code — and it is why the key uses each member's `input_hash`
+/// rather than its `updated_at`, which changes on edits that do not affect the
+/// clustered text.
+fn cluster_key(members: &[(String, String)]) -> String {
+    let mut parts: Vec<String> = members
+        .iter()
+        .map(|(id, input_hash)| format!("{id}:{input_hash}"))
+        .collect();
+    parts.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"v1\n");
+    hasher.update(parts.join("\n").as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Prompt input for one cluster: the representative first, then the remaining
+/// members in a deterministic order. Non-deterministic selection would make the
+/// cached label depend on iteration order.
+fn label_inputs(
+    cluster: &BookmarkCluster,
+    inputs: &std::collections::HashMap<&str, &str>,
+) -> Vec<String> {
+    let mut ordered: Vec<&String> = cluster
+        .bookmark_ids
+        .iter()
+        .filter(|id| **id != cluster.representative_bookmark_id)
+        .collect();
+    ordered.sort();
+
+    std::iter::once(&cluster.representative_bookmark_id)
+        .chain(ordered.into_iter())
+        .filter_map(|id| inputs.get(id.as_str()).map(|text| text.to_string()))
+        .take(wilkes_core::generate::tasks::cluster_label::MAX_MEMBERS)
+        .collect()
+}
+
+async fn forward_manager_events(
+    mut rx: mpsc::Receiver<ManagerEvent>,
+    tx: mpsc::Sender<ManagerEvent>,
+) {
+    while let Some(event) = rx.recv().await {
+        if tx.send(event).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -2985,6 +3632,7 @@ mod tests {
     use tracing::subscriber;
     use tracing_subscriber::prelude::*;
     use wilkes_core::embed::MockEmbedder;
+    use wilkes_core::generate::mock::MockGenerator;
     use wilkes_core::types::EmbeddingEngine;
     use wilkes_core::types::{
         BookmarkDock, ByteRange, EmbedderModel, IndexStatus, SearchMode, SelectedEmbedder,
@@ -3284,6 +3932,188 @@ mod tests {
             calls.load(Ordering::Relaxed),
             2,
             "editing one note should embed only that cache miss"
+        );
+    }
+
+    fn generation_ctx(
+        dir: &Path,
+        events: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    ) -> Arc<AppContext> {
+        let emitter = Arc::new(MockEmitter { events });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.to_path_buf(),
+            dir.join("settings.json"),
+            WorkerPaths::resolve(dir),
+            emitter,
+        );
+        ctx
+    }
+
+    async fn enable_generation(ctx: &Arc<AppContext>, model: &str) {
+        update_settings(
+            &ctx.settings_path,
+            serde_json::json!({
+                "generation": {
+                    "enabled": true,
+                    "model": model,
+                    "device": "cpu",
+                    "sampling_overrides": {},
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn document_summary_uses_the_shared_delta_and_terminal_event_contract() {
+        let dir = tempdir().unwrap();
+        // Desktop documents normally live outside the app-support data dir.
+        // Filesystem confinement belongs to the HTTP uploads boundary.
+        let documents = tempdir().unwrap();
+        let path = documents.path().join("paper.txt");
+        std::fs::write(&path, "A source document with a result.").unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = generation_ctx(dir.path(), Arc::clone(&events));
+        enable_generation(&ctx, "mock-generator").await;
+        *ctx.generator.lock() = Some(Arc::new(MockGenerator::scripted(["A complete summary."])));
+
+        Arc::clone(&ctx)
+            .summarize_document("summary-request".to_string(), path)
+            .await
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        let streamed = events
+            .iter()
+            .filter(|(name, _)| name == "generation-stream")
+            .map(|(_, payload)| {
+                serde_json::from_value::<GenerationStreamEvent>(payload.clone()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            streamed,
+            vec![
+                GenerationStreamEvent::Delta {
+                    request_id: "summary-request".to_string(),
+                    task: GenerationTask::DocumentSummary,
+                    delta: "A ".to_string(),
+                },
+                GenerationStreamEvent::Delta {
+                    request_id: "summary-request".to_string(),
+                    task: GenerationTask::DocumentSummary,
+                    delta: "complete ".to_string(),
+                },
+                GenerationStreamEvent::Delta {
+                    request_id: "summary-request".to_string(),
+                    task: GenerationTask::DocumentSummary,
+                    delta: "summary.".to_string(),
+                },
+                GenerationStreamEvent::Completed {
+                    request_id: "summary-request".to_string(),
+                    task: GenerationTask::DocumentSummary,
+                    text: "A complete summary.".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_task_failure_emits_one_correlated_failed_terminal_event() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "  ").unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = generation_ctx(dir.path(), Arc::clone(&events));
+        enable_generation(&ctx, "mock-generator").await;
+        *ctx.generator.lock() = Some(Arc::new(MockGenerator::scripted(["unused"])));
+
+        let error = Arc::clone(&ctx)
+            .summarize_document("failed-request".to_string(), path)
+            .await
+            .unwrap_err();
+        assert!(error.contains("document has no extractable text"));
+
+        let events = events.lock().unwrap();
+        let streamed = events
+            .iter()
+            .filter(|(name, _)| name == "generation-stream")
+            .map(|(_, payload)| {
+                serde_json::from_value::<GenerationStreamEvent>(payload.clone()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(streamed.len(), 1);
+        assert!(matches!(
+            &streamed[0],
+            GenerationStreamEvent::Failed {
+                request_id,
+                task: GenerationTask::DocumentSummary,
+                error,
+            } if request_id == "failed-request"
+                && error.contains("document has no extractable text")
+        ));
+    }
+
+    /// The generation install must not borrow the embed event stream: that
+    /// stream globally sets "indexing", and this path emits no `embed-done` to
+    /// ever clear it. Failure or success, generation reports on its own events.
+    #[tokio::test]
+    async fn generation_load_never_touches_the_embed_event_stream() {
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = generation_ctx(dir.path(), Arc::clone(&events));
+        enable_generation(&ctx, "not/a-real-model").await;
+
+        let err = ctx.load_generator().await.unwrap_err();
+        assert!(
+            err.to_string().contains("not a known generation model"),
+            "{err:#}"
+        );
+
+        let events = events.lock().unwrap();
+        assert!(
+            !events.iter().any(|(name, _)| name.starts_with("embed-")),
+            "generation emitted an embed event: {events:?}"
+        );
+        assert!(events
+            .iter()
+            .any(|(name, payload)| name == "generation-error"
+                && payload["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("not a known generation model"))));
+    }
+
+    /// Two settings changes in quick succession each spawn a load. The one that
+    /// is no longer current must leave the generator alone, whatever order the
+    /// two finish in — readiness only checks that *some* generator is attached,
+    /// so an overwrite here silently runs the wrong model.
+    #[tokio::test]
+    async fn a_superseded_load_does_not_attach_its_generator() {
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = generation_ctx(dir.path(), Arc::clone(&events));
+        enable_generation(&ctx, "not/a-real-model").await;
+
+        // Hold the load lock so the load below queues, then claim a newer epoch
+        // on its behalf — exactly what a second `load_generator` call does.
+        let held = ctx.generator_load_lock.lock().await;
+        let load = {
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move { ctx.load_generator().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        ctx.generator_epoch.fetch_add(1, Ordering::SeqCst);
+        drop(held);
+
+        assert_eq!(load.await.unwrap().unwrap(), GeneratorLoad::Superseded);
+        assert!(ctx.generator.lock().is_none());
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| name == "generation-error"),
+            "a superseded load must not report a failure"
         );
     }
 
@@ -3739,7 +4569,7 @@ mod tests {
             WorkerPaths::resolve(dir.path()),
             emitter,
         );
-        let progress = EmbedProgress::Build(wilkes_core::embed::installer::IndexBuildProgress {
+        let progress = EmbedProgress::Build(wilkes_core::models::progress::IndexBuildProgress {
             files_processed: 1,
             total_files: 2,
             message: "building".to_string(),
@@ -3762,7 +4592,7 @@ mod tests {
 
         let forward = tokio::spawn(AppContext::forward_embed_progress(Arc::clone(&emitter), rx));
         tx.send(EmbedProgress::Download(
-            wilkes_core::embed::installer::DownloadProgress {
+            wilkes_core::models::progress::DownloadProgress {
                 bytes_received: 3,
                 total_bytes: 9,
                 done: false,

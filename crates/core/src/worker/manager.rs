@@ -4,18 +4,38 @@ use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
 
+use crate::generate::{GenerationRuntime, GenerationTimings};
+
 use super::ipc::{WorkerEvent, WorkerRequest};
 use super::runtime::{supervised_manager_loop, ActiveProcessSlot};
+use super::DEFAULT_IDLE_TIMEOUT_SECS;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkerStatus {
     pub active: bool,
+    /// "embed" or "generate". A sibling of `engine`, not a replacement: the UI
+    /// reads `engine`, and overloading it would break that.
+    #[serde(default)]
+    pub role: Option<String>,
     pub engine: Option<String>,
     pub model: Option<String>,
     pub device: Option<String>,
     pub request_mode: Option<String>,
     pub pid: Option<u32>,
     pub timeout_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<GenerationWorkerStatus>,
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct GenerationWorkerStatus {
+    pub requested_device: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_load_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<GenerationTimings>,
 }
 
 #[derive(Clone)]
@@ -63,6 +83,10 @@ pub enum ManagerCommand {
     },
     ShutdownWorker,
     SetTimeout(u64),
+    /// Stop the request the worker is currently serving, without killing it.
+    /// Killing would cost a full model reload and throw away the KV cache,
+    /// making cancel more expensive than letting the generation finish.
+    CancelActiveRequest,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -96,12 +120,14 @@ impl WorkerManager {
         let active_process: ActiveProcessSlot = Arc::new(std::sync::Mutex::new(None));
         let status = Arc::new(RwLock::new(WorkerStatus {
             active: false,
+            role: None,
             engine: None,
             model: None,
             device: None,
             request_mode: None,
             pid: None,
-            timeout_secs: 300,
+            timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            generation: None,
         }));
         let sender: SenderSlot = Arc::new(std::sync::Mutex::new(tx));
         let fut = supervised_manager_loop(
@@ -129,6 +155,30 @@ impl WorkerManager {
         self.status.read().unwrap().clone()
     }
 
+    pub fn record_generation_runtime(&self, runtime: GenerationRuntime) {
+        if let Ok(mut status) = self.status.write() {
+            let timings = status
+                .generation
+                .as_ref()
+                .and_then(|generation| generation.timings.clone());
+            status.device = Some(runtime.device);
+            status.generation = Some(GenerationWorkerStatus {
+                requested_device: runtime.requested_device,
+                fallback_reason: runtime.fallback_reason,
+                model_load_micros: Some(runtime.model_load_micros),
+                timings,
+            });
+        }
+    }
+
+    pub fn record_generation_timings(&self, timings: GenerationTimings) {
+        if let Ok(mut status) = self.status.write() {
+            if let Some(generation) = status.generation.as_mut() {
+                generation.timings = Some(timings);
+            }
+        }
+    }
+
     pub async fn send(
         &self,
         cmd: ManagerCommand,
@@ -151,6 +201,12 @@ impl WorkerManager {
         self.sender.lock().unwrap().blocking_send(cmd)
     }
 
+    /// Ask the worker to abandon its in-flight request. Best effort: with no
+    /// active worker this is a no-op.
+    pub fn cancel_active_request(&self) {
+        let _ = self.try_send(ManagerCommand::CancelActiveRequest);
+    }
+
     pub fn request_shutdown(&self) {
         if let Some(proc) = self.active_process.lock().unwrap().take() {
             let active_pid = Arc::clone(&self.active_pid);
@@ -168,6 +224,7 @@ mod tests {
 
     use super::*;
     use crate::types::EmbeddingEngine;
+    use crate::worker::ipc::WorkerRole;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -187,6 +244,40 @@ mod tests {
         let status = manager.status();
         assert!(!status.active);
         assert_eq!(status.timeout_secs, 300);
+    }
+
+    #[tokio::test]
+    async fn generation_runtime_records_realized_device_and_timings() {
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("python"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("reqs"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let _loop_handle = tokio::spawn(loop_fut);
+
+        manager.record_generation_runtime(GenerationRuntime {
+            requested_device: "auto".to_string(),
+            device: "cpu".to_string(),
+            fallback_reason: Some("Metal unavailable".to_string()),
+            model_load_micros: 42,
+        });
+        manager.record_generation_timings(GenerationTimings {
+            prompt_micros: 10,
+            decode_micros: 20,
+            constraint_micros: 5,
+        });
+
+        let status = manager.status();
+        assert_eq!(status.device.as_deref(), Some("cpu"));
+        let generation = status.generation.unwrap();
+        assert_eq!(generation.requested_device, "auto");
+        assert_eq!(generation.model_load_micros, Some(42));
+        assert_eq!(generation.timings.unwrap().constraint_micros, 5);
+        assert!(generation.fallback_reason.is_some());
     }
 
     #[tokio::test]
@@ -288,7 +379,7 @@ mod tests {
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
         let req = Box::new(WorkerRequest {
             mode: "test".to_string(),
-            engine: EmbeddingEngine::Fastembed,
+            role: WorkerRole::Embed(EmbeddingEngine::Fastembed),
             model: "test_model".to_string(),
             data_dir: PathBuf::from("data"),
             device: "cpu".to_string(),
@@ -298,6 +389,7 @@ mod tests {
             paths: None,
             supported_extensions: vec![],
             texts: None,
+            generate: None,
         });
 
         manager
@@ -351,7 +443,7 @@ mod tests {
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
         let req = Box::new(WorkerRequest {
             mode: "test".to_string(),
-            engine: EmbeddingEngine::Candle,
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
             data_dir: PathBuf::from("data"),
             device: "cpu".to_string(),
@@ -361,6 +453,7 @@ mod tests {
             paths: None,
             supported_extensions: vec![],
             texts: None,
+            generate: None,
         });
 
         manager

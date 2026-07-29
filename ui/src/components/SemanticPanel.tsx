@@ -17,6 +17,7 @@ import { useSemanticStore } from "../stores/useSemanticStore";
 import LogsPanel from "./LogsPanel";
 import {CornerLeftDown, CornerRightUp} from "react-feather";
 import { Tooltip } from "./Tooltip";
+import ModelCatalog from "./ModelCatalog";
 
 // ---------------------------------------------------------------------------
 // State & reducer
@@ -207,112 +208,6 @@ function derivePhase(state: PanelState, sem: SemanticSettings | null): Phase {
   const selected = state.backendModels.find((m) => m.model_id === sem.selected.model);
   if (selected?.is_cached) return "ready";
   return "not_downloaded";
-}
-
-// ---------------------------------------------------------------------------
-// ModelList — pure render, keyed to force DOM remount on engine/filter change
-// ---------------------------------------------------------------------------
-
-interface ModelListProps {
-  models: ModelDescriptor[];
-  engine: EmbeddingEngine;
-  filter: string;
-  selectedModelId: string | undefined;
-  activeModelId: string | undefined;
-  sizeFetchingFor: string | null;
-  disabled: boolean;
-  onSelect: (id: string) => void;
-}
-
-function ModelList({ models, engine, filter, selectedModelId, activeModelId, sizeFetchingFor, disabled, onSelect }: ModelListProps) {
-  const formatBytes = (bytes: number): string => {
-    if (bytes >= 1_073_741_824) return `${(bytes / 1_073_741_824).toFixed(1)} GB`;
-    return `${Math.round(bytes / 1_048_576)} MB`;
-  };
-
-  const search = filter.trim().toLowerCase();
-  const filtered = search
-    ? models.filter(
-        (m) =>
-          m.model_id.toLowerCase().includes(search) ||
-          m.display_name.toLowerCase().includes(search) ||
-          m.description.toLowerCase().includes(search),
-      )
-    : models;
-
-  const sorted = [...filtered].sort((a, b) => {
-    if (activeModelId === a.model_id && activeModelId !== b.model_id) return -1;
-    if (activeModelId !== a.model_id && activeModelId === b.model_id) return 1;
-    return 0;
-  });
-
-  return (
-    <>
-      <div className="flex items-center justify-between">
-        <h3 className="text-[10px] font-medium text-[var(--text-dim)] uppercase tracking-wider">Embedding Model</h3>
-        <span className="text-[10px] text-[var(--text-dim)] uppercase">
-          {filter
-            ? `${sorted.length} match${sorted.length === 1 ? "" : "es"}`
-            : `${sorted.length} available`}
-        </span>
-      </div>
-
-      {/* Key MUST be unique to avoid duplicate render issues - some engines like Fastembed return models with the same code */}
-      <div key={`${engine}:${filter}`} className="flex flex-col gap-1 max-h-40 overflow-y-auto pr-1 custom-scrollbar">
-        {sorted.length === 0 && (
-          <span className="text-xs text-[var(--text-muted)] py-4 text-center">No models found for this engine</span>
-        )}
-        {sorted.map((m) => {
-          const selected = selectedModelId === m.model_id;
-          return (
-            <button
-              key={`${engine}:${m.model_id}-${Math.random()}`}
-              disabled={disabled}
-              type="button"
-              onClick={() => onSelect(m.model_id)}
-              className={`flex flex-col text-left rounded-lg p-2 transition-all ${
-                selected
-                  ? "bg-[var(--bg-active)] ring-1 ring-[var(--accent-blue)]/50"
-                  : "hover:bg-[var(--bg-active)]/50 border border-transparent"
-              } ${disabled ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}`}
-            >
-              <div className="flex items-center gap-2 mb-0.5 selectable">
-                <span className={`w-1.5 h-1.5 rounded-full ${selected ? "bg-[var(--accent-blue)]" : "bg-[var(--bg-active)]"}`} />
-                <span className={`text-[11px] font-medium ${m.is_cached ? "text-[var(--text-main)]" : "text-[var(--text-muted)]"}`}>
-                  {m.display_name}
-                </span>
-                {activeModelId === m.model_id && (
-                  <span className="text-[var(--accent-blue)] text-[9px] bg-[var(--accent-blue)]/10 px-1 rounded font-bold uppercase tracking-tighter">Active</span>
-                )}
-                {m.is_default && (
-                  <span className="text-amber-500 text-[9px] bg-amber-500/10 px-1 rounded font-bold uppercase tracking-tighter">Default</span>
-                )}
-                {m.is_recommended && !m.is_default && (
-                  <span className="text-purple-500 text-[9px] bg-purple-500/10 px-1 rounded font-bold uppercase tracking-tighter">Recommended</span>
-                )}
-                {m.is_cached && (
-                  <span className="text-green-500 text-[9px] bg-green-500/10 px-1 rounded">Cached</span>
-                )}
-                <span className="text-[9px] text-[var(--text-dim)] ml-auto">{m.size_bytes ? formatBytes(m.size_bytes) : ""}</span>
-              </div>
-              <p className="text-[9px] text-[var(--text-dim)] leading-snug line-clamp-1 ml-3.5 selectable">
-                {m.description}
-              </p>
-              {selected && !m.is_cached && (
-                <span className="text-[9px] text-[var(--text-dim)] ml-3.5 mt-0.5">
-                  {sizeFetchingFor === m.model_id
-                    ? "Checking size…"
-                    : m.size_bytes !== null
-                      ? `Estimated download: ${formatBytes(m.size_bytes)}`
-                      : "Download required"}
-                </span>
-              )}
-            </button>
-          );
-        })}
-      </div>
-    </>
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -745,68 +640,63 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       </section>
 
       {/* Model list */}
-      <section className="flex flex-col gap-2">
-        <div className="flex gap-2">
-          <input
-            type="text"
-            placeholder="Search models…"
-            value={modelFilter}
-            onChange={(e) => setModelFilter(e.target.value)}
-            disabled={isActive || !isEngineAvailable}
-            className="flex-1 text-xs bg-[var(--bg-input)] border border-[var(--border-main)] rounded-lg px-2.5 py-1.5 text-[var(--text-main)] placeholder-[var(--text-dim)] focus:outline-none focus:border-[var(--accent-blue)] disabled:opacity-50 transition-colors"
-          />
-          {settings && currentEngine && supportsCustomModels(currentEngine) && (
-            <button
-              type="button"
-              onClick={() => setIsAddingCustom(!isAddingCustom)}
-              className={`px-2 py-1.5 rounded-lg border text-[10px] font-medium transition-all ${
-                isAddingCustom
-                  ? "bg-[var(--accent-blue)] text-white border-[var(--accent-blue)]"
-                  : "bg-[var(--bg-active)] text-[var(--text-muted)] border-[var(--border-main)] hover:text-[var(--text-main)]"
-              }`}
-            >
-              {isAddingCustom ? "Cancel" : "Add Custom"}
-            </button>
-          )}
-        </div>
-
-        {isAddingCustom && (
-          <div className="flex flex-col gap-2 p-2 bg-[var(--bg-active)] rounded-lg border border-[var(--border-main)]/30 animate-in fade-in slide-in-from-top-1">
-            <p className="text-[10px] text-[var(--text-dim)]">Enter HuggingFace Repository ID:</p>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                placeholder="e.g. org/repo-name"
-                value={customModelInput}
-                onChange={(e) => setCustomModelInput(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && handleAddCustomModel()}
-                className="flex-1 text-[11px] bg-[var(--bg-app)] border border-[var(--border-main)] rounded px-2 py-1 text-[var(--text-main)] placeholder-[var(--text-dim)] focus:outline-none focus:border-[var(--accent-blue)]"
-                autoFocus
-              />
+      {settings && (
+        <ModelCatalog
+          title="Embedding Model"
+          catalogKey={`embedding:${currentEngine ?? settings.selected.engine}`}
+          models={mergedModels}
+          filter={modelFilter}
+          selectedModelId={effectiveSelected?.model}
+          activeModelId={settings.selected.model}
+          sizeFetchingFor={sizeFetchingFor}
+          disabled={isActive || !isEngineAvailable}
+          emptyMessage="No models found for this engine"
+          onFilterChange={setModelFilter}
+          onSelect={(model) => void handleModelChange(model.model_id)}
+          toolbarAction={
+            currentEngine && supportsCustomModels(currentEngine) ? (
               <button
                 type="button"
-                onClick={handleAddCustomModel}
-                className="px-3 py-1 bg-[var(--accent-blue)] text-white text-[10px] font-semibold rounded hover:bg-[var(--accent-blue-hover)]"
+                onClick={() => setIsAddingCustom(!isAddingCustom)}
+                className={`rounded-lg border px-2 py-1.5 text-[10px] font-medium transition-all ${
+                  isAddingCustom
+                    ? "border-[var(--accent-blue)] bg-[var(--accent-blue)] text-white"
+                    : "border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
+                }`}
               >
-                Add
+                {isAddingCustom ? "Cancel" : "Add Custom"}
               </button>
-            </div>
-          </div>
-        )}
-
-        {settings && (
-          <ModelList
-            models={mergedModels}
-            engine={currentEngine ?? settings.selected.engine}
-            filter={modelFilter}
-            selectedModelId={effectiveSelected?.model}
-            activeModelId={settings.selected.model}
-            sizeFetchingFor={sizeFetchingFor}
-            disabled={isActive || !isEngineAvailable}
-            onSelect={handleModelChange}
-          />
-        )}
-      </section>
+            ) : undefined
+          }
+          toolbarContent={
+            isAddingCustom ? (
+              <div className="animate-in fade-in slide-in-from-top-1 flex flex-col gap-2 rounded-lg border border-[var(--border-main)]/30 bg-[var(--bg-active)] p-2">
+                <p className="text-[10px] text-[var(--text-dim)]">
+                  Enter HuggingFace Repository ID:
+                </p>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    placeholder="e.g. org/repo-name"
+                    value={customModelInput}
+                    onChange={(event) => setCustomModelInput(event.target.value)}
+                    onKeyDown={(event) => event.key === "Enter" && handleAddCustomModel()}
+                    className="flex-1 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2 py-1 text-[11px] text-[var(--text-main)] placeholder-[var(--text-dim)] focus:border-[var(--accent-blue)] focus:outline-none"
+                    autoFocus
+                  />
+                  <button
+                    type="button"
+                    onClick={handleAddCustomModel}
+                    className="rounded bg-[var(--accent-blue)] px-3 py-1 text-[10px] font-semibold text-white hover:bg-[var(--accent-blue-hover)]"
+                  >
+                    Add
+                  </button>
+                </div>
+              </div>
+            ) : undefined
+          }
+        />
+      )}
 
       {/* Action Area */}
       <section className="bg-[var(--bg-active)]/30 rounded-xl p-3 border border-[var(--border-main)] flex flex-col gap-3">

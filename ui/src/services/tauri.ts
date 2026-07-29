@@ -14,6 +14,8 @@ import type {
   FileListResponse,
   FileMatches,
   FileMetadataUpdate,
+  GenerationDone,
+  GenerationError,
   IndexStatus,
   AddOutcome,
   CitationResult,
@@ -39,6 +41,9 @@ import type {
   CollectionValidation,
   SearchLogEntry,
   ExternalMcpStatus,
+  BookmarkClusterLabelled,
+  GeneratorDescriptor,
+  GenerationStreamEvent,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type { SearchApi, DesktopSourceApi, DataPaths } from "./api";
@@ -247,6 +252,10 @@ export class TauriSearchApi implements SearchApi {
     return invoke<import("../lib/types").WorkerStatus>("get_worker_status");
   }
 
+  async getWorkerStatuses(): Promise<import("../lib/types").WorkerStatus[]> {
+    return invoke<import("../lib/types").WorkerStatus[]>("get_worker_statuses");
+  }
+
   async killWorker(): Promise<void> {
     return invoke("kill_worker");
   }
@@ -287,6 +296,64 @@ export class TauriSearchApi implements SearchApi {
 
   async deleteIndex(root?: string): Promise<void> {
     return invoke("delete_index", { root: root ?? null });
+  }
+
+  // ── Generation commands ────────────────────────────────────────────────────
+
+  async isGenerationReady(): Promise<boolean> {
+    return invoke<boolean>("is_generation_ready");
+  }
+
+  async listGenerationModels(): Promise<GeneratorDescriptor[]> {
+    return invoke<GeneratorDescriptor[]>("list_generation_models");
+  }
+
+  async getGenerationModelSize(modelId: string): Promise<number> {
+    return invoke<number>("get_generation_model_size", { modelId });
+  }
+
+  async loadGenerationModel(): Promise<boolean> {
+    return invoke<boolean>("load_generation_model");
+  }
+
+  async explainRelatedDocument(
+    requestId: string,
+    anchorPath: string,
+    path: string,
+  ): Promise<void> {
+    return invoke("explain_related_document", { requestId, anchorPath, path });
+  }
+
+  async summarizeDocument(requestId: string, path: string): Promise<void> {
+    return invoke("summarize_document", { requestId, path });
+  }
+
+  async onBookmarkClusterLabelled(
+    handler: (event: BookmarkClusterLabelled) => void,
+  ): Promise<() => void> {
+    return listen<BookmarkClusterLabelled>("bookmark-cluster-labelled", (e) =>
+      handler(e.payload),
+    );
+  }
+
+  async onGenerationStream(
+    handler: (event: GenerationStreamEvent) => void,
+  ): Promise<() => void> {
+    return listen<GenerationStreamEvent>("generation-stream", (e) => handler(e.payload));
+  }
+
+  async onGenerationProgress(
+    handler: (progress: EmbedProgress) => void,
+  ): Promise<() => void> {
+    return listen<EmbedProgress>("generation-progress", (e) => handler(e.payload));
+  }
+
+  async onGenerationDone(handler: (done: GenerationDone) => void): Promise<() => void> {
+    return listen<GenerationDone>("generation-done", (e) => handler(e.payload));
+  }
+
+  async onGenerationError(handler: (err: GenerationError) => void): Promise<() => void> {
+    return listen<GenerationError>("generation-error", (e) => handler(e.payload));
   }
 
   async onEmbedProgress(

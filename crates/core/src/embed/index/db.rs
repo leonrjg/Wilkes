@@ -16,9 +16,9 @@ use crate::types::{
     RelatedDocument, SourceOrigin,
 };
 
-use super::super::models::installer::{EmbedProgress, IndexBuildProgress, ProgressTx};
 use super::super::Embedder;
 use super::chunk::{chunk_content, Chunk};
+use crate::models::progress::{EmbedProgress, IndexBuildProgress, ProgressTx};
 
 fn system_time_ms(value: SystemTime) -> Option<i64> {
     value
@@ -2823,6 +2823,46 @@ impl SemanticIndex {
         Ok(results)
     }
 
+    /// Leading extracted text for a document, read straight from the index.
+    ///
+    /// The extraction cache only — never a fresh parse. Hovering a row in the
+    /// related-documents pane is not a licence to open a PDF.
+    pub fn cached_document_excerpt(
+        &self,
+        path: &Path,
+        max_chars: usize,
+    ) -> anyhow::Result<Option<String>> {
+        let key = self
+            .path_key_for_existing_path(path)
+            .to_string_lossy()
+            .into_owned();
+        let mut stmt = self.conn.prepare(
+            "SELECT c.chunk_text
+             FROM files f JOIN chunks c ON c.file_id = f.id
+             WHERE f.file_path = ?1
+             ORDER BY c.byte_start ASC
+             LIMIT 8",
+        )?;
+        let rows = stmt.query_map([&key], |row| row.get::<_, String>(0))?;
+
+        let mut excerpt = String::new();
+        for row in rows {
+            if excerpt.chars().count() >= max_chars {
+                break;
+            }
+            if !excerpt.is_empty() {
+                excerpt.push(' ');
+            }
+            excerpt.push_str(row?.trim());
+        }
+        if excerpt.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            crate::generate::truncate_chars(excerpt.trim(), max_chars).to_string(),
+        ))
+    }
+
     pub fn related_documents(
         &self,
         root: &Path,
@@ -3667,7 +3707,7 @@ fn f32_slice_to_bytes(v: &[f32]) -> Vec<u8> {
 
 fn f32_slice_from_bytes(bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
     anyhow::ensure!(
-        bytes.len() % std::mem::size_of::<f32>() == 0,
+        bytes.len().is_multiple_of(std::mem::size_of::<f32>()),
         "Invalid embedding byte length: {}",
         bytes.len()
     );
@@ -3706,6 +3746,7 @@ fn centroid(sum: &[f32], count: usize) -> Vec<f32> {
     sum.iter().map(|value| value / count).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn source_origin_from_parts(
     origin_type: &str,
     page: Option<i64>,

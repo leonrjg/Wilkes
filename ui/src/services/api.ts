@@ -10,6 +10,8 @@ import type {
   FileListChanged,
   FileMatches,
   FileMetadataUpdate,
+  GenerationDone,
+  GenerationError,
   IndexStatus,
   AddOutcome,
   CitationResult,
@@ -35,6 +37,9 @@ import type {
   CollectionValidation,
   SearchLogEntry,
   ExternalMcpStatus,
+  BookmarkClusterLabelled,
+  GeneratorDescriptor,
+  GenerationStreamEvent,
 } from "../lib/types";
 
 export interface DataPaths {
@@ -111,6 +116,9 @@ export interface SearchApi {
 
   // ── Worker Management ────────────────────────────────────────────────────────
   getWorkerStatus(): Promise<import("../lib/types").WorkerStatus>;
+  /** Every worker, one entry per role. Two processes can die independently, so
+   *  a single status would misreport a dead generation worker as healthy. */
+  getWorkerStatuses(): Promise<import("../lib/types").WorkerStatus[]>;
   killWorker(): Promise<void>;
   setWorkerTimeout(secs: number): Promise<void>;
 
@@ -123,6 +131,35 @@ export interface SearchApi {
   getIndexStatus(root?: string): Promise<IndexStatus>;
   isSemanticReady(): Promise<boolean>;
   deleteIndex(root?: string): Promise<void>;
+
+  // ── Generation commands ────────────────────────────────────────────────────
+  /** The single gate. Every LLM-dependent affordance hangs off this, never off
+   *  `settings.generation.enabled` directly — enabled but not installed is
+   *  exactly the state that produces a spinner which never resolves. */
+  isGenerationReady(): Promise<boolean>;
+  listGenerationModels(): Promise<GeneratorDescriptor[]>;
+  getGenerationModelSize(modelId: string): Promise<number>;
+  /** Download if needed, then attach. Progress arrives on
+   *  `onGenerationProgress`, terminated by `onGenerationDone`/`onGenerationError`. */
+  loadGenerationModel(): Promise<boolean>;
+  /** Starts a related-document explanation. Its complete lifecycle arrives on
+   *  `onGenerationStream`, correlated by `requestId`. */
+  explainRelatedDocument(
+    requestId: string,
+    anchorPath: string,
+    path: string,
+  ): Promise<void>;
+  /** Starts a summary of one viewer document. */
+  summarizeDocument(requestId: string, path: string): Promise<void>;
+
+  onBookmarkClusterLabelled(
+    handler: (event: BookmarkClusterLabelled) => void,
+  ): Promise<() => void>;
+  onGenerationStream(handler: (event: GenerationStreamEvent) => void): Promise<() => void>;
+
+  onGenerationProgress(handler: (progress: EmbedProgress) => void): Promise<() => void>;
+  onGenerationDone(handler: (done: GenerationDone) => void): Promise<() => void>;
+  onGenerationError(handler: (err: GenerationError) => void): Promise<() => void>;
 
   onEmbedProgress(handler: (progress: EmbedProgress) => void): Promise<() => void>;
   onEmbedDone(handler: (done: EmbedDone) => void): Promise<() => void>;

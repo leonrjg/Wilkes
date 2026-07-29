@@ -92,6 +92,7 @@ impl SearchHandle {
 /// For `SearchMode::Grep`: `embedder` and `index` are ignored.
 /// For `SearchMode::Semantic`: both must be `Some`, otherwise the search returns
 /// an immediate error. The desktop validates presence before calling.
+#[allow(clippy::too_many_arguments)]
 pub fn start_search(
     query: SearchQuery,
     all_roots: Vec<std::path::PathBuf>,

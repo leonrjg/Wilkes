@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye } from "react-feather";
+import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText } from "react-feather";
 import CodeViewer from "./preview/CodeViewer";
 import MarkdownViewer from "./preview/MarkdownViewer";
 import PdfViewer from "./preview/PdfViewer";
@@ -20,6 +20,10 @@ import RelatedDocumentsPane from "./RelatedDocumentsPane";
 import BookmarkDetails from "./preview/BookmarkDetails";
 import type { BookmarkAnchor } from "./preview/bookmarkPosition";
 import ViewerTabs from "./ViewerTabs";
+import DocumentSummaryPane from "./DocumentSummaryPane";
+import { useGenerationStore } from "../stores/useGenerationStore";
+
+type ViewerSidePanel = "related" | "summary" | null;
 
 function headerTitle(metadata: DocumentMetadata | null) {
   const title = metadata?.title?.trim();
@@ -83,8 +87,9 @@ export default function PreviewPane() {
   const chatBackendsLoaded = useChatStore((s) => s.backendsLoaded);
   const hasAvailableChatBackend = useChatStore((s) => s.hasAvailableBackend);
   const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
+  const generationReady = useGenerationStore((state) => state.ready);
   const { addToast } = useToasts();
-  const [relatedPanelOpen, setRelatedPanelOpen] = useState(false);
+  const [sidePanel, setSidePanel] = useState<ViewerSidePanel>(null);
   const [markdownView, setMarkdownView] = useState<"source" | "rendered">("rendered");
   const [openBookmarkTarget, setOpenBookmarkTarget] = useState<{
     id: string;
@@ -99,6 +104,10 @@ export default function PreviewPane() {
     setOpenBookmarkTarget(null);
     setDeletingBookmark(false);
   }, [selectedMatch?.path]);
+
+  useEffect(() => {
+    if (!generationReady && sidePanel === "summary") setSidePanel(null);
+  }, [generationReady, sidePanel]);
 
   useEffect(() => {
     if (openBookmarkTarget && !openBookmark) setOpenBookmarkTarget(null);
@@ -383,12 +392,32 @@ export default function PreviewPane() {
           </div>
         </div>
 
-        <Tooltip content={relatedPanelOpen ? "Hide related documents" : "Show related documents"}>
+        {generationReady && (
+          <Tooltip content={sidePanel === "summary" ? "Hide summary" : "Summarize document"}>
+            <button
+              onClick={() =>
+                setSidePanel((current) => (current === "summary" ? null : "summary"))
+              }
+              aria-label={sidePanel === "summary" ? "Hide summary" : "Summarize document"}
+              className={`hidden p-1 rounded text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] md:inline-flex ${
+                sidePanel === "summary"
+                  ? "bg-[var(--bg-active)] text-[var(--text-main)]"
+                  : ""
+              }`}
+            >
+              <FileText size={16} />
+            </button>
+          </Tooltip>
+        )}
+
+        <Tooltip content={sidePanel === "related" ? "Hide related documents" : "Show related documents"}>
           <button
-            onClick={() => setRelatedPanelOpen((open) => !open)}
-            aria-label={relatedPanelOpen ? "Hide related documents" : "Show related documents"}
+            onClick={() =>
+              setSidePanel((current) => (current === "related" ? null : "related"))
+            }
+            aria-label={sidePanel === "related" ? "Hide related documents" : "Show related documents"}
             className={`hidden p-1 rounded text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] md:inline-flex ${
-              relatedPanelOpen ? "bg-[var(--bg-active)] text-[var(--text-main)]" : ""
+              sidePanel === "related" ? "bg-[var(--bg-active)] text-[var(--text-main)]" : ""
             }`}
           >
             <Link2 size={16} />
@@ -485,11 +514,17 @@ export default function PreviewPane() {
               />
             ) : null}
           </div>
-          {relatedPanelOpen && (
+          {sidePanel === "summary" && generationReady && (
+            <DocumentSummaryPane
+              path={selectedMatch.path}
+              onClose={() => setSidePanel(null)}
+            />
+          )}
+          {sidePanel === "related" && (
             <RelatedDocumentsPane
               currentPath={selectedMatch.path}
               onOpenDocument={openFile}
-              onClose={() => setRelatedPanelOpen(false)}
+              onClose={() => setSidePanel(null)}
             />
           )}
         </div>

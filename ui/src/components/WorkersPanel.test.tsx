@@ -4,7 +4,7 @@ import WorkersPanel from "./WorkersPanel";
 
 describe("WorkersPanel", () => {
   const mockApi = {
-    getWorkerStatus: vi.fn(),
+    getWorkerStatuses: vi.fn(),
     killWorker: vi.fn(),
     setWorkerTimeout: vi.fn(),
   } as any;
@@ -20,15 +20,28 @@ describe("WorkersPanel", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
-    mockApi.getWorkerStatus.mockResolvedValue({
-      active: true,
-      engine: "SBERT",
-      model: "test-model",
-      device: "cpu",
-      request_mode: "embed",
-      pid: 1234,
-      timeout_secs: 300,
-    });
+    mockApi.getWorkerStatuses.mockResolvedValue([
+      {
+        active: true,
+        role: "embed",
+        engine: "SBERT",
+        model: "test-model",
+        device: "cpu",
+        request_mode: "embed",
+        pid: 1234,
+        timeout_secs: 300,
+      },
+      {
+        active: false,
+        role: "generate",
+        engine: null,
+        model: null,
+        device: null,
+        request_mode: null,
+        pid: null,
+        timeout_secs: 300,
+      },
+    ]);
   });
 
   afterEach(() => {
@@ -40,11 +53,53 @@ describe("WorkersPanel", () => {
       render(<WorkersPanel api={mockApi} settings={mockSettings} onUpdateSettings={mockOnUpdateSettings} />);
     });
     
+    expect(screen.getByText("Embedding worker")).toBeInTheDocument();
+    // Both roles are listed: two processes can die independently, so one
+    // status would misreport a dead generation worker as healthy.
+    expect(screen.getByText("Generation worker")).toBeInTheDocument();
     expect(screen.getByText("Active")).toBeInTheDocument();
+    expect(screen.getByText("Idle")).toBeInTheDocument();
     expect(screen.getByText("SBERT")).toBeInTheDocument();
     expect(screen.getByText("cpu")).toBeInTheDocument();
     expect(screen.getByText("embed")).toBeInTheDocument();
     expect(screen.getByText("1234")).toBeInTheDocument();
+  });
+
+  it("renders the realized generation device and timing telemetry", async () => {
+    mockApi.getWorkerStatuses.mockResolvedValue([
+      {
+        active: true,
+        role: "generate",
+        engine: "candle",
+        model: "qwen3-0.6b",
+        device: "cpu",
+        request_mode: "generate",
+        pid: 4321,
+        timeout_secs: 300,
+        generation: {
+          requested_device: "auto",
+          fallback_reason: "Metal initialization failed",
+          model_load_micros: 1_250_000,
+          timings: {
+            prompt_micros: 2_000,
+            decode_micros: 130_000,
+            constraint_micros: 25_000,
+          },
+        },
+      },
+    ]);
+
+    await act(async () => {
+      render(<WorkersPanel api={mockApi} settings={mockSettings} onUpdateSettings={mockOnUpdateSettings} />);
+    });
+
+    expect(screen.getByText("cpu")).toBeInTheDocument();
+    expect(screen.getByText("1250.0 ms")).toBeInTheDocument();
+    expect(screen.getByText("2.0 ms")).toBeInTheDocument();
+    expect(screen.getByText("130.0 ms")).toBeInTheDocument();
+    expect(screen.getByText("25.0 ms")).toBeInTheDocument();
+    expect(screen.getByText(/Requested auto; using cpu/)).toBeInTheDocument();
+    expect(screen.getByText(/Metal initialization failed/)).toBeInTheDocument();
   });
 
   it("kills worker", async () => {

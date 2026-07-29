@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -7,10 +8,12 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use super::ipc::{WorkerEvent, WorkerRequest};
-use super::manager::{ManagerCommand, ManagerEvent, WorkerPaths, WorkerStatus};
+use super::ipc::{CancelSignal, WorkerEvent, WorkerRequest, WorkerRole};
+use super::manager::{
+    GenerationWorkerStatus, ManagerCommand, ManagerEvent, WorkerPaths, WorkerStatus,
+};
 use super::process::WorkerProcess;
-use crate::types::EmbeddingEngine;
+use super::DEFAULT_IDLE_TIMEOUT_SECS;
 
 #[async_trait]
 pub(crate) trait WorkerSession: Send + Sync {
@@ -21,6 +24,10 @@ pub(crate) trait WorkerSession: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send>>;
 
     async fn shutdown(&self, pid_slot: &AtomicU32);
+
+    /// Ask the worker to stop the request it is currently serving. Only the
+    /// generation mode acts on this; every other mode ignores the line.
+    async fn cancel_active_request(&self) -> Result<(), ()>;
 }
 
 pub(super) type ActiveProcessSlot = Arc<std::sync::Mutex<Option<Arc<dyn WorkerSession>>>>;
@@ -64,6 +71,12 @@ impl WorkerSession for WorkerProcess {
     async fn shutdown(&self, pid_slot: &AtomicU32) {
         WorkerProcess::shutdown(self, pid_slot).await;
     }
+
+    async fn cancel_active_request(&self) -> Result<(), ()> {
+        let line = serde_json::to_string(&CancelSignal { cancel: true })
+            .expect("CancelSignal serialization cannot fail");
+        WorkerProcess::send_out_of_band(self, &line).await
+    }
 }
 
 pub(super) async fn supervised_manager_loop(
@@ -105,6 +118,7 @@ pub(super) async fn supervised_manager_loop(
 fn reset_worker_status(status: &Arc<RwLock<WorkerStatus>>) {
     if let Ok(mut current) = status.write() {
         current.active = false;
+        current.role = None;
         current.engine = None;
         current.model = None;
         current.device = None;
@@ -134,10 +148,13 @@ struct WorkerRuntime {
     status: Arc<RwLock<WorkerStatus>>,
     spawner: Arc<dyn WorkerProcessSpawner>,
     active_process: Option<Arc<dyn WorkerSession>>,
-    active_engine: Option<EmbeddingEngine>,
+    active_role: Option<WorkerRole>,
     active_model: Option<String>,
     active_device: Option<String>,
     idle_timeout: Duration,
+    /// Commands taken off the channel while a request was in flight, held back
+    /// until it finished. Only the cancel signal is acted on mid-request.
+    deferred: VecDeque<ManagerCommand>,
 }
 
 enum NextCommand {
@@ -152,10 +169,25 @@ fn serialize_request_for_worker(req: &WorkerRequest) -> Result<String, String> {
 
 fn should_restart_worker(
     active_process: bool,
-    active_engine: Option<EmbeddingEngine>,
-    req_engine: EmbeddingEngine,
+    active_role: Option<WorkerRole>,
+    req_role: WorkerRole,
 ) -> bool {
-    !active_process || active_engine != Some(req_engine)
+    !active_process || active_role != Some(req_role)
+}
+
+/// Deliver the cancel signal to whatever worker is active. Takes the slot
+/// rather than `&self` so it can also be called from inside `handle_submit`,
+/// where the runtime is busy driving the request being cancelled.
+async fn deliver_cancel(slot: &ActiveProcessSlot) {
+    let active = slot.lock().unwrap().clone();
+    match active {
+        Some(proc) => {
+            if proc.cancel_active_request().await.is_err() {
+                tracing::warn!("WorkerManager: could not deliver cancel signal to the worker");
+            }
+        }
+        None => tracing::debug!("WorkerManager: cancel requested with no active worker"),
+    }
 }
 
 fn restart_runtime_after_panic(
@@ -185,10 +217,11 @@ impl WorkerRuntime {
             status,
             spawner,
             active_process: None,
-            active_engine: None,
+            active_role: None,
             active_model: None,
             active_device: None,
-            idle_timeout: Duration::from_secs(300),
+            idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+            deferred: VecDeque::new(),
         }
     }
 
@@ -206,6 +239,11 @@ impl WorkerRuntime {
     }
 
     async fn next_command(&mut self) -> NextCommand {
+        // Commands received while a request held the loop are replayed first,
+        // in arrival order, before anything newer off the channel.
+        if let Some(cmd) = self.deferred.pop_front() {
+            return NextCommand::Received(cmd);
+        }
         match timeout(self.idle_timeout, self.rx.recv()).await {
             Ok(Some(cmd)) => NextCommand::Received(cmd),
             Ok(None) => NextCommand::ChannelClosed,
@@ -240,6 +278,9 @@ impl WorkerRuntime {
                 self.update_timeout(secs);
                 tracing::info!("WorkerManager: Idle timeout updated to {} seconds.", secs);
             }
+            ManagerCommand::CancelActiveRequest => {
+                deliver_cancel(&self.active_process_slot).await;
+            }
             ManagerCommand::Submit { req, reply } => {
                 self.handle_submit(req, reply).await;
             }
@@ -270,10 +311,36 @@ impl WorkerRuntime {
 
         self.maybe_hot_swap_tracking(&req);
 
-        if let Some(proc) = self.active_process.as_ref() {
-            if proc.start_request(req_json, reply).await.is_err() {
-                self.clear_active_worker().await;
+        let Some(proc) = self.active_process.clone() else {
+            return;
+        };
+
+        // The request runs to its terminal event, but the command channel keeps
+        // being served while it does. A cancel is only useful mid-request, and
+        // draining it here — rather than after the request returns — is what
+        // makes the out-of-band signal reach the worker in time. Every other
+        // command is deferred so requests stay serialised: one request owns the
+        // worker's stdin/stdout until it finishes.
+        let request = proc.start_request(req_json, reply);
+        tokio::pin!(request);
+        let slot = Arc::clone(&self.active_process_slot);
+        let mut channel_closed = false;
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                result = &mut request => break result,
+                cmd = self.rx.recv(), if !channel_closed => match cmd {
+                    Some(ManagerCommand::CancelActiveRequest) => deliver_cancel(&slot).await,
+                    Some(other) => self.deferred.push_back(other),
+                    // The sender is gone; stop polling it and let the main loop
+                    // observe the closure once the request has finished.
+                    None => channel_closed = true,
+                },
             }
+        };
+
+        if outcome.is_err() {
+            self.clear_active_worker().await;
         }
     }
 
@@ -282,11 +349,8 @@ impl WorkerRuntime {
         req: &WorkerRequest,
         reply: &mpsc::Sender<WorkerEvent>,
     ) -> Result<(), ()> {
-        let needs_restart = should_restart_worker(
-            self.active_process.is_some(),
-            self.active_engine,
-            req.engine,
-        );
+        let needs_restart =
+            should_restart_worker(self.active_process.is_some(), self.active_role, req.role);
 
         if !needs_restart {
             return Ok(());
@@ -294,9 +358,9 @@ impl WorkerRuntime {
 
         if self.active_process.is_some() {
             tracing::info!(
-                "WorkerManager: restarting worker (engine: {:?} -> {:?}, model: {:?} -> {:?}, device: {:?} -> {:?})",
-                self.active_engine,
-                req.engine,
+                "WorkerManager: restarting worker (role: {:?} -> {:?}, model: {:?} -> {:?}, device: {:?} -> {:?})",
+                self.active_role,
+                req.role,
                 self.active_model,
                 req.model,
                 self.active_device,
@@ -305,8 +369,8 @@ impl WorkerRuntime {
             self.clear_active_worker().await;
         } else {
             tracing::info!(
-                "WorkerManager: starting new worker for engine: {:?}, model: {:?}, device: {:?}",
-                req.engine,
+                "WorkerManager: starting new worker for role: {:?}, model: {:?}, device: {:?}",
+                req.role,
                 req.model,
                 req.device
             );
@@ -318,10 +382,10 @@ impl WorkerRuntime {
             Ok(proc) => {
                 self.active_process = Some(Arc::clone(&proc));
                 *self.active_process_slot.lock().unwrap() = Some(proc);
-                self.active_engine = Some(req.engine);
+                self.active_role = Some(req.role);
                 self.active_model = Some(req.model.clone());
                 self.active_device = Some(req.device.clone());
-                self.update_status_active(req.engine, &req.model, &req.device, &req.mode);
+                self.update_status_active(req.role, &req.model, &req.device, &req.mode);
                 Ok(())
             }
             Err(e) => {
@@ -332,7 +396,7 @@ impl WorkerRuntime {
     }
 
     fn maybe_hot_swap_tracking(&mut self, req: &WorkerRequest) {
-        if self.active_process.is_none() || self.active_engine != Some(req.engine) {
+        if self.active_process.is_none() || self.active_role != Some(req.role) {
             return;
         }
 
@@ -348,7 +412,7 @@ impl WorkerRuntime {
             );
             self.active_model = Some(req.model.clone());
             self.active_device = Some(req.device.clone());
-            self.update_status_active(req.engine, &req.model, &req.device, &req.mode);
+            self.update_status_active(req.role, &req.model, &req.device, &req.mode);
         }
     }
 
@@ -359,7 +423,7 @@ impl WorkerRuntime {
                 proc.shutdown(&self.active_pid).await;
             }
         }
-        self.active_engine = None;
+        self.active_role = None;
         self.active_model = None;
         self.active_device = None;
         self.update_status_idle();
@@ -367,16 +431,29 @@ impl WorkerRuntime {
 
     fn update_status_active(
         &self,
-        engine: EmbeddingEngine,
+        role: WorkerRole,
         model: &str,
         device: &str,
         request_mode: &str,
     ) {
         if let Ok(mut status) = self.status.write() {
             status.active = true;
-            status.engine = Some(engine.as_str().to_string());
+            status.role = Some(role.as_str().to_string());
+            status.engine = Some(role.engine_str().to_string());
             status.model = Some(model.to_string());
-            status.device = Some(device.to_string());
+            status.device = if role.as_str() == "generate" {
+                None
+            } else {
+                Some(device.to_string())
+            };
+            status.generation = if role.as_str() == "generate" {
+                Some(GenerationWorkerStatus {
+                    requested_device: device.to_string(),
+                    ..GenerationWorkerStatus::default()
+                })
+            } else {
+                None
+            };
             status.request_mode = Some(request_mode.to_string());
             let pid = self.active_pid.load(Ordering::Relaxed);
             status.pid = if pid == 0 { None } else { Some(pid) };
@@ -386,11 +463,13 @@ impl WorkerRuntime {
     fn update_status_idle(&self) {
         if let Ok(mut status) = self.status.write() {
             status.active = false;
+            status.role = None;
             status.engine = None;
             status.model = None;
             status.device = None;
             status.request_mode = None;
             status.pid = None;
+            status.generation = None;
         }
     }
 
@@ -404,9 +483,12 @@ impl WorkerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::GenerationEngine;
+    use crate::types::EmbeddingEngine;
     use std::sync::atomic::AtomicUsize;
 
     struct FakeSession {
+        cancel_calls: Arc<AtomicUsize>,
         send_calls: Arc<AtomicUsize>,
         shutdown_calls: Arc<AtomicUsize>,
         send_should_fail: bool,
@@ -433,6 +515,11 @@ mod tests {
         async fn shutdown(&self, _pid_slot: &AtomicU32) {
             self.shutdown_calls.fetch_add(1, Ordering::Relaxed);
         }
+
+        async fn cancel_active_request(&self) -> Result<(), ()> {
+            self.cancel_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
     }
 
     struct FakeSpawner {
@@ -456,6 +543,7 @@ mod tests {
                 return Err("Failed to spawn worker: fake failure".to_string());
             }
             Ok(Arc::new(FakeSession {
+                cancel_calls: Arc::new(AtomicUsize::new(0)),
                 send_calls: Arc::clone(&self.send_calls),
                 shutdown_calls: Arc::clone(&self.shutdown_calls),
                 send_should_fail: self.send_should_fail,
@@ -484,12 +572,14 @@ mod tests {
         let active_pid = Arc::new(AtomicU32::new(0));
         let status = Arc::new(RwLock::new(WorkerStatus {
             active: false,
+            role: None,
             engine: None,
             model: None,
             device: None,
             request_mode: None,
             pid: None,
             timeout_secs: 300,
+            generation: None,
         }));
         let active_process_slot: ActiveProcessSlot = Arc::new(std::sync::Mutex::new(None));
         let spawn_calls = Arc::new(AtomicUsize::new(0));
@@ -520,6 +610,114 @@ mod tests {
         )
     }
 
+    /// A session whose request only ends once the worker has been told to
+    /// cancel — the shape of a generation stream.
+    struct BlockingSession {
+        until_cancelled: Arc<tokio::sync::Notify>,
+        cancel_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl WorkerSession for BlockingSession {
+        fn start_request(
+            &self,
+            _req_json: String,
+            _reply: mpsc::Sender<WorkerEvent>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send>> {
+            let until_cancelled = Arc::clone(&self.until_cancelled);
+            Box::pin(async move {
+                until_cancelled.notified().await;
+                Ok(())
+            })
+        }
+
+        async fn shutdown(&self, _pid_slot: &AtomicU32) {}
+
+        async fn cancel_active_request(&self) -> Result<(), ()> {
+            self.cancel_calls.fetch_add(1, Ordering::Relaxed);
+            self.until_cancelled.notify_one();
+            Ok(())
+        }
+    }
+
+    struct BlockingSpawner {
+        session: Arc<BlockingSession>,
+    }
+
+    #[async_trait]
+    impl WorkerProcessSpawner for BlockingSpawner {
+        async fn spawn(
+            &self,
+            _paths: &WorkerPaths,
+            _req: &WorkerRequest,
+            _active_pid: &AtomicU32,
+        ) -> Result<Arc<dyn WorkerSession>, String> {
+            Ok(Arc::clone(&self.session) as Arc<dyn WorkerSession>)
+        }
+    }
+
+    /// Regression test for a cancel that could never arrive in time.
+    ///
+    /// `handle_submit` used to await the request to its terminal event before
+    /// returning to the command loop, so `CancelActiveRequest` — which travels
+    /// through that same loop — was only handled once generation had already
+    /// finished. Here the request *only* ends when the cancel reaches the
+    /// worker: if the loop stops serving commands mid-request, this deadlocks.
+    #[tokio::test]
+    async fn cancel_reaches_the_worker_while_the_request_is_still_running() {
+        let (mut runtime, _spawn_calls, _send_calls, _shutdown_calls, tx, _event_rx) =
+            test_runtime();
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let session = Arc::new(BlockingSession {
+            until_cancelled: Arc::new(tokio::sync::Notify::new()),
+            cancel_calls: Arc::clone(&cancel_calls),
+        });
+        runtime.spawner = Arc::new(BlockingSpawner {
+            session: Arc::clone(&session),
+        });
+
+        let req = WorkerRequest {
+            role: WorkerRole::Generate(GenerationEngine::Candle),
+            model: "model-a".to_string(),
+            device: "cpu".to_string(),
+            texts: None,
+            generate: None,
+            mode: "generate".to_string(),
+            root: std::path::PathBuf::from("root"),
+            data_dir: std::path::PathBuf::from("data"),
+            chunk_size: None,
+            chunk_overlap: None,
+            paths: None,
+            supported_extensions: vec![],
+        };
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        let (timeout_done_tx, timeout_done_rx) = tokio::sync::oneshot::channel();
+
+        let loop_handle = tokio::spawn(async move {
+            runtime.run().await;
+            let _ = timeout_done_tx.send(());
+        });
+
+        tx.send(ManagerCommand::Submit {
+            req: Box::new(req),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        tx.send(ManagerCommand::CancelActiveRequest).await.unwrap();
+        // Deferred until the request ends; proves ordering is preserved too.
+        tx.send(ManagerCommand::SetTimeout(23)).await.unwrap();
+        drop(tx);
+
+        timeout(Duration::from_secs(5), timeout_done_rx)
+            .await
+            .expect("the command loop never served the cancel")
+            .unwrap();
+        loop_handle.await.unwrap();
+
+        assert_eq!(cancel_calls.load(Ordering::Relaxed), 1);
+    }
+
     #[tokio::test]
     async fn test_handle_command_set_timeout_updates_status() {
         let (mut runtime, _spawn_calls, _send_calls, _shutdown_calls, _tx, _event_rx) =
@@ -535,12 +733,14 @@ mod tests {
         let active_pid = Arc::new(AtomicU32::new(44));
         let status = Arc::new(RwLock::new(WorkerStatus {
             active: true,
+            role: Some("embed".to_string()),
             engine: Some("candle".to_string()),
             model: Some("model-a".to_string()),
             device: Some("cpu".to_string()),
             request_mode: Some("embed".to_string()),
             pid: Some(44),
             timeout_secs: 300,
+            generation: None,
         }));
         let (old_tx, _old_rx) = mpsc::channel(1);
         let sender_slot = Arc::new(std::sync::Mutex::new(old_tx));
@@ -559,12 +759,14 @@ mod tests {
         let active_pid = Arc::new(AtomicU32::new(12));
         let status = Arc::new(RwLock::new(WorkerStatus {
             active: true,
+            role: Some("embed".to_string()),
             engine: Some("candle".to_string()),
             model: Some("model-a".to_string()),
             device: Some("cpu".to_string()),
             request_mode: Some("embed".to_string()),
             pid: Some(12),
             timeout_secs: 300,
+            generation: None,
         }));
         let (old_tx, _old_rx) = mpsc::channel(1);
         let sender_slot = Arc::new(std::sync::Mutex::new(old_tx));
@@ -579,27 +781,30 @@ mod tests {
     }
 
     #[test]
-    fn test_should_restart_worker_uses_active_session_and_engine() {
-        assert!(should_restart_worker(false, None, EmbeddingEngine::Candle));
-        assert!(should_restart_worker(
-            true,
-            Some(EmbeddingEngine::Candle),
-            EmbeddingEngine::SBERT
-        ));
-        assert!(!should_restart_worker(
-            true,
-            Some(EmbeddingEngine::Candle),
-            EmbeddingEngine::Candle
-        ));
+    fn test_should_restart_worker_uses_active_session_and_role() {
+        let candle = WorkerRole::Embed(EmbeddingEngine::Candle);
+        let sbert = WorkerRole::Embed(EmbeddingEngine::SBERT);
+        let generate = WorkerRole::Generate(GenerationEngine::Candle);
+
+        assert!(should_restart_worker(false, None, candle));
+        assert!(should_restart_worker(true, Some(candle), sbert));
+        assert!(!should_restart_worker(true, Some(candle), candle));
+
+        // The reason generation needs its own manager: a shared one would
+        // evict a multi-gigabyte model on every alternation.
+        assert!(should_restart_worker(true, Some(candle), generate));
+        assert!(should_restart_worker(true, Some(generate), candle));
+        assert!(!should_restart_worker(true, Some(generate), generate));
     }
 
     #[test]
     fn test_serialize_request_for_worker_round_trips_json() {
         let req = WorkerRequest {
-            engine: EmbeddingEngine::Candle,
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
+            generate: None,
             mode: "embed".to_string(),
             root: std::path::PathBuf::from("root"),
             data_dir: std::path::PathBuf::from("data"),
@@ -622,13 +827,14 @@ mod tests {
         let (mut runtime, _spawn_calls, _send_calls, shutdown_calls, _tx, _event_rx) =
             test_runtime();
         let proc: Arc<dyn WorkerSession> = Arc::new(FakeSession {
+            cancel_calls: Arc::new(AtomicUsize::new(0)),
             send_calls: Arc::new(AtomicUsize::new(0)),
             shutdown_calls: Arc::clone(&shutdown_calls),
             send_should_fail: false,
         });
         *runtime.active_process_slot.lock().unwrap() = Some(Arc::clone(&proc));
         runtime.active_process = Some(proc);
-        runtime.active_engine = Some(EmbeddingEngine::Candle);
+        runtime.active_role = Some(WorkerRole::Embed(EmbeddingEngine::Candle));
         runtime.active_model = Some("model-a".to_string());
         runtime.active_device = Some("cpu".to_string());
 
@@ -643,10 +849,11 @@ mod tests {
         let (mut runtime, spawn_calls, send_calls, shutdown_calls, _tx, mut event_rx) =
             test_runtime();
         let req = WorkerRequest {
-            engine: EmbeddingEngine::Candle,
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
+            generate: None,
             mode: "embed".to_string(),
             root: std::path::PathBuf::from("root"),
             data_dir: std::path::PathBuf::from("data"),
@@ -707,12 +914,14 @@ mod tests {
         let active_pid = Arc::new(AtomicU32::new(0));
         let status = Arc::new(RwLock::new(WorkerStatus {
             active: false,
+            role: None,
             engine: None,
             model: None,
             device: None,
             request_mode: None,
             pid: None,
             timeout_secs: 300,
+            generation: None,
         }));
         let spawn_calls = Arc::new(AtomicUsize::new(0));
         let send_calls = Arc::new(AtomicUsize::new(0));
@@ -734,10 +943,11 @@ mod tests {
         );
 
         let req = WorkerRequest {
-            engine: EmbeddingEngine::Candle,
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
+            generate: None,
             mode: "embed".to_string(),
             root: std::path::PathBuf::from("root"),
             data_dir: std::path::PathBuf::from("data"),
@@ -761,10 +971,11 @@ mod tests {
         let (mut runtime, spawn_calls, _send_calls, _shutdown_calls, _tx, _event_rx) =
             test_runtime();
         let req = WorkerRequest {
-            engine: EmbeddingEngine::Candle,
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
+            generate: None,
             mode: "embed".to_string(),
             root: std::path::PathBuf::from("root"),
             data_dir: std::path::PathBuf::from("data"),
@@ -786,10 +997,11 @@ mod tests {
         let (mut runtime, spawn_calls, _send_calls, shutdown_calls, _tx, _event_rx) =
             test_runtime();
         let first = WorkerRequest {
-            engine: EmbeddingEngine::Candle,
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
+            generate: None,
             mode: "embed".to_string(),
             root: std::path::PathBuf::from("root"),
             data_dir: std::path::PathBuf::from("data"),
@@ -799,7 +1011,7 @@ mod tests {
             supported_extensions: vec![],
         };
         let second = WorkerRequest {
-            engine: EmbeddingEngine::SBERT,
+            role: WorkerRole::Embed(EmbeddingEngine::SBERT),
             ..first.clone()
         };
         let (reply_tx, _reply_rx) = mpsc::channel(4);
@@ -809,7 +1021,10 @@ mod tests {
 
         assert_eq!(spawn_calls.load(Ordering::Relaxed), 2);
         assert_eq!(shutdown_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(runtime.active_engine, Some(EmbeddingEngine::SBERT));
+        assert_eq!(
+            runtime.active_role,
+            Some(WorkerRole::Embed(EmbeddingEngine::SBERT))
+        );
     }
 
     #[test]
@@ -817,10 +1032,11 @@ mod tests {
         let (mut runtime, _spawn_calls, _send_calls, _shutdown_calls, _tx, _event_rx) =
             test_runtime();
         let req = WorkerRequest {
-            engine: EmbeddingEngine::Candle,
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
+            generate: None,
             mode: "embed".to_string(),
             root: std::path::PathBuf::from("root"),
             data_dir: std::path::PathBuf::from("data"),
@@ -850,12 +1066,14 @@ mod tests {
         let active_pid = Arc::new(AtomicU32::new(0));
         let status = Arc::new(RwLock::new(WorkerStatus {
             active: false,
+            role: None,
             engine: None,
             model: None,
             device: None,
             request_mode: None,
             pid: None,
             timeout_secs: 300,
+            generation: None,
         }));
         let spawn_calls = Arc::new(AtomicUsize::new(0));
         let send_calls = Arc::new(AtomicUsize::new(0));
@@ -877,10 +1095,11 @@ mod tests {
         );
 
         let req = WorkerRequest {
-            engine: EmbeddingEngine::Candle,
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
+            generate: None,
             mode: "embed".to_string(),
             root: std::path::PathBuf::from("root"),
             data_dir: std::path::PathBuf::from("data"),
@@ -906,13 +1125,14 @@ mod tests {
             test_runtime();
         let status = Arc::clone(&runtime.status);
         let proc: Arc<dyn WorkerSession> = Arc::new(FakeSession {
+            cancel_calls: Arc::new(AtomicUsize::new(0)),
             send_calls: Arc::new(AtomicUsize::new(0)),
             shutdown_calls: Arc::clone(&shutdown_calls),
             send_should_fail: false,
         });
         *runtime.active_process_slot.lock().unwrap() = Some(Arc::clone(&proc));
         runtime.active_process = Some(proc);
-        runtime.active_engine = Some(EmbeddingEngine::Candle);
+        runtime.active_role = Some(WorkerRole::Embed(EmbeddingEngine::Candle));
         runtime.active_model = Some("model-a".to_string());
         runtime.active_device = Some("cpu".to_string());
         drop(tx);
@@ -929,13 +1149,14 @@ mod tests {
             test_runtime();
         let status = Arc::clone(&runtime.status);
         let proc: Arc<dyn WorkerSession> = Arc::new(FakeSession {
+            cancel_calls: Arc::new(AtomicUsize::new(0)),
             send_calls: Arc::new(AtomicUsize::new(0)),
             shutdown_calls: Arc::clone(&shutdown_calls),
             send_should_fail: false,
         });
         *runtime.active_process_slot.lock().unwrap() = Some(Arc::clone(&proc));
         runtime.active_process = Some(proc);
-        runtime.active_engine = Some(EmbeddingEngine::Candle);
+        runtime.active_role = Some(WorkerRole::Embed(EmbeddingEngine::Candle));
         runtime.active_model = Some("model-a".to_string());
         runtime.active_device = Some("cpu".to_string());
         runtime.idle_timeout = std::time::Duration::from_millis(20);

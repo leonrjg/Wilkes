@@ -14,12 +14,13 @@ use candle_transformers::models::jina_bert::{
 };
 use candle_transformers::models::modernbert::{Config as ModernBertConfig, ModernBert};
 use hf_hub::api::sync::ApiBuilder;
+
+use crate::models::hf_hub::HfProgressReporter;
 use tokenizers::Tokenizer;
 
-use super::super::models::installer::{
-    DownloadProgress, EmbedProgress, EmbedderInstaller, ProgressTx,
-};
 use super::super::Embedder;
+use crate::embed::installer::EmbedderInstaller;
+use crate::models::progress::{DownloadProgress, EmbedProgress, ProgressTx};
 use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
 
 // ── Static model catalog ──────────────────────────────────────────────────────
@@ -172,14 +173,15 @@ pub fn parse_dimension_from_config(config_text: &str) -> anyhow::Result<usize> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandleDevicePlan {
     Cpu,
-    MetalPreferred,
+    Auto,
+    MetalRequired,
 }
 
 pub fn select_device_plan(device: &str) -> CandleDevicePlan {
-    if device.trim().eq_ignore_ascii_case("cpu") {
-        CandleDevicePlan::Cpu
-    } else {
-        CandleDevicePlan::MetalPreferred
+    match device.trim().to_ascii_lowercase().as_str() {
+        "cpu" => CandleDevicePlan::Cpu,
+        "metal" | "mps" | "gpu" => CandleDevicePlan::MetalRequired,
+        _ => CandleDevicePlan::Auto,
     }
 }
 
@@ -187,23 +189,67 @@ pub fn select_dtype_for_plan(_plan: &CandleDevicePlan) -> DType {
     DType::F32
 }
 
-pub fn realize_device(plan: CandleDevicePlan) -> Device {
+pub struct RealizedCandleDevice {
+    pub device: Device,
+    pub name: String,
+    pub fallback_reason: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+fn metal_device() -> Result<Device, String> {
+    if !candle_core::utils::metal_is_available() {
+        return Err("Candle was built without Metal support".to_string());
+    }
+    match std::panic::catch_unwind(|| Device::new_metal(0)) {
+        Ok(Ok(device)) => Ok(device),
+        Ok(Err(error)) => Err(format!("Metal device initialization failed: {error:#}")),
+        Err(_) => Err("Metal device initialization panicked".to_string()),
+    }
+}
+
+pub fn realize_device(plan: CandleDevicePlan) -> anyhow::Result<RealizedCandleDevice> {
     match plan {
-        CandleDevicePlan::Cpu => Device::Cpu,
-        CandleDevicePlan::MetalPreferred => {
+        CandleDevicePlan::Cpu => Ok(RealizedCandleDevice {
+            device: Device::Cpu,
+            name: "cpu".to_string(),
+            fallback_reason: None,
+        }),
+        CandleDevicePlan::Auto | CandleDevicePlan::MetalRequired => {
             #[cfg(target_os = "macos")]
             {
-                if candle_core::utils::metal_is_available() {
-                    match std::panic::catch_unwind(|| Device::new_metal(0)) {
-                        Ok(Ok(d)) => return d,
-                        Ok(Err(e)) => {
-                            warn!("Metal device init failed ({e:#}), falling back to CPU")
-                        }
-                        Err(_) => warn!("Metal device init panicked, falling back to CPU"),
+                match metal_device() {
+                    Ok(device) => {
+                        return Ok(RealizedCandleDevice {
+                            device,
+                            name: "metal".to_string(),
+                            fallback_reason: None,
+                        });
+                    }
+                    Err(reason) if plan == CandleDevicePlan::MetalRequired => {
+                        anyhow::bail!("{reason}");
+                    }
+                    Err(reason) => {
+                        warn!("{reason}; auto device selection is falling back to CPU");
+                        return Ok(RealizedCandleDevice {
+                            device: Device::Cpu,
+                            name: "cpu".to_string(),
+                            fallback_reason: Some(reason),
+                        });
                     }
                 }
             }
-            Device::Cpu
+            #[cfg(not(target_os = "macos"))]
+            {
+                let reason = "Metal is unavailable on this platform".to_string();
+                if plan == CandleDevicePlan::MetalRequired {
+                    anyhow::bail!("{reason}");
+                }
+                Ok(RealizedCandleDevice {
+                    device: Device::Cpu,
+                    name: "cpu".to_string(),
+                    fallback_reason: Some(reason),
+                })
+            }
         }
     }
 }
@@ -344,6 +390,9 @@ pub(crate) trait HfModelFetcher {
 
 struct RealHfModelFetcher {
     cache_dir: PathBuf,
+    /// Present when the caller wants byte-level progress. Absent means the
+    /// download is a silent probe (restore, availability check).
+    progress: Option<HfProgressReporter>,
 }
 
 impl HfModelFetcher for RealHfModelFetcher {
@@ -354,8 +403,20 @@ impl HfModelFetcher for RealHfModelFetcher {
             .context("Failed to initialise HF hub API")?;
         let repo = api.model(model_id.to_string());
         for filename in files {
+            // `ApiRepo::get` checks the cache before downloading but discards
+            // progress; `download_with_progress` reports progress but always
+            // hits the network. Keep the cache check here so the two paths have
+            // the same skip-if-present semantics.
+            if cached_path(&self.cache_dir, model_id, filename).is_some() {
+                debug!("'{filename}' already cached for '{model_id}', skipping download");
+                continue;
+            }
             let url = repo.url(filename);
-            repo.get(filename).map_err(|e| {
+            let outcome = match self.progress.clone() {
+                Some(progress) => repo.download_with_progress(filename, progress),
+                None => repo.download(filename),
+            };
+            outcome.map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to download '{filename}' for '{model_id}' from {url}: {e:#}"
                 )
@@ -382,7 +443,7 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
     PREEXISTING_MODELS
         .iter()
         .map(|info| {
-            let is_cached = super::super::models::hf_hub::is_model_cached(data_dir, info.model_id);
+            let is_cached = crate::models::hf_hub::is_model_cached(data_dir, info.model_id);
 
             let size_bytes = if is_cached {
                 cached_size_bytes(data_dir, info.model_id)
@@ -436,13 +497,6 @@ fn load_pooling_strategy(data_dir: &Path, model_id: &str) -> PoolingStrategy {
         return PoolingStrategy::Max;
     }
     PoolingStrategy::Mean
-}
-
-// ── Device / dtype selection ──────────────────────────────────────────────────
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn select_device(device: &str) -> Device {
-    realize_device(select_device_plan(device))
 }
 
 /// F32 everywhere. Candle 0.9's Metal backend lacks F16 kernels for several ops
@@ -656,14 +710,14 @@ impl Embedder for CandleEmbedder {
 
 pub struct CandleInstaller {
     pub model: EmbedderModel,
-    pub manager: super::super::worker::manager::WorkerManager,
+    pub manager: crate::worker::manager::WorkerManager,
     pub device: String,
 }
 
 impl CandleInstaller {
     pub fn new(
         model: EmbedderModel,
-        manager: super::super::worker::manager::WorkerManager,
+        manager: crate::worker::manager::WorkerManager,
         device: String,
     ) -> Self {
         Self {
@@ -674,15 +728,21 @@ impl CandleInstaller {
     }
 }
 
-pub fn install_local(data_dir: &Path, model: &EmbedderModel) -> anyhow::Result<()> {
+pub fn install_local(
+    data_dir: &Path,
+    model: &EmbedderModel,
+    progress: Option<ProgressTx>,
+) -> anyhow::Result<()> {
     let model_id = model.0.clone();
     let fetcher = RealHfModelFetcher {
         cache_dir: data_dir.to_path_buf(),
+        progress: progress.map(HfProgressReporter::new),
     };
     fetcher.download_required_files(&model_id, MODEL_FILES)?;
 
     let fetcher = RealHfModelFetcher {
         cache_dir: data_dir.to_path_buf(),
+        progress: None,
     };
     fetcher.fetch_optional_files(&model_id, &["1_Pooling/config.json"])?;
 
@@ -693,21 +753,15 @@ pub fn install_local(data_dir: &Path, model: &EmbedderModel) -> anyhow::Result<(
 #[async_trait]
 impl EmbedderInstaller for CandleInstaller {
     fn is_available(&self, data_dir: &Path) -> bool {
-        super::super::models::hf_hub::is_model_cached(data_dir, &self.model.0)
+        crate::models::hf_hub::is_model_cached(data_dir, &self.model.0)
     }
 
     async fn install(&self, data_dir: &Path, tx: ProgressTx) -> anyhow::Result<()> {
-        let _ = tx
-            .send(EmbedProgress::Download(DownloadProgress {
-                bytes_received: 0,
-                total_bytes: 0,
-                done: false,
-            }))
-            .await;
-
         let model = self.model.clone();
         let data_dir = data_dir.to_path_buf();
-        tokio::task::spawn_blocking(move || install_local(&data_dir, &model)).await??;
+        let progress_tx = tx.clone();
+        tokio::task::spawn_blocking(move || install_local(&data_dir, &model, Some(progress_tx)))
+            .await??;
 
         let _ = tx
             .send(EmbedProgress::Download(DownloadProgress {
@@ -728,20 +782,18 @@ impl EmbedderInstaller for CandleInstaller {
         let model_id = &self.model.0;
         let dimension = read_dimension(data_dir, model_id)?;
         let prefixes = super::aux_config::load_prefixes(data_dir, model_id);
-        Ok(Arc::new(
-            super::super::worker::embedder::WorkerEmbedder::new(
-                self.manager.clone(),
-                super::super::worker::embedder::WorkerEmbedderConfig {
-                    model_id: model_id.clone(),
-                    dimension,
-                    device: self.device.clone(),
-                    engine: EmbeddingEngine::Candle,
-                    data_dir: data_dir.to_path_buf(),
-                    query_prefix: prefixes.query_prefix,
-                    passage_prefix: prefixes.passage_prefix,
-                },
-            ),
-        ))
+        Ok(Arc::new(crate::worker::embedder::WorkerEmbedder::new(
+            self.manager.clone(),
+            crate::worker::embedder::WorkerEmbedderConfig {
+                model_id: model_id.clone(),
+                dimension,
+                device: self.device.clone(),
+                engine: EmbeddingEngine::Candle,
+                data_dir: data_dir.to_path_buf(),
+                query_prefix: prefixes.query_prefix,
+                passage_prefix: prefixes.passage_prefix,
+            },
+        )))
     }
 }
 
@@ -776,7 +828,8 @@ fn load_embedder_with_factory<F: CandleRuntimeFactory>(
     let config_text = read_config_text(&artifacts.config_path)?;
     let peek = parse_model_type(&config_text)?;
     let plan = build_embedder_plan(data_dir, &model.0, &config_text, device)?;
-    let device = realize_device(plan.device_plan);
+    let realized = realize_device(plan.device_plan)?;
+    let device = realized.device;
     let dtype = plan.dtype;
 
     let vb = factory.load_var_builder(&artifacts.weights_path, dtype, &device)?;
@@ -973,16 +1026,6 @@ mod tests {
     }
 
     #[test]
-    fn test_select_device() {
-        assert!(matches!(select_device("cpu"), Device::Cpu));
-        // On systems without a usable Metal device, it should fallback to Cpu.
-        assert!(matches!(
-            select_device("metal"),
-            Device::Cpu | Device::Metal(_)
-        ));
-    }
-
-    #[test]
     fn test_read_dimension_static() {
         let dir = tempdir().unwrap();
         let dim = read_dimension(dir.path(), "sentence-transformers/all-MiniLM-L12-v2").unwrap();
@@ -1137,8 +1180,8 @@ mod tests {
     #[test]
     fn test_candle_installer_basics() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
-            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths::resolve(dir.path()),
         );
         let installer =
             CandleInstaller::new(EmbedderModel("m1".to_string()), manager, "cpu".to_string());
@@ -1164,8 +1207,8 @@ mod tests {
     async fn test_candle_installer_install_skip() {
         std::env::set_var("HF_HUB_OFFLINE", "1");
         let dir = tempdir().unwrap();
-        let (manager, _, _) = crate::embed::worker::manager::WorkerManager::new(
-            crate::embed::worker::manager::WorkerPaths::resolve(dir.path()),
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths::resolve(dir.path()),
         );
         let installer =
             CandleInstaller::new(EmbedderModel("m1".to_string()), manager, "cpu".to_string());
@@ -1516,7 +1559,7 @@ mod tests {
 
     #[test]
     fn test_fetch_model_size_with_empty_result() {
-        let res = crate::embed::models::hf_hub::fetch_model_size("non-existent");
+        let res = crate::models::hf_hub::fetch_model_size("non-existent");
         assert!(res.is_err());
     }
 
@@ -1655,15 +1698,13 @@ mod tests {
     fn test_select_device_plan_and_realize_device() {
         assert_eq!(select_device_plan("cpu"), CandleDevicePlan::Cpu);
         assert_eq!(select_device_plan("  CPU  "), CandleDevicePlan::Cpu);
-        assert_eq!(select_device_plan("gpu"), CandleDevicePlan::MetalPreferred);
+        assert_eq!(select_device_plan("auto"), CandleDevicePlan::Auto);
+        assert_eq!(select_device_plan("gpu"), CandleDevicePlan::MetalRequired);
         assert_eq!(select_dtype_for_plan(&CandleDevicePlan::Cpu), DType::F32);
-        assert!(matches!(realize_device(CandleDevicePlan::Cpu), Device::Cpu));
-
-        let metal = realize_device(CandleDevicePlan::MetalPreferred);
-        #[cfg(not(target_os = "macos"))]
-        assert!(matches!(metal, Device::Cpu));
-        #[cfg(target_os = "macos")]
-        assert!(matches!(metal, Device::Cpu | Device::Metal(_)));
+        let cpu = realize_device(CandleDevicePlan::Cpu).unwrap();
+        assert!(matches!(cpu.device, Device::Cpu));
+        assert_eq!(cpu.name, "cpu");
+        assert!(cpu.fallback_reason.is_none());
     }
 
     #[test]
@@ -1784,6 +1825,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let fetcher = RealHfModelFetcher {
             cache_dir: dir.path().to_path_buf(),
+            progress: None,
         };
         // Should not panic, might fail to download but we test the interface
         let _ = fetcher.fetch_optional_files("BAAI/bge-small-en-v1.5", &["README.md"]);

@@ -77,6 +77,7 @@ fn apply_renames(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn process_directory_change<F1, F2>(
     batch: DirectoryChangeBatch,
     index: &Arc<Mutex<Option<SemanticIndex>>>,

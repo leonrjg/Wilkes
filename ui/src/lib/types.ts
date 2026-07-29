@@ -143,9 +143,16 @@ export interface BookmarkClustersQuery {
 }
 
 export interface BookmarkCluster {
+  /** Content-derived identity (sha256 over sorted member id:input_hash pairs).
+   *  The only stable handle for patching a late-arriving label: clusters are
+   *  recomputed on every call and `representative_bookmark_id` moves when
+   *  granularity changes. */
+  cluster_key: string;
   bookmark_ids: string[];
   representative_bookmark_id: string;
   cohesion: number;
+  /** Absent until generated, or forever when generation is off. */
+  label?: string | null;
 }
 
 export interface BookmarkClustersResult {
@@ -379,6 +386,72 @@ export interface SemanticSettings {
   worker_timeout_secs: number;
 }
 
+export type GenerationTask =
+  | "cluster_label"
+  | "relation_explanation"
+  | "document_summary";
+
+export interface GenerationSampling {
+  temperature: number;
+  top_p?: number | null;
+  top_k?: number | null;
+  repeat_penalty?: [number, number] | null;
+  seed: number;
+}
+
+export interface GenerationSettings {
+  enabled: boolean;
+  model: string | null;
+  device: string | null;
+  sampling_overrides: Partial<Record<GenerationTask, GenerationSampling>>;
+}
+
+/** Catalog entry for a generation model. Distinct from `ModelDescriptor`:
+ *  `dimension` and `preferred_batch_size` are meaningless for a generator, and
+ *  generation models need two repo ids because the GGUF repos ship no
+ *  tokenizer. */
+export interface GeneratorDescriptor {
+  model_id: string;
+  display_name: string;
+  description: string;
+  weights_file: string;
+  weights_revision: string;
+  tokenizer_repo: string;
+  tokenizer_revision: string;
+  context_tokens: number;
+  is_cached: boolean;
+  is_default: boolean;
+  is_recommended: boolean;
+  size_bytes: number | null;
+}
+
+/** Emitted per cluster as its label finishes generating. */
+export interface BookmarkClusterLabelled {
+  cluster_key: string;
+  label: string;
+}
+
+/** The shared lifecycle for every user-facing generation stream. */
+export type GenerationStreamEvent =
+  | {
+      phase: "delta";
+      request_id: string;
+      task: GenerationTask;
+      delta: string;
+    }
+  | {
+      phase: "completed";
+      request_id: string;
+      task: GenerationTask;
+      text: string;
+    }
+  | {
+      phase: "failed";
+      request_id: string;
+      task: GenerationTask;
+      error: string;
+    };
+
 export interface ZoteroSettings {
   enabled: boolean;
   base_url: string;
@@ -407,12 +480,24 @@ export type MetadataSourcePreference = "file" | "zotero" | "semantic_scholar" | 
 
 export interface WorkerStatus {
   active: boolean;
+  /** "embed" or "generate". A sibling of `engine`, not a replacement. */
+  role?: string | null;
   engine: string | null;
   model: string | null;
   device: string | null;
   request_mode: string | null;
   pid: number | null;
   timeout_secs: number;
+  generation?: {
+    requested_device: string;
+    fallback_reason?: string | null;
+    model_load_micros?: number | null;
+    timings?: {
+      prompt_micros: number;
+      decode_micros: number;
+      constraint_micros: number;
+    } | null;
+  } | null;
 }
 
 export interface Settings {
@@ -424,6 +509,7 @@ export interface Settings {
   theme: Theme;
   search_prefer_semantic: boolean;
   semantic: SemanticSettings;
+  generation: GenerationSettings;
   integrations: IntegrationsSettings;
   primary_metadata_source?: MetadataSourcePreference;
   supported_extensions: string[];
@@ -524,6 +610,19 @@ export interface EmbedDone {
 
 export interface EmbedError {
   operation: EmbedOperation;
+  message: string;
+}
+
+// ── Generation model install ─────────────────────────────────────────────────
+// Deliberately separate from the embed events: the embed stream drives the
+// global "indexing" state, which a generation download has no business
+// entering. Same progress shape, different lifecycle.
+
+export interface GenerationDone {
+  model: string;
+}
+
+export interface GenerationError {
   message: string;
 }
 

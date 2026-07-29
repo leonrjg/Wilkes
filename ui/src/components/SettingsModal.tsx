@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from "react";
 import type { SearchApi } from "../services/api";
 import type { ExternalMcpStatus, Settings } from "../lib/types";
 import SemanticPanel from "./SemanticPanel";
+import GenerationPanel from "./GenerationPanel";
+import { useGenerationStore } from "../stores/useGenerationStore";
 import ChunkingPanel from "./ChunkingPanel";
 import DataPanel from "./DataPanel";
 import ExtensionsPanel from "./ExtensionsPanel";
@@ -165,7 +167,20 @@ export default function SettingsModal({
   refreshSemanticReady,
   onSettingsUpdate,
 }: SettingsModalProps) {
-  const [activeTab, setActiveTab] = useState<"general" | "chat" | "extensions" | "integrations" | "models" | "chunking" | "data" | "workers" | "logs" | "technical">("general");
+  type SettingsTab =
+    | "general"
+    | "extensions"
+    | "integrations"
+    | "semantic-models"
+    | "semantic-chunking"
+    | "generation-chat"
+    | "generation-models"
+    | "data"
+    | "workers"
+    | "logs"
+    | "technical";
+
+  const [activeTab, setActiveTab] = useState<SettingsTab>("general");
   const [settings, setSettings] = useState<Settings | null>(null);
   const [customInstructionsDraft, setCustomInstructionsDraft] = useState("");
   const [externalMcpStatus, setExternalMcpStatus] = useState<ExternalMcpStatus | null>(null);
@@ -210,8 +225,16 @@ export default function SettingsModal({
       const newSettings = await api.updateSettings(patch);
       setSettings(newSettings);
       if (onSettingsUpdate) onSettingsUpdate(patch);
+      // Attaching the generation model is asynchronous, so readiness has to be
+      // re-read from the backend rather than inferred from the flag the user
+      // just flipped. Done here because this is the one place arbitrary
+      // settings patches are applied from the UI, including the JSON editor.
+      if (patch.generation) {
+        void useGenerationStore.getState().refreshReady();
+      }
     } catch (e) {
       console.error("Failed to update settings:", e);
+      throw e;
     }
   };
 
@@ -302,8 +325,19 @@ export default function SettingsModal({
     }
   };
 
-  const TabButton = ({ id, label, indent = false }: { id: typeof activeTab; label: string; indent?: boolean }) => (
+  const TabButton = ({
+    id,
+    label,
+    accessibleLabel,
+    indent = false,
+  }: {
+    id: SettingsTab;
+    label: string;
+    accessibleLabel?: string;
+    indent?: boolean;
+  }) => (
     <button
+      aria-label={accessibleLabel}
       onClick={() => setActiveTab(id)}
       className={`px-3 py-1.5 rounded-lg text-sm text-left transition-colors ${
         indent ? "ml-2" : ""
@@ -337,15 +371,30 @@ export default function SettingsModal({
           <div className="w-40 border-r border-[var(--border-main)] bg-[var(--bg-sidebar)] p-2 flex flex-col gap-3">
             <div className="flex flex-col gap-0.5">
               <TabButton id="general" label="General" />
-              {isTauri && <TabButton id="chat" label="Chat" />}
               <TabButton id="extensions" label="File extensions" />
               <TabButton id="integrations" label="Integrations" />
             </div>
 
             <div className="flex flex-col gap-0.5">
               <span className="px-3 py-1 text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Semantic Search</span>
-              <TabButton id="models" label="Models" indent />
-              <TabButton id="chunking" label="Chunking" indent />
+              <TabButton
+                id="semantic-models"
+                label="Models"
+                accessibleLabel="Semantic Search Models"
+                indent
+              />
+              <TabButton id="semantic-chunking" label="Chunking" indent />
+            </div>
+
+            <div className="flex flex-col gap-0.5">
+              <span className="px-3 py-1 text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Generation</span>
+              {isTauri && <TabButton id="generation-chat" label="Chat" indent />}
+              <TabButton
+                id="generation-models"
+                label="Models"
+                accessibleLabel="Generation Models"
+                indent
+              />
             </div>
 
             <div className="flex flex-col gap-0.5">
@@ -473,7 +522,7 @@ export default function SettingsModal({
               )}
             </div>
 
-            <div className={activeTab === "chat" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "generation-chat" ? "block h-full" : "hidden"}>
               {settings && isTauri && (
                 <div className="space-y-4">
                   <section>
@@ -713,7 +762,7 @@ export default function SettingsModal({
               )}
             </div>
 
-            <div className={activeTab === "models" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "semantic-models" ? "block h-full" : "hidden"}>
               <SemanticPanel
                 api={api}
                 directory={directory}
@@ -721,7 +770,17 @@ export default function SettingsModal({
               />
             </div>
 
-            <div className={activeTab === "chunking" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "generation-models" ? "block h-full" : "hidden"}>
+              {settings && (
+                <GenerationPanel
+                  api={api}
+                  settings={settings}
+                  onUpdateSettings={handleUpdateSettings}
+                />
+              )}
+            </div>
+
+            <div className={activeTab === "semantic-chunking" ? "block h-full" : "hidden"}>
               {settings && (
                 <ChunkingPanel api={api} settings={settings} onUpdate={setSettings} />
               )}

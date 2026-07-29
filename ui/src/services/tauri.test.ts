@@ -287,6 +287,38 @@ describe("TauriSearchApi", () => {
     await api.onEmbedError(handler);
     expect(listen).toHaveBeenCalledWith("embed-error", expect.any(Function));
   });
+
+  it("starts generation tasks and subscribes to their shared stream", async () => {
+    (invoke as any).mockResolvedValue(undefined);
+    await api.explainRelatedDocument("relation-1", "/docs/a.pdf", "/docs/b.pdf");
+    expect(invoke).toHaveBeenLastCalledWith("explain_related_document", {
+      requestId: "relation-1",
+      anchorPath: "/docs/a.pdf",
+      path: "/docs/b.pdf",
+    });
+    await api.summarizeDocument("summary-1", "/docs/a.pdf");
+    expect(invoke).toHaveBeenLastCalledWith("summarize_document", {
+      requestId: "summary-1",
+      path: "/docs/a.pdf",
+    });
+
+    const handler = vi.fn();
+    (listen as any).mockResolvedValue(vi.fn());
+    await api.onGenerationStream(handler);
+    expect(listen).toHaveBeenLastCalledWith(
+      "generation-stream",
+      expect.any(Function),
+    );
+    const listener = (listen as any).mock.calls.at(-1)[1];
+    const event = {
+      phase: "completed",
+      request_id: "summary-1",
+      task: "document_summary",
+      text: "Done",
+    };
+    listener({ payload: event });
+    expect(handler).toHaveBeenCalledWith(event);
+  });
 });
 
 describe("TauriSourceApi", () => {

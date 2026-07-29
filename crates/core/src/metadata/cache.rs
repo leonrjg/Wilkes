@@ -59,15 +59,6 @@ impl MetadataSource {
             MetadataSource::OpenAlex => "openalex",
         }
     }
-
-    pub fn from_str(value: &str) -> Self {
-        match value {
-            "zotero" => MetadataSource::Zotero,
-            "semantic_scholar" => MetadataSource::SemanticScholar,
-            "openalex" => MetadataSource::OpenAlex,
-            _ => MetadataSource::File,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

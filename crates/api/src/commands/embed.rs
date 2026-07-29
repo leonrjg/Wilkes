@@ -4,17 +4,17 @@ use std::sync::Arc;
 
 use ignore::WalkBuilder;
 use wilkes_core::embed::index::SemanticIndex;
-use wilkes_core::embed::installer::ProgressTx;
-use wilkes_core::embed::models::installer::EmbedderInstaller;
-use wilkes_core::embed::worker::ipc::{WorkerEvent, WorkerRequest};
-use wilkes_core::embed::worker::manager::{ManagerCommand, WorkerManager};
+use wilkes_core::embed::installer::EmbedderInstaller;
 use wilkes_core::embed::Embedder;
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
+use wilkes_core::models::progress::ProgressTx;
 use wilkes_core::types::{EmbeddingEngine, IndexStatus, SelectedEmbedder};
+use wilkes_core::worker::ipc::{WorkerEvent, WorkerRequest, WorkerRole};
+use wilkes_core::worker::manager::{ManagerCommand, WorkerManager};
 
 pub struct BuildIndexOptions {
-    pub manager: Option<wilkes_core::embed::worker::manager::WorkerManager>,
+    pub manager: Option<wilkes_core::worker::manager::WorkerManager>,
     pub device: Option<String>,
     pub data_dir: PathBuf,
     pub tx: ProgressTx,
@@ -27,7 +27,7 @@ pub struct BuildIndexOptions {
 /// Download and install the model. Reports progress via `tx`.
 pub async fn download_model(
     selected: SelectedEmbedder,
-    manager: wilkes_core::embed::worker::manager::WorkerManager,
+    manager: wilkes_core::worker::manager::WorkerManager,
     device: String,
     data_dir: PathBuf,
     tx: ProgressTx,
@@ -151,7 +151,7 @@ async fn build_index_via_worker(
     let request = WorkerRequest {
         mode: "build".to_string(),
         root,
-        engine: selected.engine,
+        role: WorkerRole::Embed(selected.engine),
         model: selected.model.model_id().to_string(),
         data_dir: options.data_dir.clone(),
         chunk_size: Some(options.chunk_size),
@@ -159,6 +159,7 @@ async fn build_index_via_worker(
         device: device.clone(),
         paths: None,
         texts: None,
+        generate: None,
         supported_extensions: options.supported_extensions.clone(),
     };
 
@@ -193,7 +194,9 @@ async fn build_index_via_worker(
                 WorkerEvent::Error(err) => {
                     anyhow::bail!(err);
                 }
-                WorkerEvent::Embeddings(_) | WorkerEvent::Info { .. } => {}
+                // A build never generates; these can only mean a protocol
+                // mismatch, so log rather than swallow silently.
+                other => tracing::warn!("build: ignoring unexpected worker event: {other:?}"),
             },
             Ok(None) => break,
             Err(_) => continue,

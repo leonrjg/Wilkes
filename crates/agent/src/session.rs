@@ -171,6 +171,7 @@ pub struct ChatReplayToolCall {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum ChatReplayContentBlock {
     Text { text: String },
     Tool { tool: ChatReplayToolCall },

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use super::ipc::{WorkerEvent, WorkerRequest};
+use super::ipc::{WorkerEvent, WorkerRequest, WorkerRole};
 use super::manager::WorkerPaths;
 use super::python_env::setup_python_env;
 use crate::types::EmbeddingEngine;
@@ -48,8 +48,9 @@ pub(super) async fn build_command_plan(
     paths: &WorkerPaths,
     req: &WorkerRequest,
 ) -> Result<ProcessCommandPlan, String> {
-    Ok(match req.engine {
-        EmbeddingEngine::SBERT => {
+    Ok(match req.role {
+        // SBERT is the only role that runs outside the Rust worker binary.
+        WorkerRole::Embed(EmbeddingEngine::SBERT) => {
             let python = setup_python_env(paths).await?;
             let cache_root = paths.data_dir.join("huggingface");
             let xdg_cache_root = paths.data_dir.join(".cache");
@@ -223,7 +224,7 @@ exit 0
         let req = WorkerRequest {
             mode: "embed".to_string(),
             root: dir.path().to_path_buf(),
-            engine: EmbeddingEngine::Candle,
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
             data_dir: dir.path().to_path_buf(),
             chunk_size: None,
@@ -231,6 +232,7 @@ exit 0
             device: "cpu".to_string(),
             paths: None,
             texts: Some(vec!["hello".to_string()]),
+            generate: None,
             supported_extensions: vec![],
         };
 
@@ -252,6 +254,85 @@ exit 0
         assert_eq!(active_pid.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
+    /// Regression test for a latent cross-request corruption window.
+    ///
+    /// Dropping the reply receiver used to return immediately, leaving the
+    /// worker's remaining output in the pipe for the *next* request to read as
+    /// its own. For an embed request that residue was two lines; for a
+    /// cancelled generation it is hundreds. `send_request` owns the invariant
+    /// "on return, the pipe is at a request boundary".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abandoning_a_request_drains_to_the_next_request_boundary() {
+        let dir = tempdir().unwrap();
+        let worker_bin = dir.path().join("worker.sh");
+        write_executable(
+            &worker_bin,
+            r#"#!/bin/sh
+read first
+echo '{"Token":{"text":"a"}}'
+echo '{"Token":{"text":"b"}}'
+echo '{"Token":{"text":"c"}}'
+echo '{"Completion":{"tokens":3,"stop":"Eos"}}'
+read second
+echo '{"Embeddings":[[9.0]]}'
+echo '"Done"'
+"#,
+        );
+
+        let paths = WorkerPaths {
+            python_path: std::path::PathBuf::from("python"),
+            python_package_dir: dir.path().to_path_buf(),
+            requirements_path: dir.path().join("requirements.txt"),
+            venv_dir: dir.path().join("venv"),
+            worker_bin,
+            data_dir: dir.path().to_path_buf(),
+        };
+        let req = WorkerRequest {
+            mode: "generate".to_string(),
+            root: dir.path().to_path_buf(),
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
+            model: "m".to_string(),
+            data_dir: dir.path().to_path_buf(),
+            chunk_size: None,
+            chunk_overlap: None,
+            device: "cpu".to_string(),
+            paths: None,
+            texts: None,
+            generate: None,
+            supported_extensions: vec![],
+        };
+        let req_json = serde_json::to_string(&req).unwrap();
+
+        let active_pid = AtomicU32::new(0);
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+            .await
+            .unwrap();
+
+        // A one-slot channel whose receiver is dropped after the first token:
+        // the remaining tokens and the Completion have nowhere to go.
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
+        let abandon = async {
+            let first = reply_rx.recv().await;
+            assert!(matches!(first, Some(WorkerEvent::Token { .. })));
+            drop(reply_rx);
+        };
+        let (send_result, ()) = tokio::join!(proc.send_request(&req_json, &reply_tx), abandon);
+        assert!(send_result.is_ok());
+        drop(reply_tx);
+
+        // The next request must read its own reply, not the residue of the
+        // first one.
+        let (second_tx, mut second_rx) = tokio::sync::mpsc::channel(8);
+        proc.send_request(&req_json, &second_tx).await.unwrap();
+        match second_rx.recv().await.unwrap() {
+            WorkerEvent::Embeddings(v) => assert_eq!(v, vec![vec![9.0]]),
+            other => panic!("read the previous request's residue: {other:?}"),
+        }
+
+        proc.shutdown(&active_pid).await;
+    }
+
     #[tokio::test]
     async fn test_worker_process_send_request_closed_stdout() {
         let dir = tempdir().unwrap();
@@ -271,7 +352,7 @@ exit 0
         let req = WorkerRequest {
             mode: "embed".to_string(),
             root: dir.path().to_path_buf(),
-            engine: EmbeddingEngine::Candle,
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
             data_dir: dir.path().to_path_buf(),
             chunk_size: None,
@@ -279,6 +360,7 @@ exit 0
             device: "cpu".to_string(),
             paths: None,
             texts: Some(vec!["hello".to_string()]),
+            generate: None,
             supported_extensions: vec![],
         };
 
@@ -315,7 +397,7 @@ exit 0
         let req = WorkerRequest {
             mode: "embed".to_string(),
             root: dir.path().to_path_buf(),
-            engine: EmbeddingEngine::Candle,
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
             data_dir: dir.path().to_path_buf(),
             chunk_size: None,
@@ -323,6 +405,7 @@ exit 0
             device: "cpu".to_string(),
             paths: None,
             texts: Some(vec!["hello".to_string()]),
+            generate: None,
             supported_extensions: vec![],
         };
 
@@ -366,7 +449,7 @@ exit 0
         let req = WorkerRequest {
             mode: "embed".to_string(),
             root: dir.path().to_path_buf(),
-            engine: EmbeddingEngine::Candle,
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
             data_dir: dir.path().to_path_buf(),
             chunk_size: None,
@@ -374,6 +457,7 @@ exit 0
             device: "cpu".to_string(),
             paths: None,
             texts: Some(vec!["hello".to_string()]),
+            generate: None,
             supported_extensions: vec![],
         };
 
@@ -410,7 +494,7 @@ exit 0
         let req = WorkerRequest {
             mode: "embed".to_string(),
             root: dir.path().to_path_buf(),
-            engine: EmbeddingEngine::Candle,
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
             data_dir: dir.path().to_path_buf(),
             chunk_size: None,
@@ -418,6 +502,7 @@ exit 0
             device: "cpu".to_string(),
             paths: None,
             texts: Some(vec!["hello".to_string()]),
+            generate: None,
             supported_extensions: vec![],
         };
 
@@ -451,7 +536,7 @@ exit 0
         let req = WorkerRequest {
             mode: "embed".to_string(),
             root: dir.path().to_path_buf(),
-            engine: EmbeddingEngine::SBERT,
+            role: WorkerRole::Embed(EmbeddingEngine::SBERT),
             model: "intfloat/e5-small-v2".to_string(),
             data_dir: dir.path().to_path_buf(),
             chunk_size: None,
@@ -459,6 +544,7 @@ exit 0
             device: "cpu".to_string(),
             paths: None,
             texts: Some(vec!["hello".to_string()]),
+            generate: None,
             supported_extensions: vec![],
         };
 
@@ -525,7 +611,7 @@ exit 0
         let req = WorkerRequest {
             mode: "embed".to_string(),
             root: dir.path().to_path_buf(),
-            engine: EmbeddingEngine::Candle,
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
             data_dir: dir.path().to_path_buf(),
             chunk_size: None,
@@ -533,6 +619,7 @@ exit 0
             device: "cpu".to_string(),
             paths: None,
             texts: Some(vec!["hello".to_string()]),
+            generate: None,
             supported_extensions: vec![],
         };
 

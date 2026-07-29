@@ -449,9 +449,20 @@ pub struct BookmarkClustersQuery {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BookmarkCluster {
+    /// Content-derived identity: `sha256` over the sorted member
+    /// `bookmark_id:input_hash` pairs. Clusters are recomputed on every call
+    /// and have no persistent id, so a label cannot be keyed to the cluster
+    /// itself — only to its membership. This is also the only stable handle the
+    /// UI can patch a late-arriving label against; `representative_bookmark_id`
+    /// moves when granularity changes.
+    pub cluster_key: String,
     pub bookmark_ids: Vec<String>,
     pub representative_bookmark_id: String,
     pub cohesion: f32,
+    /// `None` until the label has been generated, or forever if generation is
+    /// disabled. A missing label is not an error.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -549,6 +560,121 @@ pub struct ModelDescriptor {
     /// How many texts to embed at once. `None` means process all texts as one batch
     /// (required for some quantized models to ensure consistent results).
     pub preferred_batch_size: Option<usize>,
+}
+
+// ── Generation ────────────────────────────────────────────────────────────────
+
+/// The weights repo id of a generation model. The sibling of `EmbedderModel`.
+pub const LEGACY_QUANTIZED_GEMMA_MODEL: &str = "unsloth/gemma-3-1b-it-GGUF";
+pub const DENSE_GEMMA_MODEL: &str = "unsloth/gemma-3-1b-it";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+pub struct GeneratorModel(pub String);
+
+impl GeneratorModel {
+    pub fn model_id(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for GeneratorModel {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let model = String::deserialize(deserializer)?;
+        Ok(Self(if model == LEGACY_QUANTIZED_GEMMA_MODEL {
+            DENSE_GEMMA_MODEL.to_string()
+        } else {
+            model
+        }))
+    }
+}
+
+/// A catalog entry for a generation model.
+///
+/// Distinct from `ModelDescriptor` rather than reusing it with zeroed fields:
+/// `dimension` and `preferred_batch_size` are meaningless for a generator, and
+/// a field that lies is worse than a second struct. Generation models also need
+/// separate artifact metadata because GGUF repositories may not ship a
+/// tokenizer, while dense repositories also require `config.json`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeneratorDescriptor {
+    /// Repo holding the weights. Doubles as the model's identity.
+    pub model_id: String,
+    pub display_name: String,
+    pub description: String,
+    /// The weight file within `model_id`; per-model, hence not a const.
+    pub weights_file: String,
+    /// Pinned revision of the weights repo. Third-party republishers are a
+    /// supply-chain surface, so this is never `main`.
+    pub weights_revision: String,
+    /// Repo holding `tokenizer.json`; may equal `model_id` for dense models.
+    pub tokenizer_repo: String,
+    /// Pinned revision of the tokenizer repo, on the same terms as the weights.
+    pub tokenizer_revision: String,
+    pub context_tokens: usize,
+    pub is_cached: bool,
+    pub is_default: bool,
+    pub is_recommended: bool,
+    pub size_bytes: Option<u64>,
+}
+
+/// Sibling of `SemanticSettings`. Deliberately not folded into it: the two
+/// subsystems are independently toggleable, and coupling them would make
+/// enabling semantic search silently enable a second resident model.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct GenerationSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub model: Option<GeneratorModel>,
+    /// "auto", "cpu", "metal". Absent falls back to the engine default.
+    #[serde(default)]
+    pub device: Option<String>,
+    /// Per-task sampling overrides. Absent entries use the task default; the
+    /// settings exist for tuning, not as a step the user must take.
+    #[serde(default)]
+    pub sampling_overrides: HashMap<GenerationTask, crate::generate::Sampling>,
+}
+
+/// Tasks whose sampling the user may override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationTask {
+    ClusterLabel,
+    RelationExplanation,
+    DocumentSummary,
+}
+
+/// One event protocol for every user-facing token stream. Task inputs and
+/// validation stay task-specific; correlation and lifecycle do not.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum GenerationStreamEvent {
+    Delta {
+        request_id: String,
+        task: GenerationTask,
+        delta: String,
+    },
+    Completed {
+        request_id: String,
+        task: GenerationTask,
+        text: String,
+    },
+    Failed {
+        request_id: String,
+        task: GenerationTask,
+        error: String,
+    },
+}
+
+impl Default for GenerationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: None,
+            device: None,
+            sampling_overrides: HashMap::new(),
+        }
+    }
 }
 
 // ── Embedding engine ──────────────────────────────────────────────────────────
@@ -720,7 +846,7 @@ impl SemanticSettings {
     }
 
     fn default_worker_timeout() -> u64 {
-        300
+        crate::worker::DEFAULT_IDLE_TIMEOUT_SECS
     }
 
     fn default_dimension() -> usize {
@@ -894,6 +1020,10 @@ pub struct Settings {
     /// and is intentionally never serialized as part of Settings.
     #[serde(default)]
     pub external_mcp: ExternalMcpSettings,
+    /// Local text generation. Off by default; every affordance that depends on
+    /// it is invisible until it is both enabled and ready.
+    #[serde(default)]
+    pub generation: GenerationSettings,
 }
 
 fn default_file_display_fields() -> Vec<FileDisplayField> {
@@ -938,6 +1068,7 @@ impl Default for Settings {
             chat_config: Vec::new(),
             chat_custom_instructions: String::new(),
             external_mcp: ExternalMcpSettings::default(),
+            generation: GenerationSettings::default(),
         }
     }
 }
@@ -1480,6 +1611,52 @@ mod tests {
     }
 
     #[test]
+    fn test_generation_settings_defaults() {
+        let settings = GenerationSettings::default();
+        assert!(!settings.enabled);
+        assert_eq!(settings.model, None);
+        assert_eq!(settings.device, None);
+        assert!(settings.sampling_overrides.is_empty());
+    }
+
+    #[test]
+    fn legacy_quantized_gemma_selection_migrates_to_dense_model() {
+        let settings: GenerationSettings = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "model": LEGACY_QUANTIZED_GEMMA_MODEL
+        }))
+        .unwrap();
+        assert_eq!(
+            settings.model,
+            Some(GeneratorModel(DENSE_GEMMA_MODEL.to_string()))
+        );
+        assert_eq!(
+            serde_json::to_value(settings.model.unwrap()).unwrap(),
+            serde_json::json!(DENSE_GEMMA_MODEL)
+        );
+    }
+
+    #[test]
+    fn legacy_generation_timeout_is_not_persisted_as_a_second_worker_policy() {
+        let settings: GenerationSettings = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "model": "org/model",
+            "device": null,
+            "worker_timeout_secs": 60,
+            "sampling_overrides": {}
+        }))
+        .unwrap();
+
+        let serialized = serde_json::to_value(settings).unwrap();
+        assert_eq!(
+            serialized.get("worker_timeout_secs"),
+            None,
+            "generation must use the shared five-minute worker residency"
+        );
+        assert_eq!(crate::worker::DEFAULT_IDLE_TIMEOUT_SECS, 300);
+    }
+
+    #[test]
     fn test_source_map_resolve_fallback() {
         let map = SourceMap {
             segments: vec![SourceSegment {
@@ -1730,5 +1907,28 @@ mod tests {
 
         let settings: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.chat_backend, AgentBackend::Nanocoder);
+    }
+
+    #[test]
+    fn generation_stream_event_uses_one_tagged_transport_contract() {
+        let event = GenerationStreamEvent::Completed {
+            request_id: "summary-42".to_string(),
+            task: GenerationTask::DocumentSummary,
+            text: "Final summary.".to_string(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "phase": "completed",
+                "request_id": "summary-42",
+                "task": "document_summary",
+                "text": "Final summary."
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<GenerationStreamEvent>(json).unwrap(),
+            event
+        );
     }
 }

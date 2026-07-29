@@ -386,6 +386,9 @@ interface Props {
   documents?: FileEntry[];
   preserveDocumentOrder?: boolean;
   documentDetails?: (entry: FileEntry) => DocumentDetail[];
+  /** Extra content rendered under each document row. Used by the related
+   *  documents pane for on-demand relation explanations. */
+  documentAccessory?: (entry: FileEntry) => React.ReactNode;
 }
 
 export default function ResultList({
@@ -396,6 +399,7 @@ export default function ResultList({
   documents,
   preserveDocumentOrder = false,
   documentDetails,
+  documentAccessory,
 }: Props) {
   const results = useSearchStore((s) => s.results);
   const stats = useSearchStore((s) => s.stats);
@@ -818,6 +822,7 @@ export default function ResultList({
               key={entry.path}
               entry={entry}
               leadingDetails={documentDetails?.(entry) ?? []}
+              accessory={documentAccessory?.(entry)}
               displayFields={fileDisplayFields}
               selected={selectedMatch?.path === entry.path}
               onClick={() => onFileClick(entry.path)}
@@ -1161,6 +1166,7 @@ function SortVisibilityMenu({
 function FileEntryRowAdapter({
   entry,
   leadingDetails = [],
+  accessory,
   displayFields,
   selected,
   detail,
@@ -1170,6 +1176,7 @@ function FileEntryRowAdapter({
 }: {
   entry: FileEntry;
   leadingDetails?: DocumentDetail[];
+  accessory?: React.ReactNode;
   displayFields: FileDisplayField[];
   selected: boolean;
   detail?: string;
@@ -1200,6 +1207,7 @@ function FileEntryRowAdapter({
     <DocumentEntryRow
       entry={entry}
       details={details}
+      accessory={accessory}
       selected={selected}
       muted={muted}
       onClick={onClick}

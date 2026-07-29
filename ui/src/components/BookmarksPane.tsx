@@ -8,6 +8,7 @@ import {
   Edit2,
   FileText,
   Layers,
+  Loader,
   Sidebar,
   Trash2,
   X,
@@ -16,6 +17,7 @@ import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
+import { useGenerationStore } from "../stores/useGenerationStore";
 import { toMarkdown } from "../lib/utils/bookmarkMarkdown";
 import { api } from "../services";
 import { useToasts } from "./Toast";
@@ -30,7 +32,17 @@ import type {
 type ThemeStatus = "idle" | "loading" | "ready";
 type BookmarkRow =
   | { kind: "bookmark"; key: string; bookmark: Bookmark }
-  | { kind: "theme"; key: string; label: string; count: number; expanded: boolean };
+  | {
+      kind: "theme";
+      key: string;
+      label: string;
+      count: number;
+      expanded: boolean;
+      /** True while a generated label for this cluster is still in flight.
+       *  Only ever true when generation is ready, so this can never become a
+       *  spinner that spins forever. */
+      labelPending: boolean;
+    };
 
 const GRANULARITY_VALUES: readonly BookmarkClusterGranularity[] = [
   "much_fewer",
@@ -98,6 +110,9 @@ export default function BookmarksPane() {
   const setDock = useSettingsStore((s) => s.setBookmarksDock);
   const preferSemantic = useSettingsStore((s) => s.preferSemantic);
   const closePane = useBookmarksStore((s) => s.closePane);
+  const generationReady = useGenerationStore((s) => s.ready);
+  const clusterLabels = useGenerationStore((s) => s.clusterLabels);
+  const clearClusterLabels = useGenerationStore((s) => s.clearClusterLabels);
   const semanticIndexReady = useSemanticStore((s) => s.readyForCurrentRoot);
   const semanticReady = preferSemantic && semanticIndexReady;
   const zoteroEnabled = useSettingsStore(
@@ -229,6 +244,9 @@ export default function BookmarksPane() {
 
     let cancelled = false;
     setThemeStatus("loading");
+    // A new clustering run supersedes the previous one: its labels were
+    // computed for a partition that is no longer displayed.
+    clearClusterLabels();
     const timeout = window.setTimeout(() => {
       api.clusterBookmarks({
         bookmark_ids: scoped.map((bookmark) => bookmark.id),
@@ -274,6 +292,7 @@ export default function BookmarksPane() {
       key: string,
       label: string,
       ids: string[],
+      labelPending = false,
     ) => {
       const groupBookmarks = ids.flatMap((id) => {
         if (assignedIds.has(id)) return [];
@@ -291,6 +310,7 @@ export default function BookmarksPane() {
         label,
         count: groupBookmarks.length,
         expanded,
+        labelPending,
       });
       if (expanded) {
         groupedRows.push(
@@ -306,10 +326,17 @@ export default function BookmarksPane() {
     for (const cluster of displayedThemeResult.clusters) {
       const representative = bookmarksById.get(cluster.representative_bookmark_id);
       const quote = representative?.quote.trim();
+      // Late labels are patched by `cluster_key`, never by the row key:
+      // `representative_bookmark_id` moves when granularity changes.
+      const generated = cluster.label ?? clusterLabels[cluster.cluster_key] ?? null;
+      const fallback = quote ? `Around “${quote}”` : "Theme";
       appendGroup(
         cluster.representative_bookmark_id,
-        quote ? `Around “${quote}”` : "Theme",
+        generated ?? fallback,
         cluster.bookmark_ids,
+        // With generation off the pane is byte-identical to before: fallback
+        // text and no indicator.
+        generationReady && !generated,
       );
     }
 
@@ -325,7 +352,15 @@ export default function BookmarksPane() {
       unclusteredIds,
     );
     return groupedRows;
-  }, [displayedThemeResult, expandedThemes, filtered, scoped, themesEnabled]);
+  }, [
+    displayedThemeResult,
+    expandedThemes,
+    filtered,
+    scoped,
+    themesEnabled,
+    clusterLabels,
+    generationReady,
+  ]);
 
   const bookmarkCountLabel =
     `${filtered.length} ${filtered.length === 1 ? "bookmark" : "bookmarks"}`;
@@ -500,6 +535,17 @@ export default function BookmarksPane() {
                     <span className="min-w-0 flex-1 whitespace-pre-wrap break-words text-[10px] font-medium leading-snug">
                       {row.label}
                     </span>
+                    {/* Labels are not streamed — a two-to-five word label
+                        materialising word by word is worse than one that
+                        appears at once — but a run of ten clusters serialises
+                        through one worker, so the last one can be seconds out. */}
+                    {row.labelPending && (
+                      <Loader
+                        size={10}
+                        aria-label="Generating cluster label"
+                        className="mt-0.5 flex-shrink-0 animate-spin text-[var(--text-dim)]"
+                      />
+                    )}
                     <span className="flex-shrink-0 text-[10px] tabular-nums">{row.count}</span>
                   </button>
                 ) : (

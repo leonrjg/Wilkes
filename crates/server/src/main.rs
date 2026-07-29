@@ -26,13 +26,13 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 use wilkes_api::context::AppContext;
-use wilkes_core::embed::worker::manager::WorkerPaths;
 use wilkes_core::types::{
     AddOutcome, BookmarkClustersQuery, CitationResult, CollectionValidation, DocumentMetadata,
     DocumentTagUpdate, EmbeddingEngine, IntegrationStatus, MatchRef, ModelDescriptor, NewBookmark,
     NewSmartCollection, NewTag, OpenAlexWork, RelatedDocumentsQuery, SearchLogEntry, SearchQuery,
     SelectedEmbedder, SemanticScholarPaper, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
+use wilkes_core::worker::manager::WorkerPaths;
 
 fn confine_to_uploads(
     raw: &str,
@@ -403,6 +403,85 @@ async fn is_semantic_ready_handler(State(state): State<Arc<AppState>>) -> Json<b
     Json(state.ctx.is_semantic_ready())
 }
 
+/// The backend half of the gate. The UI gate prevents the request; this one
+/// makes the API honest if something calls it anyway — the server is reachable
+/// without the desktop UI, so neither is redundant with the other.
+async fn is_generation_ready_handler(State(state): State<Arc<AppState>>) -> Json<bool> {
+    Json(state.ctx.is_generation_ready().await)
+}
+
+async fn list_generation_models_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<wilkes_core::types::GeneratorDescriptor>> {
+    Json(state.ctx.list_generation_models())
+}
+
+#[derive(Deserialize)]
+struct GenerationModelSizeQuery {
+    model_id: String,
+}
+
+async fn generation_model_size_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<GenerationModelSizeQuery>,
+) -> Result<Json<u64>, (StatusCode, Json<ErrorBody>)> {
+    let ctx = Arc::clone(&state.ctx);
+    tokio::task::spawn_blocking(move || ctx.fetch_generation_model_size(&query.model_id))
+        .await
+        .map_err(|e| server_err(e.to_string()))?
+        .map(Json)
+        .map_err(|e| server_err(e.to_string()))
+}
+
+async fn load_generation_model_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<bool>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .load_generator()
+        .await
+        .map(|outcome| Json(outcome.attached()))
+        .map_err(|e| server_err(format!("{e:#}")))
+}
+
+#[derive(Deserialize)]
+struct ExplainRelatedBody {
+    request_id: String,
+    anchor_path: String,
+    path: String,
+}
+
+async fn explain_related_document_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ExplainRelatedBody>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    let anchor_path = confine_to_uploads(&body.anchor_path, &state.uploads_dir)?;
+    let related_path = confine_to_uploads(&body.path, &state.uploads_dir)?;
+    Arc::clone(&state.ctx)
+        .explain_related_document(body.request_id, anchor_path, related_path)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(server_err)
+}
+
+#[derive(Deserialize)]
+struct SummarizeDocumentBody {
+    request_id: String,
+    path: String,
+}
+
+async fn summarize_document_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SummarizeDocumentBody>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
+    Arc::clone(&state.ctx)
+        .summarize_document(body.request_id, path)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(server_err)
+}
+
 // ── File listing / open ───────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -763,35 +842,20 @@ async fn asset_handler(
         .unwrap())
 }
 
-fn mime_for_path(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("pdf") => "application/pdf",
-        Some("txt") | Some("md") | Some("rst") => "text/plain",
-        Some("html") | Some("htm") => "text/html",
-        Some("json") => "application/json",
-        Some("xml") => "application/xml",
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        _ => "application/octet-stream",
-    }
-}
-
-// ── Embed events SSE ──────────────────────────────────────────────────────────
-
 // ── Health check ──────────────────────────────────────────────────────────────
 
 async fn health_handler() -> StatusCode {
     StatusCode::OK
 }
 
-// ── Embed events SSE ──────────────────────────────────────────────────────────
+// ── App events SSE ────────────────────────────────────────────────────────────
 
-/// Subscribe to a stream of embed/manager events (progress, done, error,
-/// manager-event). Connect before triggering a download or build.
+/// Subscribe to the shared stream of server-pushed application events. Connect
+/// before triggering any operation whose lifecycle arrives through events.
 ///
 /// A keepalive comment is sent every 30 s so that stale connections (network
 /// drops without a clean TCP close) are detected promptly via send failure.
-async fn embed_events_handler(
+async fn events_handler(
     State(state): State<Arc<AppState>>,
 ) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
     let mut rx = state.events_tx.subscribe();
@@ -953,6 +1017,12 @@ async fn get_worker_status_handler(
     Ok(Json(status))
 }
 
+async fn get_worker_statuses_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    Ok(Json(state.ctx.get_worker_statuses()))
+}
+
 async fn kill_worker_handler(State(state): State<Arc<AppState>>) -> StatusCode {
     state.ctx.kill_worker();
     StatusCode::NO_CONTENT
@@ -976,23 +1046,6 @@ async fn set_worker_timeout_handler(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-async fn dir_size(path: &Path) -> anyhow::Result<u64> {
-    let mut total = 0u64;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut entries = tokio::fs::read_dir(&dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let meta = entry.metadata().await?;
-            if meta.is_dir() {
-                stack.push(entry.path());
-            } else {
-                total += meta.len();
-            }
-        }
-    }
-    Ok(total)
-}
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -1150,6 +1203,24 @@ async fn main() -> anyhow::Result<()> {
             post(openalex_lookup_handler),
         )
         .route("/api/embed/ready", get(is_semantic_ready_handler))
+        .route("/api/generation/ready", get(is_generation_ready_handler))
+        .route(
+            "/api/generation/models",
+            get(list_generation_models_handler),
+        )
+        .route(
+            "/api/generation/models/size",
+            get(generation_model_size_handler),
+        )
+        .route("/api/generation/load", post(load_generation_model_handler))
+        .route(
+            "/api/generation/explain-related",
+            post(explain_related_document_handler),
+        )
+        .route(
+            "/api/generation/summarize",
+            post(summarize_document_handler),
+        )
         .route("/api/logs", get(get_logs_handler))
         .route("/api/logs", delete(clear_logs_handler))
         .route("/api/data/paths", get(get_data_paths_handler))
@@ -1175,7 +1246,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/upload/all", delete(delete_all_upload_handler))
         .route("/asset", get(asset_handler))
         // Embed
-        .route("/api/embed/events", get(embed_events_handler))
+        .route("/api/events", get(events_handler))
         .route("/api/embed/engines", get(get_engines_handler))
         .route("/api/embed/models", get(list_models_handler))
         .route("/api/embed/model-size", get(get_model_size_handler))
@@ -1186,6 +1257,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/embed/cancel", delete(cancel_embed_handler))
         // Worker
         .route("/api/worker/status", get(get_worker_status_handler))
+        .route("/api/worker/statuses", get(get_worker_statuses_handler))
         .route("/api/worker/kill", post(kill_worker_handler))
         .route("/api/worker/timeout", patch(set_worker_timeout_handler))
         // Static assets
@@ -1209,20 +1281,6 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use wilkes_api::context::EventEmitter;
-
-    #[test]
-    fn test_mime_for_path() {
-        assert_eq!(mime_for_path(Path::new("test.pdf")), "application/pdf");
-        assert_eq!(mime_for_path(Path::new("test.txt")), "text/plain");
-        assert_eq!(mime_for_path(Path::new("test.html")), "text/html");
-        assert_eq!(mime_for_path(Path::new("test.json")), "application/json");
-        assert_eq!(mime_for_path(Path::new("test.png")), "image/png");
-        assert_eq!(mime_for_path(Path::new("test.jpg")), "image/jpeg");
-        assert_eq!(
-            mime_for_path(Path::new("test.unknown")),
-            "application/octet-stream"
-        );
-    }
 
     #[test]
     fn test_parse_config_defaults() {
@@ -1327,23 +1385,6 @@ mod tests {
             }
             Err(_) => panic!("list_files_handler failed"),
         }
-    }
-
-    #[tokio::test]
-    async fn test_dir_size() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-
-        tokio::fs::write(path.join("f1.txt"), "hello")
-            .await
-            .unwrap();
-        tokio::fs::create_dir(path.join("subdir")).await.unwrap();
-        tokio::fs::write(path.join("subdir/f2.txt"), "world")
-            .await
-            .unwrap();
-
-        let size = dir_size(&path).await.unwrap();
-        assert_eq!(size, 10);
     }
 
     #[tokio::test]
@@ -2122,14 +2163,6 @@ mod tests {
         let _ = get_settings_handler(State(state.clone())).await;
     }
 
-    #[test]
-    fn test_mime_for_path_variants() {
-        assert_eq!(mime_for_path(Path::new("t.md")), "text/plain");
-        assert_eq!(mime_for_path(Path::new("t.html")), "text/html");
-        assert_eq!(mime_for_path(Path::new("t.png")), "image/png");
-        assert_eq!(mime_for_path(Path::new("t.json")), "application/json");
-    }
-
     #[tokio::test]
     async fn test_asset_handler_direct() {
         use wilkes_core::types::SourceOrigin;
@@ -2226,7 +2259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_embed_events_handler_sse() {
+    async fn test_events_handler_sse() {
         let dir = tempfile::tempdir().unwrap();
         let (events_tx, _) = broadcast::channel(1024);
         let paths = WorkerPaths::resolve(dir.path());
@@ -2244,7 +2277,7 @@ mod tests {
             events_tx: events_tx.clone(),
         });
 
-        let sse = embed_events_handler(State(state)).await;
+        let sse = events_handler(State(state)).await;
         // Verify it returns an Sse response
         let _ = sse.into_response();
 

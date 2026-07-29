@@ -1,13 +1,9 @@
 pub mod cluster;
 pub mod engines;
 pub mod index;
-pub mod models;
-pub mod worker;
+pub mod installer;
 
 pub use engines::dispatch;
-pub use models::installer;
-pub use worker::ipc as worker_ipc;
-pub use worker::manager as worker_manager;
 
 use std::sync::Arc;
 

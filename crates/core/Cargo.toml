@@ -4,12 +4,17 @@ version.workspace = true
 edition = "2021"
 
 [features]
-default = ["fastembed", "candle"]
+default = ["fastembed", "candle", "generate"]
 test-utils = []
 fastembed = ["dep:fastembed", "dep:hf-hub", "dep:ureq", "dep:ort"]
 fastembed-coreml = ["fastembed", "ort/coreml"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "dep:ureq"]
-candle-metal = ["candle", "candle-core/metal", "candle-core/accelerate", "candle-nn/metal", "candle-transformers/metal"]
+candle-metal = ["candle", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+# CPU BLAS. Opt-in and deliberately NOT implied by candle-metal: candle's
+# accelerate CPU backend bails on f16 matmul, which breaks quantized generation
+# on the CPU fallback path. See docs/internal/specs/generation-engine.md §2.3.
+candle-accelerate = ["candle", "candle-core/accelerate"]
+generate = ["candle", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "dep:sha2"]
 
 [dependencies]
 grep-matcher = "0.1"
@@ -59,33 +64,37 @@ version = "2"
 optional = true
 
 [dependencies.candle-core]
-version = "0.9"
+version = "0.11"
 optional = true
 
 [dependencies.candle-nn]
-version = "0.9"
+version = "0.11"
 optional = true
 
 [dependencies.candle-transformers]
-version = "0.9"
+version = "0.11"
 optional = true
 
 [dependencies.tokenizers]
 version = "0.20"
 optional = true
 
-[target.'cfg(target_os = "macos")'.dependencies.candle-core]
-version = "0.9"
+[dependencies.sha2]
+version = "0.10"
 optional = true
-features = ["metal", "accelerate"]
+
+[target.'cfg(target_os = "macos")'.dependencies.candle-core]
+version = "0.11"
+optional = true
+features = ["metal"]
 
 [target.'cfg(target_os = "macos")'.dependencies.candle-nn]
-version = "0.9"
+version = "0.11"
 optional = true
 features = ["metal"]
 
 [target.'cfg(target_os = "macos")'.dependencies.candle-transformers]
-version = "0.9"
+version = "0.11"
 optional = true
 features = ["metal"]
 

@@ -10,6 +10,8 @@ import type {
   FileListResponse,
   FileMatches,
   FileMetadataUpdate,
+  GenerationDone,
+  GenerationError,
   IndexStatus,
   AddOutcome,
   CitationResult,
@@ -34,6 +36,9 @@ import type {
   NewSmartCollection,
   CollectionValidation,
   SearchLogEntry,
+  BookmarkClusterLabelled,
+  GeneratorDescriptor,
+  GenerationStreamEvent,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type { SearchApi, WebSourceApi } from "./api";
@@ -404,6 +409,12 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<import("../lib/types").WorkerStatus>;
   }
 
+  async getWorkerStatuses(): Promise<import("../lib/types").WorkerStatus[]> {
+    const res = await fetch("/api/worker/statuses");
+    if (!res.ok) throw new Error(`getWorkerStatuses failed: ${res.status}`);
+    return res.json() as Promise<import("../lib/types").WorkerStatus[]>;
+  }
+
   async killWorker(): Promise<void> {
     const res = await fetch("/api/worker/kill", { method: "POST" });
     if (!res.ok && res.status !== 204) throw new Error(`killWorker failed: ${res.status}`);
@@ -468,75 +479,164 @@ export class HttpSearchApi implements SearchApi {
     if (!res.ok && res.status !== 204) throw new Error(`deleteIndex failed: ${res.status}`);
   }
 
-  // All four embed-event subscriptions share one EventSource. A refcount tracks
-  // active subscribers; the connection is opened on the first and closed on the last.
-  private embedEventSource: EventSource | null = null;
-  private embedEventSourceRefs = 0;
+  // Every server-pushed app event shares one EventSource. A refcount opens the
+  // connection for the first subscriber and closes it after the last.
+  private eventSource: EventSource | null = null;
+  private eventSourceRefs = 0;
 
-  private acquireEmbedEventSource(): EventSource {
-    if (!this.embedEventSource) {
-      this.embedEventSource = new EventSource("/api/embed/events");
+  private acquireEventSource(): EventSource {
+    if (!this.eventSource) {
+      this.eventSource = new EventSource("/api/events");
     }
-    this.embedEventSourceRefs++;
-    return this.embedEventSource;
+    this.eventSourceRefs++;
+    return this.eventSource;
   }
 
-  private releaseEmbedEventSource(eventName: string, listener: (e: any) => void): void {
-    if (this.embedEventSource) {
-      this.embedEventSource.removeEventListener(eventName, listener);
+  private releaseEventSource(eventName: string, listener: (e: any) => void): void {
+    if (this.eventSource) {
+      this.eventSource.removeEventListener(eventName, listener);
     }
-    this.embedEventSourceRefs--;
-    if (this.embedEventSourceRefs <= 0) {
-      this.embedEventSource?.close();
-      this.embedEventSource = null;
-      this.embedEventSourceRefs = 0;
+    this.eventSourceRefs--;
+    if (this.eventSourceRefs <= 0) {
+      this.eventSource?.close();
+      this.eventSource = null;
+      this.eventSourceRefs = 0;
     }
+  }
+
+  async onGenerationProgress(handler: (p: EmbedProgress) => void): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("generation-progress", listener);
+    return () => this.releaseEventSource("generation-progress", listener);
+  }
+
+  async onGenerationDone(handler: (d: GenerationDone) => void): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("generation-done", listener);
+    return () => this.releaseEventSource("generation-done", listener);
+  }
+
+  async onGenerationError(handler: (e: GenerationError) => void): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("generation-error", listener);
+    return () => this.releaseEventSource("generation-error", listener);
   }
 
   async onEmbedProgress(handler: (p: EmbedProgress) => void): Promise<() => void> {
-    const es = this.acquireEmbedEventSource();
+    const es = this.acquireEventSource();
     const listener = (e: any) => handler(JSON.parse(e.data));
     es.addEventListener("embed-progress", listener);
-    return () => this.releaseEmbedEventSource("embed-progress", listener);
+    return () => this.releaseEventSource("embed-progress", listener);
   }
 
   async onEmbedDone(handler: (d: EmbedDone) => void): Promise<() => void> {
-    const es = this.acquireEmbedEventSource();
+    const es = this.acquireEventSource();
     const listener = (e: any) => handler(JSON.parse(e.data));
     es.addEventListener("embed-done", listener);
-    return () => this.releaseEmbedEventSource("embed-done", listener);
+    return () => this.releaseEventSource("embed-done", listener);
   }
 
   async onEmbedError(handler: (e: EmbedError) => void): Promise<() => void> {
-    const es = this.acquireEmbedEventSource();
+    const es = this.acquireEventSource();
     const listener = (e: any) => handler(JSON.parse(e.data));
     es.addEventListener("embed-error", listener);
-    return () => this.releaseEmbedEventSource("embed-error", listener);
+    return () => this.releaseEventSource("embed-error", listener);
   }
 
   async onManagerEvent(handler: (event: string) => void): Promise<() => void> {
-    const es = this.acquireEmbedEventSource();
+    const es = this.acquireEventSource();
     const listener = (e: any) => handler(JSON.parse(e.data));
     es.addEventListener("manager-event", listener);
-    return () => this.releaseEmbedEventSource("manager-event", listener);
+    return () => this.releaseEventSource("manager-event", listener);
   }
 
   async onFileListChanged(
     handler: (event: FileListChanged) => void,
   ): Promise<() => void> {
-    const es = this.acquireEmbedEventSource();
+    const es = this.acquireEventSource();
     const listener = (e: any) => handler(JSON.parse(e.data));
     es.addEventListener("file-list-changed", listener);
-    return () => this.releaseEmbedEventSource("file-list-changed", listener);
+    return () => this.releaseEventSource("file-list-changed", listener);
   }
 
   async onFileMetadataUpdated(
     handler: (updates: FileMetadataUpdate[]) => void,
   ): Promise<() => void> {
-    const es = this.acquireEmbedEventSource();
+    const es = this.acquireEventSource();
     const listener = (e: any) => handler(JSON.parse(e.data));
     es.addEventListener("file-metadata-updated", listener);
-    return () => this.releaseEmbedEventSource("file-metadata-updated", listener);
+    return () => this.releaseEventSource("file-metadata-updated", listener);
+  }
+
+  // ── Generation commands ────────────────────────────────────────────────────
+
+  async isGenerationReady(): Promise<boolean> {
+    const res = await fetch("/api/generation/ready");
+    if (!res.ok) throw new Error(`isGenerationReady failed: ${res.status}`);
+    return res.json() as Promise<boolean>;
+  }
+
+  async listGenerationModels(): Promise<GeneratorDescriptor[]> {
+    const res = await fetch("/api/generation/models");
+    if (!res.ok) throw new Error(`listGenerationModels failed: ${res.status}`);
+    return res.json() as Promise<GeneratorDescriptor[]>;
+  }
+
+  async getGenerationModelSize(modelId: string): Promise<number> {
+    const res = await fetch(
+      `/api/generation/models/size?model_id=${encodeURIComponent(modelId)}`,
+    );
+    if (!res.ok) throw new Error(`getGenerationModelSize failed: ${res.status}`);
+    return res.json() as Promise<number>;
+  }
+
+  async loadGenerationModel(): Promise<boolean> {
+    const res = await fetch("/api/generation/load", { method: "POST" });
+    if (!res.ok) throw new Error(`loadGenerationModel failed: ${res.status}`);
+    return res.json() as Promise<boolean>;
+  }
+
+  async explainRelatedDocument(
+    requestId: string,
+    anchorPath: string,
+    path: string,
+  ): Promise<void> {
+    const res = await fetch("/api/generation/explain-related", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: requestId, anchor_path: anchorPath, path }),
+    });
+    if (!res.ok) throw new Error(`explainRelatedDocument failed: ${res.status}`);
+  }
+
+  async summarizeDocument(requestId: string, path: string): Promise<void> {
+    const res = await fetch("/api/generation/summarize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: requestId, path }),
+    });
+    if (!res.ok) throw new Error(`summarizeDocument failed: ${res.status}`);
+  }
+
+  async onBookmarkClusterLabelled(
+    handler: (event: BookmarkClusterLabelled) => void,
+  ): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("bookmark-cluster-labelled", listener);
+    return () => this.releaseEventSource("bookmark-cluster-labelled", listener);
+  }
+
+  async onGenerationStream(
+    handler: (event: GenerationStreamEvent) => void,
+  ): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("generation-stream", listener);
+    return () => this.releaseEventSource("generation-stream", listener);
   }
 }
 

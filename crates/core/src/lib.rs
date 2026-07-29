@@ -1,10 +1,13 @@
 pub mod directory_watcher;
 pub mod embed;
 pub mod extract;
+pub mod generate;
 pub mod integrations;
 pub mod logging;
 pub mod metadata;
+pub mod models;
 pub mod network;
 pub mod path;
 pub mod search;
 pub mod types;
+pub mod worker;

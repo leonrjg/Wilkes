@@ -19,6 +19,8 @@ vi.mock("./services", () => ({
     onManagerEvent: vi.fn(() => Promise.resolve(() => {})),
     onFileMetadataUpdated: vi.fn(() => Promise.resolve(() => {})),
     onFileListChanged: vi.fn(() => Promise.resolve(() => {})),
+    onBookmarkClusterLabelled: vi.fn(() => Promise.resolve(() => {})),
+    isGenerationReady: vi.fn(() => Promise.resolve(false)),
     getSettings: vi.fn(() => Promise.resolve({
       favorites: [],
       recent_dirs: [],
@@ -28,6 +30,12 @@ vi.mock("./services", () => ({
       theme: "Dark",
       search_prefer_semantic: false,
       semantic: { enabled: true, index_path: null, worker_timeout_secs: 300 },
+      generation: {
+        enabled: false,
+        model: null,
+        device: null,
+        sampling_overrides: {},
+      },
       supported_extensions: ["ts"],
     })),
     getLogs: vi.fn(() => Promise.resolve([])),

@@ -4,6 +4,7 @@ import { api } from "../services";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
+import { useGenerationStore } from "../stores/useGenerationStore";
 
 export function useGlobalEvents() {
   const { addToast, removeToast } = useToasts();
@@ -13,6 +14,7 @@ export function useGlobalEvents() {
     let managerUnlisten: (() => void) | undefined;
     let fileListUnlisten: (() => void) | undefined;
     let metadataUnlisten: (() => void) | undefined;
+    let clusterLabelUnlisten: (() => void) | undefined;
     let mounted = true;
 
     const closeReindexToast = () => {
@@ -78,11 +80,28 @@ export function useGlobalEvents() {
       }
     });
 
+    // Cluster labels arrive after `cluster_bookmarks` has already returned:
+    // labelling one cluster takes ~370ms, so inlining it would add seconds to
+    // a call that is otherwise pure compute.
+    api.onBookmarkClusterLabelled((event) => {
+      if (!mounted) return;
+      useGenerationStore.getState().applyClusterLabel(event);
+    }).then((u) => {
+      if (!mounted) {
+        u();
+      } else {
+        clusterLabelUnlisten = u;
+      }
+    });
+
+    void useGenerationStore.getState().refreshReady();
+
     return () => {
       mounted = false;
       if (managerUnlisten) managerUnlisten();
       if (fileListUnlisten) fileListUnlisten();
       if (metadataUnlisten) metadataUnlisten();
+      if (clusterLabelUnlisten) clusterLabelUnlisten();
     };
   }, [addToast, removeToast]);
 }

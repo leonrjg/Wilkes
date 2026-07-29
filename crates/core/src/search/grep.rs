@@ -183,6 +183,7 @@ impl SearchProvider for GrepSearchProvider {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_path(
     path: &Path,
     query: &SearchQuery,

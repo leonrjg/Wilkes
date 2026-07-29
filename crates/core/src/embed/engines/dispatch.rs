@@ -1,9 +1,9 @@
-use super::super::models::installer::EmbedderInstaller;
-use super::super::worker::manager::WorkerManager;
 use super::super::Embedder;
-use crate::embed::installer::{DownloadProgress, EmbedProgress};
-use crate::embed::worker::ipc::WorkerEvent;
+use crate::embed::installer::EmbedderInstaller;
+use crate::models::progress::{DownloadProgress, EmbedProgress};
 use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
+use crate::worker::ipc::WorkerEvent;
+use crate::worker::manager::WorkerManager;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -123,6 +123,33 @@ async fn emit_download_progress(
     }
 }
 
+/// Bridge a byte-level `ProgressTx` onto the worker's event channel. Returns the
+/// sender to hand to the installer plus the join handle of the forwarder, which
+/// finishes when the sender is dropped.
+fn bridge_progress_to_worker_events(
+    event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
+) -> (
+    Option<crate::models::progress::ProgressTx>,
+    Option<tokio::task::JoinHandle<()>>,
+) {
+    let Some(event_tx) = event_tx.cloned() else {
+        return (None, None);
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<EmbedProgress>(64);
+    let handle = tokio::spawn(async move {
+        while let Some(progress) = rx.recv().await {
+            if event_tx
+                .send(WorkerEvent::Progress(progress))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    (Some(tx), Some(handle))
+}
+
 pub async fn prepare_embedder(
     engine: EmbeddingEngine,
     model: &EmbedderModel,
@@ -132,9 +159,8 @@ pub async fn prepare_embedder(
 ) -> anyhow::Result<PreparedEmbedder> {
     match engine {
         EmbeddingEngine::SBERT => {
-            let paths = super::super::worker::manager::WorkerPaths::resolve(data_dir);
-            let (manager, _event_rx, loop_fut) =
-                super::super::worker::manager::WorkerManager::new(paths);
+            let paths = crate::worker::manager::WorkerPaths::resolve(data_dir);
+            let (manager, _event_rx, loop_fut) = crate::worker::manager::WorkerManager::new(paths);
             let background_task = tokio::spawn(loop_fut);
             let installer =
                 super::sbert::SBERTInstaller::new(model.clone(), manager, device.to_string());
@@ -150,12 +176,20 @@ pub async fn prepare_embedder(
         #[cfg(feature = "candle")]
         EmbeddingEngine::Candle => {
             emit_download_progress(event_tx, false).await;
+            let (progress_tx, forwarder) = bridge_progress_to_worker_events(event_tx);
             let install_model = model.clone();
             let install_data_dir = data_dir.to_path_buf();
-            tokio::task::spawn_blocking(move || {
-                super::candle::install_local(&install_data_dir, &install_model)
+            let install = tokio::task::spawn_blocking(move || {
+                super::candle::install_local(&install_data_dir, &install_model, progress_tx)
             })
-            .await??;
+            .await;
+            if let Some(forwarder) = forwarder {
+                // The blocking task owns the only sender; awaiting the forwarder
+                // here drains every progress event before the install result is
+                // reported.
+                let _ = forwarder.await;
+            }
+            install??;
             let model = model.clone();
             let data_dir = data_dir.to_path_buf();
             let device = device.to_string();
@@ -200,10 +234,10 @@ pub async fn prepare_embedder(
 
 pub fn fetch_model_size(engine: EmbeddingEngine, _model_id: &str) -> anyhow::Result<u64> {
     match engine {
-        EmbeddingEngine::SBERT => super::super::models::hf_hub::fetch_model_size(_model_id),
+        EmbeddingEngine::SBERT => crate::models::hf_hub::fetch_model_size(_model_id),
 
         #[cfg(feature = "candle")]
-        EmbeddingEngine::Candle => super::super::models::hf_hub::fetch_model_size(_model_id),
+        EmbeddingEngine::Candle => crate::models::hf_hub::fetch_model_size(_model_id),
         #[cfg(not(feature = "candle"))]
         EmbeddingEngine::Candle => anyhow::bail!("Candle feature is disabled"),
 
@@ -217,7 +251,7 @@ pub fn fetch_model_size(engine: EmbeddingEngine, _model_id: &str) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embed::worker::manager::{WorkerManager, WorkerPaths};
+    use crate::worker::manager::{WorkerManager, WorkerPaths};
     use tempfile::tempdir;
 
     #[test]
