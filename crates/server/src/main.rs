@@ -26,6 +26,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 use wilkes_api::context::AppContext;
+use wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryInput;
 use wilkes_core::types::{
     AddOutcome, BookmarkClustersQuery, CitationResult, CollectionValidation, DocumentMetadata,
     DocumentTagUpdate, EmbeddingEngine, IntegrationStatus, MatchRef, ModelDescriptor, NewBookmark,
@@ -477,6 +478,23 @@ async fn summarize_document_handler(
     let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
     Arc::clone(&state.ctx)
         .summarize_document(body.request_id, path)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(server_err)
+}
+
+#[derive(Deserialize)]
+struct SummarizeSearchResultsBody {
+    request_id: String,
+    input: SearchResultsSummaryInput,
+}
+
+async fn summarize_search_results_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SummarizeSearchResultsBody>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    Arc::clone(&state.ctx)
+        .summarize_search_results(body.request_id, body.input)
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(server_err)
@@ -1220,6 +1238,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/generation/summarize",
             post(summarize_document_handler),
+        )
+        .route(
+            "/api/generation/summarize-results",
+            post(summarize_search_results_handler),
         )
         .route("/api/logs", get(get_logs_handler))
         .route("/api/logs", delete(clear_logs_handler))

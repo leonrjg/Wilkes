@@ -32,6 +32,7 @@ import type {
   SemanticScholarPaper,
   SearchQuery,
   SearchStats,
+  SearchResultsSummaryInput,
   Settings,
   Tag,
   NewTag,
@@ -326,6 +327,13 @@ export class TauriSearchApi implements SearchApi {
 
   async summarizeDocument(requestId: string, path: string): Promise<void> {
     return invoke("summarize_document", { requestId, path });
+  }
+
+  async summarizeSearchResults(
+    requestId: string,
+    input: SearchResultsSummaryInput,
+  ): Promise<void> {
+    return invoke("summarize_search_results", { requestId, input });
   }
 
   async onBookmarkClusterLabelled(

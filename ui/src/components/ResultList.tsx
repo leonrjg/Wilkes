@@ -27,6 +27,7 @@ import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useChatStore } from "../stores/useChatStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useResearchStore } from "../stores/useResearchStore";
+import { useGenerationStore } from "../stores/useGenerationStore";
 import { FileScopeControls } from "./FileScopeControls";
 import { MetadataField } from "../lib/types";
 import type {
@@ -55,6 +56,11 @@ import {
   type DetailIcon,
   type DocumentDetail,
 } from "./DocumentEntryRow";
+import SearchResultsSummary from "./SearchResultsSummary";
+import {
+  buildSearchResultsSummaryInput,
+  searchResultsSummaryKey,
+} from "../lib/utils/searchResultsSummary";
 
 function originLabel(origin: SourceOrigin): string {
   if ("TextFile" in origin) return `L${origin.TextFile.line}`;
@@ -405,11 +411,13 @@ export default function ResultList({
   const stats = useSearchStore((s) => s.stats);
   const searching = useSearchStore((s) => s.searching);
   const storeHasQuery = useSearchStore((s) => s.hasQuery);
+  const lastQuery = useSearchStore((s) => s.lastQuery);
   const hasQuery = documents ? false : storeHasQuery;
   const selectedMatch = useViewerStore((state) => activeViewerTab(state)?.match ?? null);
   const closePath = useViewerStore((state) => state.closePath);
   const replaySearch = useSearchStore((s) => s.replaySearch);
   const { addToast } = useToasts();
+  const generationReady = useGenerationStore((s) => s.ready);
 
   const fileList = useSettingsStore((s) => s.fileList);
   const omittedFileList = useSettingsStore((s) => s.omittedFileList);
@@ -436,6 +444,7 @@ export default function ResultList({
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
   const [expandedFiles, setExpandedFiles] = useState<Set<number>>(new Set());
   const [showOmittedFiles, setShowOmittedFiles] = useState(false);
+  const [openSummaryKey, setOpenSummaryKey] = useState<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<{ path: string; name: string } | null>(null);
   const [moveTarget, setMoveTarget] = useState<{
     path: string;
@@ -456,6 +465,10 @@ export default function ResultList({
   useEffect(() => {
     if (results.length === 0) setExpandedFiles(new Set());
   }, [results.length]);
+
+  useEffect(() => {
+    if (searching) setOpenSummaryKey(null);
+  }, [searching]);
 
   useEffect(() => {
     if (omittedFileList.length === 0) setShowOmittedFiles(false);
@@ -698,6 +711,23 @@ export default function ResultList({
   };
 
   const totalCount = results.reduce((n, fm) => n + fm.matches.length, 0);
+  const summaryInput = React.useMemo(
+    () => buildSearchResultsSummaryInput(lastQuery?.pattern ?? "", results),
+    [lastQuery?.pattern, results],
+  );
+  const completedSummaryKey =
+    !searching &&
+    !indexing &&
+    stats &&
+    stats.total_matches === totalCount &&
+    summaryInput.query &&
+    summaryInput.files.length > 0
+      ? searchResultsSummaryKey(summaryInput)
+      : null;
+  const summaryOpen =
+    generationReady &&
+    completedSummaryKey != null &&
+    openSummaryKey === completedSummaryKey;
 
   if (!hasQuery) {
     const filteredVisibleFiles = filterFileEntries(sortedFileList, filterText);
@@ -899,15 +929,36 @@ export default function ResultList({
         </div>
       )}
       <div className="px-3 py-1.5 text-xs text-[var(--text-muted)] border-b border-[var(--border-main)] flex-shrink-0 flex flex-col gap-0.5 bg-[var(--bg-header)]">
-        <span>
-          {searching
-            ? `${totalCount} matches…`
-            : indexing
-              ? "Indexing files…"
-              : stats
-                ? `${stats.total_matches} matches in ${stats.files_scanned} files (${stats.elapsed_ms}ms)`
-                : "Ready"}
-        </span>
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="min-w-0 flex-1 truncate">
+            {searching
+              ? `${totalCount} matches…`
+              : indexing
+                ? "Indexing files…"
+                : stats
+                  ? `${stats.total_matches} matches in ${stats.files_scanned} files (${stats.elapsed_ms}ms)`
+                  : "Ready"}
+          </span>
+          {generationReady && completedSummaryKey && (
+            <Tooltip content={summaryOpen ? "Close results summary" : "Summarize results"}>
+              <button
+                type="button"
+                aria-label={summaryOpen ? "Close results summary" : "Summarize results"}
+                aria-pressed={summaryOpen}
+                onClick={() =>
+                  setOpenSummaryKey(summaryOpen ? null : completedSummaryKey)
+                }
+                className={`inline-flex h-6 w-6 flex-shrink-0 items-center justify-center rounded transition-colors ${
+                  summaryOpen
+                    ? "bg-[var(--accent-blue-muted)] text-[var(--accent-blue)]"
+                    : "text-[var(--text-muted)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)]"
+                }`}
+              >
+                <FileText size={14} />
+              </button>
+            </Tooltip>
+          )}
+        </div>
         {stats && stats.errors.length > 0 && (
           <Tooltip content={<span className="whitespace-pre-line">{stats.errors.join("\n")}</span>}>
             <span className="text-red-500 font-medium">
@@ -916,6 +967,14 @@ export default function ResultList({
           </Tooltip>
         )}
       </div>
+
+      {summaryOpen && completedSummaryKey && (
+        <SearchResultsSummary
+          input={summaryInput}
+          requestKey={completedSummaryKey}
+          onClose={() => setOpenSummaryKey(null)}
+        />
+      )}
 
       <div className="flex-1 overflow-hidden relative">
         <div ref={parentRef} className="h-full overflow-y-auto">

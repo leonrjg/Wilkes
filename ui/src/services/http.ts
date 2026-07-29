@@ -28,6 +28,7 @@ import type {
   SemanticScholarPaper,
   SearchQuery,
   SearchStats,
+  SearchResultsSummaryInput,
   Settings,
   Tag,
   NewTag,
@@ -619,6 +620,18 @@ export class HttpSearchApi implements SearchApi {
       body: JSON.stringify({ request_id: requestId, path }),
     });
     if (!res.ok) throw new Error(`summarizeDocument failed: ${res.status}`);
+  }
+
+  async summarizeSearchResults(
+    requestId: string,
+    input: SearchResultsSummaryInput,
+  ): Promise<void> {
+    const res = await fetch("/api/generation/summarize-results", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: requestId, input }),
+    });
+    if (!res.ok) throw new Error(`summarizeSearchResults failed: ${res.status}`);
   }
 
   async onBookmarkClusterLabelled(

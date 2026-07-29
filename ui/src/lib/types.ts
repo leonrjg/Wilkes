@@ -389,7 +389,18 @@ export interface SemanticSettings {
 export type GenerationTask =
   | "cluster_label"
   | "relation_explanation"
-  | "document_summary";
+  | "document_summary"
+  | "search_results_summary";
+
+export interface SearchResultsSummaryFile {
+  title: string;
+  excerpts: string[];
+}
+
+export interface SearchResultsSummaryInput {
+  query: string;
+  files: SearchResultsSummaryFile[];
+}
 
 export interface GenerationSampling {
   temperature: number;

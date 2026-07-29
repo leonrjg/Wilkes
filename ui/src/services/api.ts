@@ -36,6 +36,7 @@ import type {
   NewSmartCollection,
   CollectionValidation,
   SearchLogEntry,
+  SearchResultsSummaryInput,
   ExternalMcpStatus,
   BookmarkClusterLabelled,
   GeneratorDescriptor,
@@ -151,6 +152,11 @@ export interface SearchApi {
   ): Promise<void>;
   /** Starts a summary of one viewer document. */
   summarizeDocument(requestId: string, path: string): Promise<void>;
+  /** Starts a synthesis of one completed search-result snapshot. */
+  summarizeSearchResults(
+    requestId: string,
+    input: SearchResultsSummaryInput,
+  ): Promise<void>;
 
   onBookmarkClusterLabelled(
     handler: (event: BookmarkClusterLabelled) => void,

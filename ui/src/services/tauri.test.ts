@@ -301,6 +301,15 @@ describe("TauriSearchApi", () => {
       requestId: "summary-1",
       path: "/docs/a.pdf",
     });
+    const resultsInput = {
+      query: "cache",
+      files: [{ title: "a.pdf", excerpts: ["finding"] }],
+    };
+    await api.summarizeSearchResults("results-1", resultsInput);
+    expect(invoke).toHaveBeenLastCalledWith("summarize_search_results", {
+      requestId: "results-1",
+      input: resultsInput,
+    });
 
     const handler = vi.fn();
     (listen as any).mockResolvedValue(vi.fn());

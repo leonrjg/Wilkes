@@ -225,6 +225,12 @@ export default function BookmarksPane() {
   }, [themeInputKey]);
 
   useEffect(() => {
+    if (generationReady && themesAvailable) {
+      setThemesEnabled(true);
+    }
+  }, [generationReady, themesAvailable]);
+
+  useEffect(() => {
     if (themesEnabled && !themesAvailable) {
       setThemesEnabled(false);
       setThemeStatus("idle");
@@ -517,7 +523,7 @@ export default function BookmarksPane() {
                   width: "100%",
                   transform: `translateY(${item.start}px)`,
                 }}
-                className={row.kind === "theme" ? "px-2 pt-3 pb-1" : "p-2"}
+                className={row.kind === "theme" ? "px-2 pt-3 pb-1" : "px-2 py-1"}
               >
                 {row.kind === "theme" ? (
                   <button
@@ -525,7 +531,7 @@ export default function BookmarksPane() {
                     aria-expanded={row.expanded}
                     aria-label={`${row.expanded ? "Collapse" : "Expand"} cluster: ${row.label}`}
                     onClick={() => toggleTheme(row.key)}
-                    className="flex w-full min-w-0 items-start gap-1.5 rounded px-1 py-1 text-left text-[var(--text-dim)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)]"
+                    className="flex w-full min-w-0 items-start gap-1.5 rounded px-1 py-1 text-left text-[var(--text-main)] hover:bg-[var(--bg-active)]"
                   >
                     {row.expanded ? (
                       <ChevronDown size={12} className="mt-0.5 flex-shrink-0" />
@@ -541,9 +547,9 @@ export default function BookmarksPane() {
                         through one worker, so the last one can be seconds out. */}
                     {row.labelPending && (
                       <Loader
-                        size={10}
+                        size={12}
                         aria-label="Generating cluster label"
-                        className="mt-0.5 flex-shrink-0 animate-spin text-[var(--text-dim)]"
+                        className="mt-0.5 flex-shrink-0 animate-spin text-[var(--accent-blue)]"
                       />
                     )}
                     <span className="flex-shrink-0 text-[10px] tabular-nums">{row.count}</span>
@@ -620,7 +626,7 @@ function BookmarkCard({
       className="border border-[var(--border-main)] bg-[var(--bg-app)] rounded p-2 text-left hover:border-[var(--border-strong)] cursor-pointer"
     >
       <div className="flex items-start justify-between gap-2">
-        <p className="text-xs text-[var(--text-main)] line-clamp-3">{bookmark.quote}</p>
+        <p className="text-xs text-[var(--text-main)] line-clamp-4">{bookmark.quote}</p>
         {page && (
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--bg-active)] text-[var(--text-muted)] flex-shrink-0">
             p.{page}

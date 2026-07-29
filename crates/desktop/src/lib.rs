@@ -2060,6 +2060,17 @@ async fn summarize_document(
 }
 
 #[tauri::command]
+async fn summarize_search_results(
+    app: AppHandle,
+    request_id: String,
+    input: wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryInput,
+) -> Result<(), String> {
+    app_context(&app)
+        .summarize_search_results(request_id, input)
+        .await
+}
+
+#[tauri::command]
 async fn kill_worker(app: AppHandle) -> Result<(), String> {
     kill_worker_for_ctx(app_context(&app)).await
 }
@@ -2181,6 +2192,7 @@ pub fn run() {
             load_generation_model,
             explain_related_document,
             summarize_document,
+            summarize_search_results,
             get_worker_status,
             get_worker_statuses,
             kill_worker,

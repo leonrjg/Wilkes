@@ -642,6 +642,7 @@ pub enum GenerationTask {
     ClusterLabel,
     RelationExplanation,
     DocumentSummary,
+    SearchResultsSummary,
 }
 
 /// One event protocol for every user-facing token stream. Task inputs and

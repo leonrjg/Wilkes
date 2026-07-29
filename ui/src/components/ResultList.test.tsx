@@ -1,4 +1,5 @@
 import {
+  act,
   render,
   screen,
   fireEvent,
@@ -10,7 +11,8 @@ import { ToastProvider } from "./Toast";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useResearchStore } from "../stores/useResearchStore";
-import type { FileEntry } from "../lib/types";
+import { useGenerationStore } from "../stores/useGenerationStore";
+import type { FileEntry, GenerationStreamEvent } from "../lib/types";
 
 const {
   mockOpenPath,
@@ -23,6 +25,8 @@ const {
   mockDeleteFile,
   mockDeletionKind,
   mockIsTauri,
+  mockSummarizeSearchResults,
+  mockOnGenerationStream,
 } = vi.hoisted(() => ({
   mockOpenPath: vi.fn(),
   mockRevealPath: vi.fn(),
@@ -34,6 +38,8 @@ const {
   mockDeleteFile: vi.fn().mockResolvedValue(undefined),
   mockDeletionKind: { value: "permanent" as "trash" | "permanent" },
   mockIsTauri: { value: false },
+  mockSummarizeSearchResults: vi.fn().mockResolvedValue(undefined),
+  mockOnGenerationStream: vi.fn(),
 }));
 
 vi.mock("../services", () => ({
@@ -45,6 +51,8 @@ vi.mock("../services", () => ({
     writeClipboard: mockWriteClipboard,
     listFiles: mockListFiles,
     updateSettings: mockUpdateSettings,
+    summarizeSearchResults: mockSummarizeSearchResults,
+    onGenerationStream: mockOnGenerationStream,
   },
   source: {
     get deletionKind() {
@@ -82,6 +90,7 @@ vi.mock("@tanstack/react-virtual", () => ({
 describe("ResultList", () => {
   const mockOnMatchClick = vi.fn();
   const mockOnFileClick = vi.fn();
+  let generationHandler: (event: GenerationStreamEvent) => void;
 
   const renderWithToasts = (
     filterText = "",
@@ -105,11 +114,19 @@ describe("ResultList", () => {
     mockListFiles.mockResolvedValue({ files: [], omitted: [] });
     mockIsTauri.value = false;
     mockDeletionKind.value = "permanent";
+    mockSummarizeSearchResults.mockResolvedValue(undefined);
+    mockOnGenerationStream.mockImplementation(
+      (handler: (event: GenerationStreamEvent) => void) => {
+        generationHandler = handler;
+        return Promise.resolve(vi.fn());
+      },
+    );
     useSearchStore.setState({
       results: [],
       stats: null,
       searching: false,
       hasQuery: false,
+      lastQuery: null,
     });
     useSettingsStore.setState({
       fileList: [],
@@ -127,6 +144,7 @@ describe("ResultList", () => {
       draftCollectionExpression: null,
       load: vi.fn().mockResolvedValue(undefined),
     } as any);
+    useGenerationStore.setState({ ready: false });
   });
 
   it("renders empty state when no query", () => {
@@ -799,6 +817,92 @@ describe("ResultList", () => {
     renderWithToasts();
     expect(screen.getByText(/42 matches in 10 files/)).toBeInTheDocument();
     expect(screen.getByText(/1 file failed/)).toBeInTheDocument();
+  });
+
+  it("summarizes one completed result snapshot and detaches it when a new search starts", async () => {
+    useGenerationStore.setState({ ready: true });
+    useSearchStore.setState({
+      hasQuery: true,
+      searching: false,
+      lastQuery: {
+        pattern: "cache behavior",
+        root: "/papers",
+        is_regex: false,
+        case_sensitive: false,
+        max_results: 100,
+        respect_gitignore: true,
+        max_file_size: 1_000_000,
+        context_lines: 2,
+        mode: "Semantic",
+        scope: { type: "corpus" },
+        supported_extensions: ["pdf"],
+      },
+      results: [
+        {
+          path: "/papers/top.pdf",
+          file_type: "Pdf",
+          matches: [
+            {
+              text_range: null,
+              matched_text: "Top-ranked finding",
+              context_before: "",
+              context_after: "",
+              origin: { PdfPage: { page: 1, bbox: null } },
+              score: 0.98,
+            },
+          ],
+        },
+      ],
+      stats: {
+        total_matches: 1,
+        files_scanned: 1,
+        elapsed_ms: 12,
+        errors: [],
+      },
+    });
+
+    renderWithToasts();
+    fireEvent.click(screen.getByRole("button", { name: "Summarize results" }));
+
+    await waitFor(() => expect(mockSummarizeSearchResults).toHaveBeenCalledOnce());
+    const [requestId, input] = mockSummarizeSearchResults.mock.calls[0];
+    expect(input).toEqual({
+      query: "cache behavior",
+      files: [{ title: "top.pdf", excerpts: ["Top-ranked finding"] }],
+    });
+
+    act(() => {
+      generationHandler({
+        phase: "completed",
+        request_id: requestId,
+        task: "search_results_summary",
+        text: "Caching behavior converges across the leading result [1].",
+      });
+    });
+    expect(
+      await screen.findByText("Caching behavior converges across the leading result [1]."),
+    ).toBeInTheDocument();
+
+    act(() => useSearchStore.setState({ searching: true }));
+
+    await waitFor(() =>
+      expect(screen.queryByText("Results summary")).not.toBeInTheDocument(),
+    );
+
+    act(() =>
+      useSearchStore.setState({
+        searching: false,
+        stats: {
+          total_matches: 0,
+          files_scanned: 0,
+          elapsed_ms: 5,
+          errors: ["search failed"],
+        },
+      }),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Summarize results" }),
+    ).not.toBeInTheDocument();
   });
 
   it("handles empty results and searching state", () => {

@@ -7,6 +7,7 @@ import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useViewerStore } from "../stores/useViewerStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
+import { useGenerationStore } from "../stores/useGenerationStore";
 
 const ensureCurrentRootIndexed = useSemanticStore.getState().ensureCurrentRootIndexed;
 const virtualizerOptionsSpy = vi.hoisted(() => vi.fn());
@@ -96,6 +97,7 @@ describe("BookmarksPane", () => {
       preferSemantic: false,
     });
     useSemanticStore.setState({ readyForCurrentRoot: false, ensureCurrentRootIndexed });
+    useGenerationStore.setState({ ready: false, clusterLabels: {} });
   });
 
   it("closes the pane from the header close button and keeps the dock toggle", () => {
@@ -276,11 +278,13 @@ describe("BookmarksPane", () => {
     vi.mocked(api.clusterBookmarks).mockResolvedValue({
       clusters: [
         {
+          cluster_key: "cats",
           bookmark_ids: ["cat-1", "cat-2"],
           representative_bookmark_id: "cat-1",
           cohesion: 0.9,
         },
         {
+          cluster_key: "physics",
           bookmark_ids: ["physics-1", "physics-2"],
           representative_bookmark_id: "physics-1",
           cohesion: 0.88,
@@ -345,6 +349,126 @@ describe("BookmarksPane", () => {
       expect(screen.queryByText("Around “quantum fields”")).not.toBeInTheDocument();
     });
     expect(api.clusterBookmarks).toHaveBeenCalledTimes(2);
+  });
+
+  it("automatically groups bookmarks when generation is already ready", async () => {
+    useBookmarksStore.setState({
+      scope: "all",
+      bookmarks: [
+        {
+          id: "one",
+          path: "/tmp/one.pdf",
+          origin: { PdfPage: { page: 1, bbox: null } },
+          quote: "first theme",
+          created_at: "2026-01-01T00:00:00Z",
+          rects: [],
+        },
+        {
+          id: "two",
+          path: "/tmp/two.pdf",
+          origin: { PdfPage: { page: 1, bbox: null } },
+          quote: "second theme",
+          created_at: "2026-01-01T00:00:00Z",
+          rects: [],
+        },
+        {
+          id: "three",
+          path: "/tmp/three.pdf",
+          origin: { PdfPage: { page: 1, bbox: null } },
+          quote: "third theme",
+          created_at: "2026-01-01T00:00:00Z",
+          rects: [],
+        },
+      ],
+    });
+    useSettingsStore.setState({ preferSemantic: true });
+    useSemanticStore.setState({ readyForCurrentRoot: true });
+    useGenerationStore.setState({ ready: true });
+    vi.mocked(api.clusterBookmarks).mockResolvedValue({
+      clusters: [
+        {
+          cluster_key: "all-three",
+          bookmark_ids: ["one", "two", "three"],
+          representative_bookmark_id: "one",
+          cohesion: 0.9,
+        },
+      ],
+      unclustered_bookmark_ids: [],
+    });
+
+    renderPane();
+
+    await waitFor(() => {
+      expect(api.clusterBookmarks).toHaveBeenCalledWith({
+        bookmark_ids: ["one", "two", "three"],
+        granularity: "balanced",
+      });
+    });
+    expect(
+      screen.getByRole("button", { name: "Show bookmarks as a list" }),
+    ).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("starts automatic grouping when generation becomes ready and allows opting out", async () => {
+    useBookmarksStore.setState({
+      scope: "all",
+      bookmarks: [
+        {
+          id: "one",
+          path: "/tmp/one.pdf",
+          origin: { PdfPage: { page: 1, bbox: null } },
+          quote: "first theme",
+          created_at: "2026-01-01T00:00:00Z",
+          rects: [],
+        },
+        {
+          id: "two",
+          path: "/tmp/two.pdf",
+          origin: { PdfPage: { page: 1, bbox: null } },
+          quote: "second theme",
+          created_at: "2026-01-01T00:00:00Z",
+          rects: [],
+        },
+        {
+          id: "three",
+          path: "/tmp/three.pdf",
+          origin: { PdfPage: { page: 1, bbox: null } },
+          quote: "third theme",
+          created_at: "2026-01-01T00:00:00Z",
+          rects: [],
+        },
+      ],
+    });
+    useSettingsStore.setState({ preferSemantic: true });
+    useSemanticStore.setState({ readyForCurrentRoot: true });
+    vi.mocked(api.clusterBookmarks).mockResolvedValue({
+      clusters: [
+        {
+          cluster_key: "all-three",
+          bookmark_ids: ["one", "two", "three"],
+          representative_bookmark_id: "one",
+          cohesion: 0.9,
+        },
+      ],
+      unclustered_bookmark_ids: [],
+    });
+
+    renderPane();
+    expect(api.clusterBookmarks).not.toHaveBeenCalled();
+
+    act(() => useGenerationStore.setState({ ready: true }));
+
+    const listToggle = await screen.findByRole("button", {
+      name: "Show bookmarks as a list",
+    });
+    await waitFor(() => expect(api.clusterBookmarks).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(listToggle);
+
+    expect(
+      screen.getByRole("button", { name: "Group bookmarks by theme" }),
+    ).toHaveAttribute("aria-pressed", "false");
+    expect(api.clusterBookmarks).toHaveBeenCalledTimes(1);
   });
 
   it("edits and saves a note through the store", async () => {

@@ -24,6 +24,9 @@ use wilkes_core::generate::tasks::document_summary::{
 use wilkes_core::generate::tasks::relation::{
     explain_relation, DocumentSummary, MAX_EXCERPT_CHARS,
 };
+use wilkes_core::generate::tasks::search_results_summary::{
+    summarize_search_results as generate_search_results_summary, SearchResultsSummaryInput,
+};
 use wilkes_core::generate::{Generated, GenerationEngine, Generator};
 use wilkes_core::integrations::openalex::OpenAlexClient;
 use wilkes_core::integrations::semantic_scholar::SemanticScholarClient;
@@ -2533,6 +2536,22 @@ impl AppContext {
         .await
     }
 
+    /// Stream a synthesis of one completed, ranked search-result snapshot.
+    pub async fn summarize_search_results(
+        self: Arc<Self>,
+        request_id: String,
+        input: SearchResultsSummaryInput,
+    ) -> Result<(), String> {
+        self.run_generation_stream(
+            request_id,
+            GenerationTask::SearchResultsSummary,
+            move |_ctx, generator, sink| {
+                generate_search_results_summary(generator.as_ref(), &input, sink)
+            },
+        )
+        .await
+    }
+
     /// Title plus a leading excerpt, both from caches. Returns `Err` when there
     /// is no cached text: no fallback extraction.
     fn document_summary(&self, path: &Path) -> Result<DocumentSummary, String> {
@@ -4016,6 +4035,45 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn search_results_summary_uses_its_own_correlated_task() {
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = generation_ctx(dir.path(), Arc::clone(&events));
+        enable_generation(&ctx, "mock-generator").await;
+        *ctx.generator.lock() = Some(Arc::new(MockGenerator::scripted([
+            "The leading studies agree [1].",
+        ])));
+        let input = SearchResultsSummaryInput {
+            query: "agreement".to_string(),
+            files: vec![
+                wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryFile {
+                    title: "paper.pdf".to_string(),
+                    excerpts: vec!["The studies agree.".to_string()],
+                },
+            ],
+        };
+
+        Arc::clone(&ctx)
+            .summarize_search_results("results-request".to_string(), input)
+            .await
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|(name, payload)| {
+            name == "generation-stream"
+                && matches!(
+                    serde_json::from_value::<GenerationStreamEvent>(payload.clone()).unwrap(),
+                    GenerationStreamEvent::Completed {
+                        request_id,
+                        task: GenerationTask::SearchResultsSummary,
+                        text,
+                    } if request_id == "results-request"
+                        && text == "The leading studies agree [1]."
+                )
+        }));
     }
 
     #[tokio::test]

@@ -5,3 +5,4 @@
 pub mod cluster_label;
 pub mod document_summary;
 pub mod relation;
+pub mod search_results_summary;

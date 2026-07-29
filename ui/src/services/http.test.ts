@@ -461,6 +461,21 @@ describe("HttpSearchApi", () => {
         }),
       }),
     );
+    const resultsInput = {
+      query: "cache",
+      files: [{ title: "a.pdf", excerpts: ["finding"] }],
+    };
+    await api.summarizeSearchResults("results-1", resultsInput);
+    expect(fetch).toHaveBeenLastCalledWith(
+      "/api/generation/summarize-results",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          request_id: "results-1",
+          input: resultsInput,
+        }),
+      }),
+    );
 
     const handler = vi.fn();
     const eventSource = {
