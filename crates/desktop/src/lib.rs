@@ -78,6 +78,8 @@ async fn rename_file_for_path(
         .map_err(|e| e.to_string())?;
     ctx.rekey_research_path(&old, &new)
         .map_err(|e| e.to_string())?;
+    ctx.rekey_index_path(&old, &new)
+        .map_err(|e| e.to_string())?;
     Ok(new.display().to_string())
 }
 
@@ -130,6 +132,8 @@ async fn move_file_to_root_for_ctx(
     .map_err(|e| e.to_string())?;
     let new = moved.pop().unwrap_or_default();
     ctx.rekey_research_path(&old, &new)
+        .map_err(|e| e.to_string())?;
+    ctx.rekey_index_path(&old, &new)
         .map_err(|e| e.to_string())?;
     Ok(new.display().to_string())
 }

@@ -1286,6 +1286,7 @@ impl AppContext {
         let old = path.clone();
         let new = crate::commands::files::rename_file(path, new_name).await?;
         self.rekey_research_path(&old, &new)?;
+        self.rekey_index_path(&old, &new)?;
         Ok(new)
     }
 
@@ -1294,6 +1295,17 @@ impl AppContext {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .rekey_document(old, new)
+    }
+
+    /// Rewrites the semantic index keys for a renamed file or directory so its
+    /// embeddings are preserved in place. A no-op when no index is loaded.
+    pub fn rekey_index_path(&self, old: &Path, new: &Path) -> anyhow::Result<()> {
+        let index_arc = self.index.lock().clone();
+        let mut guard = index_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(index) = guard.as_mut() {
+            index.rename_file(old, new)?;
+        }
+        Ok(())
     }
 
     pub async fn import_files_into_current_root(

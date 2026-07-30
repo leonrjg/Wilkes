@@ -394,6 +394,48 @@ mod tests {
     }
 
     #[test]
+    fn test_rename_directory_rekeys_descendant_chunks_and_keeps_embeddings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut idx =
+            SemanticIndex::create(root, "m", 3, EmbeddingEngine::Candle, Some(root)).unwrap();
+
+        let old_dir = root.join("old");
+        fs::create_dir(&old_dir).unwrap();
+        let old_file = old_dir.join("paper.txt");
+        fs::write(&old_file, "hello world").unwrap();
+        idx.write_file(PreparedFile {
+            path: old_file.clone(),
+            chunks: vec![(
+                Chunk {
+                    file_path: old_file.clone(),
+                    text: "hello world".to_string(),
+                    byte_range: ByteRange { start: 0, end: 11 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![1.0, 0.0, 0.0],
+            )],
+        })
+        .unwrap();
+
+        let new_dir = root.join("new");
+        fs::rename(&old_dir, &new_dir).unwrap();
+        idx.rename_file(&old_dir, &new_dir).unwrap();
+
+        // The descendant's chunk survives under the renamed directory.
+        let new_file = new_dir.join("paper.txt");
+        let results = idx.query(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file_path, canon(&new_file));
+
+        // Keyed under the new path only.
+        idx.remove_file(&old_file).unwrap();
+        assert_eq!(idx.query(&[1.0, 0.0, 0.0], 1).unwrap().len(), 1);
+        idx.remove_file(&new_file).unwrap();
+        assert_eq!(idx.query(&[1.0, 0.0, 0.0], 1).unwrap().len(), 0);
+    }
+
+    #[test]
     fn test_delete_non_existent() {
         let dir = tempdir().unwrap();
         let idx = SemanticIndex::create(dir.path(), "m", 3, EmbeddingEngine::Candle, None).unwrap();
@@ -2773,12 +2815,57 @@ impl SemanticIndex {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
+        // A file rename: the renamed path itself is an indexed file.
         Self::delete_file_by_key_tx(&tx, &new_rel)?;
         tx.execute(
             "UPDATE files SET file_path = ?1 WHERE file_path = ?2",
             params![new_rel, old_rel],
         )?;
+        // A directory rename: every indexed file beneath it keeps its embeddings
+        // but must move to the new path prefix.
+        Self::rekey_descendant_files_tx(&tx, &old_rel, &new_rel)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Rewrites the keys of indexed files living under a renamed directory. Keys
+    /// are absolute paths, so a directory rename shifts every descendant's
+    /// prefix. Embeddings are preserved — only `file_path` changes. Rows already
+    /// occupying a destination key are dropped first to honour the
+    /// `UNIQUE(file_path)` constraint.
+    fn rekey_descendant_files_tx(
+        tx: &rusqlite::Transaction<'_>,
+        old_key: &str,
+        new_key: &str,
+    ) -> anyhow::Result<()> {
+        for separator in ['/', '\\'] {
+            let old_prefix = format!("{old_key}{separator}");
+            let new_prefix = format!("{new_key}{separator}");
+            let old_len = old_prefix.chars().count() as i64;
+            let new_len = new_prefix.chars().count() as i64;
+            tx.execute(
+                "DELETE FROM vec_chunks WHERE rowid IN (
+                    SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id
+                    WHERE substr(f.file_path, 1, ?1) = ?2
+                )",
+                params![new_len, new_prefix],
+            )?;
+            tx.execute(
+                "DELETE FROM chunks WHERE file_id IN (
+                    SELECT id FROM files WHERE substr(file_path, 1, ?1) = ?2
+                )",
+                params![new_len, new_prefix],
+            )?;
+            tx.execute(
+                "DELETE FROM files WHERE substr(file_path, 1, ?1) = ?2",
+                params![new_len, new_prefix],
+            )?;
+            tx.execute(
+                "UPDATE files SET file_path = ?1 || substr(file_path, ?2 + 1)
+                 WHERE substr(file_path, 1, ?2) = ?3",
+                params![new_prefix, old_len, old_prefix],
+            )?;
+        }
         Ok(())
     }
 

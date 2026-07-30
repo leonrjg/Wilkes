@@ -6,8 +6,10 @@ use crate::types::{
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use super::{SearchProvider, SearchResultTx};
 
@@ -65,99 +67,95 @@ impl SearchProvider for GrepSearchProvider {
         eligible_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
     ) -> anyhow::Result<Vec<String>> {
         let matcher = Self::build_matcher(query)?;
-        let mut total_matches: usize = 0;
-        let mut errors: Vec<String> = if query.scope == SearchScope::All {
+        let total_matches = AtomicUsize::new(0);
+        let errors = Mutex::new(if query.scope == SearchScope::All {
             self.all_root_errors.clone()
         } else {
             Vec::new()
+        });
+
+        // A single-file scope has nothing to walk in parallel.
+        if let SearchScope::File { path } = &query.scope {
+            let _ = search_path(
+                path,
+                query,
+                extractors,
+                &matcher,
+                &tx,
+                &total_matches,
+                &errors,
+                eligible_paths,
+            )?;
+            return Ok(errors.into_inner().unwrap());
+        }
+
+        // Resolve the root set: the single root for Corpus, every library root
+        // for All.
+        let (first, rest): (&Path, &[std::path::PathBuf]) = match &query.scope {
+            SearchScope::Corpus => (query.root.as_path(), &[]),
+            SearchScope::All => self
+                .all_roots
+                .split_first()
+                .map(|(first, rest)| (first.as_path(), rest))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("No accessible library directories are configured")
+                })?,
+            SearchScope::File { .. } => unreachable!("File scope handled above"),
         };
 
-        match &query.scope {
-            SearchScope::Corpus => {
-                let mut builder = WalkBuilder::new(&query.root);
-                builder.git_ignore(query.respect_gitignore).hidden(false);
-                let walk = builder.build();
+        let mut builder = WalkBuilder::new(first);
+        for root in rest {
+            builder.add(root);
+        }
+        builder.git_ignore(query.respect_gitignore).hidden(false);
 
-                for entry in walk {
-                    if tx.is_closed() {
-                        break;
-                    }
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-                    let path = entry.path();
-                    if !path.is_file() {
-                        continue;
-                    }
-                    if search_path(
-                        path,
-                        query,
-                        extractors,
-                        &matcher,
-                        &tx,
-                        &mut total_matches,
-                        &mut errors,
-                        eligible_paths,
-                    )? {
-                        break;
-                    }
+        // Fan the walk across a thread pool. PDF extraction dominates grep cost
+        // and is independent per file, so this is where the wall-clock win comes
+        // from. Match count and errors are shared synchronized state; result
+        // ordering is not preserved, which is fine because matches already stream
+        // to the caller as they are found rather than being returned as a batch.
+        builder.build_parallel().run(|| {
+            Box::new(|entry| {
+                if tx.is_closed() {
+                    return WalkState::Quit;
                 }
-            }
-            SearchScope::All => {
-                let Some((first, rest)) = self.all_roots.split_first() else {
-                    anyhow::bail!("No accessible library directories are configured");
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => return WalkState::Continue,
                 };
-                let mut builder = WalkBuilder::new(first);
-                for root in rest {
-                    builder.add(root);
+                let path = entry.path();
+                if !path.is_file() {
+                    return WalkState::Continue;
                 }
-                builder.git_ignore(query.respect_gitignore).hidden(false);
-                let walk = builder.build();
-
-                for entry in walk {
-                    if tx.is_closed() {
-                        break;
-                    }
-
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-
-                    let path = entry.path();
-                    if !path.is_file() {
-                        continue;
-                    }
-                    if search_path(
-                        path,
-                        query,
-                        extractors,
-                        &matcher,
-                        &tx,
-                        &mut total_matches,
-                        &mut errors,
-                        eligible_paths,
-                    )? {
-                        break;
-                    }
-                }
-            }
-            SearchScope::File { path } => {
-                let _ = search_path(
+                match search_path(
                     path,
                     query,
                     extractors,
                     &matcher,
                     &tx,
-                    &mut total_matches,
-                    &mut errors,
+                    &total_matches,
+                    &errors,
                     eligible_paths,
-                )?;
-            }
-        }
+                ) {
+                    // Stop the whole walk: max_results reached or receiver closed.
+                    Ok(true) => WalkState::Quit,
+                    Ok(false) => WalkState::Continue,
+                    // The pattern was already validated by build_matcher, so an
+                    // Err here is a single-file failure that must not abort the
+                    // rest of the search. Log and record it, then keep walking.
+                    Err(err) => {
+                        tracing::error!("grep error at {}: {err:#}", path.display());
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}: {err:#}", path.display()));
+                        WalkState::Continue
+                    }
+                }
+            })
+        });
 
-        Ok(errors)
+        Ok(errors.into_inner().unwrap())
     }
 
     fn capabilities(&self) -> SearchCapabilities {
@@ -190,8 +188,8 @@ fn search_path(
     extractors: &ExtractorRegistry,
     matcher: &RegexMatcher,
     tx: &SearchResultTx,
-    total_matches: &mut usize,
-    errors: &mut Vec<String>,
+    total_matches: &AtomicUsize,
+    errors: &Mutex<Vec<String>>,
     eligible_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
 ) -> anyhow::Result<bool> {
     if tx.is_closed() {
@@ -224,12 +222,18 @@ fn search_path(
             Some(extractor) => match extractor.extract(path) {
                 Ok(content) => search_extracted_content(&content, matcher)?,
                 Err(e) => {
-                    errors.push(format!("{}: {e:#}", path.display()));
+                    errors
+                        .lock()
+                        .unwrap()
+                        .push(format!("{}: {e:#}", path.display()));
                     return Ok(false);
                 }
             },
             None => {
-                errors.push(format!("{}: no extractor registered", path.display()));
+                errors
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}: no extractor registered", path.display()));
                 return Ok(false);
             }
         },
@@ -239,7 +243,8 @@ fn search_path(
         return Ok(false);
     }
 
-    *total_matches += matches.len();
+    let previous = total_matches.fetch_add(matches.len(), Ordering::Relaxed);
+    let running_total = previous + matches.len();
     let file_matches = FileMatches {
         path: path.to_path_buf(),
         file_type,
@@ -249,7 +254,7 @@ fn search_path(
         return Ok(true);
     }
 
-    Ok(query.max_results > 0 && *total_matches >= query.max_results)
+    Ok(query.max_results > 0 && running_total >= query.max_results)
 }
 
 // ── Text file search ──────────────────────────────────────────────────────────
