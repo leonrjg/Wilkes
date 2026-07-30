@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from "react";
-import { Search, Database, Check, Clock, Globe, Trash2 } from "react-feather";
+import { Search, Database, Check, Clock, Globe, Trash2, X } from "react-feather";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
@@ -51,6 +51,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const deleteHistory = useResearchStore((s) => s.deleteHistory);
   const clearHistory = useResearchStore((s) => s.clearHistory);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
   const prevSemanticReady = useRef(semanticReady);
   const prevFilterKey = useRef(`${selectedCollectionId ?? ""}|${selectedTagId ?? ""}`);
   const replayQueryRef = useRef<SearchQuery | null>(null);
@@ -214,6 +215,13 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     triggerSearch(pattern, { searchAll: next }, "user");
   };
 
+  const handleResetSearch = () => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    setPattern("");
+    clearResults();
+    inputRef.current?.focus();
+  };
+
   const replayHistory = (query: SearchQuery) => {
     const collectionId = collections.some((item) => item.id === query.collection_id)
       ? query.collection_id ?? null
@@ -277,14 +285,43 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
         )}
 
         <div className="flex flex-1 items-center rounded border border-[var(--border-main)] bg-[var(--bg-input)] transition-colors focus-within:ring-1 focus-within:ring-[var(--accent-blue)]">
-          <input
-            type="text"
-            value={pattern}
-            onChange={(e) => setPattern(e.target.value)}
-            placeholder="Search…"
-            className="min-w-0 flex-1 bg-transparent px-3 py-1.5 text-sm text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
-            spellCheck={false}
-            autoFocus
+          <div className="relative min-w-0 flex-shrink">
+            <span
+              aria-hidden="true"
+              className="invisible block whitespace-pre py-1.5 pl-3 text-sm"
+            >
+              {pattern || "Search…"}
+            </span>
+            <input
+              ref={inputRef}
+              type="text"
+              value={pattern}
+              onChange={(e) => setPattern(e.target.value)}
+              placeholder="Search…"
+              className="absolute inset-0 min-w-0 w-full bg-transparent py-1.5 pl-3 text-sm text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
+              spellCheck={false}
+              autoFocus
+            />
+          </div>
+          {pattern && (
+            <Tooltip content="Clear search">
+              <button
+                type="button"
+                onClick={handleResetSearch}
+                aria-label="Clear search"
+                className="inline-flex flex-shrink-0 rounded p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)]"
+              >
+                <X size={14} aria-hidden="true" />
+              </button>
+            </Tooltip>
+          )}
+          <div
+            className="min-w-0 flex-1 self-stretch"
+            aria-hidden="true"
+            onMouseDown={(event) => {
+              event.preventDefault();
+              inputRef.current?.focus();
+            }}
           />
           <Tooltip content={searchAll ? "Search current directory" : "Search all directories"}>
             <button

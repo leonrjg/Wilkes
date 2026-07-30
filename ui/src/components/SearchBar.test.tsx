@@ -19,6 +19,7 @@ describe("SearchBar", () => {
       deferSemanticSearch: vi.fn(),
       searching: false,
       setHasQuery: vi.fn(),
+      clearResults: vi.fn(),
     });
     useSettingsStore.setState({
       directory: "/test/dir",
@@ -88,6 +89,24 @@ describe("SearchBar", () => {
         pattern: "test query",
       }),
     );
+  });
+
+  it("clears the query and results from the search bar", () => {
+    const clearResults = vi.fn();
+    useSearchStore.setState({ clearResults });
+
+    render(<SearchBar sourceSlot={<MockSourceSlot />} />);
+    const input = screen.getByPlaceholderText("Search…");
+
+    expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: "test query" } });
+    fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+
+    expect(input).toHaveValue("");
+    expect(input).toHaveFocus();
+    expect(clearResults).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
   });
 
   it("toggles regex option", () => {
