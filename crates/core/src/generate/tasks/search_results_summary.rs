@@ -1,107 +1,120 @@
-//! Answer one completed, ranked search-result snapshot, grounded in citations.
+//! Synthesize a short cited answer from a bounded, rank-preserving set of
+//! cleaned search passages.
 //!
-//! Every sentence must close with the bracketed number of a supplied source.
-//! The per-request grammar is what makes that unrepresentable rather than
-//! merely requested: an uncited claim and a citation to a source that was never
-//! supplied are both outside the language, so there is no parse-and-retry path.
-//!
-//! Source numbering follows the caller's file order exactly -- the first
-//! excerpt of every file is always emitted, so no file is silently dropped and
-//! `[k]` always denotes the caller's k-th file. The UI relies on that to turn
-//! each citation into a link to the right document.
+//! Search relevance belongs to the search provider. The caller may remove
+//! malformed evidence, but it must not promote passages with a second lexical
+//! or model-based score. This task therefore consumes passages in caller order
+//! and lets the configured LLM interpret the open-ended query. A grammar limits
+//! every generated sentence to citations from the supplied sources.
 
 use std::ops::ControlFlow;
 
 use serde::{Deserialize, Serialize};
 
 use crate::generate::{
-    grammar::Grammar, truncate_chars, Constraint, Generated, GenerationRequest, Generator, Sampling,
+    grammar::Grammar, Constraint, Generated, GenerationRequest, Generator, Sampling,
 };
 
-pub const MAX_FILES: usize = 5;
-pub const MAX_EXCERPTS_PER_FILE: usize = 2;
-pub const MAX_EXCERPT_CHARS: usize = 420;
-pub const MAX_TOTAL_EXCERPT_CHARS: usize = MAX_FILES * MAX_EXCERPTS_PER_FILE * MAX_EXCERPT_CHARS;
+pub const MAX_SOURCES: usize = 5;
+pub const MAX_PASSAGES: usize = 6;
+pub const MAX_PASSAGE_CHARS: usize = 700;
+pub const MAX_SENTENCES: usize = 3;
 const MAX_QUERY_CHARS: usize = 500;
 const MAX_TITLE_CHARS: usize = 200;
-pub const MAX_SENTENCE_BODY_CHARS: usize = 128;
-pub const MAX_SENTENCES: usize = 3;
-/// Each non-EOS token accepted by the grammar consumes at least one character.
-/// This is the exact maximum character count: three bodies, three
-/// three-character citations, three periods, two separators, and one optional
-/// final newline.
-const MAX_TOKENS: usize =
-    MAX_SENTENCES * (MAX_SENTENCE_BODY_CHARS + 3 + 1) + (MAX_SENTENCES - 1) + 1;
+const MAX_TOKENS: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SearchResultsSummaryFile {
+pub struct SearchResultsSummarySource {
     pub title: String,
-    pub excerpts: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SearchResultsSummaryPassage {
+    pub text: String,
+    /// Zero-based index into `SearchResultsSummaryInput::sources`.
+    pub source_index: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchResultsSummaryInput {
     pub query: String,
-    pub files: Vec<SearchResultsSummaryFile>,
+    pub sources: Vec<SearchResultsSummarySource>,
+    pub passages: Vec<SearchResultsSummaryPassage>,
 }
 
-const PROMPT_HEADER: &str =
-    "Read the numbered evidence and answer the question at the end. Use only \
-factual findings from the evidence. Write one to three short sentences in plain \
-prose. End every sentence with its supporting document number in brackets, then \
-a period.\n\n\
-Evidence:\n";
+const PROMPT_HEADER: &str = "Answer the search question using only the ranked evidence below. The \
+evidence is ordered from most to least relevant. If it does not directly answer \
+the question, say that rather than filling gaps with outside knowledge. Write \
+one to three concise sentences. End every sentence with the supporting source \
+number in brackets.\n\nRanked evidence:\n";
 
-/// `source_numbers` is the closed set of caller positions that actually carry
-/// evidence. Keeping those positions rather than renumbering non-empty files is
-/// what makes a generated `[k]` open the UI's k-th document.
+fn normalized_passage(text: &str) -> anyhow::Result<String> {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    anyhow::ensure!(!normalized.is_empty(), "search passage is empty");
+    anyhow::ensure!(
+        normalized.chars().count() <= MAX_PASSAGE_CHARS,
+        "search passage exceeds {MAX_PASSAGE_CHARS} characters"
+    );
+    anyhow::ensure!(
+        normalized
+            .chars()
+            .filter(|character| character.is_alphabetic())
+            .count()
+            >= 20,
+        "search passage contains no substantive prose"
+    );
+    Ok(normalized)
+}
+
+fn validated_passages(input: &SearchResultsSummaryInput) -> anyhow::Result<Vec<(usize, String)>> {
+    anyhow::ensure!(
+        input.sources.len() <= MAX_SOURCES,
+        "search summary has more than {MAX_SOURCES} sources"
+    );
+    anyhow::ensure!(
+        input.passages.len() <= MAX_PASSAGES,
+        "search summary has more than {MAX_PASSAGES} passages"
+    );
+    input
+        .passages
+        .iter()
+        .map(|passage| {
+            anyhow::ensure!(
+                passage.source_index < input.sources.len(),
+                "search passage refers to missing source {}",
+                passage.source_index
+            );
+            Ok((passage.source_index, normalized_passage(&passage.text)?))
+        })
+        .collect()
+}
+
+fn source_numbers(passages: &[(usize, String)], source_count: usize) -> Vec<usize> {
+    (0..source_count)
+        .filter(|source_index| {
+            passages
+                .iter()
+                .any(|(passage_source, _)| passage_source == source_index)
+        })
+        .map(|source_index| source_index + 1)
+        .collect()
+}
+
 pub fn build_grammar(source_numbers: &[usize]) -> String {
     let digits = source_numbers
         .iter()
-        .copied()
-        .filter(|number| *number > 0)
         .map(|number| format!("\"{number}\""))
         .collect::<Vec<_>>()
         .join(" | ");
-    let digits = if digits.is_empty() {
-        "\"1\"".to_string()
-    } else {
-        digits
-    };
     let mut grammar = String::new();
     grammar.push_str(&format!(
         "answer ::= sentence (\" \" sentence){{0,{}}} \"\\n\"?\n",
         MAX_SENTENCES - 1
     ));
-    grammar.push_str("sentence ::= body cite \".\"\n");
-    grammar.push_str(&format!(
-        "body ::= [^\\[\\]\\n.!?]{{1,{MAX_SENTENCE_BODY_CHARS}}}\n"
-    ));
-    grammar.push_str("cite ::= \"[\" digit \"]\"\n");
+    grammar.push_str("sentence ::= body \" [\" digit \"].\"\n");
+    grammar.push_str("body ::= [^\\[\\]\\n.!?]+\n");
     grammar.push_str(&format!("digit ::= {digits}\n"));
     grammar
-}
-
-fn normalized_excerpt(text: &str) -> String {
-    truncate_chars(text.trim(), MAX_EXCERPT_CHARS * 2)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn source_numbers(input: &SearchResultsSummaryInput) -> Vec<usize> {
-    input
-        .files
-        .iter()
-        .take(MAX_FILES)
-        .enumerate()
-        .filter_map(|(index, file)| {
-            file.excerpts
-                .iter()
-                .any(|excerpt| !excerpt.trim().is_empty())
-                .then_some(index + 1)
-        })
-        .collect()
 }
 
 fn matches_grammar(grammar_source: &str, text: &str) -> anyhow::Result<bool> {
@@ -111,21 +124,20 @@ fn matches_grammar(grammar_source: &str, text: &str) -> anyhow::Result<bool> {
         .is_some_and(|state| grammar.is_complete(&state)))
 }
 
-/// Catch degeneration that is technically shaped like an answer, such as
-/// `14141414[1].`. The scan is character-based, so arbitrary Unicode remains
-/// safe and a repeated multi-byte character cannot create an invalid slice.
+/// Reject decoder degeneration even when it happens to satisfy citation shape.
+/// The scan is character-based and therefore safe for arbitrary Unicode.
 fn has_pathological_repetition(text: &str) -> bool {
-    let chars = text.chars().collect::<Vec<_>>();
+    let characters = text.chars().collect::<Vec<_>>();
     for width in 2..=8 {
         let run_chars = width * 4;
-        if chars.len() < run_chars {
+        if characters.len() < run_chars {
             continue;
         }
-        for start in 0..=chars.len() - run_chars {
-            let pattern = &chars[start..start + width];
+        for start in 0..=characters.len() - run_chars {
+            let pattern = &characters[start..start + width];
             if (1..4).all(|repeat| {
                 let offset = start + repeat * width;
-                chars[offset..offset + width] == *pattern
+                characters[offset..offset + width] == *pattern
             }) {
                 return true;
             }
@@ -134,65 +146,45 @@ fn has_pathological_repetition(text: &str) -> bool {
     false
 }
 
-pub fn build_request(input: &SearchResultsSummaryInput) -> GenerationRequest {
-    let mut prompt = String::from(PROMPT_HEADER);
+pub fn build_request(input: &SearchResultsSummaryInput) -> anyhow::Result<GenerationRequest> {
+    anyhow::ensure!(!input.query.trim().is_empty(), "search query is empty");
+    let passages = validated_passages(input)?;
+    anyhow::ensure!(!passages.is_empty(), "search results contain no passages");
+    let source_numbers = source_numbers(&passages, input.sources.len());
 
-    let mut total_chars = 0;
-    for (index, file) in input.files.iter().take(MAX_FILES).enumerate() {
-        let mut excerpts = Vec::new();
-        for excerpt in &file.excerpts {
-            if excerpts.len() == MAX_EXCERPTS_PER_FILE {
-                break;
-            }
-            let normalized = normalized_excerpt(excerpt);
-            if normalized.is_empty() {
-                continue;
-            }
-            // The first excerpt of a file is emitted unconditionally so the
-            // source is never dropped and citation numbers stay aligned with the
-            // caller's file order; later excerpts yield to the shared budget.
-            if !excerpts.is_empty() && total_chars >= MAX_TOTAL_EXCERPT_CHARS {
-                break;
-            }
-            let bounded = truncate_chars(&normalized, MAX_EXCERPT_CHARS)
-                .trim_end()
-                .to_string();
-            total_chars += bounded.chars().count();
-            excerpts.push(bounded);
-        }
-        if excerpts.is_empty() {
-            continue;
-        }
+    let mut prompt = String::from(PROMPT_HEADER);
+    for (source_index, passage) in &passages {
+        let source = &input.sources[*source_index];
+        let title = source
+            .title
+            .trim()
+            .chars()
+            .take(MAX_TITLE_CHARS)
+            .collect::<String>();
         prompt.push_str(&format!(
-            "\n[{}] {}\n",
-            index + 1,
-            truncate_chars(file.title.trim(), MAX_TITLE_CHARS)
+            "\n[{}] {}\n{}\n",
+            source_index + 1,
+            title,
+            passage
         ));
-        for excerpt in excerpts {
-            prompt.push_str(&excerpt);
-            prompt.push('\n');
-        }
     }
+    let query = input
+        .query
+        .trim()
+        .chars()
+        .take(MAX_QUERY_CHARS)
+        .collect::<String>();
     prompt.push_str(&format!(
-        "\nEnd evidence.\n\nQuestion: {}\nAnswer:",
-        truncate_chars(input.query.trim(), MAX_QUERY_CHARS),
+        "\nEnd evidence.\n\nSearch question: {query}\nAnswer:"
     ));
 
-    let source_numbers = source_numbers(input);
-
-    GenerationRequest {
+    Ok(GenerationRequest {
         system: None,
         prompt,
         max_tokens: MAX_TOKENS,
         constraint: Constraint::Grammar(build_grammar(&source_numbers)),
-        sampling: Sampling {
-            temperature: 0.2,
-            top_p: None,
-            top_k: Some(32),
-            repeat_penalty: Some((1.15, 64)),
-            seed: 0,
-        },
-    }
+        sampling: Sampling::default(),
+    })
 }
 
 pub fn summarize_search_results(
@@ -200,22 +192,13 @@ pub fn summarize_search_results(
     input: &SearchResultsSummaryInput,
     sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
 ) -> anyhow::Result<Generated> {
-    anyhow::ensure!(!input.query.trim().is_empty(), "search query is empty");
-    let source_numbers = source_numbers(input);
-    anyhow::ensure!(
-        !source_numbers.is_empty(),
-        "search results contain no excerpts"
-    );
-
-    let request = build_request(input);
+    let request = build_request(input)?;
     let Constraint::Grammar(grammar_source) = &request.constraint else {
-        unreachable!("search result answers always use a grammar");
+        unreachable!("search result answers always use a citation grammar");
     };
     let grammar_source = grammar_source.clone();
-    // This task withholds its short decode until verification. Streaming an
-    // invalid prefix would briefly show the exact repetition/OCR failures these
-    // checks are meant to prevent, even though the terminal event later failed.
-    // `Generator::generate` still uses the one shared streaming decoder.
+
+    // Verify the complete short answer before displaying any part of it.
     let mut generated = generator.generate(request)?;
     anyhow::ensure!(
         generated.is_complete(),
@@ -227,9 +210,6 @@ pub fn summarize_search_results(
         !trimmed.is_empty(),
         "generator returned an empty search results summary"
     );
-
-    // Re-run the exact task contract so a mock or future engine that ignores
-    // constraints cannot surface an uncited, overlong, or out-of-range answer.
     anyhow::ensure!(
         matches_grammar(&grammar_source, trimmed)?,
         "search results answer violates the citation grammar"
@@ -246,6 +226,7 @@ pub fn summarize_search_results(
         !has_pathological_repetition(trimmed),
         "search results answer contains pathological repetition"
     );
+
     generated.text = trimmed.to_string();
     anyhow::ensure!(
         sink(&generated.text).is_continue(),
@@ -263,11 +244,27 @@ mod tests {
 
     fn input() -> SearchResultsSummaryInput {
         SearchResultsSummaryInput {
-            query: "cache coherence".to_string(),
-            files: vec![SearchResultsSummaryFile {
-                title: "paper.pdf".to_string(),
-                excerpts: vec!["first finding".to_string(), "second finding".to_string()],
-            }],
+            query: "how caching affects execution".to_string(),
+            sources: vec![
+                SearchResultsSummarySource {
+                    title: "cache.pdf".to_string(),
+                },
+                SearchResultsSummarySource {
+                    title: "runtime.pdf".to_string(),
+                },
+            ],
+            passages: vec![
+                SearchResultsSummaryPassage {
+                    text: "The measured cache reduced repeated work during program execution."
+                        .to_string(),
+                    source_index: 0,
+                },
+                SearchResultsSummaryPassage {
+                    text: "Runtime stalls declined after the cache was enabled in the experiment."
+                        .to_string(),
+                    source_index: 1,
+                },
+            ],
         }
     }
 
@@ -278,172 +275,84 @@ mod tests {
     }
 
     #[test]
-    fn prompt_numbers_every_file_by_position_and_bounds_excerpts() {
-        let repeated = "é".repeat(MAX_EXCERPT_CHARS + 50);
-        let mut files = Vec::new();
-        for index in 0..(MAX_FILES + 2) {
-            files.push(SearchResultsSummaryFile {
-                title: format!("file-{index}"),
-                excerpts: vec![
-                    repeated.clone(),
-                    format!("unique-{index}"),
-                    format!("second-{index}"),
-                    format!("ignored-{index}"),
-                ],
-            });
-        }
-        let request = build_request(&SearchResultsSummaryInput {
-            query: "query".to_string(),
-            files,
-        });
-
-        // Numbered by position, capped at MAX_FILES, never renumbered.
-        assert!(request.prompt.contains("[1] file-0"));
-        assert!(request.prompt.contains("[5] file-4"));
-        assert!(!request.prompt.contains("file-5"));
-        // At most MAX_EXCERPTS_PER_FILE excerpts survive per file.
-        assert!(!request.prompt.contains("ignored-0"));
-        // Each excerpt is truncated to the character budget.
-        assert!(!request.prompt.contains(&"é".repeat(MAX_EXCERPT_CHARS + 1)));
+    fn request_preserves_passage_order_and_uses_open_ended_grammar() {
+        let request = build_request(&input()).unwrap();
+        let first = request.prompt.find("The measured cache").unwrap();
+        let second = request.prompt.find("Runtime stalls").unwrap();
+        assert!(first < second);
+        assert!(request
+            .prompt
+            .contains("ordered from most to least relevant"));
         assert_eq!(request.max_tokens, MAX_TOKENS);
-        assert_eq!(
-            request.sampling,
-            Sampling {
-                temperature: 0.2,
-                top_p: None,
-                top_k: Some(32),
-                repeat_penalty: Some((1.15, 64)),
-                seed: 0,
-            }
-        );
+        assert_eq!(request.sampling, Sampling::default());
         assert!(matches!(request.constraint, Constraint::Grammar(_)));
-        assert!(
-            request.prompt.rfind("Question: query").unwrap()
-                > request.prompt.rfind("End evidence.").unwrap()
-        );
-        assert!(!request.prompt.contains("no preamble"));
     }
 
     #[test]
-    fn request_uses_a_grammar_over_the_supplied_source_numbers() {
-        let request = build_request(&input());
-        let Constraint::Grammar(grammar) = &request.constraint else {
-            panic!("expected a grammar constraint");
-        };
-        let grammar = Grammar::parse(grammar).expect("the answer grammar must compile");
-        assert!(accepts(&grammar, "Caches stay coherent [1]."));
-        // Uncited claims and out-of-range sources are outside the language.
-        assert!(!accepts(&grammar, "Caches stay coherent."));
-        assert!(!accepts(&grammar, "Caches stay coherent [2]."));
-        assert!(!accepts(
-            &grammar,
-            "Caches stay coherent. Batching reduces stalls [1]."
-        ));
-    }
-
-    #[test]
-    fn grammar_admits_up_to_max_sentences_of_grounded_prose() {
+    fn grammar_requires_valid_citations_and_at_most_three_sentences() {
         let grammar = Grammar::parse(&build_grammar(&[1, 2])).unwrap();
-        assert!(accepts(&grammar, "First point [1]. Second point [2]."));
-        let longest = (0..MAX_SENTENCES)
-            .map(|_| "point [1].")
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(accepts(&grammar, &longest));
-        let too_many = (0..MAX_SENTENCES + 1)
-            .map(|_| "point [1].")
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(!accepts(&grammar, &too_many));
-    }
-
-    #[test]
-    fn every_supplied_source_count_produces_a_compiling_grammar() {
-        for sources in 1..=MAX_FILES {
-            let numbers = (1..=sources).collect::<Vec<_>>();
-            Grammar::parse(&build_grammar(&numbers))
-                .unwrap_or_else(|_| panic!("grammar for {sources} sources must compile"));
-        }
-    }
-
-    #[test]
-    fn sentence_bodies_are_finite_and_the_token_budget_reaches_the_longest_answer() {
-        let grammar = Grammar::parse(&build_grammar(&[1])).unwrap();
-        let longest_body = "x".repeat(MAX_SENTENCE_BODY_CHARS);
-        let longest = (0..MAX_SENTENCES)
-            .map(|_| format!("{longest_body}[1]."))
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(accepts(&grammar, &longest));
-        assert!(!accepts(
+        assert!(accepts(&grammar, "Caching reduces repeated work [1]."));
+        assert!(accepts(
             &grammar,
-            &format!("{}[1].", "x".repeat(MAX_SENTENCE_BODY_CHARS + 1))
+            "Caching reduces work [1]. Runtime stalls decline [2]."
         ));
-        assert_eq!(longest.chars().count() + 1, MAX_TOKENS);
+        assert!(!accepts(&grammar, "Caching reduces repeated work."));
+        assert!(!accepts(&grammar, "Caching reduces repeated work [3]."));
+        assert!(!accepts(&grammar, "One [1]. Two [1]. Three [2]. Four [2]."));
     }
 
     #[test]
-    fn empty_files_keep_their_caller_positions_out_of_the_citation_language() {
-        let input = SearchResultsSummaryInput {
-            query: "query".to_string(),
-            files: vec![
-                SearchResultsSummaryFile {
-                    title: "empty.pdf".to_string(),
-                    excerpts: vec![" ".to_string()],
-                },
-                SearchResultsSummaryFile {
-                    title: "evidence.pdf".to_string(),
-                    excerpts: vec!["relevant evidence".to_string()],
-                },
-            ],
-        };
-        let request = build_request(&input);
-        assert!(request.prompt.contains("[2] evidence.pdf"));
+    fn source_language_excludes_sources_without_passages() {
+        let mut input = input();
+        input.passages.truncate(1);
+        let request = build_request(&input).unwrap();
         let Constraint::Grammar(source) = request.constraint else {
             panic!("expected grammar");
         };
         let grammar = Grammar::parse(&source).unwrap();
-        assert!(accepts(&grammar, "Relevant evidence supports this [2]."));
-        assert!(!accepts(&grammar, "Relevant evidence supports this [1]."));
+        assert!(accepts(&grammar, "Supported answer [1]."));
+        assert!(!accepts(&grammar, "Unsupported answer [2]."));
     }
 
     #[test]
-    fn streams_and_verifies_the_answer() {
-        let generator = MockGenerator::scripted(["Caching reduces stalls [1]."]);
+    fn validates_bounds_and_sources_before_generation() {
+        let generator = MockGenerator::scripted(["unused"]);
+        let mut invalid = input();
+        invalid.passages[0].source_index = 5;
+        assert!(summarize_search_results(&generator, &invalid, &mut |_| {
+            ControlFlow::Continue(())
+        })
+        .is_err());
+
+        invalid = input();
+        invalid.passages[0].text = "é".repeat(MAX_PASSAGE_CHARS + 1);
+        assert!(summarize_search_results(&generator, &invalid, &mut |_| {
+            ControlFlow::Continue(())
+        })
+        .is_err());
+        assert_eq!(generator.request_count(), 0);
+    }
+
+    #[test]
+    fn streams_only_a_verified_cited_answer() {
+        let generator =
+            MockGenerator::scripted(["Caching reduces work [1]. Runtime stalls decline [2]."]);
         let mut streamed = String::new();
-        let generated = summarize_search_results(&generator, &input(), &mut |token| {
-            streamed.push_str(token);
+        let generated = summarize_search_results(&generator, &input(), &mut |delta| {
+            streamed.push_str(delta);
             ControlFlow::Continue(())
         })
         .unwrap();
-
         assert_eq!(streamed, generated.text);
         assert_eq!(generated.stop, StopReason::Eos);
     }
 
     #[test]
-    fn rejects_an_answer_without_any_citation() {
-        let generator = MockGenerator::scripted(["Caching reduces stalls everywhere."]);
-        assert!(
-            summarize_search_results(&generator, &input(), &mut |_| ControlFlow::Continue(()))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn rejects_a_citation_outside_the_supplied_sources() {
-        let generator = MockGenerator::scripted(["Caching reduces stalls [3]."]);
-        assert!(
-            summarize_search_results(&generator, &input(), &mut |_| ControlFlow::Continue(()))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn rejects_numeric_and_repeating_degeneration_even_when_it_is_cited() {
+    fn rejects_uncited_out_of_range_and_repeating_answers() {
         for answer in [
-            "14141414141414141414[1].",
-            "Econometric evidence 14141414141414141414[1].",
+            "Caching reduces repeated work.",
+            "Caching reduces repeated work [3].",
+            "Caching 1414141414141414 reduces repeated work [1].",
         ] {
             let generator = MockGenerator::scripted([answer]);
             let mut streamed = String::new();
@@ -455,31 +364,28 @@ mod tests {
                 .is_err(),
                 "{answer}"
             );
-            assert!(
-                streamed.is_empty(),
-                "invalid output must never be displayed"
-            );
+            assert!(streamed.is_empty());
         }
-    }
-
-    #[test]
-    fn cancellation_after_validation_is_still_an_error() {
-        let generator = MockGenerator::scripted(["Caching reduces stalls [1]."]);
-        assert!(
-            summarize_search_results(&generator, &input(), &mut |_| ControlFlow::Break(()))
-                .is_err()
-        );
     }
 
     #[test]
     fn empty_inputs_issue_no_request() {
         let generator = MockGenerator::scripted(["unused"]);
         let mut empty = input();
-        empty.files[0].excerpts = vec![" ".to_string()];
+        empty.passages.clear();
         assert!(
             summarize_search_results(&generator, &empty, &mut |_| ControlFlow::Continue(()))
                 .is_err()
         );
         assert_eq!(generator.request_count(), 0);
+    }
+
+    #[test]
+    fn cancellation_after_validation_is_an_error() {
+        let generator = MockGenerator::scripted(["Caching reduces repeated work [1]."]);
+        assert!(
+            summarize_search_results(&generator, &input(), &mut |_| ControlFlow::Break(()))
+                .is_err()
+        );
     }
 }

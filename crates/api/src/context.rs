@@ -2536,7 +2536,7 @@ impl AppContext {
         .await
     }
 
-    /// Stream a synthesis of one completed, ranked search-result snapshot.
+    /// Synthesize a cited answer from cleaned, rank-preserving search passages.
     pub async fn summarize_search_results(
         self: Arc<Self>,
         request_id: String,
@@ -4044,14 +4044,19 @@ mod tests {
         let ctx = generation_ctx(dir.path(), Arc::clone(&events));
         enable_generation(&ctx, "mock-generator").await;
         *ctx.generator.lock() = Some(Arc::new(MockGenerator::scripted([
-            "The leading studies agree [1].",
+            "The leading studies agree on the measured outcome [1].",
         ])));
         let input = SearchResultsSummaryInput {
             query: "agreement".to_string(),
-            files: vec![
-                wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryFile {
+            sources: vec![
+                wilkes_core::generate::tasks::search_results_summary::SearchResultsSummarySource {
                     title: "paper.pdf".to_string(),
-                    excerpts: vec!["The studies agree.".to_string()],
+                },
+            ],
+            passages: vec![
+                wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryPassage {
+                    text: "The leading studies agree on the measured outcome.".to_string(),
+                    source_index: 0,
                 },
             ],
         };
@@ -4071,7 +4076,7 @@ mod tests {
                         task: GenerationTask::SearchResultsSummary,
                         text,
                     } if request_id == "results-request"
-                        && text == "The leading studies agree [1]."
+                        && text == "The leading studies agree on the measured outcome [1]."
                 )
         }));
     }

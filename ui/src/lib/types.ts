@@ -392,17 +392,24 @@ export type GenerationTask =
   | "document_summary"
   | "search_results_summary";
 
-export interface SearchResultsSummaryFile {
+export interface SearchResultsSummarySource {
   title: string;
-  excerpts: string[];
-  /** Anchor for the citation link; the backend ignores it (serde skips unknown
-   * fields) and numbers sources purely by position. */
+  /** Anchor for citation links; the backend ignores unknown fields and uses
+   * source positions only. */
   path: string;
+}
+
+export interface SearchResultsSummaryPassage {
+  /** A cleaned source passage in authoritative search-result order. */
+  text: string;
+  /** Zero-based index into `sources`. */
+  source_index: number;
 }
 
 export interface SearchResultsSummaryInput {
   query: string;
-  files: SearchResultsSummaryFile[];
+  sources: SearchResultsSummarySource[];
+  passages: SearchResultsSummaryPassage[];
 }
 
 export interface GenerationSampling {

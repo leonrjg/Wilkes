@@ -463,7 +463,8 @@ describe("HttpSearchApi", () => {
     );
     const resultsInput = {
       query: "cache",
-      files: [{ title: "a.pdf", excerpts: ["finding"] }],
+      sources: [{ title: "a.pdf", path: "/docs/a.pdf" }],
+      passages: [{ text: "Caching reduces repeated work.", source_index: 0 }],
     };
     await api.summarizeSearchResults("results-1", resultsInput);
     expect(fetch).toHaveBeenLastCalledWith(

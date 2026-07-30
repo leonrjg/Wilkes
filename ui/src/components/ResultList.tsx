@@ -58,6 +58,7 @@ import {
 } from "./DocumentEntryRow";
 import SearchResultsSummary from "./SearchResultsSummary";
 import {
+  buildSearchResultsChatPrompt,
   buildSearchResultsSummaryInput,
   searchResultsSummaryKey,
 } from "../lib/utils/searchResultsSummary";
@@ -418,6 +419,8 @@ export default function ResultList({
   const replaySearch = useSearchStore((s) => s.replaySearch);
   const { addToast } = useToasts();
   const generationReady = useGenerationStore((s) => s.ready);
+  const hasAvailableChatBackend = useChatStore((s) => s.hasAvailableBackend);
+  const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
 
   const fileList = useSettingsStore((s) => s.fileList);
   const omittedFileList = useSettingsStore((s) => s.omittedFileList);
@@ -721,7 +724,7 @@ export default function ResultList({
     stats &&
     stats.total_matches === totalCount &&
     summaryInput.query &&
-    summaryInput.files.length > 0
+    totalCount > 0
       ? searchResultsSummaryKey(summaryInput)
       : null;
   const summaryOpen =
@@ -973,6 +976,18 @@ export default function ResultList({
           input={summaryInput}
           requestKey={completedSummaryKey}
           onClose={() => setOpenSummaryKey(null)}
+          onExplore={
+            hasAvailableChatBackend
+              ? () => {
+                  openChatPaneAndSend(
+                    buildSearchResultsChatPrompt(summaryInput.query, results),
+                  ).catch((error) => {
+                    console.error("Explore search results failed:", error);
+                    addToast("Could not open agent chat", { type: "error" });
+                  });
+                }
+              : undefined
+          }
         />
       )}
 

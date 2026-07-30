@@ -1,9 +1,9 @@
 import { Fragment, useCallback } from "react";
-import { Check, Copy, RefreshCw, X } from "react-feather";
+import { Check, Copy, MessageCircle, RefreshCw, X } from "react-feather";
 import { useGenerationStream } from "../hooks/useGenerationStream";
 import type {
-  SearchResultsSummaryFile,
   SearchResultsSummaryInput,
+  SearchResultsSummarySource,
 } from "../lib/types";
 import { api } from "../services";
 import { useViewerStore } from "../stores/useViewerStore";
@@ -14,16 +14,16 @@ interface Props {
   input: SearchResultsSummaryInput;
   requestKey: string;
   onClose: () => void;
+  onExplore?: () => void;
 }
 
 /**
- * Render the answer, turning each `[k]` the grammar emitted into a link that
- * opens the k-th source. `k` maps to `files[k - 1]` because the backend numbers
- * sources by the exact order it received them.
+ * Render the synthesized answer, turning each constrained `[k]` citation into
+ * a link to `sources[k - 1]`.
  */
 function renderAnswer(
   text: string,
-  files: SearchResultsSummaryFile[],
+  sources: SearchResultsSummarySource[],
   openFile: (path: string) => void,
 ) {
   const nodes: React.ReactNode[] = [];
@@ -33,14 +33,14 @@ function renderAnswer(
   let key = 0;
   while ((match = citation.exec(text)) !== null) {
     if (match.index > cursor) nodes.push(text.slice(cursor, match.index));
-    const file = files[Number(match[1]) - 1];
-    if (file) {
+    const source = sources[Number(match[1]) - 1];
+    if (source) {
       nodes.push(
         <button
           key={`cite-${key++}`}
           type="button"
-          onClick={() => openFile(file.path)}
-          title={file.title}
+          onClick={() => openFile(source.path)}
+          title={source.title}
           className="mx-0.5 rounded bg-[var(--bg-active)] px-1 font-medium text-[var(--text-main)] hover:bg-[var(--bg-hover)]"
         >
           {match[0]}
@@ -59,14 +59,16 @@ export default function SearchResultsSummary({
   input,
   requestKey,
   onClose,
+  onExplore,
 }: Props) {
   const openFile = useViewerStore((state) => state.openFile);
   const start = useCallback(
     (requestId: string) => api.summarizeSearchResults(requestId, input),
     [input],
   );
+  const hasPassages = input.passages.length > 0;
   const { phase, retry } = useGenerationStream({
-    enabled: true,
+    enabled: hasPassages,
     requestKey,
     task: "search_results_summary",
     start,
@@ -114,12 +116,17 @@ export default function SearchResultsSummary({
         </Tooltip>
       </div>
       <div aria-live="polite" className="min-h-0 overflow-y-auto px-3 pb-3">
-        {phase.kind === "queued" && (
+        {!hasPassages && (
+          <p className="text-xs leading-relaxed text-[var(--text-muted)]">
+            No substantive passage in these results directly addresses the query.
+          </p>
+        )}
+        {hasPassages && phase.kind === "queued" && (
           <p className="text-xs italic text-[var(--text-dim)]">Summarizing…</p>
         )}
         {text && (
           <p className="whitespace-pre-wrap text-xs leading-relaxed text-[var(--text-muted)]">
-            {renderAnswer(text, input.files, openFile)}
+            {renderAnswer(text, input.sources, openFile)}
             {phase.kind === "streaming" && <span className="animate-pulse">▍</span>}
           </p>
         )}
@@ -135,21 +142,33 @@ export default function SearchResultsSummary({
             </button>
           </div>
         )}
-        <p className="mt-2 text-[10px] leading-relaxed text-[var(--text-dim)]">
-          {input.files.map((file, index) => (
-            <Fragment key={file.path}>
-              {index > 0 && " · "}
-              <button
-                type="button"
-                onClick={() => openFile(file.path)}
-                title={file.title}
-                className="hover:text-[var(--text-main)] hover:underline"
-              >
-                [{index + 1}] {file.title}
-              </button>
-            </Fragment>
-          ))}
-        </p>
+        {input.sources.length > 0 && (
+          <p className="mt-2 text-[10px] leading-relaxed text-[var(--text-dim)]">
+            {input.sources.map((source, index) => (
+              <Fragment key={source.path}>
+                {index > 0 && " · "}
+                <button
+                  type="button"
+                  onClick={() => openFile(source.path)}
+                  title={source.title}
+                  className="hover:text-[var(--text-main)] hover:underline"
+                >
+                  [{index + 1}] {source.title}
+                </button>
+              </Fragment>
+            ))}
+          </p>
+        )}
+        {onExplore && (
+          <button
+            type="button"
+            onClick={onExplore}
+            className="mt-2 inline-flex items-center gap-1 rounded border border-[var(--border-main)] px-2 py-1 text-xs text-[var(--text-muted)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)]"
+          >
+            <MessageCircle size={12} aria-hidden="true" />
+            Explore results in agent chat
+          </button>
+        )}
       </div>
     </section>
   );

@@ -12,6 +12,7 @@ import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useResearchStore } from "../stores/useResearchStore";
 import { useGenerationStore } from "../stores/useGenerationStore";
+import { useChatStore } from "../stores/useChatStore";
 import type { FileEntry, GenerationStreamEvent } from "../lib/types";
 
 const {
@@ -27,6 +28,7 @@ const {
   mockIsTauri,
   mockSummarizeSearchResults,
   mockOnGenerationStream,
+  mockOpenChatPaneAndSend,
 } = vi.hoisted(() => ({
   mockOpenPath: vi.fn(),
   mockRevealPath: vi.fn(),
@@ -40,6 +42,7 @@ const {
   mockIsTauri: { value: false },
   mockSummarizeSearchResults: vi.fn().mockResolvedValue(undefined),
   mockOnGenerationStream: vi.fn(),
+  mockOpenChatPaneAndSend: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../services", () => ({
@@ -145,6 +148,10 @@ describe("ResultList", () => {
       load: vi.fn().mockResolvedValue(undefined),
     } as any);
     useGenerationStore.setState({ ready: false });
+    useChatStore.setState({
+      hasAvailableBackend: false,
+      openPaneAndSend: mockOpenChatPaneAndSend,
+    });
   });
 
   it("renders empty state when no query", () => {
@@ -844,7 +851,8 @@ describe("ResultList", () => {
           matches: [
             {
               text_range: null,
-              matched_text: "Top-ranked finding",
+              matched_text:
+                "Caching behavior converges across the leading measured result.",
               context_before: "",
               context_after: "",
               origin: { PdfPage: { page: 1, bbox: null } },
@@ -868,11 +876,16 @@ describe("ResultList", () => {
     const [requestId, input] = mockSummarizeSearchResults.mock.calls[0];
     expect(input).toEqual({
       query: "cache behavior",
-      files: [
+      sources: [
         {
           title: "top.pdf",
-          excerpts: ["Top-ranked finding"],
           path: "/papers/top.pdf",
+        },
+      ],
+      passages: [
+        {
+          text: "Caching behavior converges across the leading measured result.",
+          source_index: 0,
         },
       ],
     });
@@ -882,14 +895,18 @@ describe("ResultList", () => {
         phase: "completed",
         request_id: requestId,
         task: "search_results_summary",
-        text: "Caching behavior converges across the leading result [1].",
+        text: "Caching behavior converges across the leading measured result [1].",
       });
     });
     // The prose renders as a text node; the citation renders as its own link.
+    const summary = screen.getByText("Results summary").closest("section");
+    expect(summary).not.toBeNull();
     expect(
-      await screen.findByText(/Caching behavior converges across the leading result/),
+      within(summary!).getByText(
+        /Caching behavior converges across the leading measured result/,
+      ),
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "[1]" })).toBeInTheDocument();
+    expect(within(summary!).getByRole("button", { name: "[1]" })).toBeInTheDocument();
 
     act(() => useSearchStore.setState({ searching: true }));
 
@@ -911,6 +928,73 @@ describe("ResultList", () => {
     expect(
       screen.queryByRole("button", { name: "Summarize results" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("skips generation when cleaning leaves only references and offers agent chat", async () => {
+    useGenerationStore.setState({ ready: true });
+    useChatStore.setState({ hasAvailableBackend: true });
+    useSearchStore.setState({
+      hasQuery: true,
+      searching: false,
+      lastQuery: {
+        pattern: "use of econometric methods in computer science research",
+        root: "/papers",
+        is_regex: false,
+        case_sensitive: false,
+        max_results: 100,
+        respect_gitignore: true,
+        max_file_size: 1_000_000,
+        context_lines: 2,
+        mode: "Semantic",
+        scope: { type: "corpus" },
+        supported_extensions: ["pdf"],
+      },
+      results: [
+        {
+          path: "/papers/references.pdf",
+          file_type: "Pdf",
+          matches: [
+            {
+              text_range: null,
+              matched_text:
+                "References. Isaac Baley and Laura Veldkamp. Bayesian learning. NBER Working Paper 29338, 2021. Another Author. Related title. Journal of Economics, 2023.",
+              context_before: "",
+              context_after: "",
+              origin: { PdfPage: { page: 1, bbox: null } },
+              score: 0.98,
+            },
+          ],
+        },
+      ],
+      stats: {
+        total_matches: 1,
+        files_scanned: 1,
+        elapsed_ms: 12,
+        errors: [],
+      },
+    });
+
+    renderWithToasts();
+    fireEvent.click(screen.getByRole("button", { name: "Summarize results" }));
+
+    expect(
+      screen.getByText(
+        "No substantive passage in these results directly addresses the query.",
+      ),
+    ).toBeInTheDocument();
+    expect(mockOnGenerationStream).not.toHaveBeenCalled();
+    expect(mockSummarizeSearchResults).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Explore results in agent chat" }),
+    );
+    await waitFor(() => expect(mockOpenChatPaneAndSend).toHaveBeenCalledOnce());
+    expect(mockOpenChatPaneAndSend.mock.calls[0][0]).toContain(
+      "Search query: use of econometric methods in computer science research",
+    );
+    expect(mockOpenChatPaneAndSend.mock.calls[0][0]).toContain(
+      "- /papers/references.pdf",
+    );
   });
 
   it("handles empty results and searching state", () => {
