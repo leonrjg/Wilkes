@@ -65,6 +65,7 @@ interface SettingsStore {
   addFavorite: (dir: string) => void;
   removeFavorite: (dir: string) => void;
   forgetDirectory: (dir: string) => void;
+  renameDirectory: (oldPath: string, newPath: string) => void;
   refreshFileList: () => Promise<void>;
   applyMetadataUpdates: (updates: FileMetadataUpdate[]) => void;
   setPreferSemantic: (active: boolean) => void;
@@ -174,6 +175,32 @@ export const useSettingsStore = create<SettingsStore>()(
       }).catch(() => {});
 
       set({ favorites: nextBookmarks, recentDirs: nextRecent, directory: nextDir });
+    },
+
+    renameDirectory: (oldPath: string, newPath: string) => {
+      if (oldPath === newPath) return;
+      // A rename invalidates every stored path equal to, or nested under, the
+      // renamed folder. Rewrite the prefix so favorites, history and the active
+      // directory keep pointing at the same folders.
+      const remap = (path: string): string => {
+        if (path === oldPath) return newPath;
+        if (path.startsWith(`${oldPath}/`) || path.startsWith(`${oldPath}\\`)) {
+          return newPath + path.slice(oldPath.length);
+        }
+        return path;
+      };
+      const { favorites, recentDirs, directory } = get();
+      const nextFavorites = favorites.map(remap);
+      const nextRecent = recentDirs.map(remap);
+      const nextDir = remap(directory);
+
+      api.updateSettings({
+        favorites: nextFavorites,
+        recent_dirs: nextRecent,
+        last_directory: nextDir || null,
+      }).catch(() => {});
+
+      set({ favorites: nextFavorites, recentDirs: nextRecent, directory: nextDir });
     },
 
     refreshFileList: async () => {

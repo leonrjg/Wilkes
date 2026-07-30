@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ChevronDown, ChevronRight, Folder } from "react-feather";
 
 interface Props {
@@ -6,11 +6,29 @@ interface Props {
   selected: string;
   onSelect: (path: string) => void;
   loadChildren: (path: string) => Promise<string[]>;
+  /** Overrides the displayed name for specific paths (keyed by path). */
+  labels?: Record<string, string>;
 }
 
 function baseName(path: string): string {
   const trimmed = path.replace(/[/\\]+$/, "");
   return trimmed.split(/[/\\]/).pop() || path;
+}
+
+function normalize(path: string): string {
+  return path.replace(/[/\\]+$/, "");
+}
+
+/** The containing directory of `path` (empty when it has no parent segment). */
+export function parentPath(path: string): string {
+  return normalize(path).replace(/[/\\][^/\\]*$/, "");
+}
+
+/** True when `ancestor` is a strict parent (at any depth) of `path`. */
+export function isStrictAncestor(ancestor: string, path: string): boolean {
+  const a = normalize(ancestor);
+  const p = normalize(path);
+  return p !== a && (p.startsWith(`${a}/`) || p.startsWith(`${a}\\`));
 }
 
 function DirectoryNode({
@@ -19,16 +37,39 @@ function DirectoryNode({
   selected,
   onSelect,
   loadChildren,
+  allRoots,
+  labels,
 }: {
   path: string;
   depth: number;
   selected: string;
   onSelect: (path: string) => void;
   loadChildren: (path: string) => Promise<string[]>;
+  allRoots: string[];
+  labels?: Record<string, string>;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  const label = labels?.[path] ?? baseName(path);
+  // Auto-expand when another root lives inside this one, so the nested root is
+  // revealed in place instead of being duplicated at the top level.
+  const autoExpand = allRoots.some((root) => isStrictAncestor(path, root));
+  const [expanded, setExpanded] = useState(autoExpand);
   const [children, setChildren] = useState<string[] | null>(null);
   const [error, setError] = useState(false);
+
+  const load = async () => {
+    setError(false);
+    try {
+      setChildren(await loadChildren(path));
+    } catch {
+      setChildren([]);
+      setError(true);
+    }
+  };
+
+  useEffect(() => {
+    if (autoExpand && children === null) load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoExpand]);
 
   const toggle = async () => {
     if (expanded) {
@@ -37,13 +78,7 @@ function DirectoryNode({
     }
     setExpanded(true);
     if (children !== null) return;
-    setError(false);
-    try {
-      setChildren(await loadChildren(path));
-    } catch {
-      setChildren([]);
-      setError(true);
-    }
+    await load();
   };
 
   return (
@@ -58,7 +93,7 @@ function DirectoryNode({
       >
         <button
           type="button"
-          aria-label={`${expanded ? "Collapse" : "Expand"} ${baseName(path)}`}
+          aria-label={`${expanded ? "Collapse" : "Expand"} ${label}`}
           onClick={toggle}
           className="flex h-7 w-7 shrink-0 items-center justify-center rounded hover:bg-black/10"
         >
@@ -71,7 +106,7 @@ function DirectoryNode({
           className="flex min-w-0 flex-1 items-center gap-2 self-stretch text-left"
         >
           <Folder size={15} className="shrink-0" />
-          <span className="truncate">{baseName(path)}</span>
+          <span className="truncate">{label}</span>
         </button>
       </div>
       {expanded && (
@@ -94,6 +129,8 @@ function DirectoryNode({
               selected={selected}
               onSelect={onSelect}
               loadChildren={loadChildren}
+              allRoots={allRoots}
+              labels={labels}
             />
           ))}
         </ul>
@@ -102,11 +139,17 @@ function DirectoryNode({
   );
 }
 
-export function DirectoryTree({ roots, selected, onSelect, loadChildren }: Props) {
+export function DirectoryTree({ roots, selected, onSelect, loadChildren, labels }: Props) {
+  // A root nested inside another root is reached by expanding its ancestor, so
+  // only surface roots that aren't descendants of any other root.
+  const topRoots = roots.filter(
+    (root) => !roots.some((other) => isStrictAncestor(other, root)),
+  );
+
   return (
     <div className="mb-3 max-h-72 overflow-auto rounded border border-[var(--border-main)] bg-[var(--bg-active)] p-1">
       <ul role="tree" aria-label="Destination directory">
-        {roots.map((root) => (
+        {topRoots.map((root) => (
           <DirectoryNode
             key={root}
             path={root}
@@ -114,6 +157,8 @@ export function DirectoryTree({ roots, selected, onSelect, loadChildren }: Props
             selected={selected}
             onSelect={onSelect}
             loadChildren={loadChildren}
+            allRoots={roots}
+            labels={labels}
           />
         ))}
       </ul>

@@ -59,6 +59,7 @@ pub async fn list_files(
                             modified_at_ms,
                             title: None,
                             author: None,
+                            doi: None,
                             publication_date: None,
                             citation_count: None,
                             metadata_conflicts: Default::default(),
@@ -81,6 +82,7 @@ pub async fn list_files(
                             modified_at_ms,
                             title: None,
                             author: None,
+                            doi: None,
                             publication_date: None,
                             citation_count: None,
                             metadata_conflicts: Default::default(),
@@ -100,6 +102,7 @@ pub async fn list_files(
                     modified_at_ms,
                     title: None,
                     author: None,
+                    doi: None,
                     publication_date: None,
                     citation_count: None,
                     metadata_conflicts: Default::default(),
@@ -168,8 +171,8 @@ pub async fn rename_file(path: PathBuf, new_name: String) -> anyhow::Result<Path
     validate_new_file_name(new_name)?;
 
     let metadata = tokio::fs::metadata(&path).await?;
-    if !metadata.is_file() {
-        anyhow::bail!("Can only rename files");
+    if !metadata.is_file() && !metadata.is_dir() {
+        anyhow::bail!("Can only rename files or folders");
     }
 
     let parent = path
@@ -182,6 +185,26 @@ pub async fn rename_file(path: PathBuf, new_name: String) -> anyhow::Result<Path
     }
 
     tokio::fs::rename(&path, &target).await?;
+    Ok(target)
+}
+
+pub async fn create_directory(parent: PathBuf, name: String) -> anyhow::Result<PathBuf> {
+    let name = name.trim();
+    validate_new_file_name(name)?;
+
+    let parent_meta = tokio::fs::metadata(&parent).await.map_err(|err| {
+        anyhow::anyhow!("Parent directory not found: {} ({err})", parent.display())
+    })?;
+    if !parent_meta.is_dir() {
+        anyhow::bail!("Parent is not a directory: {}", parent.display());
+    }
+
+    let target = parent.join(name);
+    if tokio::fs::try_exists(&target).await? {
+        anyhow::bail!("A file or folder with that name already exists");
+    }
+
+    tokio::fs::create_dir(&target).await?;
     Ok(target)
 }
 
@@ -449,6 +472,48 @@ mod tests {
         assert!(err.to_string().contains("path separators"));
 
         let err = rename_file(path, "taken.txt".into()).await.unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_rename_file_renames_a_directory() {
+        let dir = tempdir().unwrap();
+        let folder = dir.path().join("old");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("paper.pdf"), "pdf").unwrap();
+
+        let renamed = rename_file(folder.clone(), "new".into()).await.unwrap();
+
+        assert_eq!(renamed, dir.path().join("new"));
+        assert!(!folder.exists());
+        assert!(renamed.join("paper.pdf").is_file());
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_creates_child_folder() {
+        let dir = tempdir().unwrap();
+
+        let created = create_directory(dir.path().to_path_buf(), "Reference".into())
+            .await
+            .unwrap();
+
+        assert_eq!(created, dir.path().join("Reference"));
+        assert!(created.is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_rejects_path_names_and_existing_targets() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("taken")).unwrap();
+
+        let err = create_directory(dir.path().to_path_buf(), "../escape".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("path separators"));
+
+        let err = create_directory(dir.path().to_path_buf(), "taken".into())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("already exists"));
     }
 

@@ -19,6 +19,8 @@ import type {
   MatchRef,
   DocumentMetadata,
   ModelDescriptor,
+  CitationLinks,
+  CitationLinksQuery,
   NewBookmark,
   OpenAlexWork,
   PreviewData,
@@ -56,6 +58,7 @@ export interface SearchApi {
   ): Promise<string>;
   cancelSearch(searchId: string): Promise<void>;
   relatedDocuments(query: RelatedDocumentsQuery): Promise<RelatedDocument[]>;
+  citationLinks(query: CitationLinksQuery): Promise<CitationLinks>;
   preview(matchRef: MatchRef): Promise<PreviewData>;
   getSettings(): Promise<Settings>;
   updateSettings(patch: Partial<Settings>): Promise<Settings>;
@@ -192,6 +195,7 @@ export interface DesktopSourceApi extends SourceApi {
   readClipboardFiles(): Promise<string[]>;
   moveFile(path: string, targetRoot: string): Promise<string>;
   listDirectories(path: string): Promise<string[]>;
+  createDirectory(parent: string, name: string): Promise<string>;
 }
 
 export interface WebSourceApi extends SourceApi {

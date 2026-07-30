@@ -96,7 +96,18 @@ export function buildFileContextMenuItems({
     });
   }
 
-  if (target.kind === "directory") return primaryItems;
+  if (target.kind === "directory") {
+    if (isTauri && onRenameRequest) {
+      primaryItems.push({
+        id: "rename",
+        label: "Rename",
+        icon: Edit2,
+        dividerBefore: true,
+        run: () => onRenameRequest(target.path),
+      });
+    }
+    return primaryItems;
+  }
 
   const managementItems: ContextMenuItem[] = [
     {

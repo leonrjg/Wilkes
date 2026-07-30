@@ -225,6 +225,29 @@ describe("useSettingsStore", () => {
     });
   });
 
+  it("should remap favorites, history and current directory when a folder is renamed", () => {
+    useSettingsStore.setState({
+      favorites: ["/lib/old", "/lib/old/sub", "/other"],
+      recentDirs: ["/lib/old/sub", "/keep"],
+      directory: "/lib/old",
+    });
+    (api.updateSettings as any).mockResolvedValue({});
+
+    useSettingsStore.getState().renameDirectory("/lib/old", "/lib/new");
+
+    const state = useSettingsStore.getState();
+    // The renamed folder and every nested path pick up the new prefix; unrelated
+    // paths are untouched.
+    expect(state.favorites).toEqual(["/lib/new", "/lib/new/sub", "/other"]);
+    expect(state.recentDirs).toEqual(["/lib/new/sub", "/keep"]);
+    expect(state.directory).toBe("/lib/new");
+    expect(api.updateSettings).toHaveBeenCalledWith({
+      favorites: ["/lib/new", "/lib/new/sub", "/other"],
+      recent_dirs: ["/lib/new/sub", "/keep"],
+      last_directory: "/lib/new",
+    });
+  });
+
   it("should apply settings patch", () => {
     useSettingsStore.getState().applySettingsPatch({ theme: "Light" });
     expect(useSettingsStore.getState().theme).toBe("Light");

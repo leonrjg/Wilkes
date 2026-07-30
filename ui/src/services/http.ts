@@ -19,6 +19,8 @@ import type {
   MatchRef,
   DocumentMetadata,
   ModelDescriptor,
+  CitationLinks,
+  CitationLinksQuery,
   NewBookmark,
   OpenAlexWork,
   PreviewData,
@@ -128,6 +130,16 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw new Error(`relatedDocuments failed: ${res.status}`);
     return res.json() as Promise<RelatedDocument[]>;
+  }
+
+  async citationLinks(query: CitationLinksQuery): Promise<CitationLinks> {
+    const res = await fetch("/api/citation-links", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(query),
+    });
+    if (!res.ok) throw new Error(`citationLinks failed: ${res.status}`);
+    return res.json() as Promise<CitationLinks>;
   }
 
   async clusterBookmarks(query: BookmarkClustersQuery): Promise<BookmarkClustersResult> {

@@ -1026,6 +1026,14 @@ async fn related_documents(
     app_context(&app).related_documents(query).await
 }
 
+#[tauri::command]
+async fn citation_links(
+    query: wilkes_core::types::CitationLinksQuery,
+    app: AppHandle,
+) -> Result<wilkes_core::types::CitationLinks, String> {
+    app_context(&app).citation_links(query).await
+}
+
 // ── Chat commands ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -1668,6 +1676,14 @@ async fn move_file(path: String, target_root: String, app: AppHandle) -> Result<
 }
 
 #[tauri::command]
+async fn create_directory(parent: String, name: String) -> Result<String, String> {
+    wilkes_api::commands::files::create_directory(parent.into(), name)
+        .await
+        .map(|path| path.display().to_string())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn list_directories(path: String) -> Result<Vec<String>, String> {
     let mut entries = tokio::fs::read_dir(&path)
         .await
@@ -2128,6 +2144,7 @@ pub fn run() {
             search,
             cancel_search,
             related_documents,
+            citation_links,
             preview,
             list_files,
             open_file,
@@ -2135,6 +2152,7 @@ pub fn run() {
             import_files,
             read_clipboard_files,
             move_file,
+            create_directory,
             list_directories,
             trash_file,
             get_file_metadata,

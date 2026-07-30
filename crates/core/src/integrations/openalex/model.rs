@@ -21,6 +21,15 @@ pub struct OpenAlexWorkResponse {
     pub publication_date: Option<String>,
     #[serde(default)]
     pub cited_by_count: Option<i64>,
+    /// Top-level DOI, populated when the query selects `doi` directly (used by
+    /// batch id→DOI resolution for the citation graph). Metadata lookups read
+    /// the DOI from `ids` instead; both may be present.
+    #[serde(default)]
+    pub doi: Option<String>,
+    /// OpenAlex ids of the works this work references. Populated only when the
+    /// query selects `referenced_works`.
+    #[serde(default)]
+    pub referenced_works: Vec<String>,
     #[serde(default)]
     pub ids: HashMap<String, serde_json::Value>,
     #[serde(default)]

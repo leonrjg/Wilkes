@@ -39,6 +39,7 @@ export default function App() {
   const addFavorite = useSettingsStore((s) => s.addFavorite);
   const removeFavorite = useSettingsStore((s) => s.removeFavorite);
   const forgetDirectory = useSettingsStore((s) => s.forgetDirectory);
+  const renameDirectory = useSettingsStore((s) => s.renameDirectory);
   const refreshFileList = useSettingsStore((s) => s.refreshFileList);
   const applySettingsPatch = useSettingsStore((s) => s.applySettingsPatch);
   const setIndexing = useSettingsStore((s) => s.setIndexing);
@@ -259,6 +260,7 @@ export default function App() {
         onFavoriteAdd={addFavorite}
         onFavoriteRemove={removeFavorite}
         onForgetDirectory={forgetDirectory}
+        onRenameDirectory={renameDirectory}
       />
     ) : (
       <UploadZone

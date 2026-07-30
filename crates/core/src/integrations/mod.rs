@@ -2,9 +2,12 @@ use async_trait::async_trait;
 
 use crate::types::{IntegrationStatus, Settings};
 
+pub mod citations;
 pub mod openalex;
 pub mod semantic_scholar;
 pub mod zotero;
+
+pub use citations::CitationSource;
 
 #[async_trait]
 pub trait Integration: Send + Sync {

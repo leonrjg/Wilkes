@@ -2,6 +2,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
 
+use async_trait::async_trait;
+
+use crate::integrations::CitationSource;
 use crate::metadata::doi::normalize_doi;
 use crate::network::{ProviderHttpClient, ProviderHttpErrorKind};
 use crate::types::{
@@ -12,6 +15,12 @@ use super::model::{OpenAlexWorkResponse, OpenAlexWorksResponse};
 
 const LOOKUP_SELECT: &str =
     "id,doi,display_name,publication_year,publication_date,cited_by_count,ids,primary_location,best_oa_location,open_access";
+/// Minimal projection for fetching a work's outgoing reference ids.
+const REFERENCES_SELECT: &str = "id,referenced_works";
+/// Minimal projection for resolving OpenAlex ids back to DOIs.
+const RESOLVE_SELECT: &str = "id,doi";
+/// OpenAlex accepts up to 50 OR-values per filter; one call resolves a chunk.
+const RESOLVE_CHUNK: usize = 50;
 const STATUS_PROBE_DOI: &str = "10.1145/3801158";
 
 #[derive(Clone)]
@@ -122,6 +131,70 @@ impl OpenAlexClient {
             .collect())
     }
 
+    /// Resolve the DOIs referenced by `doi`. Fetches the work's
+    /// `referenced_works` (OpenAlex ids), then batch-resolves those ids to
+    /// DOIs. References without a DOI are dropped — they cannot be library
+    /// edges. See [`CitationSource`].
+    pub async fn references(&self, doi: &str) -> anyhow::Result<Vec<String>> {
+        let doi = normalize_doi(doi).ok_or_else(|| anyhow!("Invalid DOI: {doi}"))?;
+        let referenced_ids = self.fetch_referenced_work_ids(&doi).await?;
+        if referenced_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut dois = Vec::new();
+        for chunk in referenced_ids.chunks(RESOLVE_CHUNK) {
+            let resolved = self.lookup_works(self.resolve_url(chunk)).await?;
+            for work in resolved.results {
+                if let Some(doi) = work.doi.as_deref().and_then(normalize_doi) {
+                    dois.push(doi);
+                }
+            }
+        }
+        dois.sort();
+        dois.dedup();
+        Ok(dois)
+    }
+
+    /// Fetch the short OpenAlex ids (`W123…`) referenced by a work.
+    async fn fetch_referenced_work_ids(&self, doi: &str) -> anyhow::Result<Vec<String>> {
+        let body = self.lookup_works(self.references_url(doi)).await?;
+        Ok(body
+            .results
+            .into_iter()
+            .next()
+            .map(|work| {
+                work.referenced_works
+                    .iter()
+                    .filter_map(|id| short_openalex_id(id))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn references_url(&self, doi: &str) -> String {
+        let mut url = format!(
+            "{}/works?filter=doi:{}&select={REFERENCES_SELECT}&per-page=1",
+            self.base_url,
+            urlencoding::encode(&format!("https://doi.org/{doi}")),
+        );
+        self.append_mailto(&mut url);
+        url
+    }
+
+    fn resolve_url(&self, short_ids: &[String]) -> String {
+        // Short ids are alphanumeric (`W123…`); the `|` OR-operator must stay
+        // literal, so neither is percent-encoded.
+        let joined = short_ids.join("|");
+        let mut url = format!(
+            "{}/works?filter=openalex_id:{joined}&select={RESOLVE_SELECT}&per-page={}",
+            self.base_url,
+            short_ids.len(),
+        );
+        self.append_mailto(&mut url);
+        url
+    }
+
     async fn lookup_works(&self, url: String) -> anyhow::Result<OpenAlexWorksResponse> {
         match self.http.get_json::<OpenAlexWorksResponse>(url, &[]).await {
             Ok(body) => Ok(body),
@@ -168,12 +241,27 @@ impl OpenAlexClient {
     }
 }
 
+#[async_trait]
+impl CitationSource for OpenAlexClient {
+    async fn references(&self, doi: &str) -> anyhow::Result<Vec<String>> {
+        OpenAlexClient::references(self, doi).await
+    }
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|d| i64::try_from(d.as_millis()).ok())
         .unwrap_or(0)
+}
+
+/// Reduce an OpenAlex work id to its short form: `https://openalex.org/W123`
+/// (or a bare `W123`) becomes `W123`. Returns `None` for anything that is not a
+/// `W`-prefixed id, so non-work references never reach the resolve filter.
+fn short_openalex_id(id: &str) -> Option<String> {
+    let short = id.rsplit('/').next().unwrap_or(id).trim();
+    short.starts_with('W').then(|| short.to_string())
 }
 
 #[cfg(test)]
@@ -307,5 +395,68 @@ mod tests {
             Some("https://example.test/paper.pdf")
         );
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn references_fetches_referenced_ids_then_resolves_to_dois() {
+        let mut server = mockito::Server::new_async().await;
+        let refs_mock = server
+            .mock("GET", "/works")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("filter".into(), "doi:https://doi.org/10.1/anchor".into()),
+                Matcher::UrlEncoded("select".into(), REFERENCES_SELECT.into()),
+            ]))
+            .with_status(200)
+            .with_body(
+                r#"{"results":[{"id":"https://openalex.org/W1","referenced_works":["https://openalex.org/W10","https://openalex.org/W11","https://openalex.org/A99"]}]}"#,
+            )
+            .create_async()
+            .await;
+        // W10 resolves to a DOI, W11 has none (a book) and is dropped; A99 is
+        // not a work id and never reaches this call.
+        let resolve_mock = server
+            .mock("GET", "/works")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("filter".into(), "openalex_id:W10|W11".into()),
+                Matcher::UrlEncoded("select".into(), RESOLVE_SELECT.into()),
+            ]))
+            .with_status(200)
+            .with_body(
+                r#"{"results":[{"id":"https://openalex.org/W10","doi":"https://doi.org/10.5/ref"},{"id":"https://openalex.org/W11"}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let dois = OpenAlexClient::new(server.url(), None)
+            .references("10.1/anchor")
+            .await
+            .unwrap();
+
+        assert_eq!(dois, vec!["10.5/ref".to_string()]);
+        refs_mock.assert_async().await;
+        resolve_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn references_returns_empty_without_a_second_call_when_no_refs() {
+        let mut server = mockito::Server::new_async().await;
+        let refs_mock = server
+            .mock("GET", "/works")
+            .match_query(Matcher::UrlEncoded(
+                "select".into(),
+                REFERENCES_SELECT.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"results":[{"id":"https://openalex.org/W1","referenced_works":[]}]}"#)
+            .create_async()
+            .await;
+
+        let dois = OpenAlexClient::new(server.url(), None)
+            .references("10.1/anchor")
+            .await
+            .unwrap();
+
+        assert!(dois.is_empty());
+        refs_mock.assert_async().await;
     }
 }

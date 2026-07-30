@@ -40,6 +40,8 @@ const DEFAULT_SEARCH_CONTEXT_LINES: u32 = 2;
 const MAX_SEARCH_CONTEXT_LINES: u32 = 5;
 const DEFAULT_RELATED_DOCUMENTS_LIMIT: usize = 8;
 const MAX_RELATED_DOCUMENTS_LIMIT: usize = 25;
+const DEFAULT_LIST_DOCUMENTS_LIMIT: usize = 50;
+const MAX_LIST_DOCUMENTS_LIMIT: usize = 500;
 const DEFAULT_SEARCH_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 const SEMANTIC_INDEX_GUIDANCE: &str = "The user can enable the semantic index in Wilkes Settings. Use exact search with mode='exact' instead in the meantime.";
@@ -53,6 +55,8 @@ pub(crate) const WILKES_MCP_TOOL_NAMES: &[&str] = &[
     "list_context",
     "get_document_text",
     "get_related_documents",
+    "get_file_metadata",
+    "list_documents",
     "search",
     "literature_search",
 ];
@@ -456,6 +460,22 @@ struct LiteratureSearchParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GetFileMetadataParams {
+    /// Document to read metadata for. Omit to use the active document.
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ListDocumentsParams {
+    /// Corpus/library root to list. Omit for the current root.
+    root: Option<String>,
+    /// List location. Use all for the whole library; omit for the current root only.
+    scope: Option<SearchScopeParam>,
+    /// Maximum documents to return (1-500, default 50).
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct DownloadParams {
     /// Direct HTTP(S) URL of the file to download.
     url: String,
@@ -562,9 +582,53 @@ enum SearchScopeParamResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct GetFileMetadataResponse {
+    path: String,
+    #[serde(flatten)]
+    metadata: wilkes_core::types::DocumentMetadata,
+}
+
+#[derive(Debug, Serialize)]
+struct ListDocumentsResponse {
+    root: String,
+    scope: SearchScopeParamResponse,
+    documents: Vec<DocumentSummaryResponse>,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DocumentSummaryResponse {
+    path: String,
+    title: Option<String>,
+    author: Option<String>,
+    doi: Option<String>,
+    publication_date: Option<String>,
+    citation_count: Option<i64>,
+}
+
+impl From<wilkes_core::types::FileEntry> for DocumentSummaryResponse {
+    fn from(entry: wilkes_core::types::FileEntry) -> Self {
+        Self {
+            path: display_path(&entry.path),
+            title: entry.title,
+            author: entry.author,
+            doi: entry.doi,
+            publication_date: entry.publication_date,
+            citation_count: entry.citation_count,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 struct SearchFileResponse {
     path: String,
     file_type: wilkes_core::types::FileType,
+    /// Document title from cached metadata; null until the file is processed.
+    title: Option<String>,
+    /// Document author from cached metadata; null until the file is processed.
+    author: Option<String>,
+    /// Document DOI from cached metadata; null when absent or not yet processed.
+    doi: Option<String>,
     matches: Vec<SearchMatchResponse>,
 }
 
@@ -626,6 +690,32 @@ impl WilkesMcp {
         Parameters(params): Parameters<GetRelatedDocumentsParams>,
     ) -> CallToolResult {
         match get_related_documents_for_mcp(self, params).await {
+            Ok(response) => structured(response),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        }
+    }
+
+    #[tool(
+        description = "Read full bibliographic metadata for one Wilkes document: title, author, DOI, publication date, and any Semantic Scholar / OpenAlex enrichment. Omit path to use the active document."
+    )]
+    async fn get_file_metadata(
+        &self,
+        Parameters(params): Parameters<GetFileMetadataParams>,
+    ) -> CallToolResult {
+        match get_file_metadata_for_mcp(self, params).await {
+            Ok(response) => structured(response),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        }
+    }
+
+    #[tool(
+        description = "List documents in the Wilkes library with their title, author, and DOI. Set scope='all' to list the whole library; otherwise lists the current root. Use this to browse what documents exist rather than searching their contents."
+    )]
+    async fn list_documents(
+        &self,
+        Parameters(params): Parameters<ListDocumentsParams>,
+    ) -> CallToolResult {
+        match list_documents_for_mcp(self, params).await {
             Ok(response) => structured(response),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
@@ -1061,6 +1151,7 @@ async fn search_documents(
     };
     let query_text = query.pattern.clone();
     let collected = search
+        .clone()
         .search(query, max_files)
         .await
         .map_err(|message| match mode {
@@ -1068,18 +1159,148 @@ async fn search_documents(
             SearchModeParam::Exact => message,
         })?;
 
+    let mut matches = Vec::with_capacity(collected.files.len());
+    for file in collected.files {
+        let path = file.path.clone();
+        let mut response = SearchFileResponse::from(file);
+        // Best-effort bibliographic enrichment from the same cache the file list
+        // uses. Enrichment must never fail the search itself, but a real error
+        // (cache lock, access boundary) is an anomaly worth surfacing rather
+        // than silently dropping — so leave the fields null and log it.
+        match search.clone().document_metadata(path.clone()).await {
+            Ok(metadata) => {
+                response.title = metadata.title;
+                response.author = metadata.author;
+                response.doi = metadata.doi;
+            }
+            Err(error) => {
+                info!(path = %path.display(), %error, "search: metadata enrichment skipped");
+            }
+        }
+        matches.push(response);
+    }
+
     Ok(SearchResponse {
         query: query_text,
         mode,
         root,
         file,
-        matches: collected
-            .files
-            .into_iter()
-            .map(SearchFileResponse::from)
-            .collect(),
+        matches,
         stats: collected.stats,
         truncated: collected.truncated,
+    })
+}
+
+/// Resolve the document path for a single-document tool: an explicit `path`
+/// when given, otherwise the session's active document. Enforces the same
+/// read-access boundary every other document tool uses.
+async fn resolve_document_path(
+    mcp: &WilkesMcp,
+    path: Option<String>,
+) -> Result<PathBuf, String> {
+    let explicit = path
+        .as_ref()
+        .filter(|p| !p.trim().is_empty())
+        .map(PathBuf::from);
+    let path = match (&mcp.context, explicit) {
+        (_, Some(path)) => path,
+        (McpContext::Session(context), None) => context
+            .snapshot()
+            .active_doc
+            .map(|document| PathBuf::from(document.path))
+            .ok_or_else(|| "No active document is available; pass path explicitly.".to_string())?,
+        (McpContext::Library, None) => {
+            return Err(
+                "External Wilkes MCP has no active document; pass path explicitly.".to_string(),
+            );
+        }
+    };
+    if !mcp.is_path_allowed(&path).await {
+        return Err(read_access_error(&path));
+    }
+    Ok(path)
+}
+
+async fn get_file_metadata_for_mcp(
+    mcp: &WilkesMcp,
+    params: GetFileMetadataParams,
+) -> Result<GetFileMetadataResponse, String> {
+    let path = resolve_document_path(mcp, params.path).await?;
+    let search = mcp
+        .search
+        .clone()
+        .ok_or_else(|| "Wilkes document metadata is not available in this session.".to_string())?;
+    let metadata = search.document_metadata(path.clone()).await?;
+    Ok(GetFileMetadataResponse {
+        path: display_path(&path),
+        metadata,
+    })
+}
+
+async fn list_documents_for_mcp(
+    mcp: &WilkesMcp,
+    params: ListDocumentsParams,
+) -> Result<ListDocumentsResponse, String> {
+    let search = mcp
+        .search
+        .clone()
+        .ok_or_else(|| "Wilkes document listing is not available in this session.".to_string())?;
+    let all = params.scope == Some(SearchScopeParam::All);
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_LIST_DOCUMENTS_LIMIT)
+        .clamp(1, MAX_LIST_DOCUMENTS_LIMIT);
+
+    let roots: Vec<PathBuf> = if all {
+        let roots = mcp.library_roots().await;
+        if roots.is_empty() {
+            return Err("No Wilkes library roots are configured.".to_string());
+        }
+        roots
+    } else {
+        let root = match params.root.as_ref() {
+            Some(root) if !root.trim().is_empty() => PathBuf::from(root),
+            Some(_) => return Err("List-documents root cannot be empty.".to_string()),
+            None => mcp.current_root().await?,
+        };
+        // The external, library-scoped server must not list outside configured
+        // roots; a session server already trusts its own root.
+        if matches!(mcp.context, McpContext::Library)
+            && !is_within_roots(&root, &mcp.library_roots().await)
+        {
+            return Err(read_access_error(&root));
+        }
+        vec![root]
+    };
+
+    let display_root = if all {
+        "all".to_string()
+    } else {
+        display_path(&roots[0])
+    };
+
+    let mut documents = Vec::new();
+    let mut truncated = false;
+    'outer: for root in roots {
+        let listed = search.clone().list_documents(root).await?;
+        for entry in listed.files {
+            if documents.len() >= limit {
+                truncated = true;
+                break 'outer;
+            }
+            documents.push(DocumentSummaryResponse::from(entry));
+        }
+    }
+
+    Ok(ListDocumentsResponse {
+        root: display_root,
+        scope: if all {
+            SearchScopeParamResponse::All
+        } else {
+            SearchScopeParamResponse::CurrentRoot
+        },
+        documents,
+        truncated,
     })
 }
 
@@ -1261,6 +1482,9 @@ impl From<wilkes_core::types::FileMatches> for SearchFileResponse {
         Self {
             path: display_path(&file.path),
             file_type: file.file_type,
+            title: None,
+            author: None,
+            doi: None,
             matches: file
                 .matches
                 .into_iter()
@@ -1312,8 +1536,9 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
     use wilkes_core::types::{
-        FileMatches, FileType, Match, RelatedDocument, RelatedDocumentsQuery, SearchMode,
-        SearchQuery, SearchScope, SearchStats, SourceOrigin,
+        DocumentMetadata, FileEntry, FileListResponse, FileMatches, FileType, Match,
+        RelatedDocument, RelatedDocumentsQuery, SearchMode, SearchQuery, SearchScope, SearchStats,
+        SourceOrigin,
     };
 
     struct FakeSearch {
@@ -1322,6 +1547,8 @@ mod tests {
         default_root: Option<PathBuf>,
         response: Mutex<Option<CollectedSearch>>,
         related_response: Mutex<Option<Vec<RelatedDocument>>>,
+        documents: Mutex<Option<FileListResponse>>,
+        metadata: Mutex<Option<DocumentMetadata>>,
     }
 
     #[test]
@@ -1395,6 +1622,32 @@ mod tests {
             *self.last_related_query.lock().unwrap() = Some(query);
             Ok(self.related_response.lock().unwrap().take().unwrap())
         }
+
+        async fn list_documents(
+            self: Arc<Self>,
+            _root: PathBuf,
+        ) -> Result<FileListResponse, String> {
+            Ok(self
+                .documents
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(FileListResponse {
+                    files: Vec::new(),
+                    omitted: Vec::new(),
+                }))
+        }
+
+        async fn document_metadata(
+            self: Arc<Self>,
+            _path: PathBuf,
+        ) -> Result<DocumentMetadata, String> {
+            self.metadata
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| "no metadata".to_string())
+        }
     }
 
     fn fake_search_with_root(root: PathBuf) -> Arc<FakeSearch> {
@@ -1404,6 +1657,8 @@ mod tests {
             default_root: Some(root),
             response: Mutex::new(None),
             related_response: Mutex::new(None),
+            documents: Mutex::new(None),
+            metadata: Mutex::new(None),
         })
     }
 
@@ -2025,6 +2280,8 @@ mod tests {
             default_root: None,
             response: Mutex::new(None),
             related_response: Mutex::new(Some(Vec::new())),
+            documents: Mutex::new(None),
+            metadata: Mutex::new(None),
         });
         let context = ContextStateHandle::default();
         context.set_search_root(Some(root.to_string_lossy().into_owned()));
@@ -2089,6 +2346,8 @@ mod tests {
                 truncated: false,
             })),
             related_response: Mutex::new(None),
+            documents: Mutex::new(None),
+            metadata: Mutex::new(None),
         });
         let context = ContextStateHandle::default();
         context.set_search_root(Some(live_root.to_string_lossy().into_owned()));
@@ -2152,6 +2411,8 @@ mod tests {
                 truncated: false,
             })),
             related_response: Mutex::new(None),
+            documents: Mutex::new(None),
+            metadata: Mutex::new(None),
         });
 
         let response = search_documents(
@@ -2260,5 +2521,164 @@ mod tests {
         let found = find_file_with_content(dir.path(), &target, b"same paper").unwrap();
 
         assert_eq!(found, None);
+    }
+
+    fn doc_entry(path: PathBuf, title: &str, doi: Option<&str>) -> FileEntry {
+        FileEntry {
+            path,
+            size_bytes: 1,
+            file_type: FileType::Pdf,
+            extension: "pdf".into(),
+            created_at_ms: None,
+            modified_at_ms: None,
+            title: Some(title.into()),
+            author: Some("Author".into()),
+            doi: doi.map(Into::into),
+            publication_date: None,
+            citation_count: None,
+            metadata_conflicts: Default::default(),
+            tags: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_documents_reports_titles_dois_and_truncation() {
+        let library = tempdir().unwrap();
+        let service = fake_search_with_root(library.path().to_path_buf());
+        *service.documents.lock().unwrap() = Some(FileListResponse {
+            files: vec![
+                doc_entry(library.path().join("a.pdf"), "Alpha", Some("10.1/a")),
+                doc_entry(library.path().join("b.pdf"), "Beta", None),
+                doc_entry(library.path().join("c.pdf"), "Gamma", Some("10.1/c")),
+            ],
+            omitted: Vec::new(),
+        });
+        let mcp = WilkesMcp::new(McpContext::Library, PathBuf::new(), Some(service), None);
+
+        let response = list_documents_for_mcp(
+            &mcp,
+            ListDocumentsParams {
+                root: None,
+                scope: None,
+                limit: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.documents.len(), 2);
+        assert!(response.truncated);
+        assert_eq!(response.documents[0].title.as_deref(), Some("Alpha"));
+        assert_eq!(response.documents[0].doi.as_deref(), Some("10.1/a"));
+        assert_eq!(response.documents[1].title.as_deref(), Some("Beta"));
+        assert_eq!(response.documents[1].doi, None);
+    }
+
+    #[tokio::test]
+    async fn get_file_metadata_returns_full_record() {
+        let library = tempdir().unwrap();
+        let doc = library.path().join("paper.pdf");
+        std::fs::write(&doc, b"paper").unwrap();
+        let service = fake_search_with_root(library.path().to_path_buf());
+        *service.metadata.lock().unwrap() = Some(DocumentMetadata {
+            title: Some("Deep Nets".into()),
+            author: Some("Ada".into()),
+            doi: Some("10.1/deep".into()),
+            created_at: Some("2024-05".into()),
+            semantic_scholar: None,
+            openalex: None,
+        });
+        let mcp = WilkesMcp::new(McpContext::Library, PathBuf::new(), Some(service), None);
+
+        let response = get_file_metadata_for_mcp(
+            &mcp,
+            GetFileMetadataParams {
+                path: Some(doc.to_string_lossy().into_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.path, display_path(&doc));
+        assert_eq!(response.metadata.title.as_deref(), Some("Deep Nets"));
+        assert_eq!(response.metadata.author.as_deref(), Some("Ada"));
+        assert_eq!(response.metadata.doi.as_deref(), Some("10.1/deep"));
+    }
+
+    #[tokio::test]
+    async fn get_file_metadata_requires_explicit_path_without_active_document() {
+        let library = tempdir().unwrap();
+        let mcp = WilkesMcp::new(
+            McpContext::Library,
+            PathBuf::new(),
+            Some(fake_search_with_root(library.path().to_path_buf())),
+            None,
+        );
+
+        let error = get_file_metadata_for_mcp(&mcp, GetFileMetadataParams { path: None })
+            .await
+            .unwrap_err();
+        assert!(error.contains("pass path explicitly"));
+    }
+
+    #[tokio::test]
+    async fn search_results_are_enriched_with_metadata() {
+        let live_root = tempdir().unwrap();
+        let path = live_root.path().join("hit.pdf");
+        std::fs::write(&path, b"hit").unwrap();
+        let service = fake_search_with_root(live_root.path().to_path_buf());
+        *service.response.lock().unwrap() = Some(CollectedSearch {
+            files: vec![FileMatches {
+                path: path.clone(),
+                file_type: FileType::Pdf,
+                matches: vec![Match {
+                    text_range: None,
+                    matched_text: "hit".into(),
+                    context_before: String::new(),
+                    context_after: String::new(),
+                    origin: SourceOrigin::PdfPage {
+                        page: 1,
+                        bbox: None,
+                    },
+                    score: Some(0.5),
+                }],
+            }],
+            stats: SearchStats::default(),
+            truncated: false,
+        });
+        *service.metadata.lock().unwrap() = Some(DocumentMetadata {
+            title: Some("Hit Paper".into()),
+            author: Some("Bo".into()),
+            doi: Some("10.1/hit".into()),
+            created_at: None,
+            semantic_scholar: None,
+            openalex: None,
+        });
+        let context = ContextStateHandle::default();
+
+        let response = search_documents(
+            &context,
+            Some(service),
+            Path::new("/fallback"),
+            SearchParams {
+                query: "hit".into(),
+                mode: SearchModeParam::Exact,
+                scope: None,
+                root: Some(live_root.path().to_string_lossy().into_owned()),
+                file: None,
+                max_results: None,
+                case_sensitive: None,
+                is_regex: None,
+                context_lines: None,
+                collection_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.matches.len(), 1);
+        assert_eq!(response.matches[0].title.as_deref(), Some("Hit Paper"));
+        assert_eq!(response.matches[0].author.as_deref(), Some("Bo"));
+        assert_eq!(response.matches[0].doi.as_deref(), Some("10.1/hit"));
     }
 }

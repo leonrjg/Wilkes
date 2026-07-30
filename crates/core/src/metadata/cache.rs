@@ -17,10 +17,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use rusqlite::{params, Connection, OptionalExtension};
 
+use super::doi::normalize_doi;
 use super::MetadataField;
 use crate::types::{DocumentMetadata, OpenAlexWork, SemanticScholarPaper};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 const FIELD_TITLE: &str = MetadataField::Title.as_str();
@@ -200,7 +201,8 @@ impl MetadataCache {
 
         if stored_version != Some(SCHEMA_VERSION) {
             conn.execute_batch(
-                "DROP TABLE IF EXISTS file_metadata;
+                "DROP TABLE IF EXISTS document_citations;
+                 DROP TABLE IF EXISTS file_metadata;
                  DROP TABLE IF EXISTS files;
                  DROP TABLE IF EXISTS meta;",
             )?;
@@ -240,6 +242,13 @@ impl MetadataCache {
                 ON file_metadata(source);
             CREATE INDEX IF NOT EXISTS idx_file_metadata_key_value
                 ON file_metadata(key, value);
+            CREATE TABLE IF NOT EXISTS document_citations (
+                source_doi TEXT NOT NULL,
+                target_doi TEXT NOT NULL,
+                PRIMARY KEY (source_doi, target_doi)
+            );
+            CREATE INDEX IF NOT EXISTS idx_document_citations_target
+                ON document_citations(target_doi);
             PRAGMA foreign_keys = ON;
             ",
         )?;
@@ -1081,6 +1090,106 @@ impl MetadataCache {
         }
         Ok(file_ids.len())
     }
+
+    /// The DOI recorded for `path`, from any source, if the file is cached.
+    /// Identity is not checked: a DOI is stable metadata, and the citation
+    /// graph is keyed on it rather than on file content.
+    pub fn doi_for_path(&self, path: &Path) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT fm.value
+                 FROM files f
+                 JOIN file_metadata fm ON fm.file_id = f.id AND fm.key = ?2
+                 WHERE f.file_path = ?1
+                 LIMIT 1",
+                params![Self::key(path), FIELD_DOI],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Replace the stored outgoing citation edges for `source_doi` with
+    /// `target_dois`. Delete-then-insert so a re-enrichment reflects the
+    /// current reference list rather than accumulating stale edges. Edges are
+    /// stored by normalized DOI only — no provider identifier and no `file_id`,
+    /// so an edge to a paper not yet in the library remains valid and resolves
+    /// the moment that paper is added.
+    pub fn replace_citations(
+        &self,
+        source_doi: &str,
+        target_dois: &[String],
+    ) -> anyhow::Result<usize> {
+        let Some(source) = normalize_doi(source_doi) else {
+            return Ok(0);
+        };
+        self.conn.execute(
+            "DELETE FROM document_citations WHERE source_doi = ?1",
+            params![source],
+        )?;
+        let mut inserted = 0;
+        for target in target_dois {
+            let Some(target) = normalize_doi(target) else {
+                continue;
+            };
+            if target == source {
+                continue;
+            }
+            inserted += self.conn.execute(
+                "INSERT OR IGNORE INTO document_citations (source_doi, target_doi)
+                 VALUES (?1, ?2)",
+                params![source, target],
+            )?;
+        }
+        Ok(inserted)
+    }
+
+    /// Citation neighbours of `doi` that resolve to a document in the library.
+    /// `references` are documents `doi` cites; `cited_by` are documents that
+    /// cite `doi`. The library intersection happens here, at read time, by
+    /// joining edges against the DOIs of cached files — so a document added
+    /// after the edge was stored still lights up.
+    pub fn citation_links(&self, doi: &str) -> anyhow::Result<CitationLinkPaths> {
+        let Some(doi) = normalize_doi(doi) else {
+            return Ok(CitationLinkPaths::default());
+        };
+        Ok(CitationLinkPaths {
+            references: self.linked_paths(
+                "SELECT DISTINCT f.file_path
+                 FROM document_citations c
+                 JOIN file_metadata dm ON dm.key = ?1 AND dm.value = c.target_doi
+                 JOIN files f ON f.id = dm.file_id
+                 WHERE c.source_doi = ?2",
+                &doi,
+            )?,
+            cited_by: self.linked_paths(
+                "SELECT DISTINCT f.file_path
+                 FROM document_citations c
+                 JOIN file_metadata dm ON dm.key = ?1 AND dm.value = c.source_doi
+                 JOIN files f ON f.id = dm.file_id
+                 WHERE c.target_doi = ?2",
+                &doi,
+            )?,
+        })
+    }
+
+    fn linked_paths(&self, sql: &str, doi: &str) -> anyhow::Result<Vec<PathBuf>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let paths = stmt
+            .query_map(params![FIELD_DOI, doi], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        Ok(paths)
+    }
+}
+
+/// Library paths of a document's citation neighbours, both edge directions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CitationLinkPaths {
+    pub references: Vec<PathBuf>,
+    pub cited_by: Vec<PathBuf>,
 }
 
 #[cfg(test)]
@@ -1113,6 +1222,85 @@ mod tests {
             .upsert(path, id, &sample(), MetadataSource::File)
             .unwrap();
         assert_eq!(cache.get_valid(path, id).unwrap(), Some(sample()));
+    }
+
+    fn doc_with_doi(doi: &str) -> DocumentMetadata {
+        DocumentMetadata {
+            doi: Some(doi.into()),
+            ..DocumentMetadata::default()
+        }
+    }
+
+    #[test]
+    fn citation_links_resolve_both_directions_by_doi() {
+        let dir = tempdir().unwrap();
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        let id = FileIdentity {
+            size_bytes: 1,
+            modified_at_ms: 1,
+        };
+        let a = Path::new("/docs/a.pdf");
+        let b = Path::new("/docs/b.pdf");
+        cache
+            .upsert(a, id, &doc_with_doi("10.1/a"), MetadataSource::File)
+            .unwrap();
+        cache
+            .upsert(b, id, &doc_with_doi("10.1/b"), MetadataSource::File)
+            .unwrap();
+
+        // A cites B (and a paper not in the library, which is stored but does
+        // not resolve to a path).
+        cache
+            .replace_citations("10.1/a", &["10.1/b".into(), "10.1/absent".into()])
+            .unwrap();
+
+        let from_a = cache.citation_links("10.1/a").unwrap();
+        assert_eq!(from_a.references, vec![b.to_path_buf()]);
+        assert!(from_a.cited_by.is_empty());
+
+        let from_b = cache.citation_links("10.1/b").unwrap();
+        assert_eq!(from_b.cited_by, vec![a.to_path_buf()]);
+        assert!(from_b.references.is_empty());
+
+        // Late binding: the absent reference resolves once its document lands.
+        cache
+            .upsert(
+                Path::new("/docs/c.pdf"),
+                id,
+                &doc_with_doi("10.1/absent"),
+                MetadataSource::File,
+            )
+            .unwrap();
+        assert_eq!(
+            cache.citation_links("10.1/a").unwrap().references.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn replace_citations_is_idempotent_and_prunes() {
+        let dir = tempdir().unwrap();
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        let id = FileIdentity {
+            size_bytes: 1,
+            modified_at_ms: 1,
+        };
+        let b = Path::new("/docs/b.pdf");
+        cache
+            .upsert(b, id, &doc_with_doi("10.1/b"), MetadataSource::File)
+            .unwrap();
+
+        cache
+            .replace_citations("10.1/a", &["10.1/b".into(), "10.1/b".into()])
+            .unwrap();
+        assert_eq!(
+            cache.citation_links("10.1/a").unwrap().references,
+            vec![b.to_path_buf()]
+        );
+
+        // Re-running with an empty list clears the edge; a self-edge is ignored.
+        cache.replace_citations("10.1/a", &["10.1/a".into()]).unwrap();
+        assert!(cache.citation_links("10.1/a").unwrap().references.is_empty());
     }
 
     #[test]

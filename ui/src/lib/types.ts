@@ -111,6 +111,19 @@ export interface RelatedDocument extends FileEntry {
   score: number;
 }
 
+export interface CitationLinksQuery {
+  root: string;
+  path: string;
+}
+
+/** Citation neighbours of a document present in the library, resolved by DOI.
+ *  `references` are documents the anchor cites; `cited_by` are documents that
+ *  cite the anchor. */
+export interface CitationLinks {
+  references: FileEntry[];
+  cited_by: FileEntry[];
+}
+
 export interface MatchRef {
   path: string;
   origin: SourceOrigin;

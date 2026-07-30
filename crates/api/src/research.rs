@@ -590,29 +590,55 @@ impl ResearchStore {
                 |r| r.get(0),
             )
             .optional()?;
-        let Some(old_id) = old_id else {
-            return Ok(());
-        };
-        let target_id: Option<String> = tx
-            .query_row(
-                "SELECT id FROM document_refs WHERE path=?1",
-                [&new_path],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(target_id) = target_id.filter(|id| id != &old_id) {
+        // Exact-match rekey applies when a file is renamed. A directory is never
+        // itself a document_refs row, so this is simply skipped for folders.
+        if let Some(old_id) = old_id {
+            let target_id: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM document_refs WHERE path=?1",
+                    [&new_path],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(target_id) = target_id.filter(|id| id != &old_id) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO document_tags(document_id,tag_id,created_at_ms)
+                     SELECT ?1,tag_id,created_at_ms FROM document_tags WHERE document_id=?2",
+                    params![old_id, target_id],
+                )?;
+                tx.execute("DELETE FROM document_refs WHERE id=?1", [target_id])?;
+            }
             tx.execute(
-                "INSERT OR IGNORE INTO document_tags(document_id,tag_id,created_at_ms)
-                 SELECT ?1,tag_id,created_at_ms FROM document_tags WHERE document_id=?2",
-                params![old_id, target_id],
+                "UPDATE document_refs SET path=?2,last_seen_at_ms=?3 WHERE id=?1",
+                params![old_id, new_path, now_ms()],
             )?;
-            tx.execute("DELETE FROM document_refs WHERE id=?1", [target_id])?;
         }
-        tx.execute(
-            "UPDATE document_refs SET path=?2,last_seen_at_ms=?3 WHERE id=?1",
-            params![old_id, new_path, now_ms()],
-        )?;
+        Self::rekey_descendant_paths(&tx, &old_path, &new_path)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Rewrites the stored paths of documents that live under a renamed
+    /// directory. A directory itself is never a `document_refs` row, so the
+    /// exact-match update above leaves its contents pointing at the old prefix;
+    /// this remaps every descendant. The rename that triggers this rejects an
+    /// existing target, so the new prefix is guaranteed collision-free.
+    fn rekey_descendant_paths(
+        tx: &rusqlite::Transaction,
+        old_path: &str,
+        new_path: &str,
+    ) -> anyhow::Result<()> {
+        for separator in ['/', '\\'] {
+            let old_prefix = format!("{old_path}{separator}");
+            let new_prefix = format!("{new_path}{separator}");
+            let prefix_len = old_prefix.chars().count() as i64;
+            tx.execute(
+                "UPDATE document_refs
+                 SET path = ?1 || substr(path, ?2 + 1), last_seen_at_ms = ?3
+                 WHERE substr(path, 1, ?2) = ?4",
+                params![new_prefix, prefix_len, now_ms(), old_prefix],
+            )?;
+        }
         Ok(())
     }
 
@@ -901,6 +927,7 @@ fn validate_program(expression: &str) -> anyhow::Result<Program> {
         modified_at_ms: None,
         title: Some("Example".into()),
         author: Some("Author".into()),
+        doi: None,
         publication_date: Some("2024-01".into()),
         citation_count: Some(1),
         metadata_conflicts: Default::default(),
@@ -1026,6 +1053,7 @@ mod tests {
             modified_at_ms: None,
             title: None,
             author: None,
+            doi: None,
             publication_date: None,
             citation_count: None,
             metadata_conflicts: Default::default(),
@@ -1050,6 +1078,60 @@ mod tests {
             .eligible_paths(&collection.id, dir.path(), &entries)
             .unwrap();
         assert!(eligible.contains(&path));
+    }
+
+    #[test]
+    fn rekey_document_remaps_descendants_of_a_renamed_directory() {
+        let dir = tempdir().unwrap();
+        let mut store =
+            ResearchStore::open(dir.path(), &dir.path().join("bookmarks.json")).unwrap();
+        let tag = store
+            .create_tag(NewTag {
+                name: "Reviewed".into(),
+                color: None,
+            })
+            .unwrap();
+
+        let old_dir = dir.path().join("old");
+        let tagged = old_dir.join("paper.pdf");
+        store
+            .update_document_tags(DocumentTagUpdate {
+                paths: vec![tagged.clone()],
+                add_tag_ids: vec![tag.id.clone()],
+                remove_tag_ids: vec![],
+            })
+            .unwrap();
+
+        let new_dir = dir.path().join("new");
+        store.rekey_document(&old_dir, &new_dir).unwrap();
+
+        let make = |path: PathBuf| FileEntry {
+            path,
+            size_bytes: 0,
+            file_type: wilkes_core::types::FileType::Pdf,
+            extension: "pdf".into(),
+            created_at_ms: None,
+            modified_at_ms: None,
+            title: None,
+            author: None,
+            doi: None,
+            publication_date: None,
+            citation_count: None,
+            metadata_conflicts: Default::default(),
+            tags: vec![],
+        };
+        let mut entries = vec![make(new_dir.join("paper.pdf")), make(tagged.clone())];
+        store.enrich_files(&mut entries).unwrap();
+
+        assert_eq!(
+            entries[0].tags.len(),
+            1,
+            "the descendant keeps its tag under the new path"
+        );
+        assert!(
+            entries[1].tags.is_empty(),
+            "the old path is no longer tagged"
+        );
     }
 
     #[test]
@@ -1159,6 +1241,7 @@ mod tests {
             modified_at_ms: None,
             title: None,
             author: None,
+            doi: None,
             publication_date: None,
             citation_count,
             metadata_conflicts: Default::default(),
@@ -1187,6 +1270,7 @@ mod tests {
             modified_at_ms: None,
             title: None,
             author: None,
+            doi: None,
             publication_date: None,
             citation_count: None,
             metadata_conflicts: Default::default(),

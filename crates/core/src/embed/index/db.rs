@@ -3002,6 +3002,7 @@ impl SemanticIndex {
                     modified_at_ms: metadata.modified().ok().and_then(system_time_ms),
                     title: None,
                     author: None,
+                    doi: None,
                     publication_date: None,
                     citation_count: None,
                     metadata_conflicts: Default::default(),

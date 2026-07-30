@@ -3,14 +3,23 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import DirectoryPicker from "./DirectoryPicker";
 import { ToastProvider } from "./Toast";
 
-const { mockOpenPath, mockIsTauri } = vi.hoisted(() => ({
-  mockOpenPath: vi.fn(),
-  mockIsTauri: { value: false },
-}));
+const { mockOpenPath, mockIsTauri, mockCreateDirectory, mockListDirectories, mockRenameFile } =
+  vi.hoisted(() => ({
+    mockOpenPath: vi.fn(),
+    mockIsTauri: { value: false },
+    mockCreateDirectory: vi.fn(),
+    mockListDirectories: vi.fn(),
+    mockRenameFile: vi.fn(),
+  }));
 
 vi.mock("../services", () => ({
   api: {
     openPath: mockOpenPath,
+    renameFile: mockRenameFile,
+  },
+  source: {
+    createDirectory: mockCreateDirectory,
+    listDirectories: mockListDirectories,
   },
   get isTauri() {
     return mockIsTauri.value;
@@ -35,6 +44,7 @@ describe("DirectoryPicker", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockIsTauri.value = false;
+    mockListDirectories.mockResolvedValue([]);
   });
 
   const renderWithToasts = (props = defaultProps) =>
@@ -111,6 +121,77 @@ describe("DirectoryPicker", () => {
 
     fireEvent.click(screen.getByRole("menuitem", { name: "Open" }));
     expect(defaultProps.onChange).toHaveBeenCalledWith("/home/user/other");
+  });
+
+  it("creates a folder as a sibling of the top-level roots by default", async () => {
+    // The three roots share the parent /home/user, surfaced as a "[user]" node
+    // and the default destination — creating there is a sibling of the roots.
+    mockCreateDirectory.mockResolvedValue("/home/user/Reference");
+    renderWithToasts();
+
+    fireEvent.click(screen.getByRole("button", { name: "New folder" }));
+    // The parent's children are the roots themselves — its arbitrary, non-Wilkes
+    // contents are never listed.
+    expect(await screen.findByText("[user]")).toBeInTheDocument();
+    expect(mockListDirectories).not.toHaveBeenCalledWith("/home/user");
+
+    fireEvent.change(screen.getByLabelText("Folder name"), {
+      target: { value: "Reference" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await screen.findByText('Created folder "Reference"');
+    expect(mockCreateDirectory).toHaveBeenCalledWith("/home/user", "Reference");
+    expect(defaultProps.onChange).toHaveBeenCalledWith("/home/user/Reference");
+  });
+
+  it("creates a folder within a chosen root", async () => {
+    mockCreateDirectory.mockResolvedValue("/home/user/project/Reference");
+    renderWithToasts();
+
+    fireEvent.click(screen.getByRole("button", { name: "New folder" }));
+
+    // The parent auto-expands, revealing the roots as selectable destinations.
+    const project = await screen.findByRole("button", { name: /^project$/i });
+    fireEvent.click(project);
+    fireEvent.change(screen.getByLabelText("Folder name"), {
+      target: { value: "Reference" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await screen.findByText('Created folder "Reference"');
+    expect(mockCreateDirectory).toHaveBeenCalledWith("/home/user/project", "Reference");
+  });
+
+  it("renames a folder from its context menu and remaps stored paths", async () => {
+    mockIsTauri.value = true;
+    mockRenameFile.mockResolvedValue("/home/user/renamed");
+    const onRenameDirectory = vi.fn();
+    renderWithToasts({ ...defaultProps, onRenameDirectory });
+
+    fireEvent.contextMenu(screen.getByText("other"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+
+    const input = screen.getByLabelText("New folder name");
+    fireEvent.change(input, { target: { value: "renamed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+
+    await screen.findByText('Renamed folder to "renamed"');
+    expect(mockRenameFile).toHaveBeenCalledWith("/home/user/other", "renamed");
+    expect(onRenameDirectory).toHaveBeenCalledWith("/home/user/other", "/home/user/renamed");
+  });
+
+  it("does not offer Rename without a rename handler", () => {
+    mockIsTauri.value = true;
+    renderWithToasts({ ...defaultProps, onRenameDirectory: undefined });
+
+    fireEvent.contextMenu(screen.getByText("other"));
+    expect(screen.queryByRole("menuitem", { name: "Rename" })).not.toBeInTheDocument();
+  });
+
+  it("does not show the new-folder button when there are no roots", () => {
+    renderWithToasts({ ...defaultProps, directory: "", favorites: [], recentDirs: [] });
+    expect(screen.queryByRole("button", { name: "New folder" })).not.toBeInTheDocument();
   });
 
   it("shows the desktop file-manager action for directory chips", () => {

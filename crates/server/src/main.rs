@@ -28,10 +28,11 @@ use tracing::info;
 use wilkes_api::context::AppContext;
 use wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryInput;
 use wilkes_core::types::{
-    AddOutcome, BookmarkClustersQuery, CitationResult, CollectionValidation, DocumentMetadata,
-    DocumentTagUpdate, EmbeddingEngine, IntegrationStatus, MatchRef, ModelDescriptor, NewBookmark,
-    NewSmartCollection, NewTag, OpenAlexWork, RelatedDocumentsQuery, SearchLogEntry, SearchQuery,
-    SelectedEmbedder, SemanticScholarPaper, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
+    AddOutcome, BookmarkClustersQuery, CitationLinksQuery, CitationResult, CollectionValidation,
+    DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, IntegrationStatus, MatchRef,
+    ModelDescriptor, NewBookmark, NewSmartCollection, NewTag, OpenAlexWork, RelatedDocumentsQuery,
+    SearchLogEntry, SearchQuery, SelectedEmbedder, SemanticScholarPaper, SmartCollection, Tag,
+    UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::worker::manager::WorkerPaths;
 
@@ -125,6 +126,25 @@ async fn related_documents_handler(
         .await
         .map_err(server_err)?;
     Ok(Json(related))
+}
+
+async fn citation_links_handler(
+    State(state): State<Arc<AppState>>,
+    Json(mut query): Json<CitationLinksQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    query.root = crate::http::state::confined_root_for_search(
+        &query.root.to_string_lossy(),
+        &state.uploads_dir,
+        &TokioServerFs,
+    )
+    .await?;
+    let links = state
+        .ctx
+        .clone()
+        .citation_links(query)
+        .await
+        .map_err(server_err)?;
+    Ok(Json(links))
 }
 
 // ── Preview ───────────────────────────────────────────────────────────────────
@@ -1161,6 +1181,7 @@ async fn main() -> anyhow::Result<()> {
         // Core
         .route("/api/search", post(search_handler))
         .route("/api/related-documents", post(related_documents_handler))
+        .route("/api/citation-links", post(citation_links_handler))
         .route("/api/preview", post(preview_handler))
         .route("/api/settings", get(get_settings_handler))
         .route("/api/settings", patch(update_settings_handler))

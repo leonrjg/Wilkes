@@ -211,6 +211,22 @@ pub struct RelatedDocument {
     pub score: f32,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CitationLinksQuery {
+    pub root: PathBuf,
+    pub path: PathBuf,
+}
+
+/// Citation neighbours of a document that are present in the library, resolved
+/// by DOI. `references` are documents the anchor cites; `cited_by` are
+/// documents that cite the anchor. Both directions carry the same
+/// metadata-enriched [`FileEntry`] shape as every other document list.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CitationLinks {
+    pub references: Vec<FileEntry>,
+    pub cited_by: Vec<FileEntry>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileType {
     PlainText,
@@ -1370,6 +1386,11 @@ pub struct FileEntry {
     /// cache has processed this file.
     #[serde(default)]
     pub author: Option<String>,
+    /// Document DOI from cached extracted metadata (normalized, no URL prefix).
+    /// `None` until the metadata cache has processed this file or when the
+    /// document carries no DOI.
+    #[serde(default)]
+    pub doi: Option<String>,
     /// Document publication date ("YYYY-MM") from cached extracted metadata.
     /// `None` until the metadata cache has processed this file.
     #[serde(default)]

@@ -36,12 +36,13 @@ use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::models::progress::EmbedProgress;
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
-    Bookmark, BookmarkCluster, BookmarkClustersQuery, BookmarkClustersResult, CollectionValidation,
-    DocumentMetadata, DocumentTagUpdate, EmbedderModel, FileType, IndexStatus, IndexingConfig,
-    MetadataConflictValue, MetadataSourcePreference, NewBookmark, NewSmartCollection, NewTag,
-    PreviewData, RelatedDocument, RelatedDocumentsQuery, SearchLogEntry, SearchMode, SearchQuery,
-    SearchScope, SelectedEmbedder, SemanticSettings, Settings, SmartCollection, Tag,
-    UpdateSmartCollection, UpdateTag,
+    Bookmark, BookmarkCluster, BookmarkClustersQuery, BookmarkClustersResult, CitationLinks,
+    CitationLinksQuery, CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbedderModel,
+    FileEntry, FileListResponse, FileType, IndexStatus, IndexingConfig, MetadataConflictValue,
+    MetadataSourcePreference,
+    NewBookmark, NewSmartCollection, NewTag, PreviewData, RelatedDocument, RelatedDocumentsQuery,
+    SearchLogEntry, SearchMode, SearchQuery, SearchScope, SelectedEmbedder, SemanticSettings,
+    Settings, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::types::{
     GenerationSettings, GenerationStreamEvent, GenerationTask, GeneratorDescriptor,
@@ -123,6 +124,22 @@ impl wilkes_agent::search::SearchService for AppContext {
         query: RelatedDocumentsQuery,
     ) -> Result<Vec<RelatedDocument>, String> {
         AppContext::related_documents(self, query).await
+    }
+
+    async fn list_documents(
+        self: Arc<Self>,
+        root: PathBuf,
+    ) -> Result<FileListResponse, String> {
+        self.list_files(root).await.map_err(|e| e.to_string())
+    }
+
+    async fn document_metadata(
+        self: Arc<Self>,
+        path: PathBuf,
+    ) -> Result<DocumentMetadata, String> {
+        self.document_metadata_full(path)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -827,6 +844,7 @@ impl AppContext {
                             let citation_count = provider_citation_count(&meta);
                             entry.title = meta.title;
                             entry.author = meta.author;
+                            entry.doi = meta.doi;
                             entry.publication_date = meta.created_at;
                             entry.citation_count = citation_count;
                             entry.metadata_conflicts = cached
@@ -1219,6 +1237,24 @@ impl AppContext {
                                 error!("metadata cache openalex upsert {}: {e:#}", path.display());
                             }
                         }
+                        // Populate the citation graph from the same enrichment
+                        // pass. Edges are keyed by DOI, so this is independent
+                        // of whether the referenced papers are in the library.
+                        if let Some(doi) = metadata.doi.clone() {
+                            match client.references(&doi).await {
+                                Ok(targets) => {
+                                    if let Ok(guard) = cache.lock() {
+                                        if let Err(e) = guard.replace_citations(&doi, &targets) {
+                                            error!(
+                                                "metadata cache citations {}: {e:#}",
+                                                path.display()
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => info!("openalex references {doi}: {e:#}"),
+                            }
+                        }
                         openalex_updates.push(metadata_update_json_from_cache(
                             &cache,
                             path,
@@ -1303,6 +1339,37 @@ impl AppContext {
         }
         let s = self.get_settings().await;
         crate::commands::metadata::get_file_metadata(path, s.supported_extensions).await
+    }
+
+    /// Richest available metadata for one document, in one authoritative order.
+    /// Cache-first: when the file is cached and unchanged, return the composed
+    /// record (title / author / DOI / publication date plus any Semantic
+    /// Scholar or OpenAlex enrichment) exactly as the file list resolves it. On
+    /// a cache miss fall back to [`Self::resolve_file_metadata`] (extraction +
+    /// Zotero override), which yields the bibliographic basics for a file the
+    /// cache has not processed yet. No third composition is introduced — this
+    /// only chooses between the two the app already owns.
+    pub async fn document_metadata_full(
+        &self,
+        path: PathBuf,
+    ) -> anyhow::Result<DocumentMetadata> {
+        if !is_under(&path, &self.data_dir) {
+            anyhow::bail!("Access denied: path outside data directory");
+        }
+        if let (Some(cache), Some(identity)) =
+            (self.metadata_cache(), FileIdentity::for_path(&path))
+        {
+            let primary =
+                metadata_source_preference(&self.get_settings().await.primary_metadata_source);
+            let cached = cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("metadata cache lock poisoned"))?
+                .get_valid_with_primary(&path, identity, primary)?;
+            if let Some(cached) = cached {
+                return Ok(cached.metadata);
+            }
+        }
+        self.resolve_file_metadata(path).await
     }
 
     pub async fn zotero_status(&self) -> anyhow::Result<wilkes_core::types::IntegrationStatus> {
@@ -2407,6 +2474,70 @@ impl AppContext {
             }
         }
         Ok(related)
+    }
+
+    /// Citation neighbours of a document that are present in the library,
+    /// resolved by DOI: the documents it references and the documents that
+    /// cite it. Unlike `related_documents` this needs no semantic index — it
+    /// reads the DOI-keyed citation graph from the metadata cache. Returns
+    /// empty when the anchor has no known DOI or no cached edges.
+    pub async fn citation_links(
+        self: Arc<Self>,
+        query: CitationLinksQuery,
+    ) -> Result<CitationLinks, String> {
+        let settings = self.settings().await;
+        let (library_roots, _) = library_roots(&settings);
+        let root = Self::canonicalize_search_root(&query.root)?;
+        Self::ensure_path_in_library(&root, &library_roots, "Citation links root")?;
+        let (source_path, _) = Self::canonicalize_supported_file(
+            &root,
+            &query.path,
+            &settings.supported_extensions,
+            "Citation links",
+        )?;
+        Self::ensure_path_in_library(&source_path, &library_roots, "Citation links file")?;
+
+        let cache = self
+            .metadata_cache()
+            .ok_or_else(|| "Metadata cache is unavailable".to_string())?;
+        let paths = {
+            let guard = cache.lock().map_err(|_| "Metadata cache lock failed".to_string())?;
+            let Some(doi) = guard.doi_for_path(&source_path).map_err(|e| e.to_string())? else {
+                return Ok(CitationLinks::default());
+            };
+            guard.citation_links(&doi).map_err(|e| e.to_string())?
+        };
+        if paths.references.is_empty() && paths.cited_by.is_empty() {
+            return Ok(CitationLinks::default());
+        }
+
+        // Resolve edge paths to the same metadata-enriched record shape as every
+        // other document list. Citation edges span the whole library, so list
+        // across all roots rather than a single scope.
+        let mut entries = std::collections::HashMap::new();
+        for listing_root in library_roots {
+            let listed = self
+                .list_files(listing_root)
+                .await
+                .map_err(|e| e.to_string())?;
+            entries.extend(
+                listed
+                    .files
+                    .into_iter()
+                    .map(|entry| (entry.path.clone(), entry)),
+            );
+        }
+        let resolve = |paths: Vec<PathBuf>| -> Vec<FileEntry> {
+            paths
+                .into_iter()
+                .filter(|path| path != &source_path)
+                .filter_map(|path| entries.get(&path).cloned())
+                .collect()
+        };
+        Ok(CitationLinks {
+            references: resolve(paths.references),
+            cited_by: resolve(paths.cited_by),
+        })
     }
 
     /// One lifecycle and event contract for every user-facing token stream.
@@ -6316,6 +6447,141 @@ exit 0
             .unwrap_err();
 
         assert!(err.contains("not in the library"));
+    }
+
+    #[tokio::test]
+    async fn test_citation_links_rejects_root_outside_library() {
+        let (dir, ctx) = test_ctx();
+        let library = dir.path().join("library");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let source = outside.join("source.txt");
+        std::fs::write(&source, "source").unwrap();
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": library }),
+        )
+        .await
+        .unwrap();
+
+        let err = ctx
+            .citation_links(CitationLinksQuery {
+                root: outside,
+                path: source,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("not in the library"));
+    }
+
+    #[tokio::test]
+    async fn test_citation_links_empty_when_anchor_has_no_doi() {
+        let (dir, ctx) = test_ctx();
+        let library = dir.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let source = library.join("source.txt");
+        std::fs::write(&source, "source").unwrap();
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": library }),
+        )
+        .await
+        .unwrap();
+
+        let links = ctx
+            .clone()
+            .citation_links(CitationLinksQuery {
+                root: library,
+                path: source,
+            })
+            .await
+            .unwrap();
+
+        assert!(links.references.is_empty());
+        assert!(links.cited_by.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_citation_links_resolves_library_edges() {
+        let (dir, ctx) = test_ctx();
+        let library = std::fs::canonicalize(dir.path()).unwrap().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let source = library.join("source.txt");
+        let cited = library.join("cited.txt");
+        std::fs::write(&source, "source").unwrap();
+        std::fs::write(&cited, "cited").unwrap();
+
+        let cache = ctx.metadata_cache().expect("cache opens");
+        let id = FileIdentity {
+            size_bytes: 1,
+            modified_at_ms: 1,
+        };
+        {
+            let guard = cache.lock().unwrap();
+            guard
+                .upsert(
+                    &source,
+                    id,
+                    &DocumentMetadata {
+                        doi: Some("10.1/source".into()),
+                        ..DocumentMetadata::default()
+                    },
+                    wilkes_core::metadata::cache::MetadataSource::File,
+                )
+                .unwrap();
+            guard
+                .upsert(
+                    &cited,
+                    id,
+                    &DocumentMetadata {
+                        doi: Some("10.1/cited".into()),
+                        ..DocumentMetadata::default()
+                    },
+                    wilkes_core::metadata::cache::MetadataSource::File,
+                )
+                .unwrap();
+            guard
+                .replace_citations("10.1/source", &["10.1/cited".into()])
+                .unwrap();
+        }
+
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": library }),
+        )
+        .await
+        .unwrap();
+
+        let links = ctx
+            .clone()
+            .citation_links(CitationLinksQuery {
+                root: library.clone(),
+                path: source.clone(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            links.references.iter().map(|e| e.path.clone()).collect::<Vec<_>>(),
+            vec![cited.clone()]
+        );
+        assert!(links.cited_by.is_empty());
+
+        // The reverse direction resolves from the same stored edge.
+        let reverse = ctx
+            .citation_links(CitationLinksQuery {
+                root: library,
+                path: cited,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            reverse.cited_by.iter().map(|e| e.path.clone()).collect::<Vec<_>>(),
+            vec![source]
+        );
+        assert!(reverse.references.is_empty());
     }
 
     #[tokio::test]
