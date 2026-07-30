@@ -395,6 +395,9 @@ export type GenerationTask =
 export interface SearchResultsSummaryFile {
   title: string;
   excerpts: string[];
+  /** Anchor for the citation link; the backend ignores it (serde skips unknown
+   * fields) and numbers sources purely by position. */
+  path: string;
 }
 
 export interface SearchResultsSummaryInput {

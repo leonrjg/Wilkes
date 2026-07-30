@@ -1,8 +1,12 @@
-import { useCallback } from "react";
+import { Fragment, useCallback } from "react";
 import { Check, Copy, RefreshCw, X } from "react-feather";
 import { useGenerationStream } from "../hooks/useGenerationStream";
-import type { SearchResultsSummaryInput } from "../lib/types";
+import type {
+  SearchResultsSummaryFile,
+  SearchResultsSummaryInput,
+} from "../lib/types";
 import { api } from "../services";
+import { useViewerStore } from "../stores/useViewerStore";
 import { CopyButton } from "./CopyButton";
 import { Tooltip } from "./Tooltip";
 
@@ -12,11 +16,51 @@ interface Props {
   onClose: () => void;
 }
 
+/**
+ * Render the answer, turning each `[k]` the grammar emitted into a link that
+ * opens the k-th source. `k` maps to `files[k - 1]` because the backend numbers
+ * sources by the exact order it received them.
+ */
+function renderAnswer(
+  text: string,
+  files: SearchResultsSummaryFile[],
+  openFile: (path: string) => void,
+) {
+  const nodes: React.ReactNode[] = [];
+  const citation = /\[(\d+)\]/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+  while ((match = citation.exec(text)) !== null) {
+    if (match.index > cursor) nodes.push(text.slice(cursor, match.index));
+    const file = files[Number(match[1]) - 1];
+    if (file) {
+      nodes.push(
+        <button
+          key={`cite-${key++}`}
+          type="button"
+          onClick={() => openFile(file.path)}
+          title={file.title}
+          className="mx-0.5 rounded bg-[var(--bg-active)] px-1 font-medium text-[var(--text-main)] hover:bg-[var(--bg-hover)]"
+        >
+          {match[0]}
+        </button>,
+      );
+    } else {
+      nodes.push(match[0]);
+    }
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < text.length) nodes.push(text.slice(cursor));
+  return nodes;
+}
+
 export default function SearchResultsSummary({
   input,
   requestKey,
   onClose,
 }: Props) {
+  const openFile = useViewerStore((state) => state.openFile);
   const start = useCallback(
     (requestId: string) => api.summarizeSearchResults(requestId, input),
     [input],
@@ -75,7 +119,7 @@ export default function SearchResultsSummary({
         )}
         {text && (
           <p className="whitespace-pre-wrap text-xs leading-relaxed text-[var(--text-muted)]">
-            {text}
+            {renderAnswer(text, input.files, openFile)}
             {phase.kind === "streaming" && <span className="animate-pulse">▍</span>}
           </p>
         )}
@@ -92,7 +136,19 @@ export default function SearchResultsSummary({
           </div>
         )}
         <p className="mt-2 text-[10px] leading-relaxed text-[var(--text-dim)]">
-          {input.files.map((file, index) => `[${index + 1}] ${file.title}`).join(" · ")}
+          {input.files.map((file, index) => (
+            <Fragment key={file.path}>
+              {index > 0 && " · "}
+              <button
+                type="button"
+                onClick={() => openFile(file.path)}
+                title={file.title}
+                className="hover:text-[var(--text-main)] hover:underline"
+              >
+                [{index + 1}] {file.title}
+              </button>
+            </Fragment>
+          ))}
         </p>
       </div>
     </section>

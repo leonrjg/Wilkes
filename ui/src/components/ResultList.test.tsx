@@ -868,7 +868,13 @@ describe("ResultList", () => {
     const [requestId, input] = mockSummarizeSearchResults.mock.calls[0];
     expect(input).toEqual({
       query: "cache behavior",
-      files: [{ title: "top.pdf", excerpts: ["Top-ranked finding"] }],
+      files: [
+        {
+          title: "top.pdf",
+          excerpts: ["Top-ranked finding"],
+          path: "/papers/top.pdf",
+        },
+      ],
     });
 
     act(() => {
@@ -879,9 +885,11 @@ describe("ResultList", () => {
         text: "Caching behavior converges across the leading result [1].",
       });
     });
+    // The prose renders as a text node; the citation renders as its own link.
     expect(
-      await screen.findByText("Caching behavior converges across the leading result [1]."),
+      await screen.findByText(/Caching behavior converges across the leading result/),
     ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "[1]" })).toBeInTheDocument();
 
     act(() => useSearchStore.setState({ searching: true }));
 

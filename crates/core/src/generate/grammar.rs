@@ -12,6 +12,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+const REPEAT_LIMIT: usize = 128;
+
 // ── Character sets ────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -382,7 +384,6 @@ impl NfaBuilder {
         rules: &HashMap<String, Expr>,
         stack: &mut Vec<String>,
     ) -> anyhow::Result<Fragment> {
-        const REPEAT_LIMIT: usize = 64;
         anyhow::ensure!(
             min <= REPEAT_LIMIT && max.unwrap_or(0) <= REPEAT_LIMIT,
             "grammar repetition bound exceeds {REPEAT_LIMIT}"
@@ -860,6 +861,12 @@ mod tests {
         assert!(accepts(&grammar, "ababab"));
         assert!(!accepts(&grammar, "abab"));
         assert!(!accepts(&grammar, "abababab"));
+    }
+
+    #[test]
+    fn finite_repetition_limit_covers_summary_sentences_without_unbounded_nfas() {
+        Grammar::parse(&format!(r#"root ::= "x"{{1,{REPEAT_LIMIT}}}"#)).unwrap();
+        assert!(Grammar::parse(&format!(r#"root ::= "x"{{1,{}}}"#, REPEAT_LIMIT + 1)).is_err());
     }
 
     #[test]
