@@ -7,7 +7,9 @@ use tracing::{error, info};
 
 use super::super::Embedder;
 use super::SemanticIndex;
-use crate::directory_watcher::{path_has_supported_extension, DirectoryChangeBatch};
+use crate::directory_watcher::{
+    collect_supported_files, path_has_supported_extension, DirectoryChangeBatch,
+};
 use crate::extract::ExtractorRegistry;
 use crate::metadata::cache::{FileIdentity, MetadataCache};
 use crate::types::IndexingConfig;
@@ -41,6 +43,13 @@ fn detect_renames(cache: &CacheHandle, changed: &[PathBuf]) -> Vec<(PathBuf, Pat
         }
     }
     renames
+}
+
+/// Drop duplicate paths while preserving first-seen order. A file can reach the
+/// candidate list both as its own change event and via an expanded parent dir.
+fn dedup_paths(paths: &mut Vec<PathBuf>) {
+    let mut seen = HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
 }
 
 /// Re-key both stores for each rename instead of deleting and re-embedding.
@@ -98,10 +107,27 @@ pub fn process_directory_change<F1, F2>(
         .collect();
     let mut removed_paths = batch.removed;
 
-    // A rename surfaces as its old path removed and its new path changed.
-    // Detect that by content identity and re-key both stores instead of
-    // deleting + re-extracting + re-embedding identical content.
-    let renames = detect_renames(cache, &changed_paths);
+    // A file rename surfaces as its old path removed and its new path changed.
+    // An external *directory* rename (or move-in) surfaces only as the new
+    // directory appearing — the OS never reports the descendants — so expand it
+    // into its files and treat them as rename candidates too. Every candidate is
+    // matched by content identity and re-keyed instead of being deleted +
+    // re-embedded. Candidates that are not renames (e.g. files under a directory
+    // that was merely touched) are left untouched, never re-embedded: a genuine
+    // modification arrives as its own file event on `changed`.
+    let mut rename_candidates = changed_paths.clone();
+    // Walking a directory is only worthwhile when the batch also carries a
+    // removal — the signature of a rename or move. A directory also emits an
+    // event whenever its contents change, so expanding unconditionally would
+    // re-scan the whole folder on every in-place file add or edit.
+    if !removed_paths.is_empty() {
+        for dir in &batch.appeared_dirs {
+            collect_supported_files(dir, &config.supported_extensions, &mut rename_candidates);
+        }
+    }
+    dedup_paths(&mut rename_candidates);
+
+    let renames = detect_renames(cache, &rename_candidates);
     if !renames.is_empty() {
         apply_renames(index, cache, &renames);
         let renamed_new: HashSet<&PathBuf> = renames.iter().map(|(_, n)| n).collect();
@@ -445,6 +471,7 @@ mod tests {
                 root: dir.path().to_path_buf(),
                 changed: vec![changed_path],
                 removed: vec![removed_path],
+                appeared_dirs: vec![],
             },
             &index,
             &None,
@@ -497,6 +524,7 @@ mod tests {
                 root: dir.path().to_path_buf(),
                 changed: Vec::new(),
                 removed: vec![file_path.clone()],
+                appeared_dirs: vec![],
             },
             &index,
             &None,
@@ -606,6 +634,7 @@ mod tests {
                 root: dir.path().to_path_buf(),
                 changed: vec![new_path.clone()],
                 removed: vec![old_path.clone()],
+                appeared_dirs: vec![],
             },
             &index,
             &cache_handle,
@@ -631,5 +660,115 @@ mod tests {
         let guard = cache_handle.as_ref().unwrap().lock().unwrap();
         assert!(guard.get_valid(&new_path, identity).unwrap().is_some());
         assert!(guard.get_valid(&old_path, identity).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_process_directory_change_rekeys_external_directory_rename() {
+        struct FailingEmbedder;
+        impl Embedder for FailingEmbedder {
+            fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+                anyhow::bail!("embed must not be called on a directory rename")
+            }
+            fn model_id(&self) -> &str {
+                "m"
+            }
+            fn dimension(&self) -> usize {
+                3
+            }
+            fn engine(&self) -> EmbeddingEngine {
+                EmbeddingEngine::Candle
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        // Use the canonical base so the cache and the (always-canonicalising)
+        // index agree on path form, as the watcher supplies in production.
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let idx_dir = base.join("idx");
+        std::fs::create_dir_all(&idx_dir).unwrap();
+        let mut idx =
+            SemanticIndex::create(&idx_dir, "m", 3, EmbeddingEngine::Candle, None).unwrap();
+
+        // A file indexed and cached under a directory that will be renamed
+        // externally (only the directory event reaches the watcher).
+        let old_dir = base.join("old");
+        std::fs::create_dir(&old_dir).unwrap();
+        let old_file = old_dir.join("paper.txt");
+        std::fs::write(&old_file, "hello world").unwrap();
+        idx.write_file(crate::embed::index::db::PreparedFile {
+            path: old_file.clone(),
+            chunks: vec![(
+                crate::embed::index::chunk::Chunk {
+                    file_path: old_file.clone(),
+                    text: "hello world".to_string(),
+                    byte_range: crate::types::ByteRange { start: 0, end: 11 },
+                    origin: crate::types::SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![0.1, 0.2, 0.3],
+            )],
+        })
+        .unwrap();
+
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        let identity = FileIdentity::for_path(&old_file).unwrap();
+        cache
+            .upsert(
+                &old_file,
+                identity,
+                &crate::types::DocumentMetadata::default(),
+                crate::metadata::cache::MetadataSource::File,
+            )
+            .unwrap();
+
+        let new_dir = base.join("new");
+        std::fs::rename(&old_dir, &new_dir).unwrap();
+        let new_file = new_dir.join("paper.txt");
+
+        let index = Arc::new(Mutex::new(Some(idx)));
+        let cache_handle: CacheHandle = Some(Arc::new(Mutex::new(cache)));
+        let registry = Arc::new(ExtractorRegistry::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
+        let config = IndexingConfig {
+            chunk_size: 100,
+            chunk_overlap: 0,
+            supported_extensions: vec!["txt".to_string()],
+        };
+
+        // The watcher only reports the new directory and the vanished old one.
+        process_directory_change(
+            DirectoryChangeBatch {
+                root: base.clone(),
+                changed: vec![],
+                removed: vec![old_dir.clone()],
+                appeared_dirs: vec![new_dir.clone()],
+            },
+            &index,
+            &cache_handle,
+            &registry,
+            &embedder,
+            &config,
+            &|| {},
+            &|| {},
+        );
+
+        // The descendant's chunk survived, re-keyed rather than re-embedded.
+        assert_eq!(
+            index.lock().unwrap().as_ref().unwrap().status().total_chunks,
+            1
+        );
+        let results = index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query(&[0.1, 0.2, 0.3], 1)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file_path, std::fs::canonicalize(&new_file).unwrap());
+
+        // Cache row followed the descendant to its new path.
+        let guard = cache_handle.as_ref().unwrap().lock().unwrap();
+        assert!(guard.get_valid(&new_file, identity).unwrap().is_some());
+        assert!(guard.get_valid(&old_file, identity).unwrap().is_none());
     }
 }

@@ -178,7 +178,7 @@ export default function DirectoryPicker({
 
       {/* Folders list (Favorites + History) */}
       {displayDirs.length > 0 && (
-        <div className="flex items-center gap-1 overflow-x-auto flex-1 min-w-0 custom-scrollbar">
+        <div className="folder-strip-scrollbar flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
           {displayDirs.map((b) => {
             const favorite = isFavorite(b);
             const active = b === directory;
@@ -186,7 +186,7 @@ export default function DirectoryPicker({
             return (
               <div
                 key={b}
-                className={`flex h-6 items-center gap-0.5 rounded transition-colors group bg-[var(--bg-active)]`}
+                className="group flex h-6 items-center rounded bg-[var(--bg-active)] transition-colors"
                 onContextMenu={(event) =>
                   openMenu({
                     event,
@@ -211,16 +211,16 @@ export default function DirectoryPicker({
                         const confirmed = await confirmDialog(`Remove "${shortPath(b)}" from your history?`);
                         if (confirmed) onForgetDirectory(b);
                       }}
-                      className="h-full text-[10px] pl-1.5 pr-1 text-[var(--text-dim)] hover:text-[var(--text-error)] transition-colors"
+                      className="h-full pl-1 pr-0.5 text-[10px] text-[var(--text-dim)] transition-colors hover:text-[var(--text-error)]"
                     >
-                      <X size={12} />
+                      <X size={10} />
                     </button>
                   </Tooltip>
                 )}
                 <Tooltip content={b} className="font-mono break-all">
                   <button
                     onClick={() => onChange(b)}
-                    className={`h-full select-none text-xs px-2 flex-shrink-0 truncate max-w-[100px] transition-colors ${
+                    className={`h-full max-w-[88px] flex-shrink-0 select-none truncate px-1.5 text-xs transition-colors ${
                       active
                         ? "text-[var(--text-main)] font-bold"
                         : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
@@ -236,13 +236,13 @@ export default function DirectoryPicker({
                         e.stopPropagation();
                         favorite ? onFavoriteRemove(b) : onFavoriteAdd(b);
                       }}
-                      className={`h-full text-[10px] px-1.5 transition-colors ${
+                      className={`h-full px-1 text-[10px] transition-colors ${
                         favorite
                           ? "text-[var(--accent-blue)]"
                           : "text-[var(--text-dim)] hover:text-[var(--accent-blue)]"
                       }`}
                     >
-                      <Star size={10} fill={favorite ? "currentColor" : "none"} />
+                      <Star size={9} fill={favorite ? "currentColor" : "none"} />
                     </button>
                   </Tooltip>
                 )}

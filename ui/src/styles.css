@@ -84,6 +84,18 @@ body,
   background: var(--text-dim);
 }
 
+.folder-strip-scrollbar {
+  scrollbar-width: thin;
+}
+
+.folder-strip-scrollbar::-webkit-scrollbar {
+  height: 5px;
+}
+
+.folder-strip-scrollbar::-webkit-scrollbar-thumb {
+  border-width: 1px;
+}
+
 .selectable {
   user-select: text;
 }

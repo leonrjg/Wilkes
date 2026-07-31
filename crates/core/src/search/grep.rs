@@ -243,7 +243,15 @@ fn search_path(
         return Ok(false);
     }
 
+    // Atomically claim this file's matches against the global budget. Reserving
+    // before sending is what keeps `max_results` a hard cap under parallelism:
+    // if another worker already spent the budget, `previous` is past the limit
+    // and we drop this file instead of racing an extra result past the cap.
     let previous = total_matches.fetch_add(matches.len(), Ordering::Relaxed);
+    if query.max_results > 0 && previous >= query.max_results {
+        return Ok(true);
+    }
+
     let running_total = previous + matches.len();
     let file_matches = FileMatches {
         path: path.to_path_buf(),

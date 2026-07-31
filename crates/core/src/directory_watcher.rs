@@ -10,11 +10,15 @@ pub struct DirectoryChangeBatch {
     pub root: PathBuf,
     pub changed: Vec<PathBuf>,
     pub removed: Vec<PathBuf>,
+    /// Directories that now exist — an external rename target or a moved-in
+    /// folder. The OS reports only the directory path, not its descendants, so
+    /// consumers expand these to reconcile the files inside.
+    pub appeared_dirs: Vec<PathBuf>,
 }
 
 impl DirectoryChangeBatch {
     pub fn is_empty(&self) -> bool {
-        self.changed.is_empty() && self.removed.is_empty()
+        self.changed.is_empty() && self.removed.is_empty() && self.appeared_dirs.is_empty()
     }
 }
 
@@ -23,11 +27,14 @@ pub fn classify_directory_events(root: PathBuf, events: &[DebouncedEvent]) -> Di
         root,
         changed: Vec::new(),
         removed: Vec::new(),
+        appeared_dirs: Vec::new(),
     };
 
     for event in events {
         if event.path.exists() {
-            if event.path.is_file() {
+            if event.path.is_dir() {
+                batch.appeared_dirs.push(event.path.clone());
+            } else if event.path.is_file() {
                 batch.changed.push(event.path.clone());
             }
         } else {
@@ -36,6 +43,37 @@ pub fn classify_directory_events(root: PathBuf, events: &[DebouncedEvent]) -> Di
     }
 
     batch
+}
+
+/// Recursively collect the supported files beneath `dir`, skipping symlinks so
+/// the walk is cycle-safe. Used to expand an externally-appeared directory into
+/// the descendant files a consumer must reconcile (e.g. re-key after a rename).
+pub fn collect_supported_files(
+    dir: &Path,
+    supported_extensions: &[String],
+    out: &mut Vec<PathBuf>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            error!("[DirectoryWatcher] cannot read {}: {e}", dir.display());
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_supported_files(&path, supported_extensions, out);
+        } else if file_type.is_file() && path_has_supported_extension(&path, supported_extensions) {
+            out.push(path);
+        }
+    }
 }
 
 pub struct DirectoryWatcher {
@@ -166,6 +204,7 @@ mod tests {
 
         assert_eq!(batch.changed, vec![changed_file, unsupported_file]);
         assert_eq!(batch.removed, vec![removed_file]);
+        assert_eq!(batch.appeared_dirs, vec![directory]);
     }
 
     #[test]
