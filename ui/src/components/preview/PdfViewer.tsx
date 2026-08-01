@@ -34,6 +34,8 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
 
 export interface PdfViewerProps {
   url: string;
+  /** Incremented to retry a failed parse without changing the document URL. */
+  loadAttempt?: number;
   page: number;
   highlight_bbox: BoundingBox | null;
   /** Precise per-line rects for the navigation target (bookmarks). When set,
@@ -42,6 +44,7 @@ export interface PdfViewerProps {
   bookmarkHighlights?: Array<{ id: string; page: number; rects: BoundingBox[] }>;
   onBookmarkOpen?: BookmarkOpenHandler;
   onRenderSuccess?: () => void;
+  onLoadError?: (error: unknown) => void;
   /** Fires (debounced) whenever the page nearest the viewport center changes
    *  -- covers scroll, page-jump, and link/outline navigation alike, since
    *  all of them funnel through `currentPage`. Used to keep the chat pane's
@@ -135,12 +138,14 @@ function unionBox(rects: BoundingBox[]): BoundingBox {
 
 export default function PdfViewer({
   url,
+  loadAttempt = 0,
   page,
   highlight_bbox,
   highlight_rects = null,
   bookmarkHighlights = [],
   onBookmarkOpen,
   onRenderSuccess,
+  onLoadError,
   onAddBookmark,
   showChatSelectionActions = false,
   onExplainSelection,
@@ -174,7 +179,7 @@ export default function PdfViewer({
   const [zoom, setZoom] = useState(() => readPdfScrollPosition(url)?.zoom ?? 1.0);
   // The parsed document comes from a shared LRU cache (kept alive across
   // unmounts), so navigating back to a recently opened file is instant.
-  const pdf = usePdfDocument(url);
+  const pdf = usePdfDocument(url, loadAttempt, onLoadError);
   const numPages = pdf?.numPages ?? null;
   const [isOutlineOpen, setIsOutlineOpen] = useState(false);
   const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));

@@ -63,6 +63,8 @@ export default function App() {
 
   const openMatch = useViewerStore((state) => state.openMatch);
   const openFile = useViewerStore((state) => state.openFile);
+  const restoreViewerSession = useViewerStore((state) => state.restoreSession);
+  const remapViewerPathPrefix = useViewerStore((state) => state.remapPathPrefix);
   const activeViewerPath = useViewerStore((state) => activeViewerTab(state)?.path ?? null);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -81,9 +83,9 @@ export default function App() {
   } | null>(null);
 
   useEffect(() => {
-    loadSettings().catch(() => {});
+    loadSettings().then(restoreViewerSession).catch(() => {});
     loadBookmarks().catch(() => {});
-  }, [loadSettings, loadBookmarks]);
+  }, [loadSettings, loadBookmarks, restoreViewerSession]);
 
   useEffect(() => {
     setFileFilterText("");
@@ -257,6 +259,14 @@ export default function App() {
     if (picked) setDirectory(picked);
   }, [setDirectory]);
 
+  const handleRenameDirectory = useCallback(
+    (oldPath: string, newPath: string) => {
+      renameDirectory(oldPath, newPath);
+      remapViewerPathPrefix(oldPath, newPath);
+    },
+    [renameDirectory, remapViewerPathPrefix],
+  );
+
   const sourceSlot =
     source.type === "desktop" ? (
       <DirectoryPicker
@@ -268,7 +278,7 @@ export default function App() {
         onFavoriteAdd={addFavorite}
         onFavoriteRemove={removeFavorite}
         onForgetDirectory={forgetDirectory}
-        onRenameDirectory={renameDirectory}
+        onRenameDirectory={handleRenameDirectory}
       />
     ) : (
       <UploadZone

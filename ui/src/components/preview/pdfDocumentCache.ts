@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { pdfjs } from "react-pdf";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 
@@ -77,8 +77,17 @@ export function loadPdfDocument(url: string): Promise<PDFDocumentProxy> {
 }
 
 /** The cached-or-loading `PDFDocumentProxy` for `url`, or null while loading. */
-export function usePdfDocument(url: string): PDFDocumentProxy | null {
+export function usePdfDocument(
+  url: string,
+  loadAttempt = 0,
+  onLoadError?: (error: unknown) => void,
+): PDFDocumentProxy | null {
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(() => peekCachedPdfDocument(url));
+  const onLoadErrorRef = useRef(onLoadError);
+
+  useEffect(() => {
+    onLoadErrorRef.current = onLoadError;
+  }, [onLoadError]);
 
   useEffect(() => {
     const cached = peekCachedPdfDocument(url);
@@ -94,13 +103,16 @@ export function usePdfDocument(url: string): PDFDocumentProxy | null {
         if (!cancelled) setPdf(proxy);
       })
       .catch((e) => {
-        if (!cancelled) console.error("PDF document load failed:", e);
+        if (!cancelled) {
+          console.error("PDF document load failed:", e);
+          onLoadErrorRef.current?.(e);
+        }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [url]);
+  }, [url, loadAttempt]);
 
   return pdf;
 }

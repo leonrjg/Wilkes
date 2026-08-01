@@ -70,10 +70,14 @@ const bookmarkPaneActions = {
   openPane: useBookmarksStore.getState().openPane,
   closePane: useBookmarksStore.getState().closePane,
 };
+const viewerSessionActions = {
+  restoreSession: useViewerStore.getState().restoreSession,
+};
 
 describe("App", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
     useSettingsStore.setState({
       load: vi.fn().mockResolvedValue(undefined),
       directory: "/test/dir",
@@ -117,6 +121,8 @@ describe("App", () => {
     useViewerStore.setState({
       activeTabId: null,
       tabs: [],
+      sessionHydrated: false,
+      restoreSession: viewerSessionActions.restoreSession,
     });
   });
 
@@ -145,6 +151,31 @@ describe("App", () => {
     });
     
     expect(loadMock).toHaveBeenCalled();
+  });
+
+  it("restores the viewer session after settings are ready", async () => {
+    let finishSettings: (() => void) | undefined;
+    const loadSettings = vi.fn(
+      () => new Promise<void>((resolve) => {
+        finishSettings = resolve;
+      }),
+    );
+    const restoreSession = vi.fn().mockResolvedValue(undefined);
+    useSettingsStore.setState({ load: loadSettings });
+    useViewerStore.setState({ restoreSession });
+
+    render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>,
+    );
+
+    expect(loadSettings).toHaveBeenCalledTimes(1);
+    expect(restoreSession).not.toHaveBeenCalled();
+
+    await act(async () => finishSettings?.());
+
+    expect(restoreSession).toHaveBeenCalledTimes(1);
   });
 
   it("opens settings modal when clicked", async () => {
@@ -211,6 +242,8 @@ describe("App", () => {
           },
         },
         previewLoading: false,
+        previewError: null,
+        pdfLoadAttempt: 0,
         metadata: null,
         metadataStatus: "idle",
         requestId: 1,

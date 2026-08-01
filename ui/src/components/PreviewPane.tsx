@@ -77,11 +77,15 @@ export default function PreviewPane() {
   const selectedMatch = activeTab?.match ?? null;
   const previewData = activeTab?.previewData ?? null;
   const previewLoading = activeTab?.previewLoading ?? false;
+  const previewError = activeTab?.previewError ?? null;
+  const pdfLoadAttempt = activeTab?.pdfLoadAttempt ?? 0;
   const viewerMetadata = activeTab?.metadata ?? null;
   const viewerMetadataStatus = activeTab?.metadataStatus ?? "idle";
   const canGoBack = activeTab != null && activeTab.historyIndex > 0;
   const canGoForward =
     activeTab != null && activeTab.historyIndex < activeTab.history.length - 1;
+  const retryTab = useViewerStore((state) => state.retryTab);
+  const reportTabLoadError = useViewerStore((state) => state.reportTabLoadError);
   const addBookmark = useBookmarksStore((s) => s.add);
   const removeBookmark = useBookmarksStore((s) => s.remove);
   const bookmarks = useBookmarksStore((s) => s.bookmarks);
@@ -504,16 +508,40 @@ export default function PreviewPane() {
                 </div>
               </div>
             )}
+            {previewError && !previewLoading && (
+              <div className="absolute inset-0 z-30 flex items-center justify-center bg-[var(--bg-app)] px-6">
+                <div className="flex max-w-md flex-col items-center gap-3 text-center">
+                  <FileText size={28} className="text-[var(--text-dim)]" />
+                  <div>
+                    <p className="text-sm font-medium text-[var(--text-main)]">
+                      Could not load this document
+                    </p>
+                    <p className="mt-1 break-words text-xs text-[var(--text-muted)]">
+                      {previewError}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => retryTab(activeTab.id)}
+                    className="rounded border border-[var(--border-main)] bg-[var(--bg-active)] px-3 py-1.5 text-xs text-[var(--text-main)] hover:border-[var(--border-strong)]"
+                  >
+                    Retry
+                  </button>
+                </div>
+              </div>
+            )}
             {isPdfFile ? (
               <PdfViewer
                 key={api.resolvePdfUrl(selectedMatch.path)}
                 url={api.resolvePdfUrl(selectedMatch.path)}
+                loadAttempt={pdfLoadAttempt}
                 page={pdfPage}
                 highlight_bbox={pdfBbox}
                 highlight_rects={targetBookmarkRects}
                 bookmarkHighlights={bookmarkHighlights}
                 onBookmarkOpen={handleOpenBookmark}
                 onRenderSuccess={() => setIsPdfRendering(false)}
+                onLoadError={(error) => reportTabLoadError(activeTab.id, error)}
                 onAddBookmark={handleAddBookmark}
                 showChatSelectionActions={chatSelectionActionsAvailable}
                 onExplainSelection={handleExplainSelection}

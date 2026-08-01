@@ -2,6 +2,27 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup } from "@testing-library/react";
 import { afterEach, vi } from "vitest";
 
+const localStorageValues = new Map<string, string>();
+Object.defineProperty(window, "localStorage", {
+  configurable: true,
+  value: {
+    getItem: vi.fn((key: string) => localStorageValues.get(key) ?? null),
+    setItem: vi.fn((key: string, value: string) => {
+      localStorageValues.set(key, String(value));
+    }),
+    removeItem: vi.fn((key: string) => {
+      localStorageValues.delete(key);
+    }),
+    clear: vi.fn(() => {
+      localStorageValues.clear();
+    }),
+    key: vi.fn((index: number) => Array.from(localStorageValues.keys())[index] ?? null),
+    get length() {
+      return localStorageValues.size;
+    },
+  },
+});
+
 // Runs a cleanup after each test case (e.g. clearing jsdom)
 afterEach(() => {
   cleanup();

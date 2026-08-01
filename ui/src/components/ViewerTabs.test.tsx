@@ -16,6 +16,8 @@ function tab(id: string, path: string): ViewerTab {
     historyIndex: 0,
     previewData: null,
     previewLoading: false,
+    previewError: null,
+    pdfLoadAttempt: 0,
     metadata: null,
     metadataStatus: "idle",
     requestId: 1,

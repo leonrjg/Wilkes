@@ -300,13 +300,104 @@ impl WilkesMcp {
         search: Option<Arc<dyn SearchService>>,
         integrations: Option<IntegrationsSettings>,
     ) -> Self {
+        let mut tool_router = Self::tool_router();
+        normalize_tool_input_schemas(&mut tool_router);
         Self {
             context,
             cwd,
             search,
             integrations,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
+    }
+}
+
+/// Keep Wilkes tool schemas within the broadly supported JSON Schema subset.
+///
+/// Schemars represents `Option<T>` as a nullable union such as
+/// `"type": ["integer", "null"]`. That is valid JSON Schema 2020-12, but some
+/// MCP clients discard array-valued `type` declarations before presenting a
+/// tool to the model. Tool parameters are already optional through the
+/// top-level `required` list, so advertising only their non-null value type is
+/// both accurate for normal calls and more interoperable.
+fn normalize_tool_input_schemas<S>(tool_router: &mut ToolRouter<S>) {
+    for route in tool_router.map.values_mut() {
+        let schema = Arc::make_mut(&mut route.attr.input_schema);
+        for value in schema.values_mut() {
+            normalize_optional_schema(value);
+        }
+    }
+}
+
+fn normalize_optional_schema(value: &mut serde_json::Value) {
+    let serde_json::Value::Object(schema) = value else {
+        if let serde_json::Value::Array(values) = value {
+            for value in values {
+                normalize_optional_schema(value);
+            }
+        }
+        return;
+    };
+
+    let collapsed_type = match schema.get_mut("type") {
+        Some(serde_json::Value::Array(types)) => {
+            let non_null_count = types.iter().filter(|value| *value != "null").count();
+            if non_null_count > 0 && non_null_count < types.len() {
+                types.retain(|value| value != "null");
+            }
+            (types.len() == 1).then(|| types[0].clone())
+        }
+        _ => None,
+    };
+    if let Some(value_type) = collapsed_type {
+        schema.insert("type".to_string(), value_type);
+    }
+
+    if let Some(serde_json::Value::Array(values)) = schema.get_mut("enum") {
+        let has_non_null = values.iter().any(|value| !value.is_null());
+        if has_non_null {
+            values.retain(|value| !value.is_null());
+        }
+    }
+
+    for keyword in ["anyOf", "oneOf"] {
+        let single_branch = match schema.get_mut(keyword) {
+            Some(serde_json::Value::Array(branches)) => {
+                branches.retain(|branch| !is_null_schema(branch));
+                for branch in branches.iter_mut() {
+                    normalize_optional_schema(branch);
+                }
+                (branches.len() == 1).then(|| branches[0].clone())
+            }
+            _ => None,
+        };
+
+        if let Some(serde_json::Value::Object(branch)) = single_branch {
+            if branch.keys().all(|key| !schema.contains_key(key)) {
+                schema.remove(keyword);
+                schema.extend(branch);
+            }
+        }
+    }
+
+    for nested in schema.values_mut() {
+        normalize_optional_schema(nested);
+    }
+}
+
+fn is_null_schema(value: &serde_json::Value) -> bool {
+    let Some(schema) = value.as_object() else {
+        return false;
+    };
+    if schema.get("const").is_some_and(serde_json::Value::is_null) {
+        return true;
+    }
+    match schema.get("type") {
+        Some(serde_json::Value::String(value)) => value == "null",
+        Some(serde_json::Value::Array(values)) => {
+            !values.is_empty() && values.iter().all(|value| value == "null")
+        }
+        _ => false,
     }
 }
 
@@ -402,11 +493,74 @@ fn is_within_roots(path: &Path, roots: &[PathBuf]) -> bool {
     })
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum IntegerOrString<T> {
+    Integer(T),
+    String(String),
+}
+
+fn deserialize_optional_integer<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + std::str::FromStr,
+{
+    match Option::<IntegerOrString<T>>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(IntegerOrString::Integer(value)) => Ok(Some(value)),
+        Some(IntegerOrString::String(value)) => value
+            .parse()
+            .map(Some)
+            .map_err(|_| serde::de::Error::custom(format!("invalid integer string {value:?}"))),
+    }
+}
+
+fn deserialize_integer<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + std::str::FromStr,
+{
+    match IntegerOrString::<T>::deserialize(deserializer)? {
+        IntegerOrString::Integer(value) => Ok(value),
+        IntegerOrString::String(value) => value
+            .parse()
+            .map_err(|_| serde::de::Error::custom(format!("invalid integer string {value:?}"))),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BoolOrString {
+    Bool(bool),
+    String(String),
+}
+
+fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<BoolOrString>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(BoolOrString::Bool(value)) => Ok(Some(value)),
+        Some(BoolOrString::String(value)) => match value.as_str() {
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            _ => Err(serde::de::Error::custom(format!(
+                "invalid boolean string {value:?}"
+            ))),
+        },
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetDocumentTextParams {
     path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
+    #[schemars(with = "Option<u32>")]
     page: Option<u32>,
     page_range: Option<PageRange>,
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
+    #[schemars(with = "Option<usize>")]
     max_chars: Option<usize>,
 }
 
@@ -424,12 +578,20 @@ struct SearchParams {
     /// about the open/current document or a concrete context document.
     file: Option<String>,
     /// Maximum matches to return.
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
+    #[schemars(with = "Option<usize>")]
     max_results: Option<usize>,
     /// Exact search only.
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    #[schemars(with = "Option<bool>")]
     case_sensitive: Option<bool>,
     /// Exact search only.
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    #[schemars(with = "Option<bool>")]
     is_regex: Option<bool>,
     /// Exact search context lines.
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
+    #[schemars(with = "Option<u32>")]
     context_lines: Option<u32>,
     /// Optional saved smart collection ID to intersect with the chosen scope.
     collection_id: Option<String>,
@@ -444,6 +606,8 @@ struct GetRelatedDocumentsParams {
     /// Corpus/index root. Omit unless using a different root is intentional.
     root: Option<String>,
     /// Maximum related documents to return (1-25, default 8).
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
+    #[schemars(with = "Option<usize>")]
     limit: Option<usize>,
     /// Optional saved smart collection ID to constrain returned documents.
     collection_id: Option<String>,
@@ -456,6 +620,8 @@ struct LiteratureSearchParams {
     /// Enabled literature provider to use.
     provider: LiteratureProviderParam,
     /// Maximum works to return (1-100, default 10).
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
+    #[schemars(with = "Option<usize>")]
     limit: Option<usize>,
 }
 
@@ -472,6 +638,8 @@ struct ListDocumentsParams {
     /// List location. Use all for the whole library; omit for the current root only.
     scope: Option<SearchScopeParam>,
     /// Maximum documents to return (1-500, default 50).
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
+    #[schemars(with = "Option<usize>")]
     limit: Option<usize>,
 }
 
@@ -519,9 +687,11 @@ enum SearchScopeParam {
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
 struct PageRange {
-    #[serde(alias = "start_page")]
+    #[serde(alias = "start_page", deserialize_with = "deserialize_integer")]
+    #[schemars(with = "u32")]
     start: u32,
-    #[serde(alias = "end_page")]
+    #[serde(alias = "end_page", deserialize_with = "deserialize_integer")]
+    #[schemars(with = "u32")]
     end: u32,
 }
 
@@ -1552,6 +1722,131 @@ mod tests {
     }
 
     #[test]
+    fn search_tool_schema_keeps_optional_parameters_typed() {
+        let mcp = WilkesMcp::new(McpContext::Library, PathBuf::new(), None, None);
+        let search = &mcp.tool_router.map.get("search").unwrap().attr.input_schema;
+        let properties = search
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap();
+
+        assert_eq!(properties["max_results"]["type"], "integer");
+        assert_eq!(properties["context_lines"]["type"], "integer");
+        assert_eq!(properties["case_sensitive"]["type"], "boolean");
+        assert_eq!(properties["is_regex"]["type"], "boolean");
+        assert_eq!(properties["root"]["type"], "string");
+        let scope_ref = properties["scope"]["$ref"].as_str().unwrap();
+        let search_value = serde_json::Value::Object(search.as_ref().clone());
+        let scope_schema = search_value
+            .pointer(scope_ref.strip_prefix('#').unwrap())
+            .unwrap();
+        assert_eq!(scope_schema["type"], "string");
+        assert_eq!(scope_schema["enum"], serde_json::json!(["all"]));
+
+        let required = search
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert_eq!(
+            required
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["query", "mode"]
+        );
+    }
+
+    #[test]
+    fn all_tool_schemas_omit_nullable_unions() {
+        let mcp = WilkesMcp::new(McpContext::Library, PathBuf::new(), None, None);
+        for route in mcp.tool_router.map.values() {
+            assert_schema_has_no_null_union(
+                &serde_json::Value::Object(route.attr.input_schema.as_ref().clone()),
+                route.name(),
+            );
+        }
+    }
+
+    #[test]
+    fn search_params_coerce_stringified_scalars() {
+        let params: SearchParams = serde_json::from_value(serde_json::json!({
+            "query": "test",
+            "mode": "semantic",
+            "scope": "all",
+            "max_results": "5",
+            "case_sensitive": "false",
+            "is_regex": "true",
+            "context_lines": "2"
+        }))
+        .unwrap();
+        assert_eq!(params.max_results, Some(5));
+        assert_eq!(params.case_sensitive, Some(false));
+        assert_eq!(params.is_regex, Some(true));
+        assert_eq!(params.context_lines, Some(2));
+
+        let range: PageRange = serde_json::from_value(serde_json::json!({
+            "start_page": "1",
+            "end_page": "5"
+        }))
+        .unwrap();
+        assert_eq!(range, PageRange { start: 1, end: 5 });
+    }
+
+    #[test]
+    fn mcp_scalar_coercion_rejects_invalid_strings() {
+        assert!(serde_json::from_value::<SearchParams>(serde_json::json!({
+            "query": "test",
+            "mode": "exact",
+            "scope": "all",
+            "max_results": "5.0"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<SearchParams>(serde_json::json!({
+            "query": "test",
+            "mode": "exact",
+            "scope": "all",
+            "case_sensitive": "yes"
+        }))
+        .is_err());
+    }
+
+    fn assert_schema_has_no_null_union(value: &serde_json::Value, path: &str) {
+        match value {
+            serde_json::Value::Object(schema) => {
+                if let Some(serde_json::Value::Array(types)) = schema.get("type") {
+                    assert!(
+                        !types.iter().any(|value| value == "null"),
+                        "nullable type remained in {path}: {value}"
+                    );
+                }
+                if let Some(serde_json::Value::Array(values)) = schema.get("enum") {
+                    assert!(
+                        !values.iter().any(serde_json::Value::is_null),
+                        "nullable enum remained in {path}: {value}"
+                    );
+                }
+                for keyword in ["anyOf", "oneOf"] {
+                    if let Some(serde_json::Value::Array(branches)) = schema.get(keyword) {
+                        assert!(
+                            !branches.iter().any(is_null_schema),
+                            "nullable {keyword} branch remained in {path}: {value}"
+                        );
+                    }
+                }
+                for (key, nested) in schema {
+                    assert_schema_has_no_null_union(nested, &format!("{path}.{key}"));
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for (index, nested) in values.iter().enumerate() {
+                    assert_schema_has_no_null_union(nested, &format!("{path}[{index}]"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
     fn list_context_includes_root_and_first_three_files() {
         let dir = tempdir().unwrap();
         for name in ["04.txt", "02.txt", "01.txt", "03.txt"] {
@@ -1906,6 +2201,20 @@ mod tests {
         assert!(names.contains(&"search"));
         assert!(names.contains(&"get_document_text"));
         assert!(names.contains(&"download"));
+        let search = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "search")
+            .unwrap();
+        assert_eq!(
+            search["inputSchema"]["properties"]["max_results"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            search["inputSchema"]["properties"]["case_sensitive"]["type"],
+            "boolean"
+        );
     }
 
     #[tokio::test]

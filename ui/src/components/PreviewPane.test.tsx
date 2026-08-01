@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import PreviewPane from "./PreviewPane";
-import { useViewerStore } from "../stores/useViewerStore";
+import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import { useGenerationStore } from "../stores/useGenerationStore";
@@ -59,6 +59,7 @@ function setViewerState(state: {
   selectedMatch?: any;
   previewData?: any;
   previewLoading?: boolean;
+  previewError?: string | null;
   viewerMetadata?: any;
   viewerMetadataStatus?: any;
 }) {
@@ -78,6 +79,8 @@ function setViewerState(state: {
         historyIndex: 0,
         previewData: state.previewData ?? null,
         previewLoading: state.previewLoading ?? false,
+        previewError: state.previewError ?? null,
+        pdfLoadAttempt: 0,
         metadata: state.viewerMetadata ?? null,
         metadataStatus: state.viewerMetadataStatus ?? "idle",
         requestId: 1,
@@ -162,6 +165,27 @@ describe("PreviewPane", () => {
     expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "test.txt" })).toBeInTheDocument();
     expect(screen.getAllByText("test.txt")).toHaveLength(1);
+  });
+
+  it("shows a recoverable error when a restored document cannot be loaded", () => {
+    setViewerState({
+      selectedMatch: {
+        path: "/missing.txt",
+        origin: { TextFile: { line: 0, col: 0 } },
+      },
+      previewError: "file no longer exists",
+    });
+
+    render(<PreviewPane />);
+
+    expect(screen.getByText("Could not load this document")).toBeInTheDocument();
+    expect(screen.getByText("file no longer exists")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(api.preview).toHaveBeenCalledWith({
+      path: "/missing.txt",
+      origin: { TextFile: { line: 0, col: 0 } },
+    });
   });
 
   it("defaults Markdown files to rendered and toggles to source with an icon button", () => {
@@ -562,6 +586,27 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
     expect(screen.getByTestId("pdf-viewer")).toBeInTheDocument();
+  });
+
+  it("surfaces PDF parse failures and retries with a fresh load attempt", () => {
+    const mockMatch = {
+      path: "/missing.pdf",
+      origin: { PdfPage: { page: 1, bbox: null } },
+    } as any;
+    setViewerState({
+      selectedMatch: mockMatch,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } },
+    });
+
+    render(<PreviewPane />);
+    act(() => {
+      mockPdfViewer.mock.lastCall?.[0].onLoadError(new Error("PDF file not found"));
+    });
+
+    expect(screen.getByText("PDF file not found")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(activeViewerTab(useViewerStore.getState())?.pdfLoadAttempt).toBe(1);
   });
 
   it("renders created-at month and year in the metadata summary", () => {
