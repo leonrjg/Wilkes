@@ -5,8 +5,9 @@
 //! no parse-and-retry path here on purpose.
 
 use crate::generate::{
-    truncate_chars, Constraint, GenerationRequest, Generator, Sampling, StopReason,
+    truncate_chars, Constraint, Generated, GenerationRequest, Generator, Sampling, StopReason,
 };
+use std::ops::ControlFlow;
 
 /// Bumping the prompt or the grammar changes what a cached label means, so it
 /// must be accompanied by a bump of the persisted recipe version.
@@ -62,9 +63,23 @@ pub fn build_request(members: &[&str]) -> GenerationRequest {
 }
 
 pub fn cluster_label(generator: &dyn Generator, members: &[&str]) -> anyhow::Result<String> {
-    anyhow::ensure!(!members.is_empty(), "cluster has no members to label");
-    let generated = generator.generate(build_request(members))?;
+    cluster_label_stream(generator, members, &mut |_| ControlFlow::Continue(()))
+}
 
+/// Generate a label through the shared streaming primitive so callers can
+/// cooperatively cancel local or worker-backed decoding without introducing a
+/// second generation path.
+pub fn cluster_label_stream(
+    generator: &dyn Generator,
+    members: &[&str],
+    sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(!members.is_empty(), "cluster has no members to label");
+    let generated = generator.generate_stream(build_request(members), sink)?;
+    parse_generated_label(generated)
+}
+
+fn parse_generated_label(generated: Generated) -> anyhow::Result<String> {
     if !generated.is_complete() {
         anyhow::bail!(
             "cluster label generation did not finish cleanly ({:?})",

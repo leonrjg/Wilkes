@@ -6,6 +6,8 @@ import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import { useGenerationStore } from "../stores/useGenerationStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useTopicsStore } from "../stores/useTopicsStore";
+import { useSearchStore } from "../stores/useSearchStore";
 import { api } from "../services";
 import { saveMarkdownViewMode } from "./preview/textScrollMemory";
 
@@ -31,6 +33,10 @@ vi.mock("../services", () => ({
     }),
     resolvePdfUrl: vi.fn((path: string) => path),
     relatedDocuments: vi.fn(() => Promise.resolve([])),
+    chunkTopics: vi.fn(() => Promise.resolve({ topics: [] })),
+    cancelChunkTopics: vi.fn(() => Promise.resolve()),
+    cancelSearch: vi.fn(() => Promise.resolve()),
+    updateSettings: vi.fn(() => Promise.resolve()),
     citationLinks: vi.fn(() => Promise.resolve({ references: [], cited_by: [] })),
     explainRelatedDocument: vi.fn(() => Promise.resolve()),
     summarizeDocument: vi.fn(() => Promise.resolve()),
@@ -105,6 +111,26 @@ describe("PreviewPane", () => {
       indexStatus: null,
     } as any);
     useGenerationStore.setState({ ready: false });
+    useTopicsStore.setState({
+      document: {
+        loading: false,
+        requestId: null,
+        result: null,
+        root: null,
+        path: null,
+        granularity: "much_fewer",
+        selectedTopicKey: null,
+      },
+    });
+    useSearchStore.setState({
+      results: [],
+      stats: null,
+      searching: false,
+      hasQuery: false,
+      currentSearchId: null,
+      lastQuery: null,
+      resultContext: null,
+    });
   });
 
   it("renders empty state when no match is selected", () => {
@@ -824,6 +850,100 @@ describe("PreviewPane", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Close related documents" }));
     expect(screen.queryByText("related.txt")).not.toBeInTheDocument();
+  });
+
+  it("opens a within-document topic cloud and surfaces its chunks as search results", async () => {
+    vi.mocked(api.chunkTopics).mockResolvedValueOnce({
+      topics: [
+        {
+          cluster_key: "document-topic-a",
+          chunks: [
+            {
+              chunk_id: 1,
+              file_path: "/docs/source.txt",
+              chunk_text: "First indexed passage",
+              extraction_byte_range: { start: 0, end: 21 },
+              origin: { TextFile: { line: 1, col: 1 } },
+            },
+            {
+              chunk_id: 2,
+              file_path: "/docs/source.txt",
+              chunk_text: "Second indexed passage",
+              extraction_byte_range: { start: 22, end: 44 },
+              origin: { TextFile: { line: 2, col: 1 } },
+            },
+          ],
+          representative_chunk_id: 1,
+          chunk_count: 2,
+          distinct_document_count: 1,
+          cohesion: 0.9,
+          label: "Indexed Passage Themes",
+        },
+      ],
+      total_chunk_count: 6,
+      sampled_chunk_count: 6,
+      total_document_count: 1,
+      sampled_document_count: 1,
+      input_cap: 6,
+    });
+    useSemanticStore.setState({
+      readyForCurrentRoot: true,
+      indexStatus: {
+        indexed_files: 1,
+        total_chunks: 6,
+        built_at: 123,
+        build_duration_ms: 10,
+        engine: "Candle",
+        model_id: "model",
+        dimension: 2,
+        root_path: "/docs",
+        db_size_bytes: 100,
+      },
+    } as any);
+    setViewerState({
+      selectedMatch: {
+        path: "/docs/source.txt",
+        origin: { TextFile: { line: 1, col: 1 } },
+      },
+      previewData: {
+        Text: {
+          content: "source",
+          language: "text",
+          highlight_line: 1,
+          highlight_range: { start: 0, end: 6 },
+        },
+      },
+    });
+
+    render(<PreviewPane />);
+    fireEvent.click(screen.getByRole("button", { name: "Show related documents" }));
+    expect(await screen.findByText(/Related to source\.txt/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show document topics" }));
+    expect(await screen.findByText("Indexed Passage Themes")).toBeInTheDocument();
+    expect(screen.queryByText(/Related to source\.txt/)).not.toBeInTheDocument();
+    expect(api.chunkTopics).toHaveBeenCalledWith(
+      expect.any(String),
+      {
+        root: "/docs",
+        path: "/docs/source.txt",
+        granularity: "much_fewer",
+      },
+    );
+
+    fireEvent.click(screen.getByText("Indexed Passage Themes"));
+    await waitFor(() =>
+      expect(useSearchStore.getState().stats).toEqual(
+        expect.objectContaining({ files_scanned: 1, total_matches: 2 }),
+      ),
+    );
+    expect(
+      useSearchStore.getState().results[0].matches.map((match) => match.matched_text),
+    ).toEqual(["First indexed passage", "Second indexed passage"]);
+
+    const requestId = useTopicsStore.getState().document.requestId;
+    fireEvent.click(screen.getByRole("button", { name: "Close document topics" }));
+    expect(api.cancelChunkTopics).toHaveBeenCalledWith(requestId);
   });
 
   it("gates the summary affordance on generation readiness and keeps viewer panels exclusive", async () => {

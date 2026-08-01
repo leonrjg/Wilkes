@@ -490,6 +490,10 @@ pub struct BookmarkClustersResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChunkTopicsQuery {
     pub root: PathBuf,
+    /// When present, discover topics only within this indexed document.
+    /// Absence retains the active-root cloud semantics.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
     #[serde(default = "chunk_topic_default_granularity")]
     pub granularity: BookmarkClusterGranularity,
 }
@@ -1141,6 +1145,11 @@ pub struct Settings {
     pub theme: Theme,
     #[serde(default)]
     pub search_prefer_semantic: bool,
+    /// When enabled, exact (grep) search reads a PDF's text from the semantic
+    /// index instead of re-extracting it, falling back to live extraction only
+    /// for files the index does not yet hold. Off by default.
+    #[serde(default)]
+    pub grep_use_index: bool,
     pub semantic: SemanticSettings,
     #[serde(default)]
     pub integrations: IntegrationsSettings,
@@ -1223,6 +1232,7 @@ impl Default for Settings {
             context_lines: 2,
             theme: Theme::default(),
             search_prefer_semantic: false,
+            grep_use_index: false,
             semantic: SemanticSettings::default(),
             integrations: IntegrationsSettings::default(),
             primary_metadata_source: MetadataSourcePreference::default(),
@@ -1642,6 +1652,7 @@ mod tests {
     fn chunk_topic_query_defaults_to_minimal_granularity() {
         let query: ChunkTopicsQuery = serde_json::from_str(r#"{"root":"/library"}"#).unwrap();
         assert_eq!(query.granularity, BookmarkClusterGranularity::MuchFewer);
+        assert!(query.path.is_none());
         assert_eq!(
             SemanticSettings::default().topic_cloud_input_cap,
             SemanticSettings::default_topic_cloud_input_cap()

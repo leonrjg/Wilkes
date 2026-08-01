@@ -193,9 +193,14 @@ async fn cluster_bookmarks_for_ctx(
 
 async fn chunk_topics_for_ctx(
     ctx: Arc<AppContext>,
+    request_id: String,
     query: ChunkTopicsQuery,
 ) -> Result<ChunkTopicsResult, String> {
-    ctx.chunk_topics(query).await
+    ctx.chunk_topics(request_id, query).await
+}
+
+fn cancel_chunk_topics_for_ctx(ctx: Arc<AppContext>, request_id: &str) {
+    ctx.cancel_chunk_topics(request_id);
 }
 
 async fn zotero_status_for_ctx(ctx: Arc<AppContext>) -> Result<IntegrationStatus, String> {
@@ -1813,10 +1818,17 @@ async fn cluster_bookmarks(
 
 #[tauri::command]
 async fn chunk_topics(
+    request_id: String,
     query: ChunkTopicsQuery,
     app: AppHandle,
 ) -> Result<ChunkTopicsResult, String> {
-    chunk_topics_for_ctx(app_context(&app), query).await
+    chunk_topics_for_ctx(app_context(&app), request_id, query).await
+}
+
+#[tauri::command]
+async fn cancel_chunk_topics(request_id: String, app: AppHandle) -> Result<(), String> {
+    cancel_chunk_topics_for_ctx(app_context(&app), &request_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -2188,6 +2200,7 @@ pub fn run() {
             update_bookmark_note,
             cluster_bookmarks,
             chunk_topics,
+            cancel_chunk_topics,
             list_tags,
             create_tag,
             update_tag,

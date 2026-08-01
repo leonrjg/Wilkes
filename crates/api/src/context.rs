@@ -1,5 +1,6 @@
 use parking_lot::Mutex as PLMutex;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,7 +20,9 @@ use wilkes_core::embed::{dispatch, Embedder};
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::{ContentExtractor, ExtractorRegistry};
 use wilkes_core::generate::engines::dispatch as generate_dispatch;
-use wilkes_core::generate::tasks::cluster_label::{cluster_label, validate_cluster_label};
+use wilkes_core::generate::tasks::cluster_label::{
+    cluster_label, cluster_label_stream, validate_cluster_label,
+};
 use wilkes_core::generate::tasks::document_summary::{
     summarize_document as generate_document_summary, DocumentSummaryInput,
 };
@@ -130,17 +133,11 @@ impl wilkes_agent::search::SearchService for AppContext {
         AppContext::related_documents(self, query).await
     }
 
-    async fn list_documents(
-        self: Arc<Self>,
-        root: PathBuf,
-    ) -> Result<FileListResponse, String> {
+    async fn list_documents(self: Arc<Self>, root: PathBuf) -> Result<FileListResponse, String> {
         self.list_files(root).await.map_err(|e| e.to_string())
     }
 
-    async fn document_metadata(
-        self: Arc<Self>,
-        path: PathBuf,
-    ) -> Result<DocumentMetadata, String> {
+    async fn document_metadata(self: Arc<Self>, path: PathBuf) -> Result<DocumentMetadata, String> {
         self.document_metadata_full(path)
             .await
             .map_err(|e| e.to_string())
@@ -286,6 +283,7 @@ impl GeneratorLoad {
 
 struct TopicTreeCache {
     root: PathBuf,
+    path: Option<PathBuf>,
     requested_input_cap: usize,
     index_revision: u64,
     tree: WardTree,
@@ -297,11 +295,48 @@ struct TopicTreeCache {
 }
 
 impl TopicTreeCache {
-    fn matches(&self, root: &Path, requested_input_cap: usize, index_revision: u64) -> bool {
+    fn matches(
+        &self,
+        root: &Path,
+        path: Option<&Path>,
+        requested_input_cap: usize,
+        index_revision: u64,
+    ) -> bool {
         self.root == root
+            && self.path.as_deref() == path
             && self.requested_input_cap == requested_input_cap
             && self.index_revision == index_revision
     }
+}
+
+#[derive(Default)]
+struct TopicTreeCaches {
+    root: Option<Arc<TopicTreeCache>>,
+    document: Option<Arc<TopicTreeCache>>,
+}
+
+impl TopicTreeCaches {
+    fn slot(&self, path: Option<&Path>) -> &Option<Arc<TopicTreeCache>> {
+        if path.is_some() {
+            &self.document
+        } else {
+            &self.root
+        }
+    }
+
+    fn set(&mut self, path: Option<&Path>, cache: Arc<TopicTreeCache>) {
+        if path.is_some() {
+            self.document = Some(cache);
+        } else {
+            self.root = Some(cache);
+        }
+    }
+}
+
+struct TopicOperation {
+    cancel: CancellationToken,
+    cancel_flag: Arc<AtomicBool>,
+    label_task: Option<JoinHandle<()>>,
 }
 
 /// Shared application state and lifecycle logic. Both the desktop (Tauri) and
@@ -339,13 +374,14 @@ pub struct AppContext {
     /// makes the previous run's results describe a partition nobody is looking
     /// at any more.
     cluster_label_task: PLMutex<Option<JoinHandle<()>>>,
-    /// Topic labels have an independent lifecycle from bookmark labels: a
-    /// redraw of one pane must not cancel useful work for the other.
-    topic_label_task: PLMutex<Option<JoinHandle<()>>>,
-    /// One bounded, active-root Ward tree. The retained similarity matrix is
-    /// O(n²), so keeping historical roots or caps would multiply the resource
-    /// knob instead of respecting it.
-    topic_tree_cache: PLMutex<Option<Arc<TopicTreeCache>>>,
+    /// Root and document clouds can be visible together. Each request owns one
+    /// cancellation lifecycle; closing or redrawing one surface must not stop
+    /// the other.
+    topic_operations: PLMutex<HashMap<String, TopicOperation>>,
+    /// Exactly one retained root tree and one current-document tree. This
+    /// prevents viewer navigation from evicting the library tree without
+    /// turning the O(n²) cache into unbounded history.
+    topic_tree_caches: PLMutex<TopicTreeCaches>,
     /// Serialises cache misses so rapid redraw requests cannot build duplicate
     /// O(n²) trees concurrently.
     topic_tree_build_lock: tokio::sync::Mutex<()>,
@@ -388,8 +424,8 @@ impl AppContext {
             generator_load_lock: tokio::sync::Mutex::new(()),
             generator_epoch: AtomicU64::new(0),
             cluster_label_task: PLMutex::new(None),
-            topic_label_task: PLMutex::new(None),
-            topic_tree_cache: PLMutex::new(None),
+            topic_operations: PLMutex::new(HashMap::new()),
+            topic_tree_caches: PLMutex::new(TopicTreeCaches::default()),
             topic_tree_build_lock: tokio::sync::Mutex::new(()),
             semantic_index_revision: AtomicU64::new(0),
             events,
@@ -857,45 +893,107 @@ impl AppContext {
 
     fn invalidate_topic_tree_cache(&self) {
         self.semantic_index_revision.fetch_add(1, Ordering::AcqRel);
-        self.topic_tree_cache.lock().take();
+        *self.topic_tree_caches.lock() = TopicTreeCaches::default();
     }
 
     fn matching_topic_tree_cache(
         &self,
         root: &Path,
+        path: Option<&Path>,
         requested_input_cap: usize,
         index_revision: u64,
     ) -> Option<Arc<TopicTreeCache>> {
-        self.topic_tree_cache
+        self.topic_tree_caches
             .lock()
+            .slot(path)
             .as_ref()
-            .filter(|cached| cached.matches(root, requested_input_cap, index_revision))
+            .filter(|cached| cached.matches(root, path, requested_input_cap, index_revision))
             .cloned()
+    }
+
+    fn start_topic_operation(
+        &self,
+        request_id: &str,
+    ) -> Result<(CancellationToken, Arc<AtomicBool>), String> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Err("Invalid chunk-topic request id".to_string());
+        }
+        let cancel = CancellationToken::new();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let previous = self.topic_operations.lock().insert(
+            request_id.to_string(),
+            TopicOperation {
+                cancel: cancel.clone(),
+                cancel_flag: Arc::clone(&cancel_flag),
+                label_task: None,
+            },
+        );
+        if let Some(previous) = previous {
+            previous.cancel_flag.store(true, Ordering::Relaxed);
+            previous.cancel.cancel();
+            if let Some(task) = previous.label_task {
+                task.abort();
+            }
+        }
+        Ok((cancel, cancel_flag))
+    }
+
+    fn finish_topic_operation(&self, request_id: &str) {
+        self.topic_operations.lock().remove(request_id);
+    }
+
+    pub fn cancel_chunk_topics(&self, request_id: &str) {
+        if let Some(operation) = self.topic_operations.lock().remove(request_id) {
+            operation.cancel_flag.store(true, Ordering::Relaxed);
+            operation.cancel.cancel();
+            if let Some(task) = operation.label_task {
+                task.abort();
+            }
+        }
     }
 
     async fn topic_tree_for(
         self: &Arc<Self>,
         root: PathBuf,
+        path: Option<PathBuf>,
         requested_input_cap: usize,
+        cancel: &CancellationToken,
+        cancel_flag: &Arc<AtomicBool>,
     ) -> Result<Arc<TopicTreeCache>, String> {
         loop {
+            if cancel.is_cancelled() {
+                return Err("Chunk topic operation cancelled".to_string());
+            }
             let index_revision = self.semantic_index_revision.load(Ordering::Acquire);
-            if let Some(cached) =
-                self.matching_topic_tree_cache(&root, requested_input_cap, index_revision)
-            {
+            if let Some(cached) = self.matching_topic_tree_cache(
+                &root,
+                path.as_deref(),
+                requested_input_cap,
+                index_revision,
+            ) {
                 return Ok(cached);
             }
 
-            let _build_guard = self.topic_tree_build_lock.lock().await;
+            let _build_guard = tokio::select! {
+                guard = self.topic_tree_build_lock.lock() => guard,
+                _ = cancel.cancelled() => {
+                    return Err("Chunk topic operation cancelled".to_string());
+                }
+            };
             let index_revision = self.semantic_index_revision.load(Ordering::Acquire);
-            if let Some(cached) =
-                self.matching_topic_tree_cache(&root, requested_input_cap, index_revision)
-            {
+            if let Some(cached) = self.matching_topic_tree_cache(
+                &root,
+                path.as_deref(),
+                requested_input_cap,
+                index_revision,
+            ) {
                 return Ok(cached);
             }
 
             let index_arc = self.index.lock().clone();
             let build_root = root.clone();
+            let build_path = path.clone();
+            let build_cancel = Arc::clone(cancel_flag);
             let built = tokio::task::spawn_blocking(move || {
                 // Release the database mutex before Ward starts. The bulk read
                 // is the only part that needs the live semantic index.
@@ -907,10 +1005,16 @@ impl AppContext {
                         "Semantic index unavailable. Build or restore the semantic index first."
                             .to_string()
                     })?;
-                    index
-                        .topic_chunks_for_root(&build_root)
-                        .map_err(|error| format!("Could not load indexed chunks: {error:#}"))?
+                    match build_path.as_deref() {
+                        Some(path) => index.topic_chunks_for_file(&build_root, path),
+                        None => index.topic_chunks_for_root(&build_root),
+                    }
+                    .map_err(|error| format!("Could not load indexed chunks: {error:#}"))?
                 };
+
+                if build_cancel.load(Ordering::Relaxed) {
+                    return Err("Chunk topic operation cancelled".to_string());
+                }
 
                 let total_chunk_count = all.len();
                 let input_cap = requested_input_cap.min(total_chunk_count);
@@ -933,11 +1037,12 @@ impl AppContext {
                     .iter_mut()
                     .map(|chunk| std::mem::take(&mut chunk.embedding))
                     .collect();
-                let tree = WardTree::build(&vectors)
+                let tree = WardTree::build_with_cancel(&vectors, &build_cancel)
                     .map_err(|error| format!("Could not cluster indexed chunks: {error:#}"))?;
 
                 Ok::<_, String>(Arc::new(TopicTreeCache {
                     root: build_root,
+                    path: build_path,
                     requested_input_cap,
                     index_revision,
                     tree,
@@ -951,9 +1056,12 @@ impl AppContext {
             .await
             .map_err(|error| format!("Chunk topic task panicked: {error}"))??;
 
-            let mut cache = self.topic_tree_cache.lock();
+            if cancel.is_cancelled() {
+                return Err("Chunk topic operation cancelled".to_string());
+            }
+            let mut caches = self.topic_tree_caches.lock();
             if self.semantic_index_revision.load(Ordering::Acquire) == index_revision {
-                *cache = Some(Arc::clone(&built));
+                caches.set(path.as_deref(), Arc::clone(&built));
                 return Ok(built);
             }
             // The index changed while Ward was building. Discard the stale
@@ -963,7 +1071,25 @@ impl AppContext {
 
     pub async fn chunk_topics(
         self: Arc<Self>,
+        request_id: String,
         query: ChunkTopicsQuery,
+    ) -> Result<ChunkTopicsResult, String> {
+        let (cancel, cancel_flag) = self.start_topic_operation(&request_id)?;
+        let result = Arc::clone(&self)
+            .chunk_topics_inner(&request_id, query, &cancel, &cancel_flag)
+            .await;
+        if result.is_err() {
+            self.finish_topic_operation(&request_id);
+        }
+        result
+    }
+
+    async fn chunk_topics_inner(
+        self: Arc<Self>,
+        request_id: &str,
+        query: ChunkTopicsQuery,
+        cancel: &CancellationToken,
+        cancel_flag: &Arc<AtomicBool>,
     ) -> Result<ChunkTopicsResult, String> {
         self.ensure_no_active_embed_task(
             "Semantic index is currently being built. Please wait before finding topics.",
@@ -972,20 +1098,34 @@ impl AppContext {
             return Err("Choose a library root before finding topics.".to_string());
         }
 
-        let requested_input_cap = self
-            .get_settings()
-            .await
-            .semantic
-            .topic_cloud_input_cap
-            .max(3);
+        let settings = self.settings().await;
+        let (library_roots, _) = library_roots(&settings);
+        let root = Self::canonicalize_search_root(&query.root)?;
+        Self::ensure_path_in_library(&root, &library_roots, "Chunk topics root")?;
+        let path = match query.path {
+            Some(path) => {
+                let (path, _) = Self::canonicalize_supported_file(
+                    &root,
+                    &path,
+                    &settings.supported_extensions,
+                    "Chunk topics",
+                )?;
+                Self::ensure_path_in_library(&path, &library_roots, "Chunk topics file")?;
+                Some(path)
+            }
+            None => None,
+        };
+        let requested_input_cap = settings.semantic.topic_cloud_input_cap.max(3);
         let granularity = query.granularity;
-        let root = query.root;
-        let cached = self.topic_tree_for(root, requested_input_cap).await?;
+        let cached = self
+            .topic_tree_for(root, path, requested_input_cap, cancel, cancel_flag)
+            .await?;
         let cached_for_cut = Arc::clone(&cached);
+        let cut_cancel = Arc::clone(cancel_flag);
         let mut result = tokio::task::spawn_blocking(move || {
             let clustered = cached_for_cut
                 .tree
-                .cut(granularity)
+                .cut_with_cancel(granularity, &cut_cancel)
                 .map_err(|error| format!("Could not cut chunk topic tree: {error:#}"))?;
             let topics = clustered
                 .clusters
@@ -1026,8 +1166,13 @@ impl AppContext {
         .await
         .map_err(|e| format!("Chunk topic task panicked: {e}"))??;
 
-        self.attach_chunk_topic_labels(&mut result.topics, &cached.sampled)
-            .await;
+        self.attach_chunk_topic_labels(
+            request_id,
+            Arc::clone(cancel_flag),
+            &mut result.topics,
+            &cached.sampled,
+        )
+        .await;
         Ok(result)
     }
 
@@ -1035,20 +1180,22 @@ impl AppContext {
     /// background. Late labels are patched by the membership-derived key.
     async fn attach_chunk_topic_labels(
         self: &Arc<Self>,
+        request_id: &str,
+        cancel_flag: Arc<AtomicBool>,
         topics: &mut [ChunkTopic],
         sampled: &[TopicChunkData],
     ) {
-        if let Some(previous) = self.topic_label_task.lock().take() {
-            previous.abort();
-        }
         if topics.is_empty() {
+            self.finish_topic_operation(request_id);
             return;
         }
         let Some(generator) = self.generator.lock().clone() else {
+            self.finish_topic_operation(request_id);
             return;
         };
         let settings = self.generation_settings().await;
         if !settings.enabled {
+            self.finish_topic_operation(request_id);
             return;
         }
         let model_id = generator.model_id().to_string();
@@ -1067,6 +1214,7 @@ impl AppContext {
             Ok(cached) => cached,
             Err(error) => {
                 error!("Could not read cached chunk-cluster labels: {error:#}");
+                self.finish_topic_operation(request_id);
                 return;
             }
         };
@@ -1092,20 +1240,35 @@ impl AppContext {
             pending.push((topic.cluster_key.clone(), members));
         }
         if pending.is_empty() {
+            self.finish_topic_operation(request_id);
             return;
         }
         let ctx = Arc::clone(self);
+        let task_request_id = request_id.to_string();
         let task = tokio::spawn(async move {
             for (key, members) in pending {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    break;
+                }
                 let generator = Arc::clone(&generator);
+                let generation_cancel = Arc::clone(&cancel_flag);
                 let generated = tokio::task::spawn_blocking(move || {
                     let refs: Vec<&str> = members.iter().map(String::as_str).collect();
-                    cluster_label(generator.as_ref(), &refs)
+                    cluster_label_stream(generator.as_ref(), &refs, &mut |_| {
+                        if generation_cancel.load(Ordering::Relaxed) {
+                            std::ops::ControlFlow::Break(())
+                        } else {
+                            std::ops::ControlFlow::Continue(())
+                        }
+                    })
                 })
                 .await;
                 let label = match generated {
                     Ok(Ok(label)) => label,
                     Ok(Err(error)) => {
+                        if cancel_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
                         warn!("Could not label chunk topic {key}: {error:#}");
                         continue;
                     }
@@ -1114,6 +1277,9 @@ impl AppContext {
                         continue;
                     }
                 };
+                if cancel_flag.load(Ordering::Relaxed) {
+                    break;
+                }
                 if let Ok(store) = ctx.research_store() {
                     if let Err(error) = store
                         .lock()
@@ -1130,11 +1296,21 @@ impl AppContext {
                 }
                 ctx.events.emit(
                     "chunk-topic-labelled",
-                    serde_json::json!({ "cluster_key": key, "label": label }),
+                    serde_json::json!({
+                        "request_id": task_request_id.clone(),
+                        "cluster_key": key,
+                        "label": label
+                    }),
                 );
             }
+            ctx.finish_topic_operation(&task_request_id);
         });
-        *self.topic_label_task.lock() = Some(task);
+        let mut operations = self.topic_operations.lock();
+        if let Some(operation) = operations.get_mut(request_id) {
+            operation.label_task = Some(task);
+        } else {
+            task.abort();
+        }
     }
 
     pub async fn list_files(
@@ -1692,10 +1868,7 @@ impl AppContext {
     /// Zotero override), which yields the bibliographic basics for a file the
     /// cache has not processed yet. No third composition is introduced — this
     /// only chooses between the two the app already owns.
-    pub async fn document_metadata_full(
-        &self,
-        path: PathBuf,
-    ) -> anyhow::Result<DocumentMetadata> {
+    pub async fn document_metadata_full(&self, path: PathBuf) -> anyhow::Result<DocumentMetadata> {
         if !is_under(&path, &self.data_dir) {
             anyhow::bail!("Access denied: path outside data directory");
         }
@@ -2710,6 +2883,7 @@ impl AppContext {
             log,
             retrieval,
             generator,
+            settings.grep_use_index,
         ))
     }
 
@@ -2861,8 +3035,13 @@ impl AppContext {
             .metadata_cache()
             .ok_or_else(|| "Metadata cache is unavailable".to_string())?;
         let paths = {
-            let guard = cache.lock().map_err(|_| "Metadata cache lock failed".to_string())?;
-            let Some(doi) = guard.doi_for_path(&source_path).map_err(|e| e.to_string())? else {
+            let guard = cache
+                .lock()
+                .map_err(|_| "Metadata cache lock failed".to_string())?;
+            let Some(doi) = guard
+                .doi_for_path(&source_path)
+                .map_err(|e| e.to_string())?
+            else {
                 return Ok(CitationLinks::default());
             };
             guard.citation_links(&doi).map_err(|e| e.to_string())?
@@ -3589,8 +3768,12 @@ impl AppContext {
         if let Some(task) = self.cluster_label_task.lock().take() {
             task.abort();
         }
-        if let Some(task) = self.topic_label_task.lock().take() {
-            task.abort();
+        for (_, operation) in self.topic_operations.lock().drain() {
+            operation.cancel_flag.store(true, Ordering::Relaxed);
+            operation.cancel.cancel();
+            if let Some(task) = operation.label_task {
+                task.abort();
+            }
         }
         self.kill_all_workers();
     }
@@ -4339,6 +4522,9 @@ mod tests {
         let (dir, ctx) = test_ctx();
         let root = dir.path().join("topic-root");
         std::fs::create_dir_all(&root).unwrap();
+        let mut settings = Settings::default();
+        settings.last_directory = Some(root.clone());
+        std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
         let mut index = SemanticIndex::create(
             dir.path(),
             "topic-cache-model",
@@ -4361,6 +4547,7 @@ mod tests {
             std::fs::write(&path, &text).unwrap();
             index
                 .write_file(wilkes_core::embed::index::db::PreparedFile {
+                    full_text: String::new(),
                     path: path.clone(),
                     chunks: vec![(
                         wilkes_core::embed::index::chunk::Chunk {
@@ -4380,26 +4567,34 @@ mod tests {
         *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
 
         let fewer = Arc::clone(&ctx)
-            .chunk_topics(ChunkTopicsQuery {
-                root: root.clone(),
-                granularity: wilkes_core::types::BookmarkClusterGranularity::MuchFewer,
-            })
+            .chunk_topics(
+                "root-fewer".to_string(),
+                ChunkTopicsQuery {
+                    root: root.clone(),
+                    path: None,
+                    granularity: wilkes_core::types::BookmarkClusterGranularity::MuchFewer,
+                },
+            )
             .await
             .unwrap();
-        let first_tree = ctx.topic_tree_cache.lock().as_ref().unwrap().clone();
+        let first_tree = ctx.topic_tree_caches.lock().root.as_ref().unwrap().clone();
         assert!(first_tree
             .sampled
             .iter()
             .all(|chunk| chunk.embedding.is_empty()));
 
         let more = Arc::clone(&ctx)
-            .chunk_topics(ChunkTopicsQuery {
-                root: root.clone(),
-                granularity: wilkes_core::types::BookmarkClusterGranularity::MuchMore,
-            })
+            .chunk_topics(
+                "root-more".to_string(),
+                ChunkTopicsQuery {
+                    root: root.clone(),
+                    path: None,
+                    granularity: wilkes_core::types::BookmarkClusterGranularity::MuchMore,
+                },
+            )
             .await
             .unwrap();
-        let recut_tree = ctx.topic_tree_cache.lock().as_ref().unwrap().clone();
+        let recut_tree = ctx.topic_tree_caches.lock().root.as_ref().unwrap().clone();
         assert!(Arc::ptr_eq(&first_tree, &recut_tree));
         assert_ne!(fewer.topics.len(), more.topics.len());
 
@@ -4409,20 +4604,149 @@ mod tests {
         })
         .await;
         let capped = Arc::clone(&ctx)
-            .chunk_topics(ChunkTopicsQuery {
-                root,
-                granularity: wilkes_core::types::BookmarkClusterGranularity::Balanced,
-            })
+            .chunk_topics(
+                "root-capped".to_string(),
+                ChunkTopicsQuery {
+                    root,
+                    path: None,
+                    granularity: wilkes_core::types::BookmarkClusterGranularity::Balanced,
+                },
+            )
             .await
             .unwrap();
-        let rebuilt_tree = ctx.topic_tree_cache.lock().as_ref().unwrap().clone();
+        let rebuilt_tree = ctx.topic_tree_caches.lock().root.as_ref().unwrap().clone();
         assert!(!Arc::ptr_eq(&first_tree, &rebuilt_tree));
         assert_eq!(capped.sampled_chunk_count, 3);
 
         let revision = ctx.semantic_index_revision.load(Ordering::Acquire);
         ctx.deactivate_semantic();
-        assert!(ctx.topic_tree_cache.lock().is_none());
+        assert!(ctx.topic_tree_caches.lock().root.is_none());
+        assert!(ctx.topic_tree_caches.lock().document.is_none());
         assert!(ctx.semantic_index_revision.load(Ordering::Acquire) > revision);
+    }
+
+    #[tokio::test]
+    async fn document_topics_are_file_scoped_and_keep_the_root_tree_cached() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("document-topic-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let document = root.join("paper.txt");
+        let other = root.join("other.txt");
+        std::fs::write(&document, "document passages").unwrap();
+        std::fs::write(&other, "other passage").unwrap();
+        let mut settings = Settings::default();
+        settings.last_directory = Some(root.clone());
+        std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        let mut index = SemanticIndex::create(
+            dir.path(),
+            "document-topic-model",
+            2,
+            EmbeddingEngine::Candle,
+            Some(&root),
+        )
+        .unwrap();
+        let vectors = [
+            [1.0, 0.0],
+            [0.99, 0.01],
+            [0.0, 1.0],
+            [0.01, 0.99],
+            [-1.0, 0.0],
+            [-0.99, 0.01],
+        ];
+        let chunks = vectors
+            .into_iter()
+            .enumerate()
+            .map(|(number, vector)| {
+                let text = format!("document topic passage {number}");
+                (
+                    wilkes_core::embed::index::chunk::Chunk {
+                        file_path: document.clone(),
+                        text: text.clone(),
+                        byte_range: ByteRange {
+                            start: 0,
+                            end: text.len(),
+                        },
+                        origin: SourceOrigin::TextFile {
+                            line: (number + 1) as u32,
+                            col: 1,
+                        },
+                    },
+                    vector.to_vec(),
+                )
+            })
+            .collect();
+        index
+            .write_file(wilkes_core::embed::index::db::PreparedFile {
+                full_text: String::new(),
+                path: document.clone(),
+                chunks,
+            })
+            .unwrap();
+        index
+            .write_file(wilkes_core::embed::index::db::PreparedFile {
+                full_text: String::new(),
+                path: other.clone(),
+                chunks: vec![(
+                    wilkes_core::embed::index::chunk::Chunk {
+                        file_path: other,
+                        text: "other passage".to_string(),
+                        byte_range: ByteRange { start: 0, end: 13 },
+                        origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                    },
+                    vec![0.5, 0.5],
+                )],
+            })
+            .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
+
+        Arc::clone(&ctx)
+            .chunk_topics(
+                "root-cloud".to_string(),
+                ChunkTopicsQuery {
+                    root: root.clone(),
+                    path: None,
+                    granularity: wilkes_core::types::BookmarkClusterGranularity::MuchFewer,
+                },
+            )
+            .await
+            .unwrap();
+        let document_result = Arc::clone(&ctx)
+            .chunk_topics(
+                "document-cloud".to_string(),
+                ChunkTopicsQuery {
+                    root,
+                    path: Some(document.clone()),
+                    granularity: wilkes_core::types::BookmarkClusterGranularity::MuchFewer,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(document_result.total_document_count, 1);
+        assert_eq!(document_result.total_chunk_count, 6);
+        let canonical_document = document.canonicalize().unwrap();
+        assert!(document_result
+            .topics
+            .iter()
+            .flat_map(|topic| &topic.chunks)
+            .all(|chunk| chunk.file_path == canonical_document));
+        let caches = ctx.topic_tree_caches.lock();
+        assert!(caches.root.is_some());
+        assert!(caches.document.is_some());
+    }
+
+    #[test]
+    fn cancelling_one_topic_request_does_not_cancel_another() {
+        let (_dir, ctx) = test_ctx();
+        let (_, first_flag) = ctx.start_topic_operation("first").unwrap();
+        let (_, second_flag) = ctx.start_topic_operation("second").unwrap();
+
+        ctx.cancel_chunk_topics("first");
+
+        assert!(first_flag.load(Ordering::Relaxed));
+        assert!(!second_flag.load(Ordering::Relaxed));
+        assert!(ctx.topic_operations.lock().contains_key("second"));
     }
 
     #[test]
@@ -7206,7 +7530,11 @@ exit 0
             .unwrap();
 
         assert_eq!(
-            links.references.iter().map(|e| e.path.clone()).collect::<Vec<_>>(),
+            links
+                .references
+                .iter()
+                .map(|e| e.path.clone())
+                .collect::<Vec<_>>(),
             vec![cited.clone()]
         );
         assert!(links.cited_by.is_empty());
@@ -7220,7 +7548,11 @@ exit 0
             .await
             .unwrap();
         assert_eq!(
-            reverse.cited_by.iter().map(|e| e.path.clone()).collect::<Vec<_>>(),
+            reverse
+                .cited_by
+                .iter()
+                .map(|e| e.path.clone())
+                .collect::<Vec<_>>(),
             vec![source]
         );
         assert!(reverse.references.is_empty());
@@ -7270,11 +7602,13 @@ exit 0
             origin: SourceOrigin::TextFile { line: 1, col: 1 },
         };
         idx.write_file(wilkes_core::embed::index::db::PreparedFile {
+            full_text: String::new(),
             path: source.clone(),
             chunks: vec![(chunk(&source, "source"), vec![1.0, 0.0])],
         })
         .unwrap();
         idx.write_file(wilkes_core::embed::index::db::PreparedFile {
+            full_text: String::new(),
             path: related.clone(),
             chunks: vec![(chunk(&related, "related"), vec![0.9, 0.1])],
         })

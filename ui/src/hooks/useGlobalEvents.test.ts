@@ -217,7 +217,11 @@ describe("useGlobalEvents", () => {
     });
 
     act(() => {
-      topicLabelHandler({ cluster_key: "topic-b", label: "Other topic" });
+      topicLabelHandler({
+        request_id: "topics-1",
+        cluster_key: "topic-b",
+        label: "Other topic",
+      });
     });
     expect(useSearchStore.getState().resultContext).toEqual({
       kind: "topic",
@@ -226,7 +230,11 @@ describe("useGlobalEvents", () => {
     });
 
     act(() => {
-      topicLabelHandler({ cluster_key: "topic-a", label: "Graph indexes" });
+      topicLabelHandler({
+        request_id: "topics-1",
+        cluster_key: "topic-a",
+        label: "Graph indexes",
+      });
     });
     expect(useSearchStore.getState().resultContext).toEqual({
       kind: "topic",

@@ -155,14 +155,30 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<BookmarkClustersResult>;
   }
 
-  async chunkTopics(query: ChunkTopicsQuery): Promise<ChunkTopicsResult> {
-    const res = await fetch("/api/topics/chunks", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(query),
+  async chunkTopics(requestId: string, query: ChunkTopicsQuery): Promise<ChunkTopicsResult> {
+    const controller = new AbortController();
+    this.controllers.set(requestId, controller);
+    try {
+      const res = await fetch("/api/topics/chunks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ request_id: requestId, query }),
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(`chunkTopics failed: ${res.status}`);
+      return res.json() as Promise<ChunkTopicsResult>;
+    } finally {
+      this.controllers.delete(requestId);
+    }
+  }
+
+  async cancelChunkTopics(requestId: string): Promise<void> {
+    this.controllers.get(requestId)?.abort();
+    this.controllers.delete(requestId);
+    const res = await fetch(`/api/topics/chunks/${encodeURIComponent(requestId)}`, {
+      method: "DELETE",
     });
-    if (!res.ok) throw new Error(`chunkTopics failed: ${res.status}`);
-    return res.json() as Promise<ChunkTopicsResult>;
+    if (!res.ok) throw new Error(`cancelChunkTopics failed: ${res.status}`);
   }
 
   async preview(matchRef: MatchRef): Promise<PreviewData> {

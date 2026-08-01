@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { randomId } from "../lib/types";
 import { api } from "../services";
 import type {
   BookmarkClusterGranularity,
@@ -6,39 +7,92 @@ import type {
   ChunkTopicsResult,
 } from "../lib/types";
 
+interface DocumentTopicsState {
+  loading: boolean;
+  requestId: string | null;
+  result: ChunkTopicsResult | null;
+  root: string | null;
+  path: string | null;
+  granularity: BookmarkClusterGranularity;
+  selectedTopicKey: string | null;
+}
+
 interface TopicsStore {
   paneOpen: boolean;
   loading: boolean;
-  requestId: number;
+  requestId: string | null;
   result: ChunkTopicsResult | null;
   root: string | null;
   granularity: BookmarkClusterGranularity;
   selectedTopicKey: string | null;
+  document: DocumentTopicsState;
   openPane: () => void;
   closePane: () => void;
   setGranularity: (granularity: BookmarkClusterGranularity) => void;
   selectTopic: (clusterKey: string | null) => void;
   load: (root: string) => Promise<void>;
+  loadDocument: (root: string, path: string) => Promise<void>;
+  cancelDocument: () => void;
+  setDocumentGranularity: (granularity: BookmarkClusterGranularity) => void;
+  selectDocumentTopic: (clusterKey: string | null) => void;
   applyLabel: (event: ChunkTopicLabelled) => void;
 }
+
+function cancelRequest(requestId: string | null) {
+  if (requestId) {
+    void api.cancelChunkTopics(requestId).catch((error) =>
+      console.debug("Could not cancel chunk-topic request:", error),
+    );
+  }
+}
+
+function patchLabel(
+  result: ChunkTopicsResult | null,
+  clusterKey: string,
+  label: string,
+) {
+  if (!result) return result;
+  let changed = false;
+  const topics = result.topics.map((topic) => {
+    if (topic.cluster_key !== clusterKey) return topic;
+    changed = true;
+    return { ...topic, label };
+  });
+  return changed ? { ...result, topics } : result;
+}
+
+const emptyDocumentState: DocumentTopicsState = {
+  loading: false,
+  requestId: null,
+  result: null,
+  root: null,
+  path: null,
+  granularity: "much_fewer",
+  selectedTopicKey: null,
+};
 
 export const useTopicsStore = create<TopicsStore>((set, get) => ({
   paneOpen: false,
   loading: false,
-  requestId: 0,
+  requestId: null,
   result: null,
   root: null,
   granularity: "much_fewer",
   selectedTopicKey: null,
+  document: emptyDocumentState,
 
   openPane: () => set({ paneOpen: true }),
-  closePane: () => set({ paneOpen: false }),
+  closePane: () => {
+    cancelRequest(get().requestId);
+    set({ paneOpen: false, loading: false, requestId: null });
+  },
   setGranularity: (granularity) =>
     set({ granularity, selectedTopicKey: null }),
   selectTopic: (selectedTopicKey) => set({ selectedTopicKey }),
 
   load: async (root) => {
-    const requestId = get().requestId + 1;
+    cancelRequest(get().requestId);
+    const requestId = randomId();
     const granularity = get().granularity;
     set({
       requestId,
@@ -48,27 +102,101 @@ export const useTopicsStore = create<TopicsStore>((set, get) => ({
       ...(get().root === root ? {} : { result: null }),
     });
     try {
-      const result = await api.chunkTopics({ root, granularity });
-      if (get().requestId === requestId) {
+      const result = await api.chunkTopics(requestId, { root, granularity });
+      if (get().requestId === requestId && get().paneOpen) {
         set({ result, loading: false });
       }
     } catch (error) {
-      if (get().requestId === requestId) {
+      if (get().requestId === requestId && get().paneOpen) {
         set({ loading: false });
+        throw error;
       }
-      throw error;
     }
   },
 
-  applyLabel: ({ cluster_key, label }) =>
-    set((state) => {
-      if (!state.result) return state;
-      let changed = false;
-      const topics = state.result.topics.map((topic) => {
-        if (topic.cluster_key !== cluster_key) return topic;
-        changed = true;
-        return { ...topic, label };
+  loadDocument: async (root, path) => {
+    cancelRequest(get().document.requestId);
+    const requestId = randomId();
+    const granularity = get().document.granularity;
+    const sameDocument =
+      get().document.root === root && get().document.path === path;
+    set((state) => ({
+      document: {
+        ...state.document,
+        requestId,
+        loading: true,
+        root,
+        path,
+        selectedTopicKey: null,
+        ...(sameDocument ? {} : { result: null }),
+      },
+    }));
+    try {
+      const result = await api.chunkTopics(requestId, {
+        root,
+        path,
+        granularity,
       });
-      return changed ? { result: { ...state.result, topics } } : state;
+      if (get().document.requestId === requestId) {
+        set((state) => ({
+          document: { ...state.document, result, loading: false },
+        }));
+      }
+    } catch (error) {
+      if (get().document.requestId === requestId) {
+        set((state) => ({
+          document: { ...state.document, loading: false },
+        }));
+        throw error;
+      }
+    }
+  },
+
+  cancelDocument: () => {
+    cancelRequest(get().document.requestId);
+    set((state) => ({
+      document: {
+        ...state.document,
+        loading: false,
+        requestId: null,
+      },
+    }));
+  },
+  setDocumentGranularity: (granularity) =>
+    set((state) => ({
+      document: {
+        ...state.document,
+        granularity,
+        selectedTopicKey: null,
+      },
+    })),
+  selectDocumentTopic: (selectedTopicKey) =>
+    set((state) => ({
+      document: { ...state.document, selectedTopicKey },
+    })),
+
+  applyLabel: ({ request_id, cluster_key, label }) =>
+    set((state) => {
+      const rootMatches = state.requestId === request_id;
+      const documentMatches = state.document.requestId === request_id;
+      if (!rootMatches && !documentMatches) return {};
+
+      return {
+        ...(rootMatches
+          ? { result: patchLabel(state.result, cluster_key, label) }
+          : {}),
+        ...(documentMatches
+          ? {
+              document: {
+                ...state.document,
+                result: patchLabel(
+                  state.document.result,
+                  cluster_key,
+                  label,
+                ),
+              },
+            }
+          : {}),
+      };
     }),
 }));

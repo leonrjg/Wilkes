@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText } from "react-feather";
+import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud } from "react-feather";
 import CodeViewer from "./preview/CodeViewer";
 import MarkdownViewer from "./preview/MarkdownViewer";
 import PdfViewer from "./preview/PdfViewer";
@@ -22,8 +22,10 @@ import type { BookmarkAnchor } from "./preview/bookmarkPosition";
 import ViewerTabs from "./ViewerTabs";
 import DocumentSummaryPane from "./DocumentSummaryPane";
 import { useGenerationStore } from "../stores/useGenerationStore";
+import { useSemanticStore } from "../stores/useSemanticStore";
+import DocumentTopicCloudPane from "./DocumentTopicCloudPane";
 
-type ViewerSidePanel = "related" | "summary" | null;
+type ViewerSidePanel = "related" | "summary" | "topics" | null;
 
 function headerTitle(metadata: DocumentMetadata | null) {
   const title = metadata?.title?.trim();
@@ -88,6 +90,7 @@ export default function PreviewPane() {
   const hasAvailableChatBackend = useChatStore((s) => s.hasAvailableBackend);
   const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
   const generationReady = useGenerationStore((state) => state.ready);
+  const semanticReady = useSemanticStore((state) => state.readyForCurrentRoot);
   const { addToast } = useToasts();
   const [sidePanel, setSidePanel] = useState<ViewerSidePanel>(null);
   const [markdownView, setMarkdownView] = useState<"source" | "rendered">("rendered");
@@ -108,6 +111,10 @@ export default function PreviewPane() {
   useEffect(() => {
     if (!generationReady && sidePanel === "summary") setSidePanel(null);
   }, [generationReady, sidePanel]);
+
+  useEffect(() => {
+    if (!semanticReady && sidePanel === "topics") setSidePanel(null);
+  }, [semanticReady, sidePanel]);
 
   useEffect(() => {
     if (openBookmarkTarget && !openBookmark) setOpenBookmarkTarget(null);
@@ -424,6 +431,38 @@ export default function PreviewPane() {
           </button>
         </Tooltip>
 
+        <Tooltip
+          content={
+            semanticReady
+              ? sidePanel === "topics"
+                ? "Hide document topics"
+                : "Show document topics"
+              : "Build the semantic index to view document topics"
+          }
+        >
+          <button
+            type="button"
+            disabled={!semanticReady}
+            onClick={() =>
+              setSidePanel((current) =>
+                current === "topics" ? null : "topics",
+              )
+            }
+            aria-label={
+              sidePanel === "topics"
+                ? "Hide document topics"
+                : "Show document topics"
+            }
+            className={`hidden rounded p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-40 md:inline-flex ${
+              sidePanel === "topics"
+                ? "bg-[var(--bg-active)] text-[var(--text-main)]"
+                : ""
+            }`}
+          >
+            <Cloud size={16} />
+          </button>
+        </Tooltip>
+
         {isMarkdownFile && (
           <Tooltip content={markdownView === "rendered" ? "View Markdown source" : "View rendered Markdown"}>
             <button
@@ -524,6 +563,12 @@ export default function PreviewPane() {
             <RelatedDocumentsPane
               currentPath={selectedMatch.path}
               onOpenDocument={openFile}
+              onClose={() => setSidePanel(null)}
+            />
+          )}
+          {sidePanel === "topics" && semanticReady && (
+            <DocumentTopicCloudPane
+              currentPath={selectedMatch.path}
               onClose={() => setSidePanel(null)}
             />
           )}

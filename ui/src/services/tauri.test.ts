@@ -69,8 +69,18 @@ describe("TauriSearchApi", () => {
   it("should call invoke for chunkTopics", async () => {
     (invoke as any).mockResolvedValue({ topics: [] });
     const query = { root: "/library", granularity: "much_fewer" as const };
-    await api.chunkTopics(query);
-    expect(invoke).toHaveBeenCalledWith("chunk_topics", { query });
+    await api.chunkTopics("topics-1", query);
+    expect(invoke).toHaveBeenCalledWith("chunk_topics", {
+      requestId: "topics-1",
+      query,
+    });
+  });
+
+  it("should call invoke for cancelChunkTopics", async () => {
+    await api.cancelChunkTopics("topics-1");
+    expect(invoke).toHaveBeenCalledWith("cancel_chunk_topics", {
+      requestId: "topics-1",
+    });
   });
 
   it("should call invoke for listFiles", async () => {

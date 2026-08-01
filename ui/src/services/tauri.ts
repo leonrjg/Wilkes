@@ -149,8 +149,12 @@ export class TauriSearchApi implements SearchApi {
     return invoke<BookmarkClustersResult>("cluster_bookmarks", { query });
   }
 
-  async chunkTopics(query: ChunkTopicsQuery): Promise<ChunkTopicsResult> {
-    return invoke<ChunkTopicsResult>("chunk_topics", { query });
+  async chunkTopics(requestId: string, query: ChunkTopicsQuery): Promise<ChunkTopicsResult> {
+    return invoke<ChunkTopicsResult>("chunk_topics", { requestId, query });
+  }
+
+  async cancelChunkTopics(requestId: string): Promise<void> {
+    return invoke("cancel_chunk_topics", { requestId });
   }
 
   async listFiles(root: string, collectionId?: string | null, tagIds: string[] = [], collectionExpression?: string | null): Promise<FileListResponse> {

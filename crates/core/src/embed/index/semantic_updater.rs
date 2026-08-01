@@ -324,6 +324,7 @@ mod tests {
 
         // Add file to index manually first
         idx.write_file(crate::embed::index::db::PreparedFile {
+            full_text: String::new(),
             path: file_path.clone(),
             chunks: vec![(
                 crate::embed::index::chunk::Chunk {
@@ -365,6 +366,7 @@ mod tests {
         std::fs::write(&file_path, "content").unwrap();
 
         idx.write_file(crate::embed::index::db::PreparedFile {
+            full_text: String::new(),
             path: file_path.clone(),
             chunks: vec![(
                 crate::embed::index::chunk::Chunk {
@@ -442,6 +444,7 @@ mod tests {
         std::fs::write(&removed_path, "world").unwrap();
 
         idx.write_file(crate::embed::index::db::PreparedFile {
+            full_text: String::new(),
             path: removed_path.clone(),
             chunks: vec![(
                 crate::embed::index::chunk::Chunk {
@@ -584,6 +587,7 @@ mod tests {
         let old_path = dir.path().join("old.txt");
         std::fs::write(&old_path, "hello world").unwrap();
         idx.write_file(crate::embed::index::db::PreparedFile {
+            full_text: String::new(),
             path: old_path.clone(),
             chunks: vec![(
                 crate::embed::index::chunk::Chunk {
@@ -647,13 +651,7 @@ mod tests {
 
         // Index chunk survived (re-keyed, not deleted + re-embedded).
         assert_eq!(
-            index
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .status()
-                .total_chunks,
+            index.lock().unwrap().as_ref().unwrap().status().total_chunks,
             1
         );
         // Metadata cache row moved from old path to new path.
@@ -696,6 +694,7 @@ mod tests {
         let old_file = old_dir.join("paper.txt");
         std::fs::write(&old_file, "hello world").unwrap();
         idx.write_file(crate::embed::index::db::PreparedFile {
+            full_text: String::new(),
             path: old_file.clone(),
             chunks: vec![(
                 crate::embed::index::chunk::Chunk {
@@ -753,7 +752,13 @@ mod tests {
 
         // The descendant's chunk survived, re-keyed rather than re-embedded.
         assert_eq!(
-            index.lock().unwrap().as_ref().unwrap().status().total_chunks,
+            index
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .status()
+                .total_chunks,
             1
         );
         let results = index

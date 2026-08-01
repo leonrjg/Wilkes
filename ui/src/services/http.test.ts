@@ -76,11 +76,24 @@ describe("HttpSearchApi", () => {
     });
     const query = { root: "/library", granularity: "much_fewer" as const };
 
-    await expect(api.chunkTopics(query)).resolves.toEqual(result);
+    await expect(api.chunkTopics("topics-1", query)).resolves.toEqual(result);
     expect(fetch).toHaveBeenCalledWith(
       "/api/topics/chunks",
-      expect.objectContaining({ method: "POST", body: JSON.stringify(query) }),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ request_id: "topics-1", query }),
+      }),
     );
+  });
+
+  it("cancelChunkTopics deletes the correlated operation", async () => {
+    (fetch as any).mockResolvedValue({ ok: true });
+
+    await api.cancelChunkTopics("topics/1");
+
+    expect(fetch).toHaveBeenCalledWith("/api/topics/chunks/topics%2F1", {
+      method: "DELETE",
+    });
   });
 
   it("search streams results", async () => {

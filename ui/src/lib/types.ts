@@ -175,6 +175,7 @@ export interface BookmarkClustersResult {
 
 export interface ChunkTopicsQuery {
   root: string;
+  path?: string | null;
   granularity?: BookmarkClusterGranularity;
 }
 
@@ -529,6 +530,7 @@ export interface BookmarkClusterLabelled {
 }
 
 export interface ChunkTopicLabelled {
+  request_id: string;
   cluster_key: string;
   label: string;
 }
@@ -610,6 +612,7 @@ export interface Settings {
   max_file_size: number;
   theme: Theme;
   search_prefer_semantic: boolean;
+  grep_use_index: boolean;
   semantic: SemanticSettings;
   generation: GenerationSettings;
   /** Query-vector enhancement for semantic search (HyDE, pseudo-relevance

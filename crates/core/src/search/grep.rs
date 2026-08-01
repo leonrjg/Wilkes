@@ -1,7 +1,8 @@
+use crate::embed::index::SemanticIndex;
 use crate::extract::ExtractorRegistry;
 use crate::types::{
     ByteRange, FileMatches, FileType, Match, SearchCapabilities, SearchQuery, SearchScope,
-    SourceOrigin,
+    SourceMap, SourceOrigin,
 };
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -9,13 +10,21 @@ use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, WalkState};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::{SearchProvider, SearchResultTx};
+
+/// Shared handle to the live semantic index, as held by the API layer.
+type IndexHandle = Arc<Mutex<Option<SemanticIndex>>>;
 
 pub struct GrepSearchProvider {
     all_roots: Vec<std::path::PathBuf>,
     all_root_errors: Vec<String>,
+    /// When set, PDF matches are found against text the index already holds
+    /// instead of re-extracting the file. Files the index does not hold (or that
+    /// changed on disk) fall back to live extraction. `None` disables this and
+    /// makes every PDF extract live, i.e. the setting is off.
+    index: Option<IndexHandle>,
 }
 
 impl GrepSearchProvider {
@@ -23,6 +32,7 @@ impl GrepSearchProvider {
         Self {
             all_roots: Vec::new(),
             all_root_errors: Vec::new(),
+            index: None,
         }
     }
 
@@ -33,7 +43,15 @@ impl GrepSearchProvider {
         Self {
             all_roots,
             all_root_errors,
+            index: None,
         }
+    }
+
+    /// Enable index-backed exact search: PDF matches are read from the semantic
+    /// index when it holds the file's current text, otherwise extracted live.
+    pub fn with_index(mut self, index: Option<IndexHandle>) -> Self {
+        self.index = index;
+        self
     }
 
     fn build_matcher(query: &SearchQuery) -> anyhow::Result<RegexMatcher> {
@@ -74,6 +92,8 @@ impl SearchProvider for GrepSearchProvider {
             Vec::new()
         });
 
+        let index = self.index.as_ref();
+
         // A single-file scope has nothing to walk in parallel.
         if let SearchScope::File { path } = &query.scope {
             let _ = search_path(
@@ -85,6 +105,7 @@ impl SearchProvider for GrepSearchProvider {
                 &total_matches,
                 &errors,
                 eligible_paths,
+                index,
             )?;
             return Ok(errors.into_inner().unwrap());
         }
@@ -136,6 +157,7 @@ impl SearchProvider for GrepSearchProvider {
                     &total_matches,
                     &errors,
                     eligible_paths,
+                    index,
                 ) {
                     // Stop the whole walk: max_results reached or receiver closed.
                     Ok(true) => WalkState::Quit,
@@ -191,6 +213,7 @@ fn search_path(
     total_matches: &AtomicUsize,
     errors: &Mutex<Vec<String>>,
     eligible_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
+    index: Option<&IndexHandle>,
 ) -> anyhow::Result<bool> {
     if tx.is_closed() {
         return Ok(true);
@@ -217,26 +240,37 @@ fn search_path(
     };
 
     let matches = match &file_type {
+        // Plain text is memory-mapped and already fast; it also carries exact
+        // line/column origins that the chunk-granular index cannot reproduce, so
+        // it never uses the index regardless of the setting.
         FileType::PlainText => search_text_file(path, matcher, query.context_lines as u64)?,
-        FileType::Pdf => match extractors.find(path, None) {
-            Some(extractor) => match extractor.extract(path) {
-                Ok(content) => search_extracted_content(&content, matcher)?,
-                Err(e) => {
-                    errors
-                        .lock()
-                        .unwrap()
-                        .push(format!("{}: {e:#}", path.display()));
-                    return Ok(false);
-                }
-            },
-            None => {
-                errors
-                    .lock()
-                    .unwrap()
-                    .push(format!("{}: no extractor registered", path.display()));
-                return Ok(false);
+        FileType::Pdf => {
+            // Prefer text the index already holds. A genuine index fault is
+            // logged and demoted to live extraction rather than failing the
+            // file; "not indexed / stale / pre-v4" simply returns None.
+            let from_index = index.and_then(|handle| {
+                indexed_pdf_matches(handle, path, matcher).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "index-backed grep failed for {}, extracting live: {e:#}",
+                        path.display()
+                    );
+                    None
+                })
+            });
+            match from_index {
+                Some(matches) => matches,
+                None => match live_pdf_matches(path, extractors, matcher) {
+                    Ok(matches) => matches,
+                    Err(e) => {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}: {e:#}", path.display()));
+                        return Ok(false);
+                    }
+                },
             }
-        },
+        }
     };
 
     if matches.is_empty() {
@@ -342,12 +376,54 @@ fn search_text_file(
 
 // ── Extracted content search (PDF / future formats) ──────────────────────────
 
-fn search_extracted_content(
-    content: &crate::types::ExtractedContent,
+/// Extract a PDF live and search it. Used when the index is disabled, or does
+/// not yet hold this file's current text.
+fn live_pdf_matches(
+    path: &Path,
+    extractors: &ExtractorRegistry,
     matcher: &RegexMatcher,
 ) -> anyhow::Result<Vec<Match>> {
-    let text = content.text.as_bytes();
-    let full = &content.text;
+    let extractor = extractors
+        .find(path, None)
+        .ok_or_else(|| anyhow::anyhow!("no extractor registered"))?;
+    let content = extractor.extract(path)?;
+    search_text_and_map(&content.text, &content.source_map, matcher)
+}
+
+/// Search a PDF's text as held by the semantic index. Returns `None` when the
+/// index cannot serve this file (not loaded, not indexed, changed on disk, or
+/// indexed before schema v4), leaving the caller to extract it live.
+fn indexed_pdf_matches(
+    index: &IndexHandle,
+    path: &Path,
+    matcher: &RegexMatcher,
+) -> anyhow::Result<Option<Vec<Match>>> {
+    // Hold the index lock only long enough to copy out the stored text; run the
+    // regex afterwards so we do not block indexing for the scan itself.
+    let document = {
+        let guard = index
+            .lock()
+            .map_err(|_| anyhow::anyhow!("semantic index lock poisoned"))?;
+        let Some(idx) = guard.as_ref() else {
+            return Ok(None);
+        };
+        idx.indexed_document_for_path(path)?
+    };
+    let Some((text, source_map)) = document else {
+        return Ok(None);
+    };
+    Ok(Some(search_text_and_map(&text, &source_map, matcher)?))
+}
+
+/// Run the exact matcher over already-extracted `text`, resolving each match's
+/// source position through `source_map`. Shared by the live and index-backed
+/// PDF paths so both produce identical `Match` shapes.
+fn search_text_and_map(
+    full: &str,
+    source_map: &SourceMap,
+    matcher: &RegexMatcher,
+) -> anyhow::Result<Vec<Match>> {
+    let text = full.as_bytes();
     let mut matches = Vec::new();
 
     matcher
@@ -355,8 +431,7 @@ fn search_extracted_content(
             let start = m.start();
             let end = m.end();
             let matched_text = String::from_utf8_lossy(&text[start..end]).into_owned();
-            let origin = content
-                .source_map
+            let origin = source_map
                 .resolve_range(ByteRange { start, end })
                 .unwrap_or(SourceOrigin::PdfPage {
                     page: 1,
@@ -594,7 +669,7 @@ mod tests {
             tag_ids: Vec::new(),
         };
         let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
-        let matches = search_extracted_content(&content, &matcher).unwrap();
+        let matches = search_text_and_map(&content.text, &content.source_map, &matcher).unwrap();
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].matched_text, "fox");
@@ -725,6 +800,83 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, scoped);
         assert_eq!(results[0].matches.len(), 1);
+    }
+
+    #[test]
+    fn index_backed_grep_serves_matches_without_extraction() {
+        use crate::embed::index::chunk::Chunk;
+        use crate::embed::index::db::{PreparedFile, SemanticIndex};
+        use crate::types::{EmbeddingEngine, SourceOrigin};
+        use std::sync::Arc;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let pdf = root.join("paper.pdf");
+        // Real bytes so the file's on-disk identity matches what we index; the
+        // content is irrelevant because matches are served from the index.
+        fs::write(&pdf, "%PDF-1.7 opaque bytes").unwrap();
+
+        let mut idx =
+            SemanticIndex::create(root, "m", 3, EmbeddingEngine::Candle, Some(root)).unwrap();
+        idx.write_file(PreparedFile {
+            path: pdf.clone(),
+            full_text: "alpha beta gamma".to_string(),
+            chunks: vec![(
+                Chunk {
+                    file_path: pdf.clone(),
+                    text: "alpha beta gamma".to_string(),
+                    byte_range: ByteRange { start: 0, end: 16 },
+                    origin: SourceOrigin::PdfPage {
+                        page: 1,
+                        bbox: None,
+                    },
+                },
+                vec![1.0, 0.0, 0.0],
+            )],
+        })
+        .unwrap();
+        let handle = Arc::new(Mutex::new(Some(idx)));
+
+        let query = SearchQuery {
+            pattern: "beta".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: root.to_path_buf(),
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            scope: SearchScope::File { path: pdf.clone() },
+            supported_extensions: vec!["pdf".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
+        };
+
+        // A failing extractor is the tripwire: if grep fell back to live
+        // extraction instead of using the index, the search would error and
+        // return no matches.
+        let mut extractors = ExtractorRegistry::new();
+        extractors.register(Box::new(FailingPdfExtractor));
+
+        let provider = GrepSearchProvider::new().with_index(Some(handle));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        std::thread::spawn(move || {
+            provider.search(&query, &extractors, tx, None).unwrap();
+        });
+
+        let mut results = Vec::new();
+        while let Some(m) = rx.blocking_recv() {
+            results.push(m);
+        }
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].matches.len(), 1);
+        assert_eq!(results[0].matches[0].matched_text, "beta");
+        match &results[0].matches[0].origin {
+            SourceOrigin::PdfPage { page, .. } => assert_eq!(*page, 1),
+            other => panic!("expected pdf page origin, got {other:?}"),
+        }
     }
 
     struct FailingPdfExtractor;

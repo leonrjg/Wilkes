@@ -6,14 +6,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use ignore::WalkBuilder;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql};
 use tracing::error;
 
 use crate::extract::ExtractorRegistry;
 use crate::metadata::cache::FileIdentity;
 use crate::types::{
     BoundingBox, ByteRange, EmbeddingEngine, FileType, IndexStatus, IndexingConfig,
-    RelatedDocument, SourceOrigin,
+    RelatedDocument, SourceMap, SourceOrigin, SourceSegment,
 };
 
 use super::super::Embedder;
@@ -55,7 +55,7 @@ fn db_path(data_dir: &Path) -> PathBuf {
 }
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 fn configure_connection(conn: &Connection, path: &Path) -> anyhow::Result<()> {
     conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
@@ -297,6 +297,7 @@ mod tests {
         let file_path = root.join("test.txt");
         fs::write(&file_path, "hello world\nfoo bar").unwrap();
         let prepared = PreparedFile {
+            full_text: String::new(),
             path: file_path.clone(),
             chunks: vec![
                 (
@@ -364,6 +365,7 @@ mod tests {
         let new = root.join("new.txt");
         fs::write(&old, "hello world").unwrap();
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: old.clone(),
             chunks: vec![(
                 Chunk {
@@ -394,6 +396,91 @@ mod tests {
     }
 
     #[test]
+    fn indexed_document_for_path_serves_stored_text_and_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut idx =
+            SemanticIndex::create(root, "m", 3, EmbeddingEngine::Candle, Some(root)).unwrap();
+
+        let path = root.join("doc.txt");
+        fs::write(&path, "the quick brown fox").unwrap();
+        idx.write_file(PreparedFile {
+            path: path.clone(),
+            full_text: "the quick brown fox".to_string(),
+            chunks: vec![(
+                Chunk {
+                    file_path: path.clone(),
+                    text: "the quick brown fox".to_string(),
+                    byte_range: ByteRange { start: 0, end: 19 },
+                    origin: SourceOrigin::PdfPage {
+                        page: 2,
+                        bbox: None,
+                    },
+                },
+                vec![1.0, 0.0, 0.0],
+            )],
+        })
+        .unwrap();
+
+        // Happy path: stored text and a chunk-granular source map come back, and
+        // the map resolves a match offset to the chunk's page.
+        let (text, map) = idx
+            .indexed_document_for_path(&path)
+            .unwrap()
+            .expect("indexed document should be served");
+        assert_eq!(text, "the quick brown fox");
+        match map.resolve_range(ByteRange { start: 4, end: 9 }) {
+            Some(SourceOrigin::PdfPage { page, .. }) => assert_eq!(page, 2),
+            other => panic!("expected page-2 origin, got {other:?}"),
+        }
+
+        // Stale on-disk change: identity no longer matches, so the caller is told
+        // to extract live rather than be served vanished content.
+        fs::write(&path, "completely different content now").unwrap();
+        assert!(idx.indexed_document_for_path(&path).unwrap().is_none());
+
+        // Absent file: nothing to serve.
+        assert!(idx
+            .indexed_document_for_path(&root.join("missing.txt"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn indexed_document_for_path_none_when_full_text_missing() {
+        // Simulates a row written before schema v4: chunks exist but full_text is
+        // NULL, so grep must fall back to live extraction.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut idx =
+            SemanticIndex::create(root, "m", 3, EmbeddingEngine::Candle, Some(root)).unwrap();
+
+        let path = root.join("legacy.txt");
+        fs::write(&path, "legacy body").unwrap();
+        idx.write_file(PreparedFile {
+            path: path.clone(),
+            full_text: "legacy body".to_string(),
+            chunks: vec![(
+                Chunk {
+                    file_path: path.clone(),
+                    text: "legacy body".to_string(),
+                    byte_range: ByteRange { start: 0, end: 11 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![1.0, 0.0, 0.0],
+            )],
+        })
+        .unwrap();
+
+        // Force the column back to NULL to emulate a pre-v4 row.
+        idx.conn
+            .execute("UPDATE files SET full_text = NULL", [])
+            .unwrap();
+
+        assert!(idx.indexed_document_for_path(&path).unwrap().is_none());
+    }
+
+    #[test]
     fn topic_chunks_bulk_read_is_root_scoped_and_includes_passage_metadata() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("root");
@@ -404,6 +491,7 @@ mod tests {
             SemanticIndex::create(dir.path(), "m", 3, EmbeddingEngine::Candle, Some(&root))
                 .unwrap();
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: path.clone(),
             chunks: vec![
                 (
@@ -434,6 +522,15 @@ mod tests {
         assert_eq!(chunks[0].chunk_text, "first");
         assert_eq!(chunks[0].embedding, vec![1.0, 0.0, 0.0]);
         assert!(chunks[0].chunk_id > 0);
+        let file_chunks = idx.topic_chunks_for_file(&root, &path).unwrap();
+        assert_eq!(file_chunks.len(), 2);
+        assert!(file_chunks
+            .iter()
+            .all(|chunk| chunk.file_path == canon(&path)));
+        assert!(idx
+            .topic_chunks_for_file(&root, &root.join("missing.txt"))
+            .unwrap()
+            .is_empty());
         assert!(idx
             .topic_chunks_for_root(&root.join("missing"))
             .unwrap()
@@ -452,6 +549,7 @@ mod tests {
         let old_file = old_dir.join("paper.txt");
         fs::write(&old_file, "hello world").unwrap();
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: old_file.clone(),
             chunks: vec![(
                 Chunk {
@@ -531,8 +629,9 @@ mod tests {
         fs::write(&path, "hello world").unwrap();
 
         let registry = ExtractorRegistry::new(); // empty registry
-        let chunks = SemanticIndex::extract_chunks(&path, &registry, 100, 10).unwrap();
+        let (full_text, chunks) = SemanticIndex::extract_chunks(&path, &registry, 100, 10).unwrap();
 
+        assert_eq!(full_text, "hello world");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "hello world");
     }
@@ -604,6 +703,7 @@ mod tests {
         let path = dir.path().join("test.pdf");
         fs::write(&path, "page content").unwrap();
         let prepared = PreparedFile {
+            full_text: String::new(),
             path: path.clone(),
             chunks: vec![(
                 Chunk {
@@ -651,6 +751,7 @@ mod tests {
         fs::write(&other_path, "other chunk").unwrap();
 
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: scoped_path.clone(),
             chunks: vec![(
                 Chunk {
@@ -664,6 +765,7 @@ mod tests {
         })
         .unwrap();
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: other_path.clone(),
             chunks: vec![(
                 Chunk {
@@ -721,6 +823,7 @@ mod tests {
         };
 
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: source.clone(),
             chunks: vec![
                 (chunk(&source, "source one"), vec![1.0, 0.0]),
@@ -729,16 +832,19 @@ mod tests {
         })
         .unwrap();
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: close.clone(),
             chunks: vec![(chunk(&close, "close"), vec![0.9, 0.1])],
         })
         .unwrap();
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: far.clone(),
             chunks: vec![(chunk(&far, "far"), vec![0.0, 1.0])],
         })
         .unwrap();
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: unsupported.clone(),
             chunks: vec![(chunk(&unsupported, "unsupported"), vec![1.0, 0.0])],
         })
@@ -811,6 +917,7 @@ mod tests {
         )
         .unwrap();
         let prepared = |path: &Path, text: &str| PreparedFile {
+            full_text: String::new(),
             path: path.to_path_buf(),
             chunks: vec![(
                 Chunk {
@@ -865,6 +972,7 @@ mod tests {
         let path = dir.path().join("mystery.txt");
         fs::write(&path, "mystery").unwrap();
         let prepared = PreparedFile {
+            full_text: String::new(),
             path: path.clone(),
             chunks: vec![(
                 Chunk {
@@ -927,6 +1035,7 @@ mod tests {
         let new = root.join("new.txt");
         fs::write(&old, "stable content").unwrap();
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: old.clone(),
             chunks: vec![(
                 Chunk {
@@ -968,6 +1077,7 @@ mod tests {
         let path = root.join("gone.txt");
         fs::write(&path, "delete me").unwrap();
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: path.clone(),
             chunks: vec![(
                 Chunk {
@@ -1005,6 +1115,7 @@ mod tests {
         let path = root.join("changed.txt");
         fs::write(&path, "old").unwrap();
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: path.clone(),
             chunks: vec![(
                 Chunk {
@@ -1199,6 +1310,7 @@ mod tests {
             SemanticIndex::create(dir.path(), "m", 2, EmbeddingEngine::Candle, Some(&root_a))
                 .unwrap();
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: a.clone(),
             chunks: vec![(
                 test_chunk(&a, "close outside requested root"),
@@ -1208,6 +1320,7 @@ mod tests {
         .unwrap();
         idx.activate_root(&root_b).unwrap();
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: b.clone(),
             chunks: vec![(test_chunk(&b, "inside requested root"), vec![0.5, 0.5])],
         })
@@ -1246,6 +1359,7 @@ mod tests {
         )
         .unwrap();
         idx.write_file(PreparedFile {
+            full_text: String::new(),
             path: path.clone(),
             chunks: vec![(test_chunk(&path, "old content"), vec![1.0])],
         })
@@ -1414,6 +1528,7 @@ mod tests {
         let path = dir.path().join("test.txt");
         fs::write(&path, "original").unwrap();
         let original = PreparedFile {
+            full_text: String::new(),
             path: path.clone(),
             chunks: vec![(
                 Chunk {
@@ -1428,6 +1543,7 @@ mod tests {
         idx.write_file(original).unwrap();
 
         let replacement = PreparedFile {
+            full_text: String::new(),
             path: path.clone(),
             chunks: vec![(
                 Chunk {
@@ -1453,6 +1569,10 @@ pub struct PreparedFile {
     pub path: PathBuf,
     /// Pairs of (chunk metadata, embedding vector), ready to write.
     pub chunks: Vec<(Chunk, Vec<f32>)>,
+    /// The document's full extracted text, stored verbatim so exact (grep)
+    /// search can scan it without re-extracting the source file. Empty when the
+    /// document yielded no text.
+    pub full_text: String,
 }
 
 // ── Indexed chunk (query result) ──────────────────────────────────────────────
@@ -1569,7 +1689,11 @@ impl SemanticIndex {
             .unwrap_or(0);
         if schema_version == 2 {
             Self::migrate_v2_to_v3(&conn)?;
-            schema_version = SCHEMA_VERSION;
+            schema_version = 3;
+        }
+        if schema_version == 3 {
+            Self::migrate_v3_to_v4(&conn)?;
+            schema_version = 4;
         }
         anyhow::ensure!(
             schema_version == SCHEMA_VERSION,
@@ -1640,7 +1764,11 @@ impl SemanticIndex {
             .unwrap_or(0);
         if schema_version == 2 {
             Self::migrate_v2_to_v3(&conn)?;
-            schema_version = SCHEMA_VERSION;
+            schema_version = 3;
+        }
+        if schema_version == 3 {
+            Self::migrate_v3_to_v4(&conn)?;
+            schema_version = 4;
         }
         anyhow::ensure!(
             schema_version == SCHEMA_VERSION,
@@ -1787,13 +1915,13 @@ impl SemanticIndex {
                 }
             }
 
-            let chunks = match Self::extract_chunks(
+            let (full_text, chunks) = match Self::extract_chunks(
                 path,
                 extractors,
                 indexing.chunk_size,
                 indexing.chunk_overlap,
             ) {
-                Ok(c) if !c.is_empty() => c,
+                Ok((text, c)) if !c.is_empty() => (text, c),
                 _ => continue,
             };
 
@@ -1831,6 +1959,7 @@ impl SemanticIndex {
             let prepared = PreparedFile {
                 path: path.clone(),
                 chunks: chunks.into_iter().zip(embeddings).collect(),
+                full_text,
             };
             if let Err(e) = idx.write_file(prepared) {
                 error!(
@@ -1908,7 +2037,8 @@ impl SemanticIndex {
                 file_path      TEXT    NOT NULL UNIQUE,
                 size_bytes     INTEGER NOT NULL,
                 modified_at_ms INTEGER NOT NULL,
-                indexed_at_ms  INTEGER NOT NULL
+                indexed_at_ms  INTEGER NOT NULL,
+                full_text      TEXT
             );
             CREATE TABLE IF NOT EXISTS indexed_roots (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2054,21 +2184,44 @@ impl SemanticIndex {
             }
         }
 
+        // Stamp the concrete version this step produces, not the crate's current
+        // SCHEMA_VERSION: a v2 index must still pass through the v3->v4 step.
         conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",
-            params![SCHEMA_VERSION.to_string()],
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '3')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// v3 -> v4: add the `files.full_text` column that lets exact (grep) search
+    /// read a document's text from the index instead of re-extracting it.
+    /// Existing rows keep `full_text = NULL` and are backfilled the next time the
+    /// file is (re)indexed; until then grep falls back to live extraction.
+    fn migrate_v3_to_v4(conn: &Connection) -> anyhow::Result<()> {
+        let has_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'full_text'")?
+            .exists([])?;
+        if !has_column {
+            conn.execute_batch("ALTER TABLE files ADD COLUMN full_text TEXT;")?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '4')",
+            [],
         )?;
         Ok(())
     }
 
     /// Extract and chunk a file without embedding. Use this to collect chunks
     /// from many files before embedding them all in a single batch.
+    /// Extract and chunk a file, returning both the document's full extracted
+    /// text and its chunks. The text is stored verbatim so exact (grep) search
+    /// can scan it without re-extracting the file.
     pub fn extract_chunks(
         path: &Path,
         extractors: &ExtractorRegistry,
         chunk_size: usize,
         chunk_overlap: usize,
-    ) -> anyhow::Result<Vec<Chunk>> {
+    ) -> anyhow::Result<(String, Vec<Chunk>)> {
         let content = match extractors.find(path, None) {
             Some(ext) => ext.extract(path)?,
             None => {
@@ -2076,7 +2229,7 @@ impl SemanticIndex {
                 let text = std::fs::read_to_string(path)
                     .with_context(|| format!("Failed to read {}", path.display()))?;
                 crate::types::ExtractedContent {
-                    text: text.clone(),
+                    text,
                     source_map: crate::types::SourceMap {
                         segments: Vec::new(),
                     },
@@ -2090,12 +2243,8 @@ impl SemanticIndex {
                 }
             }
         };
-        Ok(chunk_content(
-            &content,
-            path.to_path_buf(),
-            chunk_size,
-            chunk_overlap,
-        ))
+        let chunks = chunk_content(&content, path.to_path_buf(), chunk_size, chunk_overlap);
+        Ok((content.text, chunks))
     }
 
     /// Extract, chunk, and embed a file without holding the index lock.
@@ -2106,11 +2255,13 @@ impl SemanticIndex {
         chunk_size: usize,
         chunk_overlap: usize,
     ) -> anyhow::Result<PreparedFile> {
-        let raw_chunks = Self::extract_chunks(path, extractors, chunk_size, chunk_overlap)?;
+        let (full_text, raw_chunks) =
+            Self::extract_chunks(path, extractors, chunk_size, chunk_overlap)?;
         if raw_chunks.is_empty() {
             return Ok(PreparedFile {
                 path: path.to_path_buf(),
                 chunks: Vec::new(),
+                full_text,
             });
         }
 
@@ -2128,6 +2279,7 @@ impl SemanticIndex {
         Ok(PreparedFile {
             path: path.to_path_buf(),
             chunks,
+            full_text,
         })
     }
 
@@ -2144,7 +2296,7 @@ impl SemanticIndex {
         let source_file = source
             .conn
             .query_row(
-                "SELECT id, size_bytes, modified_at_ms
+                "SELECT id, size_bytes, modified_at_ms, full_text
                  FROM files
                  WHERE file_path = ?1",
                 params![key_str],
@@ -2153,11 +2305,12 @@ impl SemanticIndex {
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((source_file_id, size_bytes, modified_at_ms)) = source_file else {
+        let Some((source_file_id, size_bytes, modified_at_ms, full_text)) = source_file else {
             return Ok(false);
         };
         if size_bytes != identity.size_bytes || modified_at_ms != identity.modified_at_ms {
@@ -2245,8 +2398,86 @@ impl SemanticIndex {
         self.write_file(PreparedFile {
             path: path.to_path_buf(),
             chunks,
+            full_text: full_text.unwrap_or_default(),
         })?;
         Ok(true)
+    }
+
+    /// Return a file's stored extracted text plus a chunk-granular `SourceMap`,
+    /// for exact (grep) search that reads from the index instead of
+    /// re-extracting. Returns `None` — so the caller falls back to live
+    /// extraction — when the file is absent, has no stored `full_text` (indexed
+    /// before schema v4), or has changed on disk since it was indexed (stale
+    /// text must never be served as a match).
+    pub fn indexed_document_for_path(
+        &self,
+        path: &Path,
+    ) -> anyhow::Result<Option<(String, SourceMap)>> {
+        let key = Self::canonical_path(path);
+        let key_str = key.to_string_lossy().into_owned();
+
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, size_bytes, modified_at_ms, full_text
+                 FROM files WHERE file_path = ?1",
+                params![key_str],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((file_id, size_bytes, modified_at_ms, full_text)) = row else {
+            return Ok(None);
+        };
+        let Some(full_text) = full_text else {
+            return Ok(None);
+        };
+
+        // Reject stale text: a file edited after indexing would otherwise yield
+        // matches against content that no longer exists on disk.
+        let identity = Self::identity_for_path(path)?;
+        if size_bytes != identity.size_bytes || modified_at_ms != identity.modified_at_ms {
+            return Ok(None);
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT byte_start, byte_end, origin_type, page, line, col,
+                    bbox_x, bbox_y, bbox_w, bbox_h
+             FROM chunks WHERE file_id = ?1 ORDER BY chunk_idx",
+        )?;
+        let segments = stmt
+            .query_map(params![file_id], |row| {
+                let byte_start = row.get::<_, i64>(0)? as usize;
+                let byte_end = row.get::<_, i64>(1)? as usize;
+                let origin = source_origin_from_parts(
+                    &row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<f64>>(6)?,
+                    row.get::<_, Option<f64>>(7)?,
+                    row.get::<_, Option<f64>>(8)?,
+                    row.get::<_, Option<f64>>(9)?,
+                );
+                Ok((byte_start, byte_end, origin))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|(start, end, origin)| {
+                origin.map(|origin| SourceSegment {
+                    text_range: ByteRange { start, end },
+                    origin,
+                })
+            })
+            .collect();
+
+        Ok(Some((full_text, SourceMap { segments })))
     }
 
     fn canonical_path(path: &Path) -> PathBuf {
@@ -2367,7 +2598,7 @@ impl SemanticIndex {
         })?;
 
         let mut source_stmt = source.conn.prepare(
-            "SELECT f.id, f.file_path, f.size_bytes, f.modified_at_ms, f.indexed_at_ms
+            "SELECT f.id, f.file_path, f.size_bytes, f.modified_at_ms, f.indexed_at_ms, f.full_text
              FROM root_files rf
              JOIN files f ON f.id = rf.file_id
              WHERE rf.root_id = ?1",
@@ -2380,6 +2611,7 @@ impl SemanticIndex {
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2390,7 +2622,9 @@ impl SemanticIndex {
             params![target_root_id],
         )?;
 
-        for (source_file_id, file_path, size_bytes, modified_at_ms, indexed_at_ms) in source_files {
+        for (source_file_id, file_path, size_bytes, modified_at_ms, indexed_at_ms, full_text) in
+            source_files
+        {
             let target_file_id: Option<i64> = tx
                 .query_row(
                     "SELECT id FROM files WHERE file_path = ?1",
@@ -2402,16 +2636,22 @@ impl SemanticIndex {
                 Self::delete_chunks_for_file_tx(&tx, file_id)?;
                 tx.execute(
                     "UPDATE files
-                     SET size_bytes = ?2, modified_at_ms = ?3, indexed_at_ms = ?4
+                     SET size_bytes = ?2, modified_at_ms = ?3, indexed_at_ms = ?4, full_text = ?5
                      WHERE id = ?1",
-                    params![file_id, size_bytes, modified_at_ms, indexed_at_ms],
+                    params![
+                        file_id,
+                        size_bytes,
+                        modified_at_ms,
+                        indexed_at_ms,
+                        full_text
+                    ],
                 )?;
                 file_id
             } else {
                 tx.execute(
-                    "INSERT INTO files (file_path, size_bytes, modified_at_ms, indexed_at_ms)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![file_path, size_bytes, modified_at_ms, indexed_at_ms],
+                    "INSERT INTO files (file_path, size_bytes, modified_at_ms, indexed_at_ms, full_text)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![file_path, size_bytes, modified_at_ms, indexed_at_ms, full_text],
                 )?;
                 tx.last_insert_rowid()
             };
@@ -2740,16 +2980,28 @@ impl SemanticIndex {
             Self::delete_chunks_for_file_tx(&tx, file_id)?;
             tx.execute(
                 "UPDATE files
-                 SET size_bytes = ?2, modified_at_ms = ?3, indexed_at_ms = ?4
+                 SET size_bytes = ?2, modified_at_ms = ?3, indexed_at_ms = ?4, full_text = ?5
                  WHERE id = ?1",
-                params![file_id, identity.size_bytes, identity.modified_at_ms, now],
+                params![
+                    file_id,
+                    identity.size_bytes,
+                    identity.modified_at_ms,
+                    now,
+                    prepared.full_text,
+                ],
             )?;
             file_id
         } else {
             tx.execute(
-                "INSERT INTO files (file_path, size_bytes, modified_at_ms, indexed_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![key_str, identity.size_bytes, identity.modified_at_ms, now],
+                "INSERT INTO files (file_path, size_bytes, modified_at_ms, indexed_at_ms, full_text)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    key_str,
+                    identity.size_bytes,
+                    identity.modified_at_ms,
+                    now,
+                    prepared.full_text,
+                ],
             )?;
             tx.last_insert_rowid()
         };
@@ -3343,7 +3595,36 @@ impl SemanticIndex {
         let Some(root_id) = self.root_id_for_path(root)? else {
             return Ok(Vec::new());
         };
-        let mut stmt = self.conn.prepare(
+        self.topic_chunks_filtered("rf.root_id = ?1", &[&root_id])
+    }
+
+    /// Bulk-read vectors and passage metadata for one indexed document while
+    /// proving that the file belongs to the requested root. Filtering in SQL
+    /// avoids materialising the entire root for a within-document cloud.
+    pub fn topic_chunks_for_file(
+        &self,
+        root: &Path,
+        path: &Path,
+    ) -> anyhow::Result<Vec<TopicChunkData>> {
+        let Some(root_id) = self.root_id_for_path(root)? else {
+            return Ok(Vec::new());
+        };
+        let path_key = self
+            .path_key_for_existing_path(path)
+            .to_string_lossy()
+            .into_owned();
+        self.topic_chunks_filtered(
+            "rf.root_id = ?1 AND f.file_path = ?2",
+            &[&root_id, &path_key],
+        )
+    }
+
+    fn topic_chunks_filtered(
+        &self,
+        predicate: &str,
+        parameters: &[&dyn ToSql],
+    ) -> anyhow::Result<Vec<TopicChunkData>> {
+        let sql = format!(
             "SELECT c.id, f.id, f.file_path, c.byte_start, c.byte_end,
                     c.origin_type, c.page, c.line, c.col,
                     c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.chunk_text,
@@ -3352,10 +3633,11 @@ impl SemanticIndex {
              JOIN files f ON f.id = rf.file_id
              JOIN chunks c ON c.file_id = f.id
              JOIN vec_chunks v ON v.rowid = c.id
-             WHERE rf.root_id = ?1
-             ORDER BY f.file_path, c.chunk_idx, c.id",
-        )?;
-        let rows = stmt.query_map(params![root_id], |row| {
+             WHERE {predicate}
+             ORDER BY f.file_path, c.chunk_idx, c.id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(parameters, |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -3817,7 +4099,11 @@ impl SemanticIndex {
             .unwrap_or(0);
         if schema_version == 2 {
             Self::migrate_v2_to_v3(&conn)?;
-            schema_version = SCHEMA_VERSION;
+            schema_version = 3;
+        }
+        if schema_version == 3 {
+            Self::migrate_v3_to_v4(&conn)?;
+            schema_version = 4;
         }
         anyhow::ensure!(
             schema_version == SCHEMA_VERSION,

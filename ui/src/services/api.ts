@@ -79,7 +79,8 @@ export interface SearchApi {
   removeBookmark(id: string): Promise<void>;
   updateBookmarkNote(id: string, note: string | null): Promise<Bookmark>;
   clusterBookmarks(query: BookmarkClustersQuery): Promise<BookmarkClustersResult>;
-  chunkTopics(query: ChunkTopicsQuery): Promise<ChunkTopicsResult>;
+  chunkTopics(requestId: string, query: ChunkTopicsQuery): Promise<ChunkTopicsResult>;
+  cancelChunkTopics(requestId: string): Promise<void>;
   listFiles(root: string, collectionId?: string | null, tagIds?: string[], collectionExpression?: string | null): Promise<FileListResponse>;
   listTags(): Promise<Tag[]>;
   createTag(tag: NewTag): Promise<Tag>;

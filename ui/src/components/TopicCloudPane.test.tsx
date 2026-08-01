@@ -9,6 +9,7 @@ import { ToastProvider } from "./Toast";
 vi.mock("../services", () => ({
   api: {
     chunkTopics: vi.fn(),
+    cancelChunkTopics: vi.fn().mockResolvedValue(undefined),
     updateSettings: vi.fn().mockResolvedValue(undefined),
     listFiles: vi.fn().mockResolvedValue({ files: [], omitted: [] }),
     cancelSearch: vi.fn().mockResolvedValue(undefined),
@@ -67,11 +68,20 @@ describe("TopicCloudPane", () => {
     useTopicsStore.setState({
       paneOpen: true,
       loading: false,
-      requestId: 0,
+      requestId: null,
       result: null,
       root: null,
       granularity: "much_fewer",
       selectedTopicKey: null,
+      document: {
+        loading: false,
+        requestId: null,
+        result: null,
+        root: null,
+        path: null,
+        granularity: "much_fewer",
+        selectedTopicKey: null,
+      },
     });
     useSearchStore.setState({
       results: [],
@@ -93,10 +103,10 @@ describe("TopicCloudPane", () => {
 
     expect(await screen.findByText("Graph Database Indexes")).toBeInTheDocument();
     expect(screen.getByText("1,500 of 2,400 chunks")).toBeInTheDocument();
-    expect(api.chunkTopics).toHaveBeenCalledWith({
-      root: "/library",
-      granularity: "much_fewer",
-    });
+    expect(api.chunkTopics).toHaveBeenCalledWith(
+      expect.any(String),
+      { root: "/library", granularity: "much_fewer" },
+    );
 
     fireEvent.click(screen.getByText("Graph Database Indexes"));
     await waitFor(() =>
@@ -164,10 +174,10 @@ describe("TopicCloudPane", () => {
     expect(granularity).toHaveAttribute("aria-valuetext", "Much fewer");
     fireEvent.change(granularity, { target: { value: "1" } });
     await waitFor(() =>
-      expect(api.chunkTopics).toHaveBeenLastCalledWith({
-        root: "/library",
-        granularity: "fewer",
-      }),
+      expect(api.chunkTopics).toHaveBeenLastCalledWith(
+        expect.any(String),
+        { root: "/library", granularity: "fewer" },
+      ),
     );
   });
 
@@ -193,10 +203,10 @@ describe("TopicCloudPane", () => {
     fireEvent.change(granularity, { target: { value: "4" } });
 
     await waitFor(() => expect(api.chunkTopics).toHaveBeenCalledTimes(2));
-    expect(api.chunkTopics).toHaveBeenLastCalledWith({
-      root: "/library",
-      granularity: "much_more",
-    });
+    expect(api.chunkTopics).toHaveBeenLastCalledWith(
+      expect.any(String),
+      { root: "/library", granularity: "much_more" },
+    );
     expect(screen.getByText("Adjusting…")).toBeInTheDocument();
     expect(granularity).toBeDisabled();
     expect(screen.getByLabelText("Chunk topic cloud")).toHaveAttribute(

@@ -425,6 +425,19 @@ export default function SettingsModal({
                         <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Respect .gitignore files</span>
                       </label>
 
+                      <label className="flex items-start gap-2.5 cursor-pointer group">
+                        <input
+                          type="checkbox"
+                          checked={settings.grep_use_index}
+                          onChange={(e) => handleUpdateSettings({ grep_use_index: e.target.checked })}
+                          className="mt-0.5 w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
+                        />
+                        <span className="flex flex-col">
+                          <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Use index for exact search</span>
+                          <span className="text-[10px] text-[var(--text-dim)] italic">Reads PDF text from the semantic index instead of re-extracting; falls back to reading files directly when a file isn't indexed</span>
+                        </span>
+                      </label>
+
                       <div className="space-y-1">
                         <div className="flex justify-between items-baseline">
                           <label className="text-xs text-[var(--text-muted)]">Max file size (MB)</label>

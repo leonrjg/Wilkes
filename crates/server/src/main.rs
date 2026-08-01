@@ -236,23 +236,44 @@ async fn cluster_bookmarks_handler(
     Ok(Json(clusters))
 }
 
+#[derive(Deserialize)]
+struct ChunkTopicsBody {
+    request_id: String,
+    query: ChunkTopicsQuery,
+}
+
 async fn chunk_topics_handler(
     State(state): State<Arc<AppState>>,
-    Json(mut query): Json<ChunkTopicsQuery>,
+    Json(body): Json<ChunkTopicsBody>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let mut query = body.query;
     query.root = crate::http::state::confined_root_for_search(
         &query.root.to_string_lossy(),
         &state.uploads_dir,
         &TokioServerFs,
     )
     .await?;
+    if let Some(path) = query.path.as_ref() {
+        query.path = Some(confine_to_uploads(
+            &path.to_string_lossy(),
+            &state.uploads_dir,
+        )?);
+    }
     let topics = state
         .ctx
         .clone()
-        .chunk_topics(query)
+        .chunk_topics(body.request_id, query)
         .await
         .map_err(server_err)?;
     Ok(Json(topics))
+}
+
+async fn cancel_chunk_topics_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(request_id): axum::extract::Path<String>,
+) -> StatusCode {
+    state.ctx.cancel_chunk_topics(&request_id);
+    StatusCode::NO_CONTENT
 }
 
 async fn remove_bookmark_handler(
@@ -1208,6 +1229,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/bookmarks", post(add_bookmark_handler))
         .route("/api/bookmarks/clusters", post(cluster_bookmarks_handler))
         .route("/api/topics/chunks", post(chunk_topics_handler))
+        .route(
+            "/api/topics/chunks/:request_id",
+            delete(cancel_chunk_topics_handler),
+        )
         .route("/api/bookmarks/:id", delete(remove_bookmark_handler))
         .route("/api/bookmarks/:id", patch(update_bookmark_note_handler))
         .route("/api/tags", get(list_tags_handler).post(create_tag_handler))

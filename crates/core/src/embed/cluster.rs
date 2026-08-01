@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use crate::types::BookmarkClusterGranularity;
 
@@ -89,6 +90,13 @@ impl WardTree {
     /// down to one root does not alter any earlier merge, so every granularity
     /// observes exactly the same deterministic sequence.
     pub fn build(vectors: &[Vec<f32>]) -> anyhow::Result<Self> {
+        Self::build_with_cancel(vectors, &AtomicBool::new(false))
+    }
+
+    /// Build while cooperatively observing cancellation from a blocking
+    /// caller. The ordinary builder delegates here so clustering has one
+    /// implementation and identical merge semantics in every context.
+    pub fn build_with_cancel(vectors: &[Vec<f32>], cancelled: &AtomicBool) -> anyhow::Result<Self> {
         let count = vectors.len();
         if count < 3 {
             return Ok(Self {
@@ -109,7 +117,11 @@ impl WardTree {
             "Bookmark embeddings contain non-finite values"
         );
 
-        let normalized: Vec<Vec<f32>> = vectors.iter().map(|vector| normalize(vector)).collect();
+        let mut normalized = Vec::with_capacity(count);
+        for vector in vectors {
+            ensure_not_cancelled(cancelled)?;
+            normalized.push(normalize(vector));
+        }
         let squared_norms: Vec<f32> = normalized
             .iter()
             .map(|vector| dot(vector, vector))
@@ -121,11 +133,15 @@ impl WardTree {
         let mut heap = BinaryHeap::new();
         let mut item_similarities = vec![vec![0.0; count]; count];
         for index in 0..count {
+            ensure_not_cancelled(cancelled)?;
             item_similarities[index][index] = 1.0;
             centroids[index] = normalized[index].clone();
             sizes[index] = 1;
             active[index] = true;
             for other in (index + 1)..count {
+                if other.is_multiple_of(256) {
+                    ensure_not_cancelled(cancelled)?;
+                }
                 let similarity = dot(&normalized[index], &normalized[other]).clamp(-1.0, 1.0);
                 item_similarities[index][other] = similarity;
                 item_similarities[other][index] = similarity;
@@ -146,6 +162,7 @@ impl WardTree {
         let mut next_cluster = count;
 
         while active_count > 1 {
+            ensure_not_cancelled(cancelled)?;
             let Some(edge) = heap.pop() else {
                 break;
             };
@@ -176,6 +193,9 @@ impl WardTree {
             });
 
             for other in 0..merged {
+                if other.is_multiple_of(256) {
+                    ensure_not_cancelled(cancelled)?;
+                }
                 if !active[other] {
                     continue;
                 }
@@ -210,6 +230,16 @@ impl WardTree {
         &self,
         granularity: BookmarkClusterGranularity,
     ) -> anyhow::Result<EmbeddingClusterResult> {
+        self.cut_with_cancel(granularity, &AtomicBool::new(false))
+    }
+
+    /// Recut while cooperatively observing cancellation during the retained
+    /// O(n²) quality and representative scans.
+    pub fn cut_with_cancel(
+        &self,
+        granularity: BookmarkClusterGranularity,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<EmbeddingClusterResult> {
         let count = self.item_count;
         if count < 3 {
             return Ok(EmbeddingClusterResult {
@@ -228,6 +258,7 @@ impl WardTree {
             .take(count - target_cluster_count)
             .enumerate()
         {
+            ensure_not_cancelled(cancelled)?;
             anyhow::ensure!(
                 active[merge.left] && active[merge.right],
                 "Ward tree contains an invalid merge sequence"
@@ -248,7 +279,7 @@ impl WardTree {
             "Could not produce the requested Ward tree cut"
         );
         partition.sort_by_key(|group| group[0]);
-        if silhouette_score(&partition, &self.item_similarities) <= f32::EPSILON {
+        if silhouette_score(&partition, &self.item_similarities, cancelled)? <= f32::EPSILON {
             return Ok(EmbeddingClusterResult {
                 clusters: Vec::new(),
                 unclustered_indices: (0..count).collect(),
@@ -257,12 +288,13 @@ impl WardTree {
 
         let mut result = EmbeddingClusterResult::default();
         for group in partition {
+            ensure_not_cancelled(cancelled)?;
             if group.len() < 2 {
                 result.unclustered_indices.extend(group);
                 continue;
             }
-            let representative_index = medoid(&group, &self.item_similarities);
-            let cohesion = average_pair_similarity(&group, &self.item_similarities);
+            let representative_index = medoid(&group, &self.item_similarities, cancelled)?;
+            let cohesion = average_pair_similarity(&group, &self.item_similarities, cancelled)?;
             result.clusters.push(EmbeddingCluster {
                 item_indices: group,
                 representative_index,
@@ -291,6 +323,14 @@ impl WardTree {
         members.sort_unstable();
         members
     }
+}
+
+fn ensure_not_cancelled(cancelled: &AtomicBool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cancelled.load(AtomicOrdering::Relaxed),
+        "Chunk topic operation cancelled"
+    );
+    Ok(())
 }
 
 fn normalize(vector: &[f32]) -> Vec<f32> {
@@ -338,7 +378,11 @@ fn singleton_ward_merge_cost(
     (0.5 * (left_squared_norm + right_squared_norm) - similarity).max(0.0)
 }
 
-fn silhouette_score(partition: &[Vec<usize>], similarities: &[Vec<f32>]) -> f32 {
+fn silhouette_score(
+    partition: &[Vec<usize>],
+    similarities: &[Vec<f32>],
+    cancelled: &AtomicBool,
+) -> anyhow::Result<f32> {
     let item_count = similarities.len();
     let mut cluster_for_item = vec![0usize; item_count];
     for (cluster_index, cluster) in partition.iter().enumerate() {
@@ -349,6 +393,7 @@ fn silhouette_score(partition: &[Vec<usize>], similarities: &[Vec<f32>]) -> f32 
 
     let mut total = 0.0;
     for item in 0..item_count {
+        ensure_not_cancelled(cancelled)?;
         let own = &partition[cluster_for_item[item]];
         if own.len() <= 1 {
             continue;
@@ -376,44 +421,51 @@ fn silhouette_score(partition: &[Vec<usize>], similarities: &[Vec<f32>]) -> f32 
             total += (nearest_other - within) / denominator;
         }
     }
-    total / item_count as f32
+    Ok(total / item_count as f32)
 }
 
-fn medoid(group: &[usize], similarities: &[Vec<f32>]) -> usize {
-    group
-        .iter()
-        .copied()
-        .max_by(|&left, &right| {
-            let left_score: f32 = group
-                .iter()
-                .filter(|&&other| other != left)
-                .map(|&other| similarities[left][other])
-                .sum();
-            let right_score: f32 = group
-                .iter()
-                .filter(|&&other| other != right)
-                .map(|&other| similarities[right][other])
-                .sum();
-            left_score
-                .total_cmp(&right_score)
-                .then_with(|| right.cmp(&left))
-        })
-        .unwrap_or(group[0])
+fn medoid(
+    group: &[usize],
+    similarities: &[Vec<f32>],
+    cancelled: &AtomicBool,
+) -> anyhow::Result<usize> {
+    let mut best = group[0];
+    let mut best_score = f32::NEG_INFINITY;
+    for &candidate in group {
+        ensure_not_cancelled(cancelled)?;
+        let score = group
+            .iter()
+            .filter(|&&other| other != candidate)
+            .map(|&other| similarities[candidate][other])
+            .sum::<f32>();
+        if score.total_cmp(&best_score).is_gt()
+            || (score.total_cmp(&best_score).is_eq() && candidate < best)
+        {
+            best = candidate;
+            best_score = score;
+        }
+    }
+    Ok(best)
 }
 
-fn average_pair_similarity(group: &[usize], similarities: &[Vec<f32>]) -> f32 {
+fn average_pair_similarity(
+    group: &[usize],
+    similarities: &[Vec<f32>],
+    cancelled: &AtomicBool,
+) -> anyhow::Result<f32> {
     let mut total = 0.0;
     let mut pairs = 0usize;
     for (offset, &left) in group.iter().enumerate() {
+        ensure_not_cancelled(cancelled)?;
         for &right in &group[(offset + 1)..] {
             total += similarities[left][right];
             pairs += 1;
         }
     }
     if pairs == 0 {
-        1.0
+        Ok(1.0)
     } else {
-        total / pairs as f32
+        Ok(total / pairs as f32)
     }
 }
 
@@ -635,6 +687,23 @@ mod tests {
         let result = cluster_balanced(&[vec![1.0], vec![1.0]]).unwrap();
         assert!(result.clusters.is_empty());
         assert_eq!(result.unclustered_indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn cancellable_build_and_cut_stop_before_work() {
+        let vectors = vec![vec![1.0, 0.0], vec![0.9, 0.1], vec![0.0, 1.0]];
+        let cancelled = AtomicBool::new(true);
+        assert!(WardTree::build_with_cancel(&vectors, &cancelled)
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+
+        let tree = WardTree::build(&vectors).unwrap();
+        assert!(tree
+            .cut_with_cancel(BookmarkClusterGranularity::Balanced, &cancelled)
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
     }
 
     #[test]

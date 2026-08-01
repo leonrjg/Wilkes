@@ -106,6 +106,7 @@ pub fn start_search(
     log: Option<SearchLogTracker>,
     retrieval: RetrievalSettings,
     generator: Option<Arc<dyn Generator>>,
+    grep_use_index: bool,
 ) -> SearchHandle {
     let (tx, rx) = mpsc::channel::<FileMatches>(64);
 
@@ -133,10 +134,16 @@ pub fn start_search(
                     ];
                 }
             },
-            SearchMode::Grep => Box::new(GrepSearchProvider::with_all_roots(
-                all_roots,
-                all_root_errors,
-            )),
+            SearchMode::Grep => {
+                // When enabled, let grep read PDF text the index already holds
+                // instead of re-extracting each file. `None` keeps every PDF on
+                // the live-extraction path.
+                let grep_index = if grep_use_index { index } else { None };
+                Box::new(
+                    GrepSearchProvider::with_all_roots(all_roots, all_root_errors)
+                        .with_index(grep_index),
+                )
+            }
         };
 
         provider
@@ -186,6 +193,7 @@ mod tests {
             None,
             RetrievalSettings::default(),
             None,
+            false,
         );
         let mut matches = Vec::new();
         while let Some(m) = handle.rx.recv().await {
@@ -231,6 +239,7 @@ mod tests {
             None,
             RetrievalSettings::default(),
             None,
+            false,
         );
         let errors = handle.finish().await;
         assert_eq!(errors.len(), 1);
@@ -271,6 +280,7 @@ mod tests {
             None,
             RetrievalSettings::default(),
             None,
+            false,
         );
 
         let stats = handle
@@ -319,6 +329,7 @@ mod tests {
             None,
             RetrievalSettings::default(),
             None,
+            false,
         );
 
         let stats = handle
@@ -364,6 +375,7 @@ mod tests {
             None,
             RetrievalSettings::default(),
             None,
+            false,
         );
         let errors = handle.finish().await;
         assert_eq!(errors.len(), 1);
