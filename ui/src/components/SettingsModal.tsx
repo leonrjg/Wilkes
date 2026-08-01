@@ -190,6 +190,7 @@ export default function SettingsModal({
   const [externalMcpBusy, setExternalMcpBusy] = useState(false);
   const [externalMcpError, setExternalMcpError] = useState<string | null>(null);
   const customInstructionsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const generationReady = useGenerationStore((state) => state.ready);
 
   useEffect(() => {
     if (isOpen) {
@@ -474,6 +475,153 @@ export default function SettingsModal({
                       </div>
                     </div>
                   </section>
+
+                  {(() => {
+                    const retrieval = settings.retrieval ?? {
+                      hyde: { enabled: false, hypotheticals: 1, include_query: true },
+                      pseudo_relevance_feedback: { enabled: false, feedback_docs: 5, alpha: 1, beta: 0.5 },
+                    };
+                    const hyde = retrieval.hyde;
+                    const prf = retrieval.pseudo_relevance_feedback;
+                    const canToggleHyde = generationReady || hyde.enabled;
+                    const updateRetrieval = (patch: Partial<typeof retrieval>) =>
+                      handleUpdateSettings({ retrieval: { ...retrieval, ...patch } });
+                    const numberBox =
+                      "w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors";
+
+                    return (
+                      <section>
+                        <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-1 uppercase tracking-wider">Query enhancement</h3>
+                        <p className="text-[10px] text-[var(--text-dim)] italic mb-2.5">
+                          Reshapes the query vector before semantic search. No effect on exact (grep) search.
+                        </p>
+                        <div className="space-y-4">
+                          {/* HyDE */}
+                          <div className="space-y-2">
+                            <label
+                              className={`flex items-center gap-2.5 group ${canToggleHyde ? "cursor-pointer" : "cursor-not-allowed opacity-60"}`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={hyde.enabled}
+                                disabled={!canToggleHyde}
+                                onChange={(e) => updateRetrieval({ hyde: { ...hyde, enabled: e.target.checked } })}
+                                className="w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
+                              />
+                              <span className="text-xs text-[var(--text-main)]">
+                                HyDE (hypothetical document embeddings)
+                              </span>
+                            </label>
+                            <p className="text-[10px] text-[var(--text-dim)] italic pl-6">
+                              {generationReady
+                                ? "Searches with the embedding of an LLM-generated answer, adding generation latency to each search."
+                                : "Requires a generation model — enable and download one under Generation → Models."}
+                            </p>
+                            {hyde.enabled && generationReady && (
+                              <div className="pl-6 space-y-2">
+                                <div className="space-y-1">
+                                  <div className="flex justify-between items-baseline">
+                                    <label className="text-xs text-[var(--text-muted)]">Hypothetical passages</label>
+                                    <p className="text-[10px] text-[var(--text-dim)] italic">More = broader, slower</p>
+                                  </div>
+                                  <input
+                                    type="number"
+                                    min={1}
+                                    max={5}
+                                    value={hyde.hypotheticals}
+                                    onChange={(e) =>
+                                      updateRetrieval({
+                                        hyde: { ...hyde, hypotheticals: Math.max(1, parseInt(e.target.value) || 1) },
+                                      })
+                                    }
+                                    className={numberBox}
+                                  />
+                                </div>
+                                <label className="flex items-center gap-2.5 cursor-pointer">
+                                  <input
+                                    type="checkbox"
+                                    checked={hyde.include_query}
+                                    onChange={(e) => updateRetrieval({ hyde: { ...hyde, include_query: e.target.checked } })}
+                                    className="w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
+                                  />
+                                  <span className="text-xs text-[var(--text-muted)]">Blend with the original query vector</span>
+                                </label>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Pseudo-relevance feedback */}
+                          <div className="space-y-2">
+                            <label className="flex items-center gap-2.5 cursor-pointer group">
+                              <input
+                                type="checkbox"
+                                checked={prf.enabled}
+                                onChange={(e) =>
+                                  updateRetrieval({ pseudo_relevance_feedback: { ...prf, enabled: e.target.checked } })
+                                }
+                                className="w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
+                              />
+                              <span className="text-xs text-[var(--text-main)]">Pseudo-relevance feedback (Rocchio)</span>
+                            </label>
+                            <p className="text-[10px] text-[var(--text-dim)] italic pl-6">
+                              Folds the top initial hits back into the query and searches again. No generation model needed.
+                            </p>
+                            {prf.enabled && (
+                              <div className="pl-6 grid grid-cols-3 gap-2">
+                                <div className="space-y-1">
+                                  <label className="text-[10px] text-[var(--text-muted)]">Feedback docs</label>
+                                  <input
+                                    type="number"
+                                    min={1}
+                                    value={prf.feedback_docs}
+                                    onChange={(e) =>
+                                      updateRetrieval({
+                                        pseudo_relevance_feedback: {
+                                          ...prf,
+                                          feedback_docs: Math.max(1, parseInt(e.target.value) || 1),
+                                        },
+                                      })
+                                    }
+                                    className={numberBox}
+                                  />
+                                </div>
+                                <div className="space-y-1">
+                                  <label className="text-[10px] text-[var(--text-muted)]">α (query)</label>
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    step={0.1}
+                                    value={prf.alpha}
+                                    onChange={(e) =>
+                                      updateRetrieval({
+                                        pseudo_relevance_feedback: { ...prf, alpha: Math.max(0, Number(e.target.value)) },
+                                      })
+                                    }
+                                    className={numberBox}
+                                  />
+                                </div>
+                                <div className="space-y-1">
+                                  <label className="text-[10px] text-[var(--text-muted)]">β (feedback)</label>
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    step={0.1}
+                                    value={prf.beta}
+                                    onChange={(e) =>
+                                      updateRetrieval({
+                                        pseudo_relevance_feedback: { ...prf, beta: Math.max(0, Number(e.target.value)) },
+                                      })
+                                    }
+                                    className={numberBox}
+                                  />
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </section>
+                    );
+                  })()}
 
                   <section>
                     <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Appearance</h3>

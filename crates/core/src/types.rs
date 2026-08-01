@@ -992,6 +992,94 @@ impl Default for SemanticSettings {
     }
 }
 
+// ── Retrieval query enhancement ───────────────────────────────────────────────
+
+/// Techniques that reshape the *query vector* before the nearest-neighbour
+/// lookup. Both are optional and off by default. Neither adds a ranking stage
+/// after retrieval: search relevance stays owned by the vector index. They only
+/// change where in the latent space the query lands before that lookup happens.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct RetrievalSettings {
+    /// HyDE: search with the embedding of an LLM-generated hypothetical answer,
+    /// which sits in document space rather than terse-question space.
+    #[serde(default)]
+    pub hyde: HydeSettings,
+    /// Pseudo-relevance feedback (Rocchio): fold the centroid of the top initial
+    /// hits back into the query vector and retrieve a second time.
+    #[serde(default)]
+    pub pseudo_relevance_feedback: PrfSettings,
+}
+
+/// Hypothetical Document Embeddings (Gao et al., 2022).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct HydeSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Number of hypothetical documents generated and averaged together. More
+    /// broadens topical coverage at a linear generation-latency cost.
+    #[serde(default = "HydeSettings::default_hypotheticals")]
+    pub hypotheticals: usize,
+    /// Keep the original query vector in the average. When false, retrieval
+    /// relies solely on the generated hypotheticals.
+    #[serde(default = "default_true")]
+    pub include_query: bool,
+}
+
+impl HydeSettings {
+    pub const fn default_hypotheticals() -> usize {
+        1
+    }
+}
+
+impl Default for HydeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hypotheticals: Self::default_hypotheticals(),
+            include_query: true,
+        }
+    }
+}
+
+/// Pseudo-relevance feedback via the Rocchio update `q' = α·q + β·centroid`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PrfSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Number of top initial hits treated as pseudo-relevant feedback.
+    #[serde(default = "PrfSettings::default_feedback_docs")]
+    pub feedback_docs: usize,
+    /// Weight on the original query vector.
+    #[serde(default = "PrfSettings::default_alpha")]
+    pub alpha: f32,
+    /// Weight on the feedback centroid.
+    #[serde(default = "PrfSettings::default_beta")]
+    pub beta: f32,
+}
+
+impl PrfSettings {
+    pub const fn default_feedback_docs() -> usize {
+        5
+    }
+    pub fn default_alpha() -> f32 {
+        1.0
+    }
+    pub fn default_beta() -> f32 {
+        0.5
+    }
+}
+
+impl Default for PrfSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            feedback_docs: Self::default_feedback_docs(),
+            alpha: Self::default_alpha(),
+            beta: Self::default_beta(),
+        }
+    }
+}
+
 // ── Index status ──────────────────────────────────────────────────────────────
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IndexStatus {
@@ -1101,6 +1189,10 @@ pub struct Settings {
     /// it is invisible until it is both enabled and ready.
     #[serde(default)]
     pub generation: GenerationSettings,
+    /// Query-vector enhancement for semantic search (HyDE, pseudo-relevance
+    /// feedback). Off by default.
+    #[serde(default)]
+    pub retrieval: RetrievalSettings,
 }
 
 fn default_file_display_fields() -> Vec<FileDisplayField> {
@@ -1146,6 +1238,7 @@ impl Default for Settings {
             chat_custom_instructions: String::new(),
             external_mcp: ExternalMcpSettings::default(),
             generation: GenerationSettings::default(),
+            retrieval: RetrievalSettings::default(),
         }
     }
 }

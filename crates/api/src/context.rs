@@ -2689,6 +2689,16 @@ impl AppContext {
             Some(SearchLogTracker::new(store, id))
         };
 
+        // Query-vector enhancement is a semantic-only concern. HyDE additionally
+        // needs the loaded generator; hand it over only when HyDE is on so the
+        // provider does not hold a generator reference it will never use.
+        let retrieval = settings.retrieval.clone();
+        let generator = if query.mode == SearchMode::Semantic && retrieval.hyde.enabled {
+            self.generator.lock().clone()
+        } else {
+            None
+        };
+
         Ok(start_search(
             query,
             all_roots,
@@ -2698,6 +2708,8 @@ impl AppContext {
             semantic_indexing,
             eligible_paths,
             log,
+            retrieval,
+            generator,
         ))
     }
 

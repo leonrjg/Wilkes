@@ -8,11 +8,13 @@ use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::Embedder;
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
+use wilkes_core::generate::Generator;
 use wilkes_core::search::grep::GrepSearchProvider;
 use wilkes_core::search::semantic::SemanticSearchProvider;
 use wilkes_core::search::SearchProvider;
 use wilkes_core::types::{
-    FileMatches, IndexingConfig, SearchLogStatus, SearchMode, SearchQuery, SearchStats,
+    FileMatches, IndexingConfig, RetrievalSettings, SearchLogStatus, SearchMode, SearchQuery,
+    SearchStats,
 };
 
 /// Handle to a running search. Dropping the handle cancels the search.
@@ -102,6 +104,8 @@ pub fn start_search(
     indexing: Option<IndexingConfig>,
     eligible_paths: Option<std::collections::HashSet<std::path::PathBuf>>,
     log: Option<SearchLogTracker>,
+    retrieval: RetrievalSettings,
+    generator: Option<Arc<dyn Generator>>,
 ) -> SearchHandle {
     let (tx, rx) = mpsc::channel::<FileMatches>(64);
 
@@ -111,15 +115,18 @@ pub fn start_search(
 
         let provider: Box<dyn SearchProvider> = match query.mode {
             SearchMode::Semantic => match (embedder, index) {
-                (Some(emb), Some(idx)) => Box::new(SemanticSearchProvider::new(
-                    emb,
-                    idx,
-                    indexing.unwrap_or_else(|| IndexingConfig {
-                        chunk_size: 1000,
-                        chunk_overlap: 200,
-                        supported_extensions: query.supported_extensions.clone(),
-                    }),
-                )),
+                (Some(emb), Some(idx)) => Box::new(
+                    SemanticSearchProvider::new(
+                        emb,
+                        idx,
+                        indexing.unwrap_or_else(|| IndexingConfig {
+                            chunk_size: 1000,
+                            chunk_overlap: 200,
+                            supported_extensions: query.supported_extensions.clone(),
+                        }),
+                    )
+                    .with_retrieval(retrieval, generator),
+                ),
                 _ => {
                     return vec![
                         "Semantic search requires a loaded embedder and built index".into()
@@ -168,7 +175,18 @@ mod tests {
             tag_ids: Vec::new(),
         };
 
-        let mut handle = start_search(query, Vec::new(), Vec::new(), None, None, None, None, None);
+        let mut handle = start_search(
+            query,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            RetrievalSettings::default(),
+            None,
+        );
         let mut matches = Vec::new();
         while let Some(m) = handle.rx.recv().await {
             matches.push(m);
@@ -202,7 +220,18 @@ mod tests {
             tag_ids: Vec::new(),
         };
 
-        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None, None, None);
+        let handle = start_search(
+            query,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            RetrievalSettings::default(),
+            None,
+        );
         let errors = handle.finish().await;
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("Semantic search requires"));
@@ -231,7 +260,18 @@ mod tests {
             tag_ids: Vec::new(),
         };
 
-        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None, None, None);
+        let handle = start_search(
+            query,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            RetrievalSettings::default(),
+            None,
+        );
 
         let stats = handle
             .run(|fm| async move {
@@ -268,7 +308,18 @@ mod tests {
             tag_ids: Vec::new(),
         };
 
-        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None, None, None);
+        let handle = start_search(
+            query,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            RetrievalSettings::default(),
+            None,
+        );
 
         let stats = handle
             .run(|_fm| async move {
@@ -302,7 +353,18 @@ mod tests {
             tag_ids: Vec::new(),
         };
 
-        let handle = start_search(query, Vec::new(), Vec::new(), None, None, None, None, None);
+        let handle = start_search(
+            query,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            RetrievalSettings::default(),
+            None,
+        );
         let errors = handle.finish().await;
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("search failed"));

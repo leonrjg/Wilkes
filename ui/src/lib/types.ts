@@ -473,6 +473,36 @@ export interface GenerationSettings {
   sampling_overrides: Partial<Record<GenerationTask, GenerationSampling>>;
 }
 
+/** HyDE: search with the embedding of an LLM-generated hypothetical answer,
+ *  which sits in document space rather than terse-question space. Requires
+ *  generation to be enabled and ready. */
+export interface HydeSettings {
+  enabled: boolean;
+  /** Hypothetical passages generated and averaged together. */
+  hypotheticals: number;
+  /** Keep the original query vector in the average. */
+  include_query: boolean;
+}
+
+/** Pseudo-relevance feedback (Rocchio): fold the centroid of the top initial
+ *  hits back into the query vector and retrieve a second time. */
+export interface PrfSettings {
+  enabled: boolean;
+  /** Top initial hits treated as pseudo-relevant feedback. */
+  feedback_docs: number;
+  /** Weight on the original query vector. */
+  alpha: number;
+  /** Weight on the feedback centroid. */
+  beta: number;
+}
+
+/** Query-vector enhancement for semantic search. Both techniques reshape the
+ *  vector before the nearest-neighbour lookup; neither re-ranks afterwards. */
+export interface RetrievalSettings {
+  hyde: HydeSettings;
+  pseudo_relevance_feedback: PrfSettings;
+}
+
 /** Catalog entry for a generation model. Distinct from `ModelDescriptor`:
  *  `dimension` and `preferred_batch_size` are meaningless for a generator, and
  *  generation models need two repo ids because the GGUF repos ship no
@@ -582,6 +612,9 @@ export interface Settings {
   search_prefer_semantic: boolean;
   semantic: SemanticSettings;
   generation: GenerationSettings;
+  /** Query-vector enhancement for semantic search (HyDE, pseudo-relevance
+   *  feedback). Off by default. */
+  retrieval: RetrievalSettings;
   integrations: IntegrationsSettings;
   primary_metadata_source?: MetadataSourcePreference;
   supported_extensions: string[];

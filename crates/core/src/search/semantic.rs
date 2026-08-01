@@ -2,19 +2,27 @@ use std::sync::{Arc, Mutex};
 
 use crate::extract::ExtractorRegistry;
 use crate::types::{
-    FileMatches, FileType, IndexingConfig, Match, SearchCapabilities, SearchQuery, SearchScope,
-    SourceOrigin,
+    FileMatches, FileType, IndexingConfig, Match, RetrievalSettings, SearchCapabilities,
+    SearchQuery, SearchScope, SourceOrigin,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::{SearchProvider, SearchResultTx};
 use crate::embed::index::{SemanticIndex, SemanticQueryScope};
 use crate::embed::Embedder;
+use crate::generate::tasks::hypothetical_document;
+use crate::generate::Generator;
 
 pub struct SemanticSearchProvider {
     embedder: Arc<dyn Embedder>,
     index: Arc<Mutex<Option<SemanticIndex>>>,
     indexing: IndexingConfig,
+    /// Query-vector enhancement (HyDE, PRF). Default is all-off, so a provider
+    /// built with `new` alone behaves exactly as it did before these features.
+    retrieval: RetrievalSettings,
+    /// Only consulted for HyDE, and only when the setting is enabled. `None`
+    /// means no generation model is loaded.
+    generator: Option<Arc<dyn Generator>>,
 }
 
 impl SemanticSearchProvider {
@@ -27,8 +35,200 @@ impl SemanticSearchProvider {
             embedder,
             index,
             indexing,
+            retrieval: RetrievalSettings::default(),
+            generator: None,
         }
     }
+
+    /// Attach query-vector enhancement. The generator is only needed for HyDE;
+    /// pass `None` when generation is unavailable and HyDE will degrade to the
+    /// raw query (and log a warning) rather than failing the search.
+    pub fn with_retrieval(
+        mut self,
+        retrieval: RetrievalSettings,
+        generator: Option<Arc<dyn Generator>>,
+    ) -> Self {
+        self.retrieval = retrieval;
+        self.generator = generator;
+        self
+    }
+
+    /// Embed the raw query string into a single vector (question space).
+    fn embed_query_vector(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        let vecs = self.embedder.embed_query(&[text]).map_err(|e| {
+            error!("[semantic] embed error: {e:#}");
+            e
+        })?;
+        vecs.into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Embedder returned no vector for the query"))
+    }
+
+    /// HyDE: replace the question-space vector with the mean of the (optional)
+    /// query vector and one or more embedded LLM-generated hypothetical
+    /// passages, moving the search into document space.
+    ///
+    /// Best-effort by contract: the base vector is the *input* this transforms,
+    /// not a competing implementation, so any failure logs a warning and
+    /// returns the un-transformed base vector.
+    fn apply_hyde(&self, query_text: &str, base: Vec<f32>) -> Vec<f32> {
+        let hyde = &self.retrieval.hyde;
+        if !hyde.enabled {
+            return base;
+        }
+
+        let Some(generator) = self.generator.as_deref() else {
+            warn!(
+                "[semantic] HyDE is enabled but no generation model is loaded; searched with the raw query"
+            );
+            return base;
+        };
+
+        let passages = match hypothetical_document::hypothetical_documents(
+            generator,
+            query_text,
+            hyde.hypotheticals,
+        ) {
+            Ok(passages) => passages,
+            Err(e) => {
+                warn!("[semantic] HyDE generation failed; searched with the raw query: {e:#}");
+                return base;
+            }
+        };
+
+        let refs: Vec<&str> = passages.iter().map(String::as_str).collect();
+        let passage_vecs = match self.embedder.embed_passages(&refs) {
+            Ok(vecs) => vecs,
+            Err(e) => {
+                warn!(
+                    "[semantic] HyDE passage embedding failed; searched with the raw query: {e:#}"
+                );
+                return base;
+            }
+        };
+
+        // Normalise each component so the mean is a direction, not dominated by
+        // whichever vector happens to have the largest magnitude.
+        let mut components: Vec<Vec<f32>> = Vec::with_capacity(passage_vecs.len() + 1);
+        if hyde.include_query {
+            components.push(normalize(&base));
+        }
+        for vec in &passage_vecs {
+            components.push(normalize(vec));
+        }
+
+        match mean_vector(&components) {
+            Some(mean) => {
+                info!(
+                    "[semantic] HyDE: query vector shifted using {} hypothetical passage(s)",
+                    passage_vecs.len()
+                );
+                normalize(&mean)
+            }
+            None => base,
+        }
+    }
+
+    /// Pseudo-relevance feedback (Rocchio). Runs an initial retrieval with `q0`,
+    /// treats the top hits as pseudo-relevant, and folds their centroid back
+    /// into the vector: `q1 = α·q0 + β·centroid`.
+    ///
+    /// An empty initial result set is a no-op, not an error. Invalid zero
+    /// weights and embedding failures log a warning and return `q0` unchanged.
+    fn apply_prf(
+        &self,
+        q0: &[f32],
+        query: &SearchQuery,
+        eligible_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
+    ) -> anyhow::Result<Vec<f32>> {
+        let prf = &self.retrieval.pseudo_relevance_feedback;
+        if !prf.enabled || prf.feedback_docs == 0 {
+            return Ok(q0.to_vec());
+        }
+        if prf.alpha == 0.0 && prf.beta == 0.0 {
+            warn!("[semantic] PRF alpha and beta are both zero; searched without feedback");
+            return Ok(q0.to_vec());
+        }
+
+        let feedback = {
+            let guard = self.index.lock().unwrap();
+            let idx = guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Semantic index is not built yet"))?;
+            idx.query_scoped_filtered(q0, prf.feedback_docs, query_scope(query), eligible_paths)?
+        };
+        if feedback.is_empty() {
+            return Ok(q0.to_vec());
+        }
+
+        let texts: Vec<&str> = feedback
+            .iter()
+            .map(|chunk| chunk.chunk_text.as_str())
+            .collect();
+        let feedback_vecs = match self.embedder.embed_passages(&texts) {
+            Ok(vecs) => vecs,
+            Err(e) => {
+                warn!("[semantic] PRF feedback embedding failed; searched without feedback: {e:#}");
+                return Ok(q0.to_vec());
+            }
+        };
+
+        let normalized: Vec<Vec<f32>> = feedback_vecs.iter().map(|vec| normalize(vec)).collect();
+        let Some(centroid) = mean_vector(&normalized) else {
+            return Ok(q0.to_vec());
+        };
+
+        let q1 = rocchio(&normalize(q0), &centroid, prf.alpha, prf.beta);
+        info!(
+            "[semantic] PRF: query vector refined from {} feedback passage(s)",
+            feedback_vecs.len()
+        );
+        Ok(normalize(&q1))
+    }
+}
+
+/// The nearest-neighbour scope for a query. Rebuilt per call because it borrows
+/// the query's paths and is consumed by each index lookup.
+fn query_scope(query: &SearchQuery) -> SemanticQueryScope<'_> {
+    match &query.scope {
+        SearchScope::Corpus => SemanticQueryScope::Root(&query.root),
+        SearchScope::All => SemanticQueryScope::Corpus,
+        SearchScope::File { path } => SemanticQueryScope::File(path),
+    }
+}
+
+/// L2-normalise a vector; a zero vector normalises to itself.
+fn normalize(v: &[f32]) -> Vec<f32> {
+    let norm = v.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm == 0.0 {
+        return v.to_vec();
+    }
+    v.iter().map(|value| value / norm).collect()
+}
+
+/// Element-wise mean of equal-length vectors. `None` for an empty input.
+fn mean_vector(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
+    let dim = vectors.first()?.len();
+    let mut acc = vec![0.0f32; dim];
+    for vec in vectors {
+        for (slot, value) in acc.iter_mut().zip(vec) {
+            *slot += value;
+        }
+    }
+    let count = vectors.len() as f32;
+    for slot in acc.iter_mut() {
+        *slot /= count;
+    }
+    Some(acc)
+}
+
+/// Rocchio combination `alpha*query + beta*centroid`.
+fn rocchio(query: &[f32], centroid: &[f32], alpha: f32, beta: f32) -> Vec<f32> {
+    query
+        .iter()
+        .zip(centroid)
+        .map(|(q, c)| alpha * q + beta * c)
+        .collect()
 }
 
 impl SearchProvider for SemanticSearchProvider {
@@ -57,20 +257,15 @@ impl SearchProvider for SemanticSearchProvider {
             )?
         };
 
-        // 2. Embed the query string.
+        // 2. Form the query vector. The raw query embedding is the base; HyDE
+        // then PRF (each optional) reshape it before the authoritative lookup.
+        // Neither adds a ranking stage after retrieval — the index still owns
+        // relevance.
         info!("[semantic] embedding query...");
-        let query_vecs = self
-            .embedder
-            .embed_query(&[query.pattern.as_str()])
-            .map_err(|e| {
-                error!("[semantic] embed error: {e:#}");
-                e
-            })?;
-        info!("[semantic] query embedded, running index query");
-        let query_vec = query_vecs
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Embedder returned no vector for the query"))?;
+        let base_vec = self.embed_query_vector(query.pattern.as_str())?;
+        let hyde_vec = self.apply_hyde(query.pattern.as_str(), base_vec);
+        let query_vec = self.apply_prf(&hyde_vec, query, eligible_paths)?;
+        info!("[semantic] query vector ready, running index query");
 
         // 3. Lock the index and run the nearest-neighbour query.
         let guard = self.index.lock().unwrap();
@@ -79,12 +274,8 @@ impl SearchProvider for SemanticSearchProvider {
             .ok_or_else(|| anyhow::anyhow!("Semantic index is not built yet"))?;
 
         let top_k = query.max_results;
-        let scope = match &query.scope {
-            SearchScope::Corpus => SemanticQueryScope::Root(&query.root),
-            SearchScope::All => SemanticQueryScope::Corpus,
-            SearchScope::File { path } => SemanticQueryScope::File(path),
-        };
-        let results = idx.query_scoped_filtered(&query_vec, top_k, scope, eligible_paths)?;
+        let results =
+            idx.query_scoped_filtered(&query_vec, top_k, query_scope(query), eligible_paths)?;
         drop(guard);
 
         // 4. Convert IndexedChunk results into FileMatches / Match.
@@ -182,6 +373,286 @@ mod tests {
             chunk_overlap: 0,
             supported_extensions: extensions,
         }
+    }
+
+    /// Records how many times it was asked to generate, so HyDE wiring can be
+    /// asserted without a real model.
+    struct ScriptedGenerator {
+        reply: String,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedGenerator {
+        fn new(reply: &str) -> Self {
+            Self {
+                reply: reply.to_string(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::generate::Generator for ScriptedGenerator {
+        fn generate_stream(
+            &self,
+            _req: crate::generate::GenerationRequest,
+            sink: &mut dyn FnMut(&str) -> std::ops::ControlFlow<()>,
+        ) -> anyhow::Result<crate::generate::Generated> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = sink(&self.reply);
+            Ok(crate::generate::Generated {
+                text: self.reply.clone(),
+                tokens: self.reply.split_whitespace().count(),
+                stop: crate::generate::StopReason::Eos,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "scripted"
+        }
+        fn context_tokens(&self) -> usize {
+            4096
+        }
+    }
+
+    /// A single-chunk text index, mirroring the setup shared by several tests.
+    fn index_with_one_text_chunk(dir: &tempfile::TempDir) -> (SemanticIndex, std::path::PathBuf) {
+        let mut idx = SemanticIndex::create(
+            dir.path(),
+            "mock",
+            768,
+            crate::types::EmbeddingEngine::SBERT,
+            Some(dir.path()),
+        )
+        .unwrap();
+
+        let path = dir.path().join("doc.txt");
+        std::fs::write(&path, "hello world").unwrap();
+
+        use crate::embed::index::chunk::Chunk;
+        use crate::embed::index::db::PreparedFile;
+        use crate::types::{ByteRange, SourceOrigin};
+
+        idx.write_file(PreparedFile {
+            path: path.clone(),
+            chunks: vec![(
+                Chunk {
+                    file_path: path.clone(),
+                    text: "hello world".to_string(),
+                    byte_range: ByteRange { start: 0, end: 11 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![1.0; 768],
+            )],
+        })
+        .unwrap();
+        (idx, path)
+    }
+
+    fn text_query(root: &std::path::Path) -> SearchQuery {
+        SearchQuery {
+            pattern: "test".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: root.to_path_buf(),
+            max_results: 10,
+            respect_gitignore: false,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Semantic,
+            scope: Default::default(),
+            supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
+        }
+    }
+
+    async fn collect(
+        handle: tokio::task::JoinHandle<Vec<String>>,
+        mut rx: tokio::sync::mpsc::Receiver<FileMatches>,
+    ) -> (Vec<FileMatches>, Vec<String>) {
+        let mut results = Vec::new();
+        while let Some(fm) = rx.recv().await {
+            results.push(fm);
+        }
+        let errors = handle.await.unwrap();
+        (results, errors)
+    }
+
+    // ── Query-vector math ─────────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_produces_unit_vector() {
+        let n = normalize(&[3.0, 4.0]);
+        let mag = (n[0] * n[0] + n[1] * n[1]).sqrt();
+        assert!((mag - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_leaves_zero_vector_untouched() {
+        assert_eq!(normalize(&[0.0, 0.0]), vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn mean_vector_averages_elementwise() {
+        let m = mean_vector(&[vec![0.0, 2.0], vec![2.0, 4.0]]).unwrap();
+        assert_eq!(m, vec![1.0, 3.0]);
+    }
+
+    #[test]
+    fn mean_vector_is_none_for_empty_input() {
+        assert!(mean_vector(&[]).is_none());
+    }
+
+    #[test]
+    fn rocchio_weights_query_and_centroid() {
+        // alpha=1, beta=0 keeps the query; beta contribution is additive.
+        assert_eq!(rocchio(&[1.0, 0.0], &[0.0, 1.0], 1.0, 0.5), vec![1.0, 0.5]);
+    }
+
+    // ── HyDE wiring / degradation ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_hyde_enabled_without_generator_degrades_without_search_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (idx, _path) = index_with_one_text_chunk(&dir);
+        let provider = SemanticSearchProvider::new(
+            Arc::new(MockEmbedder),
+            Arc::new(Mutex::new(Some(idx))),
+            indexing_config(vec!["txt".to_string()]),
+        )
+        .with_retrieval(
+            crate::types::RetrievalSettings {
+                hyde: crate::types::HydeSettings {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            None, // no generator loaded
+        );
+
+        let query = text_query(dir.path());
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let handle = tokio::task::spawn_blocking(move || {
+            provider
+                .search(&query, &ExtractorRegistry::new(), tx, None)
+                .unwrap()
+        });
+        let (results, errors) = collect(handle, rx).await;
+
+        // Search succeeds with the raw query, and the optional enhancement's
+        // degradation does not masquerade as a file/search failure.
+        assert_eq!(results.len(), 1);
+        assert!(errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_hyde_enabled_invokes_generator() {
+        let dir = tempfile::tempdir().unwrap();
+        let (idx, _path) = index_with_one_text_chunk(&dir);
+        let generator = Arc::new(ScriptedGenerator::new("A hypothetical answer passage."));
+        let provider = SemanticSearchProvider::new(
+            Arc::new(MockEmbedder),
+            Arc::new(Mutex::new(Some(idx))),
+            indexing_config(vec!["txt".to_string()]),
+        )
+        .with_retrieval(
+            crate::types::RetrievalSettings {
+                hyde: crate::types::HydeSettings {
+                    enabled: true,
+                    hypotheticals: 1,
+                    include_query: true,
+                },
+                ..Default::default()
+            },
+            Some(generator.clone()),
+        );
+
+        let query = text_query(dir.path());
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let handle = tokio::task::spawn_blocking(move || {
+            provider
+                .search(&query, &ExtractorRegistry::new(), tx, None)
+                .unwrap()
+        });
+        let (results, errors) = collect(handle, rx).await;
+
+        assert_eq!(
+            generator.calls(),
+            1,
+            "HyDE should invoke the generator once"
+        );
+        assert_eq!(results.len(), 1);
+        assert!(
+            errors.is_empty(),
+            "no degradation notes expected: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prf_enabled_runs_and_returns_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let (idx, _path) = index_with_one_text_chunk(&dir);
+        let provider = SemanticSearchProvider::new(
+            Arc::new(MockEmbedder),
+            Arc::new(Mutex::new(Some(idx))),
+            indexing_config(vec!["txt".to_string()]),
+        )
+        .with_retrieval(
+            crate::types::RetrievalSettings {
+                pseudo_relevance_feedback: crate::types::PrfSettings {
+                    enabled: true,
+                    feedback_docs: 3,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            None,
+        );
+
+        let query = text_query(dir.path());
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let handle = tokio::task::spawn_blocking(move || {
+            provider
+                .search(&query, &ExtractorRegistry::new(), tx, None)
+                .unwrap()
+        });
+        let (results, errors) = collect(handle, rx).await;
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            errors.is_empty(),
+            "PRF should not surface errors here: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_prf_with_zero_weights_keeps_original_query() {
+        let provider = SemanticSearchProvider::new(
+            Arc::new(MockEmbedder),
+            Arc::new(Mutex::new(None)),
+            indexing_config(vec!["txt".to_string()]),
+        )
+        .with_retrieval(
+            crate::types::RetrievalSettings {
+                pseudo_relevance_feedback: crate::types::PrfSettings {
+                    enabled: true,
+                    feedback_docs: 3,
+                    alpha: 0.0,
+                    beta: 0.0,
+                },
+                ..Default::default()
+            },
+            None,
+        );
+
+        let q0 = vec![0.25, 0.75];
+        let query = text_query(std::path::Path::new("/unused"));
+        let refined = provider.apply_prf(&q0, &query, None).unwrap();
+
+        assert_eq!(refined, q0);
     }
 
     #[test]

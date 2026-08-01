@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, act, within } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import SettingsModal from "./SettingsModal";
+import { useGenerationStore } from "../stores/useGenerationStore";
 
 // Mock sub-components
 vi.mock("./SemanticPanel", () => ({ default: () => <div data-testid="semantic-panel">SemanticPanel</div> }));
@@ -69,6 +70,7 @@ describe("SettingsModal", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    useGenerationStore.setState({ ready: false });
     mockApi.getSettings.mockResolvedValue(mockSettings);
     mockApi.getExternalMcpStatus.mockResolvedValue({
       enabled: false,
@@ -326,5 +328,85 @@ describe("SettingsModal", () => {
       fireEvent.click(applyBtn);
     });
     expect(mockApi.updateSettings).toHaveBeenCalled();
+  });
+
+  it("gates HyDE on generation readiness and persists PRF as a complete retrieval object", async () => {
+    // Return the merged settings so the component re-renders with the toggle on.
+    mockApi.updateSettings.mockImplementation(async (patch: any) => ({ ...mockSettings, ...patch }));
+
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+
+    expect(screen.getByText("Query enhancement")).toBeInTheDocument();
+
+    // Generation is not ready in this harness, so enabling HyDE must be disabled.
+    const hydeCheckbox = screen
+      .getByText(/HyDE/i)
+      .closest("label")!
+      .querySelector("input[type=checkbox]") as HTMLInputElement;
+    expect(hydeCheckbox.disabled).toBe(true);
+
+    // PRF has no generation dependency and must persist the full nested object,
+    // because the backend merges settings at the top level only.
+    const prfCheckbox = screen
+      .getByText(/Pseudo-relevance feedback/i)
+      .closest("label")!
+      .querySelector("input[type=checkbox]") as HTMLInputElement;
+    await act(async () => {
+      fireEvent.click(prfCheckbox);
+    });
+
+    expect(mockApi.updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        retrieval: expect.objectContaining({
+          hyde: expect.any(Object),
+          pseudo_relevance_feedback: expect.objectContaining({ enabled: true }),
+        }),
+      }),
+    );
+  });
+
+  it("allows enabled HyDE to be turned off when generation is unavailable", async () => {
+    const settingsWithHyde = {
+      ...mockSettings,
+      retrieval: {
+        hyde: { enabled: true, hypotheticals: 1, include_query: true },
+        pseudo_relevance_feedback: {
+          enabled: false,
+          feedback_docs: 5,
+          alpha: 1,
+          beta: 0.5,
+        },
+      },
+    };
+    mockApi.getSettings.mockResolvedValue(settingsWithHyde);
+    mockApi.updateSettings.mockImplementation(async (patch: any) => ({
+      ...settingsWithHyde,
+      ...patch,
+    }));
+
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+
+    const hydeCheckbox = screen
+      .getByText(/HyDE/i)
+      .closest("label")!
+      .querySelector("input[type=checkbox]") as HTMLInputElement;
+    expect(hydeCheckbox.checked).toBe(true);
+    expect(hydeCheckbox.disabled).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(hydeCheckbox);
+    });
+
+    expect(mockApi.updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        retrieval: expect.objectContaining({
+          hyde: expect.objectContaining({ enabled: false }),
+        }),
+      }),
+    );
   });
 });
