@@ -6,6 +6,7 @@ import { useToasts } from "../components/Toast";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
+import { useSearchStore } from "../stores/useSearchStore";
 
 vi.mock("../services", () => ({
   api: {
@@ -13,6 +14,7 @@ vi.mock("../services", () => ({
     onFileListChanged: vi.fn().mockResolvedValue(vi.fn()),
     onFileMetadataUpdated: vi.fn().mockResolvedValue(vi.fn()),
     onBookmarkClusterLabelled: vi.fn().mockResolvedValue(vi.fn()),
+    onChunkTopicLabelled: vi.fn().mockResolvedValue(vi.fn()),
     isGenerationReady: vi.fn().mockResolvedValue(false),
   },
 }));
@@ -61,6 +63,7 @@ describe("useGlobalEvents", () => {
       handleIndexTerminated,
     });
     (useBookmarksStore.getState as any).mockReturnValue({ load: loadBookmarks });
+    useSearchStore.setState({ resultContext: null });
   });
 
   it("handles WorkerStarting event", async () => {
@@ -196,5 +199,39 @@ describe("useGlobalEvents", () => {
     expect(removeToast).toHaveBeenCalledWith("toast-id");
     expect(handleIndexUpdated).not.toHaveBeenCalled();
     expect(handleIndexTerminated).toHaveBeenCalled();
+  });
+
+  it("attaches a late label only to the matching displayed topic", async () => {
+    let topicLabelHandler: any;
+    (api.onChunkTopicLabelled as any).mockImplementation((handler: any) => {
+      topicLabelHandler = handler;
+      return Promise.resolve(vi.fn());
+    });
+    useSearchStore.setState({
+      resultContext: { kind: "topic", topicKey: "topic-a", subject: null },
+    });
+
+    renderHook(() => useGlobalEvents());
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    act(() => {
+      topicLabelHandler({ cluster_key: "topic-b", label: "Other topic" });
+    });
+    expect(useSearchStore.getState().resultContext).toEqual({
+      kind: "topic",
+      topicKey: "topic-a",
+      subject: null,
+    });
+
+    act(() => {
+      topicLabelHandler({ cluster_key: "topic-a", label: "Graph indexes" });
+    });
+    expect(useSearchStore.getState().resultContext).toEqual({
+      kind: "topic",
+      topicKey: "topic-a",
+      subject: "Graph indexes",
+    });
   });
 });

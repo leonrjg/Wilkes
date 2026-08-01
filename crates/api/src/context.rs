@@ -10,6 +10,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use wilkes_core::directory_watcher::{DirectoryChangeBatch, DirectoryWatcher};
+use wilkes_core::embed::cluster::WardTree;
+use wilkes_core::embed::index::db::TopicChunkData;
 use wilkes_core::embed::index::semantic_updater::process_directory_change;
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::installer::EmbedderInstaller;
@@ -17,7 +19,7 @@ use wilkes_core::embed::{dispatch, Embedder};
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::{ContentExtractor, ExtractorRegistry};
 use wilkes_core::generate::engines::dispatch as generate_dispatch;
-use wilkes_core::generate::tasks::cluster_label::cluster_label;
+use wilkes_core::generate::tasks::cluster_label::{cluster_label, validate_cluster_label};
 use wilkes_core::generate::tasks::document_summary::{
     summarize_document as generate_document_summary, DocumentSummaryInput,
 };
@@ -36,13 +38,14 @@ use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::models::progress::EmbedProgress;
 use wilkes_core::path::is_under;
 use wilkes_core::types::{
-    Bookmark, BookmarkCluster, BookmarkClustersQuery, BookmarkClustersResult, CitationLinks,
-    CitationLinksQuery, CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbedderModel,
-    FileEntry, FileListResponse, FileType, IndexStatus, IndexingConfig, MetadataConflictValue,
-    MetadataSourcePreference,
-    NewBookmark, NewSmartCollection, NewTag, PreviewData, RelatedDocument, RelatedDocumentsQuery,
-    SearchLogEntry, SearchMode, SearchQuery, SearchScope, SelectedEmbedder, SemanticSettings,
-    Settings, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
+    Bookmark, BookmarkCluster, BookmarkClustersQuery, BookmarkClustersResult, ChunkTopic,
+    ChunkTopicMember, ChunkTopicsQuery, ChunkTopicsResult, CitationLinks, CitationLinksQuery,
+    CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbedderModel, FileEntry,
+    FileListResponse, FileType, IndexStatus, IndexingConfig, MetadataConflictValue,
+    MetadataSourcePreference, NewBookmark, NewSmartCollection, NewTag, PreviewData,
+    RelatedDocument, RelatedDocumentsQuery, SearchLogEntry, SearchMode, SearchQuery, SearchScope,
+    SelectedEmbedder, SemanticSettings, Settings, SmartCollection, Tag, UpdateSmartCollection,
+    UpdateTag,
 };
 use wilkes_core::types::{
     GenerationSettings, GenerationStreamEvent, GenerationTask, GeneratorDescriptor,
@@ -60,7 +63,8 @@ const BOOKMARK_EMBEDDING_RECIPE_VERSION: i64 = 1;
 /// Bump whenever the cluster-label prompt or grammar changes: that is the whole
 /// point of the field, and a stale cache would otherwise serve labels produced
 /// by a recipe that no longer exists.
-const BOOKMARK_CLUSTER_LABEL_RECIPE_VERSION: i64 = 3;
+const BOOKMARK_CLUSTER_LABEL_RECIPE_VERSION: i64 = 6;
+const CHUNK_CLUSTER_LABEL_RECIPE_VERSION: i64 = 4;
 
 /// A run producing more clusters than this is not worth labelling: the worker
 /// serialises requests, so 20 labels already means several seconds of queue.
@@ -280,6 +284,26 @@ impl GeneratorLoad {
 
 // ── AppContext ────────────────────────────────────────────────────────────────
 
+struct TopicTreeCache {
+    root: PathBuf,
+    requested_input_cap: usize,
+    index_revision: u64,
+    tree: WardTree,
+    sampled: Vec<TopicChunkData>,
+    total_chunk_count: usize,
+    total_document_count: usize,
+    sampled_document_count: usize,
+    input_cap: usize,
+}
+
+impl TopicTreeCache {
+    fn matches(&self, root: &Path, requested_input_cap: usize, index_revision: u64) -> bool {
+        self.root == root
+            && self.requested_input_cap == requested_input_cap
+            && self.index_revision == index_revision
+    }
+}
+
 /// Shared application state and lifecycle logic. Both the desktop (Tauri) and
 /// the server (axum) create exactly one `Arc<AppContext>` and delegate all
 /// business operations to it.
@@ -315,6 +339,19 @@ pub struct AppContext {
     /// makes the previous run's results describe a partition nobody is looking
     /// at any more.
     cluster_label_task: PLMutex<Option<JoinHandle<()>>>,
+    /// Topic labels have an independent lifecycle from bookmark labels: a
+    /// redraw of one pane must not cancel useful work for the other.
+    topic_label_task: PLMutex<Option<JoinHandle<()>>>,
+    /// One bounded, active-root Ward tree. The retained similarity matrix is
+    /// O(n²), so keeping historical roots or caps would multiply the resource
+    /// knob instead of respecting it.
+    topic_tree_cache: PLMutex<Option<Arc<TopicTreeCache>>>,
+    /// Serialises cache misses so rapid redraw requests cannot build duplicate
+    /// O(n²) trees concurrently.
+    topic_tree_build_lock: tokio::sync::Mutex<()>,
+    /// Incremented before every semantic-index mutation. A build captures this
+    /// value and may install its tree only if the value is still current.
+    semantic_index_revision: AtomicU64,
     events: Arc<dyn EventEmitter>,
     settings_lock: tokio::sync::Mutex<()>,
     bookmarks_lock: tokio::sync::Mutex<()>,
@@ -351,6 +388,10 @@ impl AppContext {
             generator_load_lock: tokio::sync::Mutex::new(()),
             generator_epoch: AtomicU64::new(0),
             cluster_label_task: PLMutex::new(None),
+            topic_label_task: PLMutex::new(None),
+            topic_tree_cache: PLMutex::new(None),
+            topic_tree_build_lock: tokio::sync::Mutex::new(()),
+            semantic_index_revision: AtomicU64::new(0),
             events,
             settings_lock: tokio::sync::Mutex::new(()),
             bookmarks_lock: tokio::sync::Mutex::new(()),
@@ -739,11 +780,19 @@ impl AppContext {
 
         let mut pending: Vec<(String, Vec<String>)> = Vec::new();
         for cluster in clusters.iter_mut() {
+            let members = label_inputs(cluster, &inputs);
             if let Some(label) = cached.get(&cluster.cluster_key) {
-                cluster.label = Some(label.clone());
-                continue;
+                let refs: Vec<&str> = members.iter().map(String::as_str).collect();
+                if validate_cluster_label(label, &refs).is_ok() {
+                    cluster.label = Some(label.clone());
+                    continue;
+                }
+                warn!(
+                    "Ignoring invalid cached cluster label for {}",
+                    cluster.cluster_key
+                );
             }
-            pending.push((cluster.cluster_key.clone(), label_inputs(cluster, &inputs)));
+            pending.push((cluster.cluster_key.clone(), members));
         }
 
         if pending.is_empty() {
@@ -804,6 +853,288 @@ impl AppContext {
             }
         });
         *self.cluster_label_task.lock() = Some(task);
+    }
+
+    fn invalidate_topic_tree_cache(&self) {
+        self.semantic_index_revision.fetch_add(1, Ordering::AcqRel);
+        self.topic_tree_cache.lock().take();
+    }
+
+    fn matching_topic_tree_cache(
+        &self,
+        root: &Path,
+        requested_input_cap: usize,
+        index_revision: u64,
+    ) -> Option<Arc<TopicTreeCache>> {
+        self.topic_tree_cache
+            .lock()
+            .as_ref()
+            .filter(|cached| cached.matches(root, requested_input_cap, index_revision))
+            .cloned()
+    }
+
+    async fn topic_tree_for(
+        self: &Arc<Self>,
+        root: PathBuf,
+        requested_input_cap: usize,
+    ) -> Result<Arc<TopicTreeCache>, String> {
+        loop {
+            let index_revision = self.semantic_index_revision.load(Ordering::Acquire);
+            if let Some(cached) =
+                self.matching_topic_tree_cache(&root, requested_input_cap, index_revision)
+            {
+                return Ok(cached);
+            }
+
+            let _build_guard = self.topic_tree_build_lock.lock().await;
+            let index_revision = self.semantic_index_revision.load(Ordering::Acquire);
+            if let Some(cached) =
+                self.matching_topic_tree_cache(&root, requested_input_cap, index_revision)
+            {
+                return Ok(cached);
+            }
+
+            let index_arc = self.index.lock().clone();
+            let build_root = root.clone();
+            let built = tokio::task::spawn_blocking(move || {
+                // Release the database mutex before Ward starts. The bulk read
+                // is the only part that needs the live semantic index.
+                let all = {
+                    let guard = index_arc
+                        .lock()
+                        .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+                    let index = guard.as_ref().ok_or_else(|| {
+                        "Semantic index unavailable. Build or restore the semantic index first."
+                            .to_string()
+                    })?;
+                    index
+                        .topic_chunks_for_root(&build_root)
+                        .map_err(|error| format!("Could not load indexed chunks: {error:#}"))?
+                };
+
+                let total_chunk_count = all.len();
+                let input_cap = requested_input_cap.min(total_chunk_count);
+                let total_document_count = all
+                    .iter()
+                    .map(|chunk| chunk.file_id)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                let mut sampled = cap_topic_chunks(all, input_cap);
+                let sampled_document_count = sampled
+                    .iter()
+                    .map(|chunk| chunk.file_id)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+
+                // The cached corpus needs passage metadata, not another copy
+                // of every vector. Move embeddings into the one-time builder
+                // and retain only the Ward tree's similarity matrix afterward.
+                let vectors: Vec<Vec<f32>> = sampled
+                    .iter_mut()
+                    .map(|chunk| std::mem::take(&mut chunk.embedding))
+                    .collect();
+                let tree = WardTree::build(&vectors)
+                    .map_err(|error| format!("Could not cluster indexed chunks: {error:#}"))?;
+
+                Ok::<_, String>(Arc::new(TopicTreeCache {
+                    root: build_root,
+                    requested_input_cap,
+                    index_revision,
+                    tree,
+                    sampled,
+                    total_chunk_count,
+                    total_document_count,
+                    sampled_document_count,
+                    input_cap,
+                }))
+            })
+            .await
+            .map_err(|error| format!("Chunk topic task panicked: {error}"))??;
+
+            let mut cache = self.topic_tree_cache.lock();
+            if self.semantic_index_revision.load(Ordering::Acquire) == index_revision {
+                *cache = Some(Arc::clone(&built));
+                return Ok(built);
+            }
+            // The index changed while Ward was building. Discard the stale
+            // tree and retry against the new revision before serving results.
+        }
+    }
+
+    pub async fn chunk_topics(
+        self: Arc<Self>,
+        query: ChunkTopicsQuery,
+    ) -> Result<ChunkTopicsResult, String> {
+        self.ensure_no_active_embed_task(
+            "Semantic index is currently being built. Please wait before finding topics.",
+        )?;
+        if query.root.as_os_str().is_empty() {
+            return Err("Choose a library root before finding topics.".to_string());
+        }
+
+        let requested_input_cap = self
+            .get_settings()
+            .await
+            .semantic
+            .topic_cloud_input_cap
+            .max(3);
+        let granularity = query.granularity;
+        let root = query.root;
+        let cached = self.topic_tree_for(root, requested_input_cap).await?;
+        let cached_for_cut = Arc::clone(&cached);
+        let mut result = tokio::task::spawn_blocking(move || {
+            let clustered = cached_for_cut
+                .tree
+                .cut(granularity)
+                .map_err(|error| format!("Could not cut chunk topic tree: {error:#}"))?;
+            let topics = clustered
+                .clusters
+                .into_iter()
+                .map(|cluster| {
+                    let chunks: Vec<ChunkTopicMember> = cluster
+                        .item_indices
+                        .iter()
+                        .map(|index| topic_member(&cached_for_cut.sampled[*index]))
+                        .collect();
+                    let distinct_document_count = chunks
+                        .iter()
+                        .map(|chunk| &chunk.file_path)
+                        .collect::<std::collections::HashSet<_>>()
+                        .len();
+                    ChunkTopic {
+                        cluster_key: chunk_cluster_key(chunks.iter().map(|chunk| chunk.chunk_id)),
+                        chunk_count: chunks.len(),
+                        distinct_document_count,
+                        chunks,
+                        representative_chunk_id: cached_for_cut.sampled
+                            [cluster.representative_index]
+                            .chunk_id,
+                        cohesion: cluster.cohesion,
+                        label: None,
+                    }
+                })
+                .collect();
+            Ok::<_, String>(ChunkTopicsResult {
+                topics,
+                total_chunk_count: cached_for_cut.total_chunk_count,
+                sampled_chunk_count: cached_for_cut.sampled.len(),
+                total_document_count: cached_for_cut.total_document_count,
+                sampled_document_count: cached_for_cut.sampled_document_count,
+                input_cap: cached_for_cut.input_cap,
+            })
+        })
+        .await
+        .map_err(|e| format!("Chunk topic task panicked: {e}"))??;
+
+        self.attach_chunk_topic_labels(&mut result.topics, &cached.sampled)
+            .await;
+        Ok(result)
+    }
+
+    /// Fill cached topic labels immediately and generate only the misses in the
+    /// background. Late labels are patched by the membership-derived key.
+    async fn attach_chunk_topic_labels(
+        self: &Arc<Self>,
+        topics: &mut [ChunkTopic],
+        sampled: &[TopicChunkData],
+    ) {
+        if let Some(previous) = self.topic_label_task.lock().take() {
+            previous.abort();
+        }
+        if topics.is_empty() {
+            return;
+        }
+        let Some(generator) = self.generator.lock().clone() else {
+            return;
+        };
+        let settings = self.generation_settings().await;
+        if !settings.enabled {
+            return;
+        }
+        let model_id = generator.model_id().to_string();
+        let keys: Vec<String> = topics
+            .iter()
+            .map(|topic| topic.cluster_key.clone())
+            .collect();
+        let cached = match self.research_store() {
+            Ok(store) => store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .cached_chunk_cluster_labels(&keys, &model_id, CHUNK_CLUSTER_LABEL_RECIPE_VERSION),
+            Err(error) => Err(error),
+        };
+        let cached = match cached {
+            Ok(cached) => cached,
+            Err(error) => {
+                error!("Could not read cached chunk-cluster labels: {error:#}");
+                return;
+            }
+        };
+
+        let text_by_id: std::collections::HashMap<i64, &str> = sampled
+            .iter()
+            .map(|chunk| (chunk.chunk_id, chunk.chunk_text.as_str()))
+            .collect();
+        let mut pending = Vec::new();
+        for topic in topics.iter_mut() {
+            let members = chunk_label_inputs(topic, &text_by_id);
+            if let Some(label) = cached.get(&topic.cluster_key) {
+                let refs: Vec<&str> = members.iter().map(String::as_str).collect();
+                if validate_cluster_label(label, &refs).is_ok() {
+                    topic.label = Some(label.clone());
+                    continue;
+                }
+                warn!(
+                    "Ignoring invalid cached chunk-topic label for {}",
+                    topic.cluster_key
+                );
+            }
+            pending.push((topic.cluster_key.clone(), members));
+        }
+        if pending.is_empty() {
+            return;
+        }
+        let ctx = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            for (key, members) in pending {
+                let generator = Arc::clone(&generator);
+                let generated = tokio::task::spawn_blocking(move || {
+                    let refs: Vec<&str> = members.iter().map(String::as_str).collect();
+                    cluster_label(generator.as_ref(), &refs)
+                })
+                .await;
+                let label = match generated {
+                    Ok(Ok(label)) => label,
+                    Ok(Err(error)) => {
+                        warn!("Could not label chunk topic {key}: {error:#}");
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!("Chunk-topic label task failed for {key}: {error}");
+                        continue;
+                    }
+                };
+                if let Ok(store) = ctx.research_store() {
+                    if let Err(error) = store
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .upsert_chunk_cluster_label(
+                            &key,
+                            &label,
+                            &model_id,
+                            CHUNK_CLUSTER_LABEL_RECIPE_VERSION,
+                        )
+                    {
+                        error!("Could not cache chunk-topic label: {error:#}");
+                    }
+                }
+                ctx.events.emit(
+                    "chunk-topic-labelled",
+                    serde_json::json!({ "cluster_key": key, "label": label }),
+                );
+            }
+        });
+        *self.topic_label_task.lock() = Some(task);
     }
 
     pub async fn list_files(
@@ -1560,6 +1891,10 @@ impl AppContext {
         if !has_index {
             return;
         }
+        // Invalidate before the updater can mutate rows. A concurrently
+        // finishing tree build will observe the revision change and discard
+        // its stale result instead of installing it.
+        self.invalidate_topic_tree_cache();
         if let Ok(mut guard) = index_arc.lock() {
             if let Some(idx) = guard.as_mut() {
                 if let Err(e) = idx.activate_root(&batch.root) {
@@ -1750,6 +2085,7 @@ impl AppContext {
     /// resident embedder + index so filesystem changes no longer reindex. The
     /// on-disk DB is preserved so re-enabling is cheap.
     fn deactivate_semantic(&self) {
+        self.invalidate_topic_tree_cache();
         *self.index.lock() = Arc::new(Mutex::new(None));
         *self.embedder.lock() = None;
     }
@@ -2957,6 +3293,7 @@ impl AppContext {
         let actual_dim = index.status().dimension;
         let index_arc = Arc::new(Mutex::new(Some(index)));
 
+        self.invalidate_topic_tree_cache();
         *self.embedder.lock() = Some(Arc::clone(&embedder));
         *self.index.lock() = Arc::clone(&index_arc);
 
@@ -3240,10 +3577,14 @@ impl AppContext {
         if let Some(task) = self.cluster_label_task.lock().take() {
             task.abort();
         }
+        if let Some(task) = self.topic_label_task.lock().take() {
+            task.abort();
+        }
         self.kill_all_workers();
     }
 
     pub async fn delete_index(&self, root: Option<PathBuf>) -> anyhow::Result<()> {
+        self.invalidate_topic_tree_cache();
         if let Some(root) = root {
             crate::commands::embed::delete_index(&self.data_dir, Some(root.clone())).await?;
             let index_arc = self.index.lock().clone();
@@ -3512,6 +3853,7 @@ impl AppContext {
         embedder: Arc<dyn Embedder>,
         index: SemanticIndex,
     ) -> Arc<Mutex<Option<SemanticIndex>>> {
+        self.invalidate_topic_tree_cache();
         *self.embedder.lock() = Some(Arc::clone(&embedder));
         let index_arc = Arc::new(Mutex::new(Some(index)));
         *self.index.lock() = Arc::clone(&index_arc);
@@ -3594,6 +3936,110 @@ fn cluster_key(members: &[(String, String)]) -> String {
     hasher.update(b"v1\n");
     hasher.update(parts.join("\n").as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Distribute a hard chunk budget across documents before Ward sees the input.
+///
+/// The round-robin quota makes every document contribute one chunk whenever
+/// that is mathematically possible, then fills short documents completely
+/// before repeatedly increasing larger ones. Within each document, evenly
+/// spaced windows avoid turning the cap into a "document beginnings" sampler.
+fn cap_topic_chunks(chunks: Vec<TopicChunkData>, cap: usize) -> Vec<TopicChunkData> {
+    if cap == 0 {
+        return Vec::new();
+    }
+    if chunks.len() <= cap {
+        return chunks;
+    }
+    let mut by_file: std::collections::BTreeMap<i64, Vec<TopicChunkData>> =
+        std::collections::BTreeMap::new();
+    for chunk in chunks {
+        by_file.entry(chunk.file_id).or_default().push(chunk);
+    }
+    let groups: Vec<Vec<TopicChunkData>> = by_file.into_values().collect();
+
+    // More documents than slots is the only case where "every document"
+    // cannot coexist with a hard ceiling. Choose documents evenly across the
+    // stable file ordering rather than silently preferring the first paths.
+    if groups.len() > cap {
+        return (0..cap)
+            .map(|slot| {
+                let group_index = slot.saturating_mul(groups.len()) / cap;
+                let group = &groups[group_index];
+                group[group.len() / 2].clone()
+            })
+            .collect();
+    }
+
+    let mut quotas = vec![1usize; groups.len()];
+    let mut assigned = groups.len();
+    while assigned < cap {
+        let mut progressed = false;
+        for (quota, group) in quotas.iter_mut().zip(&groups) {
+            if assigned == cap {
+                break;
+            }
+            if *quota < group.len() {
+                *quota += 1;
+                assigned += 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    let mut sampled = Vec::with_capacity(assigned);
+    for (group, quota) in groups.into_iter().zip(quotas) {
+        for slot in 0..quota {
+            // Midpoints of `quota` equal-width ranges, characteristically
+            // selecting first/middle/last coverage as the quota grows.
+            let index = ((slot.saturating_mul(2) + 1).saturating_mul(group.len()))
+                / quota.saturating_mul(2);
+            sampled.push(group[index.min(group.len() - 1)].clone());
+        }
+    }
+    sampled
+}
+
+fn topic_member(chunk: &TopicChunkData) -> ChunkTopicMember {
+    ChunkTopicMember {
+        chunk_id: chunk.chunk_id,
+        file_path: chunk.file_path.clone(),
+        chunk_text: chunk.chunk_text.clone(),
+        extraction_byte_range: chunk.extraction_byte_range.clone(),
+        origin: chunk.origin.clone(),
+    }
+}
+
+fn chunk_cluster_key(chunk_ids: impl IntoIterator<Item = i64>) -> String {
+    let mut ids: Vec<i64> = chunk_ids.into_iter().collect();
+    ids.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(b"chunk-cluster-v1\n");
+    for id in ids {
+        hasher.update(id.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn chunk_label_inputs(
+    topic: &ChunkTopic,
+    text_by_id: &std::collections::HashMap<i64, &str>,
+) -> Vec<String> {
+    let mut remaining: Vec<i64> = topic
+        .chunks
+        .iter()
+        .map(|chunk| chunk.chunk_id)
+        .filter(|id| *id != topic.representative_chunk_id)
+        .collect();
+    remaining.sort_unstable();
+    std::iter::once(topic.representative_chunk_id)
+        .chain(remaining)
+        .filter_map(|id| text_by_id.get(&id).map(|text| (*text).to_string()))
+        .take(wilkes_core::generate::tasks::cluster_label::MAX_MEMBERS)
+        .collect()
 }
 
 /// Prompt input for one cluster: the representative first, then the remaining
@@ -3800,6 +4246,178 @@ mod tests {
         BookmarkDock, ByteRange, EmbedderModel, IndexStatus, SearchMode, SelectedEmbedder,
         SemanticSettings, Settings, SourceOrigin, Theme,
     };
+
+    fn topic_chunk(file_id: i64, chunk_id: i64) -> TopicChunkData {
+        TopicChunkData {
+            chunk_id,
+            file_id,
+            file_path: PathBuf::from(format!("/library/{file_id}.txt")),
+            chunk_text: format!("chunk {chunk_id}"),
+            extraction_byte_range: ByteRange {
+                start: chunk_id as usize,
+                end: chunk_id as usize + 1,
+            },
+            origin: SourceOrigin::TextFile { line: 1, col: 1 },
+            embedding: vec![chunk_id as f32, 1.0],
+        }
+    }
+
+    #[test]
+    fn topic_cap_is_hard_and_distributed_per_document() {
+        let chunks = vec![
+            topic_chunk(1, 1),
+            topic_chunk(2, 2),
+            topic_chunk(2, 3),
+            topic_chunk(2, 4),
+            topic_chunk(3, 5),
+            topic_chunk(3, 6),
+            topic_chunk(3, 7),
+            topic_chunk(3, 8),
+            topic_chunk(3, 9),
+            topic_chunk(3, 10),
+        ];
+        let sampled = cap_topic_chunks(chunks, 6);
+        assert_eq!(sampled.len(), 6);
+        let counts = sampled.iter().fold(
+            std::collections::BTreeMap::<i64, usize>::new(),
+            |mut counts, chunk| {
+                *counts.entry(chunk.file_id).or_default() += 1;
+                counts
+            },
+        );
+        assert_eq!(counts, [(1, 1), (2, 3), (3, 2)].into_iter().collect());
+        assert_eq!(
+            sampled
+                .iter()
+                .filter(|chunk| chunk.file_id == 3)
+                .map(|chunk| chunk.chunk_id)
+                .collect::<Vec<_>>(),
+            vec![6, 9],
+            "within-document sampling should cover the passage range"
+        );
+    }
+
+    #[test]
+    fn topic_cap_samples_documents_evenly_when_documents_exceed_budget() {
+        let chunks = (0..10)
+            .map(|index| topic_chunk(index, index))
+            .collect::<Vec<_>>();
+        let sampled = cap_topic_chunks(chunks, 3);
+        assert_eq!(sampled.len(), 3);
+        assert_eq!(
+            sampled
+                .iter()
+                .map(|chunk| chunk.file_id)
+                .collect::<Vec<_>>(),
+            vec![0, 3, 6]
+        );
+    }
+
+    #[test]
+    fn topic_cap_allows_the_complete_data_set() {
+        let chunks = (0..10)
+            .map(|index| topic_chunk(index, index))
+            .collect::<Vec<_>>();
+        let sampled = cap_topic_chunks(chunks, usize::MAX);
+        assert_eq!(sampled.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn topic_granularity_recuts_one_cached_tree_and_cap_rebuilds_it() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("topic-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut index = SemanticIndex::create(
+            dir.path(),
+            "topic-cache-model",
+            2,
+            EmbeddingEngine::Candle,
+            Some(&root),
+        )
+        .unwrap();
+        let vectors = [
+            [1.0, 0.0],
+            [0.99, 0.01],
+            [0.0, 1.0],
+            [0.01, 0.99],
+            [-1.0, 0.0],
+            [-0.99, 0.01],
+        ];
+        for (index_number, vector) in vectors.into_iter().enumerate() {
+            let path = root.join(format!("{index_number}.txt"));
+            let text = format!("topic passage {index_number}");
+            std::fs::write(&path, &text).unwrap();
+            index
+                .write_file(wilkes_core::embed::index::db::PreparedFile {
+                    path: path.clone(),
+                    chunks: vec![(
+                        wilkes_core::embed::index::chunk::Chunk {
+                            file_path: path,
+                            text: text.clone(),
+                            byte_range: ByteRange {
+                                start: 0,
+                                end: text.len(),
+                            },
+                            origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                        },
+                        vector.to_vec(),
+                    )],
+                })
+                .unwrap();
+        }
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
+
+        let fewer = Arc::clone(&ctx)
+            .chunk_topics(ChunkTopicsQuery {
+                root: root.clone(),
+                granularity: wilkes_core::types::BookmarkClusterGranularity::MuchFewer,
+            })
+            .await
+            .unwrap();
+        let first_tree = ctx.topic_tree_cache.lock().as_ref().unwrap().clone();
+        assert!(first_tree
+            .sampled
+            .iter()
+            .all(|chunk| chunk.embedding.is_empty()));
+
+        let more = Arc::clone(&ctx)
+            .chunk_topics(ChunkTopicsQuery {
+                root: root.clone(),
+                granularity: wilkes_core::types::BookmarkClusterGranularity::MuchMore,
+            })
+            .await
+            .unwrap();
+        let recut_tree = ctx.topic_tree_cache.lock().as_ref().unwrap().clone();
+        assert!(Arc::ptr_eq(&first_tree, &recut_tree));
+        assert_ne!(fewer.topics.len(), more.topics.len());
+
+        ctx.update_semantic_settings(|settings| SemanticSettings {
+            topic_cloud_input_cap: 3,
+            ..settings
+        })
+        .await;
+        let capped = Arc::clone(&ctx)
+            .chunk_topics(ChunkTopicsQuery {
+                root,
+                granularity: wilkes_core::types::BookmarkClusterGranularity::Balanced,
+            })
+            .await
+            .unwrap();
+        let rebuilt_tree = ctx.topic_tree_cache.lock().as_ref().unwrap().clone();
+        assert!(!Arc::ptr_eq(&first_tree, &rebuilt_tree));
+        assert_eq!(capped.sampled_chunk_count, 3);
+
+        let revision = ctx.semantic_index_revision.load(Ordering::Acquire);
+        ctx.deactivate_semantic();
+        assert!(ctx.topic_tree_cache.lock().is_none());
+        assert!(ctx.semantic_index_revision.load(Ordering::Acquire) > revision);
+    }
+
+    #[test]
+    fn chunk_cluster_identity_depends_only_on_the_member_set() {
+        assert_eq!(chunk_cluster_key([3, 1, 2]), chunk_cluster_key([2, 3, 1]));
+        assert_ne!(chunk_cluster_key([1, 2]), chunk_cluster_key([1, 3]));
+    }
 
     #[test]
     fn library_roots_are_canonical_deduplicated_and_collapse_nested_paths() {

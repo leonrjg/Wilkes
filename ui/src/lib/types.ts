@@ -173,6 +173,38 @@ export interface BookmarkClustersResult {
   unclustered_bookmark_ids: string[];
 }
 
+export interface ChunkTopicsQuery {
+  root: string;
+  granularity?: BookmarkClusterGranularity;
+}
+
+export interface ChunkTopicMember {
+  chunk_id: number;
+  file_path: string;
+  chunk_text: string;
+  extraction_byte_range: ByteRange;
+  origin: SourceOrigin;
+}
+
+export interface ChunkTopic {
+  cluster_key: string;
+  chunks: ChunkTopicMember[];
+  representative_chunk_id: number;
+  chunk_count: number;
+  distinct_document_count: number;
+  cohesion: number;
+  label?: string | null;
+}
+
+export interface ChunkTopicsResult {
+  topics: ChunkTopic[];
+  total_chunk_count: number;
+  sampled_chunk_count: number;
+  total_document_count: number;
+  sampled_document_count: number;
+  input_cap: number;
+}
+
 export interface NewBookmark {
   path: string;
   origin: SourceOrigin;
@@ -396,6 +428,7 @@ export interface SemanticSettings {
   custom_models: CustomModel[];
   chunk_size: number;
   chunk_overlap: number;
+  topic_cloud_input_cap: number;
   worker_timeout_secs: number;
 }
 
@@ -461,6 +494,11 @@ export interface GeneratorDescriptor {
 
 /** Emitted per cluster as its label finishes generating. */
 export interface BookmarkClusterLabelled {
+  cluster_key: string;
+  label: string;
+}
+
+export interface ChunkTopicLabelled {
   cluster_key: string;
   label: string;
 }

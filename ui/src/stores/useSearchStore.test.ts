@@ -21,6 +21,7 @@ describe("useSearchStore", () => {
       hasQuery: false,
       currentSearchId: null,
       lastQuery: null,
+      resultContext: null,
     });
   });
 
@@ -33,6 +34,50 @@ describe("useSearchStore", () => {
   it("sets query presence", () => {
     useSearchStore.getState().setHasQuery(true);
     expect(useSearchStore.getState().hasQuery).toBe(true);
+  });
+
+  it("shows a scoped chunk result set through the regular result contract", async () => {
+    const results: FileMatches[] = [
+      {
+        path: "/root/paper.pdf",
+        file_type: "Pdf",
+        matches: [
+          {
+            text_range: null,
+            matched_text: "topic passage",
+            context_before: "",
+            context_after: "",
+            origin: { PdfPage: { page: 2, bbox: null } },
+          },
+        ],
+      },
+    ];
+
+    await useSearchStore.getState().showResultSet(results, {
+      kind: "topic",
+      topicKey: "topic-a",
+      subject: "Graph indexes",
+    });
+
+    expect(useSearchStore.getState()).toEqual(
+      expect.objectContaining({
+        results,
+        hasQuery: true,
+        searching: false,
+        lastQuery: null,
+        resultContext: {
+          kind: "topic",
+          topicKey: "topic-a",
+          subject: "Graph indexes",
+        },
+        stats: {
+          files_scanned: 1,
+          total_matches: 1,
+          elapsed_ms: 0,
+          errors: [],
+        },
+      }),
+    );
   });
 
   it("performs a search and updates results", async () => {
@@ -74,6 +119,7 @@ describe("useSearchStore", () => {
         stats,
         searching: false,
         lastQuery: query,
+        resultContext: { kind: "search", subject: "test" },
       }),
     );
   });
@@ -183,16 +229,46 @@ describe("useSearchStore", () => {
     expect(useSearchStore.getState().results).toEqual([]);
   });
 
-  it("clears only search results", () => {
+  it("clears the displayed result set and its query state", () => {
     useSearchStore.setState({
       results: [{ path: "/f.ts", file_type: "PlainText", matches: [] }],
       stats: { files_scanned: 1, total_matches: 1, elapsed_ms: 10, errors: [] },
+      hasQuery: true,
+      lastQuery: { pattern: "test" } as SearchQuery,
+      resultContext: { kind: "search", subject: "test" },
     });
 
     useSearchStore.getState().clearResults();
 
     expect(useSearchStore.getState().results).toEqual([]);
     expect(useSearchStore.getState().stats).toBeNull();
+    expect(useSearchStore.getState().hasQuery).toBe(false);
+    expect(useSearchStore.getState().lastQuery).toBeNull();
+    expect(useSearchStore.getState().resultContext).toBeNull();
+  });
+
+  it("updates only the matching displayed topic subject", () => {
+    useSearchStore.setState({
+      resultContext: { kind: "topic", topicKey: "topic-a", subject: null },
+    });
+
+    useSearchStore
+      .getState()
+      .updateTopicResultSubject("topic-b", "Unrelated topic");
+    expect(useSearchStore.getState().resultContext).toEqual({
+      kind: "topic",
+      topicKey: "topic-a",
+      subject: null,
+    });
+
+    useSearchStore
+      .getState()
+      .updateTopicResultSubject("topic-a", "Graph indexes");
+    expect(useSearchStore.getState().resultContext).toEqual({
+      kind: "topic",
+      topicKey: "topic-a",
+      subject: "Graph indexes",
+    });
   });
 
   it("handles search cancellation errors", async () => {

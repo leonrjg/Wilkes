@@ -6,6 +6,8 @@ import type {
   Bookmark,
   BookmarkClustersQuery,
   BookmarkClustersResult,
+  ChunkTopicsQuery,
+  ChunkTopicsResult,
   FileListChanged,
   FileListResponse,
   FileMatches,
@@ -40,6 +42,7 @@ import type {
   CollectionValidation,
   SearchLogEntry,
   BookmarkClusterLabelled,
+  ChunkTopicLabelled,
   GeneratorDescriptor,
   GenerationStreamEvent,
 } from "../lib/types";
@@ -150,6 +153,16 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw new Error(`clusterBookmarks failed: ${res.status}`);
     return res.json() as Promise<BookmarkClustersResult>;
+  }
+
+  async chunkTopics(query: ChunkTopicsQuery): Promise<ChunkTopicsResult> {
+    const res = await fetch("/api/topics/chunks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(query),
+    });
+    if (!res.ok) throw new Error(`chunkTopics failed: ${res.status}`);
+    return res.json() as Promise<ChunkTopicsResult>;
   }
 
   async preview(matchRef: MatchRef): Promise<PreviewData> {
@@ -653,6 +666,15 @@ export class HttpSearchApi implements SearchApi {
     const listener = (e: any) => handler(JSON.parse(e.data));
     es.addEventListener("bookmark-cluster-labelled", listener);
     return () => this.releaseEventSource("bookmark-cluster-labelled", listener);
+  }
+
+  async onChunkTopicLabelled(
+    handler: (event: ChunkTopicLabelled) => void,
+  ): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = (event: MessageEvent) => handler(JSON.parse(event.data));
+    es.addEventListener("chunk-topic-labelled", listener);
+    return () => this.releaseEventSource("chunk-topic-labelled", listener);
   }
 
   async onGenerationStream(

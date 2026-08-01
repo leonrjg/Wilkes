@@ -1,11 +1,12 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { Bookmark, MessageSquare, Settings as SettingsIcon, ChevronDown, Loader } from "react-feather";
+import { Bookmark, Cloud, MessageSquare, Settings as SettingsIcon, ChevronDown, Loader } from "react-feather";
 import SearchBar from "./components/SearchBar";
 import ResultList from "./components/ResultList";
 import PreviewPane from "./components/PreviewPane";
 import BookmarksPane from "./components/BookmarksPane";
 import ChatPane from "./components/ChatPane";
+import TopicCloudPane from "./components/TopicCloudPane";
 import DirectoryPicker from "./components/DirectoryPicker";
 import UploadZone from "./components/UploadZone";
 import SettingsModal from "./components/SettingsModal";
@@ -16,6 +17,7 @@ import { useSettingsStore } from "./stores/useSettingsStore";
 import { useBookmarksStore } from "./stores/useBookmarksStore";
 import { useChatStore } from "./stores/useChatStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
+import { useTopicsStore } from "./stores/useTopicsStore";
 import { activeViewerTab, useViewerStore } from "./stores/useViewerStore";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
 import { api, source, isTauri } from "./services";
@@ -45,6 +47,11 @@ export default function App() {
   const setIndexing = useSettingsStore((s) => s.setIndexing);
   const refreshSemanticReady = useSemanticStore((s) => s.refreshCurrentRootStatus);
   const handleIndexUpdated = useSemanticStore((s) => s.handleIndexUpdated);
+  const semanticReadyForRoot = useSemanticStore((s) => s.readyForCurrentRoot);
+  const preferSemantic = useSettingsStore((s) => s.preferSemantic);
+  const topicsPaneOpen = useTopicsStore((s) => s.paneOpen);
+  const openTopicsPane = useTopicsStore((s) => s.openPane);
+  const closeTopicsPane = useTopicsStore((s) => s.closePane);
 
   const chatPaneOpen = useChatStore((s) => s.paneOpen);
   const chatPaneOpening = useChatStore((s) => s.paneOpening);
@@ -61,6 +68,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(320);
   const [bookmarksWidth, setBookmarksWidth] = useState(320);
+  const [topicsWidth, setTopicsWidth] = useState(340);
   const [chatWidth, setChatWidth] = useState(320);
   const [fileFilterText, setFileFilterText] = useState("");
   const resizeRef = useRef<{
@@ -344,6 +352,31 @@ export default function App() {
           <Bookmark size={14} fill={bookmarksPaneOpen ? "currentColor" : "none"} />
         </button>
       </Tooltip>
+      <Tooltip
+        content={
+          preferSemantic && semanticReadyForRoot
+            ? "Chunk topic cloud"
+            : "Build the semantic index to view the topic cloud"
+        }
+      >
+        <button
+          type="button"
+          disabled={!directory || !preferSemantic || !semanticReadyForRoot}
+          onClick={() => {
+            if (topicsPaneOpen) closeTopicsPane();
+            else openTopicsPane();
+          }}
+          aria-label="Chunk topic cloud"
+          aria-pressed={topicsPaneOpen}
+          className={`flex h-[32px] w-[32px] items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] transition-all disabled:opacity-40 ${
+            topicsPaneOpen
+              ? "text-[var(--accent-blue)] shadow-inner"
+              : "text-[var(--text-muted)] hover:border-[var(--border-strong)] hover:text-[var(--text-main)]"
+          }`}
+        >
+          <Cloud size={14} fill={topicsPaneOpen ? "currentColor" : "none"} />
+        </button>
+      </Tooltip>
       <Tooltip content="Settings">
         <button
           onClick={() => setSettingsOpen(true)}
@@ -400,6 +433,41 @@ export default function App() {
     </>
   ) : null;
 
+  const topicsColumn = topicsPaneOpen ? (
+    <>
+      {bookmarksDock === "Right" && (
+        <div
+          onMouseDown={startResize({
+            width: topicsWidth,
+            setWidth: setTopicsWidth,
+            direction: -1,
+            minWidth: 260,
+            maxWidth: window.innerWidth * 0.55,
+          })}
+          className="w-1 cursor-col-resize flex-shrink-0 border-l border-[var(--border-main)] bg-transparent transition-colors hover:bg-[var(--accent-blue)]/30"
+        />
+      )}
+      <div
+        className="flex-shrink-0 overflow-hidden"
+        style={{ width: `${topicsWidth}px`, minWidth: "260px" }}
+      >
+        <TopicCloudPane />
+      </div>
+      {bookmarksDock === "Left" && (
+        <div
+          onMouseDown={startResize({
+            width: topicsWidth,
+            setWidth: setTopicsWidth,
+            direction: 1,
+            minWidth: 260,
+            maxWidth: window.innerWidth * 0.55,
+          })}
+          className="w-1 cursor-col-resize flex-shrink-0 border-r border-[var(--border-main)] bg-transparent transition-colors hover:bg-[var(--accent-blue)]/30"
+        />
+      )}
+    </>
+  ) : null;
+
   // Chat is right-dock-only for v1 (bookmarks already covers left, spec §7.1).
   const chatColumn = isTauri && chatPaneOpen ? (
     <>
@@ -451,12 +519,14 @@ export default function App() {
         />
 
         {bookmarksDock === "Left" && bookmarksColumn}
+        {bookmarksDock === "Left" && topicsColumn}
 
         <div className="flex-1 min-h-0 min-w-0 overflow-hidden bg-[var(--bg-app)]">
           <PreviewPane />
         </div>
 
         {bookmarksDock === "Right" && bookmarksColumn}
+        {bookmarksDock === "Right" && topicsColumn}
         {chatColumn}
       </div>
     </div>

@@ -28,11 +28,11 @@ use tracing::info;
 use wilkes_api::context::AppContext;
 use wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryInput;
 use wilkes_core::types::{
-    AddOutcome, BookmarkClustersQuery, CitationLinksQuery, CitationResult, CollectionValidation,
-    DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, IntegrationStatus, MatchRef,
-    ModelDescriptor, NewBookmark, NewSmartCollection, NewTag, OpenAlexWork, RelatedDocumentsQuery,
-    SearchLogEntry, SearchQuery, SelectedEmbedder, SemanticScholarPaper, SmartCollection, Tag,
-    UpdateSmartCollection, UpdateTag,
+    AddOutcome, BookmarkClustersQuery, ChunkTopicsQuery, CitationLinksQuery, CitationResult,
+    CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, IntegrationStatus,
+    MatchRef, ModelDescriptor, NewBookmark, NewSmartCollection, NewTag, OpenAlexWork,
+    RelatedDocumentsQuery, SearchLogEntry, SearchQuery, SelectedEmbedder, SemanticScholarPaper,
+    SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::worker::manager::WorkerPaths;
 
@@ -234,6 +234,25 @@ async fn cluster_bookmarks_handler(
         .await
         .map_err(server_err)?;
     Ok(Json(clusters))
+}
+
+async fn chunk_topics_handler(
+    State(state): State<Arc<AppState>>,
+    Json(mut query): Json<ChunkTopicsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    query.root = crate::http::state::confined_root_for_search(
+        &query.root.to_string_lossy(),
+        &state.uploads_dir,
+        &TokioServerFs,
+    )
+    .await?;
+    let topics = state
+        .ctx
+        .clone()
+        .chunk_topics(query)
+        .await
+        .map_err(server_err)?;
+    Ok(Json(topics))
 }
 
 async fn remove_bookmark_handler(
@@ -1188,6 +1207,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/bookmarks", get(list_bookmarks_handler))
         .route("/api/bookmarks", post(add_bookmark_handler))
         .route("/api/bookmarks/clusters", post(cluster_bookmarks_handler))
+        .route("/api/topics/chunks", post(chunk_topics_handler))
         .route("/api/bookmarks/:id", delete(remove_bookmark_handler))
         .route("/api/bookmarks/:id", patch(update_bookmark_note_handler))
         .route("/api/tags", get(list_tags_handler).post(create_tag_handler))

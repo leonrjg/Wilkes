@@ -72,6 +72,7 @@ interface SettingsStore {
   setIndexing: (indexing: boolean) => void;
   applySettingsPatch: (patch: Partial<Settings>) => void;
   setBookmarksDock: (dock: BookmarkDock) => void;
+  setTopicCloudInputCap: (cap: number) => void;
   setFileSortKey: (key: FileSortKey) => void;
   setFileSortDirection: (direction: FileSortDirection) => void;
   toggleFileDisplayField: (field: FileDisplayField) => void;
@@ -317,6 +318,20 @@ export const useSettingsStore = create<SettingsStore>()(
     setBookmarksDock: (dock) => {
       set({ bookmarksDock: dock });
       api.updateSettings({ bookmarks_dock: dock }).catch(console.error);
+    },
+
+    setTopicCloudInputCap: (cap) => {
+      const semantic = get().settings?.semantic;
+      if (!semantic) return;
+      const topic_cloud_input_cap = Math.max(3, Math.round(cap));
+      const nextSemantic = { ...semantic, topic_cloud_input_cap };
+      set((state) => ({
+        semantic: nextSemantic,
+        settings: state.settings
+          ? { ...state.settings, semantic: nextSemantic }
+          : state.settings,
+      }));
+      api.updateSettings({ semantic: nextSemantic }).catch(console.error);
     },
 
     setFileSortKey: (key) => {

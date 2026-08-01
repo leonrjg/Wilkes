@@ -17,6 +17,8 @@ describe("useSettingsStore", () => {
     useResearchStore.setState({ selectedCollectionId: null, selectedTagId: null, draftCollectionExpression: null });
     useSettingsStore.setState({
       favorites: [],
+      settings: null,
+      semantic: null,
       recentDirs: [],
       directory: "",
       respectGitignore: true,
@@ -37,6 +39,24 @@ describe("useSettingsStore", () => {
     const state = useSettingsStore.getState();
     expect(state.directory).toBe("");
     expect(state.favorites).toEqual([]);
+  });
+
+  it("does not impose a fixed maximum on the topic input cap", () => {
+    vi.mocked(api.updateSettings).mockResolvedValue(undefined);
+    useSettingsStore.setState({
+      settings: {
+        semantic: { topic_cloud_input_cap: 1500 },
+      } as any,
+    });
+
+    useSettingsStore.getState().setTopicCloudInputCap(12_345);
+
+    expect(
+      useSettingsStore.getState().settings?.semantic.topic_cloud_input_cap,
+    ).toBe(12_345);
+    expect(api.updateSettings).toHaveBeenCalledWith({
+      semantic: expect.objectContaining({ topic_cloud_input_cap: 12_345 }),
+    });
   });
 
   it("should load settings", async () => {

@@ -20,6 +20,7 @@ vi.mock("./services", () => ({
     onFileMetadataUpdated: vi.fn(() => Promise.resolve(() => {})),
     onFileListChanged: vi.fn(() => Promise.resolve(() => {})),
     onBookmarkClusterLabelled: vi.fn(() => Promise.resolve(() => {})),
+    onChunkTopicLabelled: vi.fn(() => Promise.resolve(() => {})),
     isGenerationReady: vi.fn(() => Promise.resolve(false)),
     getSettings: vi.fn(() => Promise.resolve({
       favorites: [],

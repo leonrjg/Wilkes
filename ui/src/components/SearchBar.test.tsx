@@ -109,6 +109,25 @@ describe("SearchBar", () => {
     expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
   });
 
+  it("keeps the clear button beside the query within a shrinkable ceiling", () => {
+    render(<SearchBar sourceSlot={<MockSourceSlot />} />);
+    const input = screen.getByPlaceholderText("Search…");
+    const longQuery = "detectable coding-agent traces ".repeat(100);
+
+    fireEvent.change(input, { target: { value: longQuery } });
+
+    const inputSizer = input.parentElement;
+    const searchField = inputSizer?.parentElement;
+    const clearButton = screen.getByRole("button", { name: "Clear search" });
+
+    expect(input).toHaveValue(longQuery);
+    expect(inputSizer).toHaveClass("min-w-0", "max-w-full", "flex-shrink", "overflow-hidden");
+    expect(inputSizer?.firstElementChild).toHaveClass("pr-1");
+    expect(searchField).toHaveClass("min-w-0", "flex-1");
+    expect(inputSizer?.nextElementSibling).toBe(clearButton);
+    expect(screen.getByRole("button", { name: "Search all directories" })).toBeInTheDocument();
+  });
+
   it("toggles regex option", () => {
     const searchMock = vi.fn();
     useSearchStore.setState({ search: searchMock });

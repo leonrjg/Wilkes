@@ -16,11 +16,11 @@ use wilkes_api::commands::chat::{
 use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_core::types::{
     AddOutcome, AgentBackend, Bookmark, BookmarkClustersQuery, BookmarkClustersResult,
-    CitationResult, CollectionValidation, DataPaths, DocumentMetadata, DocumentTagUpdate,
-    EmbeddingEngine, ExternalMcpSettings, FileListResponse, IndexStatus, IntegrationStatus,
-    ModelDescriptor, NewBookmark, NewSmartCollection, NewTag, OpenAlexWork, SearchLogEntry,
-    SelectedEmbedder, SemanticScholarPaper, Settings, SmartCollection, Tag, UpdateSmartCollection,
-    UpdateTag,
+    ChunkTopicsQuery, ChunkTopicsResult, CitationResult, CollectionValidation, DataPaths,
+    DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, ExternalMcpSettings, FileListResponse,
+    IndexStatus, IntegrationStatus, ModelDescriptor, NewBookmark, NewSmartCollection, NewTag,
+    OpenAlexWork, SearchLogEntry, SelectedEmbedder, SemanticScholarPaper, Settings,
+    SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::worker::manager::WorkerStatus;
 
@@ -189,6 +189,13 @@ async fn cluster_bookmarks_for_ctx(
     query: BookmarkClustersQuery,
 ) -> Result<BookmarkClustersResult, String> {
     ctx.cluster_bookmarks(query).await
+}
+
+async fn chunk_topics_for_ctx(
+    ctx: Arc<AppContext>,
+    query: ChunkTopicsQuery,
+) -> Result<ChunkTopicsResult, String> {
+    ctx.chunk_topics(query).await
 }
 
 async fn zotero_status_for_ctx(ctx: Arc<AppContext>) -> Result<IntegrationStatus, String> {
@@ -1805,6 +1812,14 @@ async fn cluster_bookmarks(
 }
 
 #[tauri::command]
+async fn chunk_topics(
+    query: ChunkTopicsQuery,
+    app: AppHandle,
+) -> Result<ChunkTopicsResult, String> {
+    chunk_topics_for_ctx(app_context(&app), query).await
+}
+
+#[tauri::command]
 async fn list_tags(app: AppHandle) -> Result<Vec<Tag>, String> {
     app_context(&app).list_tags().map_err(|e| e.to_string())
 }
@@ -2172,6 +2187,7 @@ pub fn run() {
             remove_bookmark,
             update_bookmark_note,
             cluster_bookmarks,
+            chunk_topics,
             list_tags,
             create_tag,
             update_tag,

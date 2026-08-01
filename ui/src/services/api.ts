@@ -6,6 +6,8 @@ import type {
   Bookmark,
   BookmarkClustersQuery,
   BookmarkClustersResult,
+  ChunkTopicsQuery,
+  ChunkTopicsResult,
   FileListResponse,
   FileListChanged,
   FileMatches,
@@ -41,6 +43,7 @@ import type {
   SearchResultsSummaryInput,
   ExternalMcpStatus,
   BookmarkClusterLabelled,
+  ChunkTopicLabelled,
   GeneratorDescriptor,
   GenerationStreamEvent,
 } from "../lib/types";
@@ -76,6 +79,7 @@ export interface SearchApi {
   removeBookmark(id: string): Promise<void>;
   updateBookmarkNote(id: string, note: string | null): Promise<Bookmark>;
   clusterBookmarks(query: BookmarkClustersQuery): Promise<BookmarkClustersResult>;
+  chunkTopics(query: ChunkTopicsQuery): Promise<ChunkTopicsResult>;
   listFiles(root: string, collectionId?: string | null, tagIds?: string[], collectionExpression?: string | null): Promise<FileListResponse>;
   listTags(): Promise<Tag[]>;
   createTag(tag: NewTag): Promise<Tag>;
@@ -164,6 +168,7 @@ export interface SearchApi {
   onBookmarkClusterLabelled(
     handler: (event: BookmarkClusterLabelled) => void,
   ): Promise<() => void>;
+  onChunkTopicLabelled(handler: (event: ChunkTopicLabelled) => void): Promise<() => void>;
   onGenerationStream(handler: (event: GenerationStreamEvent) => void): Promise<() => void>;
 
   onGenerationProgress(handler: (progress: EmbedProgress) => void): Promise<() => void>;

@@ -10,6 +10,8 @@ import type {
   Bookmark,
   BookmarkClustersQuery,
   BookmarkClustersResult,
+  ChunkTopicsQuery,
+  ChunkTopicsResult,
   FileListChanged,
   FileListResponse,
   FileMatches,
@@ -45,6 +47,7 @@ import type {
   SearchLogEntry,
   ExternalMcpStatus,
   BookmarkClusterLabelled,
+  ChunkTopicLabelled,
   GeneratorDescriptor,
   GenerationStreamEvent,
 } from "../lib/types";
@@ -144,6 +147,10 @@ export class TauriSearchApi implements SearchApi {
 
   async clusterBookmarks(query: BookmarkClustersQuery): Promise<BookmarkClustersResult> {
     return invoke<BookmarkClustersResult>("cluster_bookmarks", { query });
+  }
+
+  async chunkTopics(query: ChunkTopicsQuery): Promise<ChunkTopicsResult> {
+    return invoke<ChunkTopicsResult>("chunk_topics", { query });
   }
 
   async listFiles(root: string, collectionId?: string | null, tagIds: string[] = [], collectionExpression?: string | null): Promise<FileListResponse> {
@@ -347,6 +354,14 @@ export class TauriSearchApi implements SearchApi {
   ): Promise<() => void> {
     return listen<BookmarkClusterLabelled>("bookmark-cluster-labelled", (e) =>
       handler(e.payload),
+    );
+  }
+
+  async onChunkTopicLabelled(
+    handler: (event: ChunkTopicLabelled) => void,
+  ): Promise<() => void> {
+    return listen<ChunkTopicLabelled>("chunk-topic-labelled", (event) =>
+      handler(event.payload),
     );
   }
 

@@ -106,7 +106,7 @@ impl ResearchStore {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(
-            version <= 3,
+            version <= 4,
             "research database schema {version} is newer than this app supports"
         );
         self.conn.execute_batch(
@@ -155,6 +155,14 @@ impl ResearchStore {
                updated_at_ms INTEGER NOT NULL,
                PRIMARY KEY(cluster_key, model_id, recipe_version)
              );
+             CREATE TABLE IF NOT EXISTS chunk_cluster_labels (
+               cluster_key TEXT NOT NULL,
+               model_id TEXT NOT NULL,
+               recipe_version INTEGER NOT NULL,
+               label TEXT NOT NULL,
+               updated_at_ms INTEGER NOT NULL,
+               PRIMARY KEY(cluster_key, model_id, recipe_version)
+             );
              CREATE TABLE IF NOT EXISTS search_log (
                id TEXT PRIMARY KEY, query_json TEXT NOT NULL,
                collection_name TEXT, collection_revision INTEGER, initiated_by TEXT NOT NULL,
@@ -176,7 +184,11 @@ impl ResearchStore {
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(3, ?1)",
             [now_ms()],
         )?;
-        self.conn.pragma_update(None, "user_version", 3)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(4, ?1)",
+            [now_ms()],
+        )?;
+        self.conn.pragma_update(None, "user_version", 4)?;
         self.conn.execute(
             "UPDATE search_log SET status='cancelled', completed_at_ms=?1
              WHERE status='running'",
@@ -407,6 +419,61 @@ impl ResearchStore {
         self.conn.execute(
             "DELETE FROM bookmark_cluster_labels WHERE rowid NOT IN (
                SELECT rowid FROM bookmark_cluster_labels
+               ORDER BY updated_at_ms DESC LIMIT ?1
+             )",
+            [MAX_CLUSTER_LABEL_ROWS],
+        )?;
+        Ok(())
+    }
+
+    pub fn cached_chunk_cluster_labels(
+        &self,
+        keys: &[String],
+        model_id: &str,
+        recipe_version: i64,
+    ) -> anyhow::Result<HashMap<String, String>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", keys.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT cluster_key,label FROM chunk_cluster_labels
+             WHERE model_id=?1 AND recipe_version=?2 AND cluster_key IN ({placeholders})"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&model_id, &recipe_version];
+        for key in keys {
+            params.push(key);
+        }
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| row.map_err(anyhow::Error::from)).collect()
+    }
+
+    /// Chunk-cluster memberships are ephemeral across reindexing. As with
+    /// bookmark labels, a bounded newest-first cache is cheaper and safer than
+    /// trying to invalidate content-derived keys manually.
+    pub fn upsert_chunk_cluster_label(
+        &mut self,
+        key: &str,
+        label: &str,
+        model_id: &str,
+        recipe_version: i64,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO chunk_cluster_labels(
+               cluster_key,model_id,recipe_version,label,updated_at_ms
+             ) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(cluster_key,model_id,recipe_version)
+             DO UPDATE SET label=excluded.label, updated_at_ms=excluded.updated_at_ms",
+            params![key, model_id, recipe_version, label, now_ms()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM chunk_cluster_labels WHERE rowid NOT IN (
+               SELECT rowid FROM chunk_cluster_labels
                ORDER BY updated_at_ms DESC LIMIT ?1
              )",
             [MAX_CLUSTER_LABEL_ROWS],
@@ -1030,6 +1097,33 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use wilkes_core::types::SourceOrigin;
+
+    #[test]
+    fn chunk_cluster_label_cache_is_recipe_and_model_scoped() {
+        let dir = tempdir().unwrap();
+        let mut store =
+            ResearchStore::open(dir.path(), &dir.path().join("bookmarks.json")).unwrap();
+        store
+            .upsert_chunk_cluster_label("members-a", "Graph Databases", "model-a", 1)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .cached_chunk_cluster_labels(&["members-a".into()], "model-a", 1)
+                .unwrap()
+                .get("members-a")
+                .map(String::as_str),
+            Some("Graph Databases")
+        );
+        assert!(store
+            .cached_chunk_cluster_labels(&["members-a".into()], "model-b", 1)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .cached_chunk_cluster_labels(&["members-a".into()], "model-a", 2)
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn tags_and_collection_membership_round_trip() {

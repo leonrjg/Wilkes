@@ -727,19 +727,25 @@ mod tests {
     }
 
     #[test]
-    fn label_grammar_accepts_two_to_six_words() {
+    fn label_grammar_accepts_two_to_twelve_words_with_fixed_frame() {
         let grammar = Grammar::parse(LABEL_GRAMMAR).unwrap();
-        assert!(accepts(&grammar, "Cache invalidation"));
-        assert!(accepts(&grammar, "Cache invalidation and staleness"));
-        assert!(accepts(&grammar, "One two three four five"));
-        assert!(accepts(&grammar, "One two three four five six"));
+        assert!(accepts(&grammar, "Topic: Cache invalidation"));
+        assert!(accepts(&grammar, "Topic: Cache invalidation and staleness"));
+        assert!(accepts(
+            &grammar,
+            "Topic: One two three four five six seven eight nine ten eleven twelve"
+        ));
     }
 
     #[test]
-    fn label_grammar_rejects_a_single_word_and_seven_words() {
+    fn label_grammar_rejects_a_missing_frame_single_word_and_thirteen_words() {
         let grammar = Grammar::parse(LABEL_GRAMMAR).unwrap();
-        assert!(!accepts(&grammar, "Cache"));
-        assert!(!accepts(&grammar, "One two three four five six seven"));
+        assert!(!accepts(&grammar, "Cache invalidation"));
+        assert!(!accepts(&grammar, "Topic: Cache"));
+        assert!(!accepts(
+            &grammar,
+            "Topic: One two three four five six seven eight nine ten eleven twelve thirteen"
+        ));
     }
 
     #[test]
@@ -748,19 +754,22 @@ mod tests {
         // This is what the real model produced for the label prompt (spec §14).
         let observed = "- Cache invalidation\n- Stale reads\n- TTL policy";
         assert!(!accepts(&grammar, observed));
-        // It cannot even be started: '-' is not a legal first character.
+        // It cannot even be started: the fixed frame is the only legal prefix.
         assert!(grammar.advance(&grammar.initial_state(), "-").is_none());
     }
 
     #[test]
     fn masking_forbids_every_token_outside_the_language() {
         let grammar = Grammar::parse(LABEL_GRAMMAR).unwrap();
-        let vocab: Vec<String> = ["Cache", "-", "\n", "*", " ", "9", ""]
+        let vocab: Vec<String> = ["Topic: ", "Cache", "-", "\n", "*", " ", "9", ""]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let allowed = grammar.allowed_next(&grammar.initial_state(), &vocab);
-        assert_eq!(allowed, vec![true, false, false, false, false, true, false]);
+        assert_eq!(
+            allowed,
+            vec![true, false, false, false, false, false, false, false]
+        );
     }
 
     #[test]
@@ -782,7 +791,7 @@ mod tests {
         .collect();
         let trie = VocabTrie::new(&vocab);
 
-        for prefix in ["", "Cache", "Cache invalidation"] {
+        for prefix in ["", "Topic: ", "Topic: Cache invalidation"] {
             let state = grammar
                 .advance(&grammar.initial_state(), prefix)
                 .unwrap_or_else(|| grammar.initial_state());
@@ -823,7 +832,9 @@ mod tests {
     #[test]
     fn is_complete_is_false_mid_word() {
         let grammar = Grammar::parse(LABEL_GRAMMAR).unwrap();
-        let state = grammar.advance(&grammar.initial_state(), "Cach").unwrap();
+        let state = grammar
+            .advance(&grammar.initial_state(), "Topic: Cach")
+            .unwrap();
         assert!(!grammar.is_complete(&state));
     }
 

@@ -394,6 +394,53 @@ mod tests {
     }
 
     #[test]
+    fn topic_chunks_bulk_read_is_root_scoped_and_includes_passage_metadata() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("notes.txt");
+        fs::write(&path, "first second").unwrap();
+        let mut idx =
+            SemanticIndex::create(dir.path(), "m", 3, EmbeddingEngine::Candle, Some(&root))
+                .unwrap();
+        idx.write_file(PreparedFile {
+            path: path.clone(),
+            chunks: vec![
+                (
+                    Chunk {
+                        file_path: path.clone(),
+                        text: "first".into(),
+                        byte_range: ByteRange { start: 0, end: 5 },
+                        origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                    },
+                    vec![1.0, 0.0, 0.0],
+                ),
+                (
+                    Chunk {
+                        file_path: path.clone(),
+                        text: "second".into(),
+                        byte_range: ByteRange { start: 6, end: 12 },
+                        origin: SourceOrigin::TextFile { line: 1, col: 7 },
+                    },
+                    vec![0.0, 1.0, 0.0],
+                ),
+            ],
+        })
+        .unwrap();
+
+        let chunks = idx.topic_chunks_for_root(&root).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].file_path, canon(&path));
+        assert_eq!(chunks[0].chunk_text, "first");
+        assert_eq!(chunks[0].embedding, vec![1.0, 0.0, 0.0]);
+        assert!(chunks[0].chunk_id > 0);
+        assert!(idx
+            .topic_chunks_for_root(&root.join("missing"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn test_rename_directory_rekeys_descendant_chunks_and_keeps_embeddings() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1417,6 +1464,20 @@ pub struct IndexedChunk {
     pub extraction_byte_range: ByteRange,
     pub origin: SourceOrigin,
     pub score: f32,
+}
+
+/// A complete indexed chunk row used by corpus-wide consumers such as the
+/// topic cloud. Unlike `IndexedChunk`, this is not an ANN result and therefore
+/// carries the stored vector and stable database ids.
+#[derive(Clone, Debug)]
+pub struct TopicChunkData {
+    pub chunk_id: i64,
+    pub file_id: i64,
+    pub file_path: PathBuf,
+    pub chunk_text: String,
+    pub extraction_byte_range: ByteRange,
+    pub origin: SourceOrigin,
+    pub embedding: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -3272,6 +3333,99 @@ impl SemanticIndex {
 
         tracing::info!("[query] returning {} results", results.len());
         Ok(results)
+    }
+
+    /// Bulk-read all chunk vectors and passage metadata belonging to one
+    /// indexed root. This is deliberately separate from ANN querying: topic
+    /// discovery needs the bounded input set itself, not nearest neighbours to
+    /// a query vector.
+    pub fn topic_chunks_for_root(&self, root: &Path) -> anyhow::Result<Vec<TopicChunkData>> {
+        let Some(root_id) = self.root_id_for_path(root)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, f.id, f.file_path, c.byte_start, c.byte_end,
+                    c.origin_type, c.page, c.line, c.col,
+                    c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.chunk_text,
+                    v.embedding
+             FROM root_files rf
+             JOIN files f ON f.id = rf.file_id
+             JOIN chunks c ON c.file_id = f.id
+             JOIN vec_chunks v ON v.rowid = c.id
+             WHERE rf.root_id = ?1
+             ORDER BY f.file_path, c.chunk_idx, c.id",
+        )?;
+        let rows = stmt.query_map(params![root_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<f64>>(9)?,
+                row.get::<_, Option<f64>>(10)?,
+                row.get::<_, Option<f64>>(11)?,
+                row.get::<_, Option<f64>>(12)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, Vec<u8>>(14)?,
+            ))
+        })?;
+
+        let mut chunks = Vec::new();
+        for row in rows {
+            let (
+                chunk_id,
+                file_id,
+                file_path,
+                byte_start,
+                byte_end,
+                origin_type,
+                page,
+                line,
+                col,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+                chunk_text,
+                embedding_bytes,
+            ) = row?;
+            let origin = source_origin_from_parts(
+                &origin_type,
+                page,
+                line,
+                col,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+            )
+            .ok_or_else(|| anyhow::anyhow!("Unknown chunk origin type '{origin_type}'"))?;
+            let embedding = f32_slice_from_bytes(&embedding_bytes)?;
+            anyhow::ensure!(
+                embedding.len() == self.dimension,
+                "Chunk {chunk_id} has dimension {}; expected {}",
+                embedding.len(),
+                self.dimension
+            );
+            chunks.push(TopicChunkData {
+                chunk_id,
+                file_id,
+                file_path: self.key_to_display_path(&file_path),
+                chunk_text,
+                extraction_byte_range: ByteRange {
+                    start: byte_start as usize,
+                    end: byte_end as usize,
+                },
+                origin,
+                embedding,
+            });
+        }
+        Ok(chunks)
     }
 
     fn query_file(

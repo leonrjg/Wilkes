@@ -28,6 +28,7 @@ import { useChatStore } from "../stores/useChatStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useResearchStore } from "../stores/useResearchStore";
 import { useGenerationStore } from "../stores/useGenerationStore";
+import { useTopicsStore } from "../stores/useTopicsStore";
 import { FileScopeControls } from "./FileScopeControls";
 import { MetadataField } from "../lib/types";
 import type {
@@ -412,7 +413,8 @@ export default function ResultList({
   const stats = useSearchStore((s) => s.stats);
   const searching = useSearchStore((s) => s.searching);
   const storeHasQuery = useSearchStore((s) => s.hasQuery);
-  const lastQuery = useSearchStore((s) => s.lastQuery);
+  const resultContext = useSearchStore((s) => s.resultContext);
+  const clearResults = useSearchStore((s) => s.clearResults);
   const hasQuery = documents ? false : storeHasQuery;
   const selectedMatch = useViewerStore((state) => activeViewerTab(state)?.match ?? null);
   const closePath = useViewerStore((state) => state.closePath);
@@ -421,6 +423,7 @@ export default function ResultList({
   const generationReady = useGenerationStore((s) => s.ready);
   const hasAvailableChatBackend = useChatStore((s) => s.hasAvailableBackend);
   const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
+  const selectTopic = useTopicsStore((s) => s.selectTopic);
 
   const fileList = useSettingsStore((s) => s.fileList);
   const omittedFileList = useSettingsStore((s) => s.omittedFileList);
@@ -714,9 +717,14 @@ export default function ResultList({
   };
 
   const totalCount = results.reduce((n, fm) => n + fm.matches.length, 0);
+  const handleClearResults = () => {
+    setOpenSummaryKey(null);
+    selectTopic(null);
+    clearResults();
+  };
   const summaryInput = React.useMemo(
-    () => buildSearchResultsSummaryInput(lastQuery?.pattern ?? "", results),
-    [lastQuery?.pattern, results],
+    () => buildSearchResultsSummaryInput(resultContext?.subject ?? "", results),
+    [resultContext?.subject, results],
   );
   const completedSummaryKey =
     !searching &&
@@ -958,6 +966,18 @@ export default function ResultList({
                 }`}
               >
                 <FileText size={14} />
+              </button>
+            </Tooltip>
+          )}
+          {stats && !searching && !indexing && (
+            <Tooltip content="Clear results">
+              <button
+                type="button"
+                aria-label="Clear results"
+                onClick={handleClearResults}
+                className="inline-flex h-6 w-6 flex-shrink-0 items-center justify-center rounded text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)]"
+              >
+                <X size={14} />
               </button>
             </Tooltip>
           )}

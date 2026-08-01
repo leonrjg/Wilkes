@@ -3,6 +3,10 @@ import { api } from "../services";
 import { isUsableSemanticIndex } from "../lib/semantic";
 import type { FileMatches, SearchQuery, SearchStats } from "../lib/types";
 
+export type ResultContext =
+  | { kind: "search"; subject: string }
+  | { kind: "topic"; topicKey: string; subject: string | null };
+
 interface SearchStore {
   results: FileMatches[];
   stats: SearchStats | null;
@@ -10,11 +14,17 @@ interface SearchStore {
   hasQuery: boolean;
   currentSearchId: string | null;
   lastQuery: SearchQuery | null;
+  resultContext: ResultContext | null;
 
   search: (query: SearchQuery) => Promise<void>;
   deferSemanticSearch: (query: SearchQuery) => void;
   replaySearch: () => Promise<void>;
   invalidateSemanticResultsForRoot: (root: string) => void;
+  showResultSet: (
+    results: FileMatches[],
+    context: ResultContext,
+  ) => Promise<void>;
+  updateTopicResultSubject: (topicKey: string, subject: string) => void;
   setHasQuery: (hasQuery: boolean) => void;
   clearResults: () => void;
 }
@@ -26,6 +36,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
   hasQuery: false,
   currentSearchId: null,
   lastQuery: null,
+  resultContext: null,
 
   search: async (query: SearchQuery) => {
     const { currentSearchId, results } = get();
@@ -36,7 +47,12 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
     // Keep existing results visible until the first new result arrives. Open
     // viewer tabs are intentionally independent from the search lifecycle.
     const hasStale = results.length > 0;
-    set({ stats: null, searching: true, lastQuery: query });
+    set({
+      stats: null,
+      searching: true,
+      lastQuery: query,
+      resultContext: { kind: "search", subject: query.pattern },
+    });
     if (!hasStale) set({ results: [] });
 
     let firstResult = true;
@@ -82,6 +98,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
       stats: null,
       searching: false,
       currentSearchId: null,
+      resultContext: { kind: "search", subject: query.pattern },
     }),
 
   replaySearch: async () => {
@@ -104,6 +121,44 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
 
   setHasQuery: (hasQuery) => set({ hasQuery }),
 
+  showResultSet: async (results, resultContext) => {
+    const currentSearchId = get().currentSearchId;
+    if (currentSearchId) {
+      await api.cancelSearch(currentSearchId).catch(() => {});
+    }
+    set({
+      results,
+      stats: {
+        files_scanned: results.length,
+        total_matches: results.reduce(
+          (count, file) => count + file.matches.length,
+          0,
+        ),
+        elapsed_ms: 0,
+        errors: [],
+      },
+      searching: false,
+      hasQuery: true,
+      currentSearchId: null,
+      lastQuery: null,
+      resultContext,
+    });
+  },
+
+  updateTopicResultSubject: (topicKey, subject) =>
+    set((state) => {
+      if (
+        state.resultContext?.kind !== "topic" ||
+        state.resultContext.topicKey !== topicKey ||
+        state.resultContext.subject === subject
+      ) {
+        return {};
+      }
+      return {
+        resultContext: { ...state.resultContext, subject },
+      };
+    }),
+
   invalidateSemanticResultsForRoot: (root) =>
     set((state) => {
       if (
@@ -117,8 +172,16 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
         stats: null,
         searching: false,
         currentSearchId: null,
+        resultContext: null,
       };
     }),
 
-  clearResults: () => set({ results: [], stats: null }),
+  clearResults: () =>
+    set({
+      results: [],
+      stats: null,
+      hasQuery: false,
+      lastQuery: null,
+      resultContext: null,
+    }),
 }));

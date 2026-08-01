@@ -17,6 +17,25 @@ pub struct EmbeddingClusterResult {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct WardMerge {
+    left: usize,
+    right: usize,
+}
+
+/// A complete deterministic Ward dendrogram plus the pairwise similarities
+/// needed to evaluate and describe any supported cut.
+///
+/// Building owns the O(n²) work. Calling [`Self::cut`] only replays merge ids
+/// and evaluates the selected partition, so callers can retain one tree while
+/// users adjust granularity.
+#[derive(Debug)]
+pub struct WardTree {
+    item_count: usize,
+    merges: Vec<WardMerge>,
+    item_similarities: Vec<Vec<f32>>,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct WardEdge {
     cost: f32,
     left: usize,
@@ -62,153 +81,216 @@ pub fn cluster_embeddings(
     vectors: &[Vec<f32>],
     granularity: BookmarkClusterGranularity,
 ) -> anyhow::Result<EmbeddingClusterResult> {
-    let count = vectors.len();
-    if count < 3 {
-        return Ok(EmbeddingClusterResult {
-            clusters: Vec::new(),
-            unclustered_indices: (0..count).collect(),
-        });
-    }
+    WardTree::build(vectors)?.cut(granularity)
+}
 
-    let dimension = vectors.first().map(Vec::len).unwrap_or_default();
-    anyhow::ensure!(dimension > 0, "Cannot cluster zero-dimensional embeddings");
-    anyhow::ensure!(
-        vectors.iter().all(|vector| vector.len() == dimension),
-        "Bookmark embedding dimensions do not match"
-    );
-    anyhow::ensure!(
-        vectors.iter().flatten().all(|value| value.is_finite()),
-        "Bookmark embeddings contain non-finite values"
-    );
-
-    let normalized: Vec<Vec<f32>> = vectors.iter().map(|vector| normalize(vector)).collect();
-    let mut item_similarities = vec![vec![0.0; count]; count];
-    for index in 0..count {
-        item_similarities[index][index] = 1.0;
-        for other in (index + 1)..count {
-            let similarity = dot(&normalized[index], &normalized[other]).clamp(-1.0, 1.0);
-            item_similarities[index][other] = similarity;
-            item_similarities[other][index] = similarity;
-        }
-    }
-
-    let capacity = count * 2 - 1;
-    let mut members: Vec<Vec<usize>> = vec![Vec::new(); capacity];
-    let mut centroids: Vec<Vec<f32>> = vec![Vec::new(); capacity];
-    let mut sizes = vec![0usize; capacity];
-    let mut active = vec![false; capacity];
-    let mut heap = BinaryHeap::new();
-
-    for index in 0..count {
-        members[index].push(index);
-        centroids[index] = normalized[index].clone();
-        sizes[index] = 1;
-        active[index] = true;
-        for other in 0..index {
-            heap.push(WardEdge {
-                cost: ward_merge_cost(
-                    &centroids[other],
-                    sizes[other],
-                    &centroids[index],
-                    sizes[index],
-                ),
-                left: other,
-                right: index,
+impl WardTree {
+    /// Build the full Ward merge tree once. Continuing from the coarsest UI cut
+    /// down to one root does not alter any earlier merge, so every granularity
+    /// observes exactly the same deterministic sequence.
+    pub fn build(vectors: &[Vec<f32>]) -> anyhow::Result<Self> {
+        let count = vectors.len();
+        if count < 3 {
+            return Ok(Self {
+                item_count: count,
+                merges: Vec::new(),
+                item_similarities: Vec::new(),
             });
         }
-    }
 
-    let target_cluster_count = cluster_count_for_granularity(count, granularity);
-    let mut active_count = count;
-    let mut next_cluster = count;
+        let dimension = vectors.first().map(Vec::len).unwrap_or_default();
+        anyhow::ensure!(dimension > 0, "Cannot cluster zero-dimensional embeddings");
+        anyhow::ensure!(
+            vectors.iter().all(|vector| vector.len() == dimension),
+            "Bookmark embedding dimensions do not match"
+        );
+        anyhow::ensure!(
+            vectors.iter().flatten().all(|value| value.is_finite()),
+            "Bookmark embeddings contain non-finite values"
+        );
 
-    while active_count > target_cluster_count {
-        let Some(edge) = heap.pop() else {
-            break;
-        };
-        if !active[edge.left] || !active[edge.right] {
-            continue;
+        let normalized: Vec<Vec<f32>> = vectors.iter().map(|vector| normalize(vector)).collect();
+        let squared_norms: Vec<f32> = normalized
+            .iter()
+            .map(|vector| dot(vector, vector))
+            .collect();
+        let capacity = count * 2 - 1;
+        let mut centroids: Vec<Vec<f32>> = vec![Vec::new(); capacity];
+        let mut sizes = vec![0usize; capacity];
+        let mut active = vec![false; capacity];
+        let mut heap = BinaryHeap::new();
+        let mut item_similarities = vec![vec![0.0; count]; count];
+        for index in 0..count {
+            item_similarities[index][index] = 1.0;
+            centroids[index] = normalized[index].clone();
+            sizes[index] = 1;
+            active[index] = true;
+            for other in (index + 1)..count {
+                let similarity = dot(&normalized[index], &normalized[other]).clamp(-1.0, 1.0);
+                item_similarities[index][other] = similarity;
+                item_similarities[other][index] = similarity;
+                heap.push(WardEdge {
+                    cost: singleton_ward_merge_cost(
+                        squared_norms[index],
+                        squared_norms[other],
+                        similarity,
+                    ),
+                    left: index,
+                    right: other,
+                });
+            }
         }
 
-        let merged = next_cluster;
-        next_cluster += 1;
-        let left_size = sizes[edge.left];
-        let right_size = sizes[edge.right];
-        sizes[merged] = left_size + right_size;
-        centroids[merged] = centroids[edge.left]
-            .iter()
-            .zip(&centroids[edge.right])
-            .map(|(left, right)| {
-                (left * left_size as f32 + right * right_size as f32) / sizes[merged] as f32
-            })
-            .collect();
-        members[merged] = members[edge.left]
-            .iter()
-            .chain(&members[edge.right])
-            .copied()
-            .collect();
-        members[merged].sort_unstable();
+        let mut merges = Vec::with_capacity(count - 1);
+        let mut active_count = count;
+        let mut next_cluster = count;
 
-        active[edge.left] = false;
-        active[edge.right] = false;
-        active[merged] = true;
-        active_count -= 1;
-
-        for other in 0..merged {
-            if !active[other] {
+        while active_count > 1 {
+            let Some(edge) = heap.pop() else {
+                break;
+            };
+            if !active[edge.left] || !active[edge.right] {
                 continue;
             }
-            heap.push(WardEdge {
-                cost: ward_merge_cost(
-                    &centroids[other],
-                    sizes[other],
-                    &centroids[merged],
-                    sizes[merged],
-                ),
-                left: other,
-                right: merged,
+
+            let merged = next_cluster;
+            next_cluster += 1;
+            let left_size = sizes[edge.left];
+            let right_size = sizes[edge.right];
+            sizes[merged] = left_size + right_size;
+            centroids[merged] = centroids[edge.left]
+                .iter()
+                .zip(&centroids[edge.right])
+                .map(|(left, right)| {
+                    (left * left_size as f32 + right * right_size as f32) / sizes[merged] as f32
+                })
+                .collect();
+
+            active[edge.left] = false;
+            active[edge.right] = false;
+            active[merged] = true;
+            active_count -= 1;
+            merges.push(WardMerge {
+                left: edge.left,
+                right: edge.right,
+            });
+
+            for other in 0..merged {
+                if !active[other] {
+                    continue;
+                }
+                heap.push(WardEdge {
+                    cost: ward_merge_cost(
+                        &centroids[other],
+                        sizes[other],
+                        &centroids[merged],
+                        sizes[merged],
+                    ),
+                    left: other,
+                    right: merged,
+                });
+            }
+        }
+
+        anyhow::ensure!(
+            active_count == 1 && merges.len() == count - 1,
+            "Could not produce the complete Ward tree"
+        );
+        Ok(Self {
+            item_count: count,
+            merges,
+            item_similarities,
+        })
+    }
+
+    /// Recut this tree without rebuilding embeddings, distances, or the Ward
+    /// heap. Silhouette rejection and representative selection remain specific
+    /// to the requested cut.
+    pub fn cut(
+        &self,
+        granularity: BookmarkClusterGranularity,
+    ) -> anyhow::Result<EmbeddingClusterResult> {
+        let count = self.item_count;
+        if count < 3 {
+            return Ok(EmbeddingClusterResult {
+                clusters: Vec::new(),
+                unclustered_indices: (0..count).collect(),
             });
         }
-    }
 
-    anyhow::ensure!(
-        active_count == target_cluster_count,
-        "Could not produce the requested bookmark cluster cut"
-    );
-    let mut partition: Vec<Vec<usize>> = active
-        .iter()
-        .enumerate()
-        .filter(|(_, is_active)| **is_active)
-        .map(|(index, _)| members[index].clone())
-        .collect();
-    partition.sort_by_key(|group| group[0]);
-    if silhouette_score(&partition, &item_similarities) <= f32::EPSILON {
-        return Ok(EmbeddingClusterResult {
-            clusters: Vec::new(),
-            unclustered_indices: (0..count).collect(),
-        });
-    }
-
-    let mut result = EmbeddingClusterResult::default();
-    for mut group in partition {
-        group.sort_unstable();
-        if group.len() < 2 {
-            result.unclustered_indices.extend(group);
-            continue;
+        let target_cluster_count = cluster_count_for_granularity(count, granularity);
+        let capacity = count * 2 - 1;
+        let mut active = vec![false; capacity];
+        active[..count].fill(true);
+        for (merge_index, merge) in self
+            .merges
+            .iter()
+            .take(count - target_cluster_count)
+            .enumerate()
+        {
+            anyhow::ensure!(
+                active[merge.left] && active[merge.right],
+                "Ward tree contains an invalid merge sequence"
+            );
+            active[merge.left] = false;
+            active[merge.right] = false;
+            active[count + merge_index] = true;
         }
-        let representative_index = medoid(&group, &item_similarities);
-        let cohesion = average_pair_similarity(&group, &item_similarities);
-        result.clusters.push(EmbeddingCluster {
-            item_indices: group,
-            representative_index,
-            cohesion,
-        });
+
+        let mut partition: Vec<Vec<usize>> = active
+            .iter()
+            .enumerate()
+            .filter(|(_, is_active)| **is_active)
+            .map(|(node, _)| self.leaf_members(node))
+            .collect();
+        anyhow::ensure!(
+            partition.len() == target_cluster_count,
+            "Could not produce the requested Ward tree cut"
+        );
+        partition.sort_by_key(|group| group[0]);
+        if silhouette_score(&partition, &self.item_similarities) <= f32::EPSILON {
+            return Ok(EmbeddingClusterResult {
+                clusters: Vec::new(),
+                unclustered_indices: (0..count).collect(),
+            });
+        }
+
+        let mut result = EmbeddingClusterResult::default();
+        for group in partition {
+            if group.len() < 2 {
+                result.unclustered_indices.extend(group);
+                continue;
+            }
+            let representative_index = medoid(&group, &self.item_similarities);
+            let cohesion = average_pair_similarity(&group, &self.item_similarities);
+            result.clusters.push(EmbeddingCluster {
+                item_indices: group,
+                representative_index,
+                cohesion,
+            });
+        }
+        result
+            .clusters
+            .sort_by_key(|cluster| cluster.item_indices[0]);
+        result.unclustered_indices.sort_unstable();
+        Ok(result)
     }
-    result
-        .clusters
-        .sort_by_key(|cluster| cluster.item_indices[0]);
-    result.unclustered_indices.sort_unstable();
-    Ok(result)
+
+    fn leaf_members(&self, node: usize) -> Vec<usize> {
+        let mut members = Vec::new();
+        let mut pending = vec![node];
+        while let Some(current) = pending.pop() {
+            if current < self.item_count {
+                members.push(current);
+                continue;
+            }
+            let merge = self.merges[current - self.item_count];
+            pending.push(merge.right);
+            pending.push(merge.left);
+        }
+        members.sort_unstable();
+        members
+    }
 }
 
 fn normalize(vector: &[f32]) -> Vec<f32> {
@@ -241,6 +323,19 @@ fn ward_merge_cost(
         })
         .sum::<f32>();
     left_size as f32 * right_size as f32 / (left_size + right_size) as f32 * squared_distance
+}
+
+/// Ward's singleton coefficient is one half, so its merge cost can reuse the
+/// dot product already computed for the similarity matrix instead of walking
+/// every embedding dimension a second time. Keeping the squared norms makes
+/// this exact for the zero vectors accepted by `normalize` too; `1 - cosine`
+/// alone would incorrectly assign a positive cost to two zero vectors.
+fn singleton_ward_merge_cost(
+    left_squared_norm: f32,
+    right_squared_norm: f32,
+    similarity: f32,
+) -> f32 {
+    (0.5 * (left_squared_norm + right_squared_norm) - similarity).max(0.0)
 }
 
 fn silhouette_score(partition: &[Vec<usize>], similarities: &[Vec<f32>]) -> f32 {
@@ -379,6 +474,30 @@ mod tests {
     }
 
     #[test]
+    fn singleton_cost_reuses_similarity_without_changing_zero_vector_behavior() {
+        let vectors = [
+            normalize(&[3.0, 4.0]),
+            normalize(&[-2.0, 5.0]),
+            normalize(&[0.0, 0.0]),
+        ];
+
+        for left in 0..vectors.len() {
+            for right in (left + 1)..vectors.len() {
+                let similarity = dot(&vectors[left], &vectors[right]).clamp(-1.0, 1.0);
+                let reused = singleton_ward_merge_cost(
+                    dot(&vectors[left], &vectors[left]),
+                    dot(&vectors[right], &vectors[right]),
+                    similarity,
+                );
+                let direct = ward_merge_cost(&vectors[left], 1, &vectors[right], 1);
+                assert!((reused - direct).abs() <= 1e-6, "{reused} != {direct}");
+            }
+        }
+
+        assert_eq!(singleton_ward_merge_cost(0.0, 0.0, 0.0), 0.0);
+    }
+
+    #[test]
     fn separates_clear_groups_and_selects_medoids() {
         let result = cluster_balanced(&[
             vec![1.0, 0.0],
@@ -472,6 +591,42 @@ mod tests {
         assert_eq!(
             cluster_count_for_granularity(6, BookmarkClusterGranularity::Balanced),
             2
+        );
+    }
+
+    #[test]
+    fn one_tree_can_be_recut_in_any_granularity_order() {
+        let vectors = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.98, 0.04, 0.0],
+            vec![0.95, -0.03, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.03, 0.97, 0.0],
+            vec![-0.04, 0.96, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![0.02, 0.0, 0.99],
+            vec![-0.03, 0.0, 0.97],
+        ];
+        let tree = WardTree::build(&vectors).unwrap();
+        assert_eq!(tree.merges.len(), vectors.len() - 1);
+
+        let more = tree.cut(BookmarkClusterGranularity::MuchMore).unwrap();
+        let fewer = tree.cut(BookmarkClusterGranularity::MuchFewer).unwrap();
+        assert_eq!(
+            tree.cut(BookmarkClusterGranularity::MuchMore).unwrap(),
+            more
+        );
+        assert_eq!(
+            tree.cut(BookmarkClusterGranularity::MuchFewer).unwrap(),
+            fewer
+        );
+        assert_eq!(
+            cluster_embeddings(&vectors, BookmarkClusterGranularity::MuchMore).unwrap(),
+            more
+        );
+        assert_eq!(
+            cluster_embeddings(&vectors, BookmarkClusterGranularity::MuchFewer).unwrap(),
+            fewer
         );
     }
 

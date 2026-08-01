@@ -247,7 +247,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   return (
     <div className="flex flex-col gap-2 p-3 border-b border-[var(--border-main)] bg-[var(--bg-app)]">
       {/* Top row: toggles + pattern */}
-      <div className="flex items-center gap-2">
+      <div className="flex min-w-0 items-center gap-2">
         <Toggle tooltip="Regular expression" active={isRegex} onToggle={handleToggleRegex}>
           <span className="font-mono text-[10px] w-4">.*</span>
         </Toggle>
@@ -284,11 +284,11 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
           </span>
         )}
 
-        <div className="flex flex-1 items-center rounded border border-[var(--border-main)] bg-[var(--bg-input)] transition-colors focus-within:ring-1 focus-within:ring-[var(--accent-blue)]">
-          <div className="relative min-w-0 flex-shrink">
+        <div className="flex min-w-0 flex-1 items-center rounded border border-[var(--border-main)] bg-[var(--bg-input)] transition-colors focus-within:ring-1 focus-within:ring-[var(--accent-blue)]">
+          <div className="relative min-w-0 max-w-full flex-shrink overflow-hidden">
             <span
               aria-hidden="true"
-              className="invisible block whitespace-pre py-1.5 pl-3 text-sm"
+              className="invisible block whitespace-pre py-1.5 pl-3 pr-1 text-sm"
             >
               {pattern || "Search…"}
             </span>

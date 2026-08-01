@@ -31,6 +31,7 @@ vi.mock("../services", () => ({
     }),
     resolvePdfUrl: vi.fn((path: string) => path),
     relatedDocuments: vi.fn(() => Promise.resolve([])),
+    citationLinks: vi.fn(() => Promise.resolve({ references: [], cited_by: [] })),
     explainRelatedDocument: vi.fn(() => Promise.resolve()),
     summarizeDocument: vi.fn(() => Promise.resolve()),
     onGenerationStream: vi.fn(() => Promise.resolve(vi.fn())),

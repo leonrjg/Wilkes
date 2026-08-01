@@ -13,6 +13,7 @@ import { useSettingsStore } from "../stores/useSettingsStore";
 import { useResearchStore } from "../stores/useResearchStore";
 import { useGenerationStore } from "../stores/useGenerationStore";
 import { useChatStore } from "../stores/useChatStore";
+import { useTopicsStore } from "../stores/useTopicsStore";
 import type { FileEntry, GenerationStreamEvent } from "../lib/types";
 
 const {
@@ -130,6 +131,7 @@ describe("ResultList", () => {
       searching: false,
       hasQuery: false,
       lastQuery: null,
+      resultContext: null,
     });
     useSettingsStore.setState({
       fileList: [],
@@ -152,6 +154,7 @@ describe("ResultList", () => {
       hasAvailableBackend: false,
       openPaneAndSend: mockOpenChatPaneAndSend,
     });
+    useTopicsStore.setState({ selectedTopicKey: null });
   });
 
   it("renders empty state when no query", () => {
@@ -826,6 +829,38 @@ describe("ResultList", () => {
     expect(screen.getByText(/1 file failed/)).toBeInTheDocument();
   });
 
+  it("clears topic results from the results strip", () => {
+    useSearchStore.setState({
+      hasQuery: true,
+      results: [
+        {
+          path: "/papers/topic.pdf",
+          file_type: "Pdf",
+          matches: [],
+        },
+      ],
+      stats: {
+        total_matches: 1,
+        files_scanned: 1,
+        elapsed_ms: 0,
+        errors: [],
+      },
+    });
+    useTopicsStore.setState({ selectedTopicKey: "topic-a" });
+
+    renderWithToasts();
+    fireEvent.click(screen.getByRole("button", { name: "Clear results" }));
+
+    expect(useSearchStore.getState()).toEqual(
+      expect.objectContaining({
+        hasQuery: false,
+        results: [],
+        stats: null,
+      }),
+    );
+    expect(useTopicsStore.getState().selectedTopicKey).toBeNull();
+  });
+
   it("summarizes one completed result snapshot and detaches it when a new search starts", async () => {
     useGenerationStore.setState({ ready: true });
     useSearchStore.setState({
@@ -844,6 +879,7 @@ describe("ResultList", () => {
         scope: { type: "corpus" },
         supported_extensions: ["pdf"],
       },
+      resultContext: { kind: "search", subject: "cache behavior" },
       results: [
         {
           path: "/papers/top.pdf",
@@ -930,6 +966,50 @@ describe("ResultList", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("summarizes a topic result set using its displayed label", async () => {
+    useGenerationStore.setState({ ready: true });
+    useSearchStore.setState({
+      hasQuery: true,
+      searching: false,
+      lastQuery: null,
+      resultContext: {
+        kind: "topic",
+        topicKey: "topic-a",
+        subject: "Graph Database Indexes",
+      },
+      results: [
+        {
+          path: "/papers/graphs.pdf",
+          file_type: "Pdf",
+          matches: [
+            {
+              text_range: null,
+              matched_text:
+                "Graph database indexes accelerate neighborhood traversal by reducing repeated scans across connected records in large collections.",
+              context_before: "",
+              context_after: "",
+              origin: { PdfPage: { page: 3, bbox: null } },
+            },
+          ],
+        },
+      ],
+      stats: {
+        total_matches: 1,
+        files_scanned: 1,
+        elapsed_ms: 0,
+        errors: [],
+      },
+    });
+
+    renderWithToasts();
+    fireEvent.click(screen.getByRole("button", { name: "Summarize results" }));
+
+    await waitFor(() => expect(mockSummarizeSearchResults).toHaveBeenCalledOnce());
+    expect(mockSummarizeSearchResults.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ query: "Graph Database Indexes" }),
+    );
+  });
+
   it("skips generation when cleaning leaves only references and offers agent chat", async () => {
     useGenerationStore.setState({ ready: true });
     useChatStore.setState({ hasAvailableBackend: true });
@@ -948,6 +1028,10 @@ describe("ResultList", () => {
         mode: "Semantic",
         scope: { type: "corpus" },
         supported_extensions: ["pdf"],
+      },
+      resultContext: {
+        kind: "search",
+        subject: "use of econometric methods in computer science research",
       },
       results: [
         {

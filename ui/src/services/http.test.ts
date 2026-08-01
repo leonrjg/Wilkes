@@ -68,6 +68,21 @@ describe("HttpSearchApi", () => {
     );
   });
 
+  it("chunkTopics posts the root and granularity", async () => {
+    const result = { topics: [], sampled_chunk_count: 0 };
+    (fetch as any).mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(result),
+    });
+    const query = { root: "/library", granularity: "much_fewer" as const };
+
+    await expect(api.chunkTopics(query)).resolves.toEqual(result);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/topics/chunks",
+      expect.objectContaining({ method: "POST", body: JSON.stringify(query) }),
+    );
+  });
+
   it("search streams results", async () => {
     const mockFileMatches = { path: "test.txt", matches: [] };
     const mockStats = { total_files: 1, total_matches: 0, duration_ms: 10 };

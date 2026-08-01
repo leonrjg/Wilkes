@@ -488,6 +488,50 @@ pub struct BookmarkClustersResult {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChunkTopicsQuery {
+    pub root: PathBuf,
+    #[serde(default = "chunk_topic_default_granularity")]
+    pub granularity: BookmarkClusterGranularity,
+}
+
+fn chunk_topic_default_granularity() -> BookmarkClusterGranularity {
+    BookmarkClusterGranularity::MuchFewer
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChunkTopicMember {
+    pub chunk_id: i64,
+    pub file_path: PathBuf,
+    pub chunk_text: String,
+    pub extraction_byte_range: ByteRange,
+    pub origin: SourceOrigin,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChunkTopic {
+    /// SHA-256 over the sorted member chunk ids. Reindexing naturally changes
+    /// the key when membership drifts.
+    pub cluster_key: String,
+    pub chunks: Vec<ChunkTopicMember>,
+    pub representative_chunk_id: i64,
+    pub chunk_count: usize,
+    pub distinct_document_count: usize,
+    pub cohesion: f32,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ChunkTopicsResult {
+    pub topics: Vec<ChunkTopic>,
+    pub total_chunk_count: usize,
+    pub sampled_chunk_count: usize,
+    pub total_document_count: usize,
+    pub sampled_document_count: usize,
+    pub input_cap: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NewBookmark {
     pub path: PathBuf,
     pub origin: SourceOrigin,
@@ -772,6 +816,11 @@ pub struct SemanticSettings {
     pub chunk_size: usize,
     #[serde(default = "SemanticSettings::default_chunk_overlap")]
     pub chunk_overlap: usize,
+    /// Maximum number of indexed chunks admitted to the flat Ward topic pass.
+    /// This is the resource control for the O(n²) clustering work; topic
+    /// granularity only changes the requested cut.
+    #[serde(default = "SemanticSettings::default_topic_cloud_input_cap")]
+    pub topic_cloud_input_cap: usize,
     /// Idle timeout for worker processes in seconds.
     #[serde(default = "SemanticSettings::default_worker_timeout")]
     pub worker_timeout_secs: u64,
@@ -791,6 +840,8 @@ struct SemanticSettingsSerde {
     chunk_size: usize,
     #[serde(default = "SemanticSettings::default_chunk_overlap")]
     chunk_overlap: usize,
+    #[serde(default = "SemanticSettings::default_topic_cloud_input_cap")]
+    topic_cloud_input_cap: usize,
     #[serde(default = "SemanticSettings::default_worker_timeout")]
     worker_timeout_secs: u64,
 }
@@ -813,6 +864,8 @@ struct LegacySemanticSettingsSerde {
     chunk_size: usize,
     #[serde(default = "SemanticSettings::default_chunk_overlap")]
     chunk_overlap: usize,
+    #[serde(default = "SemanticSettings::default_topic_cloud_input_cap")]
+    topic_cloud_input_cap: usize,
     #[serde(default = "SemanticSettings::default_worker_timeout")]
     worker_timeout_secs: u64,
 }
@@ -862,6 +915,10 @@ impl SemanticSettings {
         128
     }
 
+    pub const fn default_topic_cloud_input_cap() -> usize {
+        1_500
+    }
+
     fn default_worker_timeout() -> u64 {
         crate::worker::DEFAULT_IDLE_TIMEOUT_SECS
     }
@@ -894,6 +951,7 @@ impl<'de> Deserialize<'de> for SemanticSettings {
                 custom_models: parsed.custom_models,
                 chunk_size: parsed.chunk_size,
                 chunk_overlap: parsed.chunk_overlap,
+                topic_cloud_input_cap: parsed.topic_cloud_input_cap,
                 worker_timeout_secs: parsed.worker_timeout_secs,
             })
         } else {
@@ -911,6 +969,7 @@ impl<'de> Deserialize<'de> for SemanticSettings {
                 custom_models: parsed.custom_models,
                 chunk_size: parsed.chunk_size,
                 chunk_overlap: parsed.chunk_overlap,
+                topic_cloud_input_cap: parsed.topic_cloud_input_cap,
                 worker_timeout_secs: parsed.worker_timeout_secs,
             })
         }
@@ -927,6 +986,7 @@ impl Default for SemanticSettings {
             custom_models: Vec::new(),
             chunk_size: Self::default_chunk_size(),
             chunk_overlap: Self::default_chunk_overlap(),
+            topic_cloud_input_cap: Self::default_topic_cloud_input_cap(),
             worker_timeout_secs: Self::default_worker_timeout(),
         }
     }
@@ -1482,6 +1542,16 @@ mod tests {
         assert_eq!(
             serde_json::to_value(BookmarkClusterGranularity::MuchMore).unwrap(),
             serde_json::json!("much_more")
+        );
+    }
+
+    #[test]
+    fn chunk_topic_query_defaults_to_minimal_granularity() {
+        let query: ChunkTopicsQuery = serde_json::from_str(r#"{"root":"/library"}"#).unwrap();
+        assert_eq!(query.granularity, BookmarkClusterGranularity::MuchFewer);
+        assert_eq!(
+            SemanticSettings::default().topic_cloud_input_cap,
+            SemanticSettings::default_topic_cloud_input_cap()
         );
     }
 

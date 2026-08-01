@@ -5,6 +5,8 @@ import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useGenerationStore } from "../stores/useGenerationStore";
+import { useTopicsStore } from "../stores/useTopicsStore";
+import { useSearchStore } from "../stores/useSearchStore";
 
 export function useGlobalEvents() {
   const { addToast, removeToast } = useToasts();
@@ -15,6 +17,7 @@ export function useGlobalEvents() {
     let fileListUnlisten: (() => void) | undefined;
     let metadataUnlisten: (() => void) | undefined;
     let clusterLabelUnlisten: (() => void) | undefined;
+    let topicLabelUnlisten: (() => void) | undefined;
     let mounted = true;
 
     const closeReindexToast = () => {
@@ -94,6 +97,20 @@ export function useGlobalEvents() {
       }
     });
 
+    api.onChunkTopicLabelled((event) => {
+      if (!mounted) return;
+      useTopicsStore.getState().applyLabel(event);
+      useSearchStore
+        .getState()
+        .updateTopicResultSubject(event.cluster_key, event.label);
+    }).then((unlisten) => {
+      if (!mounted) {
+        unlisten();
+      } else {
+        topicLabelUnlisten = unlisten;
+      }
+    });
+
     void useGenerationStore.getState().refreshReady();
 
     return () => {
@@ -102,6 +119,7 @@ export function useGlobalEvents() {
       if (fileListUnlisten) fileListUnlisten();
       if (metadataUnlisten) metadataUnlisten();
       if (clusterLabelUnlisten) clusterLabelUnlisten();
+      if (topicLabelUnlisten) topicLabelUnlisten();
     };
   }, [addToast, removeToast]);
 }
