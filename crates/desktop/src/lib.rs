@@ -72,15 +72,10 @@ async fn rename_file_for_path(
     path: String,
     new_name: String,
 ) -> Result<String, String> {
-    let old = PathBuf::from(path);
-    let new = wilkes_api::commands::files::rename_file(old.clone(), new_name)
+    ctx.rename_file(path.into(), new_name)
         .await
-        .map_err(|e| e.to_string())?;
-    ctx.rekey_research_path(&old, &new)
-        .map_err(|e| e.to_string())?;
-    ctx.rekey_index_path(&old, &new)
-        .map_err(|e| e.to_string())?;
-    Ok(new.display().to_string())
+        .map(|path| path.display().to_string())
+        .map_err(|e| e.to_string())
 }
 
 async fn trash_file_for_path(path: String) -> Result<(), String> {
@@ -142,8 +137,7 @@ async fn get_file_metadata_for_path(
     ctx: Arc<AppContext>,
     path: String,
 ) -> Result<DocumentMetadata, String> {
-    let supported_extensions = ctx.get_settings().await.supported_extensions;
-    wilkes_api::commands::metadata::get_file_metadata(path.into(), supported_extensions)
+    ctx.get_file_metadata(path.into())
         .await
         .map_err(|e| e.to_string())
 }
@@ -239,8 +233,7 @@ async fn resolve_file_metadata_for_ctx(
     ctx: Arc<AppContext>,
     path: String,
 ) -> Result<DocumentMetadata, String> {
-    let settings = ctx.get_settings().await;
-    wilkes_api::commands::integrations::zotero::resolve_file_metadata(settings, path.into())
+    ctx.resolve_file_metadata(path.into())
         .await
         .map_err(|e| e.to_string())
 }
@@ -255,8 +248,7 @@ async fn refresh_file_metadata_for_ctx(
 }
 
 async fn zotero_add_item_for_ctx(ctx: Arc<AppContext>, path: String) -> Result<AddOutcome, String> {
-    let settings = ctx.get_settings().await;
-    wilkes_api::commands::integrations::zotero::zotero_add_item(settings, path.into())
+    ctx.zotero_add_item(path.into())
         .await
         .map_err(|e| e.to_string())
 }
@@ -265,8 +257,7 @@ async fn zotero_generate_citation_for_ctx(
     ctx: Arc<AppContext>,
     path: String,
 ) -> Result<CitationResult, String> {
-    let settings = ctx.get_settings().await;
-    wilkes_api::commands::integrations::zotero::zotero_generate_citation(settings, path.into())
+    ctx.zotero_generate_citation(path.into())
         .await
         .map_err(|e| e.to_string())
 }
@@ -362,6 +353,7 @@ struct ManagedExternalMcp {
 
 struct ExternalMcpManager {
     token_path: PathBuf,
+    context: wilkes_agent::mcp::ExternalMcpContext,
     runtime: tokio::sync::Mutex<Option<ManagedExternalMcp>>,
     last_error: Mutex<Option<String>>,
 }
@@ -382,9 +374,14 @@ impl ExternalMcpManager {
     fn new(data_dir: PathBuf) -> Self {
         Self {
             token_path: data_dir.join(EXTERNAL_MCP_TOKEN_FILENAME),
+            context: wilkes_agent::mcp::ExternalMcpContext::default(),
             runtime: tokio::sync::Mutex::new(None),
             last_error: Mutex::new(None),
         }
+    }
+
+    fn set_active_document(&self, path: Option<String>, page: Option<u32>) {
+        self.context.set_active_document(path, page);
     }
 
     async fn apply(
@@ -435,6 +432,7 @@ impl ExternalMcpManager {
                 settings.port,
                 token.clone(),
                 Arc::clone(&search),
+                self.context.clone(),
             )
         };
         let mut next = start().await;
@@ -471,6 +469,7 @@ impl ExternalMcpManager {
                         previous_port,
                         previous_token,
                         search,
+                        self.context.clone(),
                     )
                     .await
                     {
@@ -1010,7 +1009,13 @@ async fn pick_directory(app: AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
     app.dialog().file().pick_folder(move |path| {
-        let _ = tx.send(path.map(|p| p.to_string()));
+        let _ = tx.send(path.map(|p| {
+            let selected = p.to_string();
+            std::fs::canonicalize(&selected)
+                .unwrap_or_else(|_| selected.clone().into())
+                .display()
+                .to_string()
+        }));
     });
     Ok(rx.await.unwrap_or(None))
 }
@@ -1776,6 +1781,11 @@ async fn get_external_mcp_status(app: AppHandle) -> Result<ExternalMcpStatus, St
 }
 
 #[tauri::command]
+fn set_active_document(path: Option<String>, page: Option<u32>, app: AppHandle) {
+    external_mcp_manager_state(&app).set_active_document(path, page);
+}
+
+#[tauri::command]
 async fn rotate_external_mcp_token(app: AppHandle) -> Result<ExternalMcpStatus, String> {
     let ctx = app_context(&app);
     let settings = ctx.get_settings().await;
@@ -2193,6 +2203,7 @@ pub fn run() {
             update_settings,
             configure_external_mcp,
             get_external_mcp_status,
+            set_active_document,
             rotate_external_mcp_token,
             list_bookmarks,
             add_bookmark,
@@ -2524,16 +2535,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_file_for_ctx_denied() {
+    async fn test_open_file_for_ctx_allows_outside_data_dir() {
         let (_dir, ctx) = test_ctx();
         let outside_dir = tempdir().unwrap();
         let outside = outside_dir.path().join("outside.txt");
         std::fs::write(&outside, "hello").unwrap();
 
-        let err = open_file_for_ctx(ctx, outside.display().to_string())
+        let preview = open_file_for_ctx(ctx, outside.display().to_string())
             .await
-            .unwrap_err();
-        assert!(err.contains("Access denied"));
+            .unwrap();
+        match preview {
+            wilkes_core::types::PreviewData::Text { content, .. } => {
+                assert_eq!(content, "hello")
+            }
+            _ => panic!("Expected text preview"),
+        }
     }
 
     #[tokio::test]

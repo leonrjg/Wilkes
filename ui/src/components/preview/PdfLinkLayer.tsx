@@ -134,6 +134,9 @@ function PdfLinkOverlay({
         }}
         style={{
           position: "absolute",
+          // Links must remain the hit target when a persisted bookmark
+          // highlight covers the same text (bookmark highlights use z-index 1).
+          zIndex: 2,
           left: `${link.left}px`,
           top: `${link.top}px`,
           width: `${Math.max(link.width, 4)}px`,

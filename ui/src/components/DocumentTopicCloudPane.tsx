@@ -9,6 +9,7 @@ import {
   DEFAULT_TOPIC_INPUT_CAP,
   TopicCloudControls,
   TopicCloudTags,
+  chunkSearchResults,
   topicSearchResults,
 } from "./TopicCloudShared";
 import { Tooltip } from "./Tooltip";
@@ -70,6 +71,17 @@ export default function DocumentTopicCloudPane({ currentPath, onClose }: Props) 
     selectTopic(topic.cluster_key);
   };
 
+  const activateCoverage = async (topic: ChunkTopic) => {
+    const coverage = topic.library_coverage;
+    if (!coverage) return;
+    await showResultSet(chunkSearchResults(coverage.chunks), {
+      kind: "topic",
+      topicKey: topic.cluster_key,
+      subject: topic.label ?? null,
+    });
+    selectTopic(topic.cluster_key);
+  };
+
   return (
     <aside className="hidden w-64 flex-shrink-0 border-l border-[var(--border-main)] bg-[var(--bg-sidebar)] md:flex md:flex-col">
       <header className="space-y-2 border-b border-[var(--border-main)] p-2">
@@ -119,6 +131,7 @@ export default function DocumentTopicCloudPane({ currentPath, onClose }: Props) 
           selectedTopicKey={document.selectedTopicKey}
           documentScoped
           onActivate={(topic) => void activateTopic(topic)}
+          onActivateCoverage={(topic) => void activateCoverage(topic)}
         />
       </div>
     </aside>

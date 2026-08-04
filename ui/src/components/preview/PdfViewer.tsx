@@ -784,6 +784,9 @@ export default function PdfViewer({
                             data-bookmark-id={highlight.id}
                             style={{
                               position: "absolute",
+                              // Keep highlights above selectable text, but below
+                              // PDF links so overlapping links still hover/open.
+                              zIndex: 1,
                               left: `${x * pageScale}px`,
                               top: `${y * pageScale}px`,
                               width: `${Math.max(width * pageScale, 4)}px`,

@@ -25,7 +25,10 @@ pub fn find_dois(text: &str) -> Vec<String> {
 }
 
 pub fn normalize_doi(value: &str) -> Option<String> {
-    let trimmed = value.trim();
+    // DOI names are case-insensitive. Lowercase at the shared boundary so
+    // every provider and extractor writes the same canonical representation.
+    let lowercase = value.trim().to_ascii_lowercase();
+    let trimmed = lowercase.as_str();
     let without_prefix = trimmed
         .strip_prefix("https://doi.org/")
         .or_else(|| trimmed.strip_prefix("http://doi.org/"))
@@ -132,6 +135,10 @@ mod tests {
         assert_eq!(
             find_doi("https://doi.org/10.1000/xyz123"),
             Some("10.1000/xyz123".into())
+        );
+        assert_eq!(
+            normalize_doi("HTTPS://DOI.ORG/10.1109/ICSME.2016.33"),
+            Some("10.1109/icsme.2016.33".into())
         );
     }
 

@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import type {
   BookmarkClusterGranularity,
   ChunkTopic,
+  ChunkTopicMember,
   ChunkTopicsResult,
   FileMatches,
 } from "../lib/types";
@@ -49,9 +50,11 @@ function inputCapOptions(
   return options;
 }
 
-export function topicSearchResults(topic: ChunkTopic): FileMatches[] {
-  const byPath = new Map<string, ChunkTopic["chunks"]>();
-  for (const chunk of topic.chunks) {
+export function chunkSearchResults(
+  chunks: ChunkTopicMember[],
+): FileMatches[] {
+  const byPath = new Map<string, ChunkTopicMember[]>();
+  for (const chunk of chunks) {
     const members = byPath.get(chunk.file_path);
     if (members) members.push(chunk);
     else byPath.set(chunk.file_path, [chunk]);
@@ -68,6 +71,10 @@ export function topicSearchResults(topic: ChunkTopic): FileMatches[] {
       origin: chunk.origin,
     })),
   }));
+}
+
+export function topicSearchResults(topic: ChunkTopic): FileMatches[] {
+  return chunkSearchResults(topic.chunks);
 }
 
 interface ControlsProps {
@@ -176,6 +183,7 @@ interface TagsProps {
   selectedTopicKey: string | null;
   documentScoped?: boolean;
   onActivate: (topic: ChunkTopic) => void;
+  onActivateCoverage?: (topic: ChunkTopic) => void;
 }
 
 export function TopicCloudTags({
@@ -184,6 +192,7 @@ export function TopicCloudTags({
   selectedTopicKey,
   documentScoped = false,
   onActivate,
+  onActivateCoverage,
 }: TagsProps) {
   const weights = result?.topics.map((topic) => topic.chunk_count) ?? [];
   const minWeight = weights.length ? Math.min(...weights) : 0;
@@ -201,10 +210,31 @@ export function TopicCloudTags({
     [maxWeight, minWeight, result],
   );
   const labelsPending = tags.some(({ label }) => !label);
-  const titleFor = (topic: ChunkTopic) =>
-    documentScoped
-      ? `${topic.chunk_count} chunks`
-      : `${topic.chunk_count} chunks across ${topic.distinct_document_count} documents`;
+  const titleFor = (topic: ChunkTopic) => {
+    const chunkNoun = topic.chunk_count === 1 ? "chunk" : "chunks";
+    if (!documentScoped) {
+      const documentNoun =
+        topic.distinct_document_count === 1 ? "document" : "documents";
+      return `${topic.chunk_count} ${chunkNoun} across ${topic.distinct_document_count} ${documentNoun}`;
+    }
+    return `${topic.chunk_count} ${chunkNoun}`;
+  };
+  const coverageTitleFor = (topic: ChunkTopic) => {
+    const coverage = topic.library_coverage;
+    if (!coverage) return "";
+    const percentage = coverage.eligible_document_count
+      ? ` (${(
+          (coverage.related_document_count /
+            coverage.eligible_document_count) *
+          100
+        ).toLocaleString(undefined, { maximumFractionDigits: 1 })}%)`
+      : "";
+    const relatedNoun =
+      coverage.related_document_count === 1 ? "document" : "documents";
+    const eligibleNoun =
+      coverage.eligible_document_count === 1 ? "document" : "documents";
+    return `Show ${coverage.chunks.length.toLocaleString()} related passages from ${coverage.related_document_count.toLocaleString()} ${relatedNoun}. Coverage: ${coverage.related_document_count.toLocaleString()} out of ${coverage.eligible_document_count.toLocaleString()} other indexed ${eligibleNoun} in the full library${percentage}`;
+  };
 
   if (!loading && result && result.topics.length === 0) {
     return <p className="text-xs text-[var(--text-dim)]">No topics found.</p>;
@@ -219,21 +249,37 @@ export function TopicCloudTags({
     >
       {tags.map(({ topic, label, fontSize }) =>
         label ? (
-          <button
-            type="button"
+          <span
             key={topic.cluster_key}
-            aria-pressed={selectedTopicKey === topic.cluster_key}
-            title={titleFor(topic)}
-            onClick={() => onActivate(topic)}
-            style={{ fontSize: `${fontSize}px` }}
-            className={`max-w-full rounded px-1.5 py-0.5 leading-tight transition-colors ${
-              selectedTopicKey === topic.cluster_key
-                ? "bg-[var(--accent-blue-muted)] text-[var(--accent-blue)]"
-                : "text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-main)]"
-            }`}
+            className="inline-flex max-w-full items-baseline gap-1.5"
           >
-            {label}
-          </button>
+            <button
+              type="button"
+              aria-pressed={selectedTopicKey === topic.cluster_key}
+              title={titleFor(topic)}
+              onClick={() => onActivate(topic)}
+              style={{ fontSize: `${fontSize}px` }}
+              className={`max-w-full rounded px-1.5 py-0.5 leading-tight transition-colors ${
+                selectedTopicKey === topic.cluster_key
+                  ? "bg-[var(--accent-blue-muted)] text-[var(--accent-blue)]"
+                  : "text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-main)]"
+              }`}
+            >
+              {label}
+            </button>
+            {documentScoped && topic.library_coverage && (
+              <button
+                type="button"
+                aria-label={`Show related passages for ${label}`}
+                title={coverageTitleFor(topic)}
+                onClick={() => onActivateCoverage?.(topic)}
+                className="whitespace-nowrap rounded-full bg-[var(--bg-active)] px-1.5 py-0.5 text-xs font-medium tabular-nums text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-main)]"
+              >
+                {topic.library_coverage.related_document_count.toLocaleString()} /{" "}
+                {topic.library_coverage.eligible_document_count.toLocaleString()} docs
+              </button>
+            )}
+          </span>
         ) : (
           <button
             type="button"

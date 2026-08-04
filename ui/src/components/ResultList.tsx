@@ -14,6 +14,7 @@ import {
   HardDrive,
   Hash,
   Info,
+  Layers,
   RefreshCw,
   User,
   X,
@@ -63,6 +64,11 @@ import {
   buildSearchResultsSummaryInput,
   searchResultsSummaryKey,
 } from "../lib/utils/searchResultsSummary";
+import {
+  configuredLibraryRoots,
+  pathIsWithinRoot,
+  pathsEqual,
+} from "../lib/configuredRoots";
 
 function originLabel(origin: SourceOrigin): string {
   if ("TextFile" in origin) return `L${origin.TextFile.line}`;
@@ -97,6 +103,36 @@ function validateNewFileName(name: string): string | null {
   if (name === "." || name === "..") return "Invalid file name";
   if (/[\\/]/.test(name)) return "File name cannot contain path separators";
   return null;
+}
+
+function sanitizeSuggestedNamePart(value: string): string {
+  const sanitized = value
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[. ]+$/g, "");
+  return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(sanitized)
+    ? `_${sanitized}`
+    : sanitized;
+}
+
+function suggestedFileName(entry: FileEntry): string | null {
+  const title = entry.title?.trim();
+  if (!title) return null;
+
+  const author = entry.author?.trim();
+  const year = entry.publication_date?.match(/^\d{4}/)?.[0];
+  const descriptiveName = [author, title].filter(Boolean).join(" - ");
+  const stem = sanitizeSuggestedNamePart(
+    year ? `${descriptiveName} (${year})` : descriptiveName,
+  );
+  if (!stem) return null;
+
+  const currentName = fileName(entry.path);
+  const extensionStart = currentName.lastIndexOf(".");
+  const extension = extensionStart > 0 ? currentName.slice(extensionStart) : "";
+  const suggestion = `${stem}${extension}`;
+  return suggestion === currentName ? null : suggestion;
 }
 
 function formatSize(bytes: number): string {
@@ -439,6 +475,17 @@ export default function ResultList({
   const directory = useSettingsStore((s) => s.directory);
   const favorites = useSettingsStore((s) => s.favorites);
   const recentDirs = useSettingsStore((s) => s.recentDirs);
+  const configuredRoots = React.useMemo(
+    () => configuredLibraryRoots({ directory, favorites, recentDirs }),
+    [directory, favorites, recentDirs],
+  );
+  const additionalRootsForPath = React.useCallback(
+    (path: string) =>
+      configuredRoots.filter(
+        (root) => !pathsEqual(root, directory) && pathIsWithinRoot(path, root),
+      ),
+    [configuredRoots, directory],
+  );
   const selectedCollectionId = useResearchStore((s) => s.selectedCollectionId);
   const selectedTagId = useResearchStore((s) => s.selectedTagId);
   const draftCollectionExpression = useResearchStore((s) => s.draftCollectionExpression);
@@ -451,7 +498,11 @@ export default function ResultList({
   const [expandedFiles, setExpandedFiles] = useState<Set<number>>(new Set());
   const [showOmittedFiles, setShowOmittedFiles] = useState(false);
   const [openSummaryKey, setOpenSummaryKey] = useState<string | null>(null);
-  const [renameTarget, setRenameTarget] = useState<{ path: string; name: string } | null>(null);
+  const [renameTarget, setRenameTarget] = useState<{
+    path: string;
+    name: string;
+    suggestion: string | null;
+  } | null>(null);
   const [moveTarget, setMoveTarget] = useState<{
     path: string;
     root: string;
@@ -504,12 +555,23 @@ export default function ResultList({
   const rows = buildRows(results, expandedFiles);
   const onToast = (message: string, type: "success" | "error") => addToast(message, { type });
 
+  const openRenameDialog = (path: string) => {
+    const entry = [...displayedFileList, ...displayedOmittedFileList].find(
+      (candidate) => candidate.path === path,
+    );
+    setRenameTarget({
+      path,
+      name: fileName(path),
+      suggestion: entry ? suggestedFileName(entry) : null,
+    });
+  };
+
   const handleRowContextMenu = (
     event: React.MouseEvent,
     target: ContextMenuTarget,
   ) => {
-    const otherRoots = Array.from(new Set([...favorites, ...recentDirs, directory])).filter(
-      (root) => root && root !== dirName(target.path),
+    const otherRoots = configuredRoots.filter(
+      (root) => !pathsEqual(root, dirName(target.path)),
     );
     openMenu({
       event,
@@ -520,7 +582,7 @@ export default function ResultList({
         capabilities: { canOpenInFileManager: isTauri },
         settings,
         onToast,
-        onRenameRequest: (path) => setRenameTarget({ path, name: fileName(path) }),
+        onRenameRequest: openRenameDialog,
         availableRoots: otherRoots,
         onMoveRequest: (path) =>
           setMoveTarget({ path, root: otherRoots[0] ?? "", roots: otherRoots }),
@@ -559,13 +621,12 @@ export default function ResultList({
     }
   };
 
-  const handleRenameSubmit = async (event: React.FormEvent) => {
-    event.preventDefault();
+  const renameFile = async (nextName: string) => {
     if (!renameTarget) return;
 
     const oldPath = renameTarget.path;
     const oldName = fileName(oldPath);
-    const nextName = renameTarget.name.trim();
+    nextName = nextName.trim();
     if (nextName === oldName) {
       setRenameTarget(null);
       return;
@@ -591,6 +652,17 @@ export default function ResultList({
       console.error("Failed to rename file:", error);
       onToast("Failed to rename file", "error");
     }
+  };
+
+  const handleRenameSubmit = (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!renameTarget) return;
+    void renameFile(renameTarget.name);
+  };
+
+  const handleSuggestedRename = () => {
+    if (!renameTarget?.suggestion) return;
+    void renameFile(renameTarget.suggestion);
   };
 
   const handleMoveSubmit = async (event: React.FormEvent) => {
@@ -643,6 +715,23 @@ export default function ResultList({
           }}
           className="mb-3 h-8 w-full rounded border border-[var(--border-main)] bg-[var(--bg-active)] px-2 text-sm text-[var(--text-main)] outline-none focus:border-[var(--accent-blue)]"
         />
+        {renameTarget.suggestion && (
+          <div className="mb-3 rounded border border-[var(--border-main)] bg-[var(--bg-active)] p-2">
+            <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-[var(--text-dim)]">
+              Suggested from metadata
+            </div>
+            <div className="break-words text-xs text-[var(--text-main)]">
+              {renameTarget.suggestion}
+            </div>
+            <button
+              type="button"
+              onClick={handleSuggestedRename}
+              className="mt-2 rounded border border-[var(--accent-blue)] px-2.5 py-1 text-xs font-medium text-[var(--accent-blue)] hover:bg-[var(--bg-hover)]"
+            >
+              Rename to suggestion
+            </button>
+          </div>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -704,7 +793,10 @@ export default function ResultList({
   const rowVirtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: (index) => (rows[index].kind === "file" ? 40 : 28),
+    estimateSize: (index) => {
+      const row = rows[index];
+      return row.kind === "file" ? (row.fileMatches.title ? 48 : 40) : 28;
+    },
     overscan: 20,
   });
 
@@ -865,6 +957,7 @@ export default function ResultList({
               leadingDetails={documentDetails?.(entry) ?? []}
               accessory={documentAccessory?.(entry)}
               displayFields={fileDisplayFields}
+              additionalRoots={additionalRootsForPath(entry.path)}
               selected={selectedMatch?.path === entry.path}
               onClick={() => onFileClick(entry.path)}
               onContextMenu={(event) =>
@@ -901,6 +994,7 @@ export default function ResultList({
                       key={entry.path}
                       entry={entry}
                       displayFields={[]}
+                      additionalRoots={additionalRootsForPath(entry.path)}
                       selected={selectedMatch?.path === entry.path}
                       detail={formatOmittedReason(entry)}
                       muted
@@ -1047,6 +1141,8 @@ export default function ResultList({
                     <FileHeader
                       path={row.path}
                       count={row.fileMatches.matches.length}
+                      title={row.fileMatches.title}
+                      additionalRoots={additionalRootsForPath(row.path)}
                       onClick={() => onFileClick(row.path)}
                       onContextMenu={(event) =>
                         handleRowContextMenu(event, {
@@ -1111,11 +1207,15 @@ function formatOmittedReason(entry: OmittedFileEntry): string {
 function FileHeader({
   path,
   count,
+  title,
+  additionalRoots,
   onClick,
   onContextMenu,
 }: {
   path: string;
   count: number;
+  title?: string | null;
+  additionalRoots: string[];
   onClick: () => void;
   onContextMenu: (event: React.MouseEvent) => void;
 }) {
@@ -1125,7 +1225,19 @@ function FileHeader({
       onClick={onClick}
       onContextMenu={onContextMenu}
     >
-      <span className="text-xs font-semibold text-[var(--text-main)] truncate">{fileName(path)}</span>
+      <AdditionalRootsIndicator roots={additionalRoots} />
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="truncate text-xs font-semibold text-[var(--text-main)]">
+          {fileName(path)}
+        </span>
+        {title && (
+          <Tooltip content={title}>
+            <span className="truncate text-[11px] font-normal text-[var(--text-muted)]">
+              {title}
+            </span>
+          </Tooltip>
+        )}
+      </span>
       <span className="text-[10px] text-[var(--text-muted)] bg-[var(--bg-active)] px-1.5 py-0.5 rounded-full">
         {count}
       </span>
@@ -1262,6 +1374,7 @@ function FileEntryRowAdapter({
   leadingDetails = [],
   accessory,
   displayFields,
+  additionalRoots = [],
   selected,
   detail,
   muted = false,
@@ -1272,6 +1385,7 @@ function FileEntryRowAdapter({
   leadingDetails?: DocumentDetail[];
   accessory?: React.ReactNode;
   displayFields: FileDisplayField[];
+  additionalRoots?: string[];
   selected: boolean;
   detail?: string;
   muted?: boolean;
@@ -1301,6 +1415,7 @@ function FileEntryRowAdapter({
     <DocumentEntryRow
       entry={entry}
       details={details}
+      nameAccessory={<AdditionalRootsIndicator roots={additionalRoots} />}
       accessory={accessory}
       selected={selected}
       muted={muted}
@@ -1308,6 +1423,28 @@ function FileEntryRowAdapter({
       onContextMenu={onContextMenu}
       onTagClick={(tag) => useResearchStore.getState().setSelectedTag(tag.id)}
     />
+  );
+}
+
+function AdditionalRootsIndicator({ roots }: { roots: string[] }) {
+  if (roots.length === 0) return null;
+  const label = `Also in ${roots.length === 1 ? "root" : `${roots.length} roots`}: ${roots.join(", ")}`;
+
+  return (
+    <Tooltip
+      content={
+        <span className="font-mono break-all">
+          Also in {roots.length === 1 ? "root" : `${roots.length} roots`}: {roots.join(", ")}
+        </span>
+      }
+    >
+      <span
+        className="inline-flex h-5 w-5 flex-shrink-0 items-center justify-center text-[var(--accent-blue)]"
+        aria-label={label}
+      >
+        <Layers size={12} aria-hidden="true" />
+      </span>
+    </Tooltip>
   );
 }
 

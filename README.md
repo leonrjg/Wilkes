@@ -92,8 +92,14 @@ The endpoint:
 - listens on the configured IPv4 or IPv6 address;
 - can require a persistent bearer token stored separately from `settings.json`;
 - stays available while Wilkes is running, even when its chat pane is closed;
+- reports the document and PDF page currently visible in Wilkes through
+  `list_context`, even when its chat pane is closed;
 - reads only documents inside the current, favorite, or recent Wilkes library
   roots.
+
+The active document reported by `list_context` is informational. External
+clients must continue to pass an explicit document path to `get_document_text`,
+`get_related_documents`, and `get_file_metadata`.
 
 Binding beyond loopback makes the endpoint reachable from the corresponding
 network interfaces. Without token authentication, anyone who can reach the

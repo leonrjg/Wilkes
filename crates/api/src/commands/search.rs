@@ -9,6 +9,7 @@ use wilkes_core::embed::Embedder;
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::generate::Generator;
+use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::search::grep::GrepSearchProvider;
 use wilkes_core::search::semantic::SemanticSearchProvider;
 use wilkes_core::search::SearchProvider;
@@ -22,11 +23,45 @@ pub struct SearchHandle {
     pub rx: mpsc::Receiver<FileMatches>,
     worker: JoinHandle<Vec<String>>,
     log: Option<SearchLogTracker>,
+    metadata: Option<SearchMetadata>,
+}
+
+struct SearchMetadata {
+    cache: Arc<Mutex<MetadataCache>>,
+    primary_source: MetadataSource,
 }
 
 impl SearchHandle {
+    pub fn with_metadata(
+        mut self,
+        cache: Option<Arc<Mutex<MetadataCache>>>,
+        primary_source: MetadataSource,
+    ) -> Self {
+        self.metadata = cache.map(|cache| SearchMetadata {
+            cache,
+            primary_source,
+        });
+        self
+    }
+
     pub async fn next(&mut self) -> Option<FileMatches> {
-        self.rx.recv().await
+        let mut result = self.rx.recv().await?;
+        if let (Some(metadata), Some(identity)) =
+            (&self.metadata, FileIdentity::for_path(&result.path))
+        {
+            result.title = metadata
+                .cache
+                .lock()
+                .ok()
+                .and_then(|cache| {
+                    cache
+                        .get_valid_with_primary(&result.path, identity, metadata.primary_source)
+                        .ok()
+                })
+                .flatten()
+                .and_then(|cached| cached.metadata.title);
+        }
+        Some(result)
     }
 
     /// Wait for the worker to finish and return any non-fatal errors it collected.
@@ -151,7 +186,12 @@ pub fn start_search(
             .unwrap_or_else(|e| vec![format!("search failed: {e:#}")])
     });
 
-    SearchHandle { rx, worker, log }
+    SearchHandle {
+        rx,
+        worker,
+        log,
+        metadata: None,
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +199,64 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+    use wilkes_core::types::{DocumentMetadata, FileType};
+
+    #[tokio::test]
+    async fn search_handle_enriches_cached_titles_and_preserves_missing_titles() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("paper.txt");
+        let uncached_path = dir.path().join("untitled.txt");
+        fs::write(&path, "searchable text").unwrap();
+        fs::write(&uncached_path, "other searchable text").unwrap();
+        let identity = FileIdentity::for_path(&path).unwrap();
+        let cache = Arc::new(Mutex::new(MetadataCache::open(dir.path()).unwrap()));
+        cache
+            .lock()
+            .unwrap()
+            .upsert(
+                &path,
+                identity,
+                &DocumentMetadata {
+                    title: Some("Composed title".into()),
+                    ..DocumentMetadata::default()
+                },
+                MetadataSource::File,
+            )
+            .unwrap();
+
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(FileMatches {
+            path: path.clone(),
+            file_type: FileType::PlainText,
+            title: None,
+            matches: Vec::new(),
+        })
+        .await
+        .unwrap();
+        tx.send(FileMatches {
+            path: uncached_path,
+            file_type: FileType::PlainText,
+            title: None,
+            matches: Vec::new(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let worker = tokio::spawn(async { Vec::new() });
+        let mut handle = SearchHandle {
+            rx,
+            worker,
+            log: None,
+            metadata: None,
+        }
+        .with_metadata(Some(cache), MetadataSource::File);
+
+        let result = handle.next().await.unwrap();
+        let uncached_result = handle.next().await.unwrap();
+
+        assert_eq!(result.title.as_deref(), Some("Composed title"));
+        assert_eq!(uncached_result.title, None);
+    }
 
     #[tokio::test]
     async fn test_start_search_grep() {
@@ -392,6 +490,7 @@ mod tests {
             rx,
             worker,
             log: None,
+            metadata: None,
         };
         let errors = handle.finish().await;
         assert!(!errors.is_empty());

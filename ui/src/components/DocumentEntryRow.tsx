@@ -27,6 +27,8 @@ interface DocumentEntry {
 interface Props {
   entry: DocumentEntry;
   details?: DocumentDetail[];
+  /** Compact status rendered immediately after the filename. */
+  nameAccessory?: React.ReactNode;
   /** Rendered directly below the row, outside its button so it can hold its
    *  own controls. Absent for every caller that has nothing to attach. */
   accessory?: React.ReactNode;
@@ -44,6 +46,7 @@ export function fileName(path: string): string {
 export function DocumentEntryRow({
   entry,
   details = [],
+  nameAccessory,
   accessory,
   selected = false,
   muted = false,
@@ -99,6 +102,7 @@ export function DocumentEntryRow({
       }`}
     >
       <span className="flex w-full min-w-0 items-center gap-1.5">
+        {nameAccessory}
         <span
           className={`min-w-0 truncate text-sm font-medium ${
             muted ? "text-[var(--text-muted)]" : "text-[var(--text-main)]"

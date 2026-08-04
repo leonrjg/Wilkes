@@ -29,7 +29,7 @@ use crate::{
     context::{ActiveDoc, ContextFile},
     reader,
     search::SearchService,
-    session::{read_access_error, ContextStateHandle},
+    session::ContextStateHandle,
 };
 
 const DEFAULT_TEXT_CHAR_LIMIT: usize = 24_000;
@@ -45,6 +45,8 @@ const MAX_LIST_DOCUMENTS_LIMIT: usize = 500;
 const DEFAULT_SEARCH_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 const SEMANTIC_INDEX_GUIDANCE: &str = "The user can enable the semantic index in Wilkes Settings. Use exact search with mode='exact' instead in the meantime.";
+const EXTERNAL_DOCUMENT_PATH_REQUIRED: &str =
+    "External Wilkes MCP does not default document tools to the active document; pass path explicitly after reading list_context.";
 
 /// Names of the read-only tools this server exposes. Shared with the permission
 /// boundary in `session.rs` so calls to Wilkes's *own* MCP server are
@@ -118,12 +120,39 @@ pub(crate) async fn start(
     .await
 }
 
+/// Live application context exposed by the external MCP server.
+///
+/// This is intentionally narrower than a chat session context: it reports the
+/// document visible in Wilkes, but does not make that document an implicit
+/// argument to document-reading tools.
+#[derive(Clone, Debug, Default)]
+pub struct ExternalMcpContext {
+    active_doc: Arc<RwLock<Option<ActiveDoc>>>,
+}
+
+impl ExternalMcpContext {
+    pub fn set_active_document(&self, path: Option<String>, page: Option<u32>) {
+        *self
+            .active_doc
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            path.map(|path| ActiveDoc { path, page });
+    }
+
+    fn active_document(&self) -> Option<ActiveDoc> {
+        self.active_doc
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
 /// Application-scoped MCP server for regular Claude Code and Codex clients.
 ///
-/// Unlike the private chat server, this endpoint has no active-document or
-/// per-conversation context. Its readable scope is resolved dynamically from
-/// [`SearchService::library_roots`], so settings changes take effect without
-/// restarting the listener.
+/// Unlike the private chat server, this endpoint has no per-conversation
+/// context. Its active document and readable library scope are resolved
+/// dynamically, so viewer and settings changes take effect without restarting
+/// the listener.
 pub struct ExternalMcpRuntime {
     runtime: McpRuntime,
 }
@@ -159,6 +188,7 @@ pub async fn start_external(
     port: u16,
     token: Option<String>,
     search: Arc<dyn SearchService>,
+    context: ExternalMcpContext,
 ) -> anyhow::Result<ExternalMcpRuntime> {
     if port == 0 {
         anyhow::bail!("External MCP port must be between 1 and 65535");
@@ -168,7 +198,7 @@ pub async fn start_external(
         listener,
         "/mcp".to_string(),
         token,
-        McpContext::Library,
+        McpContext::Library(context),
         PathBuf::new(),
         Some(search),
         None,
@@ -188,7 +218,7 @@ enum HostValidation {
 #[derive(Clone, Debug)]
 enum McpContext {
     Session(ContextStateHandle),
-    Library,
+    Library(ExternalMcpContext),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -416,13 +446,13 @@ impl WilkesMcp {
     async fn context_snapshot(&self) -> crate::session::ContextSnapshot {
         match &self.context {
             McpContext::Session(context) => context.snapshot(),
-            McpContext::Library => {
+            McpContext::Library(context) => {
                 let root = match &self.search {
                     Some(search) => search.clone().default_root().await,
                     None => None,
                 };
                 crate::session::ContextSnapshot {
-                    active_doc: None,
+                    active_doc: context.active_document(),
                     context_files: Vec::new(),
                     root: crate::context::root_context(root.as_deref()),
                     branch_history: None,
@@ -440,8 +470,10 @@ impl WilkesMcp {
 
     async fn is_path_allowed(&self, path: &Path) -> bool {
         match &self.context {
-            McpContext::Session(context) => context.is_allowed(path),
-            McpContext::Library => is_within_roots(path, &self.library_roots().await),
+            McpContext::Session(context) => {
+                context.is_allowed(path) || is_within_roots(path, &self.library_roots().await)
+            }
+            McpContext::Library(_) => is_within_roots(path, &self.library_roots().await),
         }
     }
 
@@ -458,7 +490,7 @@ impl WilkesMcp {
                 }
                 Ok(self.cwd.clone())
             }
-            McpContext::Library => {
+            McpContext::Library(_) => {
                 let search = self
                     .search
                     .clone()
@@ -493,6 +525,13 @@ fn is_within_roots(path: &Path, roots: &[PathBuf]) -> bool {
     })
 }
 
+fn mcp_access_error(path: &Path) -> String {
+    format!(
+        "{} is not in a configured Wilkes library root or this chat's context. Open its containing directory as a Wilkes root or add the file to the chat context.",
+        path.display()
+    )
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum IntegerOrString<T> {
@@ -511,19 +550,6 @@ where
         Some(IntegerOrString::String(value)) => value
             .parse()
             .map(Some)
-            .map_err(|_| serde::de::Error::custom(format!("invalid integer string {value:?}"))),
-    }
-}
-
-fn deserialize_integer<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de> + std::str::FromStr,
-{
-    match IntegerOrString::<T>::deserialize(deserializer)? {
-        IntegerOrString::Integer(value) => Ok(value),
-        IntegerOrString::String(value) => value
-            .parse()
             .map_err(|_| serde::de::Error::custom(format!("invalid integer string {value:?}"))),
     }
 }
@@ -554,11 +580,16 @@ where
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetDocumentTextParams {
+    /// Document to read. Required for external MCP clients; an in-app chat may
+    /// omit it to use that chat session's active document.
     path: Option<String>,
+    /// One 1-based PDF page to read. Pass either page or page_range, not both.
     #[serde(default, deserialize_with = "deserialize_optional_integer")]
     #[schemars(with = "Option<u32>")]
     page: Option<u32>,
-    page_range: Option<PageRange>,
+    /// Inclusive 1-based PDF page range in "N-M" format, for example "7-9".
+    page_range: Option<String>,
+    /// Maximum characters to return (default 24000, capped at 120000).
     #[serde(default, deserialize_with = "deserialize_optional_integer")]
     #[schemars(with = "Option<usize>")]
     max_chars: Option<usize>,
@@ -574,8 +605,8 @@ struct SearchParams {
     scope: Option<SearchScopeParam>,
     /// Corpus/index root. Omit unless searching a different root is intentional.
     root: Option<String>,
-    /// Restrict search to this single file inside root. Use this for questions
-    /// about the open/current document or a concrete context document.
+    /// Restrict search to one file in any configured library root or chat
+    /// context. Use this for questions about a concrete document.
     file: Option<String>,
     /// Maximum matches to return.
     #[serde(default, deserialize_with = "deserialize_optional_integer")]
@@ -599,7 +630,8 @@ struct SearchParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetRelatedDocumentsParams {
-    /// Document to find related documents for. Omit to use the active document.
+    /// Document to find related documents for. Required for external MCP
+    /// clients; an in-app chat may omit it to use its active document.
     path: Option<String>,
     /// Search location. Use all for the whole library; omit for the current root.
     scope: Option<SearchScopeParam>,
@@ -627,7 +659,8 @@ struct LiteratureSearchParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetFileMetadataParams {
-    /// Document to read metadata for. Omit to use the active document.
+    /// Document to read metadata for. Required for external MCP clients; an
+    /// in-app chat may omit it to use its active document.
     path: Option<String>,
 }
 
@@ -685,13 +718,9 @@ enum SearchScopeParam {
     All,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 struct PageRange {
-    #[serde(alias = "start_page", deserialize_with = "deserialize_integer")]
-    #[schemars(with = "u32")]
     start: u32,
-    #[serde(alias = "end_page", deserialize_with = "deserialize_integer")]
-    #[schemars(with = "u32")]
     end: u32,
 }
 
@@ -813,7 +842,7 @@ struct SearchMatchResponse {
 #[tool_router]
 impl WilkesMcp {
     #[tool(
-        description = "List the current Wilkes context: configured library roots, active root, and, for an in-app chat, its active document and explicitly added files."
+        description = "List the current Wilkes context: configured library roots, active root, the document currently visible in Wilkes, and any files explicitly added to an in-app chat."
     )]
     async fn list_context(&self) -> CallToolResult {
         let snapshot = self.context_snapshot().await;
@@ -840,7 +869,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Read Wilkes-extracted document text from the active document, a context file, or any document in the current root. Use page for one PDF page or page_range for an inclusive PDF page range."
+        description = "Read Wilkes-extracted document text from any configured Wilkes library root. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. Use page for one PDF page or page_range in \"N-M\" format (for example, \"7-9\") for an inclusive PDF page range."
     )]
     async fn get_document_text(
         &self,
@@ -853,7 +882,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Find documents semantically related to a document in Wilkes. Omit path to use the active document. Set scope='all' to search the whole library; otherwise results are limited to the current root."
+        description = "Find documents semantically related to a document in Wilkes. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. Set scope='all' to search the whole library; otherwise results are limited to the current root."
     )]
     async fn get_related_documents(
         &self,
@@ -866,7 +895,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Read full bibliographic metadata for one Wilkes document: title, author, DOI, publication date, and any Semantic Scholar / OpenAlex enrichment. Omit path to use the active document."
+        description = "Read full bibliographic metadata for a document in any configured Wilkes library root: title, author, DOI, publication date, and any Semantic Scholar / OpenAlex enrichment. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document."
     )]
     async fn get_file_metadata(
         &self,
@@ -892,7 +921,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Search Wilkes-readable documents. You must explicitly set mode='exact' for literal/regex text search or mode='semantic' for meaning-based search; mode has no default. If the user asks about the open/current document or a specific context file, set file to that document path; omit file only for corpus-wide searches."
+        description = "Search Wilkes-readable documents. You must explicitly set mode='exact' for literal/regex text search or mode='semantic' for meaning-based search; mode has no default. Set scope='all' to search every configured library root; omit scope to search the current root. If the user asks about a specific document, set file to that document path; omit file only for corpus-wide searches."
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         match search_documents_for_mcp(self, params).await {
@@ -1159,45 +1188,26 @@ async fn get_document_text_for_mcp(
     mcp: &WilkesMcp,
     params: GetDocumentTextParams,
 ) -> Result<GetDocumentTextResponse, String> {
-    match &mcp.context {
-        McpContext::Session(context) => get_document_text(context, params),
-        McpContext::Library => {
-            let path = params
-                .path
-                .as_ref()
-                .filter(|path| !path.trim().is_empty())
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    "External Wilkes MCP has no active document; pass path explicitly.".to_string()
-                })?;
-            if !mcp.is_path_allowed(&path).await {
-                return Err(read_access_error(&path));
-            }
-            get_document_text_at_path(path, None, params)
-        }
-    }
-}
-
-fn get_document_text(
-    context: &ContextStateHandle,
-    params: GetDocumentTextParams,
-) -> Result<GetDocumentTextResponse, String> {
-    let snapshot = context.snapshot();
-    let (path, default_page) = match params.path.as_ref() {
-        Some(path) => (PathBuf::from(path), None),
-        None => {
-            let active_doc = snapshot
+    let (path, default_page) = match (&mcp.context, params.path.as_ref()) {
+        (_, Some(path)) if !path.trim().is_empty() => (PathBuf::from(path), None),
+        (_, Some(_)) => return Err("Document path cannot be empty.".to_string()),
+        (McpContext::Session(context), None) => {
+            let active_doc = context
+                .snapshot()
                 .active_doc
                 .ok_or_else(|| "No active Wilkes document is available.".to_string())?;
             (PathBuf::from(active_doc.path), active_doc.page)
+        }
+        (McpContext::Library(_), None) => {
+            return Err(EXTERNAL_DOCUMENT_PATH_REQUIRED.to_string());
         }
     };
 
     if params.page.is_some() && params.page_range.is_some() {
         return Err("Pass either page or page_range, not both.".to_string());
     }
-    if !context.is_allowed(&path) {
-        return Err(read_access_error(&path));
+    if !mcp.is_path_allowed(&path).await {
+        return Err(mcp_access_error(&path));
     }
     get_document_text_at_path(path, default_page, params)
 }
@@ -1208,9 +1218,9 @@ fn get_document_text_at_path(
     params: GetDocumentTextParams,
 ) -> Result<GetDocumentTextResponse, String> {
     let started_at = Instant::now();
-    let page_range = match (params.page, params.page_range) {
+    let page_range = match (params.page, params.page_range.as_deref()) {
         (Some(page), None) => Some((page, page)),
-        (None, Some(range)) => Some((range.start, range.end)),
+        (None, Some(range)) => Some(parse_page_range(range)?),
         (None, None) => default_page.map(|page| (page, page)),
         (Some(_), Some(_)) => return Err("Pass either page or page_range, not both.".to_string()),
     };
@@ -1258,6 +1268,24 @@ fn get_document_text_at_path(
     Ok(response)
 }
 
+fn parse_page_range(value: &str) -> Result<(u32, u32), String> {
+    let invalid = || {
+        format!(
+            "Invalid page_range {value:?}. Use \"N-M\" with positive 1-based page numbers, for example \"1-2\"."
+        )
+    };
+    let (start, end) = value.trim().split_once('-').ok_or_else(&invalid)?;
+    if end.contains('-') {
+        return Err(invalid());
+    }
+    let start = start.trim().parse::<u32>().map_err(|_| invalid())?;
+    let end = end.trim().parse::<u32>().map_err(|_| invalid())?;
+    if start == 0 || end == 0 {
+        return Err(invalid());
+    }
+    Ok((start.min(end), start.max(end)))
+}
+
 async fn search_documents_for_mcp(
     mcp: &WilkesMcp,
     mut params: SearchParams,
@@ -1266,19 +1294,19 @@ async fn search_documents_for_mcp(
         McpContext::Session(context) => {
             search_documents(context, mcp.search.clone(), &mcp.cwd, params).await
         }
-        McpContext::Library => {
+        McpContext::Library(_) => {
             let root = match params.root.as_ref() {
                 Some(root) if !root.trim().is_empty() => PathBuf::from(root),
                 Some(_) => return Err("Search root cannot be empty.".to_string()),
                 None => mcp.current_root().await?,
             };
             if !is_within_roots(&root, &mcp.library_roots().await) {
-                return Err(read_access_error(&root));
+                return Err(mcp_access_error(&root));
             }
             if let Some(file) = params.file.as_ref() {
                 let file = PathBuf::from(file);
                 if !mcp.is_path_allowed(&file).await {
-                    return Err(read_access_error(&file));
+                    return Err(mcp_access_error(&file));
                 }
             }
             params.root = Some(root.to_string_lossy().into_owned());
@@ -1320,14 +1348,15 @@ async fn search_documents(
         wilkes_core::types::SearchScope::File { path } => Some(display_path(path)),
     };
     let query_text = query.pattern.clone();
-    let collected = search
-        .clone()
-        .search(query, max_files)
-        .await
-        .map_err(|message| match mode {
-            SearchModeParam::Semantic => with_semantic_index_guidance(message),
-            SearchModeParam::Exact => message,
-        })?;
+    let collected =
+        search
+            .clone()
+            .search(query, max_files)
+            .await
+            .map_err(|message| match mode {
+                SearchModeParam::Semantic => with_semantic_index_guidance(message),
+                SearchModeParam::Exact => message,
+            })?;
 
     let mut matches = Vec::with_capacity(collected.files.len());
     for file in collected.files {
@@ -1364,10 +1393,7 @@ async fn search_documents(
 /// Resolve the document path for a single-document tool: an explicit `path`
 /// when given, otherwise the session's active document. Enforces the same
 /// read-access boundary every other document tool uses.
-async fn resolve_document_path(
-    mcp: &WilkesMcp,
-    path: Option<String>,
-) -> Result<PathBuf, String> {
+async fn resolve_document_path(mcp: &WilkesMcp, path: Option<String>) -> Result<PathBuf, String> {
     let explicit = path
         .as_ref()
         .filter(|p| !p.trim().is_empty())
@@ -1379,14 +1405,12 @@ async fn resolve_document_path(
             .active_doc
             .map(|document| PathBuf::from(document.path))
             .ok_or_else(|| "No active document is available; pass path explicitly.".to_string())?,
-        (McpContext::Library, None) => {
-            return Err(
-                "External Wilkes MCP has no active document; pass path explicitly.".to_string(),
-            );
+        (McpContext::Library(_), None) => {
+            return Err(EXTERNAL_DOCUMENT_PATH_REQUIRED.to_string());
         }
     };
     if !mcp.is_path_allowed(&path).await {
-        return Err(read_access_error(&path));
+        return Err(mcp_access_error(&path));
     }
     Ok(path)
 }
@@ -1435,10 +1459,10 @@ async fn list_documents_for_mcp(
         };
         // The external, library-scoped server must not list outside configured
         // roots; a session server already trusts its own root.
-        if matches!(mcp.context, McpContext::Library)
+        if matches!(mcp.context, McpContext::Library(_))
             && !is_within_roots(&root, &mcp.library_roots().await)
         {
-            return Err(read_access_error(&root));
+            return Err(mcp_access_error(&root));
         }
         vec![root]
     };
@@ -1478,29 +1502,21 @@ async fn get_related_documents_for_mcp(
     mcp: &WilkesMcp,
     mut params: GetRelatedDocumentsParams,
 ) -> Result<GetRelatedDocumentsResponse, String> {
+    let path = resolve_document_path(mcp, params.path.clone()).await?;
+    params.path = Some(path.to_string_lossy().into_owned());
+
     match &mcp.context {
         McpContext::Session(context) => {
             get_related_documents(context, mcp.search.clone(), &mcp.cwd, params).await
         }
-        McpContext::Library => {
-            let path = params
-                .path
-                .as_ref()
-                .filter(|path| !path.trim().is_empty())
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    "External Wilkes MCP has no active document; pass path explicitly.".to_string()
-                })?;
-            if !mcp.is_path_allowed(&path).await {
-                return Err(read_access_error(&path));
-            }
+        McpContext::Library(_) => {
             let root = match params.root.as_ref() {
                 Some(root) if !root.trim().is_empty() => PathBuf::from(root),
                 Some(_) => return Err("Related-documents root cannot be empty.".to_string()),
                 None => mcp.current_root().await?,
             };
             if !is_within_roots(&root, &mcp.library_roots().await) {
-                return Err(read_access_error(&root));
+                return Err(mcp_access_error(&root));
             }
             params.root = Some(root.to_string_lossy().into_owned());
             get_related_documents(
@@ -1687,7 +1703,16 @@ impl From<wilkes_core::types::Match> for SearchMatchResponse {
 
 fn structured(value: impl Serialize) -> CallToolResult {
     match serde_json::to_value(value) {
-        Ok(value) => CallToolResult::structured(value),
+        Ok(value) => match serde_yaml_ng::to_string(&value) {
+            Ok(yaml) => {
+                let mut result = CallToolResult::structured(value);
+                result.content = vec![ContentBlock::text(yaml)];
+                result
+            }
+            Err(err) => CallToolResult::error(vec![ContentBlock::text(format!(
+                "Failed to format Wilkes MCP response: {err}"
+            ))]),
+        },
         Err(err) => CallToolResult::error(vec![ContentBlock::text(format!(
             "Failed to serialize Wilkes MCP response: {err}"
         ))]),
@@ -1715,6 +1740,7 @@ mod tests {
         last_query: Mutex<Option<SearchQuery>>,
         last_related_query: Mutex<Option<RelatedDocumentsQuery>>,
         default_root: Option<PathBuf>,
+        library_roots: Vec<PathBuf>,
         response: Mutex<Option<CollectedSearch>>,
         related_response: Mutex<Option<Vec<RelatedDocument>>>,
         documents: Mutex<Option<FileListResponse>>,
@@ -1722,8 +1748,37 @@ mod tests {
     }
 
     #[test]
+    fn structured_response_uses_yaml_text_and_preserves_structured_content() {
+        let response = structured(serde_json::json!({
+            "document": {
+                "title": "Readable MCP responses",
+                "pages": 12
+            },
+            "tags": ["mcp", "yaml"]
+        }));
+        let serialized = serde_json::to_value(response).unwrap();
+
+        assert_eq!(
+            serialized["structuredContent"]["document"]["title"],
+            "Readable MCP responses"
+        );
+        assert_eq!(serialized["structuredContent"]["tags"][1], "yaml");
+
+        let text = serialized["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("document:\n"), "unexpected YAML: {text}");
+        assert!(text.contains("  title: Readable MCP responses\n"));
+        assert!(text.contains("tags:\n- mcp\n- yaml\n"));
+        assert!(!text.trim_start().starts_with('{'));
+    }
+
+    #[test]
     fn search_tool_schema_keeps_optional_parameters_typed() {
-        let mcp = WilkesMcp::new(McpContext::Library, PathBuf::new(), None, None);
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            None,
+            None,
+        );
         let search = &mcp.tool_router.map.get("search").unwrap().attr.input_schema;
         let properties = search
             .get("properties")
@@ -1757,8 +1812,45 @@ mod tests {
     }
 
     #[test]
+    fn document_text_schema_describes_page_range_format() {
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            None,
+            None,
+        );
+        let schema = &mcp
+            .tool_router
+            .map
+            .get("get_document_text")
+            .unwrap()
+            .attr
+            .input_schema;
+        let properties = schema["properties"].as_object().unwrap();
+
+        assert!(properties["page"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("1-based PDF page"));
+        assert!(properties["page_range"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("\"N-M\""));
+        assert_eq!(properties["page_range"]["type"], "string");
+        assert!(properties["max_chars"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("default 24000"));
+    }
+
+    #[test]
     fn all_tool_schemas_omit_nullable_unions() {
-        let mcp = WilkesMcp::new(McpContext::Library, PathBuf::new(), None, None);
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            None,
+            None,
+        );
         for route in mcp.tool_router.map.values() {
             assert_schema_has_no_null_union(
                 &serde_json::Value::Object(route.attr.input_schema.as_ref().clone()),
@@ -1783,13 +1875,38 @@ mod tests {
         assert_eq!(params.case_sensitive, Some(false));
         assert_eq!(params.is_regex, Some(true));
         assert_eq!(params.context_lines, Some(2));
+    }
 
-        let range: PageRange = serde_json::from_value(serde_json::json!({
-            "start_page": "1",
-            "end_page": "5"
+    #[test]
+    fn document_text_params_accept_page_range_string() {
+        let params: GetDocumentTextParams = serde_json::from_value(serde_json::json!({
+            "path": "paper.pdf",
+            "page_range": "7-10"
         }))
         .unwrap();
-        assert_eq!(range, PageRange { start: 1, end: 5 });
+        assert_eq!(params.page_range.as_deref(), Some("7-10"));
+
+        assert!(
+            serde_json::from_value::<GetDocumentTextParams>(serde_json::json!({
+                "path": "paper.pdf",
+                "page_range": { "start": 7, "end": 10 }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_page_range_string() {
+        assert_eq!(parse_page_range("7-10").unwrap(), (7, 10));
+        assert_eq!(parse_page_range(" 10 - 7 ").unwrap(), (7, 10));
+    }
+
+    #[test]
+    fn rejects_invalid_page_range_strings() {
+        for value in ["", "7", "0-2", "1-0", "1-2-3", "one-two"] {
+            let error = parse_page_range(value).unwrap_err();
+            assert!(error.contains("Use \"N-M\""), "unexpected error: {error}");
+        }
     }
 
     #[test]
@@ -1898,7 +2015,11 @@ mod tests {
         }
 
         async fn library_roots(self: Arc<Self>) -> Vec<PathBuf> {
-            self.default_root.clone().into_iter().collect()
+            if self.library_roots.is_empty() {
+                self.default_root.clone().into_iter().collect()
+            } else {
+                self.library_roots.clone()
+            }
         }
 
         async fn search(
@@ -1949,7 +2070,8 @@ mod tests {
         Arc::new(FakeSearch {
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
-            default_root: Some(root),
+            default_root: Some(root.clone()),
+            library_roots: vec![root],
             response: Mutex::new(None),
             related_response: Mutex::new(None),
             documents: Mutex::new(None),
@@ -1966,7 +2088,7 @@ mod tests {
         let outside = outside_dir.path().join("outside.txt");
         std::fs::write(&outside, "outside library").unwrap();
         let mcp = WilkesMcp::new(
-            McpContext::Library,
+            McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(fake_search_with_root(library.path().to_path_buf())),
             None,
@@ -1996,14 +2118,14 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.contains("not in the current root"));
+        assert!(error.contains("not in a configured Wilkes library root"));
     }
 
     #[tokio::test]
     async fn external_context_requires_explicit_document_path() {
         let library = tempdir().unwrap();
         let mcp = WilkesMcp::new(
-            McpContext::Library,
+            McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(fake_search_with_root(library.path().to_path_buf())),
             None,
@@ -2028,7 +2150,7 @@ mod tests {
         let library = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let mcp = WilkesMcp::new(
-            McpContext::Library,
+            McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(fake_search_with_root(library.path().to_path_buf())),
             None,
@@ -2051,7 +2173,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.contains("not in the current root"));
+        assert!(error.contains("not in a configured Wilkes library root"));
     }
 
     #[tokio::test]
@@ -2140,6 +2262,7 @@ mod tests {
             port,
             None,
             fake_search_with_root(library.path().to_path_buf()),
+            ExternalMcpContext::default(),
         )
         .await
         .unwrap();
@@ -2229,6 +2352,7 @@ mod tests {
             port,
             Some("test-token".to_string()),
             fake_search_with_root(library.path().to_path_buf()),
+            ExternalMcpContext::default(),
         )
         .await
         .unwrap();
@@ -2263,16 +2387,22 @@ mod tests {
         assert!(authorized.status().is_success());
     }
 
-    #[test]
-    fn reads_active_document_when_path_is_omitted() {
+    #[tokio::test]
+    async fn reads_active_document_when_path_is_omitted() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("active.txt");
         std::fs::write(&path, "active document text").unwrap();
         let context = ContextStateHandle::default();
         context.set_active_doc(Some(path.to_string_lossy().into_owned()), None);
+        let mcp = WilkesMcp::new(
+            McpContext::Session(context),
+            dir.path().to_path_buf(),
+            None,
+            None,
+        );
 
-        let response = get_document_text(
-            &context,
+        let response = get_document_text_for_mcp(
+            &mcp,
             GetDocumentTextParams {
                 path: None,
                 page: None,
@@ -2280,22 +2410,29 @@ mod tests {
                 max_chars: None,
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(response.text, "active document text");
         assert!(!response.truncated);
     }
 
-    #[test]
-    fn reads_explicit_context_file() {
+    #[tokio::test]
+    async fn reads_explicit_context_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("context.txt");
         std::fs::write(&path, "context document text").unwrap();
         let context = ContextStateHandle::default();
         context.add_context(path.to_string_lossy().into_owned(), None);
+        let mcp = WilkesMcp::new(
+            McpContext::Session(context),
+            dir.path().to_path_buf(),
+            None,
+            None,
+        );
 
-        let response = get_document_text(
-            &context,
+        let response = get_document_text_for_mcp(
+            &mcp,
             GetDocumentTextParams {
                 path: Some(path.to_string_lossy().into_owned()),
                 page: None,
@@ -2303,13 +2440,14 @@ mod tests {
                 max_chars: None,
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(response.text, "context document text");
     }
 
-    #[test]
-    fn reads_document_nested_in_current_root() {
+    #[tokio::test]
+    async fn reads_document_nested_in_current_root() {
         let dir = tempdir().unwrap();
         let nested = dir.path().join("nested");
         std::fs::create_dir(&nested).unwrap();
@@ -2317,9 +2455,15 @@ mod tests {
         std::fs::write(&path, "root document text").unwrap();
         let context = ContextStateHandle::default();
         context.set_search_root(Some(dir.path().to_string_lossy().into_owned()));
+        let mcp = WilkesMcp::new(
+            McpContext::Session(context),
+            dir.path().to_path_buf(),
+            None,
+            None,
+        );
 
-        let response = get_document_text(
-            &context,
+        let response = get_document_text_for_mcp(
+            &mcp,
             GetDocumentTextParams {
                 path: Some(path.to_string_lossy().into_owned()),
                 page: None,
@@ -2327,13 +2471,63 @@ mod tests {
                 max_chars: None,
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(response.text, "root document text");
     }
 
-    #[test]
-    fn denies_file_outside_current_root_and_context_with_guidance() {
+    #[tokio::test]
+    async fn in_app_mcp_reads_document_from_another_library_root() {
+        let dir = tempdir().unwrap();
+        let current_root = dir.path().join("current");
+        let other_root = dir.path().join("other");
+        std::fs::create_dir(&current_root).unwrap();
+        std::fs::create_dir(&other_root).unwrap();
+        let path = other_root.join("document.txt");
+        std::fs::write(&path, "other library root text").unwrap();
+
+        let context = ContextStateHandle::default();
+        context.set_search_root(Some(current_root.to_string_lossy().into_owned()));
+        let search = Arc::new(FakeSearch {
+            last_query: Mutex::new(None),
+            last_related_query: Mutex::new(None),
+            default_root: Some(current_root.clone()),
+            library_roots: vec![current_root.clone(), other_root],
+            response: Mutex::new(None),
+            related_response: Mutex::new(None),
+            documents: Mutex::new(None),
+            metadata: Mutex::new(None),
+        });
+        let mcp = WilkesMcp::new(
+            McpContext::Session(context),
+            current_root,
+            Some(search),
+            None,
+        );
+
+        let resolved = resolve_document_path(&mcp, Some(path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        assert_eq!(resolved, path);
+
+        let response = get_document_text_for_mcp(
+            &mcp,
+            GetDocumentTextParams {
+                path: Some(path.to_string_lossy().into_owned()),
+                page: None,
+                page_range: None,
+                max_chars: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.text, "other library root text");
+    }
+
+    #[tokio::test]
+    async fn denies_file_outside_library_roots_and_context_with_guidance() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("library");
         let sibling = dir.path().join("library-other");
@@ -2343,9 +2537,15 @@ mod tests {
         std::fs::write(&denied, "denied").unwrap();
         let context = ContextStateHandle::default();
         context.set_search_root(Some(root.to_string_lossy().into_owned()));
+        let mcp = WilkesMcp::new(
+            McpContext::Session(context),
+            root.clone(),
+            Some(fake_search_with_root(root)),
+            None,
+        );
 
-        let err = get_document_text(
-            &context,
+        let err = get_document_text_for_mcp(
+            &mcp,
             GetDocumentTextParams {
                 path: Some(denied.to_string_lossy().into_owned()),
                 page: None,
@@ -2353,20 +2553,21 @@ mod tests {
                 max_chars: None,
             },
         )
+        .await
         .unwrap_err();
 
         assert_eq!(
             err,
             format!(
-                "{} is not in the current root or this chat's context. The user can either move the file to this root, switch to that root, or add it to the context using the right-click menu on the file list",
+                "{} is not in a configured Wilkes library root or this chat's context. Open its containing directory as a Wilkes root or add the file to the chat context.",
                 denied.display()
             )
         );
     }
 
     #[cfg(unix)]
-    #[test]
-    fn denies_symlink_in_current_root_that_resolves_outside_it() {
+    #[tokio::test]
+    async fn denies_symlink_in_current_root_that_resolves_outside_it() {
         use std::os::unix::fs::symlink;
 
         let dir = tempdir().unwrap();
@@ -2378,9 +2579,15 @@ mod tests {
         symlink(&outside, &link).unwrap();
         let context = ContextStateHandle::default();
         context.set_search_root(Some(root.to_string_lossy().into_owned()));
+        let mcp = WilkesMcp::new(
+            McpContext::Session(context),
+            root.clone(),
+            Some(fake_search_with_root(root)),
+            None,
+        );
 
-        let err = get_document_text(
-            &context,
+        let err = get_document_text_for_mcp(
+            &mcp,
             GetDocumentTextParams {
                 path: Some(link.to_string_lossy().into_owned()),
                 page: None,
@@ -2388,21 +2595,28 @@ mod tests {
                 max_chars: None,
             },
         )
+        .await
         .unwrap_err();
 
-        assert!(err.contains("The user can either move the file to this root"));
+        assert!(err.contains("not in a configured Wilkes library root"));
     }
 
-    #[test]
-    fn limits_text_on_character_boundary() {
+    #[tokio::test]
+    async fn limits_text_on_character_boundary() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("unicode.txt");
         std::fs::write(&path, "aé日b").unwrap();
         let context = ContextStateHandle::default();
         context.add_context(path.to_string_lossy().into_owned(), None);
+        let mcp = WilkesMcp::new(
+            McpContext::Session(context),
+            dir.path().to_path_buf(),
+            None,
+            None,
+        );
 
-        let response = get_document_text(
-            &context,
+        let response = get_document_text_for_mcp(
+            &mcp,
             GetDocumentTextParams {
                 path: Some(path.to_string_lossy().into_owned()),
                 page: None,
@@ -2410,29 +2624,37 @@ mod tests {
                 max_chars: Some(3),
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(response.text, "aé日");
         assert!(response.truncated);
     }
 
-    #[test]
-    fn explicit_page_range_overrides_active_document_page() {
+    #[tokio::test]
+    async fn explicit_page_range_overrides_active_document_page() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("active.txt");
         std::fs::write(&path, "active document text").unwrap();
         let context = ContextStateHandle::default();
         context.set_active_doc(Some(path.to_string_lossy().into_owned()), Some(3));
+        let mcp = WilkesMcp::new(
+            McpContext::Session(context),
+            dir.path().to_path_buf(),
+            None,
+            None,
+        );
 
-        let response = get_document_text(
-            &context,
+        let response = get_document_text_for_mcp(
+            &mcp,
             GetDocumentTextParams {
                 path: None,
                 page: None,
-                page_range: Some(PageRange { start: 1, end: 5 }),
+                page_range: Some("1-5".to_string()),
                 max_chars: None,
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(response.page, None);
@@ -2587,6 +2809,7 @@ mod tests {
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
             default_root: None,
+            library_roots: Vec::new(),
             response: Mutex::new(None),
             related_response: Mutex::new(Some(Vec::new())),
             documents: Mutex::new(None),
@@ -2630,10 +2853,12 @@ mod tests {
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
             default_root: Some(default_root.clone()),
+            library_roots: Vec::new(),
             response: Mutex::new(Some(CollectedSearch {
                 files: vec![FileMatches {
                     path: path.clone(),
                     file_type: FileType::Pdf,
+                    title: None,
                     matches: vec![Match {
                         text_range: None,
                         matched_text: "IO programming".to_string(),
@@ -2714,6 +2939,7 @@ mod tests {
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
             default_root: Some(dir.path().join("active-root")),
+            library_roots: Vec::new(),
             response: Mutex::new(Some(CollectedSearch {
                 files: Vec::new(),
                 stats: SearchStats::default(),
@@ -2862,7 +3088,12 @@ mod tests {
             ],
             omitted: Vec::new(),
         });
-        let mcp = WilkesMcp::new(McpContext::Library, PathBuf::new(), Some(service), None);
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(service),
+            None,
+        );
 
         let response = list_documents_for_mcp(
             &mcp,
@@ -2897,7 +3128,12 @@ mod tests {
             semantic_scholar: None,
             openalex: None,
         });
-        let mcp = WilkesMcp::new(McpContext::Library, PathBuf::new(), Some(service), None);
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(service),
+            None,
+        );
 
         let response = get_file_metadata_for_mcp(
             &mcp,
@@ -2918,7 +3154,7 @@ mod tests {
     async fn get_file_metadata_requires_explicit_path_without_active_document() {
         let library = tempdir().unwrap();
         let mcp = WilkesMcp::new(
-            McpContext::Library,
+            McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(fake_search_with_root(library.path().to_path_buf())),
             None,
@@ -2931,6 +3167,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_context_reports_active_document_without_defaulting_get_tools() {
+        let library = tempdir().unwrap();
+        let active = library.path().join("active.pdf");
+        std::fs::write(&active, b"active document").unwrap();
+        let context = ExternalMcpContext::default();
+        context.set_active_document(Some(active.to_string_lossy().into_owned()), Some(4));
+        let mcp = WilkesMcp::new(
+            McpContext::Library(context),
+            PathBuf::new(),
+            Some(fake_search_with_root(library.path().to_path_buf())),
+            None,
+        );
+
+        let snapshot = mcp.context_snapshot().await;
+        let active_doc = snapshot.active_doc.expect("active document");
+        assert_eq!(active_doc.path, active.to_string_lossy());
+        assert_eq!(active_doc.page, Some(4));
+
+        let text_error = get_document_text_for_mcp(
+            &mcp,
+            GetDocumentTextParams {
+                path: None,
+                page: None,
+                page_range: None,
+                max_chars: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(text_error.contains("pass path explicitly"));
+
+        let related_error = get_related_documents_for_mcp(
+            &mcp,
+            GetRelatedDocumentsParams {
+                path: None,
+                scope: None,
+                root: None,
+                limit: None,
+                collection_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(related_error.contains("pass path explicitly"));
+
+        let metadata_error = get_file_metadata_for_mcp(&mcp, GetFileMetadataParams { path: None })
+            .await
+            .unwrap_err();
+        assert!(metadata_error.contains("pass path explicitly"));
+    }
+
+    #[tokio::test]
     async fn search_results_are_enriched_with_metadata() {
         let live_root = tempdir().unwrap();
         let path = live_root.path().join("hit.pdf");
@@ -2940,6 +3228,7 @@ mod tests {
             files: vec![FileMatches {
                 path: path.clone(),
                 file_type: FileType::Pdf,
+                title: None,
                 matches: vec![Match {
                     text_range: None,
                     matched_text: "hit".into(),

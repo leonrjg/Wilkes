@@ -46,6 +46,7 @@ describe("PdfLinkLayer", () => {
     );
 
     await waitFor(() => expect(screen.getAllByTestId("pdf-link")).toHaveLength(2));
+    expect(screen.getAllByTestId("pdf-link")[0]).toHaveStyle({ zIndex: "2" });
   });
 
   it("invokes navigation for an internal link and external open for a URL link", async () => {

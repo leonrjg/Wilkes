@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud } from "react-feather";
+import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud, Share2 } from "react-feather";
 import CodeViewer from "./preview/CodeViewer";
 import MarkdownViewer from "./preview/MarkdownViewer";
 import PdfViewer from "./preview/PdfViewer";
@@ -24,8 +24,10 @@ import DocumentSummaryPane from "./DocumentSummaryPane";
 import { useGenerationStore } from "../stores/useGenerationStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import DocumentTopicCloudPane from "./DocumentTopicCloudPane";
+import CitationGraphPane from "./CitationGraphPane";
+import { useSettingsStore } from "../stores/useSettingsStore";
 
-type ViewerSidePanel = "related" | "summary" | "topics" | null;
+type ViewerSidePanel = "related" | "citations" | "summary" | "topics" | null;
 
 function headerTitle(metadata: DocumentMetadata | null) {
   const title = metadata?.title?.trim();
@@ -95,6 +97,11 @@ export default function PreviewPane() {
   const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
   const generationReady = useGenerationStore((state) => state.ready);
   const semanticReady = useSemanticStore((state) => state.readyForCurrentRoot);
+  const listedDoi = useSettingsStore((state) =>
+    selectedMatch
+      ? state.fileList.find((entry) => entry.path === selectedMatch.path)?.doi ?? null
+      : null,
+  );
   const { addToast } = useToasts();
   const [sidePanel, setSidePanel] = useState<ViewerSidePanel>(null);
   const [markdownView, setMarkdownView] = useState<"source" | "rendered">("rendered");
@@ -120,6 +127,12 @@ export default function PreviewPane() {
     if (!semanticReady && sidePanel === "topics") setSidePanel(null);
   }, [semanticReady, sidePanel]);
 
+  const currentDoi = viewerMetadata?.doi?.trim() || listedDoi?.trim() || "";
+
+  useEffect(() => {
+    if (!currentDoi && sidePanel === "citations") setSidePanel(null);
+  }, [currentDoi, sidePanel]);
+
   useEffect(() => {
     if (openBookmarkTarget && !openBookmark) setOpenBookmarkTarget(null);
   }, [openBookmark, openBookmarkTarget]);
@@ -139,22 +152,32 @@ export default function PreviewPane() {
     setMarkdownView(view);
   };
 
-  // The chat pane's "open document" badge (spec §6.1, §7.4): PreviewPane is
-  // the single owner of "what's currently being viewed" since it's the only
-  // component that knows both the open file *and* -- via PdfViewer's live
-  // scroll tracking below -- the page actually on screen, not just the page
-  // the user landed on.
+  // PreviewPane is the single owner of "what's currently being viewed" since
+  // it's the only component that knows both the open file and -- via
+  // PdfViewer's live scroll tracking below -- the page actually on screen.
+  // Publish that application state directly for external MCP, then separately
+  // mirror it into the private chat context when the desktop chat is present.
   useEffect(() => {
-    if (!isTauri) return;
     if (!selectedMatch) {
-      setChatActiveDoc(null);
+      api.setActiveDocument?.(null).catch((error) =>
+        console.error("mcp: failed to clear active document", error),
+      );
+      if (isTauri) setChatActiveDoc(null);
       return;
     }
     const page = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.page : null;
-    setChatActiveDoc(selectedMatch.path, page);
+    api.setActiveDocument?.(selectedMatch.path, page).catch((error) =>
+      console.error("mcp: failed to update active document", error),
+    );
+    if (isTauri) setChatActiveDoc(selectedMatch.path, page);
   }, [selectedMatch, setChatActiveDoc]);
 
   const handleChatPageChange = (page: number) => {
+    if (selectedMatch) {
+      api.setActiveDocument?.(selectedMatch.path, page).catch((error) =>
+        console.error("mcp: failed to update active document page", error),
+      );
+    }
     if (isTauri && selectedMatch) setChatActiveDoc(selectedMatch.path, page);
   };
 
@@ -435,6 +458,23 @@ export default function PreviewPane() {
           </button>
         </Tooltip>
 
+        {currentDoi && (
+          <Tooltip content={sidePanel === "citations" ? "Hide citation graph" : "Show citation graph"}>
+            <button
+              type="button"
+              onClick={() =>
+                setSidePanel((current) => (current === "citations" ? null : "citations"))
+              }
+              aria-label={sidePanel === "citations" ? "Hide citation graph" : "Show citation graph"}
+              className={`hidden rounded p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] md:inline-flex ${
+                sidePanel === "citations" ? "bg-[var(--bg-active)] text-[var(--text-main)]" : ""
+              }`}
+            >
+              <Share2 size={16} />
+            </button>
+          </Tooltip>
+        )}
+
         <Tooltip
           content={
             semanticReady
@@ -590,6 +630,14 @@ export default function PreviewPane() {
           {sidePanel === "related" && (
             <RelatedDocumentsPane
               currentPath={selectedMatch.path}
+              onOpenDocument={openFile}
+              onClose={() => setSidePanel(null)}
+            />
+          )}
+          {sidePanel === "citations" && currentDoi && (
+            <CitationGraphPane
+              currentPath={selectedMatch.path}
+              doi={currentDoi}
               onOpenDocument={openFile}
               onClose={() => setSidePanel(null)}
             />

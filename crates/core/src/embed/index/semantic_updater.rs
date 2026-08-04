@@ -651,7 +651,13 @@ mod tests {
 
         // Index chunk survived (re-keyed, not deleted + re-embedded).
         assert_eq!(
-            index.lock().unwrap().as_ref().unwrap().status().total_chunks,
+            index
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .status()
+                .total_chunks,
             1
         );
         // Metadata cache row moved from old path to new path.
@@ -769,7 +775,10 @@ mod tests {
             .query(&[0.1, 0.2, 0.3], 1)
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].file_path, std::fs::canonicalize(&new_file).unwrap());
+        assert_eq!(
+            results[0].file_path,
+            std::fs::canonicalize(&new_file).unwrap()
+        );
 
         // Cache row followed the descendant to its new path.
         let guard = cache_handle.as_ref().unwrap().lock().unwrap();

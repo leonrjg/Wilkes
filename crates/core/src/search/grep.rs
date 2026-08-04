@@ -290,6 +290,7 @@ fn search_path(
     let file_matches = FileMatches {
         path: path.to_path_buf(),
         file_type,
+        title: None,
         matches,
     };
     if tx.blocking_send(file_matches).is_err() {

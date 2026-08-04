@@ -54,10 +54,7 @@ pub trait SearchService: Send + Sync {
     /// bibliographic fields (title, author, DOI, publication date, citation
     /// count, tags) the desktop file list shows. Backs the `list_documents`
     /// MCP tool.
-    async fn list_documents(
-        self: Arc<Self>,
-        root: PathBuf,
-    ) -> Result<FileListResponse, String> {
+    async fn list_documents(self: Arc<Self>, root: PathBuf) -> Result<FileListResponse, String> {
         let _ = root;
         Err("Document listing is not available in this session.".to_string())
     }
@@ -66,10 +63,7 @@ pub trait SearchService: Send + Sync {
     /// provider enrichment already resolved for the library is included),
     /// falling back to on-the-fly extraction for a not-yet-cached file. Backs
     /// the `get_file_metadata` MCP tool.
-    async fn document_metadata(
-        self: Arc<Self>,
-        path: PathBuf,
-    ) -> Result<DocumentMetadata, String> {
+    async fn document_metadata(self: Arc<Self>, path: PathBuf) -> Result<DocumentMetadata, String> {
         let _ = path;
         Err("Document metadata is not available in this session.".to_string())
     }

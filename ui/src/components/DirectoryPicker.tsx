@@ -9,6 +9,7 @@ import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileAc
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { Tooltip } from "./Tooltip";
 import { DirectoryTree, isStrictAncestor, parentPath } from "./DirectoryTree";
+import { configuredLibraryRoots } from "../lib/configuredRoots";
 
 interface Props {
   directory: string;
@@ -59,21 +60,10 @@ export default function DirectoryPicker({
     name: string;
   } | null>(null);
 
-  // Combine favorites and recent dirs for the list, prioritizing favorites
-  // and removing duplicates.
-  const displayDirs = useMemo(() => {
-    const combined = [...favorites];
-    for (const d of recentDirs) {
-      if (!combined.includes(d)) {
-        combined.push(d);
-      }
-    }
-    // Always ensure the current directory is in the list if it's not empty
-    if (directory && !combined.includes(directory)) {
-      combined.push(directory);
-    }
-    return combined;
-  }, [favorites, recentDirs, directory]);
+  const displayDirs = useMemo(
+    () => configuredLibraryRoots({ directory, favorites, recentDirs }),
+    [directory, favorites, recentDirs],
+  );
 
   // Destinations for the "new folder" dialog. We surface each current root plus
   // a synthetic "[parent]" node per distinct parent of the top-level roots, so a

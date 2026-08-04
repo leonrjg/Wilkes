@@ -111,6 +111,10 @@ export class TauriSearchApi implements SearchApi {
     return invoke<ExternalMcpStatus>("get_external_mcp_status");
   }
 
+  async setActiveDocument(path: string | null, page?: number | null): Promise<void> {
+    return invoke("set_active_document", { path, page: page ?? null });
+  }
+
   async configureExternalMcp(
     enabled: boolean,
     requireToken: boolean,

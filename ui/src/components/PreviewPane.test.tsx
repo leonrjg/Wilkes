@@ -37,7 +37,10 @@ vi.mock("../services", () => ({
     cancelChunkTopics: vi.fn(() => Promise.resolve()),
     cancelSearch: vi.fn(() => Promise.resolve()),
     updateSettings: vi.fn(() => Promise.resolve()),
-    citationLinks: vi.fn(() => Promise.resolve({ references: [], cited_by: [] })),
+    citationLinks: vi.fn(() =>
+      Promise.resolve({ references: [], cited_by: [], all_references: [] }),
+    ),
+    onFileMetadataUpdated: vi.fn(() => Promise.resolve(vi.fn())),
     explainRelatedDocument: vi.fn(() => Promise.resolve()),
     summarizeDocument: vi.fn(() => Promise.resolve()),
     onGenerationStream: vi.fn(() => Promise.resolve(vi.fn())),
@@ -52,6 +55,7 @@ vi.mock("../services", () => ({
     })),
     getFileMetadata: vi.fn(() => Promise.resolve(null)),
     resolveFileMetadata: vi.fn(() => Promise.resolve(null)),
+    setActiveDocument: vi.fn(() => Promise.resolve()),
   },
 }));
 
@@ -108,7 +112,7 @@ describe("PreviewPane", () => {
       bookmarks: [],
     });
     (api.relatedDocuments as any).mockResolvedValue([]);
-    useSettingsStore.setState({ directory: "/docs" });
+    useSettingsStore.setState({ directory: "/docs", fileList: [] });
     useSemanticStore.setState({
       readyForCurrentRoot: false,
       indexStatus: null,
@@ -521,6 +525,31 @@ describe("PreviewPane", () => {
     expect(screen.getByText("Scholar")).toBeInTheDocument();
   });
 
+  it("shows the citation graph button only for a document with a DOI", async () => {
+    const match = { path: "/docs/paper.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
+    setViewerState({
+      selectedMatch: match,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: { title: "Paper", author: null, doi: null, created_at: null },
+      viewerMetadataStatus: "ready",
+    });
+    const { rerender } = render(<PreviewPane />);
+
+    expect(screen.queryByRole("button", { name: "Show citation graph" })).not.toBeInTheDocument();
+
+    setViewerState({
+      selectedMatch: match,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } } as any,
+      viewerMetadata: { title: "Paper", author: null, doi: "10.1/paper", created_at: null },
+      viewerMetadataStatus: "ready",
+    });
+    rerender(<PreviewPane />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show citation graph" }));
+    expect(await screen.findByRole("complementary", { name: "Citation graph" })).toBeInTheDocument();
+    expect(api.citationLinks).toHaveBeenCalledWith({ root: "/docs", path: "/docs/paper.pdf" });
+  });
+
   it("opens DOI and Google Scholar URLs and copies DOI from header actions", () => {
     const mockMatch = { path: "paper.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any;
     setViewerState({
@@ -586,6 +615,26 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
     expect(screen.getByTestId("pdf-viewer")).toBeInTheDocument();
+  });
+
+  it("publishes the active PDF and live page for external MCP without a chat session", async () => {
+    setViewerState({
+      selectedMatch: {
+        path: "/docs/active.pdf",
+        origin: { PdfPage: { page: 2, bbox: null } },
+      } as any,
+      previewData: { Pdf: { page: 2, highlight_bbox: null } },
+    });
+
+    render(<PreviewPane />);
+
+    await waitFor(() =>
+      expect(api.setActiveDocument).toHaveBeenCalledWith("/docs/active.pdf", 2),
+    );
+    act(() => {
+      mockPdfViewer.mock.lastCall?.[0].onPageChange(6);
+    });
+    expect(api.setActiveDocument).toHaveBeenCalledWith("/docs/active.pdf", 6);
   });
 
   it("surfaces PDF parse failures and retries with a fresh load attempt", () => {
@@ -793,6 +842,7 @@ describe("PreviewPane", () => {
       scope: { type: "corpus" },
       limit: 8,
     });
+    expect(api.citationLinks).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByText("related.txt"));
     expect(useViewerStore.getState().tabs).toHaveLength(2);
@@ -922,6 +972,26 @@ describe("PreviewPane", () => {
           chunk_count: 2,
           distinct_document_count: 1,
           cohesion: 0.9,
+          library_coverage: {
+            related_document_count: 2,
+            eligible_document_count: 246,
+            chunks: [
+              {
+                chunk_id: 21,
+                file_path: "/library/outer-a.txt",
+                chunk_text: "Related passage from A",
+                extraction_byte_range: { start: 5, end: 27 },
+                origin: { TextFile: { line: 3, col: 1 } },
+              },
+              {
+                chunk_id: 22,
+                file_path: "/library/outer-b.pdf",
+                chunk_text: "Related passage from B",
+                extraction_byte_range: { start: 0, end: 22 },
+                origin: { PdfPage: { page: 4, bbox: null } },
+              },
+            ],
+          },
           label: "Indexed Passage Themes",
         },
       ],
@@ -966,6 +1036,17 @@ describe("PreviewPane", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Show document topics" }));
     expect(await screen.findByText("Indexed Passage Themes")).toBeInTheDocument();
+    expect(screen.getByText("2 / 246 docs")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "Show related passages for Indexed Passage Themes",
+      }),
+    ).toHaveAttribute(
+      "title",
+      expect.stringContaining(
+        "Show 2 related passages from 2 documents",
+      ),
+    );
     expect(screen.queryByText(/Related to source\.txt/)).not.toBeInTheDocument();
     expect(api.chunkTopics).toHaveBeenCalledWith(
       expect.any(String),
@@ -985,6 +1066,28 @@ describe("PreviewPane", () => {
     expect(
       useSearchStore.getState().results[0].matches.map((match) => match.matched_text),
     ).toEqual(["First indexed passage", "Second indexed passage"]);
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Show related passages for Indexed Passage Themes",
+      }),
+    );
+    await waitFor(() =>
+      expect(useSearchStore.getState().stats).toEqual(
+        expect.objectContaining({ files_scanned: 2, total_matches: 2 }),
+      ),
+    );
+    expect(useSearchStore.getState().results.map((result) => result.path)).toEqual([
+      "/library/outer-a.txt",
+      "/library/outer-b.pdf",
+    ]);
+    expect(
+      useSearchStore
+        .getState()
+        .results.flatMap((result) =>
+          result.matches.map((match) => match.matched_text),
+        ),
+    ).toEqual(["Related passage from A", "Related passage from B"]);
 
     const requestId = useTopicsStore.getState().document.requestId;
     fireEvent.click(screen.getByRole("button", { name: "Close document topics" }));

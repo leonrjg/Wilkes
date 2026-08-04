@@ -678,6 +678,7 @@ impl MetadataCache {
         let file_id = self
             .file_id(path)?
             .context("metadata cache file row missing after upsert")?;
+        let normalized_metadata_doi = metadata.doi.as_deref().and_then(normalize_doi);
 
         self.upsert_metadata_i64(file_id, FIELD_EXTRACTED_AT_MS, Some(now_ms), source)?;
         if !matches!(
@@ -686,7 +687,12 @@ impl MetadataCache {
         ) {
             self.upsert_metadata_value(file_id, FIELD_TITLE, metadata.title.as_deref(), source)?;
             self.upsert_metadata_value(file_id, FIELD_AUTHOR, metadata.author.as_deref(), source)?;
-            self.upsert_metadata_value(file_id, FIELD_DOI, metadata.doi.as_deref(), source)?;
+            self.upsert_metadata_value(
+                file_id,
+                FIELD_DOI,
+                normalized_metadata_doi.as_deref(),
+                source,
+            )?;
             self.upsert_metadata_value(
                 file_id,
                 FIELD_PUBLICATION_DATE,
@@ -695,7 +701,8 @@ impl MetadataCache {
             )?;
         }
         if let Some(paper) = metadata.semantic_scholar.as_ref() {
-            self.upsert_metadata_value(file_id, FIELD_DOI, Some(&paper.doi), source)?;
+            let normalized_doi = normalize_doi(&paper.doi);
+            self.upsert_metadata_value(file_id, FIELD_DOI, normalized_doi.as_deref(), source)?;
             self.upsert_metadata_value(file_id, FIELD_PAPER_ID, Some(&paper.paper_id), source)?;
             self.upsert_metadata_value(file_id, FIELD_TITLE, paper.title.as_deref(), source)?;
             self.upsert_metadata_i64(file_id, FIELD_YEAR, paper.year, source)?;
@@ -726,7 +733,8 @@ impl MetadataCache {
             )?;
         }
         if let Some(work) = metadata.openalex.as_ref() {
-            self.upsert_metadata_value(file_id, FIELD_DOI, Some(&work.doi), source)?;
+            let normalized_doi = normalize_doi(&work.doi);
+            self.upsert_metadata_value(file_id, FIELD_DOI, normalized_doi.as_deref(), source)?;
             self.upsert_metadata_value(file_id, FIELD_PAPER_ID, Some(&work.work_id), source)?;
             self.upsert_metadata_value(file_id, FIELD_TITLE, work.title.as_deref(), source)?;
             self.upsert_metadata_i64(file_id, FIELD_YEAR, work.year, source)?;
@@ -908,7 +916,8 @@ impl MetadataCache {
                 "SELECT f.id
                  FROM files f
                  JOIN file_metadata doi
-                    ON doi.file_id = f.id AND doi.key = ?1 AND doi.value = ?2
+                    ON doi.file_id = f.id AND doi.key = ?1
+                        AND doi.value = ?2 COLLATE NOCASE
                  JOIN file_metadata paper
                     ON paper.file_id = f.id AND paper.key = ?3 AND paper.source = ?4
                  LEFT JOIN file_metadata cached
@@ -939,7 +948,7 @@ impl MetadataCache {
     ) -> anyhow::Result<usize> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT file_id FROM file_metadata
-             WHERE key = ?1 AND value = ?2",
+             WHERE key = ?1 AND value = ?2 COLLATE NOCASE",
         )?;
         let file_ids = stmt
             .query_map(params![FIELD_DOI, paper.doi], |row| row.get::<_, i64>(0))?
@@ -1007,7 +1016,8 @@ impl MetadataCache {
                 "SELECT f.id
                  FROM files f
                  JOIN file_metadata doi
-                    ON doi.file_id = f.id AND doi.key = ?1 AND doi.value = ?2
+                    ON doi.file_id = f.id AND doi.key = ?1
+                        AND doi.value = ?2 COLLATE NOCASE
                  JOIN file_metadata work
                     ON work.file_id = f.id AND work.key = ?3 AND work.source = ?4
                  LEFT JOIN file_metadata cached
@@ -1035,7 +1045,7 @@ impl MetadataCache {
     pub fn upsert_openalex_by_doi(&self, work: &OpenAlexWork) -> anyhow::Result<usize> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT file_id FROM file_metadata
-             WHERE key = ?1 AND value = ?2",
+             WHERE key = ?1 AND value = ?2 COLLATE NOCASE",
         )?;
         let file_ids = stmt
             .query_map(params![FIELD_DOI, work.doi], |row| row.get::<_, i64>(0))?
@@ -1124,7 +1134,7 @@ impl MetadataCache {
             return Ok(0);
         };
         self.conn.execute(
-            "DELETE FROM document_citations WHERE source_doi = ?1",
+            "DELETE FROM document_citations WHERE source_doi = ?1 COLLATE NOCASE",
             params![source],
         )?;
         let mut inserted = 0;
@@ -1157,20 +1167,41 @@ impl MetadataCache {
             references: self.linked_paths(
                 "SELECT DISTINCT f.file_path
                  FROM document_citations c
-                 JOIN file_metadata dm ON dm.key = ?1 AND dm.value = c.target_doi
+                 JOIN file_metadata dm ON dm.key = ?1
+                    AND dm.value = c.target_doi COLLATE NOCASE
                  JOIN files f ON f.id = dm.file_id
-                 WHERE c.source_doi = ?2",
+                 WHERE c.source_doi = ?2 COLLATE NOCASE",
                 &doi,
             )?,
             cited_by: self.linked_paths(
                 "SELECT DISTINCT f.file_path
                  FROM document_citations c
-                 JOIN file_metadata dm ON dm.key = ?1 AND dm.value = c.source_doi
+                 JOIN file_metadata dm ON dm.key = ?1
+                    AND dm.value = c.source_doi COLLATE NOCASE
                  JOIN files f ON f.id = dm.file_id
-                 WHERE c.target_doi = ?2",
+                 WHERE c.target_doi = ?2 COLLATE NOCASE",
                 &doi,
             )?,
         })
+    }
+
+    /// Every outgoing DOI for a work, whether or not it currently resolves to
+    /// a file in the library. Results are canonicalized, deduplicated
+    /// case-insensitively, and sorted for a stable UI order.
+    pub fn citation_references(&self, doi: &str) -> anyhow::Result<Vec<String>> {
+        let Some(doi) = normalize_doi(doi) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT lower(target_doi)
+             FROM document_citations
+             WHERE source_doi = ?1 COLLATE NOCASE
+             ORDER BY lower(target_doi)",
+        )?;
+        let references = stmt
+            .query_map(params![doi], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(references)
     }
 
     fn linked_paths(&self, sql: &str, doi: &str) -> anyhow::Result<Vec<PathBuf>> {
@@ -1242,11 +1273,13 @@ mod tests {
         let a = Path::new("/docs/a.pdf");
         let b = Path::new("/docs/b.pdf");
         cache
-            .upsert(a, id, &doc_with_doi("10.1/a"), MetadataSource::File)
+            .upsert(a, id, &doc_with_doi("10.1/A"), MetadataSource::File)
             .unwrap();
         cache
-            .upsert(b, id, &doc_with_doi("10.1/b"), MetadataSource::File)
+            .upsert(b, id, &doc_with_doi("10.1/B"), MetadataSource::File)
             .unwrap();
+        assert_eq!(cache.doi_for_path(a).unwrap().as_deref(), Some("10.1/a"));
+        assert_eq!(cache.doi_for_path(b).unwrap().as_deref(), Some("10.1/b"));
 
         // A cites B (and a paper not in the library, which is stored but does
         // not resolve to a path).
@@ -1257,6 +1290,10 @@ mod tests {
         let from_a = cache.citation_links("10.1/a").unwrap();
         assert_eq!(from_a.references, vec![b.to_path_buf()]);
         assert!(from_a.cited_by.is_empty());
+        assert_eq!(
+            cache.citation_references("10.1/A").unwrap(),
+            vec!["10.1/absent".to_string(), "10.1/b".to_string()]
+        );
 
         let from_b = cache.citation_links("10.1/b").unwrap();
         assert_eq!(from_b.cited_by, vec![a.to_path_buf()]);
@@ -1271,10 +1308,79 @@ mod tests {
                 MetadataSource::File,
             )
             .unwrap();
+        assert_eq!(cache.citation_links("10.1/a").unwrap().references.len(), 2);
+    }
+
+    #[test]
+    fn citation_links_and_replacement_accept_legacy_mixed_case_rows() {
+        let dir = tempdir().unwrap();
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        let id = FileIdentity {
+            size_bytes: 1,
+            modified_at_ms: 1,
+        };
+        let a = Path::new("/docs/a.pdf");
+        let b = Path::new("/docs/b.pdf");
+        cache
+            .upsert(a, id, &doc_with_doi("10.1/a"), MetadataSource::File)
+            .unwrap();
+        cache
+            .upsert(b, id, &doc_with_doi("10.1/b"), MetadataSource::File)
+            .unwrap();
+
+        // Simulate rows written before DOI canonicalization was introduced.
+        cache
+            .conn
+            .execute(
+                "UPDATE file_metadata SET value = '10.1/B'
+                 WHERE file_id = (SELECT id FROM files WHERE file_path = ?1)
+                   AND key = ?2",
+                params![MetadataCache::key(b), FIELD_DOI],
+            )
+            .unwrap();
+        cache
+            .conn
+            .execute(
+                "INSERT INTO document_citations (source_doi, target_doi)
+                 VALUES ('10.1/A', '10.1/B')",
+                [],
+            )
+            .unwrap();
+        cache
+            .conn
+            .execute(
+                "INSERT INTO document_citations (source_doi, target_doi)
+                 VALUES ('10.1/a', '10.1/b')",
+                [],
+            )
+            .unwrap();
+
         assert_eq!(
-            cache.citation_links("10.1/a").unwrap().references.len(),
-            2
+            cache.citation_links("10.1/a").unwrap().references,
+            vec![b.to_path_buf()]
         );
+        assert_eq!(
+            cache.citation_links("10.1/b").unwrap().cited_by,
+            vec![a.to_path_buf()]
+        );
+        assert_eq!(
+            cache.citation_references("10.1/a").unwrap(),
+            vec!["10.1/b".to_string()]
+        );
+
+        cache
+            .replace_citations("10.1/a", &["10.1/C".into()])
+            .unwrap();
+        let stored = cache
+            .conn
+            .query_row(
+                "SELECT source_doi, target_doi FROM document_citations
+                 WHERE source_doi = '10.1/a' COLLATE NOCASE",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("10.1/a".into(), "10.1/c".into()));
     }
 
     #[test]
@@ -1299,8 +1405,14 @@ mod tests {
         );
 
         // Re-running with an empty list clears the edge; a self-edge is ignored.
-        cache.replace_citations("10.1/a", &["10.1/a".into()]).unwrap();
-        assert!(cache.citation_links("10.1/a").unwrap().references.is_empty());
+        cache
+            .replace_citations("10.1/a", &["10.1/a".into()])
+            .unwrap();
+        assert!(cache
+            .citation_links("10.1/a")
+            .unwrap()
+            .references
+            .is_empty());
     }
 
     #[test]

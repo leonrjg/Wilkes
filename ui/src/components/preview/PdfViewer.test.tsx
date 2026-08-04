@@ -406,6 +406,7 @@ describe("PdfViewer", () => {
     const highlights = screen.getAllByTestId("bookmark-highlight");
     expect(highlights).toHaveLength(2);
     expect(highlights[0]).toHaveStyle({
+      zIndex: "1",
       left: "20px",
       top: "30px",
       width: "40px",

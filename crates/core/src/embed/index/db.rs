@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,8 +12,8 @@ use tracing::error;
 use crate::extract::ExtractorRegistry;
 use crate::metadata::cache::FileIdentity;
 use crate::types::{
-    BoundingBox, ByteRange, EmbeddingEngine, FileType, IndexStatus, IndexingConfig,
-    RelatedDocument, SourceMap, SourceOrigin, SourceSegment,
+    BoundingBox, ByteRange, ChunkTopicMember, EmbeddingEngine, FileType, IndexStatus,
+    IndexingConfig, RelatedDocument, SourceMap, SourceOrigin, SourceSegment,
 };
 
 use super::super::Embedder;
@@ -55,7 +55,7 @@ fn db_path(data_dir: &Path) -> PathBuf {
 }
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 fn configure_connection(conn: &Connection, path: &Path) -> anyhow::Result<()> {
     conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
@@ -285,6 +285,62 @@ mod tests {
     }
 
     #[test]
+    fn test_open_v4_normalizes_empty_full_text_only_when_chunks_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let legacy_path = root.join("legacy.txt");
+        let empty_path = root.join("empty.txt");
+        fs::write(&legacy_path, "legacy body").unwrap();
+        fs::write(&empty_path, "").unwrap();
+
+        let mut idx =
+            SemanticIndex::create(root, "m", 1, EmbeddingEngine::Candle, Some(root)).unwrap();
+        idx.write_file(PreparedFile {
+            path: legacy_path.clone(),
+            full_text: String::new(),
+            chunks: vec![(test_chunk(&legacy_path, "legacy body"), vec![1.0])],
+        })
+        .unwrap();
+        idx.write_file(PreparedFile {
+            path: empty_path.clone(),
+            full_text: String::new(),
+            chunks: Vec::new(),
+        })
+        .unwrap();
+        idx.conn
+            .execute(
+                "UPDATE meta SET value = '4' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        drop(idx);
+
+        let idx = SemanticIndex::open(root, "m", 1).unwrap();
+        let stored_text = |path: &Path| -> Option<String> {
+            idx.conn
+                .query_row(
+                    "SELECT full_text FROM files WHERE file_path = ?1",
+                    params![canon(path).to_string_lossy()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        assert_eq!(stored_text(&legacy_path), None);
+        assert_eq!(stored_text(&empty_path), Some(String::new()));
+        assert_eq!(
+            idx.conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "5"
+        );
+    }
+
+    #[test]
     fn test_write_and_query() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -447,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_document_for_path_none_when_full_text_missing() {
+    fn indexed_document_for_path_none_when_full_text_missing_or_inconsistent() {
         // Simulates a row written before schema v4: chunks exist but full_text is
         // NULL, so grep must fall back to live extraction.
         let dir = tempfile::tempdir().unwrap();
@@ -475,6 +531,14 @@ mod tests {
         // Force the column back to NULL to emulate a pre-v4 row.
         idx.conn
             .execute("UPDATE files SET full_text = NULL", [])
+            .unwrap();
+
+        assert!(idx.indexed_document_for_path(&path).unwrap().is_none());
+
+        // Older rebuilds coerced that NULL to an empty string while retaining
+        // chunks. This is still missing text, not a genuinely empty document.
+        idx.conn
+            .execute("UPDATE files SET full_text = ''", [])
             .unwrap();
 
         assert!(idx.indexed_document_for_path(&path).unwrap().is_none());
@@ -535,6 +599,138 @@ mod tests {
             .topic_chunks_for_root(&root.join("missing"))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn topic_library_coverage_spans_configured_roots_and_excludes_stale_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let other_root = dir.path().join("other-root");
+        let stale_root = dir.path().join("stale-root");
+        let unindexed_root = dir.path().join("unindexed-root");
+        for path in [&root, &other_root, &stale_root, &unindexed_root] {
+            fs::create_dir(path).unwrap();
+        }
+        let source = root.join("source.txt");
+        let matching = root.join("matching.txt");
+        let boundary = root.join("boundary.txt");
+        let unrelated = root.join("unrelated.txt");
+        let cross_root_match = other_root.join("cross-root-match.txt");
+        let stale_match = stale_root.join("stale-match.txt");
+        for path in [
+            &source,
+            &matching,
+            &boundary,
+            &unrelated,
+            &cross_root_match,
+            &stale_match,
+        ] {
+            fs::write(path, "indexed text").unwrap();
+        }
+        let mut index =
+            SemanticIndex::create(dir.path(), "m", 2, EmbeddingEngine::Candle, Some(&root))
+                .unwrap();
+        index
+            .write_file(PreparedFile {
+                full_text: "source".into(),
+                path: source.clone(),
+                chunks: vec![(test_chunk(&source, "source"), vec![1.0, 0.0])],
+            })
+            .unwrap();
+        index
+            .write_file(PreparedFile {
+                full_text: "matching".into(),
+                path: matching.clone(),
+                // More than the per-document cap still counts as one document,
+                // and only the fifteen strongest passages are retained.
+                chunks: (0..17)
+                    .map(|number| {
+                        (
+                            test_chunk(&matching, &format!("matching {number:02}")),
+                            vec![1.0, number as f32 * 0.01],
+                        )
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        index
+            .write_file(PreparedFile {
+                full_text: "boundary".into(),
+                path: boundary.clone(),
+                chunks: vec![(test_chunk(&boundary, "boundary"), vec![0.8, 0.6])],
+            })
+            .unwrap();
+        index
+            .write_file(PreparedFile {
+                full_text: "unrelated".into(),
+                path: unrelated.clone(),
+                chunks: vec![(test_chunk(&unrelated, "unrelated"), vec![0.0, 1.0])],
+            })
+            .unwrap();
+        index.activate_root(&other_root).unwrap();
+        index
+            .write_file(PreparedFile {
+                full_text: "cross root".into(),
+                path: cross_root_match.clone(),
+                chunks: vec![(test_chunk(&cross_root_match, "cross root"), vec![1.0, 0.0])],
+            })
+            .unwrap();
+        index.activate_root(&stale_root).unwrap();
+        index
+            .write_file(PreparedFile {
+                full_text: "stale".into(),
+                path: stale_match.clone(),
+                chunks: vec![(test_chunk(&stale_match, "stale"), vec![1.0, 0.0])],
+            })
+            .unwrap();
+
+        let coverage = index
+            .topic_library_coverage(
+                &[root.clone(), root.clone(), other_root, unindexed_root],
+                &source,
+                &[
+                    TopicCoveragePrototype {
+                        mean_member_embedding: vec![1.0, 0.0],
+                        cohesion: 0.8,
+                    },
+                    TopicCoveragePrototype {
+                        mean_member_embedding: vec![0.0, 1.0],
+                        cohesion: 0.9,
+                    },
+                ],
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        assert_eq!(coverage.eligible_document_count, 4);
+        assert_eq!(coverage.related_document_counts, vec![3, 1]);
+        let matching_chunks = coverage.related_chunks[0]
+            .iter()
+            .filter(|chunk| chunk.file_path == canon(&matching))
+            .map(|chunk| chunk.chunk_text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(matching_chunks.len(), 15);
+        assert_eq!(matching_chunks.first(), Some(&"matching 00"));
+        assert_eq!(matching_chunks.last(), Some(&"matching 14"));
+        assert!(!coverage.related_chunks[0]
+            .iter()
+            .any(|chunk| chunk.chunk_text == "matching 15" || chunk.chunk_text == "matching 16"));
+        assert_eq!(coverage.related_chunks[1].len(), 1);
+        assert_eq!(coverage.related_chunks[1][0].chunk_text, "unrelated");
+
+        let cancelled = AtomicBool::new(true);
+        let error = index
+            .topic_library_coverage(
+                std::slice::from_ref(&root),
+                &source,
+                &[TopicCoveragePrototype {
+                    mean_member_embedding: vec![1.0, 0.0],
+                    cohesion: 0.8,
+                }],
+                &cancelled,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
     }
 
     #[test]
@@ -1200,6 +1396,59 @@ mod tests {
     }
 
     #[test]
+    fn test_build_reuse_backfills_missing_full_text_without_reembedding() {
+        for missing_text in [None, Some("")] {
+            let dir = tempdir().unwrap();
+            let data_dir = dir.path().join("data");
+            let root = dir.path().join("root");
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("legacy.txt");
+            fs::write(&path, "legacy body").unwrap();
+
+            let mut idx = SemanticIndex::create(
+                &data_dir,
+                "counting",
+                1,
+                EmbeddingEngine::Candle,
+                Some(&root),
+            )
+            .unwrap();
+            idx.write_file(PreparedFile {
+                path: path.clone(),
+                full_text: "legacy body".to_string(),
+                chunks: vec![(test_chunk(&path, "legacy body"), vec![1.0])],
+            })
+            .unwrap();
+            idx.conn
+                .execute("UPDATE files SET full_text = ?1", params![missing_text])
+                .unwrap();
+            drop(idx);
+
+            let registry = ExtractorRegistry::new();
+            let embedder = CountingEmbedder::new();
+            let (tx, _rx) = tokio::sync::mpsc::channel(10);
+            let rebuilt = SemanticIndex::build(
+                &data_dir,
+                &root,
+                std::slice::from_ref(&path),
+                &registry,
+                &embedder,
+                tx,
+                Arc::new(AtomicBool::new(false)),
+                &txt_indexing(),
+            )
+            .unwrap();
+
+            assert_eq!(embedder.calls(), 0);
+            let (full_text, _) = rebuilt
+                .indexed_document_for_path(&path)
+                .unwrap()
+                .expect("rebuilt document should have stored full text");
+            assert_eq!(full_text, "legacy body");
+        }
+    }
+
+    #[test]
     fn test_build_second_root_preserves_first_root() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().join("data");
@@ -1600,6 +1849,31 @@ pub struct TopicChunkData {
     pub embedding: Vec<f32>,
 }
 
+/// A document-local topic projected across the configured indexed library.
+/// `mean_member_embedding` is the arithmetic mean of normalized member
+/// embeddings, so its dot product with a normalized candidate is that
+/// candidate's average cosine similarity to the topic members.
+#[derive(Clone, Debug)]
+pub struct TopicCoveragePrototype {
+    pub mean_member_embedding: Vec<f32>,
+    pub cohesion: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TopicCoverageResult {
+    pub eligible_document_count: usize,
+    pub related_document_counts: Vec<usize>,
+    pub related_chunks: Vec<Vec<ChunkTopicMember>>,
+}
+
+const TOPIC_COVERAGE_CHUNKS_PER_DOCUMENT: usize = 15;
+
+#[derive(Clone, Debug)]
+struct RankedCoverageChunk {
+    score: f32,
+    chunk: ChunkTopicMember,
+}
+
 #[derive(Clone, Debug)]
 struct IndexedFileRecord {
     path_key: PathBuf,
@@ -1695,6 +1969,10 @@ impl SemanticIndex {
             Self::migrate_v3_to_v4(&conn)?;
             schema_version = 4;
         }
+        if schema_version == 4 {
+            Self::migrate_v4_to_v5(&conn)?;
+            schema_version = 5;
+        }
         anyhow::ensure!(
             schema_version == SCHEMA_VERSION,
             "Index schema version {} is not supported (expected {}); rebuild the index",
@@ -1769,6 +2047,10 @@ impl SemanticIndex {
         if schema_version == 3 {
             Self::migrate_v3_to_v4(&conn)?;
             schema_version = 4;
+        }
+        if schema_version == 4 {
+            Self::migrate_v4_to_v5(&conn)?;
+            schema_version = 5;
         }
         anyhow::ensure!(
             schema_version == SCHEMA_VERSION,
@@ -1905,7 +2187,7 @@ impl SemanticIndex {
             }));
 
             if let Some(source) = reusable.as_ref() {
-                match idx.reuse_unchanged_file_from(source, path) {
+                match idx.reuse_unchanged_file_from(source, path, extractors) {
                     Ok(true) => continue,
                     Ok(false) => {}
                     Err(e) => error!(
@@ -2196,7 +2478,7 @@ impl SemanticIndex {
     /// v3 -> v4: add the `files.full_text` column that lets exact (grep) search
     /// read a document's text from the index instead of re-extracting it.
     /// Existing rows keep `full_text = NULL` and are backfilled the next time the
-    /// file is (re)indexed; until then grep falls back to live extraction.
+    /// file is rebuilt or reindexed; until then grep falls back to live extraction.
     fn migrate_v3_to_v4(conn: &Connection) -> anyhow::Result<()> {
         let has_column: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'full_text'")?
@@ -2211,17 +2493,29 @@ impl SemanticIndex {
         Ok(())
     }
 
-    /// Extract and chunk a file without embedding. Use this to collect chunks
-    /// from many files before embedding them all in a single batch.
-    /// Extract and chunk a file, returning both the document's full extracted
-    /// text and its chunks. The text is stored verbatim so exact (grep) search
-    /// can scan it without re-extracting the file.
-    pub fn extract_chunks(
+    /// v4 -> v5: repair rows whose missing full text was incorrectly coerced
+    /// from NULL to an empty string while their chunks were reused. A genuinely
+    /// empty extracted document cannot have chunks.
+    fn migrate_v4_to_v5(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute(
+            "UPDATE files
+             SET full_text = NULL
+             WHERE full_text = ''
+               AND EXISTS (SELECT 1 FROM chunks WHERE chunks.file_id = files.id)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '5')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Extract a file's canonical content without chunking or embedding it.
+    fn extract_content(
         path: &Path,
         extractors: &ExtractorRegistry,
-        chunk_size: usize,
-        chunk_overlap: usize,
-    ) -> anyhow::Result<(String, Vec<Chunk>)> {
+    ) -> anyhow::Result<crate::types::ExtractedContent> {
         let content = match extractors.find(path, None) {
             Some(ext) => ext.extract(path)?,
             None => {
@@ -2243,6 +2537,19 @@ impl SemanticIndex {
                 }
             }
         };
+        Ok(content)
+    }
+
+    /// Extract and chunk a file without embedding, returning both the document's
+    /// full extracted text and its chunks. The text is stored verbatim so exact
+    /// (grep) search can scan it without re-extracting the file.
+    pub fn extract_chunks(
+        path: &Path,
+        extractors: &ExtractorRegistry,
+        chunk_size: usize,
+        chunk_overlap: usize,
+    ) -> anyhow::Result<(String, Vec<Chunk>)> {
+        let content = Self::extract_content(path, extractors)?;
         let chunks = chunk_content(&content, path.to_path_buf(), chunk_size, chunk_overlap);
         Ok((content.text, chunks))
     }
@@ -2289,6 +2596,7 @@ impl SemanticIndex {
         &mut self,
         source: &SemanticIndex,
         path: &Path,
+        extractors: &ExtractorRegistry,
     ) -> anyhow::Result<bool> {
         let key = Self::canonical_path(path);
         let key_str = key.to_string_lossy().into_owned();
@@ -2395,10 +2703,19 @@ impl SemanticIndex {
             ));
         }
 
+        // Pre-v4 rows have no stored full text. Some builds made those rows look
+        // populated by coercing NULL to an empty string even though they still
+        // had chunks. Extract only the missing text while retaining the valid
+        // chunks and embeddings copied above.
+        let full_text = match full_text {
+            Some(text) if !text.is_empty() => text,
+            _ => Self::extract_content(path, extractors)?.text,
+        };
+
         self.write_file(PreparedFile {
             path: path.to_path_buf(),
             chunks,
-            full_text: full_text.unwrap_or_default(),
+            full_text,
         })?;
         Ok(true)
     }
@@ -2438,6 +2755,20 @@ impl SemanticIndex {
         let Some(full_text) = full_text else {
             return Ok(None);
         };
+
+        // Extracted empty documents have no chunks. Empty text alongside chunks
+        // is a legacy row produced by the old NULL-to-empty reuse bug, so do not
+        // suppress the caller's live-extraction fallback.
+        if full_text.is_empty() {
+            let has_chunks: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM chunks WHERE file_id = ?1)",
+                params![file_id],
+                |row| row.get(0),
+            )?;
+            if has_chunks {
+                return Ok(None);
+            }
+        }
 
         // Reject stale text: a file edited after indexing would otherwise yield
         // matches against content that no longer exists on disk.
@@ -3619,6 +3950,206 @@ impl SemanticIndex {
         )
     }
 
+    /// Find other documents in the configured library roots that contain a
+    /// passage at least as similar to each topic as the topic's own members are
+    /// to one another, retaining the strongest passages from every match.
+    ///
+    /// Only roots that still exist in the semantic index participate. The
+    /// membership `EXISTS` clause prevents a file shared by overlapping roots
+    /// from duplicating its chunks. All prototypes are evaluated in one scan,
+    /// keeping coverage linear in the eligible indexed passage count.
+    pub fn topic_library_coverage(
+        &self,
+        roots: &[PathBuf],
+        source_path: &Path,
+        prototypes: &[TopicCoveragePrototype],
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<TopicCoverageResult> {
+        if prototypes.is_empty() {
+            return Ok(TopicCoverageResult::default());
+        }
+        for prototype in prototypes {
+            anyhow::ensure!(
+                prototype.mean_member_embedding.len() == self.dimension,
+                "Topic coverage prototype dimension mismatch: expected {}, received {}",
+                self.dimension,
+                prototype.mean_member_embedding.len()
+            );
+            anyhow::ensure!(
+                prototype
+                    .mean_member_embedding
+                    .iter()
+                    .all(|value| value.is_finite())
+                    && prototype.cohesion.is_finite(),
+                "Topic coverage prototype contains non-finite values"
+            );
+        }
+        let mut root_ids = roots
+            .iter()
+            .map(|root| self.root_id_for_path(root))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        root_ids.sort_unstable();
+        root_ids.dedup();
+        if root_ids.is_empty() {
+            return Ok(TopicCoverageResult {
+                eligible_document_count: 0,
+                related_document_counts: vec![0; prototypes.len()],
+                related_chunks: vec![Vec::new(); prototypes.len()],
+            });
+        }
+        let source_key = self
+            .path_key_for_existing_path(source_path)
+            .to_string_lossy()
+            .into_owned();
+        let root_placeholders = std::iter::repeat_n("?", root_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT c.id, f.id, f.file_path, c.byte_start, c.byte_end,
+                    c.origin_type, c.page, c.line, c.col,
+                    c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.chunk_text,
+                    v.embedding
+             FROM files f
+             JOIN chunks c ON c.file_id = f.id
+             JOIN vec_chunks v ON v.rowid = c.id
+             WHERE EXISTS (
+                 SELECT 1
+                 FROM root_files rf
+                 WHERE rf.file_id = f.id
+                   AND rf.root_id IN ({root_placeholders})
+             )
+             ORDER BY f.id, c.chunk_idx, c.id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(&root_ids), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<f64>>(9)?,
+                row.get::<_, Option<f64>>(10)?,
+                row.get::<_, Option<f64>>(11)?,
+                row.get::<_, Option<f64>>(12)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, Vec<u8>>(14)?,
+            ))
+        })?;
+
+        let mut eligible_documents = HashSet::new();
+        let mut related_by_document =
+            vec![BTreeMap::<i64, Vec<RankedCoverageChunk>>::new(); prototypes.len()];
+        for (row_number, row) in rows.enumerate() {
+            if row_number.is_multiple_of(256) && cancelled.load(Ordering::Relaxed) {
+                anyhow::bail!("Chunk topic operation cancelled");
+            }
+            let (
+                chunk_id,
+                file_id,
+                file_path,
+                byte_start,
+                byte_end,
+                origin_type,
+                page,
+                line,
+                col,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+                chunk_text,
+                embedding_bytes,
+            ) = row?;
+            if file_path == source_key {
+                continue;
+            }
+            eligible_documents.insert(file_id);
+            let embedding = normalized_vector(&f32_slice_from_bytes(&embedding_bytes)?);
+            anyhow::ensure!(
+                embedding.len() == self.dimension,
+                "Stored embedding dimension mismatch for {}. Expected {}, received {}.",
+                file_path,
+                self.dimension,
+                embedding.len()
+            );
+            let mut matches = Vec::new();
+            for (index, prototype) in prototypes.iter().enumerate() {
+                let average_similarity = embedding
+                    .iter()
+                    .zip(&prototype.mean_member_embedding)
+                    .map(|(candidate, member_mean)| candidate * member_mean)
+                    .sum::<f32>();
+                if average_similarity >= prototype.cohesion {
+                    matches.push((index, average_similarity));
+                }
+            }
+            if matches.is_empty() {
+                continue;
+            }
+            let origin = source_origin_from_parts(
+                &origin_type,
+                page,
+                line,
+                col,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+            )
+            .ok_or_else(|| anyhow::anyhow!("Unknown chunk origin type '{origin_type}'"))?;
+            let chunk = ChunkTopicMember {
+                chunk_id,
+                file_path: self.key_to_display_path(&file_path),
+                chunk_text,
+                extraction_byte_range: ByteRange {
+                    start: byte_start as usize,
+                    end: byte_end as usize,
+                },
+                origin,
+            };
+            for (index, score) in matches {
+                let ranked = related_by_document[index].entry(file_id).or_default();
+                ranked.push(RankedCoverageChunk {
+                    score,
+                    chunk: chunk.clone(),
+                });
+                ranked.sort_by(|left, right| {
+                    right
+                        .score
+                        .total_cmp(&left.score)
+                        .then_with(|| left.chunk.chunk_id.cmp(&right.chunk.chunk_id))
+                });
+                ranked.truncate(TOPIC_COVERAGE_CHUNKS_PER_DOCUMENT);
+            }
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            anyhow::bail!("Chunk topic operation cancelled");
+        }
+        let related_document_counts = related_by_document.iter().map(BTreeMap::len).collect();
+        let related_chunks = related_by_document
+            .into_iter()
+            .map(|documents| {
+                documents
+                    .into_values()
+                    .flat_map(|chunks| chunks.into_iter().map(|ranked| ranked.chunk))
+                    .collect()
+            })
+            .collect();
+        Ok(TopicCoverageResult {
+            eligible_document_count: eligible_documents.len(),
+            related_document_counts,
+            related_chunks,
+        })
+    }
+
     fn topic_chunks_filtered(
         &self,
         predicate: &str,
@@ -4104,6 +4635,10 @@ impl SemanticIndex {
         if schema_version == 3 {
             Self::migrate_v3_to_v4(&conn)?;
             schema_version = 4;
+        }
+        if schema_version == 4 {
+            Self::migrate_v4_to_v5(&conn)?;
+            schema_version = 5;
         }
         anyhow::ensure!(
             schema_version == SCHEMA_VERSION,

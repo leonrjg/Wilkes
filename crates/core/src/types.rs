@@ -103,6 +103,10 @@ pub struct Match {
 pub struct FileMatches {
     pub path: PathBuf,
     pub file_type: FileType,
+    /// Composed cached document title when available. Search providers leave
+    /// this empty; the application enriches results at the metadata boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub matches: Vec<Match>,
 }
 
@@ -219,12 +223,23 @@ pub struct CitationLinksQuery {
 
 /// Citation neighbours of a document that are present in the library, resolved
 /// by DOI. `references` are documents the anchor cites; `cited_by` are
-/// documents that cite the anchor. Both directions carry the same
-/// metadata-enriched [`FileEntry`] shape as every other document list.
+/// documents that cite the anchor. `all_references` contains every outgoing
+/// DOI known to the citation provider, including works absent from the library.
+/// Both library directions carry the same metadata-enriched [`FileEntry`] shape
+/// as every other document list.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CitationLinks {
     pub references: Vec<FileEntry>,
     pub cited_by: Vec<FileEntry>,
+    #[serde(default)]
+    pub all_references: Vec<CitationReference>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CitationReference {
+    pub doi: String,
+    /// First document line that contains this exact normalized DOI.
+    pub citation_line: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -521,8 +536,26 @@ pub struct ChunkTopic {
     pub chunk_count: usize,
     pub distinct_document_count: usize,
     pub cohesion: f32,
+    /// For a document-scoped topic, the number of other indexed documents
+    /// containing at least one passage that meets the topic's own cohesion
+    /// boundary. Root-scoped topics leave this absent because their membership
+    /// already describes the selected root's distribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_coverage: Option<TopicLibraryCoverage>,
     #[serde(default)]
     pub label: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TopicLibraryCoverage {
+    pub related_document_count: usize,
+    /// Other indexed documents across all configured library roots; the source
+    /// document is deliberately excluded from both numerator and denominator.
+    pub eligible_document_count: usize,
+    /// The highest-similarity qualifying passages retained for each related
+    /// document, ready to surface through the normal search-results pipeline.
+    #[serde(default)]
+    pub chunks: Vec<ChunkTopicMember>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

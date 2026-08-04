@@ -238,6 +238,9 @@ export const useSettingsStore = create<SettingsStore>()(
           author: Object.prototype.hasOwnProperty.call(update, "author")
             ? update.author ?? null
             : entry.author,
+          doi: Object.prototype.hasOwnProperty.call(update, "doi")
+            ? update.doi ?? null
+            : entry.doi,
           publication_date: update.publication_date ?? null,
           citation_count: update.citation_count ?? null,
           metadata_conflicts: update.metadata_conflicts ?? entry.metadata_conflicts,

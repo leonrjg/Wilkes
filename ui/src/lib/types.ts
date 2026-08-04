@@ -63,6 +63,8 @@ export interface Match {
 export interface FileMatches {
   path: string;
   file_type: FileType;
+  /** Composed cached document title, when metadata is available. */
+  title?: string | null;
   matches: Match[];
 }
 
@@ -116,12 +118,18 @@ export interface CitationLinksQuery {
   path: string;
 }
 
-/** Citation neighbours of a document present in the library, resolved by DOI.
- *  `references` are documents the anchor cites; `cited_by` are documents that
- *  cite the anchor. */
+export interface CitationReference {
+  doi: string;
+  /** First document line containing this exact normalized DOI, when available. */
+  citation_line?: string | null;
+}
+
+/** Citation neighbours resolved by DOI. The two document lists contain only
+ *  library files; `all_references` contains every known outgoing DOI. */
 export interface CitationLinks {
   references: FileEntry[];
   cited_by: FileEntry[];
+  all_references: CitationReference[];
 }
 
 export interface MatchRef {
@@ -194,7 +202,17 @@ export interface ChunkTopic {
   chunk_count: number;
   distinct_document_count: number;
   cohesion: number;
+  /** Reach across every configured indexed library root for document-scoped
+   *  topics. The source document is excluded from both counts. */
+  library_coverage?: TopicLibraryCoverage | null;
   label?: string | null;
+}
+
+export interface TopicLibraryCoverage {
+  related_document_count: number;
+  eligible_document_count: number;
+  /** Highest-similarity qualifying passages retained per related document. */
+  chunks: ChunkTopicMember[];
 }
 
 export interface ChunkTopicsResult {
@@ -315,6 +333,8 @@ export interface FileEntry {
   title?: string | null;
   /** Document author from cached extracted metadata. */
   author?: string | null;
+  /** Normalized document DOI from cached extracted metadata. */
+  doi?: string | null;
   /** Document publication date ("YYYY-MM") from cached extracted metadata.
    *  Absent until the metadata cache has processed this file. */
   publication_date?: string | null;
@@ -351,6 +371,7 @@ export interface FileMetadataUpdate {
   path: string;
   title?: string | null;
   author?: string | null;
+  doi?: string | null;
   publication_date: string | null;
   citation_count?: number | null;
   metadata_conflicts?: Record<string, MetadataConflictValue[]>;

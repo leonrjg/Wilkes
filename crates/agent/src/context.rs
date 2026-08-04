@@ -92,11 +92,10 @@ pub fn build_context_block(
          to `all` when the question asks across the library; otherwise omit it for the current root. \
          Always set search.mode explicitly: use `exact` only for literal text or regex matching, \
          and use `semantic` for concepts, paraphrases, themes, or meaning-based queries. \
-         Use get_document_text for pages or page ranges not included here; \
-         omit path to read the open document, or pass a path listed in this context or under \
-         the current root. If a document is outside the current root and is not listed in \
-         context, tell the user they can move it to this root, switch roots, or add it using \
-         the file list's right-click menu. Use \
+         Use get_document_text for pages or page ranges not included here; pass \
+         page_range in \"N-M\" format, for example \"1-2\". \
+         Omit path to read the open document, or pass a path listed in this context or under \
+         any configured Wilkes library root. Use \
          list_context to inspect the current Wilkes context.\n",
     );
 
@@ -210,8 +209,8 @@ mod tests {
         assert!(block.contains("Always set search.mode explicitly"));
         assert!(block.contains("use `semantic` for concepts"));
         assert!(block.contains("get_document_text"));
-        assert!(block.contains("pass a path listed in this context or under the current root"));
-        assert!(block.contains("file list's right-click menu"));
+        assert!(block.contains("page_range in \"N-M\" format"));
+        assert!(block.contains("under any configured Wilkes library root"));
     }
 
     #[test]

@@ -321,6 +321,7 @@ impl SearchProvider for SemanticSearchProvider {
             let fm = FileMatches {
                 path,
                 file_type,
+                title: None,
                 matches,
             };
             if tx.blocking_send(fm).is_err() {

@@ -6,8 +6,33 @@ pub async fn get_settings(path: &Path) -> anyhow::Result<Settings> {
         return Ok(Settings::default());
     }
     let json = tokio::fs::read_to_string(path).await?;
-    let settings = serde_json::from_str(&json)?;
+    let mut settings: Settings = serde_json::from_str(&json)?;
+    canonicalize_configured_roots(&mut settings);
     Ok(settings)
+}
+
+/// Resolve aliases at the settings boundary so every consumer compares the
+/// same spelling of a configured root. Nested roots remain separate: only
+/// duplicate aliases within each persisted list are removed.
+fn canonicalize_configured_roots(settings: &mut Settings) {
+    if let Some(root) = settings.last_directory.as_mut() {
+        if let Ok(canonical) = std::fs::canonicalize(&*root) {
+            *root = canonical;
+        }
+    }
+    canonicalize_root_list(&mut settings.favorites);
+    canonicalize_root_list(&mut settings.recent_dirs);
+}
+
+fn canonicalize_root_list(roots: &mut Vec<std::path::PathBuf>) {
+    let mut canonical = Vec::with_capacity(roots.len());
+    for root in roots.drain(..) {
+        let resolved = std::fs::canonicalize(&root).unwrap_or(root);
+        if !canonical.contains(&resolved) {
+            canonical.push(resolved);
+        }
+    }
+    *roots = canonical;
 }
 
 pub async fn update_settings(path: &Path, patch: serde_json::Value) -> anyhow::Result<Settings> {
@@ -105,6 +130,32 @@ mod tests {
         assert_eq!(loaded.respect_gitignore, false);
         assert_eq!(loaded.file_sort_key, FileSortKey::Modified);
         assert_eq!(loaded.file_sort_direction, FileSortDirection::Desc);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_settings_canonicalizes_root_aliases_without_collapsing_nested_roots() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let child = parent.join("child");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir_all(&child).unwrap();
+        symlink(&parent, &alias).unwrap();
+
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::default();
+        settings.last_directory = Some(parent.clone());
+        settings.favorites = vec![alias.join("child"), child.clone()];
+        tokio::fs::write(&path, serde_json::to_string(&settings).unwrap())
+            .await
+            .unwrap();
+
+        let loaded = get_settings(&path).await.unwrap();
+
+        assert_eq!(loaded.last_directory, Some(parent.canonicalize().unwrap()));
+        assert_eq!(loaded.favorites, vec![child.canonicalize().unwrap()]);
     }
 
     #[tokio::test]

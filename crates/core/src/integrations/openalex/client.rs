@@ -328,7 +328,7 @@ mod tests {
             .match_query(Matcher::AllOf(vec![
                 Matcher::UrlEncoded(
                     "filter".into(),
-                    "doi:https://doi.org/10.48550/arXiv.2103.04682".into(),
+                    "doi:https://doi.org/10.48550/arxiv.2103.04682".into(),
                 ),
                 Matcher::UrlEncoded("select".into(), LOOKUP_SELECT.into()),
             ]))
@@ -359,7 +359,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(work.doi, "10.48550/arXiv.2103.04682");
+        assert_eq!(work.doi, "10.48550/arxiv.2103.04682");
         assert_eq!(work.work_id, "https://openalex.org/W3145166639");
         assert_eq!(
             work.title.as_deref(),

@@ -67,6 +67,8 @@ export interface SearchApi {
   updateSettings(patch: Partial<Settings>): Promise<Settings>;
   /** Desktop-only lifecycle controls for the opt-in external MCP endpoint. */
   getExternalMcpStatus?(): Promise<ExternalMcpStatus>;
+  /** Desktop-only live viewer context exposed by the external MCP endpoint. */
+  setActiveDocument?(path: string | null, page?: number | null): Promise<void>;
   configureExternalMcp?(
     enabled: boolean,
     requireToken: boolean,

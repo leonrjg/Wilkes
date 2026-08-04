@@ -162,6 +162,79 @@ describe("ResultList", () => {
     expect(screen.getByPlaceholderText("Filter files...")).toBeInTheDocument();
   });
 
+  it("marks files that also belong to another configured nested root", () => {
+    useSettingsStore.setState({
+      directory: "/library",
+      favorites: ["/library/nested", "/library/sibling"],
+      recentDirs: ["/library"],
+      fileList: [
+        { path: "/library/nested/file.pdf", size_bytes: 10, file_type: "Pdf", extension: "pdf" },
+        { path: "/library/nested-old/other.pdf", size_bytes: 10, file_type: "Pdf", extension: "pdf" },
+      ],
+    });
+
+    renderWithToasts();
+
+    expect(screen.getByLabelText("Also in root: /library/nested")).toBeInTheDocument();
+    expect(screen.getAllByLabelText(/^Also in root/)).toHaveLength(1);
+  });
+
+  it("marks files in the current nested root when an ancestor is also configured", () => {
+    useSettingsStore.setState({
+      directory: "/library/nested",
+      favorites: ["/library"],
+      recentDirs: ["/library/nested"],
+      fileList: [
+        { path: "/library/nested/file.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" },
+      ],
+    });
+
+    renderWithToasts();
+
+    expect(screen.getByLabelText("Also in root: /library")).toBeInTheDocument();
+  });
+
+  it("shows the additional-root indicator while displaying search results", () => {
+    useSettingsStore.setState({
+      directory: "/library",
+      favorites: ["/library/nested"],
+      recentDirs: ["/library"],
+    });
+    useSearchStore.setState({
+      hasQuery: true,
+      results: [
+        {
+          path: "/library/nested/file.txt",
+          file_type: "PlainText",
+          matches: [],
+        },
+      ],
+    });
+
+    renderWithToasts();
+
+    expect(screen.getByLabelText("Also in root: /library/nested")).toBeInTheDocument();
+  });
+
+  it("shows title metadata in search-result headers", () => {
+    useSearchStore.setState({
+      hasQuery: true,
+      results: [
+        {
+          path: "/library/paper.pdf",
+          file_type: "Pdf",
+          title: "A Composed Document Title",
+          matches: [],
+        },
+      ],
+    });
+
+    renderWithToasts();
+
+    expect(screen.getByText("paper.pdf")).toBeInTheDocument();
+    expect(screen.getByText("A Composed Document Title")).toBeInTheDocument();
+  });
+
   it("renders document-scope controls above the filename filter", () => {
     renderWithToasts();
     const collection = screen.getByRole("combobox", { name: "Smart collection" });
@@ -1278,6 +1351,83 @@ describe("ResultList", () => {
       "/test/file.txt",
       "renamed.txt",
     );
+  });
+
+  it("suggests a metadata-based filename and renames to it in one click", async () => {
+    useSettingsStore.setState({
+      directory: "/test",
+      fileList: [
+        {
+          path: "/test/file.pdf",
+          size_bytes: 10,
+          file_type: "Pdf",
+          extension: "pdf",
+          title: "A Better Paper",
+          author: "Smith et al.",
+          publication_date: "2021-05-03",
+        },
+      ],
+    });
+
+    renderWithToasts();
+    fireEvent.contextMenu(screen.getByRole("button", { name: /file\.pdf/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+
+    expect(screen.getByText("Suggested from metadata")).toBeInTheDocument();
+    expect(screen.getByText("Smith et al. - A Better Paper (2021).pdf")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename to suggestion" }));
+
+    await waitFor(() => {
+      expect(mockRenameFile).toHaveBeenCalledWith(
+        "/test/file.pdf",
+        "Smith et al. - A Better Paper (2021).pdf",
+      );
+    });
+  });
+
+  it("sanitizes a title-only suggestion and preserves the original extension", () => {
+    useSettingsStore.setState({
+      directory: "/test",
+      fileList: [
+        {
+          path: "/test/file.paper.pdf",
+          size_bytes: 10,
+          file_type: "Pdf",
+          extension: "pdf",
+          title: "  Notes:  an   overview?  ",
+        },
+      ],
+    });
+
+    renderWithToasts();
+    fireEvent.contextMenu(screen.getByRole("button", { name: /file\.paper\.pdf/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+
+    expect(screen.getByText("Notes an overview.pdf")).toBeInTheDocument();
+  });
+
+  it("does not show a filename suggestion without a metadata title", () => {
+    useSettingsStore.setState({
+      directory: "/test",
+      fileList: [
+        {
+          path: "/test/file.txt",
+          size_bytes: 10,
+          file_type: "PlainText",
+          extension: "txt",
+          author: "Smith",
+          publication_date: "2021-05",
+        },
+      ],
+    });
+
+    renderWithToasts();
+    fireEvent.contextMenu(screen.getByRole("button", { name: /file\.txt/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+
+    expect(screen.queryByText("Suggested from metadata")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Rename to suggestion" })).not.toBeInTheDocument();
   });
 
   it("permanently deletes a web file after confirmation", async () => {

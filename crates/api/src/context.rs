@@ -1,6 +1,6 @@
 use parking_lot::Mutex as PLMutex;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 
 use wilkes_core::directory_watcher::{DirectoryChangeBatch, DirectoryWatcher};
 use wilkes_core::embed::cluster::WardTree;
-use wilkes_core::embed::index::db::TopicChunkData;
+use wilkes_core::embed::index::db::{TopicChunkData, TopicCoveragePrototype};
 use wilkes_core::embed::index::semantic_updater::process_directory_change;
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::installer::EmbedderInstaller;
@@ -38,17 +38,17 @@ use wilkes_core::integrations::semantic_scholar::SemanticScholarClient;
 use wilkes_core::integrations::zotero::model::ZoteroItem;
 use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
+use wilkes_core::metadata::doi::find_dois;
 use wilkes_core::models::progress::EmbedProgress;
-use wilkes_core::path::is_under;
 use wilkes_core::types::{
     Bookmark, BookmarkCluster, BookmarkClustersQuery, BookmarkClustersResult, ChunkTopic,
     ChunkTopicMember, ChunkTopicsQuery, ChunkTopicsResult, CitationLinks, CitationLinksQuery,
-    CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbedderModel, FileEntry,
-    FileListResponse, FileType, IndexStatus, IndexingConfig, MetadataConflictValue,
+    CitationReference, CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbedderModel,
+    FileEntry, FileListResponse, FileType, IndexStatus, IndexingConfig, MetadataConflictValue,
     MetadataSourcePreference, NewBookmark, NewSmartCollection, NewTag, PreviewData,
     RelatedDocument, RelatedDocumentsQuery, SearchLogEntry, SearchMode, SearchQuery, SearchScope,
-    SelectedEmbedder, SemanticSettings, Settings, SmartCollection, Tag, UpdateSmartCollection,
-    UpdateTag,
+    SelectedEmbedder, SemanticSettings, Settings, SmartCollection, Tag, TopicLibraryCoverage,
+    UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::types::{
     GenerationSettings, GenerationStreamEvent, GenerationTask, GeneratorDescriptor,
@@ -288,6 +288,10 @@ struct TopicTreeCache {
     index_revision: u64,
     tree: WardTree,
     sampled: Vec<TopicChunkData>,
+    /// Retained only for a document-scoped tree. Root trees deliberately drop
+    /// their input vectors after Ward construction because their O(n^2)
+    /// similarity matrix is already the dominant cache allocation.
+    sampled_embeddings: Option<Vec<Vec<f32>>>,
     total_chunk_count: usize,
     total_document_count: usize,
     sampled_document_count: usize,
@@ -1030,15 +1034,17 @@ impl AppContext {
                     .collect::<std::collections::HashSet<_>>()
                     .len();
 
-                // The cached corpus needs passage metadata, not another copy
-                // of every vector. Move embeddings into the one-time builder
-                // and retain only the Ward tree's similarity matrix afterward.
+                // Root caches need passage metadata, not another copy of every
+                // vector, so they retain only the Ward similarity matrix.
+                // Document caches keep their bounded vectors as the prototypes
+                // needed to project local topics across the full library.
                 let vectors: Vec<Vec<f32>> = sampled
                     .iter_mut()
                     .map(|chunk| std::mem::take(&mut chunk.embedding))
                     .collect();
                 let tree = WardTree::build_with_cancel(&vectors, &build_cancel)
                     .map_err(|error| format!("Could not cluster indexed chunks: {error:#}"))?;
+                let sampled_embeddings = build_path.is_some().then_some(vectors);
 
                 Ok::<_, String>(Arc::new(TopicTreeCache {
                     root: build_root,
@@ -1047,6 +1053,7 @@ impl AppContext {
                     index_revision,
                     tree,
                     sampled,
+                    sampled_embeddings,
                     total_chunk_count,
                     total_document_count,
                     sampled_document_count,
@@ -1122,49 +1129,118 @@ impl AppContext {
             .await?;
         let cached_for_cut = Arc::clone(&cached);
         let cut_cancel = Arc::clone(cancel_flag);
-        let mut result = tokio::task::spawn_blocking(move || {
+        let (mut result, coverage_prototypes) = tokio::task::spawn_blocking(move || {
             let clustered = cached_for_cut
                 .tree
                 .cut_with_cancel(granularity, &cut_cancel)
                 .map_err(|error| format!("Could not cut chunk topic tree: {error:#}"))?;
-            let topics = clustered
-                .clusters
-                .into_iter()
-                .map(|cluster| {
-                    let chunks: Vec<ChunkTopicMember> = cluster
-                        .item_indices
-                        .iter()
-                        .map(|index| topic_member(&cached_for_cut.sampled[*index]))
-                        .collect();
-                    let distinct_document_count = chunks
-                        .iter()
-                        .map(|chunk| &chunk.file_path)
-                        .collect::<std::collections::HashSet<_>>()
-                        .len();
-                    ChunkTopic {
-                        cluster_key: chunk_cluster_key(chunks.iter().map(|chunk| chunk.chunk_id)),
-                        chunk_count: chunks.len(),
-                        distinct_document_count,
-                        chunks,
-                        representative_chunk_id: cached_for_cut.sampled
-                            [cluster.representative_index]
-                            .chunk_id,
-                        cohesion: cluster.cohesion,
-                        label: None,
+            let document_scoped = cached_for_cut.path.is_some();
+            let document_embeddings =
+                match (document_scoped, cached_for_cut.sampled_embeddings.as_ref()) {
+                    (true, Some(embeddings)) => Some(embeddings),
+                    (true, None) => {
+                        return Err(
+                            "Document topic cache is missing retained embeddings".to_string()
+                        )
                     }
-                })
-                .collect();
-            Ok::<_, String>(ChunkTopicsResult {
-                topics,
-                total_chunk_count: cached_for_cut.total_chunk_count,
-                sampled_chunk_count: cached_for_cut.sampled.len(),
-                total_document_count: cached_for_cut.total_document_count,
-                sampled_document_count: cached_for_cut.sampled_document_count,
-                input_cap: cached_for_cut.input_cap,
-            })
+                    (false, _) => None,
+                };
+            let mut topics = Vec::with_capacity(clustered.clusters.len());
+            let mut coverage_prototypes = Vec::with_capacity(clustered.clusters.len());
+            for cluster in clustered.clusters {
+                if let Some(embeddings) = document_embeddings {
+                    coverage_prototypes.push(TopicCoveragePrototype {
+                        mean_member_embedding: mean_normalized_embeddings(
+                            embeddings,
+                            &cluster.item_indices,
+                        )?,
+                        cohesion: cluster.cohesion,
+                    });
+                }
+                let chunks: Vec<ChunkTopicMember> = cluster
+                    .item_indices
+                    .iter()
+                    .map(|index| topic_member(&cached_for_cut.sampled[*index]))
+                    .collect();
+                let distinct_document_count = chunks
+                    .iter()
+                    .map(|chunk| &chunk.file_path)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                topics.push(ChunkTopic {
+                    cluster_key: chunk_cluster_key(chunks.iter().map(|chunk| chunk.chunk_id)),
+                    chunk_count: chunks.len(),
+                    distinct_document_count,
+                    chunks,
+                    representative_chunk_id: cached_for_cut.sampled[cluster.representative_index]
+                        .chunk_id,
+                    cohesion: cluster.cohesion,
+                    library_coverage: None,
+                    label: None,
+                });
+            }
+            Ok::<_, String>((
+                ChunkTopicsResult {
+                    topics,
+                    total_chunk_count: cached_for_cut.total_chunk_count,
+                    sampled_chunk_count: cached_for_cut.sampled.len(),
+                    total_document_count: cached_for_cut.total_document_count,
+                    sampled_document_count: cached_for_cut.sampled_document_count,
+                    input_cap: cached_for_cut.input_cap,
+                },
+                coverage_prototypes,
+            ))
         })
         .await
         .map_err(|e| format!("Chunk topic task panicked: {e}"))??;
+
+        if let Some(source_path) = cached.path.clone() {
+            if self.semantic_index_revision.load(Ordering::Acquire) != cached.index_revision {
+                return Err("Semantic index changed while calculating topic coverage".to_string());
+            }
+            let index_arc = self.index.lock().clone();
+            let coverage_roots = library_roots;
+            let coverage_cancel = Arc::clone(cancel_flag);
+            let coverage = tokio::task::spawn_blocking(move || {
+                let guard = index_arc
+                    .lock()
+                    .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+                let index = guard.as_ref().ok_or_else(|| {
+                    "Semantic index unavailable. Build or restore the semantic index first."
+                        .to_string()
+                })?;
+                index
+                    .topic_library_coverage(
+                        &coverage_roots,
+                        &source_path,
+                        &coverage_prototypes,
+                        &coverage_cancel,
+                    )
+                    .map_err(|error| format!("Could not calculate topic coverage: {error:#}"))
+            })
+            .await
+            .map_err(|error| format!("Topic coverage task panicked: {error}"))??;
+            if self.semantic_index_revision.load(Ordering::Acquire) != cached.index_revision {
+                return Err("Semantic index changed while calculating topic coverage".to_string());
+            }
+            if coverage.related_document_counts.len() != result.topics.len()
+                || coverage.related_chunks.len() != result.topics.len()
+            {
+                return Err("Topic coverage result count does not match topic count".to_string());
+            }
+            for ((topic, related_document_count), chunks) in result
+                .topics
+                .iter_mut()
+                .zip(coverage.related_document_counts)
+                .zip(coverage.related_chunks)
+            {
+                topic.library_coverage = Some(TopicLibraryCoverage {
+                    related_document_count,
+                    eligible_document_count: coverage.eligible_document_count,
+                    chunks,
+                });
+            }
+        }
 
         self.attach_chunk_topic_labels(
             request_id,
@@ -1778,18 +1854,15 @@ impl AppContext {
         });
     }
 
+    /// Opens a caller-authorized document path. Path confinement belongs to the
+    /// transport boundary (for example MCP library roots or server uploads),
+    /// because desktop library documents normally live outside `data_dir`.
     pub async fn open_file(&self, path: PathBuf) -> anyhow::Result<PreviewData> {
-        if !is_under(&path, &self.data_dir) {
-            anyhow::bail!("Access denied: path outside data directory");
-        }
         let s = self.get_settings().await;
         crate::commands::files::open_file(path, s.supported_extensions).await
     }
 
     pub async fn rename_file(&self, path: PathBuf, new_name: String) -> anyhow::Result<PathBuf> {
-        if !is_under(&path, &self.data_dir) {
-            anyhow::bail!("Access denied: path outside data directory");
-        }
         let old = path.clone();
         let new = crate::commands::files::rename_file(path, new_name).await?;
         self.rekey_research_path(&old, &new)?;
@@ -1853,9 +1926,6 @@ impl AppContext {
     }
 
     pub async fn get_file_metadata(&self, path: PathBuf) -> anyhow::Result<DocumentMetadata> {
-        if !is_under(&path, &self.data_dir) {
-            anyhow::bail!("Access denied: path outside data directory");
-        }
         let s = self.get_settings().await;
         crate::commands::metadata::get_file_metadata(path, s.supported_extensions).await
     }
@@ -1869,9 +1939,6 @@ impl AppContext {
     /// cache has not processed yet. No third composition is introduced — this
     /// only chooses between the two the app already owns.
     pub async fn document_metadata_full(&self, path: PathBuf) -> anyhow::Result<DocumentMetadata> {
-        if !is_under(&path, &self.data_dir) {
-            anyhow::bail!("Access denied: path outside data directory");
-        }
         if let (Some(cache), Some(identity)) =
             (self.metadata_cache(), FileIdentity::for_path(&path))
         {
@@ -1933,9 +2000,6 @@ impl AppContext {
     /// background tabulation resolve through it (the fill batches the Zotero
     /// attachment fetch, but composes identically).
     pub async fn resolve_file_metadata(&self, path: PathBuf) -> anyhow::Result<DocumentMetadata> {
-        if !is_under(&path, &self.data_dir) {
-            anyhow::bail!("Access denied: path outside data directory");
-        }
         let s = self.get_settings().await;
         crate::commands::integrations::zotero::resolve_file_metadata(s, path).await
     }
@@ -1979,9 +2043,6 @@ impl AppContext {
         &self,
         path: PathBuf,
     ) -> anyhow::Result<wilkes_core::types::AddOutcome> {
-        if !is_under(&path, &self.data_dir) {
-            anyhow::bail!("Access denied: path outside data directory");
-        }
         let s = self.get_settings().await;
         crate::commands::integrations::zotero::zotero_add_item(s, path).await
     }
@@ -1990,9 +2051,6 @@ impl AppContext {
         &self,
         path: PathBuf,
     ) -> anyhow::Result<wilkes_core::types::CitationResult> {
-        if !is_under(&path, &self.data_dir) {
-            anyhow::bail!("Access denied: path outside data directory");
-        }
         let s = self.get_settings().await;
         crate::commands::integrations::zotero::zotero_generate_citation(s, path).await
     }
@@ -2872,6 +2930,7 @@ impl AppContext {
             None
         };
 
+        let primary_metadata_source = metadata_source_preference(&settings.primary_metadata_source);
         Ok(start_search(
             query,
             all_roots,
@@ -2884,7 +2943,8 @@ impl AppContext {
             retrieval,
             generator,
             settings.grep_use_index,
-        ))
+        )
+        .with_metadata(self.metadata_cache(), primary_metadata_source))
     }
 
     async fn eligible_paths_for_collection(
@@ -3034,7 +3094,7 @@ impl AppContext {
         let cache = self
             .metadata_cache()
             .ok_or_else(|| "Metadata cache is unavailable".to_string())?;
-        let paths = {
+        let (paths, reference_dois) = {
             let guard = cache
                 .lock()
                 .map_err(|_| "Metadata cache lock failed".to_string())?;
@@ -3044,11 +3104,21 @@ impl AppContext {
             else {
                 return Ok(CitationLinks::default());
             };
-            guard.citation_links(&doi).map_err(|e| e.to_string())?
+            (
+                guard.citation_links(&doi).map_err(|e| e.to_string())?,
+                guard.citation_references(&doi).map_err(|e| e.to_string())?,
+            )
         };
-        if paths.references.is_empty() && paths.cited_by.is_empty() {
+        if paths.references.is_empty() && paths.cited_by.is_empty() && reference_dois.is_empty() {
             return Ok(CitationLinks::default());
         }
+
+        let reference_text = if reference_dois.is_empty() {
+            None
+        } else {
+            self.citation_reference_text(&source_path).await
+        };
+        let all_references = enrich_citation_references(reference_dois, reference_text.as_deref());
 
         // Resolve edge paths to the same metadata-enriched record shape as every
         // other document list. Citation edges span the whole library, so list
@@ -3076,6 +3146,7 @@ impl AppContext {
         Ok(CitationLinks {
             references: resolve(paths.references),
             cited_by: resolve(paths.cited_by),
+            all_references,
         })
     }
 
@@ -3242,6 +3313,13 @@ impl AppContext {
     }
 
     fn document_summary_input(&self, path: &Path) -> Result<DocumentSummaryInput, String> {
+        Ok(DocumentSummaryInput {
+            title: self.document_title(path),
+            text: Self::read_document_text(path)?,
+        })
+    }
+
+    fn read_document_text(path: &Path) -> Result<String, String> {
         let text = if path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -3255,10 +3333,46 @@ impl AppContext {
             std::fs::read_to_string(path)
                 .map_err(|e| format!("Could not read {}: {e}", path.display()))?
         };
-        Ok(DocumentSummaryInput {
-            title: self.document_title(path),
-            text,
-        })
+        Ok(text)
+    }
+
+    /// Prefer the semantic index's current extracted text. If this file has no
+    /// usable stored full text (including legacy empty rows), extract it once
+    /// off the async runtime so citation labels still work without an index
+    /// rebuild.
+    async fn citation_reference_text(&self, path: &Path) -> Option<String> {
+        let indexed = {
+            let index = self.index.lock();
+            let guard = index.lock().unwrap_or_else(|p| p.into_inner());
+            guard.as_ref().and_then(|idx| {
+                idx.indexed_document_for_path(path)
+                    .map_err(|error| {
+                        info!(path = %path.display(), %error, "citation text index read failed");
+                        error
+                    })
+                    .ok()
+                    .flatten()
+                    .map(|(text, _)| text)
+                    .filter(|text| !text.trim().is_empty())
+            })
+        };
+        if indexed.is_some() {
+            return indexed;
+        }
+
+        let path = path.to_path_buf();
+        match tokio::task::spawn_blocking(move || Self::read_document_text(&path)).await {
+            Ok(Ok(text)) if !text.trim().is_empty() => Some(text),
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => {
+                info!(%error, "citation text extraction skipped");
+                None
+            }
+            Err(error) => {
+                info!(%error, "citation text extraction task failed");
+                None
+            }
+        }
     }
 
     fn document_title(&self, path: &Path) -> String {
@@ -4208,6 +4322,49 @@ fn topic_member(chunk: &TopicChunkData) -> ChunkTopicMember {
     }
 }
 
+fn mean_normalized_embeddings(
+    embeddings: &[Vec<f32>],
+    indices: &[usize],
+) -> Result<Vec<f32>, String> {
+    let Some(&first_index) = indices.first() else {
+        return Err("Cannot calculate coverage for an empty topic".to_string());
+    };
+    let dimension = embeddings
+        .get(first_index)
+        .ok_or_else(|| "Topic member embedding index is out of bounds".to_string())?
+        .len();
+    if dimension == 0 {
+        return Err("Cannot calculate coverage from zero-dimensional embeddings".to_string());
+    }
+    let mut mean = vec![0.0f32; dimension];
+    for &index in indices {
+        let embedding = embeddings
+            .get(index)
+            .ok_or_else(|| "Topic member embedding index is out of bounds".to_string())?;
+        if embedding.len() != dimension {
+            return Err("Topic member embedding dimensions do not match".to_string());
+        }
+        if !embedding.iter().all(|value| value.is_finite()) {
+            return Err("Topic member embedding contains non-finite values".to_string());
+        }
+        let norm = embedding
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        if norm > f32::EPSILON {
+            for (total, value) in mean.iter_mut().zip(embedding) {
+                *total += value / norm;
+            }
+        }
+    }
+    let count = indices.len() as f32;
+    for value in &mut mean {
+        *value /= count;
+    }
+    Ok(mean)
+}
+
 fn chunk_cluster_key(chunk_ids: impl IntoIterator<Item = i64>) -> String {
     let mut ids: Vec<i64> = chunk_ids.into_iter().collect();
     ids.sort_unstable();
@@ -4290,6 +4447,37 @@ enum FillOutcome {
     Renamed(DocumentMetadata),
 }
 
+fn enrich_citation_references(
+    reference_dois: Vec<String>,
+    document_text: Option<&str>,
+) -> Vec<CitationReference> {
+    let wanted = reference_dois.iter().cloned().collect::<HashSet<_>>();
+    let mut lines_by_doi = HashMap::new();
+    if let Some(text) = document_text {
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            for found in find_dois(line) {
+                if wanted.contains(&found) {
+                    lines_by_doi
+                        .entry(found)
+                        .or_insert_with(|| line.to_string());
+                }
+            }
+        }
+    }
+
+    reference_dois
+        .into_iter()
+        .map(|doi| CitationReference {
+            citation_line: lines_by_doi.remove(&doi),
+            doi,
+        })
+        .collect()
+}
+
 /// JSON payload entry for the `file-metadata-updated` event.
 fn metadata_update_json(
     path: &Path,
@@ -4300,6 +4488,7 @@ fn metadata_update_json(
         "path": path.to_string_lossy(),
         "title": metadata.title,
         "author": metadata.author,
+        "doi": metadata.doi,
         "publication_date": metadata.created_at,
         "citation_count": provider_citation_count(metadata),
         "metadata_conflicts": metadata_conflicts,
@@ -4700,7 +4889,7 @@ mod tests {
             .unwrap();
         *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
 
-        Arc::clone(&ctx)
+        let root_result = Arc::clone(&ctx)
             .chunk_topics(
                 "root-cloud".to_string(),
                 ChunkTopicsQuery {
@@ -4711,6 +4900,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(root_result
+            .topics
+            .iter()
+            .all(|topic| topic.library_coverage.is_none()));
         let document_result = Arc::clone(&ctx)
             .chunk_topics(
                 "document-cloud".to_string(),
@@ -4734,6 +4927,152 @@ mod tests {
         let caches = ctx.topic_tree_caches.lock();
         assert!(caches.root.is_some());
         assert!(caches.document.is_some());
+    }
+
+    #[tokio::test]
+    async fn document_topics_report_full_library_coverage_without_changing_membership() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("document-coverage-root");
+        let other_root = dir.path().join("document-coverage-other-root");
+        let stale_root = dir.path().join("document-coverage-stale-root");
+        let unindexed_root = dir.path().join("document-coverage-unindexed-root");
+        for path in [&root, &other_root, &stale_root, &unindexed_root] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let source = root.join("source.txt");
+        let matching = other_root.join("matching.txt");
+        let unrelated = other_root.join("unrelated.txt");
+        let stale_match = stale_root.join("stale-match.txt");
+        for path in [&source, &matching, &unrelated, &stale_match] {
+            std::fs::write(path, "indexed passage").unwrap();
+        }
+        let mut settings = Settings::default();
+        settings.last_directory = Some(root.clone());
+        settings.favorites = vec![other_root.clone(), unindexed_root];
+        std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        let mut index = SemanticIndex::create(
+            dir.path(),
+            "document-coverage-model",
+            2,
+            EmbeddingEngine::Candle,
+            Some(&root),
+        )
+        .unwrap();
+        let source_chunks = [
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 1.0],
+            [0.0, 1.0],
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(number, embedding)| {
+            let text = format!("source passage {number}");
+            (
+                wilkes_core::embed::index::chunk::Chunk {
+                    file_path: source.clone(),
+                    text: text.clone(),
+                    byte_range: ByteRange {
+                        start: 0,
+                        end: text.len(),
+                    },
+                    origin: SourceOrigin::TextFile {
+                        line: (number + 1) as u32,
+                        col: 1,
+                    },
+                },
+                embedding.to_vec(),
+            )
+        })
+        .collect();
+        index
+            .write_file(wilkes_core::embed::index::db::PreparedFile {
+                full_text: String::new(),
+                path: source.clone(),
+                chunks: source_chunks,
+            })
+            .unwrap();
+        index.activate_root(&other_root).unwrap();
+        for (path, embedding) in [
+            (matching.clone(), vec![1.0, 0.0]),
+            (unrelated.clone(), vec![-1.0, 0.0]),
+        ] {
+            index
+                .write_file(wilkes_core::embed::index::db::PreparedFile {
+                    full_text: String::new(),
+                    path: path.clone(),
+                    chunks: vec![(
+                        wilkes_core::embed::index::chunk::Chunk {
+                            file_path: path,
+                            text: "other passage".to_string(),
+                            byte_range: ByteRange { start: 0, end: 13 },
+                            origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                        },
+                        embedding,
+                    )],
+                })
+                .unwrap();
+        }
+        index.activate_root(&stale_root).unwrap();
+        index
+            .write_file(wilkes_core::embed::index::db::PreparedFile {
+                full_text: String::new(),
+                path: stale_match.clone(),
+                chunks: vec![(
+                    wilkes_core::embed::index::chunk::Chunk {
+                        file_path: stale_match,
+                        text: "stale matching passage".to_string(),
+                        byte_range: ByteRange { start: 0, end: 22 },
+                        origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                    },
+                    vec![1.0, 0.0],
+                )],
+            })
+            .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
+
+        let result = Arc::clone(&ctx)
+            .chunk_topics(
+                "document-coverage".to_string(),
+                ChunkTopicsQuery {
+                    root,
+                    path: Some(source.clone()),
+                    granularity: wilkes_core::types::BookmarkClusterGranularity::MuchFewer,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.topics.len(), 2);
+        let canonical_source = source.canonicalize().unwrap();
+        assert!(result
+            .topics
+            .iter()
+            .flat_map(|topic| &topic.chunks)
+            .all(|chunk| chunk.file_path == canonical_source));
+        let mut related_counts = result
+            .topics
+            .iter()
+            .map(|topic| {
+                let coverage = topic.library_coverage.as_ref().unwrap();
+                assert_eq!(coverage.eligible_document_count, 2);
+                (
+                    coverage.related_document_count,
+                    coverage
+                        .chunks
+                        .iter()
+                        .map(|chunk| chunk.file_path.clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        related_counts.sort_by_key(|(count, _)| *count);
+        assert_eq!(related_counts[0], (0, Vec::new()));
+        assert_eq!(related_counts[1].0, 1);
+        assert_eq!(related_counts[1].1, vec![matching.canonicalize().unwrap()]);
     }
 
     #[test]
@@ -7467,6 +7806,7 @@ exit 0
 
         assert!(links.references.is_empty());
         assert!(links.cited_by.is_empty());
+        assert!(links.all_references.is_empty());
     }
 
     #[tokio::test]
@@ -7476,7 +7816,11 @@ exit 0
         std::fs::create_dir_all(&library).unwrap();
         let source = library.join("source.txt");
         let cited = library.join("cited.txt");
-        std::fs::write(&source, "source").unwrap();
+        std::fs::write(
+            &source,
+            "References\nSmith (2024). Exact cited work. https://doi.org/10.1000/CITED.LONG.\n",
+        )
+        .unwrap();
         std::fs::write(&cited, "cited").unwrap();
 
         let cache = ctx.metadata_cache().expect("cache opens");
@@ -7491,7 +7835,7 @@ exit 0
                     &source,
                     id,
                     &DocumentMetadata {
-                        doi: Some("10.1/source".into()),
+                        doi: Some("10.1000/source".into()),
                         ..DocumentMetadata::default()
                     },
                     wilkes_core::metadata::cache::MetadataSource::File,
@@ -7502,14 +7846,21 @@ exit 0
                     &cited,
                     id,
                     &DocumentMetadata {
-                        doi: Some("10.1/cited".into()),
+                        doi: Some("10.1000/cited.long".into()),
                         ..DocumentMetadata::default()
                     },
                     wilkes_core::metadata::cache::MetadataSource::File,
                 )
                 .unwrap();
             guard
-                .replace_citations("10.1/source", &["10.1/cited".into()])
+                .replace_citations(
+                    "10.1000/source",
+                    &[
+                        "10.1000/cited".into(),
+                        "10.1000/cited.long".into(),
+                        "10.1000/missing".into(),
+                    ],
+                )
                 .unwrap();
         }
 
@@ -7538,6 +7889,21 @@ exit 0
             vec![cited.clone()]
         );
         assert!(links.cited_by.is_empty());
+        assert_eq!(
+            links
+                .all_references
+                .iter()
+                .map(|reference| (reference.doi.as_str(), reference.citation_line.as_deref(),))
+                .collect::<Vec<_>>(),
+            vec![
+                ("10.1000/cited", None),
+                (
+                    "10.1000/cited.long",
+                    Some("Smith (2024). Exact cited work. https://doi.org/10.1000/CITED.LONG."),
+                ),
+                ("10.1000/missing", None),
+            ]
+        );
 
         // The reverse direction resolves from the same stored edge.
         let reverse = ctx
@@ -7556,6 +7922,7 @@ exit 0
             vec![source]
         );
         assert!(reverse.references.is_empty());
+        assert!(reverse.all_references.is_empty());
     }
 
     #[tokio::test]
@@ -7679,7 +8046,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn test_open_file_denied() {
+    async fn test_document_operations_allow_files_outside_data_dir() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().join("data");
         std::fs::create_dir(&data_dir).unwrap();
@@ -7704,9 +8071,29 @@ exit 0
         let outside = dir.path().join("outside.txt");
         std::fs::write(&outside, "secret").unwrap();
 
-        let res = ctx.open_file(outside).await;
-        assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("Access denied"));
+        let preview = ctx.open_file(outside.clone()).await.unwrap();
+        match preview {
+            PreviewData::Text { content, .. } => assert_eq!(content, "secret"),
+            _ => panic!("Expected text preview"),
+        }
+
+        assert_eq!(
+            ctx.get_file_metadata(outside.clone()).await.unwrap(),
+            DocumentMetadata::default()
+        );
+        assert_eq!(
+            wilkes_agent::search::SearchService::document_metadata(
+                Arc::clone(&ctx),
+                outside.clone(),
+            )
+            .await
+            .unwrap(),
+            DocumentMetadata::default()
+        );
+        assert_eq!(
+            ctx.resolve_file_metadata(outside).await.unwrap(),
+            DocumentMetadata::default()
+        );
     }
 
     #[tokio::test]

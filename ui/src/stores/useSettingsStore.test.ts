@@ -295,6 +295,7 @@ describe("useSettingsStore", () => {
           extension: "pdf",
           title: "Old title",
           author: null,
+          doi: null,
         },
       ],
       omittedFileList: [],
@@ -305,6 +306,7 @@ describe("useSettingsStore", () => {
         path: "/docs/paper.pdf",
         title: "New title",
         author: "Smith et al.",
+        doi: "10.1/paper",
         publication_date: "2021-05",
       },
     ]);
@@ -312,6 +314,7 @@ describe("useSettingsStore", () => {
     expect(useSettingsStore.getState().fileList[0]).toMatchObject({
       title: "New title",
       author: "Smith et al.",
+      doi: "10.1/paper",
       publication_date: "2021-05",
     });
   });

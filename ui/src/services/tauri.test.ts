@@ -53,6 +53,20 @@ describe("TauriSearchApi", () => {
     expect(invoke).toHaveBeenCalledWith("rotate_external_mcp_token");
   });
 
+  it("should update the active document exposed by external MCP", async () => {
+    await api.setActiveDocument("/docs/paper.pdf", 3);
+    expect(invoke).toHaveBeenCalledWith("set_active_document", {
+      path: "/docs/paper.pdf",
+      page: 3,
+    });
+
+    await api.setActiveDocument(null);
+    expect(invoke).toHaveBeenLastCalledWith("set_active_document", {
+      path: null,
+      page: null,
+    });
+  });
+
   it("should call invoke for updateBookmarkNote", async () => {
     (invoke as any).mockResolvedValue({ id: "b1", note: "hi" });
     await api.updateBookmarkNote("b1", "hi");
