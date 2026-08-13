@@ -28,6 +28,11 @@ pub trait SearchService: Send + Sync {
 
     async fn library_roots(self: Arc<Self>) -> Vec<PathBuf>;
 
+    /// Current maximum file size for search. Agent-facing callers use this
+    /// rather than maintaining a second copy of the application setting.
+    /// A value of zero means unlimited.
+    async fn max_search_file_size(self: Arc<Self>) -> u64;
+
     async fn list_smart_collections(self: Arc<Self>) -> Result<Vec<SmartCollection>, String> {
         Ok(Vec::new())
     }

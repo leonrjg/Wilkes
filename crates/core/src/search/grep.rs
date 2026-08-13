@@ -86,6 +86,7 @@ impl SearchProvider for GrepSearchProvider {
     ) -> anyhow::Result<SearchOutcome> {
         let matcher = Self::build_matcher(query)?;
         let total_matches = AtomicUsize::new(0);
+        let files_scanned = AtomicUsize::new(0);
         let errors = Mutex::new(if query.scope == SearchScope::All {
             self.all_root_errors.clone()
         } else {
@@ -103,11 +104,16 @@ impl SearchProvider for GrepSearchProvider {
                 &matcher,
                 &tx,
                 &total_matches,
+                &files_scanned,
                 &errors,
                 eligible_paths,
                 index,
             )?;
-            return Ok(errors.into_inner().unwrap().into());
+            return Ok(SearchOutcome {
+                errors: errors.into_inner().unwrap(),
+                hyde_documents: Vec::new(),
+                files_scanned: Some(files_scanned.load(Ordering::Relaxed)),
+            });
         }
 
         // Resolve the root set: the single root for Corpus, every library root
@@ -155,6 +161,7 @@ impl SearchProvider for GrepSearchProvider {
                     &matcher,
                     &tx,
                     &total_matches,
+                    &files_scanned,
                     &errors,
                     eligible_paths,
                     index,
@@ -177,7 +184,11 @@ impl SearchProvider for GrepSearchProvider {
             })
         });
 
-        Ok(errors.into_inner().unwrap().into())
+        Ok(SearchOutcome {
+            errors: errors.into_inner().unwrap(),
+            hyde_documents: Vec::new(),
+            files_scanned: Some(files_scanned.load(Ordering::Relaxed)),
+        })
     }
 
     fn capabilities(&self) -> SearchCapabilities {
@@ -211,6 +222,7 @@ fn search_path(
     matcher: &RegexMatcher,
     tx: &SearchResultTx,
     total_matches: &AtomicUsize,
+    files_scanned: &AtomicUsize,
     errors: &Mutex<Vec<String>>,
     eligible_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
     index: Option<&IndexHandle>,
@@ -230,6 +242,14 @@ fn search_path(
     if query.max_file_size > 0 {
         if let Ok(meta) = path.metadata() {
             if meta.len() > query.max_file_size {
+                if matches!(query.scope, SearchScope::File { .. }) {
+                    errors.lock().unwrap().push(format!(
+                        "Search file exceeds the configured maximum size ({} bytes > {} bytes): {}",
+                        meta.len(),
+                        query.max_file_size,
+                        path.display()
+                    ));
+                }
                 return Ok(false);
             }
         }
@@ -238,6 +258,8 @@ fn search_path(
     let Some(file_type) = FileType::detect(path, &query.supported_extensions) else {
         return Ok(false);
     };
+
+    files_scanned.fetch_add(1, Ordering::Relaxed);
 
     let matches = match &file_type {
         // Plain text is memory-mapped and already fast; it also carries exact
@@ -704,13 +726,8 @@ mod tests {
 
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        let query_clone = query.clone();
         let extractors = ExtractorRegistry::new();
-        std::thread::spawn(move || {
-            provider
-                .search(&query_clone, &extractors, tx, None)
-                .unwrap();
-        });
+        let outcome = provider.search(&query, &extractors, tx, None).unwrap();
 
         let mut results = Vec::new();
         while let Some(m) = rx.blocking_recv() {
@@ -719,6 +736,76 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].path.ends_with("small.txt"));
+        assert_eq!(outcome.files_scanned, Some(1));
+        assert!(outcome.errors.is_empty());
+    }
+
+    #[test]
+    fn file_scoped_search_reports_oversized_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        fs::write(&path, "match but too large").unwrap();
+
+        let query = SearchQuery {
+            pattern: "match".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 10,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            scope: SearchScope::File { path: path.clone() },
+            supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
+        };
+
+        let provider = GrepSearchProvider::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let outcome = provider
+            .search(&query, &ExtractorRegistry::new(), tx, None)
+            .unwrap();
+
+        assert!(rx.blocking_recv().is_none());
+        assert_eq!(outcome.files_scanned, Some(0));
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(outcome.errors[0].contains("exceeds the configured maximum size"));
+        assert!(outcome.errors[0].contains("19 bytes > 10 bytes"));
+        assert!(outcome.errors[0].contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn search_counts_supported_files_without_matches_as_scanned() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("note.txt"), "haystack").unwrap();
+
+        let query = SearchQuery {
+            pattern: "needle".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            max_results: 0,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            scope: SearchScope::Corpus,
+            supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
+        };
+
+        let provider = GrepSearchProvider::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let outcome = provider
+            .search(&query, &ExtractorRegistry::new(), tx, None)
+            .unwrap();
+
+        assert!(rx.blocking_recv().is_none());
+        assert_eq!(outcome.files_scanned, Some(1));
+        assert!(outcome.errors.is_empty());
     }
 
     #[test]

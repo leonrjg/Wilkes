@@ -350,6 +350,7 @@ impl SearchProvider for SemanticSearchProvider {
         Ok(SearchOutcome {
             errors: reconcile_errors,
             hyde_documents,
+            files_scanned: None,
         })
     }
 

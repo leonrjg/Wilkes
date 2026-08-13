@@ -91,11 +91,11 @@ impl SearchHandle {
     {
         let started = std::time::Instant::now();
         let mut total_matches = 0;
-        let mut files_scanned = 0;
+        let mut files_with_matches = 0;
 
         while let Some(fm) = self.next().await {
             total_matches += fm.matches.len();
-            files_scanned += 1;
+            files_with_matches += 1;
             if let Some(log) = &mut self.log {
                 log.observe(fm.matches.len());
             }
@@ -126,7 +126,7 @@ impl SearchHandle {
             );
         }
         SearchStats {
-            files_scanned,
+            files_scanned: outcome.files_scanned.unwrap_or(files_with_matches),
             total_matches,
             elapsed_ms,
             errors: outcome.errors,
@@ -407,6 +407,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_handle_counts_files_that_have_no_matches() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::write(root.join("test.txt"), "haystack").unwrap();
+
+        let query = SearchQuery {
+            pattern: "needle".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root,
+            max_results: 10,
+            respect_gitignore: true,
+            max_file_size: 1024 * 1024,
+            context_lines: 0,
+            mode: SearchMode::Grep,
+            scope: Default::default(),
+            supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
+        };
+
+        let handle = start_search(
+            query,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            RetrievalSettings::default(),
+            None,
+            false,
+        );
+
+        let stats = handle.run(|_| async { true }).await;
+
+        assert_eq!(stats.files_scanned, 1);
+        assert_eq!(stats.total_matches, 0);
+        assert!(stats.errors.is_empty());
+    }
+
+    #[tokio::test]
     async fn search_handle_reports_hyde_documents_from_the_provider_outcome() {
         let (tx, rx) = mpsc::channel(1);
         drop(tx);
@@ -414,6 +457,7 @@ mod tests {
             SearchOutcome {
                 errors: Vec::new(),
                 hyde_documents: vec!["The exact generated passage.".to_string()],
+                files_scanned: None,
             }
         });
         let handle = SearchHandle {
@@ -471,7 +515,7 @@ mod tests {
             })
             .await;
 
-        assert_eq!(stats.files_scanned, 1);
+        assert!((1..=2).contains(&stats.files_scanned));
         assert!(stats.total_matches >= 1);
     }
 

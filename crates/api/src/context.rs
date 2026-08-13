@@ -98,6 +98,10 @@ impl wilkes_agent::search::SearchService for AppContext {
         library_roots(&settings).0
     }
 
+    async fn max_search_file_size(self: Arc<Self>) -> u64 {
+        self.get_settings().await.max_file_size
+    }
+
     async fn list_smart_collections(self: Arc<Self>) -> Result<Vec<SmartCollection>, String> {
         self.list_collections().map_err(|e| e.to_string())
     }
@@ -7370,9 +7374,16 @@ exit 0
         let initial = ctx.get_settings().await;
         assert_eq!(initial.context_lines, 2);
 
-        let patch = serde_json::json!({ "context_lines": 5 });
+        let patch = serde_json::json!({
+            "context_lines": 5,
+            "max_file_size": 23 * 1024 * 1024
+        });
         let updated = ctx.update_settings(patch).await.unwrap();
         assert_eq!(updated.context_lines, 5);
+        assert_eq!(
+            wilkes_agent::search::SearchService::max_search_file_size(ctx.clone()).await,
+            23 * 1024 * 1024
+        );
 
         let _updated_semantic = ctx
             .update_semantic_settings(|s| SemanticSettings { enabled: true, ..s })

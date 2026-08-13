@@ -930,7 +930,7 @@ describe("ResultList", () => {
     });
 
     renderWithToasts();
-    expect(screen.getByText(/42 matches in 10 files/)).toBeInTheDocument();
+    expect(screen.getByText(/42 matches · 10 files searched/)).toBeInTheDocument();
     expect(screen.getByText(/1 file failed/)).toBeInTheDocument();
   });
 

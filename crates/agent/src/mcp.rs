@@ -42,7 +42,6 @@ const DEFAULT_RELATED_DOCUMENTS_LIMIT: usize = 8;
 const MAX_RELATED_DOCUMENTS_LIMIT: usize = 25;
 const DEFAULT_LIST_DOCUMENTS_LIMIT: usize = 50;
 const MAX_LIST_DOCUMENTS_LIMIT: usize = 500;
-const DEFAULT_SEARCH_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 const SEMANTIC_INDEX_GUIDANCE: &str = "The user can enable the semantic index in Wilkes Settings. Use exact search with mode='exact' instead in the meantime.";
 const EXTERNAL_DOCUMENT_PATH_REQUIRED: &str =
@@ -1341,7 +1340,8 @@ async fn search_documents(
                 .unwrap_or_else(|| cwd.to_path_buf()),
         },
     };
-    let (query, max_files) = build_search_query(root, params)?;
+    let max_file_size = search.clone().max_search_file_size().await;
+    let (query, max_files) = build_search_query(root, params, max_file_size)?;
     let root = display_path(&query.root);
     let file = match &query.scope {
         wilkes_core::types::SearchScope::Corpus | wilkes_core::types::SearchScope::All => None,
@@ -1617,6 +1617,7 @@ fn with_semantic_index_guidance(message: String) -> String {
 fn build_search_query(
     root: PathBuf,
     params: SearchParams,
+    max_file_size: u64,
 ) -> Result<(wilkes_core::types::SearchQuery, usize), String> {
     let mode = params.mode;
     let pattern = params.query.trim().to_string();
@@ -1640,7 +1641,7 @@ fn build_search_query(
             root,
             max_results,
             respect_gitignore: true,
-            max_file_size: DEFAULT_SEARCH_MAX_FILE_SIZE,
+            max_file_size,
             context_lines,
             mode: match mode {
                 SearchModeParam::Exact => wilkes_core::types::SearchMode::Grep,
@@ -2020,6 +2021,10 @@ mod tests {
             } else {
                 self.library_roots.clone()
             }
+        }
+
+        async fn max_search_file_size(self: Arc<Self>) -> u64 {
+            23 * 1024 * 1024
         }
 
         async fn search(
@@ -2680,6 +2685,7 @@ mod tests {
                 context_lines: Some(100),
                 collection_id: None,
             },
+            23 * 1024 * 1024,
         )
         .unwrap();
 
@@ -2692,7 +2698,7 @@ mod tests {
         assert!(query.is_regex);
         assert_eq!(query.context_lines, MAX_SEARCH_CONTEXT_LINES);
         assert!(query.respect_gitignore);
-        assert_eq!(query.max_file_size, DEFAULT_SEARCH_MAX_FILE_SIZE);
+        assert_eq!(query.max_file_size, 23 * 1024 * 1024);
     }
 
     #[test]
@@ -2712,6 +2718,7 @@ mod tests {
                 context_lines: None,
                 collection_id: None,
             },
+            0,
         )
         .unwrap();
 
@@ -2738,6 +2745,7 @@ mod tests {
                 context_lines: None,
                 collection_id: None,
             },
+            0,
         )
         .unwrap();
 
@@ -2766,6 +2774,7 @@ mod tests {
                 context_lines: None,
                 collection_id: None,
             },
+            0,
         )
         .unwrap();
 
@@ -2794,6 +2803,7 @@ mod tests {
                 context_lines: None,
                 collection_id: None,
             },
+            0,
         )
         .unwrap();
 
@@ -2910,6 +2920,7 @@ mod tests {
         let captured = service.last_query.lock().unwrap().clone().unwrap();
         assert_eq!(captured.mode, SearchMode::Semantic);
         assert_eq!(captured.max_results, 3);
+        assert_eq!(captured.max_file_size, 23 * 1024 * 1024);
         assert_eq!(captured.root, live_root);
         assert_eq!(response.mode, SearchModeParam::Semantic);
         assert_eq!(response.root, display_path(&live_root));

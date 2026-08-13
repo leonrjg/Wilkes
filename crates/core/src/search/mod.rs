@@ -14,6 +14,10 @@ pub type SearchResultTx = mpsc::Sender<FileMatches>;
 pub struct SearchOutcome {
     pub errors: Vec<String>,
     pub hyde_documents: Vec<String>,
+    /// Number of supported files whose contents were actually searched. `None`
+    /// lets providers without file-scan semantics retain the stream-derived
+    /// fallback used before this field existed.
+    pub files_scanned: Option<usize>,
 }
 
 impl From<Vec<String>> for SearchOutcome {
@@ -21,6 +25,7 @@ impl From<Vec<String>> for SearchOutcome {
         Self {
             errors,
             hyde_documents: Vec::new(),
+            files_scanned: None,
         }
     }
 }

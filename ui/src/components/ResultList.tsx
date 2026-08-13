@@ -1047,7 +1047,7 @@ export default function ResultList({
               : indexing
                 ? "Indexing files…"
                 : stats
-                  ? `${stats.total_matches} matches in ${stats.files_scanned} files (${stats.elapsed_ms}ms)`
+                  ? `${stats.total_matches} matches · ${stats.files_scanned} files searched (${stats.elapsed_ms}ms)`
                   : "Ready"}
           </span>
           {hydeDocuments.length > 0 && !searching && !indexing && (

@@ -1670,6 +1670,9 @@ pub struct SearchCapabilities {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct SearchStats {
+    /// Number of supported files whose contents were actually searched. This
+    /// includes files that produced no matches and excludes policy-filtered
+    /// files that were never opened.
     pub files_scanned: usize,
     pub total_matches: usize,
     pub elapsed_ms: u64,
