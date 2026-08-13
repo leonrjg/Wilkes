@@ -1,5 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
+import { useEditorStore } from "../stores/useEditorStore";
 import { useViewerStore, type ViewerTab } from "../stores/useViewerStore";
 import ViewerTabs from "./ViewerTabs";
 
@@ -26,6 +27,7 @@ function tab(id: string, path: string): ViewerTab {
 
 describe("ViewerTabs", () => {
   beforeEach(() => {
+    useEditorStore.setState({ buffers: {}, activeEditorPath: null });
     useViewerStore.setState({
       tabs: [
         tab("one", "/docs/one.txt"),
@@ -84,5 +86,21 @@ describe("ViewerTabs", () => {
 
     expect(useViewerStore.getState().tabs).toEqual([]);
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+  });
+
+  it("pins another viewer tab into the active editor completion scope", () => {
+    const editor = useEditorStore.getState();
+    editor.ensureBuffer("/docs/one.txt", "Draft");
+    editor.setActiveEditor("/docs/one.txt");
+    render(<ViewerTabs />);
+
+    fireEvent.contextMenu(screen.getByRole("tab", { name: "two.txt" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin to completion context" }));
+
+    expect(useEditorStore.getState().buffers["/docs/one.txt"].scope).toEqual({
+      mode: "prefer",
+      pinned: ["/other/two.txt"],
+      excluded: [],
+    });
   });
 });

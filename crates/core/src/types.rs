@@ -664,6 +664,7 @@ pub struct ModelDescriptor {
 /// The weights repo id of a generation model. The sibling of `EmbedderModel`.
 pub const LEGACY_QUANTIZED_GEMMA_MODEL: &str = "unsloth/gemma-3-1b-it-GGUF";
 pub const DENSE_GEMMA_MODEL: &str = "unsloth/gemma-3-1b-it";
+pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize)]
 pub struct GeneratorModel(pub String);
@@ -685,28 +686,17 @@ impl<'de> Deserialize<'de> for GeneratorModel {
     }
 }
 
-/// A catalog entry for a generation model.
+/// A backend-neutral catalog entry for a generation model.
 ///
-/// Distinct from `ModelDescriptor` rather than reusing it with zeroed fields:
-/// `dimension` and `preferred_batch_size` are meaningless for a generator, and
-/// a field that lies is worse than a second struct. Generation models also need
-/// separate artifact metadata because GGUF repositories may not ship a
-/// tokenizer, while dense repositories also require `config.json`.
+/// Download artifact details belong to the Candle implementation. Ollama owns
+/// its model store, so exposing Hugging Face filenames here would make every
+/// non-Candle backend pretend to have artifacts it does not manage.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GeneratorDescriptor {
-    /// Repo holding the weights. Doubles as the model's identity.
+    pub engine: crate::generate::GenerationEngine,
     pub model_id: String,
     pub display_name: String,
     pub description: String,
-    /// The weight file within `model_id`; per-model, hence not a const.
-    pub weights_file: String,
-    /// Pinned revision of the weights repo. Third-party republishers are a
-    /// supply-chain surface, so this is never `main`.
-    pub weights_revision: String,
-    /// Repo holding `tokenizer.json`; may equal `model_id` for dense models.
-    pub tokenizer_repo: String,
-    /// Pinned revision of the tokenizer repo, on the same terms as the weights.
-    pub tokenizer_revision: String,
     pub context_tokens: usize,
     pub is_cached: bool,
     pub is_default: bool,
@@ -721,11 +711,23 @@ pub struct GeneratorDescriptor {
 pub struct GenerationSettings {
     #[serde(default)]
     pub enabled: bool,
+    /// Missing in settings written before multiple generation backends existed.
+    #[serde(default)]
+    pub engine: crate::generate::GenerationEngine,
     #[serde(default)]
     pub model: Option<GeneratorModel>,
     /// "auto", "cpu", "metal". Absent falls back to the engine default.
     #[serde(default)]
     pub device: Option<String>,
+    /// Base URL of the Ollama HTTP API. Kept even while Candle is selected so
+    /// switching back restores the user's endpoint.
+    #[serde(default = "default_ollama_url")]
+    pub ollama_url: String,
+    /// Explicit Ollama context window. `None` selects the model-reported
+    /// maximum; a smaller value lets users trade prompt capacity for KV-cache
+    /// memory without relying on Ollama's small implicit default.
+    #[serde(default)]
+    pub context_tokens: Option<usize>,
     /// Per-task sampling overrides. Absent entries use the task default; the
     /// settings exist for tuning, not as a step the user must take.
     #[serde(default)]
@@ -740,6 +742,8 @@ pub enum GenerationTask {
     RelationExplanation,
     DocumentSummary,
     SearchResultsSummary,
+    HypotheticalContinuation,
+    GroundedCompletion,
 }
 
 /// One event protocol for every user-facing token stream. Task inputs and
@@ -768,11 +772,18 @@ impl Default for GenerationSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            engine: crate::generate::GenerationEngine::default(),
             model: None,
             device: None,
+            ollama_url: default_ollama_url(),
+            context_tokens: None,
             sampling_overrides: HashMap::new(),
         }
     }
+}
+
+fn default_ollama_url() -> String {
+    DEFAULT_OLLAMA_URL.to_string()
 }
 
 // ── Embedding engine ──────────────────────────────────────────────────────────
@@ -1663,6 +1674,11 @@ pub struct SearchStats {
     pub elapsed_ms: u64,
     #[serde(default)]
     pub errors: Vec<String>,
+    /// Exact generated passages whose embeddings contributed to the final
+    /// semantic query vector. Empty for grep, disabled HyDE, or degradation to
+    /// the raw query.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hyde_documents: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1843,9 +1859,23 @@ mod tests {
     fn test_generation_settings_defaults() {
         let settings = GenerationSettings::default();
         assert!(!settings.enabled);
+        assert_eq!(settings.engine, crate::generate::GenerationEngine::Candle);
         assert_eq!(settings.model, None);
         assert_eq!(settings.device, None);
+        assert_eq!(settings.ollama_url, DEFAULT_OLLAMA_URL);
+        assert_eq!(settings.context_tokens, None);
         assert!(settings.sampling_overrides.is_empty());
+    }
+
+    #[test]
+    fn legacy_generation_settings_default_to_candle_and_the_local_ollama_url() {
+        let settings: GenerationSettings = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "model": "org/model"
+        }))
+        .unwrap();
+        assert_eq!(settings.engine, crate::generate::GenerationEngine::Candle);
+        assert_eq!(settings.ollama_url, DEFAULT_OLLAMA_URL);
     }
 
     #[test]

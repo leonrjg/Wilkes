@@ -1,3 +1,4 @@
+pub mod completion;
 pub mod directory_watcher;
 pub mod embed;
 pub mod extract;

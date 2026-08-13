@@ -609,7 +609,7 @@ mod tests {
         req.generate = Some(GenerationRequest {
             system: None,
             prompt: "label these".to_string(),
-            max_tokens: 16,
+            max_tokens: Some(16),
             constraint: Constraint::Text { stop: Vec::new() },
             sampling: Sampling::default(),
         });

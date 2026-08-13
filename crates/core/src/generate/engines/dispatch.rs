@@ -1,7 +1,8 @@
-//! Engine dispatch for generation, mirroring `embed::engines::dispatch`.
+//! Engine dispatch for generation.
 //!
-//! There is one engine today. The indirection exists so the call sites read the
-//! same as their embedding counterparts, not to anticipate a second engine.
+//! Candle owns downloaded artifacts and a worker proxy; Ollama owns an HTTP
+//! model store. This module is the common attachment and catalog boundary, so
+//! callers never grow a second backend-specific lifecycle.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -11,25 +12,62 @@ use crate::models::progress::ProgressTx;
 use crate::types::{GeneratorDescriptor, GeneratorModel};
 use crate::worker::manager::WorkerManager;
 
-pub use super::candle::{GeneratorInstaller, DEFAULT_GENERATOR_MODEL};
+use super::candle::GeneratorInstaller;
+pub use super::candle::DEFAULT_GENERATOR_MODEL;
 
-pub fn list_models(engine: GenerationEngine, data_dir: &Path) -> Vec<GeneratorDescriptor> {
+pub async fn list_models(
+    engine: GenerationEngine,
+    data_dir: &Path,
+    ollama_url: &str,
+) -> anyhow::Result<Vec<GeneratorDescriptor>> {
     match engine {
-        GenerationEngine::Candle => super::candle::list_supported_models(data_dir),
+        GenerationEngine::Candle => Ok(super::candle::list_supported_models(data_dir)),
+        GenerationEngine::Ollama => {
+            let ollama_url = ollama_url.to_string();
+            tokio::task::spawn_blocking(move || super::ollama::list_models(&ollama_url)).await?
+        }
     }
 }
 
-pub fn get_installer(
-    engine: GenerationEngine,
+fn candle_installer(
     model: GeneratorModel,
     manager: WorkerManager,
     device: String,
 ) -> Arc<dyn GeneratorInstaller> {
-    match engine {
-        GenerationEngine::Candle => Arc::new(super::candle::CandleGeneratorInstaller::new(
-            model, manager, device,
-        )),
-    }
+    Arc::new(super::candle::CandleGeneratorInstaller::new(
+        model, manager, device,
+    ))
+}
+
+/// Prepare and attach one generator through the lifecycle appropriate to its
+/// engine. This is the sole main-process construction path for both backends.
+pub async fn attach_generator(
+    engine: GenerationEngine,
+    model: GeneratorModel,
+    manager: WorkerManager,
+    device: String,
+    data_dir: &Path,
+    ollama_url: &str,
+    context_tokens: Option<usize>,
+    progress: ProgressTx,
+) -> anyhow::Result<Arc<dyn Generator>> {
+    let generator: Arc<dyn Generator> = match engine {
+        GenerationEngine::Candle => {
+            let installer = candle_installer(model, manager, device);
+            installer.install(data_dir, progress).await?;
+            installer.build(data_dir)?
+        }
+        GenerationEngine::Ollama => {
+            drop(progress);
+            let model_id = model.0;
+            let ollama_url = ollama_url.to_string();
+            tokio::task::spawn_blocking(move || {
+                super::ollama::OllamaGenerator::connect(&ollama_url, &model_id, context_tokens)
+            })
+            .await??
+        }
+    };
+    Ok(crate::generate::with_request_logging(generator))
 }
 
 /// Load the model in the calling process. Must only be called from the worker
@@ -42,12 +80,18 @@ pub fn load_generator_local(
 ) -> anyhow::Result<Arc<dyn Generator>> {
     match engine {
         GenerationEngine::Candle => super::candle::load_generator(model, data_dir, device),
+        GenerationEngine::Ollama => {
+            anyhow::bail!("Ollama generators are attached through the HTTP backend")
+        }
     }
 }
 
 pub fn fetch_model_size(engine: GenerationEngine, model_id: &str) -> anyhow::Result<u64> {
     match engine {
         GenerationEngine::Candle => super::candle::fetch_model_size(model_id),
+        GenerationEngine::Ollama => {
+            anyhow::bail!("Ollama manages model downloads and reports sizes in its catalog")
+        }
     }
 }
 
@@ -77,6 +121,9 @@ pub async fn prepare_generator(
             })
             .await?
         }
+        GenerationEngine::Ollama => {
+            anyhow::bail!("Ollama generation never runs in the Wilkes worker")
+        }
     }
 }
 
@@ -85,10 +132,13 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn list_models_returns_the_candle_catalog() {
+    #[tokio::test]
+    async fn list_models_returns_the_candle_catalog() {
         let dir = tempdir().unwrap();
-        assert!(!list_models(GenerationEngine::Candle, dir.path()).is_empty());
+        assert!(!list_models(GenerationEngine::Candle, dir.path(), "")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -108,8 +158,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (manager, _rx, _fut) =
             WorkerManager::new(crate::worker::manager::WorkerPaths::resolve(dir.path()));
-        let installer = get_installer(
-            GenerationEngine::Candle,
+        let installer = candle_installer(
             GeneratorModel(DEFAULT_GENERATOR_MODEL.to_string()),
             manager,
             "cpu".to_string(),

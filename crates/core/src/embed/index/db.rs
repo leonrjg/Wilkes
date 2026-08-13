@@ -981,10 +981,29 @@ mod tests {
 
         let eligible = std::collections::HashSet::from([canon(&scoped_path)]);
         let filtered = idx
-            .query_scoped_filtered(&[1.0, 0.0], 1, SemanticQueryScope::Corpus, Some(&eligible))
+            .query_scoped_filtered(
+                &[1.0, 0.0],
+                1,
+                SemanticQueryScope::Corpus,
+                Some(&eligible),
+                None,
+            )
             .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].file_path, canon(&scoped_path));
+
+        let excluded = std::collections::HashSet::from([canon(&other_path)]);
+        let without_other = idx
+            .query_scoped_filtered(
+                &[1.0, 0.0],
+                1,
+                SemanticQueryScope::Corpus,
+                None,
+                Some(&excluded),
+            )
+            .unwrap();
+        assert_eq!(without_other.len(), 1);
+        assert_eq!(without_other[0].file_path, canon(&scoped_path));
 
         let scoped = idx
             .query_scoped(&[1.0, 0.0], 1, SemanticQueryScope::File(&scoped_path))
@@ -1880,6 +1899,7 @@ struct IndexedFileRecord {
     identity: FileIdentity,
 }
 
+#[derive(Clone, Copy)]
 pub enum SemanticQueryScope<'a> {
     Corpus,
     Root(&'a Path),
@@ -3532,26 +3552,49 @@ impl SemanticIndex {
         }
     }
 
-    /// Apply document eligibility before the caller's top-k boundary. The
-    /// current index implementations already scan in Rust for root/file scope;
-    /// corpus scope requests all vector candidates only when a collection is
-    /// active, then performs the single authoritative eligibility cut.
+    /// Apply document eligibility and exclusions before the caller's top-k boundary.
+    /// Filtered queries widen the nearest-neighbour request only when filtered
+    /// documents leave too few results, avoiding a corpus-wide scan for the
+    /// common case of one or two exclusions.
     pub fn query_scoped_filtered(
         &self,
         embedding: &[f32],
         top_k: usize,
         scope: SemanticQueryScope<'_>,
         eligible_paths: Option<&std::collections::HashSet<PathBuf>>,
+        excluded_paths: Option<&std::collections::HashSet<PathBuf>>,
     ) -> anyhow::Result<Vec<IndexedChunk>> {
-        let Some(eligible_paths) = eligible_paths else {
-            return self.query_scoped(embedding, top_k, scope);
-        };
-        let mut results = self.query_scoped(embedding, 0, scope)?;
-        results.retain(|chunk| eligible_paths.contains(&chunk.file_path));
-        if top_k > 0 {
-            results.truncate(top_k);
+        if eligible_paths.is_some_and(|paths| paths.is_empty()) {
+            return Ok(Vec::new());
         }
-        Ok(results)
+        if eligible_paths.is_none() && excluded_paths.is_none_or(|paths| paths.is_empty()) {
+            return self.query_scoped(embedding, top_k, scope);
+        }
+        let retain_eligible = |chunk: &IndexedChunk| {
+            eligible_paths.is_none_or(|paths| paths.contains(&chunk.file_path))
+                && excluded_paths.is_none_or(|paths| !paths.contains(&chunk.file_path))
+        };
+        if top_k == 0 {
+            let mut results = self.query_scoped(embedding, 0, scope)?;
+            results.retain(retain_eligible);
+            return Ok(results);
+        }
+
+        let mut candidate_limit = top_k;
+        loop {
+            let mut results = self.query_scoped(embedding, candidate_limit, scope)?;
+            let exhausted = results.len() < candidate_limit;
+            results.retain(&retain_eligible);
+            if results.len() >= top_k || exhausted {
+                results.truncate(top_k);
+                return Ok(results);
+            }
+            let widened = candidate_limit.saturating_mul(2);
+            if widened == candidate_limit {
+                return Ok(results);
+            }
+            candidate_limit = widened;
+        }
     }
 
     /// Leading extracted text for a document, read straight from the index.

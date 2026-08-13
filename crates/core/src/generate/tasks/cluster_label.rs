@@ -52,7 +52,7 @@ pub fn build_request(members: &[&str]) -> GenerationRequest {
                 .to_string(),
         ),
         prompt,
-        max_tokens: MAX_TOKENS,
+        max_tokens: Some(MAX_TOKENS),
         constraint: Constraint::Grammar(LABEL_GRAMMAR.to_string()),
         // Still greedy and deterministic, with a mild penalty against loops.
         sampling: Sampling {
@@ -270,7 +270,7 @@ mod tests {
         assert_eq!(request.sampling.temperature, 0.0);
         assert_eq!(request.sampling.repeat_penalty, Some((1.12, 32)));
         assert!(request.system.is_some());
-        assert_eq!(request.max_tokens, MAX_TOKENS);
+        assert_eq!(request.max_tokens, Some(MAX_TOKENS));
     }
 
     #[test]

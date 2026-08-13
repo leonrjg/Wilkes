@@ -6,13 +6,10 @@ import GenerationPanel from "./GenerationPanel";
 
 const MODELS: GeneratorDescriptor[] = [
   {
+    engine: "candle",
     model_id: "org/default-model",
     display_name: "Default Model",
     description: "Small default generation model",
-    weights_file: "default.gguf",
-    weights_revision: "revision-a",
-    tokenizer_repo: "org/default-model",
-    tokenizer_revision: "revision-a",
     context_tokens: 4096,
     is_cached: true,
     is_default: true,
@@ -20,13 +17,10 @@ const MODELS: GeneratorDescriptor[] = [
     size_bytes: 1_073_741_824,
   },
   {
+    engine: "candle",
     model_id: "org/reasoning-model",
     display_name: "Reasoning Model",
     description: "Larger model for careful explanations",
-    weights_file: "reasoning.gguf",
-    weights_revision: "revision-b",
-    tokenizer_repo: "org/reasoning-model",
-    tokenizer_revision: "revision-b",
     context_tokens: 8192,
     is_cached: false,
     is_default: false,
@@ -38,8 +32,10 @@ const MODELS: GeneratorDescriptor[] = [
 const SETTINGS = {
   generation: {
     enabled: false,
+    engine: "candle",
     model: null,
     device: null,
+    ollama_url: "http://127.0.0.1:11434",
     sampling_overrides: {},
   },
 } as Settings;
@@ -159,5 +155,65 @@ describe("GenerationPanel", () => {
 
     expect(api.loadGenerationModel).toHaveBeenCalledTimes(1);
     expect(onUpdateSettings).not.toHaveBeenCalled();
+  });
+
+  it("switches to Ollama without carrying a Candle model across backends", async () => {
+    api.listGenerationModels.mockResolvedValueOnce(MODELS).mockResolvedValueOnce([]);
+    render(
+      <GenerationPanel
+        api={api}
+        settings={SETTINGS}
+        onUpdateSettings={onUpdateSettings}
+      />,
+    );
+
+    await screen.findByText("Default Model");
+    fireEvent.change(screen.getByLabelText("Generation backend"), {
+      target: { value: "ollama" },
+    });
+
+    await waitFor(() => {
+      expect(onUpdateSettings).toHaveBeenCalledWith({
+        generation: {
+          ...SETTINGS.generation,
+          engine: "ollama",
+          model: null,
+        },
+      });
+    });
+  });
+
+  it("persists an edited Ollama URL and clears a model owned by the old server", async () => {
+    const ollamaSettings = {
+      ...SETTINGS,
+      generation: {
+        ...SETTINGS.generation,
+        engine: "ollama" as const,
+        model: "gemma3:4b",
+      },
+    } as Settings;
+    api.listGenerationModels.mockResolvedValue([]);
+    render(
+      <GenerationPanel
+        api={api}
+        settings={ollamaSettings}
+        onUpdateSettings={onUpdateSettings}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Ollama URL"), {
+      target: { value: "http://ollama.internal:11434" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    await waitFor(() => {
+      expect(onUpdateSettings).toHaveBeenCalledWith({
+        generation: {
+          ...ollamaSettings.generation,
+          ollama_url: "http://ollama.internal:11434",
+          model: null,
+        },
+      });
+    });
   });
 });

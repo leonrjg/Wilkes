@@ -498,6 +498,7 @@ export default function ResultList({
   const [expandedFiles, setExpandedFiles] = useState<Set<number>>(new Set());
   const [showOmittedFiles, setShowOmittedFiles] = useState(false);
   const [openSummaryKey, setOpenSummaryKey] = useState<string | null>(null);
+  const [hydeOpen, setHydeOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<{
     path: string;
     name: string;
@@ -524,7 +525,10 @@ export default function ResultList({
   }, [results.length]);
 
   useEffect(() => {
-    if (searching) setOpenSummaryKey(null);
+    if (searching) {
+      setOpenSummaryKey(null);
+      setHydeOpen(false);
+    }
   }, [searching]);
 
   useEffect(() => {
@@ -809,8 +813,10 @@ export default function ResultList({
   };
 
   const totalCount = results.reduce((n, fm) => n + fm.matches.length, 0);
+  const hydeDocuments = stats?.hyde_documents ?? [];
   const handleClearResults = () => {
     setOpenSummaryKey(null);
+    setHydeOpen(false);
     selectTopic(null);
     clearResults();
   };
@@ -1044,6 +1050,29 @@ export default function ResultList({
                   ? `${stats.total_matches} matches in ${stats.files_scanned} files (${stats.elapsed_ms}ms)`
                   : "Ready"}
           </span>
+          {hydeDocuments.length > 0 && !searching && !indexing && (
+            <Tooltip content={hydeOpen ? "Hide HyDE passages" : "Show HyDE passages used for search"}>
+              <button
+                type="button"
+                aria-label={hydeOpen ? "Hide HyDE passages" : "Show HyDE passages"}
+                aria-expanded={hydeOpen}
+                onClick={() => setHydeOpen((open) => !open)}
+                className={`inline-flex h-6 flex-shrink-0 items-center gap-1 rounded px-1.5 transition-colors ${
+                  hydeOpen
+                    ? "bg-[var(--accent-blue-muted)] text-[var(--accent-blue)]"
+                    : "text-[var(--text-muted)] hover:bg-[var(--bg-active)] hover:text-[var(--text-main)]"
+                }`}
+              >
+                <Info size={12} aria-hidden="true" />
+                <span>HyDE</span>
+                <ChevronDown
+                  size={11}
+                  aria-hidden="true"
+                  className={`transition-transform ${hydeOpen ? "rotate-180" : ""}`}
+                />
+              </button>
+            </Tooltip>
+          )}
           {generationReady && completedSummaryKey && (
             <Tooltip content={summaryOpen ? "Close results summary" : "Summarize results"}>
               <button
@@ -1082,6 +1111,31 @@ export default function ResultList({
               {stats.errors.length} file{stats.errors.length === 1 ? "" : "s"} failed (hover for details)
             </span>
           </Tooltip>
+        )}
+        {hydeOpen && hydeDocuments.length > 0 && (
+          <div
+            role="region"
+            aria-label="HyDE passages used for search"
+            className="mt-1 max-h-48 overflow-y-auto rounded border border-[var(--border-main)] bg-[var(--bg-app)] p-2 text-[var(--text-main)] shadow-sm"
+          >
+            <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-[var(--text-dim)]">
+              {hydeDocuments.length === 1
+                ? "Hypothetical passage used for semantic search"
+                : `${hydeDocuments.length} hypothetical passages used for semantic search`}
+            </div>
+            <div className="space-y-2">
+              {hydeDocuments.map((document, index) => (
+                <div key={`${index}-${document}`}>
+                  {hydeDocuments.length > 1 && (
+                    <div className="mb-0.5 text-[10px] font-medium text-[var(--text-dim)]">
+                      Passage {index + 1}
+                    </div>
+                  )}
+                  <p className="whitespace-pre-wrap leading-relaxed">{document}</p>
+                </div>
+              ))}
+            </div>
+          </div>
         )}
       </div>
 

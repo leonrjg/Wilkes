@@ -26,6 +26,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 use wilkes_api::context::AppContext;
+use wilkes_core::completion::{CompletionFeedback, CompletionRequest};
 use wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryInput;
 use wilkes_core::types::{
     AddOutcome, BookmarkClustersQuery, ChunkTopicsQuery, CitationLinksQuery, CitationResult,
@@ -473,8 +474,13 @@ async fn is_generation_ready_handler(State(state): State<Arc<AppState>>) -> Json
 
 async fn list_generation_models_handler(
     State(state): State<Arc<AppState>>,
-) -> Json<Vec<wilkes_core::types::GeneratorDescriptor>> {
-    Json(state.ctx.list_generation_models())
+) -> Result<Json<Vec<wilkes_core::types::GeneratorDescriptor>>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .list_generation_models()
+        .await
+        .map(Json)
+        .map_err(|e| server_err(format!("{e:#}")))
 }
 
 #[derive(Deserialize)]
@@ -486,12 +492,12 @@ async fn generation_model_size_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<GenerationModelSizeQuery>,
 ) -> Result<Json<u64>, (StatusCode, Json<ErrorBody>)> {
-    let ctx = Arc::clone(&state.ctx);
-    tokio::task::spawn_blocking(move || ctx.fetch_generation_model_size(&query.model_id))
+    state
+        .ctx
+        .fetch_generation_model_size(&query.model_id)
         .await
-        .map_err(|e| server_err(e.to_string()))?
         .map(Json)
-        .map_err(|e| server_err(e.to_string()))
+        .map_err(|e| server_err(format!("{e:#}")))
 }
 
 async fn load_generation_model_handler(
@@ -555,6 +561,87 @@ async fn summarize_search_results_handler(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     Arc::clone(&state.ctx)
         .summarize_search_results(body.request_id, body.input)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(server_err)
+}
+
+async fn request_completion_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(completion_id): axum::extract::Path<String>,
+    Json(mut request): Json<CompletionRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    request.path = confine_to_uploads(&request.path.to_string_lossy(), &state.uploads_dir)?;
+    request.scope.pinned = request
+        .scope
+        .pinned
+        .iter()
+        .map(|path| confine_to_uploads(&path.to_string_lossy(), &state.uploads_dir))
+        .collect::<Result<Vec<_>, _>>()?;
+    request.scope.excluded = request
+        .scope
+        .excluded
+        .iter()
+        .map(|path| confine_to_uploads(&path.to_string_lossy(), &state.uploads_dir))
+        .collect::<Result<Vec<_>, _>>()?;
+    Arc::clone(&state.ctx)
+        .request_completion(completion_id, request)
+        .await
+        .map(|()| StatusCode::ACCEPTED)
+        .map_err(server_err)
+}
+
+async fn cancel_completion_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(completion_id): axum::extract::Path<String>,
+) -> StatusCode {
+    state.ctx.cancel_completion(&completion_id);
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct CompletionFeedbackBody {
+    feedback: CompletionFeedback,
+}
+
+async fn completion_feedback_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(completion_id): axum::extract::Path<String>,
+    Json(body): Json<CompletionFeedbackBody>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    state
+        .ctx
+        .completion_feedback(&completion_id, body.feedback)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(server_err)
+}
+
+async fn session_steering_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<wilkes_core::completion::SessionSteering> {
+    Json(state.ctx.get_session_steering())
+}
+
+async fn reset_session_steering_handler(State(state): State<Arc<AppState>>) -> StatusCode {
+    state.ctx.reset_session_steering();
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct SaveDocumentBody {
+    path: String,
+    text: String,
+}
+
+async fn save_document_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SaveDocumentBody>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
+    state
+        .ctx
+        .save_document(path, body.text)
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(server_err)
@@ -1309,6 +1396,19 @@ async fn main() -> anyhow::Result<()> {
             "/api/generation/summarize-results",
             post(summarize_search_results_handler),
         )
+        .route(
+            "/api/completion/:completion_id",
+            post(request_completion_handler).delete(cancel_completion_handler),
+        )
+        .route(
+            "/api/completion/:completion_id/feedback",
+            post(completion_feedback_handler),
+        )
+        .route(
+            "/api/completion/session",
+            get(session_steering_handler).delete(reset_session_steering_handler),
+        )
+        .route("/api/document/save", post(save_document_handler))
         .route("/api/logs", get(get_logs_handler))
         .route("/api/logs", delete(clear_logs_handler))
         .route("/api/data/paths", get(get_data_paths_handler))

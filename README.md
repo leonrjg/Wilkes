@@ -20,6 +20,12 @@
 - Document viewer with match highlighting
 - **Local semantic search**: uses open-source embedding models; no cloud
   - You can choose from a set of predefined models or any HuggingFace model
+- **Local text generation** for summaries, cited search synthesis, cluster
+  labels, related-document explanations, and HyDE retrieval
+  - Run built-in Candle models or use models already installed in Ollama
+- **Grounded document completion** with inline ghost text, library provenance,
+  pinned-source steering, feedback-aware retrieval, and an inspectable context
+  budget. Open a text document and choose **Edit document** to use it.
 - Fully configurable: adjust embedding chunk size and overlap, or just use the default settings
 - Cross-platform: works on Windows, Linux, and macOS
 - Web version
@@ -73,6 +79,18 @@ The app supports multiple engines to maximize model availability:
   - This has the widest variety of models, but you need to have Python installed. The environment is automatically set up by the app.
 - **Candle**
   - Default model: `all-miniLM-L6-v2`
+
+### Generation backends
+
+- **Candle** downloads a supported generation model into Wilkes and runs it in
+  an isolated local worker.
+- **Ollama** connects to an Ollama HTTP service and lists the models installed
+  there. Start Ollama and pull a model with `ollama pull <model>`, then select
+  **Settings → Generation → Models → Ollama**. The default endpoint is
+  `http://127.0.0.1:11434`, and can be changed for a remote Ollama service.
+
+Wilkes applies the same sampling, cancellation, stop, and constrained-output
+validation contract to both generation backends.
 
 ## Q&A
 - What model should I use?

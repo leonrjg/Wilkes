@@ -6,8 +6,9 @@ import type { Settings } from "./types";
 import { isTauri } from "../services";
 import { useChatStore } from "../stores/useChatStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
-import { Copy, Edit2, ExternalLink, Folder, FolderPlus, MessageSquare, RefreshCw, Tag, Trash2 } from "react-feather";
+import { Copy, Edit2, ExternalLink, Folder, FolderPlus, MessageSquare, Paperclip, RefreshCw, Tag, Trash2 } from "react-feather";
 import { useResearchStore } from "../stores/useResearchStore";
+import { useEditorStore } from "../stores/useEditorStore";
 
 export type ContextMenuTarget =
   | { kind: "file" | "match"; path: string; open: () => void }
@@ -94,6 +95,20 @@ export function buildFileContextMenuItems({
         chat.addContext(target.path);
       },
     });
+  }
+
+  if (target.kind !== "directory") {
+    const editor = useEditorStore.getState();
+    const editorPath = editor.activeEditorPath;
+    if (editorPath && editorPath !== target.path) {
+      const pinned = editor.buffers[editorPath]?.scope.pinned.includes(target.path) ?? false;
+      primaryItems.push({
+        id: "pin-completion-context",
+        label: pinned ? "Unpin from completion context" : "Pin to completion context",
+        icon: Paperclip,
+        run: () => useEditorStore.getState().togglePin(editorPath, target.path),
+      });
+    }
   }
 
   if (target.kind === "directory") {

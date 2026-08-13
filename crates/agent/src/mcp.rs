@@ -2876,6 +2876,7 @@ mod tests {
                     total_matches: 1,
                     elapsed_ms: 4,
                     errors: Vec::new(),
+                    hyde_documents: Vec::new(),
                 },
                 truncated: false,
             })),

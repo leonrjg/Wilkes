@@ -2,10 +2,9 @@ use std::io::{Read, Seek};
 
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
-use candle_transformers::models::gemma3::Model as Gemma3Model;
 use candle_transformers::models::quantized_qwen3::ModelWeights as Qwen3Weights;
 
-use super::protocol::ModelFamily;
+use super::{gemma3::Model as Gemma3Model, protocol::ModelFamily};
 
 /// Architecture-specific decoder weights behind the one interface the token
 /// loop needs. Protocol selection and tensor implementation share the same

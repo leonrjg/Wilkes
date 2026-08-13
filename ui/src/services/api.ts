@@ -46,6 +46,10 @@ import type {
   ChunkTopicLabelled,
   GeneratorDescriptor,
   GenerationStreamEvent,
+  CompletionEvent,
+  CompletionFeedback,
+  CompletionRequest,
+  SessionSteering,
 } from "../lib/types";
 
 export interface DataPaths {
@@ -167,12 +171,22 @@ export interface SearchApi {
     requestId: string,
     input: SearchResultsSummaryInput,
   ): Promise<void>;
+  requestCompletion(completionId: string, request: CompletionRequest): Promise<void>;
+  cancelCompletion(completionId: string): Promise<void>;
+  completionFeedback(completionId: string, feedback: CompletionFeedback): Promise<void>;
+  getSessionSteering(): Promise<SessionSteering>;
+  resetSessionSteering(): Promise<void>;
+  saveDocument(path: string, text: string): Promise<void>;
 
   onBookmarkClusterLabelled(
     handler: (event: BookmarkClusterLabelled) => void,
   ): Promise<() => void>;
   onChunkTopicLabelled(handler: (event: ChunkTopicLabelled) => void): Promise<() => void>;
   onGenerationStream(handler: (event: GenerationStreamEvent) => void): Promise<() => void>;
+  onCompletion(
+    completionId: string,
+    handler: (event: CompletionEvent) => void,
+  ): Promise<() => void>;
 
   onGenerationProgress(handler: (progress: EmbedProgress) => void): Promise<() => void>;
   onGenerationDone(handler: (done: GenerationDone) => void): Promise<() => void>;

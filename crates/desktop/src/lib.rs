@@ -2068,17 +2068,21 @@ async fn is_generation_ready(app: AppHandle) -> bool {
 }
 
 #[tauri::command]
-fn list_generation_models(app: AppHandle) -> Vec<wilkes_core::types::GeneratorDescriptor> {
-    app_context(&app).list_generation_models()
+async fn list_generation_models(
+    app: AppHandle,
+) -> Result<Vec<wilkes_core::types::GeneratorDescriptor>, String> {
+    app_context(&app)
+        .list_generation_models()
+        .await
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
 async fn get_generation_model_size(app: AppHandle, model_id: String) -> Result<u64, String> {
-    let ctx = app_context(&app);
-    tokio::task::spawn_blocking(move || ctx.fetch_generation_model_size(&model_id))
+    app_context(&app)
+        .fetch_generation_model_size(&model_id)
         .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// Download (if needed) and attach the configured generation model. Progress
@@ -2125,6 +2129,48 @@ async fn summarize_search_results(
     app_context(&app)
         .summarize_search_results(request_id, input)
         .await
+}
+
+#[tauri::command]
+async fn request_completion(
+    app: AppHandle,
+    completion_id: String,
+    request: wilkes_core::completion::CompletionRequest,
+) -> Result<(), String> {
+    app_context(&app)
+        .request_completion(completion_id, request)
+        .await
+}
+
+#[tauri::command]
+fn cancel_completion(app: AppHandle, completion_id: String) {
+    app_context(&app).cancel_completion(&completion_id);
+}
+
+#[tauri::command]
+async fn completion_feedback(
+    app: AppHandle,
+    completion_id: String,
+    feedback: wilkes_core::completion::CompletionFeedback,
+) -> Result<(), String> {
+    app_context(&app)
+        .completion_feedback(&completion_id, feedback)
+        .await
+}
+
+#[tauri::command]
+fn get_session_steering(app: AppHandle) -> wilkes_core::completion::SessionSteering {
+    app_context(&app).get_session_steering()
+}
+
+#[tauri::command]
+fn reset_session_steering(app: AppHandle) {
+    app_context(&app).reset_session_steering();
+}
+
+#[tauri::command]
+async fn save_document(app: AppHandle, path: String, text: String) -> Result<(), String> {
+    app_context(&app).save_document(path.into(), text).await
 }
 
 #[tauri::command]
@@ -2255,6 +2301,12 @@ pub fn run() {
             explain_related_document,
             summarize_document,
             summarize_search_results,
+            request_completion,
+            cancel_completion,
+            completion_feedback,
+            get_session_steering,
+            reset_session_steering,
+            save_document,
             get_worker_status,
             get_worker_statuses,
             kill_worker,

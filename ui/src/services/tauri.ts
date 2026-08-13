@@ -50,6 +50,10 @@ import type {
   ChunkTopicLabelled,
   GeneratorDescriptor,
   GenerationStreamEvent,
+  CompletionEvent,
+  CompletionFeedback,
+  CompletionRequest,
+  SessionSteering,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type { SearchApi, DesktopSourceApi, DataPaths } from "./api";
@@ -355,6 +359,40 @@ export class TauriSearchApi implements SearchApi {
     input: SearchResultsSummaryInput,
   ): Promise<void> {
     return invoke("summarize_search_results", { requestId, input });
+  }
+
+  async requestCompletion(completionId: string, request: CompletionRequest): Promise<void> {
+    await invoke("request_completion", { completionId, request });
+  }
+
+  async cancelCompletion(completionId: string): Promise<void> {
+    await invoke("cancel_completion", { completionId });
+  }
+
+  async completionFeedback(
+    completionId: string,
+    feedback: CompletionFeedback,
+  ): Promise<void> {
+    await invoke("completion_feedback", { completionId, feedback });
+  }
+
+  async getSessionSteering(): Promise<SessionSteering> {
+    return invoke<SessionSteering>("get_session_steering");
+  }
+
+  async resetSessionSteering(): Promise<void> {
+    await invoke("reset_session_steering");
+  }
+
+  async saveDocument(path: string, text: string): Promise<void> {
+    await invoke("save_document", { path, text });
+  }
+
+  async onCompletion(
+    completionId: string,
+    handler: (event: CompletionEvent) => void,
+  ): Promise<() => void> {
+    return listen<CompletionEvent>(`completion://${completionId}`, (event) => handler(event.payload));
   }
 
   async onBookmarkClusterLabelled(

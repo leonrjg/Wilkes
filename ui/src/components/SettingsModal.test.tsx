@@ -55,8 +55,10 @@ describe("SettingsModal", () => {
     semantic: { enabled: true, index_path: null, worker_timeout_secs: 300 },
     generation: {
       enabled: false,
+      engine: "candle",
       model: null,
       device: null,
+      ollama_url: "http://127.0.0.1:11434",
       sampling_overrides: {},
     },
     supported_extensions: ["ts"],

@@ -181,7 +181,7 @@ pub fn build_request(input: &SearchResultsSummaryInput) -> anyhow::Result<Genera
     Ok(GenerationRequest {
         system: None,
         prompt,
-        max_tokens: MAX_TOKENS,
+        max_tokens: Some(MAX_TOKENS),
         constraint: Constraint::Grammar(build_grammar(&source_numbers)),
         sampling: Sampling::default(),
     })
@@ -283,7 +283,7 @@ mod tests {
         assert!(request
             .prompt
             .contains("ordered from most to least relevant"));
-        assert_eq!(request.max_tokens, MAX_TOKENS);
+        assert_eq!(request.max_tokens, Some(MAX_TOKENS));
         assert_eq!(request.sampling, Sampling::default());
         assert!(matches!(request.constraint, Constraint::Grammar(_)));
     }

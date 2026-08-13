@@ -150,6 +150,14 @@ impl Grammar {
         state.positions.contains(&self.accept)
     }
 
+    /// Validate a complete output against the same automaton used for Candle's
+    /// token masking. External backends use this before publishing a buffered
+    /// constrained response.
+    pub fn accepts(&self, text: &str) -> bool {
+        self.advance(&self.initial_state(), text)
+            .is_some_and(|state| self.is_complete(&state))
+    }
+
     /// Indices into `vocab` that the grammar permits as the next token.
     ///
     /// This is linear in the vocabulary. For the short, tightly constrained
@@ -176,6 +184,117 @@ impl Grammar {
                 }
             }
         }
+    }
+}
+
+/// Translate this deliberately non-recursive GBNF subset into an anchored
+/// JSON-Schema/ECMAScript regular expression. Ollama accepts JSON Schema as its
+/// structured-output contract; keeping the translation beside the parser
+/// prevents a second, subtly different grammar implementation.
+pub fn json_schema_pattern(src: &str) -> anyhow::Result<String> {
+    let rules = parse_rules(src)?;
+    let root = rules
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("grammar has no rules"))?
+        .0
+        .clone();
+    let by_name: HashMap<String, Expr> = rules.into_iter().collect();
+    let expression = expression_pattern(&by_name[&root], &by_name, &mut vec![root])?;
+    Ok(format!("^(?:{expression})$"))
+}
+
+fn expression_pattern(
+    expression: &Expr,
+    rules: &HashMap<String, Expr>,
+    stack: &mut Vec<String>,
+) -> anyhow::Result<String> {
+    Ok(match expression {
+        Expr::Literal(characters) => {
+            let mut output = String::new();
+            for character in characters {
+                output.push_str(&escape_regex_literal(*character));
+            }
+            output
+        }
+        Expr::Class(set) => {
+            let mut output = String::from("[");
+            if set.negated {
+                output.push('^');
+            }
+            for (lower, upper) in &set.ranges {
+                output.push_str(&escape_regex_class(*lower));
+                if lower != upper {
+                    output.push('-');
+                    output.push_str(&escape_regex_class(*upper));
+                }
+            }
+            output.push(']');
+            output
+        }
+        Expr::Reference(name) => {
+            anyhow::ensure!(
+                !stack.contains(name),
+                "grammar rule '{name}' is recursive; this subset does not support recursion"
+            );
+            let referenced = rules
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("grammar references undefined rule '{name}'"))?;
+            stack.push(name.clone());
+            let rendered = expression_pattern(referenced, rules, stack)?;
+            stack.pop();
+            format!("(?:{rendered})")
+        }
+        Expr::Sequence(items) => {
+            let mut output = String::new();
+            for item in items {
+                output.push_str(&expression_pattern(item, rules, stack)?);
+            }
+            output
+        }
+        Expr::Alternate(options) => {
+            let rendered = options
+                .iter()
+                .map(|option| expression_pattern(option, rules, stack))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            format!("(?:{})", rendered.join("|"))
+        }
+        Expr::Repeat { inner, min, max } => {
+            anyhow::ensure!(
+                *min <= REPEAT_LIMIT && max.unwrap_or(0) <= REPEAT_LIMIT,
+                "grammar repetition bound exceeds {REPEAT_LIMIT}"
+            );
+            let rendered = expression_pattern(inner, rules, stack)?;
+            let quantifier = match max {
+                None if *min == 0 => "*".to_string(),
+                None if *min == 1 => "+".to_string(),
+                None => format!("{{{min},}}"),
+                Some(max) if *min == 0 && *max == 1 => "?".to_string(),
+                Some(max) if min == max => format!("{{{min}}}"),
+                Some(max) => format!("{{{min},{max}}}"),
+            };
+            format!("(?:{rendered}){quantifier}")
+        }
+    })
+}
+
+fn escape_regex_literal(character: char) -> String {
+    match character {
+        '\n' => "\\n".to_string(),
+        '\r' => "\\r".to_string(),
+        '\t' => "\\t".to_string(),
+        '\\' | '.' | '*' | '+' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+        | '/' => format!("\\{character}"),
+        _ => character.to_string(),
+    }
+}
+
+fn escape_regex_class(character: char) -> String {
+    match character {
+        '\n' => "\\n".to_string(),
+        '\r' => "\\r".to_string(),
+        '\t' => "\\t".to_string(),
+        '\\' | ']' | '^' | '-' => format!("\\{character}"),
+        _ => character.to_string(),
     }
 }
 
@@ -756,6 +875,16 @@ mod tests {
         assert!(!accepts(&grammar, observed));
         // It cannot even be started: the fixed frame is the only legal prefix.
         assert!(grammar.advance(&grammar.initial_state(), "-").is_none());
+    }
+
+    #[test]
+    fn json_schema_pattern_preserves_the_label_language() {
+        let pattern = json_schema_pattern(LABEL_GRAMMAR).unwrap();
+        let regex = regex::Regex::new(&pattern).unwrap();
+        assert!(regex.is_match("Topic: Cache invalidation"));
+        assert!(regex.is_match("Topic: Cache invalidation and staleness\n"));
+        assert!(!regex.is_match("Cache invalidation"));
+        assert!(!regex.is_match("Topic: Cache"));
     }
 
     #[test]

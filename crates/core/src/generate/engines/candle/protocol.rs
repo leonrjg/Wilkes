@@ -86,7 +86,7 @@ mod tests {
         GenerationRequest {
             system: system.map(str::to_string),
             prompt: "label these".to_string(),
-            max_tokens: 8,
+            max_tokens: Some(8),
             constraint: Constraint::Text { stop: Vec::new() },
             sampling: Sampling::default(),
         }

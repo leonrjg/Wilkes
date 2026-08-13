@@ -59,26 +59,42 @@ Object.defineProperty(navigator, "clipboard", {
 
 // Mock CodeMirror for all tests
 vi.mock("@codemirror/view", () => {
-  function MockView() {
+  function MockView(config?: { state?: unknown }) {
     this.destroy = vi.fn();
     this.dispatch = vi.fn();
-    this.state = { doc: { toString: () => "{}", length: 0 } };
+    this.state = config?.state ?? {
+      doc: { toString: () => "{}", length: 2 },
+      selection: { main: { empty: true, head: 2 } },
+      sliceDoc: (from: number, to: number) => "{}".slice(from, to),
+    };
   }
   MockView.theme = vi.fn().mockReturnValue({});
   MockView.baseTheme = vi.fn().mockReturnValue({});
   MockView.decorations = { from: vi.fn() };
   MockView.lineWrapping = {};
   MockView.scrollIntoView = vi.fn();
+  MockView.updateListener = { of: vi.fn() };
+  class MockWidgetType {}
   return {
     EditorView: MockView,
-    Decoration: { none: {}, mark: vi.fn() },
+    Decoration: {
+      none: {},
+      mark: vi.fn(),
+      set: vi.fn().mockReturnValue({}),
+      widget: vi.fn().mockReturnValue({ range: vi.fn().mockReturnValue({}) }),
+    },
+    WidgetType: MockWidgetType,
     keymap: { of: vi.fn() },
   };
 });
 
 vi.mock("@codemirror/state", () => ({
   EditorState: {
-    create: vi.fn().mockReturnValue({ doc: { toString: () => "{}", length: 0 } }),
+    create: vi.fn(({ doc }: { doc: string }) => ({
+      doc: { toString: () => doc, length: doc.length },
+      selection: { main: { empty: true, head: doc.length } },
+      sliceDoc: (from: number, to: number) => doc.slice(from, to),
+    })),
     readOnly: { of: vi.fn() },
   },
   RangeSetBuilder: vi.fn().mockImplementation(() => ({
@@ -87,6 +103,7 @@ vi.mock("@codemirror/state", () => ({
   })),
   StateField: { define: vi.fn() },
   StateEffect: { define: vi.fn(() => ({ of: vi.fn(), is: vi.fn() })) },
+  Prec: { highest: vi.fn((value) => value) },
 }));
 
 // Mocking Tauri APIs (since we're in a Tauri app)

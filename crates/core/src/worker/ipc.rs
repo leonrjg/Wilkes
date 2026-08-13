@@ -247,7 +247,7 @@ mod tests {
         req.generate = Some(GenerationRequest {
             system: None,
             prompt: "hello".to_string(),
-            max_tokens: 16,
+            max_tokens: Some(16),
             constraint: Constraint::OneOf(vec!["a".to_string()]),
             sampling: Sampling::default(),
         });
@@ -255,7 +255,30 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let de: WorkerRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(de.role, WorkerRole::Generate(GenerationEngine::Candle));
-        assert_eq!(de.generate.unwrap().prompt, "hello");
+        let generate = de.generate.unwrap();
+        assert_eq!(generate.prompt, "hello");
+        assert_eq!(generate.max_tokens, Some(16));
+    }
+
+    #[test]
+    fn unlimited_generation_requests_round_trip_without_a_token_limit() {
+        let mut req = sample_request();
+        req.mode = "generate".to_string();
+        req.role = WorkerRole::Generate(GenerationEngine::Candle);
+        req.generate = Some(GenerationRequest {
+            system: None,
+            prompt: "continue".to_string(),
+            max_tokens: None,
+            constraint: Constraint::Text {
+                stop: vec!["\n".to_string()],
+            },
+            sampling: Sampling::default(),
+        });
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("max_tokens"));
+        let de: WorkerRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.generate.unwrap().max_tokens, None);
     }
 
     #[test]

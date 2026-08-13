@@ -2,7 +2,9 @@
 
 use std::ops::ControlFlow;
 
-use crate::generate::{Generated, GenerationEngine, GenerationRequest, Generator, StopReason};
+use crate::generate::{
+    Generated, GenerationEngine, GenerationRequest, GenerationTimings, Generator, StopReason,
+};
 use crate::worker::ipc::{WorkerEvent, WorkerRequest, WorkerRole};
 use crate::worker::manager::{ManagerCommand, WorkerManager};
 
@@ -24,6 +26,7 @@ pub struct WorkerGenerator {
     engine: GenerationEngine,
     context_tokens: usize,
     data_dir: std::path::PathBuf,
+    last_timings: std::sync::Mutex<Option<GenerationTimings>>,
 }
 
 impl WorkerGenerator {
@@ -36,6 +39,7 @@ impl WorkerGenerator {
             engine: config.engine,
             context_tokens: config.context_tokens,
             data_dir: config.data_dir,
+            last_timings: std::sync::Mutex::new(None),
         }
     }
 
@@ -63,6 +67,10 @@ impl Generator for WorkerGenerator {
         req: GenerationRequest,
         sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
     ) -> anyhow::Result<Generated> {
+        *self
+            .last_timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         let request = self.worker_request(req);
         // Tokens arrive one per event, so the channel needs room to buffer a
         // burst without stalling the worker between decode steps.
@@ -87,6 +95,11 @@ impl Generator for WorkerGenerator {
                         self.manager.record_generation_runtime(runtime);
                     }
                     WorkerEvent::GenerationMetrics(timings) => {
+                        *self
+                            .last_timings
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(timings.clone());
                         self.manager.record_generation_timings(timings);
                     }
                     WorkerEvent::Token { text: token } => {
@@ -138,6 +151,13 @@ impl Generator for WorkerGenerator {
     fn context_tokens(&self) -> usize {
         self.context_tokens
     }
+
+    fn last_timings(&self) -> Option<GenerationTimings> {
+        self.last_timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 #[cfg(test)]
@@ -162,7 +182,7 @@ mod tests {
         GenerationRequest {
             system: None,
             prompt: "hi".to_string(),
-            max_tokens: 8,
+            max_tokens: Some(8),
             constraint: Constraint::Text { stop: Vec::new() },
             sampling: Sampling::default(),
         }
@@ -196,15 +216,17 @@ read req
 echo '{"Token":{"text":"one "}}'
 echo '{"Token":{"text":"two "}}'
 echo '{"Token":{"text":"three"}}'
+echo '{"GenerationMetrics":{"prompt_micros":12,"decode_micros":34,"constraint_micros":5}}'
 echo '{"Completion":{"tokens":3,"stop":"Eos"}}'
 "#,
         );
 
         let (manager, _rx, loop_fut) = WorkerManager::new(paths(dir.path()));
         tokio::spawn(loop_fut);
-        let generator = WorkerGenerator::new(manager, config(dir.path()));
+        let generator = std::sync::Arc::new(WorkerGenerator::new(manager, config(dir.path())));
+        let decode_generator = std::sync::Arc::clone(&generator);
 
-        let generated = tokio::task::spawn_blocking(move || generator.generate(request()))
+        let generated = tokio::task::spawn_blocking(move || decode_generator.generate(request()))
             .await
             .unwrap()
             .unwrap();
@@ -212,6 +234,14 @@ echo '{"Completion":{"tokens":3,"stop":"Eos"}}'
         assert_eq!(generated.text, "one two three");
         assert_eq!(generated.tokens, 3);
         assert_eq!(generated.stop, StopReason::Eos);
+        assert_eq!(
+            generator.last_timings(),
+            Some(GenerationTimings {
+                prompt_micros: 12,
+                decode_micros: 34,
+                constraint_micros: 5,
+            })
+        );
     }
 
     #[cfg(unix)]

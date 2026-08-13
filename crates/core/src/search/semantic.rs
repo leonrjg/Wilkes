@@ -7,7 +7,7 @@ use crate::types::{
 };
 use tracing::{error, info, warn};
 
-use super::{SearchProvider, SearchResultTx};
+use super::{SearchOutcome, SearchProvider, SearchResultTx};
 use crate::embed::index::{SemanticIndex, SemanticQueryScope};
 use crate::embed::Embedder;
 use crate::generate::tasks::hypothetical_document;
@@ -71,17 +71,17 @@ impl SemanticSearchProvider {
     /// Best-effort by contract: the base vector is the *input* this transforms,
     /// not a competing implementation, so any failure logs a warning and
     /// returns the un-transformed base vector.
-    fn apply_hyde(&self, query_text: &str, base: Vec<f32>) -> Vec<f32> {
+    fn apply_hyde(&self, query_text: &str, base: Vec<f32>) -> (Vec<f32>, Vec<String>) {
         let hyde = &self.retrieval.hyde;
         if !hyde.enabled {
-            return base;
+            return (base, Vec::new());
         }
 
         let Some(generator) = self.generator.as_deref() else {
             warn!(
                 "[semantic] HyDE is enabled but no generation model is loaded; searched with the raw query"
             );
-            return base;
+            return (base, Vec::new());
         };
 
         let passages = match hypothetical_document::hypothetical_documents(
@@ -92,7 +92,7 @@ impl SemanticSearchProvider {
             Ok(passages) => passages,
             Err(e) => {
                 warn!("[semantic] HyDE generation failed; searched with the raw query: {e:#}");
-                return base;
+                return (base, Vec::new());
             }
         };
 
@@ -103,9 +103,21 @@ impl SemanticSearchProvider {
                 warn!(
                     "[semantic] HyDE passage embedding failed; searched with the raw query: {e:#}"
                 );
-                return base;
+                return (base, Vec::new());
             }
         };
+
+        // An embedder must return exactly one vector per input passage. If it
+        // violates that contract, no generated passage can be truthfully
+        // identified as part of the final query vector, so degrade atomically.
+        if passage_vecs.len() != passages.len() {
+            warn!(
+                "[semantic] HyDE embedder returned {} vector(s) for {} passage(s); searched with the raw query",
+                passage_vecs.len(),
+                passages.len()
+            );
+            return (base, Vec::new());
+        }
 
         // Normalise each component so the mean is a direction, not dominated by
         // whichever vector happens to have the largest magnitude.
@@ -123,9 +135,9 @@ impl SemanticSearchProvider {
                     "[semantic] HyDE: query vector shifted using {} hypothetical passage(s)",
                     passage_vecs.len()
                 );
-                normalize(&mean)
+                (normalize(&mean), passages)
             }
-            None => base,
+            None => (base, Vec::new()),
         }
     }
 
@@ -155,7 +167,13 @@ impl SemanticSearchProvider {
             let idx = guard
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Semantic index is not built yet"))?;
-            idx.query_scoped_filtered(q0, prf.feedback_docs, query_scope(query), eligible_paths)?
+            idx.query_scoped_filtered(
+                q0,
+                prf.feedback_docs,
+                query_scope(query),
+                eligible_paths,
+                None,
+            )?
         };
         if feedback.is_empty() {
             return Ok(q0.to_vec());
@@ -238,7 +256,7 @@ impl SearchProvider for SemanticSearchProvider {
         _extractors: &ExtractorRegistry,
         tx: SearchResultTx,
         eligible_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
-    ) -> anyhow::Result<Vec<String>> {
+    ) -> anyhow::Result<SearchOutcome> {
         // 1. Reconcile the index with the current root before returning semantic
         // results. This blocks the first stale search so callers never see known-
         // stale paths after offline creates/renames/deletes.
@@ -263,7 +281,7 @@ impl SearchProvider for SemanticSearchProvider {
         // relevance.
         info!("[semantic] embedding query...");
         let base_vec = self.embed_query_vector(query.pattern.as_str())?;
-        let hyde_vec = self.apply_hyde(query.pattern.as_str(), base_vec);
+        let (hyde_vec, hyde_documents) = self.apply_hyde(query.pattern.as_str(), base_vec);
         let query_vec = self.apply_prf(&hyde_vec, query, eligible_paths)?;
         info!("[semantic] query vector ready, running index query");
 
@@ -275,7 +293,7 @@ impl SearchProvider for SemanticSearchProvider {
 
         let top_k = query.max_results;
         let results =
-            idx.query_scoped_filtered(&query_vec, top_k, query_scope(query), eligible_paths)?;
+            idx.query_scoped_filtered(&query_vec, top_k, query_scope(query), eligible_paths, None)?;
         drop(guard);
 
         // 4. Convert IndexedChunk results into FileMatches / Match.
@@ -329,7 +347,10 @@ impl SearchProvider for SemanticSearchProvider {
             }
         }
 
-        Ok(reconcile_errors)
+        Ok(SearchOutcome {
+            errors: reconcile_errors,
+            hyde_documents,
+        })
     }
 
     fn capabilities(&self) -> SearchCapabilities {
@@ -354,8 +375,8 @@ mod tests {
 
     struct MockEmbedder;
     impl Embedder for MockEmbedder {
-        fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-            Ok(vec![vec![1.0; 768]])
+        fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![1.0; 768]; texts.len()])
         }
         fn model_id(&self) -> &str {
             "mock"
@@ -471,15 +492,15 @@ mod tests {
     }
 
     async fn collect(
-        handle: tokio::task::JoinHandle<Vec<String>>,
+        handle: tokio::task::JoinHandle<SearchOutcome>,
         mut rx: tokio::sync::mpsc::Receiver<FileMatches>,
-    ) -> (Vec<FileMatches>, Vec<String>) {
+    ) -> (Vec<FileMatches>, SearchOutcome) {
         let mut results = Vec::new();
         while let Some(fm) = rx.recv().await {
             results.push(fm);
         }
-        let errors = handle.await.unwrap();
-        (results, errors)
+        let outcome = handle.await.unwrap();
+        (results, outcome)
     }
 
     // ── Query-vector math ─────────────────────────────────────────────────────
@@ -542,12 +563,13 @@ mod tests {
                 .search(&query, &ExtractorRegistry::new(), tx, None)
                 .unwrap()
         });
-        let (results, errors) = collect(handle, rx).await;
+        let (results, outcome) = collect(handle, rx).await;
 
         // Search succeeds with the raw query, and the optional enhancement's
         // degradation does not masquerade as a file/search failure.
         assert_eq!(results.len(), 1);
-        assert!(errors.is_empty());
+        assert!(outcome.errors.is_empty());
+        assert!(outcome.hyde_documents.is_empty());
     }
 
     #[tokio::test]
@@ -579,7 +601,7 @@ mod tests {
                 .search(&query, &ExtractorRegistry::new(), tx, None)
                 .unwrap()
         });
-        let (results, errors) = collect(handle, rx).await;
+        let (results, outcome) = collect(handle, rx).await;
 
         assert_eq!(
             generator.calls(),
@@ -588,8 +610,53 @@ mod tests {
         );
         assert_eq!(results.len(), 1);
         assert!(
-            errors.is_empty(),
-            "no degradation notes expected: {errors:?}"
+            outcome.errors.is_empty(),
+            "no degradation notes expected: {:?}",
+            outcome.errors
+        );
+        assert_eq!(
+            outcome.hyde_documents,
+            vec!["A hypothetical answer passage."]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hyde_records_every_passage_used_for_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let (idx, _path) = index_with_one_text_chunk(&dir);
+        let generator = Arc::new(ScriptedGenerator::new("A generated search passage."));
+        let provider = SemanticSearchProvider::new(
+            Arc::new(MockEmbedder),
+            Arc::new(Mutex::new(Some(idx))),
+            indexing_config(vec!["txt".to_string()]),
+        )
+        .with_retrieval(
+            crate::types::RetrievalSettings {
+                hyde: crate::types::HydeSettings {
+                    enabled: true,
+                    hypotheticals: 2,
+                    include_query: true,
+                },
+                ..Default::default()
+            },
+            Some(generator.clone()),
+        );
+
+        let query = text_query(dir.path());
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let handle = tokio::task::spawn_blocking(move || {
+            provider
+                .search(&query, &ExtractorRegistry::new(), tx, None)
+                .unwrap()
+        });
+        let (results, outcome) = collect(handle, rx).await;
+
+        assert_eq!(generator.calls(), 2);
+        assert_eq!(results.len(), 1);
+        assert!(outcome.errors.is_empty());
+        assert_eq!(
+            outcome.hyde_documents,
+            vec!["A generated search passage.", "A generated search passage."]
         );
     }
 
@@ -621,13 +688,15 @@ mod tests {
                 .search(&query, &ExtractorRegistry::new(), tx, None)
                 .unwrap()
         });
-        let (results, errors) = collect(handle, rx).await;
+        let (results, outcome) = collect(handle, rx).await;
 
         assert_eq!(results.len(), 1);
         assert!(
-            errors.is_empty(),
-            "PRF should not surface errors here: {errors:?}"
+            outcome.errors.is_empty(),
+            "PRF should not surface errors here: {:?}",
+            outcome.errors
         );
+        assert!(outcome.hyde_documents.is_empty());
     }
 
     #[test]

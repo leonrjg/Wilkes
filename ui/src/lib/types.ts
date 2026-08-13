@@ -458,7 +458,74 @@ export type GenerationTask =
   | "cluster_label"
   | "relation_explanation"
   | "document_summary"
-  | "search_results_summary";
+  | "search_results_summary"
+  | "hypothetical_continuation"
+  | "grounded_completion";
+
+export type CompletionMode = "append" | "bridge";
+export type CompletionScopeMode = "library" | "prefer" | "only";
+export type CompletionFeedback = "accepted" | "partial" | "dismissed" | "typed_through";
+
+export interface CompletionScope {
+  mode: CompletionScopeMode;
+  pinned: string[];
+  excluded: string[];
+}
+
+export interface CompletionRequest {
+  path: string;
+  text: string;
+  /** Unicode scalar offset; services translate from CodeMirror's UTF-16 position. */
+  cursor: number;
+  scope: CompletionScope;
+  /** Candidates already shown at this document position. */
+  avoid_suggestions: string[];
+}
+
+export interface CompletionSource {
+  path: string;
+  title: string;
+  page: number | null;
+  chunkIds: string[];
+  score: number;
+  pinned: boolean;
+}
+
+export type DocumentCoverage =
+  | { kind: "full" }
+  | { kind: "elided"; head_tokens: number; tail_tokens: number };
+
+export interface ContextComposition {
+  windowTokens: number;
+  usedTokens: number;
+  docCoverage: DocumentCoverage;
+  retrievalTokens: number;
+  docTokens: number;
+  scopeMode: CompletionScopeMode;
+}
+
+export type CompletionEvent =
+  | { kind: "retrieval"; sources: CompletionSource[]; hyde_query: string }
+  | { kind: "context"; composition: ContextComposition }
+  | { kind: "shown"; text: string; mode: CompletionMode }
+  | { kind: "suppressed"; reason: string }
+  | { kind: "error"; message: string };
+
+export interface SteeringContribution {
+  path: string;
+  weight: number;
+}
+
+export interface SuppressionEntry {
+  reason: string;
+  candidate: string;
+  hydeQuery: string;
+}
+
+export interface SessionSteering {
+  documents: SteeringContribution[];
+  suppressions: SuppressionEntry[];
+}
 
 export interface SearchResultsSummarySource {
   title: string;
@@ -488,10 +555,16 @@ export interface GenerationSampling {
   seed: number;
 }
 
+export type GenerationEngine = "candle" | "ollama";
+
 export interface GenerationSettings {
   enabled: boolean;
+  engine: GenerationEngine;
   model: string | null;
   device: string | null;
+  ollama_url: string;
+  /** Null/absent uses the maximum reported by the selected Ollama model. */
+  context_tokens?: number | null;
   sampling_overrides: Partial<Record<GenerationTask, GenerationSampling>>;
 }
 
@@ -525,18 +598,12 @@ export interface RetrievalSettings {
   pseudo_relevance_feedback: PrfSettings;
 }
 
-/** Catalog entry for a generation model. Distinct from `ModelDescriptor`:
- *  `dimension` and `preferred_batch_size` are meaningless for a generator, and
- *  generation models need two repo ids because the GGUF repos ship no
- *  tokenizer. */
+/** Backend-neutral catalog entry for a generation model. */
 export interface GeneratorDescriptor {
+  engine: GenerationEngine;
   model_id: string;
   display_name: string;
   description: string;
-  weights_file: string;
-  weights_revision: string;
-  tokenizer_repo: string;
-  tokenizer_revision: string;
   context_tokens: number;
   is_cached: boolean;
   is_default: boolean;
@@ -701,6 +768,8 @@ export interface SearchStats {
   total_matches: number;
   elapsed_ms: number;
   errors: string[];
+  /** Exact generated passages whose embeddings affected semantic ranking. */
+  hyde_documents?: string[];
 }
 
 export interface IndexStatus {

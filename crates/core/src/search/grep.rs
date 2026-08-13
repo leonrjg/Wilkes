@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{SearchProvider, SearchResultTx};
+use super::{SearchOutcome, SearchProvider, SearchResultTx};
 
 /// Shared handle to the live semantic index, as held by the API layer.
 type IndexHandle = Arc<Mutex<Option<SemanticIndex>>>;
@@ -83,7 +83,7 @@ impl SearchProvider for GrepSearchProvider {
         extractors: &ExtractorRegistry,
         tx: SearchResultTx,
         eligible_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
-    ) -> anyhow::Result<Vec<String>> {
+    ) -> anyhow::Result<SearchOutcome> {
         let matcher = Self::build_matcher(query)?;
         let total_matches = AtomicUsize::new(0);
         let errors = Mutex::new(if query.scope == SearchScope::All {
@@ -107,7 +107,7 @@ impl SearchProvider for GrepSearchProvider {
                 eligible_paths,
                 index,
             )?;
-            return Ok(errors.into_inner().unwrap());
+            return Ok(errors.into_inner().unwrap().into());
         }
 
         // Resolve the root set: the single root for Corpus, every library root
@@ -177,7 +177,7 @@ impl SearchProvider for GrepSearchProvider {
             })
         });
 
-        Ok(errors.into_inner().unwrap())
+        Ok(errors.into_inner().unwrap().into())
     }
 
     fn capabilities(&self) -> SearchCapabilities {
@@ -927,7 +927,7 @@ mod tests {
         });
 
         assert!(rx.blocking_recv().is_none());
-        let errors = handle.join().unwrap();
+        let errors = handle.join().unwrap().errors;
 
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("broken.pdf"));

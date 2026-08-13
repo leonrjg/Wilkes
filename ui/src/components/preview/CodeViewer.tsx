@@ -83,7 +83,7 @@ const bookmarkHighlightField = StateField.define<DecorationSet>({
 
 // ── Language detection ────────────────────────────────────────────────────────
 
-function getLanguageExtension(lang: string | null) {
+export function getLanguageExtension(lang: string | null) {
   switch (lang) {
     case "javascript":
     case "typescript":

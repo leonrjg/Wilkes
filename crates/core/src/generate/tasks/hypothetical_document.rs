@@ -1,9 +1,10 @@
 //! HyDE: generate a hypothetical answer passage for a search query.
 //!
-//! The generated text is never shown to the user. It exists only to be
-//! embedded, so the vector the index is queried with sits in *document* space
-//! rather than terse-question space (Gao et al., 2022, "Precise Zero-Shot Dense
-//! Retrieval without Relevance Labels"). Unlike the other tasks in this module,
+//! The generated text is embedded so the vector the index is queried with sits
+//! in *document* space rather than terse-question space (Gao et al., 2022,
+//! "Precise Zero-Shot Dense Retrieval without Relevance Labels"). Successful
+//! passages are also exposed as search diagnostics so the user can inspect what
+//! affected retrieval. Unlike the other tasks in this module,
 //! there is no grammar and no rejected output: a passage that hits the token
 //! ceiling is still a usable embedding target, so only an empty or cancelled
 //! generation is treated as a failure.
@@ -38,7 +39,7 @@ pub fn build_request(query: &str, seed: u64, temperature: f32) -> GenerationRequ
     GenerationRequest {
         system: None,
         prompt,
-        max_tokens: MAX_TOKENS,
+        max_tokens: Some(MAX_TOKENS),
         // Free text: the passage is an embedding target, not a parsed value, so
         // there is nothing to constrain. EOS ends it; the token ceiling caps it.
         constraint: Constraint::Text { stop: Vec::new() },
@@ -104,7 +105,7 @@ mod tests {
         let req = build_request("what causes cache invalidation", 0, 0.0);
         assert!(req.prompt.contains("what causes cache invalidation"));
         assert!(matches!(req.constraint, Constraint::Text { ref stop } if stop.is_empty()));
-        assert_eq!(req.max_tokens, MAX_TOKENS);
+        assert_eq!(req.max_tokens, Some(MAX_TOKENS));
     }
 
     #[test]

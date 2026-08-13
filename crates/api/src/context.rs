@@ -10,6 +10,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use wilkes_core::completion::{
+    run_completion, CompletionDependencies, CompletionEvent, CompletionFeedback, CompletionRequest,
+    CompletionSession, SessionSteering,
+};
 use wilkes_core::directory_watcher::{DirectoryChangeBatch, DirectoryWatcher};
 use wilkes_core::embed::cluster::WardTree;
 use wilkes_core::embed::index::db::{TopicChunkData, TopicCoveragePrototype};
@@ -343,6 +347,10 @@ struct TopicOperation {
     label_task: Option<JoinHandle<()>>,
 }
 
+struct CompletionOperation {
+    cancel: Arc<AtomicBool>,
+}
+
 /// Shared application state and lifecycle logic. Both the desktop (Tauri) and
 /// the server (axum) create exactly one `Arc<AppContext>` and delegate all
 /// business operations to it.
@@ -392,6 +400,10 @@ pub struct AppContext {
     /// Incremented before every semantic-index mutation. A build captures this
     /// value and may install its tree only if the value is still current.
     semantic_index_revision: AtomicU64,
+    /// Completion caches, Rocchio feedback, and inspector history are scoped to
+    /// this application session and share the single core completion pipeline.
+    completion_session: PLMutex<CompletionSession>,
+    completion_operations: PLMutex<HashMap<String, CompletionOperation>>,
     events: Arc<dyn EventEmitter>,
     settings_lock: tokio::sync::Mutex<()>,
     bookmarks_lock: tokio::sync::Mutex<()>,
@@ -432,6 +444,8 @@ impl AppContext {
             topic_tree_caches: PLMutex::new(TopicTreeCaches::default()),
             topic_tree_build_lock: tokio::sync::Mutex::new(()),
             semantic_index_revision: AtomicU64::new(0),
+            completion_session: PLMutex::new(CompletionSession::default()),
+            completion_operations: PLMutex::new(HashMap::new()),
             events,
             settings_lock: tokio::sync::Mutex::new(()),
             bookmarks_lock: tokio::sync::Mutex::new(()),
@@ -2245,21 +2259,36 @@ impl AppContext {
     /// attached after the feature is switched off would keep a multi-gigabyte
     /// process alive behind a toggle the user turned off.
     fn on_generation_settings_maybe_changed(self: &Arc<Self>, before: &Settings, after: &Settings) {
-        if before.generation == after.generation {
+        let before = &before.generation;
+        let after = &after.generation;
+        let attachment_changed = before.enabled != after.enabled
+            || before.engine != after.engine
+            || before.model != after.model
+            || (after.engine == GenerationEngine::Candle && before.device != after.device)
+            || (after.engine == GenerationEngine::Ollama
+                && (before.ollama_url != after.ollama_url
+                    || before.context_tokens != after.context_tokens));
+        if !attachment_changed {
             return;
         }
         let ctx = Arc::clone(self);
-        let enabled = after.generation.enabled;
-        let model_changed = before.generation.model != after.generation.model;
+        let enabled = after.enabled;
+        let identity_changed = before.engine != after.engine
+            || before.model != after.model
+            || before.device != after.device
+            || before.ollama_url != after.ollama_url;
+        if !enabled {
+            info!("generation disabled; detaching the generator");
+            self.unload_generator();
+            return;
+        }
+        if identity_changed {
+            // Detach synchronously with the settings transition. Until the new
+            // backend is attached, the shared readiness predicate must not
+            // accidentally bless the generator selected by the old settings.
+            self.unload_generator();
+        }
         tokio::spawn(async move {
-            if !enabled {
-                info!("generation disabled; detaching the generator");
-                ctx.unload_generator();
-                return;
-            }
-            if model_changed {
-                ctx.unload_generator();
-            }
             match ctx.load_generator().await {
                 Ok(GeneratorLoad::Attached) => info!("generation model attached"),
                 Ok(GeneratorLoad::NotConfigured) => {
@@ -2501,12 +2530,183 @@ impl AppContext {
         settings.enabled && settings.model.is_some() && self.generator.lock().is_some()
     }
 
-    pub fn list_generation_models(&self) -> Vec<GeneratorDescriptor> {
-        generate_dispatch::list_models(GenerationEngine::Candle, &self.data_dir)
+    /// Start the authoritative grounded-completion pipeline. Results are
+    /// emitted on `completion://{id}` so callers can subscribe before starting
+    /// and discard stale ids without a global event race.
+    pub async fn request_completion(
+        self: Arc<Self>,
+        completion_id: String,
+        request: CompletionRequest,
+    ) -> Result<(), String> {
+        if !self.is_generation_ready().await {
+            return Err("Generation is not available".to_string());
+        }
+        if !self.is_semantic_ready() {
+            return Err("Semantic index is not available".to_string());
+        }
+        let embedder = self
+            .embedder
+            .lock()
+            .clone()
+            .ok_or_else(|| "Embedding model is not available".to_string())?;
+        let index = self.index.lock().clone();
+        let generator = self
+            .generator
+            .lock()
+            .clone()
+            .ok_or_else(|| "Generation model is not available".to_string())?;
+        let (roots, _) = library_roots(&self.get_settings().await);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(previous) = self.completion_operations.lock().insert(
+            completion_id.clone(),
+            CompletionOperation {
+                cancel: Arc::clone(&cancel),
+            },
+        ) {
+            previous.cancel.store(true, Ordering::Relaxed);
+        }
+        let ctx = Arc::clone(&self);
+        tokio::task::spawn_blocking(move || {
+            let dependencies = CompletionDependencies {
+                embedder,
+                index,
+                generator,
+                library_roots: roots,
+            };
+            let event_name = format!("completion://{completion_id}");
+            let result = {
+                let mut session = ctx.completion_session.lock();
+                run_completion(
+                    &completion_id,
+                    &request,
+                    &dependencies,
+                    &mut session,
+                    cancel.as_ref(),
+                    &mut |event: CompletionEvent| {
+                        ctx.events
+                            .emit(&event_name, serde_json::to_value(event).unwrap_or_default());
+                    },
+                )
+            };
+            if let Err(error) = result {
+                if !cancel.load(Ordering::Relaxed) {
+                    error!(completion_id, "Grounded completion failed: {error:#}");
+                    ctx.events.emit(
+                        &event_name,
+                        serde_json::to_value(CompletionEvent::Error {
+                            message: format!("{error:#}"),
+                        })
+                        .unwrap_or_default(),
+                    );
+                }
+            }
+            let mut operations = ctx.completion_operations.lock();
+            if operations
+                .get(&completion_id)
+                .is_some_and(|operation| Arc::ptr_eq(&operation.cancel, &cancel))
+            {
+                operations.remove(&completion_id);
+            }
+        });
+        Ok(())
     }
 
-    pub fn fetch_generation_model_size(&self, model_id: &str) -> anyhow::Result<u64> {
-        generate_dispatch::fetch_model_size(GenerationEngine::Candle, model_id)
+    pub fn cancel_completion(&self, completion_id: &str) {
+        if let Some(operation) = self.completion_operations.lock().remove(completion_id) {
+            operation.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn cancel_all_completions(&self) {
+        for (_, operation) in self.completion_operations.lock().drain() {
+            operation.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub async fn completion_feedback(
+        self: &Arc<Self>,
+        completion_id: &str,
+        feedback: CompletionFeedback,
+    ) -> Result<(), String> {
+        let embedder = self
+            .embedder
+            .lock()
+            .clone()
+            .ok_or_else(|| "Embedding model is not available".to_string())?;
+        let ctx = Arc::clone(self);
+        let completion_id = completion_id.to_string();
+        let plan = tokio::task::spawn_blocking(move || {
+            ctx.completion_session
+                .lock()
+                .prepare_feedback(&completion_id, feedback)
+        })
+        .await
+        .map_err(|error| format!("Feedback preparation task failed: {error}"))?
+        .map_err(|error| error.to_string())?;
+        let (plan, vectors) = tokio::task::spawn_blocking(move || {
+            let vectors = plan.embed(embedder.as_ref())?;
+            anyhow::Ok((plan, vectors))
+        })
+        .await
+        .map_err(|error| format!("Feedback embedding task failed: {error}"))?
+        .map_err(|error| error.to_string())?;
+        let ctx = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            ctx.completion_session.lock().apply_feedback(plan, vectors)
+        })
+        .await
+        .map_err(|error| format!("Feedback application task failed: {error}"))?
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn get_session_steering(&self) -> SessionSteering {
+        self.completion_session.lock().steering()
+    }
+
+    pub fn reset_session_steering(&self) {
+        self.completion_session.lock().reset();
+    }
+
+    /// Persist an editor buffer. The target must already be a non-PDF document
+    /// inside the configured library; saving never becomes a path-creation or
+    /// arbitrary-filesystem API.
+    pub async fn save_document(&self, path: PathBuf, text: String) -> Result<(), String> {
+        let settings = self.get_settings().await;
+        let (roots, _) = library_roots(&settings);
+        let path = std::fs::canonicalize(&path)
+            .map_err(|error| format!("Cannot save {}: {error}", path.display()))?;
+        Self::ensure_path_in_library(&path, &roots, "Editor document")?;
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if extension.eq_ignore_ascii_case("pdf") {
+            return Err("PDF documents are not editable".to_string());
+        }
+        if !settings.supported_extensions.iter().any(|supported| {
+            supported
+                .trim_start_matches('.')
+                .eq_ignore_ascii_case(extension)
+        }) {
+            return Err("Document type is not editable".to_string());
+        }
+        tokio::fs::write(&path, text)
+            .await
+            .map_err(|error| format!("Failed to save {}: {error}", path.display()))
+    }
+
+    pub async fn list_generation_models(&self) -> anyhow::Result<Vec<GeneratorDescriptor>> {
+        let settings = self.generation_settings().await;
+        generate_dispatch::list_models(settings.engine, &self.data_dir, &settings.ollama_url).await
+    }
+
+    pub async fn fetch_generation_model_size(&self, model_id: &str) -> anyhow::Result<u64> {
+        let settings = self.generation_settings().await;
+        let engine = settings.engine;
+        let model_id = model_id.to_string();
+        tokio::task::spawn_blocking(move || generate_dispatch::fetch_model_size(engine, &model_id))
+            .await?
     }
 
     fn generation_device(settings: &GenerationSettings) -> String {
@@ -2542,13 +2742,6 @@ impl AppContext {
             return Ok(GeneratorLoad::NotConfigured);
         };
 
-        let installer = generate_dispatch::get_installer(
-            GenerationEngine::Candle,
-            model.clone(),
-            self.generate_manager.clone(),
-            Self::generation_device(&settings),
-        );
-
         // Generation download progress travels on its own event stream. The
         // `embed-*` events are owned by the semantic index lifecycle: borrowing
         // them here put the UI into "indexing" with no terminal event to leave it.
@@ -2557,12 +2750,25 @@ impl AppContext {
             Arc::clone(&self.events),
             progress_rx,
         ));
-        let install = installer.install(&self.data_dir, progress_tx).await;
+        let attach = generate_dispatch::attach_generator(
+            settings.engine,
+            model.clone(),
+            self.generate_manager.clone(),
+            Self::generation_device(&settings),
+            &self.data_dir,
+            &settings.ollama_url,
+            settings.context_tokens,
+            progress_tx,
+        )
+        .await;
         let _ = forward.await;
-        if let Err(e) = install {
-            self.emit_generation_error(format!("{e:#}"));
-            return Err(e);
-        }
+        let generator = match attach {
+            Ok(generator) => generator,
+            Err(e) => {
+                self.emit_generation_error(format!("{e:#}"));
+                return Err(e);
+            }
+        };
 
         // Last check before the assignment: a newer load claimed the epoch while
         // this one was downloading, and its model is the one the user wants.
@@ -2578,25 +2784,20 @@ impl AppContext {
             return Ok(GeneratorLoad::Superseded);
         }
 
-        let generator = match installer.build(&self.data_dir) {
-            Ok(generator) => generator,
-            Err(e) => {
-                self.emit_generation_error(format!("{e:#}"));
-                return Err(e);
-            }
-        };
         *self.generator.lock() = Some(generator);
 
         // Generation and embedding share the worker lifecycle default. Do not
         // read a second persisted timeout here: older builds wrote 60 seconds
         // into generation settings, causing a reload every minute even though
         // the common worker residency is five minutes.
-        let _ = self
-            .generate_manager
-            .send(ManagerCommand::SetTimeout(
-                wilkes_core::worker::DEFAULT_IDLE_TIMEOUT_SECS,
-            ))
-            .await;
+        if settings.engine == GenerationEngine::Candle {
+            let _ = self
+                .generate_manager
+                .send(ManagerCommand::SetTimeout(
+                    wilkes_core::worker::DEFAULT_IDLE_TIMEOUT_SECS,
+                ))
+                .await;
+        }
         self.events.emit(
             "generation-done",
             serde_json::json!({ "model": model.model_id() }),
@@ -2628,6 +2829,10 @@ impl AppContext {
     /// Detach the generator and reap its process. Called when the feature is
     /// switched off or the model changes.
     pub fn unload_generator(&self) {
+        // Supersede an install/probe already in flight. Merely clearing the Arc
+        // would let that older load attach itself again after disable returned.
+        self.generator_epoch.fetch_add(1, Ordering::SeqCst);
+        self.cancel_all_completions();
         *self.generator.lock() = None;
         self.kill_generation_worker();
     }
@@ -3878,6 +4083,7 @@ impl AppContext {
             return;
         }
         self.stop_directory_watcher();
+        self.cancel_all_completions();
         self.cancel_embed().await;
         if let Some(task) = self.cluster_label_task.lock().take() {
             task.abort();
@@ -3893,6 +4099,7 @@ impl AppContext {
     }
 
     pub async fn delete_index(&self, root: Option<PathBuf>) -> anyhow::Result<()> {
+        self.cancel_all_completions();
         self.invalidate_topic_tree_cache();
         if let Some(root) = root {
             crate::commands::embed::delete_index(&self.data_dir, Some(root.clone())).await?;
@@ -5614,6 +5821,26 @@ mod tests {
                 .any(|(name, _)| name == "generation-error"),
             "a superseded load must not report a failure"
         );
+    }
+
+    #[tokio::test]
+    async fn unloading_supersedes_a_generation_load_already_in_flight() {
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = generation_ctx(dir.path(), events);
+        enable_generation(&ctx, "not/a-real-model").await;
+
+        let held = ctx.generator_load_lock.lock().await;
+        let load = {
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move { ctx.load_generator().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        ctx.unload_generator();
+        drop(held);
+
+        assert_eq!(load.await.unwrap().unwrap(), GeneratorLoad::Superseded);
+        assert!(ctx.generator.lock().is_none());
     }
 
     #[test]

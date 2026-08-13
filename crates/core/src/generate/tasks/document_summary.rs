@@ -61,7 +61,7 @@ pub fn build_request(input: &DocumentSummaryInput) -> GenerationRequest {
     GenerationRequest {
         system: None,
         prompt,
-        max_tokens: MAX_TOKENS,
+        max_tokens: Some(MAX_TOKENS),
         constraint: Constraint::Text {
             stop: vec!["\n\n".to_string()],
         },
@@ -122,7 +122,7 @@ mod tests {
     #[test]
     fn request_is_greedy_and_bounded() {
         let request = build_request(&input("source text"));
-        assert_eq!(request.max_tokens, MAX_TOKENS);
+        assert_eq!(request.max_tokens, Some(MAX_TOKENS));
         assert_eq!(request.sampling, Sampling::default());
         assert_eq!(
             request.constraint,

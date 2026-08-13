@@ -55,12 +55,68 @@ pub trait Generator: Send + Sync {
     }
 }
 
+/// The single application-side boundary for generation-request diagnostics.
+///
+/// Keeping this as a generator decorator means Candle worker requests and
+/// in-process Ollama requests are logged identically, without teaching every
+/// task or backend about diagnostics. Prompt content is intentionally logged:
+/// it is user-authored/library content and this diagnostic is explicitly meant
+/// to make the exact model input inspectable in Wilkes' local logs.
+struct RequestLoggingGenerator {
+    inner: Arc<dyn Generator>,
+}
+
+impl Generator for RequestLoggingGenerator {
+    fn generate_stream(
+        &self,
+        req: GenerationRequest,
+        sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
+    ) -> anyhow::Result<Generated> {
+        tracing::info!(
+            target: "wilkes_core::generate::request",
+            model = self.inner.model_id(),
+            system = ?req.system,
+            prompt = %req.prompt,
+            max_tokens = ?req.max_tokens,
+            constraint = ?req.constraint,
+            sampling = ?req.sampling,
+            "generation request"
+        );
+        self.inner.generate_stream(req, sink)
+    }
+
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn context_tokens(&self) -> usize {
+        self.inner.context_tokens()
+    }
+
+    fn runtime(&self) -> Option<GenerationRuntime> {
+        self.inner.runtime()
+    }
+
+    fn last_timings(&self) -> Option<GenerationTimings> {
+        self.inner.last_timings()
+    }
+}
+
+/// Decorate an attached generator with exact request-content logging.
+#[cfg(feature = "generate")]
+pub(crate) fn with_request_logging(inner: Arc<dyn Generator>) -> Arc<dyn Generator> {
+    Arc::new(RequestLoggingGenerator { inner })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GenerationRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
     pub prompt: String,
-    pub max_tokens: usize,
+    /// An explicit output ceiling for bounded tasks. `None` lets the task's
+    /// semantic stop conditions or the backend context boundary end decoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
     pub constraint: Constraint,
     pub sampling: Sampling,
 }
@@ -109,6 +165,9 @@ pub enum Constraint {
 pub enum StopReason {
     Eos,
     StopString,
+    /// A task-owned validator found the complete prose unit it requested and
+    /// deliberately stopped the underlying decoder.
+    ProseBoundary,
     GrammarComplete,
     MaxTokens,
     Cancelled,
@@ -155,19 +214,23 @@ pub struct GenerationTimings {
 /// is live at a time because each model occupies significant memory.
 pub type ActiveGenerator = std::sync::Mutex<Option<Arc<dyn Generator>>>;
 
-/// The generation counterpart of `EmbeddingEngine`. One variant today; it exists
-/// so `WorkerRole` can discriminate, not to future-proof.
+/// The generation implementation selected in settings.
+///
+/// Candle runs in Wilkes' generation worker. Ollama is an external HTTP
+/// service and therefore never enters the worker protocol.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GenerationEngine {
     #[default]
     Candle,
+    Ollama,
 }
 
 impl GenerationEngine {
     pub fn as_str(&self) -> &'static str {
         match self {
             GenerationEngine::Candle => "candle",
+            GenerationEngine::Ollama => "ollama",
         }
     }
 }
@@ -312,7 +375,7 @@ mod tests {
         GenerationRequest {
             system: None,
             prompt: prompt.to_string(),
-            max_tokens: 16,
+            max_tokens: Some(16),
             constraint: Constraint::Text { stop: Vec::new() },
             sampling: Sampling::default(),
         }
@@ -344,6 +407,7 @@ mod tests {
         for stop in [
             StopReason::Eos,
             StopReason::StopString,
+            StopReason::ProseBoundary,
             StopReason::GrammarComplete,
         ] {
             let generated = Generated {

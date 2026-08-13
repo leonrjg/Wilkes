@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import type { SearchApi } from "../services/api";
-import type { EmbedProgress, GeneratorDescriptor, Settings } from "../lib/types";
+import type {
+  EmbedProgress,
+  GenerationEngine,
+  GeneratorDescriptor,
+  Settings,
+} from "../lib/types";
 import { useGenerationStore } from "../stores/useGenerationStore";
 import ModelCatalog, { formatModelBytes } from "./ModelCatalog";
 
@@ -43,6 +48,13 @@ export default function GenerationPanel({ api, settings, onUpdateSettings }: Pro
   const refreshReady = useGenerationStore((state) => state.refreshReady);
 
   const generation = settings.generation;
+  const engine = generation.engine ?? "candle";
+  const [ollamaUrl, setOllamaUrl] = useState(
+    generation.ollama_url || "http://127.0.0.1:11434",
+  );
+  const [contextWindow, setContextWindow] = useState(
+    generation.context_tokens?.toString() ?? "",
+  );
 
   useEffect(() => {
     let mounted = true;
@@ -66,11 +78,16 @@ export default function GenerationPanel({ api, settings, onUpdateSettings }: Pro
     return () => {
       mounted = false;
     };
-  }, [api, refreshReady]);
+  }, [api, engine, generation.ollama_url, refreshReady]);
 
   useEffect(() => {
-    if (generation.model) setDraftModelId(generation.model);
-  }, [generation.model]);
+    setDraftModelId(generation.model);
+  }, [engine, generation.model]);
+
+  useEffect(() => {
+    setOllamaUrl(generation.ollama_url || "http://127.0.0.1:11434");
+    setContextWindow(generation.context_tokens?.toString() ?? "");
+  }, [generation.ollama_url, generation.context_tokens]);
 
   // Generation installation has its own event stream. Settings changes can
   // start a load too, so the panel listens for backend truth instead of
@@ -138,7 +155,7 @@ export default function GenerationPanel({ api, settings, onUpdateSettings }: Pro
   const handleSelectModel = async (model: GeneratorDescriptor) => {
     setDraftModelId(model.model_id);
     setError(null);
-    if (model.is_cached || model.size_bytes !== null) return;
+    if (engine === "ollama" || model.is_cached || model.size_bytes !== null) return;
 
     setSizeFetchingFor(model.model_id);
     try {
@@ -154,6 +171,54 @@ export default function GenerationPanel({ api, settings, onUpdateSettings }: Pro
       setError(String(cause));
     } finally {
       setSizeFetchingFor(null);
+    }
+  };
+
+  const handleEngineChange = async (nextEngine: GenerationEngine) => {
+    if (nextEngine === engine) return;
+    setBusy(true);
+    setError(null);
+    setModels([]);
+    setDraftModelId(null);
+    try {
+      await patchGeneration({ engine: nextEngine, model: null });
+      setModels(await api.listGenerationModels());
+      await refreshReady();
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleOllamaConnect = async () => {
+    const nextUrl = ollamaUrl.trim();
+    if (!nextUrl) {
+      setError("Enter the Ollama server URL.");
+      return;
+    }
+    const parsedContext = contextWindow.trim() === "" ? null : Number(contextWindow);
+    if (parsedContext !== null && (!Number.isInteger(parsedContext) || parsedContext <= 0)) {
+      setError("Context window must be a positive whole number of tokens.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const urlChanged = nextUrl !== generation.ollama_url;
+    const contextChanged = parsedContext !== (generation.context_tokens ?? null);
+    if (urlChanged) setDraftModelId(null);
+    try {
+      await patchGeneration({
+        ollama_url: nextUrl,
+        ...(contextChanged ? { context_tokens: parsedContext } : {}),
+        ...(urlChanged ? { model: null } : {}),
+      });
+      setModels(await api.listGenerationModels());
+      await refreshReady();
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -174,7 +239,7 @@ export default function GenerationPanel({ api, settings, onUpdateSettings }: Pro
       ?? models.find((model) => model.is_default)?.model_id
       ?? null;
     if (!modelId) {
-      setError("Select a generation model before enabling local generation.");
+      setError("Select a generation model before enabling generation.");
       return;
     }
 
@@ -226,6 +291,7 @@ export default function GenerationPanel({ api, settings, onUpdateSettings }: Pro
     if (selectionChanged) {
       return selected.is_cached ? "Save model" : "Download model and enable";
     }
+    if (engine === "ollama") return "Reconnect model";
     return selected.is_cached ? "Reload model" : "Download model and enable";
   })();
 
@@ -233,7 +299,7 @@ export default function GenerationPanel({ api, settings, onUpdateSettings }: Pro
     <div className="flex flex-col gap-4 p-1">
       <section>
         <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-          Local Generation
+          Generation Backend
         </h3>
         <div className="space-y-3 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
           <label className="flex cursor-pointer items-center gap-2.5">
@@ -248,11 +314,31 @@ export default function GenerationPanel({ api, settings, onUpdateSettings }: Pro
             </span>
           </label>
           <p className="text-[10px] italic text-[var(--text-dim)]">
-            Runs entirely on this machine in a separate process. Disabling it hides
-            generation features throughout the app.
+            {engine === "candle"
+              ? "Candle runs entirely on this machine in a separate Wilkes process."
+              : "Ollama models and residency are managed by the configured Ollama service."}
+            {" "}Disabling generation hides its features throughout the app.
           </p>
 
-          {generation.enabled && (
+          <div className="border-t border-[var(--border-main)] pt-3">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-[var(--text-muted)]">Backend</span>
+              <select
+                aria-label="Generation backend"
+                value={engine}
+                disabled={busy}
+                onChange={(event) =>
+                  void handleEngineChange(event.target.value as GenerationEngine)
+                }
+                className="w-full rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2.5 py-1.5 text-xs text-[var(--text-main)]"
+              >
+                <option value="candle">Candle (built in)</option>
+                <option value="ollama">Ollama</option>
+              </select>
+            </label>
+          </div>
+
+          {engine === "candle" && generation.enabled && (
             <div className="border-t border-[var(--border-main)] pt-3">
               <label className="flex flex-col gap-1">
                 <span className="text-xs text-[var(--text-muted)]">Device</span>
@@ -272,19 +358,66 @@ export default function GenerationPanel({ api, settings, onUpdateSettings }: Pro
               </label>
             </div>
           )}
+
+          {engine === "ollama" && (
+            <div className="border-t border-[var(--border-main)] pt-3">
+              <label className="flex flex-col gap-1">
+                <span className="text-xs text-[var(--text-muted)]">Ollama URL</span>
+                <div className="flex gap-2">
+                  <input
+                    aria-label="Ollama URL"
+                    type="url"
+                    value={ollamaUrl}
+                    disabled={busy}
+                    onChange={(event) => setOllamaUrl(event.target.value)}
+                    className="min-w-0 flex-1 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2.5 py-1.5 font-mono text-xs text-[var(--text-main)]"
+                  />
+                  <button
+                    type="button"
+                    disabled={busy || !ollamaUrl.trim()}
+                    onClick={() => void handleOllamaConnect()}
+                    className="rounded border border-[var(--border-main)] px-2.5 py-1.5 text-xs text-[var(--text-main)] hover:bg-[var(--bg-active)] disabled:opacity-50"
+                  >
+                    Refresh
+                  </button>
+                </div>
+              </label>
+              <label className="mt-2 flex flex-col gap-1">
+                <span className="text-xs text-[var(--text-muted)]">Context window</span>
+                <input
+                  aria-label="Ollama context window"
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={contextWindow}
+                  placeholder="Model maximum"
+                  disabled={busy}
+                  onChange={(event) => setContextWindow(event.target.value)}
+                  className="rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2.5 py-1.5 font-mono text-xs text-[var(--text-main)]"
+                />
+                <span className="text-[10px] text-[var(--text-dim)]">
+                  Blank uses the model maximum. Large windows improve grounding context but can require several GB of KV-cache memory.
+                </span>
+              </label>
+            </div>
+          )}
         </div>
       </section>
 
       <ModelCatalog
-        title="Generation Model"
-        catalogKey="generation"
+        title={engine === "ollama" ? "Installed Ollama Model" : "Generation Model"}
+        catalogKey={`generation:${engine}`}
         models={models}
         filter={modelFilter}
         selectedModelId={draftModelId}
         activeModelId={generation.enabled ? generation.model : null}
         sizeFetchingFor={sizeFetchingFor}
         disabled={busy}
-        emptyMessage="No generation models found"
+        emptyMessage={
+          engine === "ollama"
+            ? "No installed Ollama models found"
+            : "No generation models found"
+        }
         onFilterChange={setModelFilter}
         onSelect={(model) => void handleSelectModel(model)}
       />
@@ -336,8 +469,9 @@ export default function GenerationPanel({ api, settings, onUpdateSettings }: Pro
         </button>
 
         <p className="px-1 text-[10px] italic text-[var(--text-dim)]">
-          Generation and embedding workers remain resident for five minutes by default.
-          The Workers panel reports the device actually in use.
+          {engine === "candle"
+            ? "Generation and embedding workers remain resident for five minutes by default. The Workers panel reports the device actually in use."
+            : "Wilkes asks Ollama to keep the selected model resident for five minutes after each request."}
         </p>
 
         {error && (

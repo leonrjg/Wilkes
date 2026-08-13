@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud, Share2 } from "react-feather";
+import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud, Share2, Edit3 } from "react-feather";
 import CodeViewer from "./preview/CodeViewer";
+import DocumentEditor from "./DocumentEditor";
 import MarkdownViewer from "./preview/MarkdownViewer";
 import PdfViewer from "./preview/PdfViewer";
 import type { DocumentSelection } from "./preview/SelectionActions";
@@ -105,6 +106,7 @@ export default function PreviewPane() {
   const { addToast } = useToasts();
   const [sidePanel, setSidePanel] = useState<ViewerSidePanel>(null);
   const [markdownView, setMarkdownView] = useState<"source" | "rendered">("rendered");
+  const [editing, setEditing] = useState(false);
   const [openBookmarkTarget, setOpenBookmarkTarget] = useState<{
     id: string;
     anchor: BookmarkAnchor;
@@ -117,6 +119,7 @@ export default function PreviewPane() {
   useEffect(() => {
     setOpenBookmarkTarget(null);
     setDeletingBookmark(false);
+    setEditing(false);
   }, [selectedMatch?.path]);
 
   useEffect(() => {
@@ -520,6 +523,22 @@ export default function PreviewPane() {
           </Tooltip>
         )}
 
+        {!isPdfFile && displayData && "Text" in displayData && (
+          <Tooltip content={editing ? "Return to document viewer" : "Edit document"}>
+            <button
+              type="button"
+              onClick={() => {
+                setEditing((current) => !current);
+                if (!editing) setRememberedMarkdownView("source");
+              }}
+              aria-label={editing ? "Finish editing document" : "Edit document"}
+              className={`inline-flex rounded border border-[var(--border-main)] p-1 text-[var(--text-dim)] ${editing ? "bg-[var(--bg-active)] text-[var(--text-main)]" : ""}`}
+            >
+              <Edit3 size={16} />
+            </button>
+          </Tooltip>
+        )}
+
       </div>
 
       {/* Content */}
@@ -600,6 +619,14 @@ export default function PreviewPane() {
                 showChatSelectionActions={chatSelectionActionsAvailable}
                 onExplainSelection={handleExplainSelection}
                 onAskSelection={handleAskSelection}
+              />
+            ) : displayData && "Text" in displayData && editing ? (
+              <DocumentEditor
+                content={displayData.Text.content}
+                language={displayData.Text.language}
+                documentPath={selectedMatch.path}
+                semanticReady={semanticReady}
+                generationReady={generationReady}
               />
             ) : displayData && "Text" in displayData ? (
               <CodeViewer

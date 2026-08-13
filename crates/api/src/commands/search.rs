@@ -12,7 +12,7 @@ use wilkes_core::generate::Generator;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::search::grep::GrepSearchProvider;
 use wilkes_core::search::semantic::SemanticSearchProvider;
-use wilkes_core::search::SearchProvider;
+use wilkes_core::search::{SearchOutcome, SearchProvider};
 use wilkes_core::types::{
     FileMatches, IndexingConfig, RetrievalSettings, SearchLogStatus, SearchMode, SearchQuery,
     SearchStats,
@@ -21,7 +21,7 @@ use wilkes_core::types::{
 /// Handle to a running search. Dropping the handle cancels the search.
 pub struct SearchHandle {
     pub rx: mpsc::Receiver<FileMatches>,
-    worker: JoinHandle<Vec<String>>,
+    worker: JoinHandle<SearchOutcome>,
     log: Option<SearchLogTracker>,
     metadata: Option<SearchMetadata>,
 }
@@ -67,14 +67,19 @@ impl SearchHandle {
     /// Wait for the worker to finish and return any non-fatal errors it collected.
     /// Must only be called after `next()` has returned `None`.
     pub async fn finish(mut self) -> Vec<String> {
-        let errors = self.worker.await.unwrap_or_else(|e| {
+        let outcome = self.worker.await.unwrap_or_else(|e| {
             error!("search worker panicked: {e}");
-            vec![format!("search worker panicked: {e}")]
+            vec![format!("search worker panicked: {e}")].into()
         });
         if let Some(log) = &mut self.log {
-            log.finish(SearchLogStatus::Completed, 0, 0, errors.first().cloned());
+            log.finish(
+                SearchLogStatus::Completed,
+                0,
+                0,
+                outcome.errors.first().cloned(),
+            );
         }
-        errors
+        outcome.errors
     }
 
     /// Consumes the search stream, executing `on_result` for each match.
@@ -100,26 +105,32 @@ impl SearchHandle {
             }
         }
 
-        let errors = self.worker.await.unwrap_or_else(|e| {
+        let outcome = self.worker.await.unwrap_or_else(|e| {
             error!("search worker panicked: {e}");
-            vec![format!("search worker panicked: {e}")]
+            vec![format!("search worker panicked: {e}")].into()
         });
         let elapsed_ms = started.elapsed().as_millis() as u64;
         if let Some(log) = &mut self.log {
-            let status = if errors.iter().any(|error| {
+            let status = if outcome.errors.iter().any(|error| {
                 error.starts_with("search failed:") || error.contains("worker panicked")
             }) {
                 SearchLogStatus::Failed
             } else {
                 SearchLogStatus::Completed
             };
-            log.finish(status, total_matches, elapsed_ms, errors.first().cloned());
+            log.finish(
+                status,
+                total_matches,
+                elapsed_ms,
+                outcome.errors.first().cloned(),
+            );
         }
         SearchStats {
             files_scanned,
             total_matches,
             elapsed_ms,
-            errors,
+            errors: outcome.errors,
+            hyde_documents: outcome.hyde_documents,
         }
     }
 }
@@ -166,7 +177,8 @@ pub fn start_search(
                 _ => {
                     return vec![
                         "Semantic search requires a loaded embedder and built index".into()
-                    ];
+                    ]
+                    .into();
                 }
             },
             SearchMode::Grep => {
@@ -183,7 +195,7 @@ pub fn start_search(
 
         provider
             .search(&query, &registry, tx, eligible_paths.as_ref())
-            .unwrap_or_else(|e| vec![format!("search failed: {e:#}")])
+            .unwrap_or_else(|e| vec![format!("search failed: {e:#}")].into())
     });
 
     SearchHandle {
@@ -242,7 +254,7 @@ mod tests {
         .await
         .unwrap();
         drop(tx);
-        let worker = tokio::spawn(async { Vec::new() });
+        let worker = tokio::spawn(async { SearchOutcome::default() });
         let mut handle = SearchHandle {
             rx,
             worker,
@@ -391,6 +403,29 @@ mod tests {
         assert_eq!(stats.files_scanned, 2);
         assert_eq!(stats.total_matches, 2);
         assert!(stats.errors.is_empty());
+        assert!(stats.hyde_documents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_handle_reports_hyde_documents_from_the_provider_outcome() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+        let worker = tokio::spawn(async {
+            SearchOutcome {
+                errors: Vec::new(),
+                hyde_documents: vec!["The exact generated passage.".to_string()],
+            }
+        });
+        let handle = SearchHandle {
+            rx,
+            worker,
+            log: None,
+            metadata: None,
+        };
+
+        let stats = handle.run(|_| async { true }).await;
+
+        assert_eq!(stats.hyde_documents, vec!["The exact generated passage."]);
     }
 
     #[tokio::test]

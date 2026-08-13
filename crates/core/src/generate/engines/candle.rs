@@ -22,6 +22,7 @@ use hf_hub::api::sync::ApiBuilder;
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 
+mod gemma3;
 mod protocol;
 mod weights;
 
@@ -148,6 +149,17 @@ pub const DEFAULT_GENERATOR_MODEL: &str = "unsloth/Qwen3-0.6B-GGUF";
 const LEGACY_GEMMA_WEIGHTS_FILE: &str = "gemma-3-1b-it-Q4_K_M.gguf";
 const LEGACY_GEMMA_WEIGHTS_REVISION: &str = "74e404523bcadb954d7c4e6e6a3a84f1d007568e";
 
+/// Bound the query dimension of non-flash attention during prompt ingestion.
+///
+/// A monolithic 32k prefill materializes an attention tensor proportional to
+/// `heads * prompt_len * prompt_len`; that can exhaust a 16 GB unified-memory
+/// Mac before the OS can recover. Both supported decoder families accept a
+/// non-zero sequence offset and retain KV state, so the same logical prompt can
+/// be evaluated in bounded blocks. Keep this below Gemma 3's 512-token local
+/// attention window and small enough that the higher-head Qwen catalog entries
+/// remain bounded at the end of a 32k context.
+const PREFILL_CHUNK_TOKENS: usize = 128;
+
 fn find_model(model_id: &str) -> anyhow::Result<&'static GeneratorInfo> {
     GENERATOR_MODELS
         .iter()
@@ -255,13 +267,10 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<GeneratorDescriptor> {
         .map(|info| {
             let is_cached = resolve_artifacts(data_dir, info).is_ok();
             GeneratorDescriptor {
+                engine: GenerationEngine::Candle,
                 model_id: info.model_id.to_string(),
                 display_name: info.display_name.to_string(),
                 description: info.description.to_string(),
-                weights_file: info.weights_file.to_string(),
-                weights_revision: info.weights_revision.to_string(),
-                tokenizer_repo: info.tokenizer_repo.to_string(),
-                tokenizer_revision: info.tokenizer_revision.to_string(),
                 context_tokens: info.context_tokens,
                 is_cached,
                 is_default: info.model_id == DEFAULT_GENERATOR_MODEL,
@@ -647,6 +656,36 @@ fn before_first_stop<'a>(text: &'a str, stop_strings: &[String]) -> (&'a str, bo
     }
 }
 
+fn prefill_chunks(token_ids: &[u32]) -> impl Iterator<Item = (usize, &[u32])> {
+    token_ids
+        .chunks(PREFILL_CHUNK_TOKENS)
+        .scan(0, |offset, chunk| {
+            let chunk_offset = *offset;
+            *offset += chunk.len();
+            Some((chunk_offset, chunk))
+        })
+}
+
+fn output_token_budget(
+    prompt_tokens: usize,
+    context_tokens: usize,
+    requested_limit: Option<usize>,
+) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        prompt_tokens < context_tokens,
+        "prompt of {prompt_tokens} tokens leaves no room in the {context_tokens} token context"
+    );
+    // The decoder forwards each emitted token to prepare the next step, so
+    // preserve one context position beyond the prompt and output budget.
+    let available = context_tokens - prompt_tokens - 1;
+    let budget = requested_limit.unwrap_or(available);
+    anyhow::ensure!(
+        budget <= available,
+        "prompt of {prompt_tokens} tokens plus {budget} new tokens exceeds the {context_tokens} token context"
+    );
+    Ok(budget)
+}
+
 impl Generator for CandleGenerator {
     fn generate_stream(
         &self,
@@ -669,13 +708,8 @@ impl Generator for CandleGenerator {
             .map_err(anyhow::Error::msg)?
             .get_ids()
             .to_vec();
-        anyhow::ensure!(
-            prompt_ids.len() + req.max_tokens < self.context_tokens,
-            "prompt of {} tokens plus {} new tokens exceeds the {} token context",
-            prompt_ids.len(),
-            req.max_tokens,
-            self.context_tokens
-        );
+        let max_tokens =
+            output_token_budget(prompt_ids.len(), self.context_tokens, req.max_tokens)?;
 
         let mut model = self
             .model
@@ -690,13 +724,40 @@ impl Generator for CandleGenerator {
         let mut streamed = String::new();
         let mut stop = StopReason::MaxTokens;
 
-        let input = Tensor::new(prompt_ids.as_slice(), &model.device)?.unsqueeze(0)?;
-        let mut logits = model.weights.forward(&input, 0)?.squeeze(0)?;
-        let mut offset = prompt_ids.len();
+        tracing::info!(
+            model = self.model_id,
+            prompt_tokens = prompt_ids.len(),
+            prefill_chunk_tokens = PREFILL_CHUNK_TOKENS,
+            prefill_chunks = prompt_ids.len().div_ceil(PREFILL_CHUNK_TOKENS),
+            synchronize_each_chunk = true,
+            "starting bounded generation prefill"
+        );
+        let mut logits = None;
+        let mut offset = 0;
+        for (chunk_offset, chunk) in prefill_chunks(&prompt_ids) {
+            debug_assert_eq!(chunk_offset, offset);
+            let input = Tensor::new(chunk, &model.device)?.unsqueeze(0)?;
+            logits = Some(model.weights.forward(&input, chunk_offset)?.squeeze(0)?);
+            // Metal retains resources referenced by an uncommitted command
+            // buffer. Waiting here is what makes the tensor-shape bound a
+            // real peak-memory bound rather than merely a smaller series of
+            // allocations that remain live together until sampling.
+            model.device.synchronize()?;
+            offset += chunk.len();
+        }
+        let mut logits = logits.ok_or_else(|| {
+            candle_core::Error::Msg("generation prompt tokenized to an empty sequence".to_string())
+        })?;
         let prompt_elapsed = prompt_started.elapsed();
+        tracing::info!(
+            model = self.model_id,
+            prompt_tokens = prompt_ids.len(),
+            prompt_micros = micros(prompt_elapsed),
+            "bounded generation prefill completed"
+        );
         let decode_started = Instant::now();
 
-        for _ in 0..req.max_tokens {
+        for _ in 0..max_tokens {
             if let Some((penalty, window)) = req.sampling.repeat_penalty {
                 if penalty != 1.0 && !emitted_ids.is_empty() {
                     let start = emitted_ids.len().saturating_sub(window);
@@ -775,14 +836,24 @@ impl Generator for CandleGenerator {
 
         let visible = self.family.visible_text(&raw);
         let (text, _) = before_first_stop(visible, &stop_strings);
-        *self
-            .last_timings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(GenerationTimings {
+        let timings = GenerationTimings {
             prompt_micros: micros(prompt_elapsed),
             decode_micros: micros(decode_started.elapsed()),
             constraint_micros: micros(constraint_elapsed),
-        });
+        };
+        *self
+            .last_timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(timings.clone());
+
+        tracing::info!(
+            model = self.model_id,
+            prompt_tokens = prompt_ids.len(),
+            generated_tokens = emitted_ids.len(),
+            stop = ?stop,
+            timings = ?timings,
+            "bounded generation completed"
+        );
 
         Ok(Generated {
             text: text.trim().to_string(),
@@ -847,9 +918,8 @@ pub fn load_generator(
                 .context("dense Gemma is missing config.json")?;
             let config_text = std::fs::read_to_string(config_path)
                 .with_context(|| format!("Failed to read {}", config_path.display()))?;
-            let config: candle_transformers::models::gemma3::Config =
-                serde_json::from_str(&config_text)
-                    .with_context(|| format!("Failed to parse {}", config_path.display()))?;
+            let config: gemma3::Config = serde_json::from_str(&config_text)
+                .with_context(|| format!("Failed to parse {}", config_path.display()))?;
             // The pinned checkpoint is BF16, but Candle 0.11's Metal BF16
             // execution becomes numerically unstable once Gemma's rotating
             // cache is full. FP16 preserves the dense 2-byte footprint and
@@ -869,10 +939,9 @@ pub fn load_generator(
                     artifacts.weights_path.display()
                 )
             })?;
-            let dense = candle_transformers::models::gemma3::Model::new(false, &config, vb)
-                .map_err(|error| {
-                    anyhow::anyhow!("Failed to load dense Gemma 3 weights: {error:#}")
-                })?;
+            let dense = gemma3::Model::new(false, &config, vb).map_err(|error| {
+                anyhow::anyhow!("Failed to load dense Gemma 3 weights: {error:#}")
+            })?;
             DecoderWeights::from_dense_gemma(dense)
         }
     };
@@ -1095,6 +1164,45 @@ mod tests {
     #[test]
     fn dense_gemma_uses_a_cpu_supported_dtype() {
         assert_eq!(dense_gemma_dtype(&Device::Cpu), DType::F32);
+    }
+
+    #[test]
+    fn long_prefills_are_contiguous_and_never_exceed_the_memory_bound() {
+        let token_ids = (0..32_768_u32).collect::<Vec<_>>();
+        let chunks = prefill_chunks(&token_ids).collect::<Vec<_>>();
+
+        assert_eq!(chunks.len(), token_ids.len().div_ceil(PREFILL_CHUNK_TOKENS));
+        assert!(PREFILL_CHUNK_TOKENS <= 512);
+        assert!(chunks
+            .iter()
+            .all(|(_, chunk)| !chunk.is_empty() && chunk.len() <= PREFILL_CHUNK_TOKENS));
+
+        let mut next_offset = 0;
+        let mut rebuilt = Vec::with_capacity(token_ids.len());
+        for (offset, chunk) in chunks {
+            assert_eq!(offset, next_offset);
+            rebuilt.extend_from_slice(chunk);
+            next_offset += chunk.len();
+        }
+        assert_eq!(next_offset, token_ids.len());
+        assert_eq!(rebuilt, token_ids);
+    }
+
+    #[test]
+    fn empty_prefill_produces_no_decoder_blocks() {
+        assert_eq!(prefill_chunks(&[]).count(), 0);
+    }
+
+    #[test]
+    fn unlimited_output_uses_the_remaining_context_capacity() {
+        assert_eq!(output_token_budget(300, 1_000, None).unwrap(), 699);
+    }
+
+    #[test]
+    fn explicit_output_limits_remain_bounded_by_context_capacity() {
+        assert_eq!(output_token_budget(300, 1_000, Some(120)).unwrap(), 120);
+        assert!(output_token_budget(900, 1_000, Some(100)).is_err());
+        assert!(output_token_budget(1_000, 1_000, None).is_err());
     }
 
     #[test]

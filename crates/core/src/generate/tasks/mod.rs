@@ -4,6 +4,9 @@
 
 pub mod cluster_label;
 pub mod document_summary;
+pub mod grounded_completion;
+pub mod hypothetical_continuation;
 pub mod hypothetical_document;
+pub(crate) mod prose;
 pub mod relation;
 pub mod search_results_summary;

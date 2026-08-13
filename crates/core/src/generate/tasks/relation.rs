@@ -38,7 +38,7 @@ pub fn build_request(anchor: &DocumentSummary, related: &DocumentSummary) -> Gen
     GenerationRequest {
         system: None,
         prompt,
-        max_tokens: MAX_TOKENS,
+        max_tokens: Some(MAX_TOKENS),
         // Free text rather than a grammar, and the reason cuts against the
         // cluster label: a label has a shape worth enforcing, an explanatory
         // sentence does not. The newline stop is the whole contract — the model
@@ -140,7 +140,7 @@ mod tests {
             }
         );
         assert_eq!(request.sampling, Sampling::default());
-        assert_eq!(request.max_tokens, MAX_TOKENS);
+        assert_eq!(request.max_tokens, Some(MAX_TOKENS));
     }
 
     #[test]

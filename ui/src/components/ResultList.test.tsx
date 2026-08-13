@@ -162,6 +162,38 @@ describe("ResultList", () => {
     expect(screen.getByPlaceholderText("Filter files...")).toBeInTheDocument();
   });
 
+  it("discloses every HyDE passage used for semantic search", () => {
+    useSearchStore.setState({
+      hasQuery: true,
+      results: [],
+      stats: {
+        files_scanned: 0,
+        total_matches: 0,
+        elapsed_ms: 8,
+        errors: [],
+        hyde_documents: [
+          "First exact hypothetical passage.",
+          "Second exact hypothetical passage.",
+        ],
+      },
+    });
+
+    renderWithToasts();
+
+    expect(screen.getByText("HyDE")).toBeInTheDocument();
+    expect(screen.queryByText("First exact hypothetical passage.")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show HyDE passages" }));
+
+    expect(
+      screen.getByRole("region", { name: "HyDE passages used for search" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("First exact hypothetical passage.")).toBeInTheDocument();
+    expect(screen.getByText("Second exact hypothetical passage.")).toBeInTheDocument();
+    expect(screen.getByText("Passage 1")).toBeInTheDocument();
+    expect(screen.getByText("Passage 2")).toBeInTheDocument();
+  });
+
   it("marks files that also belong to another configured nested root", () => {
     useSettingsStore.setState({
       directory: "/library",

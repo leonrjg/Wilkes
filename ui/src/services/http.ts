@@ -45,9 +45,28 @@ import type {
   ChunkTopicLabelled,
   GeneratorDescriptor,
   GenerationStreamEvent,
+  CompletionEvent,
+  CompletionFeedback,
+  CompletionRequest,
+  SessionSteering,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type { SearchApi, WebSourceApi } from "./api";
+
+async function responseError(response: Response, operation: string): Promise<Error> {
+  let detail = "";
+  try {
+    const body = await response.json() as { error?: string };
+    detail = body.error ?? "";
+  } catch {
+    // The status remains useful when a proxy returns a non-JSON error page.
+  }
+  return new Error(
+    detail
+      ? `${operation} failed: ${detail}`
+      : `${operation} failed: ${response.status}`,
+  );
+}
 
 export class HttpSearchApi implements SearchApi {
   private controllers = new Map<string, AbortController>();
@@ -623,7 +642,7 @@ export class HttpSearchApi implements SearchApi {
 
   async listGenerationModels(): Promise<GeneratorDescriptor[]> {
     const res = await fetch("/api/generation/models");
-    if (!res.ok) throw new Error(`listGenerationModels failed: ${res.status}`);
+    if (!res.ok) throw await responseError(res, "listGenerationModels");
     return res.json() as Promise<GeneratorDescriptor[]>;
   }
 
@@ -631,13 +650,13 @@ export class HttpSearchApi implements SearchApi {
     const res = await fetch(
       `/api/generation/models/size?model_id=${encodeURIComponent(modelId)}`,
     );
-    if (!res.ok) throw new Error(`getGenerationModelSize failed: ${res.status}`);
+    if (!res.ok) throw await responseError(res, "getGenerationModelSize");
     return res.json() as Promise<number>;
   }
 
   async loadGenerationModel(): Promise<boolean> {
     const res = await fetch("/api/generation/load", { method: "POST" });
-    if (!res.ok) throw new Error(`loadGenerationModel failed: ${res.status}`);
+    if (!res.ok) throw await responseError(res, "loadGenerationModel");
     return res.json() as Promise<boolean>;
   }
 
@@ -673,6 +692,65 @@ export class HttpSearchApi implements SearchApi {
       body: JSON.stringify({ request_id: requestId, input }),
     });
     if (!res.ok) throw new Error(`summarizeSearchResults failed: ${res.status}`);
+  }
+
+  async requestCompletion(completionId: string, request: CompletionRequest): Promise<void> {
+    const res = await fetch(`/api/completion/${encodeURIComponent(completionId)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+    });
+    if (!res.ok) throw await responseError(res, "requestCompletion");
+  }
+
+  async cancelCompletion(completionId: string): Promise<void> {
+    const res = await fetch(`/api/completion/${encodeURIComponent(completionId)}`, {
+      method: "DELETE",
+    });
+    if (!res.ok) throw await responseError(res, "cancelCompletion");
+  }
+
+  async completionFeedback(
+    completionId: string,
+    feedback: CompletionFeedback,
+  ): Promise<void> {
+    const res = await fetch(`/api/completion/${encodeURIComponent(completionId)}/feedback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ feedback }),
+    });
+    if (!res.ok) throw await responseError(res, "completionFeedback");
+  }
+
+  async getSessionSteering(): Promise<SessionSteering> {
+    const res = await fetch("/api/completion/session");
+    if (!res.ok) throw await responseError(res, "getSessionSteering");
+    return res.json() as Promise<SessionSteering>;
+  }
+
+  async resetSessionSteering(): Promise<void> {
+    const res = await fetch("/api/completion/session", { method: "DELETE" });
+    if (!res.ok) throw await responseError(res, "resetSessionSteering");
+  }
+
+  async saveDocument(path: string, text: string): Promise<void> {
+    const res = await fetch("/api/document/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, text }),
+    });
+    if (!res.ok) throw await responseError(res, "saveDocument");
+  }
+
+  async onCompletion(
+    completionId: string,
+    handler: (event: CompletionEvent) => void,
+  ): Promise<() => void> {
+    const eventName = `completion://${completionId}`;
+    const es = this.acquireEventSource();
+    const listener = (event: Event) => handler(JSON.parse((event as MessageEvent).data));
+    es.addEventListener(eventName, listener);
+    return () => this.releaseEventSource(eventName, listener);
   }
 
   async onBookmarkClusterLabelled(

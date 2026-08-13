@@ -13,6 +13,7 @@ import { saveMarkdownViewMode } from "./preview/textScrollMemory";
 
 const mockCodeViewer = vi.fn(() => <div data-testid="code-viewer">CodeViewer</div>);
 vi.mock("./preview/CodeViewer", () => ({ default: (props: any) => mockCodeViewer(props) }));
+vi.mock("./DocumentEditor", () => ({ default: () => <div data-testid="document-editor">DocumentEditor</div> }));
 
 const mockMarkdownViewer = vi.fn(() => <div data-testid="markdown-viewer">MarkdownViewer</div>);
 vi.mock("./preview/MarkdownViewer", () => ({ default: (props: any) => mockMarkdownViewer(props) }));

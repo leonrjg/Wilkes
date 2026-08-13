@@ -1,7 +1,9 @@
 import { useEffect, useRef } from "react";
-import { X } from "react-feather";
-import { useViewerStore } from "../stores/useViewerStore";
+import { Paperclip, X } from "react-feather";
+import { useViewerStore, type ViewerTab } from "../stores/useViewerStore";
+import { useEditorStore } from "../stores/useEditorStore";
 import { fileName } from "./DocumentEntryRow";
+import { ContextMenu, useContextMenu } from "./ContextMenu";
 import { Tooltip } from "./Tooltip";
 
 export default function ViewerTabs() {
@@ -9,6 +11,8 @@ export default function ViewerTabs() {
   const activeTabId = useViewerStore((state) => state.activeTabId);
   const activateTab = useViewerStore((state) => state.activateTab);
   const closeTab = useViewerStore((state) => state.closeTab);
+  const activeEditorPath = useEditorStore((state) => state.activeEditorPath);
+  const { menu, openMenu, closeMenu } = useContextMenu<ViewerTab>();
   const tabRefs = useRef(new Map<string, HTMLButtonElement>());
 
   useEffect(() => {
@@ -42,24 +46,47 @@ export default function ViewerTabs() {
   };
 
   return (
-    <div
-      role="tablist"
-      aria-label="Open documents"
-      className="flex min-h-9 flex-shrink-0 items-end overflow-x-auto border-b border-[var(--border-main)] bg-[var(--bg-sidebar)] custom-scrollbar"
-    >
-      {tabs.map((tab, index) => {
-        const active = tab.id === activeTabId;
-        const name = fileName(tab.path);
-        return (
-          <div
-            key={tab.id}
-            className={[
-              "group flex h-9 min-w-[8rem] max-w-[14rem] flex-shrink-0 items-center border-r border-t-2 border-[var(--border-main)]",
-              active
-                ? "border-t-[var(--accent-blue)] bg-[var(--bg-app)] text-[var(--text-main)]"
-                : "border-t-transparent bg-[var(--bg-sidebar)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)]",
-            ].join(" ")}
-          >
+    <>
+      <div
+        role="tablist"
+        aria-label="Open documents"
+        className="flex min-h-9 flex-shrink-0 items-end overflow-x-auto border-b border-[var(--border-main)] bg-[var(--bg-sidebar)] custom-scrollbar"
+      >
+        {tabs.map((tab, index) => {
+          const active = tab.id === activeTabId;
+          const name = fileName(tab.path);
+          return (
+            <div
+              key={tab.id}
+              onContextMenu={(event) => {
+                if (!activeEditorPath || tab.path === activeEditorPath) return;
+                const pinned =
+                  useEditorStore
+                    .getState()
+                    .buffers[activeEditorPath]?.scope.pinned.includes(tab.path) ?? false;
+                openMenu({
+                  event,
+                  target: tab,
+                  items: [
+                    {
+                      id: "pin-completion-context",
+                      label: pinned
+                        ? "Unpin from completion context"
+                        : "Pin to completion context",
+                      icon: Paperclip,
+                      run: () =>
+                        useEditorStore.getState().togglePin(activeEditorPath, tab.path),
+                    },
+                  ],
+                });
+              }}
+              className={[
+                "group flex h-9 min-w-[8rem] max-w-[14rem] flex-shrink-0 items-center border-r border-t-2 border-[var(--border-main)]",
+                active
+                  ? "border-t-[var(--accent-blue)] bg-[var(--bg-app)] text-[var(--text-main)]"
+                  : "border-t-transparent bg-[var(--bg-sidebar)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)]",
+              ].join(" ")}
+            >
             <Tooltip content={tab.path} className="min-w-0 flex-1">
               <button
                 ref={(node) => {
@@ -118,9 +145,11 @@ export default function ViewerTabs() {
                 <X size={12} />
               </button>
             </Tooltip>
-          </div>
-        );
-      })}
-    </div>
+            </div>
+          );
+        })}
+      </div>
+      <ContextMenu menu={menu} onClose={closeMenu} />
+    </>
   );
 }
