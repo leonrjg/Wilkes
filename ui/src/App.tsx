@@ -8,6 +8,7 @@ import BookmarksPane from "./components/BookmarksPane";
 import ChatPane from "./components/ChatPane";
 import TopicCloudPane from "./components/TopicCloudPane";
 import DirectoryPicker from "./components/DirectoryPicker";
+import WorkspacePicker from "./components/WorkspacePicker";
 import UploadZone from "./components/UploadZone";
 import SettingsModal from "./components/SettingsModal";
 import { useToasts } from "./components/Toast";
@@ -18,6 +19,7 @@ import { useBookmarksStore } from "./stores/useBookmarksStore";
 import { useChatStore } from "./stores/useChatStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useTopicsStore } from "./stores/useTopicsStore";
+import { useWorkspaceStore } from "./stores/useWorkspaceStore";
 import { activeViewerTab, useViewerStore } from "./stores/useViewerStore";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
 import { api, source, isTauri } from "./services";
@@ -29,6 +31,8 @@ export default function App() {
   const { addToast } = useToasts();
 
   const loadSettings = useSettingsStore((s) => s.load);
+  const loadWorkspaces = useWorkspaceStore((s) => s.load);
+  const workspaceSwitching = useWorkspaceStore((s) => s.switching);
   const loadBookmarks = useBookmarksStore((s) => s.load);
   const openBookmarksPane = useBookmarksStore((s) => s.openPane);
   const closeBookmarksPane = useBookmarksStore((s) => s.closePane);
@@ -83,9 +87,11 @@ export default function App() {
   } | null>(null);
 
   useEffect(() => {
-    loadSettings().then(restoreViewerSession).catch(() => {});
-    loadBookmarks().catch(() => {});
-  }, [loadSettings, loadBookmarks, restoreViewerSession]);
+    loadWorkspaces()
+      .then(() => Promise.all([loadSettings(), loadBookmarks()]))
+      .then(() => restoreViewerSession())
+      .catch(console.error);
+  }, [loadWorkspaces, loadSettings, loadBookmarks, restoreViewerSession]);
 
   useEffect(() => {
     setFileFilterText("");
@@ -267,8 +273,7 @@ export default function App() {
     [renameDirectory, remapViewerPathPrefix],
   );
 
-  const sourceSlot =
-    source.type === "desktop" ? (
+  const rootPicker = source.type === "desktop" ? (
       <DirectoryPicker
         directory={directory}
         favorites={favorites}
@@ -286,6 +291,12 @@ export default function App() {
         onRootChange={setDirectory}
       />
     );
+  const sourceSlot = (
+    <div className="flex min-w-0 flex-1 items-center gap-1">
+      <WorkspacePicker />
+      {rootPicker}
+    </div>
+  );
 
   const handleChatButtonClick = () => {
     if (chatPaneOpen) {
@@ -501,7 +512,16 @@ export default function App() {
   ) : null;
 
   return (
-    <div className="flex flex-col h-screen min-h-0 overflow-hidden bg-[var(--bg-app)] text-[var(--text-main)]">
+    <div
+      aria-busy={workspaceSwitching}
+      className="relative flex flex-col h-screen min-h-0 overflow-hidden bg-[var(--bg-app)] text-[var(--text-main)]"
+    >
+      {workspaceSwitching && (
+        <div
+          aria-label="Switching workspace"
+          className="absolute inset-0 z-[100] cursor-wait"
+        />
+      )}
       <SearchBar sourceSlot={sourceSlot} settingsSlot={settingsSlot} />
 
       <div className="flex flex-1 min-h-0 overflow-hidden">

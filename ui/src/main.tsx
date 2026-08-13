@@ -4,12 +4,15 @@ import "./styles.css";
 import App from "./App";
 import { ToastProvider } from "./components/Toast";
 import GlobalErrorReporter from "./components/GlobalErrorReporter";
+import StartupGate from "./components/StartupGate";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <ToastProvider>
       <GlobalErrorReporter />
-      <App />
+      <StartupGate>
+        <App />
+      </StartupGate>
     </ToastProvider>
   </StrictMode>,
 );

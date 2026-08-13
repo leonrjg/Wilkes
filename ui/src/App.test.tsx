@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import App from "./App";
 import { useSettingsStore } from "./stores/useSettingsStore";
@@ -21,6 +21,12 @@ vi.mock("./services", () => ({
     onFileListChanged: vi.fn(() => Promise.resolve(() => {})),
     onBookmarkClusterLabelled: vi.fn(() => Promise.resolve(() => {})),
     onChunkTopicLabelled: vi.fn(() => Promise.resolve(() => {})),
+    listWorkspaces: vi.fn(() => Promise.resolve({
+      active_workspace_id: "workspace-1",
+      workspaces: [{ id: "workspace-1", name: "Default", roots: [], active_root: "/test/dir" }],
+    })),
+    listTags: vi.fn(() => Promise.resolve([])),
+    listSmartCollections: vi.fn(() => Promise.resolve([])),
     isGenerationReady: vi.fn(() => Promise.resolve(false)),
     getSettings: vi.fn(() => Promise.resolve({
       favorites: [],
@@ -172,7 +178,7 @@ describe("App", () => {
       </ToastProvider>,
     );
 
-    expect(loadSettings).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(loadSettings).toHaveBeenCalledTimes(1));
     expect(restoreSession).not.toHaveBeenCalled();
 
     await act(async () => finishSettings?.());

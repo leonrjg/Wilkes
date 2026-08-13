@@ -11,6 +11,9 @@ import type {
 import { useSettingsStore } from "./useSettingsStore";
 
 export const VIEWER_SESSION_STORAGE_KEY = "wilkes.viewer-session";
+let activeViewerWorkspaceId = "default";
+const workspaceStorageName = (name: string) =>
+  activeViewerWorkspaceId === "default" ? name : `${name}.${activeViewerWorkspaceId}`;
 const VIEWER_SESSION_VERSION = 1;
 const MAX_PERSISTED_HISTORY_PER_TAB = 100;
 
@@ -46,6 +49,7 @@ interface ViewerStore {
   sessionHydrated: boolean;
 
   restoreSession: () => Promise<void>;
+  switchWorkspace: (workspaceId: string) => Promise<void>;
   openMatch: (match: MatchRef) => void;
   openFile: (path: string) => void;
   activateTab: (id: string) => void;
@@ -320,7 +324,7 @@ function persistedTab(tab: ViewerTab): PersistedViewerTab {
 const viewerSessionStorage: StateStorage = {
   getItem: (name) => {
     try {
-      return localStorage.getItem(name);
+      return localStorage.getItem(workspaceStorageName(name));
     } catch (error) {
       console.error("Could not read the viewer session:", error);
       return null;
@@ -328,14 +332,14 @@ const viewerSessionStorage: StateStorage = {
   },
   setItem: (name, value) => {
     try {
-      localStorage.setItem(name, value);
+      localStorage.setItem(workspaceStorageName(name), value);
     } catch (error) {
       console.error("Could not persist the viewer session:", error);
     }
   },
   removeItem: (name) => {
     try {
-      localStorage.removeItem(name);
+      localStorage.removeItem(workspaceStorageName(name));
     } catch (error) {
       console.error("Could not clear the viewer session:", error);
     }
@@ -363,6 +367,23 @@ export const useViewerStore = create<ViewerStore>()(
           restorePromise = null;
         });
         return restorePromise;
+      },
+
+      switchWorkspace: async (workspaceId) => {
+        let persisted: unknown = null;
+        try {
+          const raw = localStorage.getItem(`${VIEWER_SESSION_STORAGE_KEY}.${workspaceId}`);
+          persisted = raw ? (JSON.parse(raw) as { state?: unknown }).state : null;
+        } catch (error) {
+          console.error("Could not read the workspace viewer session:", error);
+        }
+        activeViewerWorkspaceId = workspaceId;
+        useViewerStore.setState({
+          ...restorePersistedState(persisted),
+          sessionHydrated: true,
+        });
+        const activeTabId = useViewerStore.getState().activeTabId;
+        if (activeTabId) ensureTabLoaded(activeTabId);
       },
 
       openMatch: (match) => {

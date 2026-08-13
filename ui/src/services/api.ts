@@ -50,6 +50,9 @@ import type {
   CompletionFeedback,
   CompletionRequest,
   SessionSteering,
+  WorkspaceState,
+  WorkspaceSummary,
+  StartupStatus,
 } from "../lib/types";
 
 export interface DataPaths {
@@ -58,6 +61,7 @@ export interface DataPaths {
 
 // Shared across desktop and web. All methods are identical.
 export interface SearchApi {
+  getStartupStatus(): Promise<StartupStatus>;
   search(
     query: SearchQuery,
     onResult: (fm: FileMatches) => void,
@@ -69,6 +73,10 @@ export interface SearchApi {
   preview(matchRef: MatchRef): Promise<PreviewData>;
   getSettings(): Promise<Settings>;
   updateSettings(patch: Partial<Settings>): Promise<Settings>;
+  listWorkspaces(): Promise<WorkspaceState>;
+  createWorkspace(name: string): Promise<WorkspaceSummary>;
+  renameWorkspace(workspaceId: string, name: string): Promise<WorkspaceSummary>;
+  switchWorkspace(workspaceId: string): Promise<WorkspaceState>;
   /** Desktop-only lifecycle controls for the opt-in external MCP endpoint. */
   getExternalMcpStatus?(): Promise<ExternalMcpStatus>;
   /** Desktop-only live viewer context exposed by the external MCP endpoint. */

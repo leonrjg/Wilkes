@@ -62,6 +62,8 @@ use wilkes_core::worker::manager::{
 };
 
 use crate::commands::search::{start_search, SearchHandle};
+use crate::commands::settings::{get_scoped_settings, update_scoped_settings};
+#[cfg(test)]
 use crate::commands::settings::{get_settings, update_settings};
 use crate::research::{CachedBookmarkEmbedding, ResearchStore, SearchLogTracker};
 
@@ -355,8 +357,12 @@ struct CompletionOperation {
 /// the server (axum) create exactly one `Arc<AppContext>` and delegate all
 /// business operations to it.
 pub struct AppContext {
+    /// Workspace-owned databases and conversation persistence.
     pub data_dir: PathBuf,
+    /// Shared model downloads, Python environment, and other installation data.
+    pub shared_data_dir: PathBuf,
     pub settings_path: PathBuf,
+    pub workspace_path: PathBuf,
     pub bookmarks_path: PathBuf,
     embedder: PLMutex<Option<Arc<dyn Embedder>>>,
     index: PLMutex<Arc<Mutex<Option<SemanticIndex>>>>,
@@ -420,12 +426,37 @@ impl AppContext {
         mpsc::Receiver<ManagerEvent>,
         impl std::future::Future<Output = ()> + Send,
     ) {
+        Self::new_scoped(
+            data_dir.clone(),
+            data_dir,
+            settings_path.clone(),
+            settings_path,
+            paths,
+            events,
+        )
+    }
+
+    pub fn new_scoped(
+        data_dir: PathBuf,
+        shared_data_dir: PathBuf,
+        settings_path: PathBuf,
+        workspace_path: PathBuf,
+        paths: WorkerPaths,
+        events: Arc<dyn EventEmitter>,
+    ) -> (
+        Arc<Self>,
+        mpsc::Receiver<ManagerEvent>,
+        impl std::future::Future<Output = ()> + Send,
+    ) {
         let (worker_manager, event_rx, loop_fut) = WorkerManager::new(paths.clone());
         let (generate_manager, generate_event_rx, generate_loop_fut) = WorkerManager::new(paths);
+        let bookmarks_path = data_dir.join("bookmarks.json");
         let ctx = Arc::new(Self {
             data_dir,
-            bookmarks_path: settings_path.with_file_name("bookmarks.json"),
+            shared_data_dir,
+            bookmarks_path,
             settings_path,
+            workspace_path,
             embedder: PLMutex::new(None),
             index: PLMutex::new(Arc::new(Mutex::new(None))),
             metadata_cache: PLMutex::new(None),
@@ -518,7 +549,9 @@ impl AppContext {
     // ── Business Logic ────────────────────────────────────────────────────────
 
     pub async fn get_settings(&self) -> Settings {
-        get_settings(&self.settings_path).await.unwrap_or_default()
+        get_scoped_settings(&self.settings_path, &self.workspace_path)
+            .await
+            .unwrap_or_default()
     }
 
     pub async fn list_bookmarks(&self) -> anyhow::Result<Vec<Bookmark>> {
@@ -2236,7 +2269,7 @@ impl AppContext {
         F: FnOnce(SemanticSettings) -> SemanticSettings,
     {
         let _lock = self.settings_lock.lock().await;
-        let current = match get_settings(&self.settings_path).await {
+        let current = match get_scoped_settings(&self.settings_path, &self.workspace_path).await {
             Ok(s) => s,
             Err(e) => {
                 error!("update_semantic_settings: read: {e:#}");
@@ -2244,8 +2277,9 @@ impl AppContext {
             }
         };
         let semantic = f(current.semantic);
-        if let Err(e) = update_settings(
+        if let Err(e) = update_scoped_settings(
             &self.settings_path,
+            &self.workspace_path,
             serde_json::json!({ "semantic": semantic }),
         )
         .await
@@ -2308,8 +2342,11 @@ impl AppContext {
     ) -> anyhow::Result<wilkes_core::types::Settings> {
         let (before, updated) = {
             let _lock = self.settings_lock.lock().await;
-            let before = get_settings(&self.settings_path).await.unwrap_or_default();
-            let updated = update_settings(&self.settings_path, patch).await?;
+            let before = get_scoped_settings(&self.settings_path, &self.workspace_path)
+                .await
+                .unwrap_or_default();
+            let updated =
+                update_scoped_settings(&self.settings_path, &self.workspace_path, patch).await?;
             (before, updated)
         };
         self.on_directory_setting_maybe_changed(&before, &updated);
@@ -2698,7 +2735,8 @@ impl AppContext {
 
     pub async fn list_generation_models(&self) -> anyhow::Result<Vec<GeneratorDescriptor>> {
         let settings = self.generation_settings().await;
-        generate_dispatch::list_models(settings.engine, &self.data_dir, &settings.ollama_url).await
+        generate_dispatch::list_models(settings.engine, &self.shared_data_dir, &settings.ollama_url)
+            .await
     }
 
     pub async fn fetch_generation_model_size(&self, model_id: &str) -> anyhow::Result<u64> {
@@ -2755,7 +2793,7 @@ impl AppContext {
             model.clone(),
             self.generate_manager.clone(),
             Self::generation_device(&settings),
-            &self.data_dir,
+            &self.shared_data_dir,
             &settings.ollama_url,
             settings.context_tokens,
             progress_tx,
@@ -3966,7 +4004,7 @@ impl AppContext {
         plan: DownloadModelPlan,
         selected: SelectedEmbedder,
     ) -> JoinHandle<anyhow::Result<()>> {
-        let data_dir = self.data_dir.clone();
+        let data_dir = self.shared_data_dir.clone();
         let manager = self.worker_manager.clone();
         let ctx = Arc::clone(&self);
         let (progress_tx, progress_rx) = mpsc::channel::<EmbedProgress>(64);
@@ -4031,11 +4069,11 @@ impl AppContext {
     ) -> Result<(), String> {
         // Probe model dimensions by running install again (no-op if cached).
         let (probe_tx, _) = mpsc::channel(1);
-        if let Err(e) = installer.install(&self.data_dir, probe_tx).await {
+        if let Err(e) = installer.install(&self.shared_data_dir, probe_tx).await {
             return Err(format!("Failed to probe model dimensions: {e:#}"));
         }
 
-        match installer.build(&self.data_dir) {
+        match installer.build(&self.shared_data_dir) {
             Ok(embedder) => {
                 *self.embedder.lock() = Some(embedder);
                 Ok(())
@@ -4315,16 +4353,16 @@ impl AppContext {
         installer: Arc<dyn EmbedderInstaller>,
     ) -> Option<Arc<dyn Embedder>> {
         let (probe_tx, _) = tokio::sync::mpsc::channel(1);
-        if let Err(err) = installer.install(&self.data_dir, probe_tx).await {
+        if let Err(err) = installer.install(&self.shared_data_dir, probe_tx).await {
             error!("restore_state: install probe failed: {err:#}");
             return None;
         }
-        if !installer.is_available(&self.data_dir) {
+        if !installer.is_available(&self.shared_data_dir) {
             info!("restore_state: model files absent, skipping");
             return None;
         }
 
-        let data_dir = self.data_dir.clone();
+        let data_dir = self.shared_data_dir.clone();
         match tokio::task::spawn_blocking(move || installer.build(&data_dir)).await {
             Ok(Ok(embedder)) => Some(embedder),
             Ok(Err(err)) => {
@@ -4397,7 +4435,7 @@ impl AppContext {
     /// Reload the embedder and index from disk if they were previously built,
     /// and restart the filesystem watcher. Run this once after `new`.
     pub async fn restore_state(self: Arc<Self>) {
-        let settings = match get_settings(&self.settings_path).await {
+        let settings = match get_scoped_settings(&self.settings_path, &self.workspace_path).await {
             Ok(s) => s,
             Err(e) => {
                 error!("restore_state: read settings: {e:#}");

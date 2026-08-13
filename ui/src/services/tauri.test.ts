@@ -20,6 +20,12 @@ describe("TauriSearchApi", () => {
     api = new TauriSearchApi();
   });
 
+  it("reads generic startup status before the app runtime is used", async () => {
+    (invoke as any).mockResolvedValue({ blockers: [] });
+    await expect(api.getStartupStatus()).resolves.toEqual({ blockers: [] });
+    expect(invoke).toHaveBeenCalledWith("get_startup_status");
+  });
+
   it("should call invoke for getSettings", async () => {
     (invoke as any).mockResolvedValue({ theme: "Dark" });
     const settings = await api.getSettings();
@@ -32,6 +38,24 @@ describe("TauriSearchApi", () => {
     (invoke as any).mockResolvedValue({ theme: "Light" });
     await api.updateSettings(patch);
     expect(invoke).toHaveBeenCalledWith("update_settings", { patch });
+  });
+
+  it("manages workspaces through dedicated commands", async () => {
+    (invoke as any).mockResolvedValue({ active_workspace_id: "a", workspaces: [] });
+    await api.listWorkspaces();
+    expect(invoke).toHaveBeenLastCalledWith("list_workspaces");
+
+    await api.createWorkspace("Second");
+    expect(invoke).toHaveBeenLastCalledWith("create_workspace", { name: "Second" });
+
+    await api.renameWorkspace("b", "Renamed");
+    expect(invoke).toHaveBeenLastCalledWith("rename_workspace", {
+      workspaceId: "b",
+      name: "Renamed",
+    });
+
+    await api.switchWorkspace("b");
+    expect(invoke).toHaveBeenLastCalledWith("switch_workspace", { workspaceId: "b" });
   });
 
   it("should configure the external MCP endpoint", async () => {

@@ -25,7 +25,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
+#[cfg(test)]
 use wilkes_api::context::AppContext;
+use wilkes_api::workspace::{WorkspaceManager, WorkspaceState, WorkspaceSummary};
 use wilkes_core::completion::{CompletionFeedback, CompletionRequest};
 use wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryInput;
 use wilkes_core::types::{
@@ -35,6 +37,7 @@ use wilkes_core::types::{
     RelatedDocumentsQuery, SearchLogEntry, SearchQuery, SelectedEmbedder, SemanticScholarPaper,
     SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
+#[cfg(test)]
 use wilkes_core::worker::manager::WorkerPaths;
 
 fn confine_to_uploads(
@@ -63,7 +66,7 @@ const MAX_UPLOAD_BYTES: u64 = 500 * 1024 * 1024;
 
 // ── AppState ──────────────────────────────────────────────────────────────────
 
-async fn shutdown_signal(ctx: Arc<AppContext>) {
+async fn shutdown_signal(workspaces: Arc<WorkspaceManager>) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -85,7 +88,7 @@ async fn shutdown_signal(ctx: Arc<AppContext>) {
         _ = terminate => {}
     }
 
-    ctx.shutdown().await;
+    workspaces.active().shutdown().await;
 }
 
 // ── Search ────────────────────────────────────────────────────────────────────
@@ -95,14 +98,14 @@ async fn search_handler(
     Json(mut query): Json<SearchQuery>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, (StatusCode, Json<ErrorBody>)> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+    let (ctx, uploads_dir) = state.workspace_snapshot();
     query.root = crate::http::state::confined_root_for_search(
         &query.root.to_string_lossy(),
-        &state.uploads_dir,
+        &uploads_dir,
         &TokioServerFs,
     )
     .await?;
 
-    let ctx = Arc::clone(&state.ctx);
     tokio::spawn(async move {
         forward_search_results(ctx, query, tx).await;
     });
@@ -114,14 +117,14 @@ async fn related_documents_handler(
     State(state): State<Arc<AppState>>,
     Json(mut query): Json<RelatedDocumentsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, uploads_dir) = state.workspace_snapshot();
     query.root = crate::http::state::confined_root_for_search(
         &query.root.to_string_lossy(),
-        &state.uploads_dir,
+        &uploads_dir,
         &TokioServerFs,
     )
     .await?;
-    let related = state
-        .ctx
+    let related = ctx
         .clone()
         .related_documents(query)
         .await
@@ -133,14 +136,14 @@ async fn citation_links_handler(
     State(state): State<Arc<AppState>>,
     Json(mut query): Json<CitationLinksQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, uploads_dir) = state.workspace_snapshot();
     query.root = crate::http::state::confined_root_for_search(
         &query.root.to_string_lossy(),
-        &state.uploads_dir,
+        &uploads_dir,
         &TokioServerFs,
     )
     .await?;
-    let links = state
-        .ctx
+    let links = ctx
         .clone()
         .citation_links(query)
         .await
@@ -171,7 +174,7 @@ async fn clear_logs_handler() -> StatusCode {
 }
 
 async fn get_data_paths_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let app_data = state.ctx.data_dir.display().to_string();
+    let app_data = state.context().data_dir.display().to_string();
     Json(wilkes_core::types::DataPaths { app_data })
 }
 
@@ -185,7 +188,7 @@ async fn get_python_info_handler() -> impl IntoResponse {
 async fn get_settings_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let settings = state.ctx.get_settings().await;
+    let settings = state.context().get_settings().await;
     Ok(Json(settings))
 }
 
@@ -194,18 +197,80 @@ async fn update_settings_handler(
     Json(patch): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     let settings = state
-        .ctx
+        .context()
         .update_settings(patch)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(settings))
 }
 
+#[derive(Deserialize)]
+struct WorkspaceNameBody {
+    name: String,
+}
+
+async fn list_workspaces_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<WorkspaceState>, (StatusCode, Json<ErrorBody>)> {
+    let manager = state
+        .workspaces
+        .as_ref()
+        .ok_or_else(|| server_err("Workspace manager is unavailable"))?;
+    manager
+        .state()
+        .map(Json)
+        .map_err(|error| server_err(error.to_string()))
+}
+
+async fn create_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<WorkspaceNameBody>,
+) -> Result<Json<WorkspaceSummary>, (StatusCode, Json<ErrorBody>)> {
+    let manager = state
+        .workspaces
+        .as_ref()
+        .ok_or_else(|| server_err("Workspace manager is unavailable"))?;
+    manager
+        .create(body.name)
+        .map(Json)
+        .map_err(|error| server_err(error.to_string()))
+}
+
+async fn rename_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(workspace_id): axum::extract::Path<String>,
+    Json(body): Json<WorkspaceNameBody>,
+) -> Result<Json<WorkspaceSummary>, (StatusCode, Json<ErrorBody>)> {
+    let manager = state
+        .workspaces
+        .as_ref()
+        .ok_or_else(|| server_err("Workspace manager is unavailable"))?;
+    manager
+        .rename(&workspace_id, body.name)
+        .map(Json)
+        .map_err(|error| server_err(error.to_string()))
+}
+
+async fn switch_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(workspace_id): axum::extract::Path<String>,
+) -> Result<Json<WorkspaceState>, (StatusCode, Json<ErrorBody>)> {
+    let manager = state
+        .workspaces
+        .as_ref()
+        .ok_or_else(|| server_err("Workspace manager is unavailable"))?;
+    manager
+        .switch(&workspace_id)
+        .await
+        .map(Json)
+        .map_err(|error| server_err(error.to_string()))
+}
+
 async fn list_bookmarks_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     let bookmarks = state
-        .ctx
+        .context()
         .list_bookmarks()
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -217,7 +282,7 @@ async fn add_bookmark_handler(
     Json(bookmark): Json<NewBookmark>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     let bookmark = state
-        .ctx
+        .context()
         .add_bookmark(bookmark)
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -229,7 +294,7 @@ async fn cluster_bookmarks_handler(
     Json(query): Json<BookmarkClustersQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     let clusters = state
-        .ctx
+        .context()
         .clone()
         .cluster_bookmarks(query)
         .await
@@ -248,20 +313,17 @@ async fn chunk_topics_handler(
     Json(body): Json<ChunkTopicsBody>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     let mut query = body.query;
+    let (ctx, uploads_dir) = state.workspace_snapshot();
     query.root = crate::http::state::confined_root_for_search(
         &query.root.to_string_lossy(),
-        &state.uploads_dir,
+        &uploads_dir,
         &TokioServerFs,
     )
     .await?;
     if let Some(path) = query.path.as_ref() {
-        query.path = Some(confine_to_uploads(
-            &path.to_string_lossy(),
-            &state.uploads_dir,
-        )?);
+        query.path = Some(confine_to_uploads(&path.to_string_lossy(), &uploads_dir)?);
     }
-    let topics = state
-        .ctx
+    let topics = ctx
         .clone()
         .chunk_topics(body.request_id, query)
         .await
@@ -273,7 +335,7 @@ async fn cancel_chunk_topics_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(request_id): axum::extract::Path<String>,
 ) -> StatusCode {
-    state.ctx.cancel_chunk_topics(&request_id);
+    state.context().cancel_chunk_topics(&request_id);
     StatusCode::NO_CONTENT
 }
 
@@ -282,7 +344,7 @@ async fn remove_bookmark_handler(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .remove_bookmark(&id)
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -300,7 +362,7 @@ async fn update_bookmark_note_handler(
     Json(body): Json<UpdateNoteBody>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     let bookmark = state
-        .ctx
+        .context()
         .update_bookmark_note(&id, body.note)
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -311,7 +373,7 @@ async fn list_tags_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<Tag>>, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .list_tags()
         .map(Json)
         .map_err(|e| server_err(e.to_string()))
@@ -322,7 +384,7 @@ async fn create_tag_handler(
     Json(tag): Json<NewTag>,
 ) -> Result<Json<Tag>, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .create_tag(tag)
         .map(Json)
         .map_err(|e| server_err(e.to_string()))
@@ -334,7 +396,7 @@ async fn update_tag_handler(
     Json(tag): Json<UpdateTag>,
 ) -> Result<Json<Tag>, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .update_tag(&id, tag)
         .map(Json)
         .map_err(|e| server_err(e.to_string()))
@@ -345,7 +407,7 @@ async fn delete_tag_handler(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .delete_tag(&id)
         .map_err(|e| server_err(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
@@ -355,14 +417,13 @@ async fn update_document_tags_handler(
     State(state): State<Arc<AppState>>,
     Json(mut update): Json<DocumentTagUpdate>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, uploads_dir) = state.workspace_snapshot();
     update.paths = update
         .paths
         .iter()
-        .map(|path| confine_to_uploads(&path.to_string_lossy(), &state.uploads_dir))
+        .map(|path| confine_to_uploads(&path.to_string_lossy(), &uploads_dir))
         .collect::<Result<Vec<_>, _>>()?;
-    state
-        .ctx
-        .update_document_tags(update)
+    ctx.update_document_tags(update)
         .map_err(|e| server_err(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -371,7 +432,7 @@ async fn list_collections_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<SmartCollection>>, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .list_collections()
         .map(Json)
         .map_err(|e| server_err(e.to_string()))
@@ -382,7 +443,7 @@ async fn create_collection_handler(
     Json(collection): Json<NewSmartCollection>,
 ) -> Result<Json<SmartCollection>, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .create_collection(collection)
         .map(Json)
         .map_err(|e| server_err(e.to_string()))
@@ -394,7 +455,7 @@ async fn update_collection_handler(
     Json(collection): Json<UpdateSmartCollection>,
 ) -> Result<Json<SmartCollection>, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .update_collection(&id, collection)
         .map(Json)
         .map_err(|e| server_err(e.to_string()))
@@ -405,7 +466,7 @@ async fn delete_collection_handler(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .delete_collection(&id)
         .map_err(|e| server_err(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
@@ -434,7 +495,7 @@ async fn list_search_log_handler(
     Query(query): Query<SearchLogQuery>,
 ) -> Result<Json<Vec<SearchLogEntry>>, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .list_search_log(query.limit.unwrap_or(100))
         .map(Json)
         .map_err(|e| server_err(e.to_string()))
@@ -445,7 +506,7 @@ async fn delete_search_log_handler(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .delete_search_log(&id)
         .map_err(|e| server_err(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
@@ -455,28 +516,28 @@ async fn clear_search_log_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .clear_search_log()
         .map_err(|e| server_err(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn is_semantic_ready_handler(State(state): State<Arc<AppState>>) -> Json<bool> {
-    Json(state.ctx.is_semantic_ready())
+    Json(state.context().is_semantic_ready())
 }
 
 /// The backend half of the gate. The UI gate prevents the request; this one
 /// makes the API honest if something calls it anyway — the server is reachable
 /// without the desktop UI, so neither is redundant with the other.
 async fn is_generation_ready_handler(State(state): State<Arc<AppState>>) -> Json<bool> {
-    Json(state.ctx.is_generation_ready().await)
+    Json(state.context().is_generation_ready().await)
 }
 
 async fn list_generation_models_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<wilkes_core::types::GeneratorDescriptor>>, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .list_generation_models()
         .await
         .map(Json)
@@ -493,7 +554,7 @@ async fn generation_model_size_handler(
     Query(query): Query<GenerationModelSizeQuery>,
 ) -> Result<Json<u64>, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .fetch_generation_model_size(&query.model_id)
         .await
         .map(Json)
@@ -504,7 +565,7 @@ async fn load_generation_model_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<bool>, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .load_generator()
         .await
         .map(|outcome| Json(outcome.attached()))
@@ -522,10 +583,10 @@ async fn explain_related_document_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ExplainRelatedBody>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    let anchor_path = confine_to_uploads(&body.anchor_path, &state.uploads_dir)?;
-    let related_path = confine_to_uploads(&body.path, &state.uploads_dir)?;
-    Arc::clone(&state.ctx)
-        .explain_related_document(body.request_id, anchor_path, related_path)
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let anchor_path = confine_to_uploads(&body.anchor_path, &uploads_dir)?;
+    let related_path = confine_to_uploads(&body.path, &uploads_dir)?;
+    ctx.explain_related_document(body.request_id, anchor_path, related_path)
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(server_err)
@@ -541,9 +602,9 @@ async fn summarize_document_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SummarizeDocumentBody>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
-    Arc::clone(&state.ctx)
-        .summarize_document(body.request_id, path)
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let path = confine_to_uploads(&body.path, &uploads_dir)?;
+    ctx.summarize_document(body.request_id, path)
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(server_err)
@@ -559,7 +620,8 @@ async fn summarize_search_results_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SummarizeSearchResultsBody>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    Arc::clone(&state.ctx)
+    state
+        .context()
         .summarize_search_results(body.request_id, body.input)
         .await
         .map(|()| StatusCode::NO_CONTENT)
@@ -571,21 +633,21 @@ async fn request_completion_handler(
     axum::extract::Path(completion_id): axum::extract::Path<String>,
     Json(mut request): Json<CompletionRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    request.path = confine_to_uploads(&request.path.to_string_lossy(), &state.uploads_dir)?;
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    request.path = confine_to_uploads(&request.path.to_string_lossy(), &uploads_dir)?;
     request.scope.pinned = request
         .scope
         .pinned
         .iter()
-        .map(|path| confine_to_uploads(&path.to_string_lossy(), &state.uploads_dir))
+        .map(|path| confine_to_uploads(&path.to_string_lossy(), &uploads_dir))
         .collect::<Result<Vec<_>, _>>()?;
     request.scope.excluded = request
         .scope
         .excluded
         .iter()
-        .map(|path| confine_to_uploads(&path.to_string_lossy(), &state.uploads_dir))
+        .map(|path| confine_to_uploads(&path.to_string_lossy(), &uploads_dir))
         .collect::<Result<Vec<_>, _>>()?;
-    Arc::clone(&state.ctx)
-        .request_completion(completion_id, request)
+    ctx.request_completion(completion_id, request)
         .await
         .map(|()| StatusCode::ACCEPTED)
         .map_err(server_err)
@@ -595,7 +657,7 @@ async fn cancel_completion_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(completion_id): axum::extract::Path<String>,
 ) -> StatusCode {
-    state.ctx.cancel_completion(&completion_id);
+    state.context().cancel_completion(&completion_id);
     StatusCode::NO_CONTENT
 }
 
@@ -610,7 +672,7 @@ async fn completion_feedback_handler(
     Json(body): Json<CompletionFeedbackBody>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .completion_feedback(&completion_id, body.feedback)
         .await
         .map(|()| StatusCode::NO_CONTENT)
@@ -620,11 +682,11 @@ async fn completion_feedback_handler(
 async fn session_steering_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<wilkes_core::completion::SessionSteering> {
-    Json(state.ctx.get_session_steering())
+    Json(state.context().get_session_steering())
 }
 
 async fn reset_session_steering_handler(State(state): State<Arc<AppState>>) -> StatusCode {
-    state.ctx.reset_session_steering();
+    state.context().reset_session_steering();
     StatusCode::NO_CONTENT
 }
 
@@ -638,10 +700,9 @@ async fn save_document_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SaveDocumentBody>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
-    state
-        .ctx
-        .save_document(path, body.text)
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let path = confine_to_uploads(&body.path, &uploads_dir)?;
+    ctx.save_document(path, body.text)
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(server_err)
@@ -661,7 +722,8 @@ async fn list_files_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<FilesQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let root = confine_to_uploads(&params.root, &state.uploads_dir)?;
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let root = confine_to_uploads(&params.root, &uploads_dir)?;
     let tag_ids = params
         .tag_ids
         .as_deref()
@@ -673,8 +735,7 @@ async fn list_files_handler(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let files = state
-        .ctx
+    let files = ctx
         .list_files_filtered(
             root,
             params.collection_id.as_deref(),
@@ -711,9 +772,9 @@ async fn open_file_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<OpenFileBody>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
-    let data = state
-        .ctx
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let path = confine_to_uploads(&body.path, &uploads_dir)?;
+    let data = ctx
         .open_file(path)
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -724,9 +785,9 @@ async fn rename_file_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RenameFileBody>,
 ) -> Result<Json<String>, (StatusCode, Json<ErrorBody>)> {
-    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
-    let new_path = state
-        .ctx
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let path = confine_to_uploads(&body.path, &uploads_dir)?;
+    let new_path = ctx
         .rename_file(path, body.new_name)
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -737,9 +798,9 @@ async fn get_file_metadata_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<OpenFileBody>,
 ) -> Result<Json<DocumentMetadata>, (StatusCode, Json<ErrorBody>)> {
-    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
-    let metadata = state
-        .ctx
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let path = confine_to_uploads(&body.path, &uploads_dir)?;
+    let metadata = ctx
         .get_file_metadata(path)
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -750,7 +811,7 @@ async fn zotero_status_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<IntegrationStatus>, (StatusCode, Json<ErrorBody>)> {
     let status = state
-        .ctx
+        .context()
         .zotero_status()
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -761,7 +822,7 @@ async fn semantic_scholar_status_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<IntegrationStatus>, (StatusCode, Json<ErrorBody>)> {
     let status = state
-        .ctx
+        .context()
         .semantic_scholar_status()
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -773,7 +834,7 @@ async fn semantic_scholar_lookup_handler(
     Json(body): Json<DoiBody>,
 ) -> Result<Json<SemanticScholarPaper>, (StatusCode, Json<ErrorBody>)> {
     let paper = state
-        .ctx
+        .context()
         .semantic_scholar_lookup(body.doi)
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -784,7 +845,7 @@ async fn openalex_status_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<IntegrationStatus>, (StatusCode, Json<ErrorBody>)> {
     let status = state
-        .ctx
+        .context()
         .openalex_status()
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -796,7 +857,7 @@ async fn openalex_lookup_handler(
     Json(body): Json<DoiBody>,
 ) -> Result<Json<OpenAlexWork>, (StatusCode, Json<ErrorBody>)> {
     let work = state
-        .ctx
+        .context()
         .openalex_lookup(body.doi)
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -807,9 +868,9 @@ async fn resolve_file_metadata_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<OpenFileBody>,
 ) -> Result<Json<DocumentMetadata>, (StatusCode, Json<ErrorBody>)> {
-    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
-    let metadata = state
-        .ctx
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let path = confine_to_uploads(&body.path, &uploads_dir)?;
+    let metadata = ctx
         .resolve_file_metadata(path)
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -820,13 +881,12 @@ async fn refresh_file_metadata_handler(
     State(state): State<Arc<AppState>>,
     body: Option<Json<RefreshFileMetadataBody>>,
 ) -> Result<Json<()>, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, uploads_dir) = state.workspace_snapshot();
     let path = body
         .and_then(|Json(body)| body.path)
-        .map(|path| confine_to_uploads(&path, &state.uploads_dir))
+        .map(|path| confine_to_uploads(&path, &uploads_dir))
         .transpose()?;
-    state
-        .ctx
-        .refresh_file_metadata(path)
+    ctx.refresh_file_metadata(path)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(()))
@@ -836,9 +896,9 @@ async fn zotero_add_item_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<OpenFileBody>,
 ) -> Result<Json<AddOutcome>, (StatusCode, Json<ErrorBody>)> {
-    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
-    let outcome = state
-        .ctx
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let path = confine_to_uploads(&body.path, &uploads_dir)?;
+    let outcome = ctx
         .zotero_add_item(path)
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -849,9 +909,9 @@ async fn zotero_generate_citation_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<OpenFileBody>,
 ) -> Result<Json<CitationResult>, (StatusCode, Json<ErrorBody>)> {
-    let path = confine_to_uploads(&body.path, &state.uploads_dir)?;
-    let citation = state
-        .ctx
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let path = confine_to_uploads(&body.path, &uploads_dir)?;
+    let citation = ctx
         .zotero_generate_citation(path)
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -870,10 +930,8 @@ async fn upload_handler(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let current_size = TokioServerFs
-        .dir_size(&state.uploads_dir)
-        .await
-        .unwrap_or(0);
+    let (_, uploads_dir) = state.workspace_snapshot();
+    let current_size = TokioServerFs.dir_size(&uploads_dir).await.unwrap_or(0);
     if current_size >= MAX_UPLOAD_BYTES {
         return Err(err(format!(
             "Upload directory exceeds maximum size of {} MB",
@@ -893,7 +951,7 @@ async fn upload_handler(
         if rel.as_os_str().is_empty() {
             continue;
         }
-        let plan = upload_write_plan(&state.uploads_dir, &rel);
+        let plan = upload_write_plan(&uploads_dir, &rel);
         if let Some(parent) = plan.create_parent {
             TokioServerFs
                 .create_dir_all(&parent)
@@ -909,7 +967,7 @@ async fn upload_handler(
     }
 
     Ok(Json(UploadResponse {
-        root: state.uploads_dir.to_string_lossy().into_owned(),
+        root: uploads_dir.to_string_lossy().into_owned(),
         file_count,
     }))
 }
@@ -923,6 +981,7 @@ async fn delete_upload_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<DeleteUploadQuery>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    let (_, uploads_dir) = state.workspace_snapshot();
     let requested = PathBuf::from(&params.path);
     if requested.as_os_str().is_empty() {
         return Err(err(
@@ -932,12 +991,10 @@ async fn delete_upload_handler(
     let target = if requested.is_absolute() {
         requested
     } else {
-        state
-            .uploads_dir
-            .join(sanitize_relative_upload_path(&params.path))
+        uploads_dir.join(sanitize_relative_upload_path(&params.path))
     };
     let canonical_uploads = TokioServerFs
-        .canonicalize(&state.uploads_dir)
+        .canonicalize(&uploads_dir)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     let canonical_target = TokioServerFs.canonicalize(&target).await.map_err(|_| {
@@ -973,12 +1030,13 @@ async fn delete_upload_handler(
 async fn delete_all_upload_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    let (_, uploads_dir) = state.workspace_snapshot();
     TokioServerFs
-        .remove_dir_all(&state.uploads_dir)
+        .remove_dir_all(&uploads_dir)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     TokioServerFs
-        .create_dir_all(&state.uploads_dir)
+        .create_dir_all(&uploads_dir)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
@@ -995,8 +1053,8 @@ async fn asset_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AssetQuery>,
 ) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
-    let plan =
-        asset_access_plan(Path::new(&params.path), &state.uploads_dir, &TokioServerFs).await?;
+    let (_, uploads_dir) = state.workspace_snapshot();
+    let plan = asset_access_plan(Path::new(&params.path), &uploads_dir, &TokioServerFs).await?;
     let bytes = TokioServerFs
         .read(&plan.canonical)
         .await
@@ -1072,7 +1130,8 @@ async fn list_models_handler(
     Query(params): Query<ListModelsQuery>,
 ) -> impl IntoResponse {
     let models: Vec<ModelDescriptor> =
-        wilkes_api::commands::embed::list_models(params.engine, &state.ctx.data_dir).await;
+        wilkes_api::commands::embed::list_models(params.engine, &state.context().shared_data_dir)
+            .await;
     Json(models)
 }
 
@@ -1100,13 +1159,13 @@ async fn get_index_status_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<RootQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let status = state
-        .ctx
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let status = ctx
         .get_index_status(
             params
                 .root
                 .as_deref()
-                .map(|root| confine_to_uploads(root, &state.uploads_dir))
+                .map(|root| confine_to_uploads(root, &uploads_dir))
                 .transpose()?,
         )
         .await
@@ -1123,7 +1182,8 @@ async fn download_model_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DownloadBody>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    Arc::clone(&state.ctx)
+    state
+        .context()
         .start_download_model(body.selected)
         .await
         .map_err(server_err)?;
@@ -1140,11 +1200,11 @@ async fn build_index_handler(
     State(state): State<Arc<AppState>>,
     Json(mut body): Json<BuildBody>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    body.root = confine_to_uploads(&body.root, &state.uploads_dir)?
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    body.root = confine_to_uploads(&body.root, &uploads_dir)?
         .to_string_lossy()
         .into_owned();
-    Arc::clone(&state.ctx)
-        .start_build_index(body.root, body.selected)
+    ctx.start_build_index(body.root, body.selected)
         .await
         .map_err(server_err)?;
     Ok(StatusCode::ACCEPTED)
@@ -1154,22 +1214,21 @@ async fn delete_index_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<RootQuery>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    state
-        .ctx
-        .delete_index(
-            params
-                .root
-                .as_deref()
-                .map(|root| confine_to_uploads(root, &state.uploads_dir))
-                .transpose()?,
-        )
-        .await
-        .map_err(|e| server_err(e.to_string()))?;
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    ctx.delete_index(
+        params
+            .root
+            .as_deref()
+            .map(|root| confine_to_uploads(root, &uploads_dir))
+            .transpose()?,
+    )
+    .await
+    .map_err(|e| server_err(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn cancel_embed_handler(State(state): State<Arc<AppState>>) -> StatusCode {
-    state.ctx.cancel_embed().await;
+    state.context().cancel_embed().await;
     StatusCode::NO_CONTENT
 }
 
@@ -1178,18 +1237,18 @@ async fn cancel_embed_handler(State(state): State<Arc<AppState>>) -> StatusCode 
 async fn get_worker_status_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let status = state.ctx.get_worker_status();
+    let status = state.context().get_worker_status();
     Ok(Json(status))
 }
 
 async fn get_worker_statuses_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    Ok(Json(state.ctx.get_worker_statuses()))
+    Ok(Json(state.context().get_worker_statuses()))
 }
 
 async fn kill_worker_handler(State(state): State<Arc<AppState>>) -> StatusCode {
-    state.ctx.kill_worker();
+    state.context().kill_worker();
     StatusCode::NO_CONTENT
 }
 
@@ -1203,7 +1262,7 @@ async fn set_worker_timeout_handler(
     Json(body): Json<TimeoutBody>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     state
-        .ctx
+        .context()
         .set_worker_timeout(body.secs)
         .await
         .map_err(|e| server_err(e.to_string()))?;
@@ -1280,27 +1339,27 @@ async fn main() -> anyhow::Result<()> {
     wilkes_core::logging::init_logging();
     let config = parse_config();
 
-    let uploads_dir = config.data_dir.join("uploads");
     let settings_path = config.data_dir.join("settings.json");
-    tokio::fs::create_dir_all(&uploads_dir).await?;
-
-    let paths = WorkerPaths::resolve(&config.data_dir);
 
     let (events_tx, _) = broadcast::channel::<(String, serde_json::Value)>(1024);
-    let emitter = Arc::new(BroadcastEmitter {
+    let emitter: Arc<dyn wilkes_api::context::EventEmitter> = Arc::new(BroadcastEmitter {
         tx: events_tx.clone(),
     });
-    let (ctx, event_rx, loop_fut) =
-        AppContext::new(config.data_dir.clone(), settings_path, paths, emitter);
+    let (workspaces, event_rx, loop_fut) =
+        WorkspaceManager::new(config.data_dir.clone(), settings_path, emitter)?;
+    let ctx = workspaces.active();
+    let uploads_dir = ctx.data_dir.join("uploads");
+    tokio::fs::create_dir_all(&uploads_dir).await?;
 
     ctx.clone().spawn_background_tasks(event_rx, loop_fut);
 
     let state = Arc::new(AppState {
-        ctx,
+        ctx: None,
+        workspaces: Some(Arc::clone(&workspaces)),
         uploads_dir,
         events_tx,
     });
-    let shutdown_ctx = Arc::clone(&state.ctx);
+    let shutdown_workspaces = Arc::clone(&workspaces);
     let index_html = config.dist_dir.join("index.html");
 
     let app = Router::new()
@@ -1312,6 +1371,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/preview", post(preview_handler))
         .route("/api/settings", get(get_settings_handler))
         .route("/api/settings", patch(update_settings_handler))
+        .route(
+            "/api/workspaces",
+            get(list_workspaces_handler).post(create_workspace_handler),
+        )
+        .route("/api/workspaces/:id", patch(rename_workspace_handler))
+        .route(
+            "/api/workspaces/:id/activate",
+            post(switch_workspace_handler),
+        )
         .route("/api/bookmarks", get(list_bookmarks_handler))
         .route("/api/bookmarks", post(add_bookmark_handler))
         .route("/api/bookmarks/clusters", post(cluster_bookmarks_handler))
@@ -1459,7 +1527,7 @@ async fn main() -> anyhow::Result<()> {
     info!("wilkes-server listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_ctx))
+        .with_graceful_shutdown(shutdown_signal(shutdown_workspaces))
         .await?;
 
     Ok(())
@@ -1537,7 +1605,8 @@ mod tests {
             AppContext::new(dir.path().to_path_buf(), settings_path, paths, emitter);
 
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -1632,7 +1701,8 @@ mod tests {
             emitter,
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -1669,7 +1739,8 @@ mod tests {
             emitter,
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: dir.path().join("uploads"),
             events_tx,
         });
@@ -1694,7 +1765,9 @@ mod tests {
         .into_response();
         assert_eq!(added.status(), StatusCode::OK);
 
-        let id = state.ctx.list_bookmarks().await.unwrap()[0].id.clone();
+        let id = state.context().list_bookmarks().await.unwrap()[0]
+            .id
+            .clone();
         update_bookmark_note_handler(
             State(Arc::clone(&state)),
             axum::extract::Path(id.clone()),
@@ -1707,7 +1780,9 @@ mod tests {
         .expect("update_bookmark_note_handler failed");
 
         assert_eq!(
-            state.ctx.list_bookmarks().await.unwrap()[0].note.as_deref(),
+            state.context().list_bookmarks().await.unwrap()[0]
+                .note
+                .as_deref(),
             Some("noted")
         );
     }
@@ -1740,7 +1815,8 @@ mod tests {
             emitter,
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -1807,7 +1883,8 @@ mod tests {
             emitter,
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: dir.path().to_path_buf(),
             events_tx,
         });
@@ -1851,7 +1928,8 @@ mod tests {
             emitter,
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -1900,7 +1978,8 @@ mod tests {
             emitter,
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -1939,7 +2018,8 @@ mod tests {
             emitter,
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -1978,7 +2058,8 @@ mod tests {
             emitter,
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -2053,7 +2134,8 @@ mod tests {
             emitter,
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -2107,7 +2189,8 @@ mod tests {
             emitter,
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -2146,7 +2229,8 @@ mod tests {
             emitter,
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -2212,7 +2296,8 @@ mod tests {
             emitter,
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -2243,7 +2328,8 @@ mod tests {
             emitter,
         );
         let _state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -2266,7 +2352,8 @@ mod tests {
             }),
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -2325,7 +2412,8 @@ mod tests {
             emitter,
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -2364,7 +2452,8 @@ mod tests {
         std::fs::write(&asset_file, "data").unwrap();
 
         let state = Arc::new(AppState {
-            ctx: test_ctx_with_dir(dir.path()),
+            ctx: Some(test_ctx_with_dir(dir.path())),
+            workspaces: None,
             uploads_dir: uploads_dir.clone(),
             events_tx,
         });
@@ -2460,7 +2549,8 @@ mod tests {
             }),
         );
         let state = Arc::new(AppState {
-            ctx,
+            ctx: Some(ctx),
+            workspaces: None,
             uploads_dir: dir.path().join("u"),
             events_tx: events_tx.clone(),
         });

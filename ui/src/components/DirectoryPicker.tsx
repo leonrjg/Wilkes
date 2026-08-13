@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { confirmDialog } from "../lib/utils/dialog";
-import { Folder, FolderPlus, Star, X } from "react-feather";
+import { ChevronLeft, ChevronRight, Folder, FolderPlus, Star, X } from "react-feather";
 import { useToasts } from "./Toast";
 import { ContextMenu, useContextMenu } from "./ContextMenu";
 import { api, isTauri, source } from "../services";
@@ -31,6 +31,99 @@ function shortPath(p: string): string {
 
 function baseName(p: string): string {
   return p.replace(/[/\\]+$/, "").split(/[/\\]/).pop() || p;
+}
+
+const ROOT_SCROLL_EDGE_TOLERANCE = 2;
+
+function RootCarousel({
+  activeRoot,
+  contentKey,
+  children,
+}: {
+  activeRoot: string;
+  contentKey: string;
+  children: React.ReactNode;
+}) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
+
+  const updateScrollBounds = useCallback(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+    const maxScrollLeft = Math.max(0, element.scrollWidth - element.clientWidth);
+    setCanScrollLeft(element.scrollLeft > ROOT_SCROLL_EDGE_TOLERANCE);
+    setCanScrollRight(
+      element.scrollLeft < maxScrollLeft - ROOT_SCROLL_EDGE_TOLERANCE,
+    );
+  }, []);
+
+  useLayoutEffect(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+
+    const resizeObserver = new ResizeObserver(updateScrollBounds);
+    resizeObserver.observe(element);
+    Array.from(element.children).forEach((child) => resizeObserver.observe(child));
+    element.addEventListener("scroll", updateScrollBounds, { passive: true });
+    window.addEventListener("resize", updateScrollBounds);
+    updateScrollBounds();
+
+    let boundsFrame: number | null = null;
+    const activeFrame = requestAnimationFrame(() => {
+      const active = element.querySelector<HTMLElement>('[data-root-active="true"]');
+      active?.scrollIntoView?.({ behavior: "smooth", block: "nearest", inline: "nearest" });
+      boundsFrame = requestAnimationFrame(updateScrollBounds);
+    });
+
+    return () => {
+      cancelAnimationFrame(activeFrame);
+      if (boundsFrame !== null) cancelAnimationFrame(boundsFrame);
+      resizeObserver.disconnect();
+      element.removeEventListener("scroll", updateScrollBounds);
+      window.removeEventListener("resize", updateScrollBounds);
+    };
+  }, [activeRoot, contentKey, updateScrollBounds]);
+
+  const scrollPage = (direction: -1 | 1) => {
+    const element = scrollRef.current;
+    if (!element) return;
+    const distance = Math.max(120, element.clientWidth * 0.8);
+    element.scrollBy({ left: direction * distance, behavior: "smooth" });
+  };
+
+  return (
+    <div className="relative min-w-0 flex-1">
+      <div
+        ref={scrollRef}
+        role="region"
+        aria-label="Workspace roots"
+        className="folder-strip-carousel flex min-w-0 items-center gap-1 overflow-x-auto"
+      >
+        {children}
+      </div>
+      {canScrollLeft && (
+        <button
+          type="button"
+          aria-label="Scroll roots left"
+          onClick={() => scrollPage(-1)}
+          className="absolute inset-y-0 left-0 z-10 flex w-6 items-center justify-center rounded-r bg-[var(--bg-app)]/95 text-[var(--text-muted)] shadow-[7px_0_18px_-3px_rgba(0,0,0,0.24)] hover:text-[var(--text-main)]"
+        >
+          <ChevronLeft size={13} />
+        </button>
+      )}
+      {canScrollRight && (
+        <button
+          type="button"
+          aria-label="Scroll roots right"
+          onClick={() => scrollPage(1)}
+          className="absolute inset-y-0 right-0 z-10 flex w-6 items-center justify-center rounded-l bg-[var(--bg-app)]/95 text-[var(--text-muted)] shadow-[-7px_0_18px_-3px_rgba(0,0,0,0.24)] hover:text-[var(--text-main)]"
+        >
+          <ChevronRight size={13} />
+        </button>
+      )}
+    </div>
+  );
 }
 
 export default function DirectoryPicker({
@@ -168,7 +261,7 @@ export default function DirectoryPicker({
 
       {/* Folders list (Favorites + History) */}
       {displayDirs.length > 0 && (
-        <div className="folder-strip-scrollbar flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+        <RootCarousel activeRoot={directory} contentKey={displayDirs.join("\0")}>
           {displayDirs.map((b) => {
             const favorite = isFavorite(b);
             const active = b === directory;
@@ -176,6 +269,7 @@ export default function DirectoryPicker({
             return (
               <div
                 key={b}
+                data-root-active={active ? "true" : undefined}
                 className="group flex h-6 items-center rounded bg-[var(--bg-active)] transition-colors"
                 onContextMenu={(event) =>
                   openMenu({
@@ -250,7 +344,7 @@ export default function DirectoryPicker({
               <FolderPlus size={12} />
             </button>
           </Tooltip>
-        </div>
+        </RootCarousel>
       )}
 
       {createTarget && (

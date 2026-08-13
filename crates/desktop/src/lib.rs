@@ -14,6 +14,8 @@ use wilkes_api::commands::chat::{
     ChatMessageRecord, ChatReplayContentBlock, ChatReplayToolCall, ChatTurnEnvironmentRecord,
 };
 use wilkes_api::context::{AppContext, EventEmitter};
+use wilkes_api::startup::StartupStatus;
+use wilkes_api::workspace::{WorkspaceManager, WorkspaceState, WorkspaceSummary};
 use wilkes_core::types::{
     AddOutcome, AgentBackend, Bookmark, BookmarkClustersQuery, BookmarkClustersResult,
     ChunkTopicsQuery, ChunkTopicsResult, CitationResult, CollectionValidation, DataPaths,
@@ -31,8 +33,49 @@ use platform::{
     DesktopStartupPlan, SystemDesktopPlatform, TauriPlatform,
 };
 
+#[derive(Default)]
+struct DesktopStartupState(std::sync::RwLock<StartupStatus>);
+
+impl DesktopStartupState {
+    fn status(&self) -> StartupStatus {
+        self.0.read().unwrap().clone()
+    }
+
+    fn replace(&self, status: StartupStatus) {
+        *self.0.write().unwrap() = status;
+    }
+}
+
+#[tauri::command]
+fn get_startup_status(app: AppHandle) -> StartupStatus {
+    app.state::<Arc<DesktopStartupState>>().status()
+}
+
+/// The single registration point for feature preflights. A future breaking
+/// feature adds its provider here and the shell/UI need no corresponding
+/// special case.
+fn collect_startup_status(
+    data_dir: &std::path::Path,
+    settings_path: &std::path::Path,
+) -> anyhow::Result<StartupStatus> {
+    let mut status = StartupStatus::ready();
+    status.extend(wilkes_api::workspace::startup_blockers(
+        data_dir,
+        settings_path,
+    )?);
+    Ok(status)
+}
+
 fn app_context(app: &AppHandle) -> Arc<AppContext> {
-    app.state::<Arc<AppContext>>().inner().clone()
+    if let Some(manager) = app.try_state::<Arc<WorkspaceManager>>() {
+        manager.inner().active()
+    } else {
+        app.state::<Arc<AppContext>>().inner().clone()
+    }
+}
+
+fn workspace_manager(app: &AppHandle) -> Arc<WorkspaceManager> {
+    app.state::<Arc<WorkspaceManager>>().inner().clone()
 }
 
 fn active_searches_state(app: &AppHandle) -> Arc<ActiveSearches> {
@@ -296,7 +339,7 @@ async fn list_models_for_ctx(
     ctx: Arc<AppContext>,
     engine: EmbeddingEngine,
 ) -> Result<Vec<ModelDescriptor>, String> {
-    Ok(wilkes_api::commands::embed::list_models(engine, &ctx.data_dir).await)
+    Ok(wilkes_api::commands::embed::list_models(engine, &ctx.shared_data_dir).await)
 }
 
 async fn cancel_embed_for_ctx(ctx: Arc<AppContext>) -> Result<(), String> {
@@ -630,13 +673,22 @@ fn handle_exit_event(app_handle: &AppHandle, event: tauri::RunEvent) {
         event,
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
     ) {
-        let ctx = app_handle.state::<Arc<AppContext>>().inner().clone();
+        let Some(workspaces) = app_handle.try_state::<Arc<WorkspaceManager>>() else {
+            return;
+        };
+        let ctx = workspaces.active();
         // Kill any in-flight turn and the chat subprocesses themselves before
         // the process tree goes away, rather than leaving orphaned CLIs behind.
-        chat_manager_state(app_handle).close_all();
-        let external_mcp = external_mcp_manager_state(app_handle);
+        if let Some(chat_manager) = app_handle.try_state::<Arc<ChatManager>>() {
+            chat_manager.close_all();
+        }
+        let external_mcp = app_handle
+            .try_state::<Arc<ExternalMcpManager>>()
+            .map(|manager| manager.inner().clone());
         tauri::async_runtime::spawn(async move {
-            external_mcp.stop().await;
+            if let Some(external_mcp) = external_mcp {
+                external_mcp.stop().await;
+            }
             ctx.shutdown().await;
         });
     }
@@ -891,6 +943,14 @@ fn spawn_chat_event_forwarder(
 
 struct ActiveSearches(Mutex<HashMap<String, JoinHandle<()>>>);
 
+impl ActiveSearches {
+    fn cancel_all(&self) {
+        for (_, handle) in self.0.lock().unwrap().drain() {
+            handle.abort();
+        }
+    }
+}
+
 trait SearchEventSink: Send + Sync + Clone + 'static {
     fn emit_event(&self, name: &str, payload: serde_json::Value);
 }
@@ -970,12 +1030,74 @@ fn cancel_search_for_ctx(active_searches: Arc<ActiveSearches>, search_id: &str) 
 
 #[tauri::command]
 async fn get_data_paths(app: AppHandle) -> Result<DataPaths, String> {
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map(|p| p.display().to_string())
-        .map_err(|e| e.to_string())?;
+    let app_data = app_context(&app).data_dir.display().to_string();
     Ok(data_paths_from(app_data))
+}
+
+#[tauri::command]
+async fn list_workspaces(app: AppHandle) -> Result<WorkspaceState, String> {
+    workspace_manager(&app)
+        .state()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn create_workspace(app: AppHandle, name: String) -> Result<WorkspaceSummary, String> {
+    workspace_manager(&app)
+        .create(name)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn rename_workspace(
+    app: AppHandle,
+    workspace_id: String,
+    name: String,
+) -> Result<WorkspaceSummary, String> {
+    workspace_manager(&app)
+        .rename(&workspace_id, name)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn switch_workspace(app: AppHandle, workspace_id: String) -> Result<WorkspaceState, String> {
+    let manager = workspace_manager(&app);
+    let current = manager.state().map_err(|error| error.to_string())?;
+    if current.active_workspace_id == workspace_id {
+        return Ok(current);
+    }
+    if !current
+        .workspaces
+        .iter()
+        .any(|workspace| workspace.id == workspace_id)
+    {
+        return Err("Unknown workspace".to_string());
+    }
+
+    active_searches_state(&app).cancel_all();
+    chat_manager_state(&app).close_all();
+    let external_mcp = external_mcp_manager_state(&app);
+    external_mcp.stop().await;
+
+    let state = match manager.switch(&workspace_id).await {
+        Ok(state) => state,
+        Err(error) => {
+            let ctx = manager.active();
+            let settings = ctx.get_settings().await;
+            if let Err(restart_error) = external_mcp.apply(&settings.external_mcp, ctx).await {
+                error!(
+                    "Workspace switch failed and external MCP could not restart: {restart_error}"
+                );
+            }
+            return Err(error.to_string());
+        }
+    };
+    let ctx = manager.active();
+    let settings = ctx.get_settings().await;
+    if let Err(error) = external_mcp.apply(&settings.external_mcp, ctx).await {
+        error!("Workspace switched, but external MCP failed to restart: {error}");
+    }
+    Ok(state)
 }
 
 #[tauri::command]
@@ -2192,20 +2314,49 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
+            let startup = Arc::new(DesktopStartupState::default());
+            app.manage(Arc::clone(&startup));
             let handle = app.handle().clone();
             let platform = TauriPlatform(handle.clone());
             let DesktopStartupPlan {
                 data_dir,
                 settings_path,
-                worker_paths: paths,
-            } = build_startup_plan(&platform)?;
+            } = match build_startup_plan(&platform) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    error!("desktop startup preflight failed: {error:#}");
+                    startup.replace(StartupStatus::unexpected(error));
+                    return Ok(());
+                }
+            };
 
-            let emitter = Arc::new(TauriEmitter(handle.clone()));
+            let status = match collect_startup_status(&data_dir, &settings_path) {
+                Ok(status) => status,
+                Err(error) => {
+                    error!("workspace startup preflight failed: {error:#}");
+                    startup.replace(StartupStatus::unexpected(error));
+                    return Ok(());
+                }
+            };
+            if !status.is_ready() {
+                startup.replace(status);
+                return Ok(());
+            }
+
+            let emitter: Arc<dyn EventEmitter> = Arc::new(TauriEmitter(handle.clone()));
             let external_mcp = Arc::new(ExternalMcpManager::new(data_dir.clone()));
-            let (ctx, event_rx, loop_fut) =
-                AppContext::new(data_dir, settings_path, paths, emitter);
+            let (workspaces, event_rx, loop_fut) =
+                match WorkspaceManager::new(data_dir, settings_path, emitter) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        error!("desktop startup initialization failed: {error:#}");
+                        startup.replace(StartupStatus::unexpected(error));
+                        return Ok(());
+                    }
+                };
+            let ctx = workspaces.active();
 
-            app.manage(Arc::clone(&ctx));
+            app.manage(Arc::clone(&workspaces));
             app.manage(Arc::new(ActiveSearches(Mutex::new(HashMap::new()))));
             app.manage(Arc::new(ChatManager(Mutex::new(HashMap::new()))));
             app.manage(Arc::clone(&external_mcp));
@@ -2228,6 +2379,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_startup_status,
             search,
             cancel_search,
             related_documents,
@@ -2291,6 +2443,10 @@ pub fn run() {
             get_logs,
             clear_logs,
             get_data_paths,
+            list_workspaces,
+            create_workspace,
+            rename_workspace,
+            switch_workspace,
             open_path,
             reveal_path,
             is_semantic_ready,
@@ -2342,6 +2498,35 @@ mod tests {
     use wilkes_core::worker::manager::WorkerPaths;
 
     static OPEN_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn desktop_startup_state_can_hold_feature_blockers_without_a_runtime() {
+        let state = DesktopStartupState::default();
+        assert!(state.status().is_ready());
+        state.replace(StartupStatus::unexpected("database upgrade required"));
+        let status = state.status();
+        assert!(!status.is_ready());
+        assert_eq!(status.blockers[0].id, "application.startup-failed");
+    }
+
+    #[test]
+    fn desktop_preflight_aggregates_breaking_feature_blockers() {
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            serde_json::to_vec(&serde_json::json!({
+                "last_directory": dir.path().join("legacy-library")
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let status = collect_startup_status(dir.path(), &settings_path).unwrap();
+
+        assert!(!status.is_ready());
+        assert_eq!(status.blockers[0].id, "workspaces.alpha-library-migration");
+    }
 
     #[test]
     fn chat_events_accumulate_into_the_persisted_assistant_message() {

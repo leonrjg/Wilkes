@@ -8,6 +8,9 @@ import type {
 } from "../lib/types";
 
 const SCOPE_STORAGE_KEY = "wilkes.completion-scopes";
+let activeWorkspaceId = "default";
+let storedScopes: Record<string, CompletionScope> = {};
+const scopeStorageKey = () => `${SCOPE_STORAGE_KEY}.${activeWorkspaceId}`;
 const MAX_SUGGESTION_HISTORY = 8;
 
 export type CompletionStatus = "idle" | "searching" | "nothing-relevant" | "error";
@@ -48,11 +51,12 @@ interface EditorStore {
   togglePin(path: string, pinnedPath: string): void;
   excludeFromContext(path: string, excludedPath: string): void;
   restoreToContext(path: string, restoredPath: string): void;
+  switchWorkspace(workspaceId: string): void;
 }
 
 function readScopes(): Record<string, CompletionScope> {
   try {
-    const parsed = JSON.parse(localStorage.getItem(SCOPE_STORAGE_KEY) ?? "{}") as unknown;
+    const parsed = JSON.parse(localStorage.getItem(scopeStorageKey()) ?? "{}") as unknown;
     return typeof parsed === "object" && parsed !== null
       ? parsed as Record<string, CompletionScope>
       : {};
@@ -61,10 +65,10 @@ function readScopes(): Record<string, CompletionScope> {
   }
 }
 
-const initialScopes = typeof localStorage === "undefined" ? {} : readScopes();
+storedScopes = typeof localStorage === "undefined" ? {} : readScopes();
 
 function defaultScope(path: string): CompletionScope {
-  const stored = initialScopes[path];
+  const stored = storedScopes[path];
   if (!stored || !Array.isArray(stored.pinned)) {
     return { mode: "library", pinned: [], excluded: [] };
   }
@@ -84,7 +88,7 @@ function defaultScope(path: string): CompletionScope {
 function persistScopes(buffers: Record<string, EditorBuffer>): void {
   try {
     localStorage.setItem(
-      SCOPE_STORAGE_KEY,
+      scopeStorageKey(),
       JSON.stringify(Object.fromEntries(Object.entries(buffers).map(([path, buffer]) => [path, buffer.scope]))),
     );
   } catch {
@@ -295,5 +299,10 @@ export const useEditorStore = create<EditorStore>((set) => ({
       persistScopes(buffers);
       return { buffers };
     });
+  },
+  switchWorkspace(workspaceId) {
+    activeWorkspaceId = workspaceId;
+    storedScopes = typeof localStorage === "undefined" ? {} : readScopes();
+    set({ buffers: {}, activeEditorPath: null });
   },
 }));

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Edit2, Tag as TagIcon, Trash2, X } from "react-feather";
 import { api } from "../services";
 import { useResearchStore } from "../stores/useResearchStore";
+import { TextInputDialog } from "./TextInputDialog";
 
 export function ResearchManager({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [tab, setTab] = useState<"tags" | "collections">("collections");
@@ -10,6 +11,12 @@ export function ResearchManager({ open, onClose }: { open: boolean; onClose: () 
   const [name, setName] = useState("");
   const [expression, setExpression] = useState("size(tags) > 0");
   const [error, setError] = useState<string | null>(null);
+  const [renamingTag, setRenamingTag] = useState<{
+    id: string;
+    name: string;
+    color: string | null;
+  } | null>(null);
+  const [renamingTagBusy, setRenamingTagBusy] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -41,6 +48,23 @@ export function ResearchManager({ open, onClose }: { open: boolean; onClose: () 
     }
   };
 
+  const renameTag = async (name: string) => {
+    if (!renamingTag) return;
+    if (name === renamingTag.name) {
+      setRenamingTag(null);
+      return;
+    }
+    setRenamingTagBusy(true);
+    try {
+      await store.updateTag(renamingTag.id, { name, color: renamingTag.color });
+      setRenamingTag(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRenamingTagBusy(false);
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/50" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <section className="flex h-[min(720px,86vh)] w-[min(920px,92vw)] flex-col rounded-lg border border-[var(--border-main)] bg-[var(--bg-app)] shadow-2xl">
@@ -61,7 +85,7 @@ export function ResearchManager({ open, onClose }: { open: boolean; onClose: () 
                   <TagIcon size={14} className="text-[var(--accent-blue)]" />
                   <span className="flex-1 text-sm">{tag.name}</span>
                   <code className="max-w-48 truncate text-[10px] text-[var(--text-dim)]">{tag.id}</code>
-                  <button aria-label={`Rename ${tag.name}`} onClick={async () => { const next = window.prompt("Tag name", tag.name); if (next?.trim()) await store.updateTag(tag.id, { name: next, color: tag.color }); }}><Edit2 size={14} /></button>
+                  <button aria-label={`Rename ${tag.name}`} onClick={() => setRenamingTag(tag)}><Edit2 size={14} /></button>
                   <button aria-label={`Delete ${tag.name}`} onClick={() => store.deleteTag(tag.id).catch((e) => setError(String(e)))}><Trash2 size={14} /></button>
                 </div>
               ))}
@@ -93,6 +117,16 @@ export function ResearchManager({ open, onClose }: { open: boolean; onClose: () 
           )}
         </div>
       </section>
+      <TextInputDialog
+        open={renamingTag !== null}
+        title="Rename tag"
+        label="Tag name"
+        initialValue={renamingTag?.name ?? ""}
+        confirmLabel="Rename"
+        busy={renamingTagBusy}
+        onCancel={() => setRenamingTag(null)}
+        onSubmit={(nextName) => void renameTag(nextName)}
+      />
     </div>
   );
 }

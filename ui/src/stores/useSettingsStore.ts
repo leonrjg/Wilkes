@@ -60,6 +60,7 @@ interface SettingsStore {
   fileDisplayFields: FileDisplayField[];
   chatBackend: AgentBackend;
 
+  resetForWorkspace: () => void;
   load: () => Promise<void>;
   setDirectory: (dir: string) => void;
   addFavorite: (dir: string) => void;
@@ -103,6 +104,17 @@ export const useSettingsStore = create<SettingsStore>()(
     fileSortDirection: "asc",
     fileDisplayFields: ["size"],
     chatBackend: "ClaudeCode",
+
+    resetForWorkspace: () => set({
+      favorites: [],
+      settings: null,
+      recentDirs: [],
+      directory: "",
+      semantic: null,
+      fileList: [],
+      omittedFileList: [],
+      indexing: false,
+    }),
 
     load: async () => {
       const s = await api.getSettings();

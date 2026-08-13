@@ -11,9 +11,39 @@ use axum::http::StatusCode;
 use axum::Json;
 
 pub struct AppState {
-    pub ctx: Arc<wilkes_api::context::AppContext>,
+    /// Direct context injection is only used by focused handler tests. A
+    /// production server owns contexts exclusively through `workspaces` so a
+    /// retired index cannot be kept alive by this adapter.
+    pub ctx: Option<Arc<wilkes_api::context::AppContext>>,
+    pub workspaces: Option<Arc<wilkes_api::workspace::WorkspaceManager>>,
     pub uploads_dir: PathBuf,
     pub events_tx: broadcast::Sender<(String, serde_json::Value)>,
+}
+
+impl AppState {
+    /// Pin a request to one workspace. Deriving the uploads path from the same
+    /// context prevents a concurrent workspace switch from mixing roots and
+    /// databases within a long-running HTTP request.
+    pub fn workspace_snapshot(&self) -> (Arc<wilkes_api::context::AppContext>, PathBuf) {
+        if let Some(manager) = &self.workspaces {
+            let ctx = manager.active();
+            let uploads_dir = ctx.data_dir.join("uploads");
+            (ctx, uploads_dir)
+        } else {
+            (
+                Arc::clone(
+                    self.ctx
+                        .as_ref()
+                        .expect("AppState requires a workspace manager or test context"),
+                ),
+                self.uploads_dir.clone(),
+            )
+        }
+    }
+
+    pub fn context(&self) -> Arc<wilkes_api::context::AppContext> {
+        self.workspace_snapshot().0
+    }
 }
 
 pub struct BroadcastEmitter {

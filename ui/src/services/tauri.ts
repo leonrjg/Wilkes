@@ -54,11 +54,18 @@ import type {
   CompletionFeedback,
   CompletionRequest,
   SessionSteering,
+  WorkspaceState,
+  WorkspaceSummary,
+  StartupStatus,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type { SearchApi, DesktopSourceApi, DataPaths } from "./api";
 
 export class TauriSearchApi implements SearchApi {
+  async getStartupStatus(): Promise<StartupStatus> {
+    return invoke<StartupStatus>("get_startup_status");
+  }
+
   async search(
     query: SearchQuery,
     onResult: (fm: FileMatches) => void,
@@ -109,6 +116,22 @@ export class TauriSearchApi implements SearchApi {
 
   async updateSettings(patch: Partial<Settings>): Promise<Settings> {
     return invoke<Settings>("update_settings", { patch });
+  }
+
+  async listWorkspaces(): Promise<WorkspaceState> {
+    return invoke<WorkspaceState>("list_workspaces");
+  }
+
+  async createWorkspace(name: string): Promise<WorkspaceSummary> {
+    return invoke<WorkspaceSummary>("create_workspace", { name });
+  }
+
+  async renameWorkspace(workspaceId: string, name: string): Promise<WorkspaceSummary> {
+    return invoke<WorkspaceSummary>("rename_workspace", { workspaceId, name });
+  }
+
+  async switchWorkspace(workspaceId: string): Promise<WorkspaceState> {
+    return invoke<WorkspaceState>("switch_workspace", { workspaceId });
   }
 
   async getExternalMcpStatus(): Promise<ExternalMcpStatus> {

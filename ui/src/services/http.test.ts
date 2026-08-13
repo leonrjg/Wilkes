@@ -14,6 +14,11 @@ describe("HttpSearchApi", () => {
     })));
   });
 
+  it("is startup-ready once the HTTP application is reachable", async () => {
+    await expect(api.getStartupStatus()).resolves.toEqual({ blockers: [] });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("getSettings calls fetch and returns settings", async () => {
     const mockSettings = { semantic: { enabled: true } };
     (fetch as any).mockResolvedValue({
@@ -38,6 +43,31 @@ describe("HttpSearchApi", () => {
       method: "PATCH",
       body: JSON.stringify(patch),
     }));
+  });
+
+  it("uses workspace registry endpoints", async () => {
+    (fetch as any).mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ active_workspace_id: "a", workspaces: [] }),
+    });
+
+    await api.listWorkspaces();
+    expect(fetch).toHaveBeenLastCalledWith("/api/workspaces");
+    await api.createWorkspace("Second");
+    expect(fetch).toHaveBeenLastCalledWith(
+      "/api/workspaces",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ name: "Second" }) }),
+    );
+    await api.renameWorkspace("b", "Renamed");
+    expect(fetch).toHaveBeenLastCalledWith(
+      "/api/workspaces/b",
+      expect.objectContaining({ method: "PATCH", body: JSON.stringify({ name: "Renamed" }) }),
+    );
+    await api.switchWorkspace("b");
+    expect(fetch).toHaveBeenLastCalledWith(
+      "/api/workspaces/b/activate",
+      expect.objectContaining({ method: "POST" }),
+    );
   });
 
   it("updateBookmarkNote sends a PATCH with the note body", async () => {

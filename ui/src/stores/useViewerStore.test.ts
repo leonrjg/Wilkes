@@ -276,6 +276,28 @@ describe("useViewerStore", () => {
     expect(api.preview).toHaveBeenLastCalledWith(textMatch("/docs/two.txt", 2));
   });
 
+  it("keeps persisted viewer sessions isolated by workspace", async () => {
+    const storedState = (path: string) => JSON.stringify({
+      version: 1,
+      state: {
+        tabs: [{ path, history: [textMatch(path, 1)], historyIndex: 0 }],
+        activePath: path,
+      },
+    });
+    localStorage.setItem(`${VIEWER_SESSION_STORAGE_KEY}.workspace-a`, storedState("/a.txt"));
+    localStorage.setItem(`${VIEWER_SESSION_STORAGE_KEY}.workspace-b`, storedState("/b.txt"));
+
+    await useViewerStore.getState().switchWorkspace("workspace-a");
+    expect(activeViewerTab(useViewerStore.getState())?.path).toBe("/a.txt");
+
+    await useViewerStore.getState().switchWorkspace("workspace-b");
+    expect(activeViewerTab(useViewerStore.getState())?.path).toBe("/b.txt");
+
+    await useViewerStore.getState().switchWorkspace("workspace-a");
+    expect(activeViewerTab(useViewerStore.getState())?.path).toBe("/a.txt");
+    await useViewerStore.getState().switchWorkspace("default");
+  });
+
   it("ignores unsupported and malformed persisted sessions", async () => {
     localStorage.setItem(
       VIEWER_SESSION_STORAGE_KEY,

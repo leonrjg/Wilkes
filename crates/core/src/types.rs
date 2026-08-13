@@ -1194,6 +1194,7 @@ pub struct Settings {
     /// for files the index does not yet hold. Off by default.
     #[serde(default)]
     pub grep_use_index: bool,
+    #[serde(default)]
     pub semantic: SemanticSettings,
     #[serde(default)]
     pub integrations: IntegrationsSettings,

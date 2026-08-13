@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use tauri::{AppHandle, Emitter, Manager, Runtime};
-use wilkes_core::worker::manager::WorkerPaths;
 
 pub(crate) trait DesktopPlatform {
     fn app_config_dir(&self) -> anyhow::Result<PathBuf>;
@@ -182,18 +181,15 @@ pub(crate) fn build_startup_plan<P: DesktopPlatform>(
 ) -> anyhow::Result<DesktopStartupPlan> {
     let data_dir = platform.app_data_dir()?;
     let settings_path = desktop_settings_path(platform)?;
-    let worker_paths = WorkerPaths::resolve(&data_dir);
     Ok(DesktopStartupPlan {
         data_dir,
         settings_path,
-        worker_paths,
     })
 }
 
 pub(crate) struct DesktopStartupPlan {
     pub(crate) data_dir: PathBuf,
     pub(crate) settings_path: PathBuf,
-    pub(crate) worker_paths: WorkerPaths,
 }
 
 #[cfg(test)]
@@ -274,7 +270,6 @@ mod tests {
         let plan = build_startup_plan(&platform).unwrap();
         assert_eq!(plan.data_dir, data_dir.path());
         assert_eq!(plan.settings_path, config_dir.path().join("settings.json"));
-        assert_eq!(plan.worker_paths.data_dir, data_dir.path());
     }
 
     #[test]

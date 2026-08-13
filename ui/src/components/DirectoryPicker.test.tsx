@@ -62,6 +62,30 @@ describe("DirectoryPicker", () => {
     expect(screen.getByText("project")).toBeInTheDocument();
   });
 
+  it("uses hidden-scrollbar carousel controls when roots overflow", () => {
+    renderWithToasts();
+    const roots = screen.getByRole("region", { name: "Workspace roots" });
+    const scrollBy = vi.fn();
+    Object.defineProperties(roots, {
+      clientWidth: { configurable: true, value: 300 },
+      scrollWidth: { configurable: true, value: 900 },
+      scrollLeft: { configurable: true, value: 0, writable: true },
+      scrollBy: { configurable: true, value: scrollBy },
+    });
+
+    fireEvent.scroll(roots);
+
+    expect(roots).toHaveClass("folder-strip-carousel");
+    expect(screen.queryByRole("button", { name: "Scroll roots left" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Scroll roots right" }));
+    expect(scrollBy).toHaveBeenCalledWith({ left: 240, behavior: "smooth" });
+
+    roots.scrollLeft = 600;
+    fireEvent.scroll(roots);
+    expect(screen.getByRole("button", { name: "Scroll roots left" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Scroll roots right" })).not.toBeInTheDocument();
+  });
+
   it("prevents directory tab text from being selected", () => {
     renderWithToasts();
     expect(screen.getByRole("button", { name: "/home/user/other" })).toHaveClass("select-none");

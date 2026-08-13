@@ -16,15 +16,12 @@ pub async fn search_handler(
     state: Arc<AppState>,
     mut query: SearchQuery,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, (StatusCode, Json<ErrorBody>)> {
-    query.root = confined_root_for_search(
-        &query.root.to_string_lossy(),
-        &state.uploads_dir,
-        &TokioServerFs,
-    )
-    .await?;
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    query.root =
+        confined_root_for_search(&query.root.to_string_lossy(), &uploads_dir, &TokioServerFs)
+            .await?;
 
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
-    let ctx = Arc::clone(&state.ctx);
 
     tokio::spawn(async move {
         forward_search_results(ctx, query, tx).await;
@@ -104,7 +101,8 @@ mod tests {
         (
             dir,
             Arc::new(AppState {
-                ctx,
+                ctx: Some(ctx),
+                workspaces: None,
                 uploads_dir,
                 events_tx,
             }),
@@ -136,14 +134,14 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("note.txt"), "hello world").unwrap();
         wilkes_api::commands::settings::update_settings(
-            &state.ctx.settings_path,
+            &state.context().settings_path,
             serde_json::json!({ "last_directory": root.clone() }),
         )
         .await
         .unwrap();
 
         let (tx, mut rx) = mpsc::channel(16);
-        forward_search_results(Arc::clone(&state.ctx), grep_query(root.clone()), tx).await;
+        forward_search_results(state.context(), grep_query(root.clone()), tx).await;
 
         let mut received = 0usize;
         while let Ok(Some(_event)) =
@@ -166,7 +164,7 @@ mod tests {
         query.mode = SearchMode::Semantic;
 
         let (tx, mut rx) = mpsc::channel(16);
-        forward_search_results(Arc::clone(&state.ctx), query, tx).await;
+        forward_search_results(state.context(), query, tx).await;
 
         let _first = rx.recv().await.unwrap().unwrap();
         assert!(rx.try_recv().is_err());

@@ -176,12 +176,17 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
       };
     }),
 
-  clearResults: () =>
+  clearResults: () => {
+    const currentSearchId = get().currentSearchId;
+    if (currentSearchId) void api.cancelSearch(currentSearchId).catch(() => {});
     set({
       results: [],
       stats: null,
+      searching: false,
+      currentSearchId: null,
       hasQuery: false,
       lastQuery: null,
       resultContext: null,
-    }),
+    });
+  },
 }));

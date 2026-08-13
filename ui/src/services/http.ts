@@ -71,6 +71,13 @@ async function responseError(response: Response, operation: string): Promise<Err
 export class HttpSearchApi implements SearchApi {
   private controllers = new Map<string, AbortController>();
 
+  async getStartupStatus(): Promise<import("../lib/types").StartupStatus> {
+    // Reaching the web application means the server completed startup. The
+    // desktop shell has a distinct pre-runtime phase and supplies blockers
+    // through its native command.
+    return { blockers: [] };
+  }
+
   async search(
     query: SearchQuery,
     onResult: (fm: FileMatches) => void,
@@ -224,6 +231,40 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw new Error(`updateSettings failed: ${res.status}`);
     return res.json() as Promise<Settings>;
+  }
+
+  async listWorkspaces(): Promise<import("../lib/types").WorkspaceState> {
+    const res = await fetch("/api/workspaces");
+    if (!res.ok) throw new Error(`listWorkspaces failed: ${res.status}`);
+    return res.json();
+  }
+
+  async createWorkspace(name: string): Promise<import("../lib/types").WorkspaceSummary> {
+    const res = await fetch("/api/workspaces", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!res.ok) throw new Error(`createWorkspace failed: ${res.status}`);
+    return res.json();
+  }
+
+  async renameWorkspace(workspaceId: string, name: string): Promise<import("../lib/types").WorkspaceSummary> {
+    const res = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!res.ok) throw new Error(`renameWorkspace failed: ${res.status}`);
+    return res.json();
+  }
+
+  async switchWorkspace(workspaceId: string): Promise<import("../lib/types").WorkspaceState> {
+    const res = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/activate`, {
+      method: "POST",
+    });
+    if (!res.ok) throw new Error(`switchWorkspace failed: ${res.status}`);
+    return res.json();
   }
 
   async listBookmarks(): Promise<Bookmark[]> {

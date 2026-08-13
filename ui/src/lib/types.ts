@@ -13,6 +13,36 @@ export function randomId(): string {
   });
 }
 
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  roots: string[];
+  active_root: string | null;
+}
+
+export interface WorkspaceState {
+  active_workspace_id: string;
+  workspaces: WorkspaceSummary[];
+}
+
+export interface StartupAction {
+  label: string;
+  description: string;
+  command?: string;
+}
+
+export interface StartupBlocker {
+  id: string;
+  feature: string;
+  title: string;
+  message: string;
+  actions: StartupAction[];
+}
+
+export interface StartupStatus {
+  blockers: StartupBlocker[];
+}
+
 export interface ByteRange {
   start: number;
   end: number;

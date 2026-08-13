@@ -107,6 +107,7 @@ interface ChatStore {
   editMessage: (messageId: string, text: string) => Promise<void>;
   answerPermission: (requestId: string, option: ChatPermissionOption | null) => Promise<void>;
   cancel: () => Promise<void>;
+  resetForWorkspace: () => void;
 }
 
 function upsertTool(
@@ -715,4 +716,21 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       await chatApi.cancel(sessionId, currentTurnId).catch(console.error);
     }
   },
+  resetForWorkspace: () => set({
+    paneOpen: false,
+    paneOpening: false,
+    sessionId: null,
+    conversationId: null,
+    backendSessionId: null,
+    backend: null,
+    conversations: [],
+    conversationsLoading: false,
+    messages: [],
+    contextFiles: [],
+    activeDoc: null,
+    streaming: false,
+    currentTurnId: null,
+    sessionError: null,
+    configOptions: [],
+  }),
 }));

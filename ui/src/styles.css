@@ -84,16 +84,15 @@ body,
   background: var(--text-dim);
 }
 
-.folder-strip-scrollbar {
-  scrollbar-width: thin;
+.folder-strip-carousel {
+  scrollbar-width: none;
+  scroll-behavior: smooth;
+  scroll-padding-inline: 24px;
+  -ms-overflow-style: none;
 }
 
-.folder-strip-scrollbar::-webkit-scrollbar {
-  height: 5px;
-}
-
-.folder-strip-scrollbar::-webkit-scrollbar-thumb {
-  border-width: 1px;
+.folder-strip-carousel::-webkit-scrollbar {
+  display: none;
 }
 
 .selectable {

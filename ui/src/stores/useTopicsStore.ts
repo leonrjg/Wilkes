@@ -36,6 +36,7 @@ interface TopicsStore {
   setDocumentGranularity: (granularity: BookmarkClusterGranularity) => void;
   selectDocumentTopic: (clusterKey: string | null) => void;
   applyLabel: (event: ChunkTopicLabelled) => void;
+  resetForWorkspace: () => void;
 }
 
 function cancelRequest(requestId: string | null) {
@@ -199,4 +200,17 @@ export const useTopicsStore = create<TopicsStore>((set, get) => ({
           : {}),
       };
     }),
+  resetForWorkspace: () => {
+    cancelRequest(get().requestId);
+    cancelRequest(get().document.requestId);
+    set({
+      paneOpen: false,
+      loading: false,
+      requestId: null,
+      result: null,
+      root: null,
+      selectedTopicKey: null,
+      document: emptyDocumentState,
+    });
+  },
 }));
