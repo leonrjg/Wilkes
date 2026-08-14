@@ -40,6 +40,7 @@ import type {
   Match,
   MatchRef,
   OmittedFileEntry,
+  SearchFieldMatch,
   SourceOrigin,
 } from "../lib/types";
 import { api, isTauri, source } from "../services";
@@ -812,7 +813,11 @@ export default function ResultList({
     });
   };
 
-  const totalCount = results.reduce((n, fm) => n + fm.matches.length, 0);
+  const contentMatchCount = results.reduce((n, fm) => n + fm.matches.length, 0);
+  const totalCount = results.reduce(
+    (n, fm) => n + fm.matches.length + (fm.field_matches?.length ?? 0),
+    0,
+  );
   const hydeDocuments = stats?.hyde_documents ?? [];
   const handleClearResults = () => {
     setOpenSummaryKey(null);
@@ -830,7 +835,7 @@ export default function ResultList({
     stats &&
     stats.total_matches === totalCount &&
     summaryInput.query &&
-    totalCount > 0
+    contentMatchCount > 0
       ? searchResultsSummaryKey(summaryInput)
       : null;
   const summaryOpen =
@@ -1194,7 +1199,10 @@ export default function ResultList({
                   {row.kind === "file" ? (
                     <FileHeader
                       path={row.path}
-                      count={row.fileMatches.matches.length}
+                      count={
+                        row.fileMatches.matches.length +
+                        (row.fileMatches.field_matches?.length ?? 0)
+                      }
                       title={row.fileMatches.title}
                       additionalRoots={additionalRootsForPath(row.path)}
                       onClick={() => onFileClick(row.path)}
@@ -1209,6 +1217,17 @@ export default function ResultList({
                     <ExpandStrip
                       remaining={row.totalMatches - COLLAPSED_LIMIT}
                       onExpand={() => expandFile(row.fileIndex)}
+                    />
+                  ) : row.kind === "field_match" ? (
+                    <FieldMatchRow
+                      fieldMatch={row.fieldMatch}
+                      onClick={() => onFileClick(row.path)}
+                      onContextMenu={(event) =>
+                        handleRowContextMenu(event, {
+                          kind: "file",
+                          path: row.path,
+                          open: () => onFileClick(row.path),
+                        })}
                     />
                   ) : (
                     <MatchRow
@@ -1533,6 +1552,35 @@ function MatchRow({
       )}
       <span className="text-xs line-clamp-3 flex-1 font-mono break-all">
         {highlightMatch(match.context_before, match.matched_text, match.context_after)}
+      </span>
+    </button>
+  );
+}
+
+function FieldMatchRow({
+  fieldMatch,
+  onClick,
+  onContextMenu,
+}: {
+  fieldMatch: SearchFieldMatch;
+  onClick: () => void;
+  onContextMenu: (event: React.MouseEvent) => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      onContextMenu={onContextMenu}
+      className="w-full flex select-none items-start gap-2 px-3 py-1 text-left hover:bg-[var(--bg-hover)] transition-colors"
+    >
+      <span className="text-xs text-[var(--accent-blue)] w-10 flex-shrink-0 text-right pt-px">
+        {fieldMatch.field === "filename" ? "Name" : "Title"}
+      </span>
+      <span className="text-xs line-clamp-3 flex-1 break-all">
+        {highlightMatch(
+          fieldMatch.context_before,
+          fieldMatch.matched_text,
+          fieldMatch.context_after,
+        )}
       </span>
     </button>
   );

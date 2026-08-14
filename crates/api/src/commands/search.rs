@@ -14,8 +14,8 @@ use wilkes_core::search::grep::GrepSearchProvider;
 use wilkes_core::search::semantic::SemanticSearchProvider;
 use wilkes_core::search::{SearchOutcome, SearchProvider};
 use wilkes_core::types::{
-    FileMatches, IndexingConfig, RetrievalSettings, SearchLogStatus, SearchMode, SearchQuery,
-    SearchStats,
+    FileMatches, IndexingConfig, RetrievalSettings, SearchDocument, SearchLogStatus, SearchMode,
+    SearchQuery, SearchStats,
 };
 
 /// Handle to a running search. Dropping the handle cancels the search.
@@ -59,7 +59,8 @@ impl SearchHandle {
                         .ok()
                 })
                 .flatten()
-                .and_then(|cached| cached.metadata.title);
+                .and_then(|cached| cached.metadata.title)
+                .or(result.title);
         }
         Some(result)
     }
@@ -94,10 +95,10 @@ impl SearchHandle {
         let mut files_with_matches = 0;
 
         while let Some(fm) = self.next().await {
-            total_matches += fm.matches.len();
+            total_matches += fm.total_match_count();
             files_with_matches += 1;
             if let Some(log) = &mut self.log {
-                log.observe(fm.matches.len());
+                log.observe(fm.total_match_count());
             }
             if !on_result(fm).await {
                 self.rx.close();
@@ -143,12 +144,11 @@ impl SearchHandle {
 #[allow(clippy::too_many_arguments)]
 pub fn start_search(
     query: SearchQuery,
-    all_roots: Vec<std::path::PathBuf>,
-    all_root_errors: Vec<String>,
+    documents: Vec<SearchDocument>,
+    catalog_errors: Vec<String>,
     embedder: Option<Arc<dyn Embedder>>,
     index: Option<Arc<Mutex<Option<SemanticIndex>>>>,
     indexing: Option<IndexingConfig>,
-    eligible_paths: Option<std::collections::HashSet<std::path::PathBuf>>,
     log: Option<SearchLogTracker>,
     retrieval: RetrievalSettings,
     generator: Option<Arc<dyn Generator>>,
@@ -186,16 +186,19 @@ pub fn start_search(
                 // instead of re-extracting each file. `None` keeps every PDF on
                 // the live-extraction path.
                 let grep_index = if grep_use_index { index } else { None };
-                Box::new(
-                    GrepSearchProvider::with_all_roots(all_roots, all_root_errors)
-                        .with_index(grep_index),
-                )
+                Box::new(GrepSearchProvider::new().with_index(grep_index))
             }
         };
 
-        provider
-            .search(&query, &registry, tx, eligible_paths.as_ref())
-            .unwrap_or_else(|e| vec![format!("search failed: {e:#}")].into())
+        let mut outcome = provider
+            .search(&query, &registry, tx, &documents)
+            .unwrap_or_else(|e| vec![format!("search failed: {e:#}")].into());
+        if !catalog_errors.is_empty() {
+            let mut errors = catalog_errors;
+            errors.append(&mut outcome.errors);
+            outcome.errors = errors;
+        }
+        outcome
     });
 
     SearchHandle {
@@ -212,6 +215,14 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
     use wilkes_core::types::{DocumentMetadata, FileType};
+
+    fn text_document(path: std::path::PathBuf) -> SearchDocument {
+        SearchDocument {
+            path,
+            file_type: FileType::PlainText,
+            title: None,
+        }
+    }
 
     #[tokio::test]
     async fn search_handle_enriches_cached_titles_and_preserves_missing_titles() {
@@ -241,6 +252,7 @@ mod tests {
             path: path.clone(),
             file_type: FileType::PlainText,
             title: None,
+            field_matches: Vec::new(),
             matches: Vec::new(),
         })
         .await
@@ -249,6 +261,7 @@ mod tests {
             path: uncached_path,
             file_type: FileType::PlainText,
             title: None,
+            field_matches: Vec::new(),
             matches: Vec::new(),
         })
         .await
@@ -294,9 +307,8 @@ mod tests {
 
         let mut handle = start_search(
             query,
+            vec![text_document(root.join("test.txt"))],
             Vec::new(),
-            Vec::new(),
-            None,
             None,
             None,
             None,
@@ -346,7 +358,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             RetrievalSettings::default(),
             None,
             false,
@@ -381,9 +392,11 @@ mod tests {
 
         let handle = start_search(
             query,
+            vec![
+                text_document(root.join("test1.txt")),
+                text_document(root.join("test2.txt")),
+            ],
             Vec::new(),
-            Vec::new(),
-            None,
             None,
             None,
             None,
@@ -430,9 +443,8 @@ mod tests {
 
         let handle = start_search(
             query,
+            vec![text_document(dir.path().join("test.txt"))],
             Vec::new(),
-            Vec::new(),
-            None,
             None,
             None,
             None,
@@ -497,9 +509,11 @@ mod tests {
 
         let handle = start_search(
             query,
+            vec![
+                text_document(root.join("test1.txt")),
+                text_document(root.join("test2.txt")),
+            ],
             Vec::new(),
-            Vec::new(),
-            None,
             None,
             None,
             None,
@@ -545,7 +559,6 @@ mod tests {
             query,
             Vec::new(),
             Vec::new(),
-            None,
             None,
             None,
             None,

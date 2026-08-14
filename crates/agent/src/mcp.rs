@@ -832,10 +832,19 @@ struct SearchFileResponse {
 
 #[derive(Debug, Serialize)]
 struct SearchMatchResponse {
+    kind: SearchMatchKindResponse,
     text: String,
     line: Option<u32>,
     page: Option<u32>,
     score: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SearchMatchKindResponse {
+    Content,
+    Filename,
+    Title,
 }
 
 #[tool_router]
@@ -920,7 +929,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Search Wilkes-readable documents. You must explicitly set mode='exact' for literal/regex text search or mode='semantic' for meaning-based search; mode has no default. Set scope='all' to search every configured library root; omit scope to search the current root. If the user asks about a specific document, set file to that document path; omit file only for corpus-wide searches."
+        description = "Search Wilkes-readable documents, including direct filename and cached-title matches. You must explicitly set mode='exact' for literal/regex matching or mode='semantic' for meaning-based content search plus case-insensitive literal filename/title matching; mode has no default. Each returned match has kind='content', 'filename', or 'title'. Set scope='all' to search every configured library root; omit scope to search the current root. If the user asks about a specific document, set file to that document path; omit file only for corpus-wide searches."
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         match search_documents_for_mcp(self, params).await {
@@ -1368,7 +1377,7 @@ async fn search_documents(
         // than silently dropping — so leave the fields null and log it.
         match search.clone().document_metadata(path.clone()).await {
             Ok(metadata) => {
-                response.title = metadata.title;
+                response.title = metadata.title.or(response.title);
                 response.author = metadata.author;
                 response.doi = metadata.doi;
             }
@@ -1666,17 +1675,38 @@ fn build_search_query(
 
 impl From<wilkes_core::types::FileMatches> for SearchFileResponse {
     fn from(file: wilkes_core::types::FileMatches) -> Self {
+        let mut matches = file
+            .field_matches
+            .into_iter()
+            .map(SearchMatchResponse::from)
+            .collect::<Vec<_>>();
+        matches.extend(file.matches.into_iter().map(SearchMatchResponse::from));
         Self {
             path: display_path(&file.path),
             file_type: file.file_type,
-            title: None,
+            title: file.title,
             author: None,
             doi: None,
-            matches: file
-                .matches
-                .into_iter()
-                .map(SearchMatchResponse::from)
-                .collect(),
+            matches,
+        }
+    }
+}
+
+impl From<wilkes_core::types::SearchFieldMatch> for SearchMatchResponse {
+    fn from(matched: wilkes_core::types::SearchFieldMatch) -> Self {
+        let kind = match matched.field {
+            wilkes_core::types::SearchField::Filename => SearchMatchKindResponse::Filename,
+            wilkes_core::types::SearchField::Title => SearchMatchKindResponse::Title,
+        };
+        Self {
+            kind,
+            text: format!(
+                "{}{}{}",
+                matched.context_before, matched.matched_text, matched.context_after
+            ),
+            line: None,
+            page: None,
+            score: None,
         }
     }
 }
@@ -1694,6 +1724,7 @@ impl From<wilkes_core::types::Match> for SearchMatchResponse {
         text.push_str(&matched.matched_text);
         text.push_str(&matched.context_after);
         Self {
+            kind: SearchMatchKindResponse::Content,
             text,
             line,
             page,
@@ -1733,8 +1764,8 @@ mod tests {
     use tempfile::tempdir;
     use wilkes_core::types::{
         DocumentMetadata, FileEntry, FileListResponse, FileMatches, FileType, Match,
-        RelatedDocument, RelatedDocumentsQuery, SearchMode, SearchQuery, SearchScope, SearchStats,
-        SourceOrigin,
+        RelatedDocument, RelatedDocumentsQuery, SearchField, SearchFieldMatch, SearchMode,
+        SearchQuery, SearchScope, SearchStats, SourceOrigin,
     };
 
     struct FakeSearch {
@@ -2869,6 +2900,12 @@ mod tests {
                     path: path.clone(),
                     file_type: FileType::Pdf,
                     title: None,
+                    field_matches: vec![SearchFieldMatch {
+                        field: SearchField::Filename,
+                        matched_text: "paper".into(),
+                        context_before: String::new(),
+                        context_after: ".pdf".into(),
+                    }],
                     matches: vec![Match {
                         text_range: None,
                         matched_text: "IO programming".to_string(),
@@ -2883,7 +2920,7 @@ mod tests {
                 }],
                 stats: SearchStats {
                     files_scanned: 1,
-                    total_matches: 1,
+                    total_matches: 2,
                     elapsed_ms: 4,
                     errors: Vec::new(),
                     hyde_documents: Vec::new(),
@@ -2926,12 +2963,23 @@ mod tests {
         assert_eq!(response.root, display_path(&live_root));
         assert_eq!(response.matches.len(), 1);
         assert_eq!(response.matches[0].path, display_path(&path));
-        assert_eq!(response.matches[0].matches[0].page, Some(3));
         assert_eq!(
-            response.matches[0].matches[0].text,
+            response.matches[0].matches[0].kind,
+            SearchMatchKindResponse::Filename
+        );
+        assert_eq!(response.matches[0].matches[0].text, "paper.pdf");
+        assert_eq!(response.matches[0].matches[0].page, None);
+        assert_eq!(
+            response.matches[0].matches[1].kind,
+            SearchMatchKindResponse::Content
+        );
+        assert_eq!(response.matches[0].matches[1].page, Some(3));
+        assert_eq!(
+            response.matches[0].matches[1].text,
             "before IO programming after"
         );
-        let serialized = serde_json::to_value(&response.matches[0].matches[0]).unwrap();
+        let serialized = serde_json::to_value(&response.matches[0].matches[1]).unwrap();
+        assert_eq!(serialized["kind"], "content");
         assert!(serialized.get("context_before").is_none());
         assert!(serialized.get("context_after").is_none());
     }
@@ -3241,6 +3289,7 @@ mod tests {
                 path: path.clone(),
                 file_type: FileType::Pdf,
                 title: None,
+                field_matches: Vec::new(),
                 matches: vec![Match {
                     text_range: None,
                     matched_text: "hit".into(),

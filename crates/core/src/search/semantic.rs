@@ -2,12 +2,15 @@ use std::sync::{Arc, Mutex};
 
 use crate::extract::ExtractorRegistry;
 use crate::types::{
-    FileMatches, FileType, IndexingConfig, Match, RetrievalSettings, SearchCapabilities,
+    FileMatches, IndexingConfig, Match, RetrievalSettings, SearchCapabilities, SearchDocument,
     SearchQuery, SearchScope, SourceOrigin,
 };
 use tracing::{error, info, warn};
 
-use super::{SearchOutcome, SearchProvider, SearchResultTx};
+use super::{
+    document_field_matches, field_matcher, prioritize_and_limit_results, SearchOutcome,
+    SearchProvider, SearchResultTx,
+};
 use crate::embed::index::{SemanticIndex, SemanticQueryScope};
 use crate::embed::Embedder;
 use crate::generate::tasks::hypothetical_document;
@@ -255,7 +258,7 @@ impl SearchProvider for SemanticSearchProvider {
         query: &SearchQuery,
         _extractors: &ExtractorRegistry,
         tx: SearchResultTx,
-        eligible_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
+        documents: &[SearchDocument],
     ) -> anyhow::Result<SearchOutcome> {
         // 1. Reconcile the index with the current root before returning semantic
         // results. This blocks the first stale search so callers never see known-
@@ -275,6 +278,53 @@ impl SearchProvider for SemanticSearchProvider {
             )?
         };
 
+        use std::collections::HashMap;
+        let documents_by_path = documents
+            .iter()
+            .map(|document| (document.path.clone(), document))
+            .collect::<HashMap<_, _>>();
+        let mut file_order: Vec<std::path::PathBuf> = Vec::new();
+        let mut by_file: HashMap<std::path::PathBuf, FileMatches> = HashMap::new();
+        let field_matcher = field_matcher(query)?;
+        let mut field_match_count = 0usize;
+        for document in documents {
+            let field_matches = document_field_matches(&field_matcher, document)?;
+            if field_matches.is_empty() {
+                continue;
+            }
+            field_match_count += field_matches.len();
+            file_order.push(document.path.clone());
+            by_file.insert(
+                document.path.clone(),
+                FileMatches {
+                    path: document.path.clone(),
+                    file_type: document.file_type.clone(),
+                    title: document.title.clone(),
+                    field_matches,
+                    matches: Vec::new(),
+                },
+            );
+        }
+
+        // Direct identity hits own the first part of the global budget. When
+        // they exhaust it, avoid query embedding and vector retrieval entirely.
+        if query.max_results > 0 && field_match_count >= query.max_results {
+            let ordered = file_order
+                .into_iter()
+                .filter_map(|path| by_file.remove(&path))
+                .collect();
+            for result in prioritize_and_limit_results(ordered, query.max_results) {
+                if tx.is_closed() || tx.blocking_send(result).is_err() {
+                    break;
+                }
+            }
+            return Ok(SearchOutcome {
+                errors: reconcile_errors,
+                hyde_documents: Vec::new(),
+                files_scanned: None,
+            });
+        }
+
         // 2. Form the query vector. The raw query embedding is the base; HyDE
         // then PRF (each optional) reshape it before the authoritative lookup.
         // Neither adds a ranking stage after retrieval — the index still owns
@@ -282,7 +332,11 @@ impl SearchProvider for SemanticSearchProvider {
         info!("[semantic] embedding query...");
         let base_vec = self.embed_query_vector(query.pattern.as_str())?;
         let (hyde_vec, hyde_documents) = self.apply_hyde(query.pattern.as_str(), base_vec);
-        let query_vec = self.apply_prf(&hyde_vec, query, eligible_paths)?;
+        let eligible_paths = documents
+            .iter()
+            .map(|document| document.path.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let query_vec = self.apply_prf(&hyde_vec, query, Some(&eligible_paths))?;
         info!("[semantic] query vector ready, running index query");
 
         // 3. Lock the index and run the nearest-neighbour query.
@@ -291,20 +345,25 @@ impl SearchProvider for SemanticSearchProvider {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Semantic index is not built yet"))?;
 
-        let top_k = query.max_results;
-        let results =
-            idx.query_scoped_filtered(&query_vec, top_k, query_scope(query), eligible_paths, None)?;
+        let top_k = if query.max_results == 0 {
+            0
+        } else {
+            query.max_results - field_match_count
+        };
+        let results = idx.query_scoped_filtered(
+            &query_vec,
+            top_k,
+            query_scope(query),
+            Some(&eligible_paths),
+            None,
+        )?;
         drop(guard);
 
-        // 4. Convert IndexedChunk results into FileMatches / Match.
-        //    Group by file path, preserving score-ranked order across files.
-        use std::collections::HashMap;
-        let mut by_file: HashMap<std::path::PathBuf, (FileType, Vec<Match>)> = HashMap::new();
-        let mut file_order: Vec<std::path::PathBuf> = Vec::new();
-
+        // 4. Seed direct filename/title hits in catalog order, then merge
+        // score-ranked content chunks into those files or append content-only
+        // files. This guarantees one result object per document.
         for chunk in results {
-            let Some(file_type) = FileType::detect(&chunk.file_path, &query.supported_extensions)
-            else {
+            let Some(document) = documents_by_path.get(&chunk.file_path) else {
                 continue;
             };
 
@@ -324,24 +383,28 @@ impl SearchProvider for SemanticSearchProvider {
 
             if !by_file.contains_key(&chunk.file_path) {
                 file_order.push(chunk.file_path.clone());
+                by_file.insert(
+                    chunk.file_path.clone(),
+                    FileMatches {
+                        path: chunk.file_path.clone(),
+                        file_type: document.file_type.clone(),
+                        title: document.title.clone(),
+                        field_matches: Vec::new(),
+                        matches: Vec::new(),
+                    },
+                );
             }
-            let entry = by_file
-                .entry(chunk.file_path)
-                .or_insert_with(|| (file_type, Vec::new()));
-            entry.1.push(m);
+            by_file.get_mut(&chunk.file_path).unwrap().matches.push(m);
         }
 
-        for path in file_order {
+        let ordered = file_order
+            .into_iter()
+            .filter_map(|path| by_file.remove(&path))
+            .collect();
+        for fm in prioritize_and_limit_results(ordered, query.max_results) {
             if tx.is_closed() {
                 break;
             }
-            let (file_type, matches) = by_file.remove(&path).unwrap();
-            let fm = FileMatches {
-                path,
-                file_type,
-                title: None,
-                matches,
-            };
             if tx.blocking_send(fm).is_err() {
                 break;
             }
@@ -492,6 +555,31 @@ mod tests {
         }
     }
 
+    fn test_documents(query: &SearchQuery) -> Vec<SearchDocument> {
+        let paths: Vec<std::path::PathBuf> = match &query.scope {
+            SearchScope::File { path } => vec![path.clone()],
+            SearchScope::Corpus => ignore::WalkBuilder::new(&query.root)
+                .build()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_file())
+                .map(|entry| entry.into_path())
+                .collect(),
+            SearchScope::All => Vec::new(),
+        };
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                crate::types::FileType::detect(&path, &query.supported_extensions).map(
+                    |file_type| SearchDocument {
+                        path: std::fs::canonicalize(&path).unwrap_or(path),
+                        file_type,
+                        title: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
     async fn collect(
         handle: tokio::task::JoinHandle<SearchOutcome>,
         mut rx: tokio::sync::mpsc::Receiver<FileMatches>,
@@ -560,8 +648,9 @@ mod tests {
         let query = text_query(dir.path());
         let (tx, rx) = tokio::sync::mpsc::channel(10);
         let handle = tokio::task::spawn_blocking(move || {
+            let documents = test_documents(&query);
             provider
-                .search(&query, &ExtractorRegistry::new(), tx, None)
+                .search(&query, &ExtractorRegistry::new(), tx, &documents)
                 .unwrap()
         });
         let (results, outcome) = collect(handle, rx).await;
@@ -598,8 +687,9 @@ mod tests {
         let query = text_query(dir.path());
         let (tx, rx) = tokio::sync::mpsc::channel(10);
         let handle = tokio::task::spawn_blocking(move || {
+            let documents = test_documents(&query);
             provider
-                .search(&query, &ExtractorRegistry::new(), tx, None)
+                .search(&query, &ExtractorRegistry::new(), tx, &documents)
                 .unwrap()
         });
         let (results, outcome) = collect(handle, rx).await;
@@ -646,8 +736,9 @@ mod tests {
         let query = text_query(dir.path());
         let (tx, rx) = tokio::sync::mpsc::channel(10);
         let handle = tokio::task::spawn_blocking(move || {
+            let documents = test_documents(&query);
             provider
-                .search(&query, &ExtractorRegistry::new(), tx, None)
+                .search(&query, &ExtractorRegistry::new(), tx, &documents)
                 .unwrap()
         });
         let (results, outcome) = collect(handle, rx).await;
@@ -685,8 +776,9 @@ mod tests {
         let query = text_query(dir.path());
         let (tx, rx) = tokio::sync::mpsc::channel(10);
         let handle = tokio::task::spawn_blocking(move || {
+            let documents = test_documents(&query);
             provider
-                .search(&query, &ExtractorRegistry::new(), tx, None)
+                .search(&query, &ExtractorRegistry::new(), tx, &documents)
                 .unwrap()
         });
         let (results, outcome) = collect(handle, rx).await;
@@ -766,7 +858,7 @@ mod tests {
             tag_ids: Vec::new(),
         };
 
-        let res = provider.search(&query, &ExtractorRegistry::new(), tx, None);
+        let res = provider.search(&query, &ExtractorRegistry::new(), tx, &[]);
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("not built yet"));
     }
@@ -830,8 +922,9 @@ mod tests {
         };
 
         let provider_handle = tokio::task::spawn_blocking(move || {
+            let documents = test_documents(&query);
             provider
-                .search(&query, &ExtractorRegistry::new(), tx, None)
+                .search(&query, &ExtractorRegistry::new(), tx, &documents)
                 .unwrap();
         });
 
@@ -845,6 +938,43 @@ mod tests {
         assert_eq!(results[0].path, std::fs::canonicalize(path).unwrap());
         assert_eq!(results[0].matches.len(), 1);
         assert_eq!(results[0].matches[0].matched_text, "hello world");
+    }
+
+    #[tokio::test]
+    async fn semantic_search_prioritizes_case_insensitive_filename_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (idx, path) = index_with_one_text_chunk(&dir);
+        let provider = SemanticSearchProvider::new(
+            Arc::new(MockEmbedder),
+            Arc::new(Mutex::new(Some(idx))),
+            indexing_config(vec!["txt".to_string()]),
+        );
+        let mut query = text_query(dir.path());
+        query.pattern = "DOC".into();
+        query.max_results = 1;
+        let canonical_path = std::fs::canonicalize(&path).unwrap();
+        let documents = vec![SearchDocument {
+            path: canonical_path.clone(),
+            file_type: crate::types::FileType::PlainText,
+            title: Some("Unrelated title".into()),
+        }];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+
+        let handle = tokio::task::spawn_blocking(move || {
+            provider
+                .search(&query, &ExtractorRegistry::new(), tx, &documents)
+                .unwrap()
+        });
+        let result = rx.recv().await.unwrap();
+        assert_eq!(result.path, canonical_path);
+        assert_eq!(result.field_matches.len(), 1);
+        assert_eq!(
+            result.field_matches[0].field,
+            crate::types::SearchField::Filename
+        );
+        assert!(result.matches.is_empty());
+        assert!(rx.recv().await.is_none());
+        handle.await.unwrap();
     }
 
     struct TinyMockEmbedder;
@@ -957,8 +1087,9 @@ mod tests {
         };
 
         let provider_handle = tokio::task::spawn_blocking(move || {
+            let documents = test_documents(&query);
             provider
-                .search(&query, &ExtractorRegistry::new(), tx, None)
+                .search(&query, &ExtractorRegistry::new(), tx, &documents)
                 .unwrap();
         });
 

@@ -232,10 +232,13 @@ export function buildSearchResultsChatPrompt(
   query: string,
   results: FileMatches[],
 ): string {
-  const paths = [...new Set(results.map((result) => result.path))].slice(
-    0,
-    SUMMARY_MAX_CHAT_SOURCES,
-  );
+  const paths = [
+    ...new Set(
+      results
+        .filter((result) => result.matches.length > 0)
+        .map((result) => result.path),
+    ),
+  ].slice(0, SUMMARY_MAX_CHAT_SOURCES);
   const files =
     paths.length > 0
       ? `\n\nSearch result files:\n${paths.map((path) => `- ${path}`).join("\n")}`

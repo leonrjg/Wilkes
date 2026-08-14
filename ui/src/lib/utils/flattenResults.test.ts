@@ -65,4 +65,37 @@ describe("flattenResults", () => {
     expect(rows).toHaveLength(1 + matches.length);
     expect(rows.some(r => r.kind === "expand")).toBe(false);
   });
+
+  it("places filename and title hits before content and counts them toward collapse", () => {
+    const results: FileMatches[] = [{
+      path: "report.txt",
+      file_type: "PlainText",
+      field_matches: [
+        { field: "filename", matched_text: "report", context_before: "", context_after: ".txt" },
+        { field: "title", matched_text: "Report", context_before: "Annual ", context_after: "" },
+      ],
+      matches: Array.from({ length: COLLAPSED_LIMIT }, (_, index) => ({
+        matched_text: `m${index}`,
+        context_before: "",
+        context_after: "",
+        origin: { TextFile: { line: index + 1, col: 1 } },
+        text_range: { start: 0, end: 2 },
+      })),
+    }];
+
+    const rows = buildRows(results, new Set());
+
+    expect(rows.slice(1, 3).map((row) => row.kind)).toEqual([
+      "field_match",
+      "field_match",
+    ]);
+    expect(rows.filter((row) => row.kind === "match")).toHaveLength(
+      COLLAPSED_LIMIT - 2,
+    );
+    expect(rows.at(-1)).toEqual({
+      kind: "expand",
+      fileIndex: 0,
+      totalMatches: COLLAPSED_LIMIT + 2,
+    });
+  });
 });

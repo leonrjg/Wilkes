@@ -49,10 +49,10 @@ use wilkes_core::types::{
     ChunkTopicMember, ChunkTopicsQuery, ChunkTopicsResult, CitationLinks, CitationLinksQuery,
     CitationReference, CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbedderModel,
     FileEntry, FileListResponse, FileType, IndexStatus, IndexingConfig, MetadataConflictValue,
-    MetadataSourcePreference, NewBookmark, NewSmartCollection, NewTag, PreviewData,
-    RelatedDocument, RelatedDocumentsQuery, SearchLogEntry, SearchMode, SearchQuery, SearchScope,
-    SelectedEmbedder, SemanticSettings, Settings, SmartCollection, Tag, TopicLibraryCoverage,
-    UpdateSmartCollection, UpdateTag,
+    MetadataSourcePreference, NewBookmark, NewSmartCollection, NewTag, OmittedFileReason,
+    PreviewData, RelatedDocument, RelatedDocumentsQuery, SearchDocument, SearchLogEntry,
+    SearchMode, SearchQuery, SearchScope, SelectedEmbedder, SemanticSettings, Settings,
+    SmartCollection, Tag, TopicLibraryCoverage, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::types::{
     GenerationSettings, GenerationStreamEvent, GenerationTask, GeneratorDescriptor,
@@ -1454,11 +1454,30 @@ impl AppContext {
         tag_ids: &[String],
         collection_expression: Option<&str>,
     ) -> anyhow::Result<wilkes_core::types::FileListResponse> {
+        self.list_files_filtered_with_ignore(
+            root,
+            collection_id,
+            tag_ids,
+            collection_expression,
+            true,
+        )
+        .await
+    }
+
+    async fn list_files_filtered_with_ignore(
+        &self,
+        root: PathBuf,
+        collection_id: Option<&str>,
+        tag_ids: &[String],
+        collection_expression: Option<&str>,
+        respect_gitignore: bool,
+    ) -> anyhow::Result<wilkes_core::types::FileListResponse> {
         let s = self.get_settings().await;
-        let mut response = crate::commands::files::list_files(
+        let mut response = crate::commands::files::list_files_with_ignore(
             root.clone(),
             s.supported_extensions.clone(),
             s.max_file_size,
+            respect_gitignore,
         )
         .await?;
 
@@ -3125,25 +3144,57 @@ impl AppContext {
                 .unwrap_or_else(|| vec![query.root.clone()]),
             SearchScope::Corpus => vec![query.root.clone()],
         };
-        let eligible_paths = if query.collection_id.is_some() || !query.tag_ids.is_empty() {
-            Some(
-                self.eligible_paths_for_filters(
+        let mut documents = Vec::new();
+        let mut catalog_errors = Vec::new();
+        let mut seen_paths = std::collections::HashSet::new();
+        for root in &eligibility_roots {
+            match self
+                .list_files_filtered_with_ignore(
+                    root.clone(),
                     query.collection_id.as_deref(),
                     &query.tag_ids,
-                    &eligibility_roots,
+                    None,
+                    query.respect_gitignore && !matches!(query.scope, SearchScope::File { .. }),
                 )
-                .await?,
-            )
-        } else {
-            None
-        };
+                .await
+            {
+                Ok(listed) => {
+                    if let SearchScope::File { path } = &query.scope {
+                        if let Some(omitted) =
+                            listed.omitted.iter().find(|entry| entry.file.path == *path)
+                        {
+                            if omitted.reason == OmittedFileReason::TooLarge {
+                                catalog_errors.push(format!(
+                                    "Search file exceeds the configured maximum size ({} bytes > {} bytes): {}",
+                                    omitted.file.size_bytes,
+                                    settings.max_file_size,
+                                    path.display()
+                                ));
+                            }
+                        }
+                    }
+                    for entry in listed.files {
+                        if matches!(&query.scope, SearchScope::File { path } if entry.path != *path)
+                        {
+                            continue;
+                        }
+                        if seen_paths.insert(entry.path.clone()) {
+                            documents.push(SearchDocument {
+                                path: entry.path,
+                                file_type: entry.file_type,
+                                title: entry.title,
+                            });
+                        }
+                    }
+                }
+                Err(error) => catalog_errors.push(format!("{}: {error:#}", root.display())),
+            }
+        }
 
         let mut semantic_indexing = None;
-        let (all_roots, all_root_errors) = if query.scope == SearchScope::All {
-            (resolved_library_roots, library_root_errors)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        if query.scope == SearchScope::All {
+            catalog_errors.splice(0..0, library_root_errors);
+        }
         let (embedder, index) = if query.mode == SearchMode::Semantic {
             let runtime = if query.scope == SearchScope::All {
                 self.prepare_global_semantic_runtime(&settings).await?
@@ -3180,12 +3231,11 @@ impl AppContext {
         let primary_metadata_source = metadata_source_preference(&settings.primary_metadata_source);
         Ok(start_search(
             query,
-            all_roots,
-            all_root_errors,
+            documents,
+            catalog_errors,
             embedder,
             index,
             semantic_indexing,
-            eligible_paths,
             log,
             retrieval,
             generator,
@@ -7438,6 +7488,9 @@ exit 0
     #[tokio::test]
     async fn test_start_search_grep() {
         let dir = tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "body without the query terms").unwrap();
+        let canonical_path = std::fs::canonicalize(&path).unwrap();
         let emitter = Arc::new(MockEmitter {
             events: Arc::new(Mutex::new(Vec::new())),
         });
@@ -7460,9 +7513,24 @@ exit 0
         )
         .await
         .unwrap();
+        let identity = FileIdentity::for_path(&canonical_path).unwrap();
+        ctx.metadata_cache()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .upsert(
+                &canonical_path,
+                identity,
+                &DocumentMetadata {
+                    title: Some("Composed Search Title".into()),
+                    ..DocumentMetadata::default()
+                },
+                MetadataSource::File,
+            )
+            .unwrap();
 
         let query = SearchQuery {
-            pattern: "test".to_string(),
+            pattern: "composed search title".to_string(),
             is_regex: false,
             case_sensitive: false,
             root: dir.path().to_path_buf(),
@@ -7477,9 +7545,17 @@ exit 0
             tag_ids: Vec::new(),
         };
 
-        let handle = ctx.clone().start_search(query).await.unwrap();
-        // SearchHandle only has rx field (mpsc::Receiver)
-        drop(handle);
+        let mut handle = ctx.clone().start_search(query).await.unwrap();
+        let result = handle.next().await.unwrap();
+        assert_eq!(result.path, canonical_path);
+        assert!(result.matches.is_empty());
+        assert_eq!(result.field_matches.len(), 1);
+        assert_eq!(
+            result.field_matches[0].field,
+            wilkes_core::types::SearchField::Title
+        );
+        assert!(handle.next().await.is_none());
+        assert!(handle.finish().await.is_empty());
     }
 
     #[test]

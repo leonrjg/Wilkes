@@ -1,25 +1,26 @@
 use crate::embed::index::SemanticIndex;
 use crate::extract::ExtractorRegistry;
 use crate::types::{
-    ByteRange, FileMatches, FileType, Match, SearchCapabilities, SearchQuery, SearchScope,
+    ByteRange, FileMatches, FileType, Match, SearchCapabilities, SearchDocument, SearchQuery,
     SourceMap, SourceOrigin,
 };
 use grep_matcher::Matcher;
-use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_regex::RegexMatcher;
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
-use ignore::{WalkBuilder, WalkState};
+use rayon::prelude::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{SearchOutcome, SearchProvider, SearchResultTx};
+use super::{
+    document_field_matches, exact_matcher, prioritize_and_limit_results, SearchOutcome,
+    SearchProvider, SearchResultTx,
+};
 
 /// Shared handle to the live semantic index, as held by the API layer.
 type IndexHandle = Arc<Mutex<Option<SemanticIndex>>>;
 
 pub struct GrepSearchProvider {
-    all_roots: Vec<std::path::PathBuf>,
-    all_root_errors: Vec<String>,
     /// When set, PDF matches are found against text the index already holds
     /// instead of re-extracting the file. Files the index does not hold (or that
     /// changed on disk) fall back to live extraction. `None` disables this and
@@ -29,22 +30,7 @@ pub struct GrepSearchProvider {
 
 impl GrepSearchProvider {
     pub fn new() -> Self {
-        Self {
-            all_roots: Vec::new(),
-            all_root_errors: Vec::new(),
-            index: None,
-        }
-    }
-
-    pub fn with_all_roots(
-        all_roots: Vec<std::path::PathBuf>,
-        all_root_errors: Vec<String>,
-    ) -> Self {
-        Self {
-            all_roots,
-            all_root_errors,
-            index: None,
-        }
+        Self { index: None }
     }
 
     /// Enable index-backed exact search: PDF matches are read from the semantic
@@ -55,18 +41,7 @@ impl GrepSearchProvider {
     }
 
     fn build_matcher(query: &SearchQuery) -> anyhow::Result<RegexMatcher> {
-        let pattern = if query.is_regex {
-            query.pattern.clone()
-        } else {
-            let escaped = regex::escape(&query.pattern);
-            // Replace literal spaces with \s+ to handle varying whitespace/newlines
-            // in all file types (especially PDFs).
-            escaped.replace(" ", r"\s+")
-        };
-        let matcher = RegexMatcherBuilder::new()
-            .case_insensitive(!query.case_sensitive)
-            .build(&pattern)?;
-        Ok(matcher)
+        exact_matcher(query)
     }
 }
 
@@ -82,107 +57,90 @@ impl SearchProvider for GrepSearchProvider {
         query: &SearchQuery,
         extractors: &ExtractorRegistry,
         tx: SearchResultTx,
-        eligible_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
+        documents: &[SearchDocument],
     ) -> anyhow::Result<SearchOutcome> {
         let matcher = Self::build_matcher(query)?;
-        let total_matches = AtomicUsize::new(0);
+        let errors = Mutex::new(Vec::new());
         let files_scanned = AtomicUsize::new(0);
-        let errors = Mutex::new(if query.scope == SearchScope::All {
-            self.all_root_errors.clone()
-        } else {
-            Vec::new()
-        });
-
         let index = self.index.as_ref();
-
-        // A single-file scope has nothing to walk in parallel.
-        if let SearchScope::File { path } = &query.scope {
-            let _ = search_path(
-                path,
-                query,
-                extractors,
-                &matcher,
-                &tx,
-                &total_matches,
-                &files_scanned,
-                &errors,
-                eligible_paths,
-                index,
-            )?;
-            return Ok(SearchOutcome {
-                errors: errors.into_inner().unwrap(),
-                hyde_documents: Vec::new(),
-                files_scanned: Some(files_scanned.load(Ordering::Relaxed)),
-            });
-        }
-
-        // Resolve the root set: the single root for Corpus, every library root
-        // for All.
-        let (first, rest): (&Path, &[std::path::PathBuf]) = match &query.scope {
-            SearchScope::Corpus => (query.root.as_path(), &[]),
-            SearchScope::All => self
-                .all_roots
-                .split_first()
-                .map(|(first, rest)| (first.as_path(), rest))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("No accessible library directories are configured")
-                })?,
-            SearchScope::File { .. } => unreachable!("File scope handled above"),
+        let field_matches_by_document = documents
+            .iter()
+            .map(|document| document_field_matches(&matcher, document))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let field_match_count = field_matches_by_document
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>();
+        let content_budget = if query.max_results == 0 {
+            usize::MAX
+        } else {
+            query.max_results.saturating_sub(field_match_count)
         };
-
-        let mut builder = WalkBuilder::new(first);
-        for root in rest {
-            builder.add(root);
-        }
-        builder.git_ignore(query.respect_gitignore).hidden(false);
-
-        // Fan the walk across a thread pool. PDF extraction dominates grep cost
-        // and is independent per file, so this is where the wall-clock win comes
-        // from. Match count and errors are shared synchronized state; result
-        // ordering is not preserved, which is fine because matches already stream
-        // to the caller as they are found rather than being returned as a batch.
-        builder.build_parallel().run(|| {
-            Box::new(|entry| {
+        let remaining_content_budget = AtomicUsize::new(content_budget);
+        let mut results: Vec<(usize, FileMatches)> = documents
+            .par_iter()
+            .enumerate()
+            .filter_map(|(catalog_index, document)| {
                 if tx.is_closed() {
-                    return WalkState::Quit;
+                    return None;
                 }
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(_) => return WalkState::Continue,
-                };
-                let path = entry.path();
-                if !path.is_file() {
-                    return WalkState::Continue;
+                let field_matches = field_matches_by_document[catalog_index].clone();
+                if remaining_content_budget.load(Ordering::Relaxed) == 0 {
+                    return (!field_matches.is_empty()).then(|| {
+                        (
+                            catalog_index,
+                            FileMatches {
+                                path: document.path.clone(),
+                                file_type: document.file_type.clone(),
+                                title: document.title.clone(),
+                                field_matches,
+                                matches: Vec::new(),
+                            },
+                        )
+                    });
                 }
-                match search_path(
-                    path,
-                    query,
-                    extractors,
-                    &matcher,
-                    &tx,
-                    &total_matches,
-                    &files_scanned,
-                    &errors,
-                    eligible_paths,
-                    index,
-                ) {
-                    // Stop the whole walk: max_results reached or receiver closed.
-                    Ok(true) => WalkState::Quit,
-                    Ok(false) => WalkState::Continue,
-                    // The pattern was already validated by build_matcher, so an
-                    // Err here is a single-file failure that must not abort the
-                    // rest of the search. Log and record it, then keep walking.
-                    Err(err) => {
-                        tracing::error!("grep error at {}: {err:#}", path.display());
-                        errors
-                            .lock()
-                            .unwrap()
-                            .push(format!("{}: {err:#}", path.display()));
-                        WalkState::Continue
-                    }
+                files_scanned.fetch_add(1, Ordering::Relaxed);
+                let mut matches =
+                    match search_document_content(document, query, extractors, &matcher, index) {
+                        Ok(matches) => matches,
+                        Err(err) => {
+                            errors
+                                .lock()
+                                .unwrap()
+                                .push(format!("{}: {err:#}", document.path.display()));
+                            Vec::new()
+                        }
+                    };
+                let available_matches = matches.len();
+                matches.truncate(claim_match_budget(
+                    &remaining_content_budget,
+                    available_matches,
+                ));
+                if field_matches.is_empty() && matches.is_empty() {
+                    return None;
                 }
+                Some((
+                    catalog_index,
+                    FileMatches {
+                        path: document.path.clone(),
+                        file_type: document.file_type.clone(),
+                        title: document.title.clone(),
+                        field_matches,
+                        matches,
+                    },
+                ))
             })
-        });
+            .collect();
+        results.sort_by_key(|(catalog_index, _)| *catalog_index);
+        let results = prioritize_and_limit_results(
+            results.into_iter().map(|(_, result)| result).collect(),
+            query.max_results,
+        );
+        for result in results {
+            if tx.is_closed() || tx.blocking_send(result).is_err() {
+                break;
+            }
+        }
 
         Ok(SearchOutcome {
             errors: errors.into_inner().unwrap(),
@@ -214,58 +172,40 @@ impl SearchProvider for GrepSearchProvider {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn search_path(
-    path: &Path,
+fn claim_match_budget(remaining: &AtomicUsize, requested: usize) -> usize {
+    if remaining.load(Ordering::Relaxed) == usize::MAX {
+        return requested;
+    }
+    loop {
+        let available = remaining.load(Ordering::Relaxed);
+        let claimed = available.min(requested);
+        if remaining
+            .compare_exchange_weak(
+                available,
+                available - claimed,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return claimed;
+        }
+    }
+}
+
+fn search_document_content(
+    document: &SearchDocument,
     query: &SearchQuery,
     extractors: &ExtractorRegistry,
     matcher: &RegexMatcher,
-    tx: &SearchResultTx,
-    total_matches: &AtomicUsize,
-    files_scanned: &AtomicUsize,
-    errors: &Mutex<Vec<String>>,
-    eligible_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
     index: Option<&IndexHandle>,
-) -> anyhow::Result<bool> {
-    if tx.is_closed() {
-        return Ok(true);
-    }
-
-    if !path.is_file() {
-        return Ok(false);
-    }
-
-    if eligible_paths.is_some_and(|eligible| !eligible.contains(path)) {
-        return Ok(false);
-    }
-
-    if query.max_file_size > 0 {
-        if let Ok(meta) = path.metadata() {
-            if meta.len() > query.max_file_size {
-                if matches!(query.scope, SearchScope::File { .. }) {
-                    errors.lock().unwrap().push(format!(
-                        "Search file exceeds the configured maximum size ({} bytes > {} bytes): {}",
-                        meta.len(),
-                        query.max_file_size,
-                        path.display()
-                    ));
-                }
-                return Ok(false);
-            }
-        }
-    }
-
-    let Some(file_type) = FileType::detect(path, &query.supported_extensions) else {
-        return Ok(false);
-    };
-
-    files_scanned.fetch_add(1, Ordering::Relaxed);
-
-    let matches = match &file_type {
+) -> anyhow::Result<Vec<Match>> {
+    let path = document.path.as_path();
+    match &document.file_type {
         // Plain text is memory-mapped and already fast; it also carries exact
         // line/column origins that the chunk-granular index cannot reproduce, so
         // it never uses the index regardless of the setting.
-        FileType::PlainText => search_text_file(path, matcher, query.context_lines as u64)?,
+        FileType::PlainText => search_text_file(path, matcher, query.context_lines as u64),
         FileType::Pdf => {
             // Prefer text the index already holds. A genuine index fault is
             // logged and demoted to live extraction rather than failing the
@@ -280,46 +220,11 @@ fn search_path(
                 })
             });
             match from_index {
-                Some(matches) => matches,
-                None => match live_pdf_matches(path, extractors, matcher) {
-                    Ok(matches) => matches,
-                    Err(e) => {
-                        errors
-                            .lock()
-                            .unwrap()
-                            .push(format!("{}: {e:#}", path.display()));
-                        return Ok(false);
-                    }
-                },
+                Some(matches) => Ok(matches),
+                None => live_pdf_matches(path, extractors, matcher),
             }
         }
-    };
-
-    if matches.is_empty() {
-        return Ok(false);
     }
-
-    // Atomically claim this file's matches against the global budget. Reserving
-    // before sending is what keeps `max_results` a hard cap under parallelism:
-    // if another worker already spent the budget, `previous` is past the limit
-    // and we drop this file instead of racing an extra result past the cap.
-    let previous = total_matches.fetch_add(matches.len(), Ordering::Relaxed);
-    if query.max_results > 0 && previous >= query.max_results {
-        return Ok(true);
-    }
-
-    let running_total = previous + matches.len();
-    let file_matches = FileMatches {
-        path: path.to_path_buf(),
-        file_type,
-        title: None,
-        matches,
-    };
-    if tx.blocking_send(file_matches).is_err() {
-        return Ok(true);
-    }
-
-    Ok(query.max_results > 0 && running_total >= query.max_results)
 }
 
 // ── Text file search ──────────────────────────────────────────────────────────
@@ -522,9 +427,41 @@ fn extract_context_after(text: &str, byte_pos: usize, max_chars: usize) -> Strin
 mod tests {
     use super::*;
     use crate::extract::{ContentExtractor, ExtractorRegistry};
-    use crate::types::ExtractedContent;
+    use crate::types::{ExtractedContent, SearchScope};
     use std::fs;
     use tempfile::tempdir;
+
+    fn test_document(path: std::path::PathBuf, query: &SearchQuery) -> SearchDocument {
+        SearchDocument {
+            file_type: FileType::detect(&path, &query.supported_extensions).unwrap(),
+            path,
+            title: None,
+        }
+    }
+
+    fn test_documents(query: &SearchQuery) -> Vec<SearchDocument> {
+        let paths: Vec<std::path::PathBuf> = match &query.scope {
+            SearchScope::File { path } => vec![path.clone()],
+            SearchScope::Corpus => ignore::WalkBuilder::new(&query.root)
+                .build()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_file())
+                .map(|entry| entry.into_path())
+                .collect(),
+            SearchScope::All => Vec::new(),
+        };
+        paths
+            .into_iter()
+            .filter(|path| {
+                query.max_file_size == 0
+                    || path
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.len() <= query.max_file_size)
+            })
+            .filter(|path| FileType::detect(path, &query.supported_extensions).is_some())
+            .map(|path| test_document(path, query))
+            .collect()
+    }
 
     #[test]
     fn test_build_matcher() {
@@ -727,7 +664,9 @@ mod tests {
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let extractors = ExtractorRegistry::new();
-        let outcome = provider.search(&query, &extractors, tx, None).unwrap();
+        let outcome = provider
+            .search(&query, &extractors, tx, &test_documents(&query))
+            .unwrap();
 
         let mut results = Vec::new();
         while let Some(m) = rx.blocking_recv() {
@@ -741,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn file_scoped_search_reports_oversized_file() {
+    fn file_scoped_search_uses_catalog_size_exclusion() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("large.txt");
         fs::write(&path, "match but too large").unwrap();
@@ -765,15 +704,17 @@ mod tests {
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let outcome = provider
-            .search(&query, &ExtractorRegistry::new(), tx, None)
+            .search(
+                &query,
+                &ExtractorRegistry::new(),
+                tx,
+                &test_documents(&query),
+            )
             .unwrap();
 
         assert!(rx.blocking_recv().is_none());
         assert_eq!(outcome.files_scanned, Some(0));
-        assert_eq!(outcome.errors.len(), 1);
-        assert!(outcome.errors[0].contains("exceeds the configured maximum size"));
-        assert!(outcome.errors[0].contains("19 bytes > 10 bytes"));
-        assert!(outcome.errors[0].contains(&path.display().to_string()));
+        assert!(outcome.errors.is_empty());
     }
 
     #[test]
@@ -800,7 +741,12 @@ mod tests {
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let outcome = provider
-            .search(&query, &ExtractorRegistry::new(), tx, None)
+            .search(
+                &query,
+                &ExtractorRegistry::new(),
+                tx,
+                &test_documents(&query),
+            )
             .unwrap();
 
         assert!(rx.blocking_recv().is_none());
@@ -834,10 +780,18 @@ mod tests {
             tag_ids: Vec::new(),
         };
 
-        let provider = GrepSearchProvider::with_all_roots(vec![first, second], Vec::new());
+        let documents = vec![
+            test_document(first.join("a.txt"), &query),
+            test_document(second.join("b.txt"), &query),
+        ];
+        let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let extractors = ExtractorRegistry::new();
-        std::thread::spawn(move || provider.search(&query, &extractors, tx, None).unwrap());
+        std::thread::spawn(move || {
+            provider
+                .search(&query, &extractors, tx, &documents)
+                .unwrap()
+        });
 
         let mut results = Vec::new();
         while let Some(result) = rx.blocking_recv() {
@@ -877,7 +831,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let extractors = ExtractorRegistry::new();
         std::thread::spawn(move || {
-            provider.search(&query, &extractors, tx, None).unwrap();
+            let documents = test_documents(&query);
+            provider
+                .search(&query, &extractors, tx, &documents)
+                .unwrap();
         });
 
         let mut results = Vec::new();
@@ -950,7 +907,10 @@ mod tests {
         let provider = GrepSearchProvider::new().with_index(Some(handle));
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         std::thread::spawn(move || {
-            provider.search(&query, &extractors, tx, None).unwrap();
+            let documents = test_documents(&query);
+            provider
+                .search(&query, &extractors, tx, &documents)
+                .unwrap();
         });
 
         let mut results = Vec::new();
@@ -1008,8 +968,9 @@ mod tests {
         let query_clone = query.clone();
 
         let handle = std::thread::spawn(move || {
+            let documents = test_documents(&query_clone);
             provider
-                .search(&query_clone, &extractors, tx, None)
+                .search(&query_clone, &extractors, tx, &documents)
                 .unwrap()
         });
 
@@ -1048,8 +1009,8 @@ mod tests {
     #[test]
     fn test_search_max_results() {
         let dir = tempdir().unwrap();
-        // Use a single file with 3 matches to test that it returns all of them
-        // before breaking, as it checks the limit only after processing each file.
+        // Use a single file with 3 matches to verify the global hit cap also
+        // truncates within one file.
         fs::write(dir.path().join("test.txt"), "match 1\nmatch 2\nmatch 3").unwrap();
 
         let query = SearchQuery {
@@ -1072,7 +1033,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let extractors = ExtractorRegistry::new();
         std::thread::spawn(move || {
-            provider.search(&query, &extractors, tx, None).unwrap();
+            let documents = test_documents(&query);
+            provider
+                .search(&query, &extractors, tx, &documents)
+                .unwrap();
         });
 
         let mut all_matches = Vec::new();
@@ -1080,8 +1044,7 @@ mod tests {
             all_matches.extend(m.matches);
         }
 
-        // It should return all matches from the first file.
-        assert_eq!(all_matches.len(), 3);
+        assert_eq!(all_matches.len(), 1);
     }
 
     #[test]
@@ -1112,7 +1075,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let extractors = ExtractorRegistry::new();
         std::thread::spawn(move || {
-            provider.search(&query, &extractors, tx, None).unwrap();
+            let documents = test_documents(&query);
+            provider
+                .search(&query, &extractors, tx, &documents)
+                .unwrap();
         });
 
         let mut results = Vec::new();
@@ -1175,7 +1141,7 @@ mod tests {
         drop(rx); // Close receiver immediately
 
         let extractors = ExtractorRegistry::new();
-        let res = provider.search(&query, &extractors, tx, None);
+        let res = provider.search(&query, &extractors, tx, &test_documents(&query));
         assert!(res.is_ok());
     }
 
@@ -1232,7 +1198,9 @@ mod tests {
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
 
-        provider.search(&query, &registry, tx, None).unwrap();
+        provider
+            .search(&query, &registry, tx, &test_documents(&query))
+            .unwrap();
 
         let mut results = Vec::new();
         while let Ok(m) = rx.try_recv() {
@@ -1268,13 +1236,108 @@ mod tests {
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let extractors = ExtractorRegistry::new();
-        provider.search(&query, &extractors, tx, None).unwrap();
+        provider
+            .search(&query, &extractors, tx, &test_documents(&query))
+            .unwrap();
 
         let mut results = Vec::new();
         while let Ok(m) = rx.try_recv() {
             results.push(m);
         }
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn exact_search_returns_filename_and_title_only_hits() {
+        let dir = tempdir().unwrap();
+        let filename_path = dir.path().join("Quarterly Report.txt");
+        let title_path = dir.path().join("notes.txt");
+        fs::write(&filename_path, "unrelated body").unwrap();
+        fs::write(&title_path, "another unrelated body").unwrap();
+        let query = SearchQuery {
+            pattern: "report".into(),
+            is_regex: false,
+            case_sensitive: false,
+            root: dir.path().to_path_buf(),
+            max_results: 10,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            scope: SearchScope::Corpus,
+            supported_extensions: vec!["txt".into()],
+            collection_id: None,
+            tag_ids: Vec::new(),
+        };
+        let documents = vec![
+            test_document(filename_path.clone(), &query),
+            SearchDocument {
+                path: title_path.clone(),
+                file_type: FileType::PlainText,
+                title: Some("Annual Research Report".into()),
+            },
+        ];
+        let provider = GrepSearchProvider::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+        provider
+            .search(&query, &ExtractorRegistry::new(), tx, &documents)
+            .unwrap();
+
+        let mut results = Vec::new();
+        while let Ok(result) = rx.try_recv() {
+            results.push(result);
+        }
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.matches.is_empty()));
+        assert_eq!(
+            results[0].field_matches[0].field,
+            crate::types::SearchField::Filename
+        );
+        assert_eq!(
+            results[1].field_matches[0].field,
+            crate::types::SearchField::Title
+        );
+    }
+
+    #[test]
+    fn direct_field_hits_take_the_global_budget_before_content_hits() {
+        let dir = tempdir().unwrap();
+        let content_path = dir.path().join("a.txt");
+        let filename_path = dir.path().join("needle-name.txt");
+        fs::write(&content_path, "needle in content").unwrap();
+        fs::write(&filename_path, "unrelated body").unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            is_regex: false,
+            case_sensitive: true,
+            root: dir.path().to_path_buf(),
+            max_results: 1,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: crate::types::SearchMode::Grep,
+            scope: SearchScope::Corpus,
+            supported_extensions: vec!["txt".into()],
+            collection_id: None,
+            tag_ids: Vec::new(),
+        };
+        let documents = vec![
+            test_document(content_path, &query),
+            test_document(filename_path.clone(), &query),
+        ];
+        let provider = GrepSearchProvider::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+        provider
+            .search(&query, &ExtractorRegistry::new(), tx, &documents)
+            .unwrap();
+
+        let result = rx.blocking_recv().unwrap();
+        assert_eq!(result.path, filename_path);
+        assert_eq!(result.field_matches.len(), 1);
+        assert!(result.matches.is_empty());
+        assert!(rx.blocking_recv().is_none());
     }
 }
 
@@ -1308,12 +1371,16 @@ mod eligibility_tests {
             collection_id: Some("test".into()),
             tag_ids: Vec::new(),
         };
-        let eligible = std::collections::HashSet::from([included.clone()]);
+        let documents = vec![SearchDocument {
+            path: included.clone(),
+            file_type: FileType::PlainText,
+            title: None,
+        }];
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         std::thread::spawn(move || {
             provider
-                .search(&query, &ExtractorRegistry::new(), tx, Some(&eligible))
+                .search(&query, &ExtractorRegistry::new(), tx, &documents)
                 .unwrap();
         });
         let result = rx.recv().await.expect("eligible result");

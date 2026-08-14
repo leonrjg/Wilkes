@@ -131,7 +131,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
       stats: {
         files_scanned: results.length,
         total_matches: results.reduce(
-          (count, file) => count + file.matches.length,
+          (count, file) => count + file.matches.length + (file.field_matches?.length ?? 0),
           0,
         ),
         elapsed_ms: 0,

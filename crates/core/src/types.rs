@@ -103,11 +103,46 @@ pub struct Match {
 pub struct FileMatches {
     pub path: PathBuf,
     pub file_type: FileType,
-    /// Composed cached document title when available. Search providers leave
-    /// this empty; the application enriches results at the metadata boundary.
+    /// Composed cached document title when available from the search catalog.
+    /// The application may refresh it again at the metadata boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Direct matches against document identity fields. Kept separate from
+    /// content matches because they have no truthful line, page, or byte
+    /// position inside the document.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_matches: Vec<SearchFieldMatch>,
     pub matches: Vec<Match>,
+}
+
+impl FileMatches {
+    pub fn total_match_count(&self) -> usize {
+        self.field_matches.len() + self.matches.len()
+    }
+}
+
+/// One document admitted by the application's authoritative search catalog.
+/// Providers search this list instead of independently walking the filesystem.
+#[derive(Clone, Debug)]
+pub struct SearchDocument {
+    pub path: PathBuf,
+    pub file_type: FileType,
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchField {
+    Filename,
+    Title,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SearchFieldMatch {
+    pub field: SearchField,
+    pub matched_text: String,
+    pub context_before: String,
+    pub context_after: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

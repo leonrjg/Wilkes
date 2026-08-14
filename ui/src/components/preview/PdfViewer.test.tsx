@@ -167,6 +167,40 @@ global.ResizeObserver = class {
   disconnect = vi.fn();
 } as unknown as typeof ResizeObserver;
 
+function domRect(top: number, left: number, width: number, height: number): DOMRect {
+  return {
+    top,
+    left,
+    width,
+    height,
+    bottom: top + height,
+    right: left + width,
+    x: left,
+    y: top,
+    toJSON: () => ({}),
+  } as DOMRect;
+}
+
+function deferAnimationFrames() {
+  let nextId = 1;
+  const pending = new Map<number, FrameRequestCallback>();
+  global.requestAnimationFrame = vi.fn((callback: FrameRequestCallback) => {
+    const id = nextId++;
+    pending.set(id, callback);
+    return id;
+  });
+  global.cancelAnimationFrame = vi.fn((id: number) => {
+    pending.delete(id);
+  });
+  return {
+    flush: () => {
+      const callbacks = [...pending.values()];
+      pending.clear();
+      callbacks.forEach((callback) => callback(0));
+    },
+  };
+}
+
 describe("PdfViewer", () => {
   const defaultProps = {
     url: "test.pdf",
@@ -223,6 +257,7 @@ describe("PdfViewer", () => {
       cb(0);
       return 0;
     }) as typeof requestAnimationFrame;
+    global.cancelAnimationFrame = vi.fn();
   });
 
   it("renders correctly and handles load success", async () => {
@@ -361,6 +396,132 @@ describe("PdfViewer", () => {
     // The highlight div should be present. It has background color rgba(250, 204, 21, 0.25)
     const highlight = document.querySelector('div[style*="background-color: rgba(250, 204, 21, 0.25)"]');
     expect(highlight).toBeInTheDocument();
+  });
+
+  it("reveals the active inner-search match within its page", () => {
+    const frames = deferAnimationFrames();
+    mockUseDocumentFind.value = {
+      ...mockUseDocumentFind.value,
+      isOpen: true,
+      currentIdx: 0,
+    };
+    mockUsePdfInnerSearch.value = {
+      matches: [{ page: 2, bbox: { x: 100, y: 700, width: 80, height: 20 } }],
+      isSearching: false,
+    };
+
+    render(<PdfViewer {...defaultProps} />);
+
+    expect(mockVirtualizer.scrollToIndex).toHaveBeenCalledWith(1, { align: "start" });
+    const container = document.querySelector<HTMLElement>(".overflow-auto")!;
+    const page = document.querySelector<HTMLElement>('[data-page-number="2"]')!;
+    container.scrollTop = 900;
+    container.scrollLeft = 25;
+    container.getBoundingClientRect = () => domRect(0, 0, 600, 400);
+    page.getBoundingClientRect = () => domRect(0, 0, 600, 800);
+
+    act(() => frames.flush());
+
+    // Match centre is y=710, so it is centred on the 400px-tall viewport.
+    expect(container.scrollTop).toBe(1410);
+    // Its x range is already comfortably visible; vertical navigation must not
+    // introduce unrelated lateral movement.
+    expect(container.scrollLeft).toBe(25);
+  });
+
+  it("does not move an inner-search match that is already comfortably visible", () => {
+    const frames = deferAnimationFrames();
+    mockUseDocumentFind.value = {
+      ...mockUseDocumentFind.value,
+      isOpen: true,
+      currentIdx: 0,
+    };
+    mockUsePdfInnerSearch.value = {
+      matches: [{ page: 1, bbox: { x: 100, y: 100, width: 80, height: 20 } }],
+      isSearching: false,
+    };
+
+    render(<PdfViewer {...defaultProps} />);
+
+    const container = document.querySelector<HTMLElement>(".overflow-auto")!;
+    const page = document.querySelector<HTMLElement>('[data-page-number="1"]')!;
+    container.scrollTop = 300;
+    container.scrollLeft = 20;
+    container.getBoundingClientRect = () => domRect(0, 0, 600, 400);
+    page.getBoundingClientRect = () => domRect(50, 0, 600, 800);
+
+    act(() => frames.flush());
+
+    expect(container.scrollTop).toBe(300);
+    expect(container.scrollLeft).toBe(20);
+  });
+
+  it("reveals a horizontally hidden inner-search match after zooming in", () => {
+    const frames = deferAnimationFrames();
+    mockUseDocumentFind.value = {
+      ...mockUseDocumentFind.value,
+      isOpen: true,
+      currentIdx: 0,
+    };
+    mockUsePdfInnerSearch.value = {
+      matches: [{ page: 1, bbox: { x: 520, y: 100, width: 40, height: 20 } }],
+      isSearching: false,
+    };
+
+    render(<PdfViewer {...defaultProps} />);
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+
+    const container = document.querySelector<HTMLElement>(".overflow-auto")!;
+    const page = document.querySelector<HTMLElement>('[data-page-number="1"]')!;
+    container.scrollTop = 200;
+    container.scrollLeft = 30;
+    container.getBoundingClientRect = () => domRect(0, 0, 600, 400);
+    // At 110%, the 600-unit page is 660px wide and its left edge is already
+    // shifted by the existing 30px horizontal scroll.
+    page.getBoundingClientRect = () => domRect(50, -30, 660, 880);
+
+    act(() => frames.flush());
+
+    // Scaled match centre: -30 + (520 + 20) * 1.1 = 564. Centre it against
+    // viewport x=300, starting from scrollLeft=30.
+    expect(container.scrollLeft).toBeCloseTo(294);
+    // The match is vertically visible, so horizontal reveal leaves y alone.
+    expect(container.scrollTop).toBe(200);
+  });
+
+  it("cancels a stale deferred reveal when the active match changes", () => {
+    const frames = deferAnimationFrames();
+    const matches = [
+      { page: 1, bbox: { x: 100, y: 700, width: 80, height: 20 } },
+      { page: 1, bbox: { x: 100, y: 100, width: 80, height: 20 } },
+    ];
+    mockUseDocumentFind.value = {
+      ...mockUseDocumentFind.value,
+      isOpen: true,
+      currentIdx: 0,
+    };
+    mockUsePdfInnerSearch.value = { matches, isSearching: false };
+
+    const { rerender } = render(<PdfViewer {...defaultProps} />);
+
+    mockUseDocumentFind.value = {
+      ...mockUseDocumentFind.value,
+      currentIdx: 1,
+    };
+    rerender(<PdfViewer {...defaultProps} />);
+
+    const container = document.querySelector<HTMLElement>(".overflow-auto")!;
+    const page = document.querySelector<HTMLElement>('[data-page-number="1"]')!;
+    container.scrollTop = 300;
+    container.getBoundingClientRect = () => domRect(0, 0, 600, 400);
+    page.getBoundingClientRect = () => domRect(50, 0, 600, 800);
+
+    act(() => frames.flush());
+
+    // Only the second match's frame survives, and that match is already visible.
+    // If the first frame were allowed to run it would move scrollTop to 860.
+    expect(container.scrollTop).toBe(300);
+    expect(global.cancelAnimationFrame).toHaveBeenCalled();
   });
 
   it("emphasises the navigation target per-line when highlight_rects is provided", async () => {

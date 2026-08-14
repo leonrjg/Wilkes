@@ -95,7 +95,18 @@ export interface FileMatches {
   file_type: FileType;
   /** Composed cached document title, when metadata is available. */
   title?: string | null;
+  /** Direct identity-field hits, which have no document line/page position. */
+  field_matches?: SearchFieldMatch[];
   matches: Match[];
+}
+
+export type SearchField = "filename" | "title";
+
+export interface SearchFieldMatch {
+  field: SearchField;
+  matched_text: string;
+  context_before: string;
+  context_after: string;
 }
 
 export interface RelatedDocumentsQuery {

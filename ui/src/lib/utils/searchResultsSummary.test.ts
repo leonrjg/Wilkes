@@ -260,12 +260,22 @@ describe("buildSearchResultsSummaryInput", () => {
 describe("buildSearchResultsChatPrompt", () => {
   it("hands the open-ended query and result files to agent chat", () => {
     const prompt = buildSearchResultsChatPrompt("causal methods", [
-      file("/papers/a.pdf", []),
-      file("/papers/b.pdf", []),
+      file("/papers/a.pdf", [match("A substantive result appears in this document.")]),
+      {
+        ...file("/papers/title-only.pdf", []),
+        field_matches: [{
+          field: "title",
+          matched_text: "causal methods",
+          context_before: "",
+          context_after: "",
+        }],
+      },
+      file("/papers/b.pdf", [match("Another substantive result appears here.")]),
     ]);
 
     expect(prompt).toContain("Search query: causal methods");
     expect(prompt).toContain("- /papers/a.pdf");
     expect(prompt).toContain("- /papers/b.pdf");
+    expect(prompt).not.toContain("title-only.pdf");
   });
 });

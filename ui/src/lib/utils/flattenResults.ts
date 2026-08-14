@@ -1,7 +1,8 @@
-import type { FileMatches, Match } from "../types";
+import type { FileMatches, Match, SearchFieldMatch } from "../types";
 
 export type Row =
   | { kind: "file"; fileMatches: FileMatches; fileIndex: number; path: string }
+  | { kind: "field_match"; fieldMatch: SearchFieldMatch; path: string; fileIndex: number }
   | { kind: "match"; match: Match; path: string; matchIndex: number; fileIndex: number }
   | { kind: "expand"; fileIndex: number; totalMatches: number };
 
@@ -13,9 +14,16 @@ export function buildRows(results: FileMatches[], expandedFiles: Set<number>): R
     const fm = results[fi];
     rows.push({ kind: "file", fileMatches: fm, fileIndex: fi, path: fm.path });
     const isExpanded = expandedFiles.has(fi);
-    const limit = isExpanded ? fm.matches.length : COLLAPSED_LIMIT;
+    const fieldMatches = fm.field_matches ?? [];
+    const totalMatches = fieldMatches.length + fm.matches.length;
+    const limit = isExpanded ? totalMatches : COLLAPSED_LIMIT;
 
-    for (let mi = 0; mi < Math.min(fm.matches.length, limit); mi++) {
+    for (const fieldMatch of fieldMatches.slice(0, limit)) {
+      rows.push({ kind: "field_match", fieldMatch, path: fm.path, fileIndex: fi });
+    }
+
+    const contentLimit = Math.max(0, limit - fieldMatches.length);
+    for (let mi = 0; mi < Math.min(fm.matches.length, contentLimit); mi++) {
       rows.push({
         kind: "match",
         match: fm.matches[mi],
@@ -24,8 +32,8 @@ export function buildRows(results: FileMatches[], expandedFiles: Set<number>): R
         fileIndex: fi,
       });
     }
-    if (!isExpanded && fm.matches.length > COLLAPSED_LIMIT) {
-      rows.push({ kind: "expand", fileIndex: fi, totalMatches: fm.matches.length });
+    if (!isExpanded && totalMatches > COLLAPSED_LIMIT) {
+      rows.push({ kind: "expand", fileIndex: fi, totalMatches });
     }
   }
   return rows;

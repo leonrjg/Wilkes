@@ -15,10 +15,24 @@ pub async fn list_files(
     supported_extensions: Vec<String>,
     max_file_size: u64,
 ) -> anyhow::Result<FileListResponse> {
+    list_files_with_ignore(root, supported_extensions, max_file_size, true).await
+}
+
+pub async fn list_files_with_ignore(
+    root: PathBuf,
+    supported_extensions: Vec<String>,
+    max_file_size: u64,
+    respect_gitignore: bool,
+) -> anyhow::Result<FileListResponse> {
     tokio::task::spawn_blocking(move || {
         let mut files = Vec::new();
         let mut omitted = Vec::new();
-        for result in WalkBuilder::new(&root).build() {
+        let mut builder = WalkBuilder::new(&root);
+        builder
+            .git_ignore(respect_gitignore)
+            .git_exclude(respect_gitignore)
+            .ignore(respect_gitignore);
+        for result in builder.build() {
             let entry = match result {
                 Ok(e) => e,
                 Err(_) => continue,

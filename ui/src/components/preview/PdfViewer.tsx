@@ -60,6 +60,11 @@ export interface PdfViewerProps {
 export type PdfSelection = DocumentSelection;
 
 const PAGE_GAP_PX = 12;
+// Keep active find matches away from the very edge of the reader. Besides
+// making the result easier to spot, the top inset prevents a match from sitting
+// underneath the floating find bar. The inset is reduced automatically when a
+// viewport is too small to accommodate it around the whole match.
+const FIND_MATCH_VIEWPORT_INSET_PX = 48;
 
 // Auto-zoom: bring the dominant body text of a freshly opened document up to
 // the user-configured CSS-pixel height. We only ever enlarge (floor 1.0, so
@@ -134,6 +139,56 @@ function unionBox(rects: BoundingBox[]): BoundingBox {
   const x2 = Math.max(...rects.map((r) => r.x + r.width));
   const y2 = Math.max(...rects.map((r) => r.y + r.height));
   return { x: x1, y: y1, width: x2 - x1, height: y2 - y1 };
+}
+
+/** Reveal a PDF-space rectangle inside the scroll container. Page
+ * virtualization is handled by the caller; once the page is mounted, its live
+ * DOM rectangle gives us a reliable coordinate bridge from PDF units to the
+ * current viewport at any zoom. An axis that is already comfortably visible is
+ * deliberately left alone, avoiding the disorienting lateral/vertical jitter
+ * that a blanket `scrollIntoView({ block: "center" })` would introduce. */
+function revealPdfMatch(
+  container: HTMLDivElement,
+  pageElement: HTMLElement,
+  bbox: BoundingBox,
+  pageScale: number,
+): void {
+  const containerRect = container.getBoundingClientRect();
+  const pageRect = pageElement.getBoundingClientRect();
+  const targetWidth = Math.max(bbox.width * pageScale, 4);
+  const targetHeight = Math.max(bbox.height * pageScale, 4);
+  const targetLeft = pageRect.left + bbox.x * pageScale;
+  const targetTop = pageRect.top + bbox.y * pageScale;
+  const targetRight = targetLeft + targetWidth;
+  const targetBottom = targetTop + targetHeight;
+
+  // A large match or a small pane may not leave room for the full configured
+  // inset. Shrink it per axis so the visibility test remains achievable.
+  const horizontalInset = Math.max(
+    0,
+    Math.min(FIND_MATCH_VIEWPORT_INSET_PX, (containerRect.width - targetWidth) / 2),
+  );
+  const verticalInset = Math.max(
+    0,
+    Math.min(FIND_MATCH_VIEWPORT_INSET_PX, (containerRect.height - targetHeight) / 2),
+  );
+  const horizontallyVisible =
+    targetLeft >= containerRect.left + horizontalInset &&
+    targetRight <= containerRect.right - horizontalInset;
+  const verticallyVisible =
+    targetTop >= containerRect.top + verticalInset &&
+    targetBottom <= containerRect.bottom - verticalInset;
+
+  if (!horizontallyVisible) {
+    const targetCenter = targetLeft + targetWidth / 2;
+    const viewportCenter = containerRect.left + containerRect.width / 2;
+    container.scrollLeft += targetCenter - viewportCenter;
+  }
+  if (!verticallyVisible) {
+    const targetCenter = targetTop + targetHeight / 2;
+    const viewportCenter = containerRect.top + containerRect.height / 2;
+    container.scrollTop += targetCenter - viewportCenter;
+  }
 }
 
 export default function PdfViewer({
@@ -504,11 +559,30 @@ export default function PdfViewer({
 
   useEffect(() => setInnerMatches(matches), [matches]);
 
-  // The controller owns which match is active; bring its page into view.
+  // The controller owns which match is active. Navigation is deliberately
+  // two-stage: first make the virtualizer mount the page, then use live page
+  // geometry on the next frame to reveal the match itself. Page-only alignment
+  // leaves matches lower down a page outside the viewport.
   useEffect(() => {
     const active = innerMatches[currentMatchIdx];
-    if (active) scrollToPage(active.page);
-  }, [currentMatchIdx, innerMatches, scrollToPage]);
+    if (!active) return;
+
+    scrollToPage(active.page);
+    const frame = requestAnimationFrame(() => {
+      const container = containerRef.current;
+      const pageMetric = pageMetrics[active.page - 1];
+      const pageElement = container?.querySelector<HTMLElement>(
+        `[data-page-number="${active.page}"]`,
+      );
+      if (!container || !pageMetric || !pageElement) return;
+
+      revealPdfMatch(container, pageElement, active.bbox, renderedWidth / pageMetric.width);
+    });
+
+    // Stepping quickly can replace the active match before the virtualized page
+    // is committed. Do not let the older deferred reveal win that race.
+    return () => cancelAnimationFrame(frame);
+  }, [currentMatchIdx, innerMatches, scrollToPage, pageMetrics, renderedWidth]);
 
   useLayoutEffect(() => {
     const el = containerRef.current;
