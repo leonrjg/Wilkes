@@ -1710,7 +1710,20 @@ pub struct SearchStats {
     /// files that were never opened.
     pub files_scanned: usize,
     pub total_matches: usize,
+    /// Time spent enumerating and filtering documents before the search worker
+    /// starts. Kept separate from `elapsed_ms`, which remains worker time.
+    #[serde(default)]
+    pub catalog_elapsed_ms: u64,
     pub elapsed_ms: u64,
+    /// PDFs served from stored semantic-index text during an exact search.
+    #[serde(default)]
+    pub indexed_pdf_reads: usize,
+    /// PDFs extracted live because indexed text was disabled or unavailable.
+    #[serde(default)]
+    pub live_pdf_fallbacks: usize,
+    /// Live PDF fallbacks caused by an enabled but non-resident index.
+    #[serde(default)]
+    pub index_unavailable_fallbacks: usize,
     #[serde(default)]
     pub errors: Vec<String>,
     /// Exact generated passages whose embeddings contributed to the final

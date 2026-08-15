@@ -23,6 +23,16 @@ pub struct SearchOutcome {
     /// lets providers without file-scan semantics retain the stream-derived
     /// fallback used before this field existed.
     pub files_scanned: Option<usize>,
+    /// PDFs whose extracted text was read from the semantic index during an
+    /// exact search. Zero for semantic searches and plain-text documents.
+    pub indexed_pdf_reads: usize,
+    /// PDFs that an exact search extracted from disk because index-backed text
+    /// was disabled or unavailable for that document.
+    pub live_pdf_fallbacks: usize,
+    /// Live fallbacks specifically caused by an enabled exact-search index
+    /// handle whose resident index was unavailable. A non-zero value indicates
+    /// a lifecycle/load problem rather than ordinary per-document fallback.
+    pub index_unavailable_fallbacks: usize,
 }
 
 impl From<Vec<String>> for SearchOutcome {
@@ -31,6 +41,9 @@ impl From<Vec<String>> for SearchOutcome {
             errors,
             hyde_documents: Vec::new(),
             files_scanned: None,
+            indexed_pdf_reads: 0,
+            live_pdf_fallbacks: 0,
+            index_unavailable_fallbacks: 0,
         }
     }
 }

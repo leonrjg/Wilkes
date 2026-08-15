@@ -322,6 +322,9 @@ impl SearchProvider for SemanticSearchProvider {
                 errors: reconcile_errors,
                 hyde_documents: Vec::new(),
                 files_scanned: None,
+                indexed_pdf_reads: 0,
+                live_pdf_fallbacks: 0,
+                index_unavailable_fallbacks: 0,
             });
         }
 
@@ -414,6 +417,9 @@ impl SearchProvider for SemanticSearchProvider {
             errors: reconcile_errors,
             hyde_documents,
             files_scanned: None,
+            indexed_pdf_reads: 0,
+            live_pdf_fallbacks: 0,
+            index_unavailable_fallbacks: 0,
         })
     }
 

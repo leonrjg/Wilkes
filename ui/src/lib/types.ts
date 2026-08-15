@@ -807,7 +807,15 @@ export interface SearchCapabilities {
 export interface SearchStats {
   files_scanned: number;
   total_matches: number;
+  /** Time spent enumerating/filtering the file catalog before worker execution. */
+  catalog_elapsed_ms?: number;
   elapsed_ms: number;
+  /** PDFs whose stored text was read from the semantic index. */
+  indexed_pdf_reads?: number;
+  /** PDFs extracted from disk because indexed text was disabled or unavailable. */
+  live_pdf_fallbacks?: number;
+  /** Live PDF fallbacks caused by an enabled but non-resident index. */
+  index_unavailable_fallbacks?: number;
   errors: string[];
   /** Exact generated passages whose embeddings affected semantic ranking. */
   hyde_documents?: string[];

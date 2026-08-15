@@ -2921,7 +2921,11 @@ mod tests {
                 stats: SearchStats {
                     files_scanned: 1,
                     total_matches: 2,
+                    catalog_elapsed_ms: 0,
                     elapsed_ms: 4,
+                    indexed_pdf_reads: 0,
+                    live_pdf_fallbacks: 0,
+                    index_unavailable_fallbacks: 0,
                     errors: Vec::new(),
                     hyde_documents: Vec::new(),
                 },

@@ -20,6 +20,13 @@ use super::{
 /// Shared handle to the live semantic index, as held by the API layer.
 type IndexHandle = Arc<Mutex<Option<SemanticIndex>>>;
 
+#[derive(Default)]
+struct GrepDiagnostics {
+    indexed_pdf_reads: AtomicUsize,
+    live_pdf_fallbacks: AtomicUsize,
+    index_unavailable_fallbacks: AtomicUsize,
+}
+
 pub struct GrepSearchProvider {
     /// When set, PDF matches are found against text the index already holds
     /// instead of re-extracting the file. Files the index does not hold (or that
@@ -62,6 +69,7 @@ impl SearchProvider for GrepSearchProvider {
         let matcher = Self::build_matcher(query)?;
         let errors = Mutex::new(Vec::new());
         let files_scanned = AtomicUsize::new(0);
+        let diagnostics = GrepDiagnostics::default();
         let index = self.index.as_ref();
         let field_matches_by_document = documents
             .iter()
@@ -100,17 +108,23 @@ impl SearchProvider for GrepSearchProvider {
                     });
                 }
                 files_scanned.fetch_add(1, Ordering::Relaxed);
-                let mut matches =
-                    match search_document_content(document, query, extractors, &matcher, index) {
-                        Ok(matches) => matches,
-                        Err(err) => {
-                            errors
-                                .lock()
-                                .unwrap()
-                                .push(format!("{}: {err:#}", document.path.display()));
-                            Vec::new()
-                        }
-                    };
+                let mut matches = match search_document_content(
+                    document,
+                    query,
+                    extractors,
+                    &matcher,
+                    index,
+                    &diagnostics,
+                ) {
+                    Ok(matches) => matches,
+                    Err(err) => {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}: {err:#}", document.path.display()));
+                        Vec::new()
+                    }
+                };
                 let available_matches = matches.len();
                 matches.truncate(claim_match_budget(
                     &remaining_content_budget,
@@ -146,6 +160,11 @@ impl SearchProvider for GrepSearchProvider {
             errors: errors.into_inner().unwrap(),
             hyde_documents: Vec::new(),
             files_scanned: Some(files_scanned.load(Ordering::Relaxed)),
+            indexed_pdf_reads: diagnostics.indexed_pdf_reads.load(Ordering::Relaxed),
+            live_pdf_fallbacks: diagnostics.live_pdf_fallbacks.load(Ordering::Relaxed),
+            index_unavailable_fallbacks: diagnostics
+                .index_unavailable_fallbacks
+                .load(Ordering::Relaxed),
         })
     }
 
@@ -199,6 +218,7 @@ fn search_document_content(
     extractors: &ExtractorRegistry,
     matcher: &RegexMatcher,
     index: Option<&IndexHandle>,
+    diagnostics: &GrepDiagnostics,
 ) -> anyhow::Result<Vec<Match>> {
     let path = document.path.as_path();
     match &document.file_type {
@@ -210,18 +230,38 @@ fn search_document_content(
             // Prefer text the index already holds. A genuine index fault is
             // logged and demoted to live extraction rather than failing the
             // file; "not indexed / stale / pre-v4" simply returns None.
-            let from_index = index.and_then(|handle| {
-                indexed_pdf_matches(handle, path, matcher).unwrap_or_else(|e| {
+            let from_index = match index {
+                Some(handle) => indexed_pdf_matches(handle, path, matcher).unwrap_or_else(|e| {
                     tracing::warn!(
                         "index-backed grep failed for {}, extracting live: {e:#}",
                         path.display()
                     );
-                    None
-                })
-            });
+                    IndexedPdfSearch::DocumentUnavailable
+                }),
+                None => IndexedPdfSearch::Disabled,
+            };
             match from_index {
-                Some(matches) => Ok(matches),
-                None => live_pdf_matches(path, extractors, matcher),
+                IndexedPdfSearch::Served(matches) => {
+                    diagnostics
+                        .indexed_pdf_reads
+                        .fetch_add(1, Ordering::Relaxed);
+                    Ok(matches)
+                }
+                IndexedPdfSearch::IndexUnavailable => {
+                    diagnostics
+                        .live_pdf_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                    diagnostics
+                        .index_unavailable_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                    live_pdf_matches(path, extractors, matcher)
+                }
+                IndexedPdfSearch::Disabled | IndexedPdfSearch::DocumentUnavailable => {
+                    diagnostics
+                        .live_pdf_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                    live_pdf_matches(path, extractors, matcher)
+                }
             }
         }
     }
@@ -321,11 +361,18 @@ fn live_pdf_matches(
 /// Search a PDF's text as held by the semantic index. Returns `None` when the
 /// index cannot serve this file (not loaded, not indexed, changed on disk, or
 /// indexed before schema v4), leaving the caller to extract it live.
+enum IndexedPdfSearch {
+    Served(Vec<Match>),
+    Disabled,
+    IndexUnavailable,
+    DocumentUnavailable,
+}
+
 fn indexed_pdf_matches(
     index: &IndexHandle,
     path: &Path,
     matcher: &RegexMatcher,
-) -> anyhow::Result<Option<Vec<Match>>> {
+) -> anyhow::Result<IndexedPdfSearch> {
     // Hold the index lock only long enough to copy out the stored text; run the
     // regex afterwards so we do not block indexing for the scan itself.
     let document = {
@@ -333,14 +380,18 @@ fn indexed_pdf_matches(
             .lock()
             .map_err(|_| anyhow::anyhow!("semantic index lock poisoned"))?;
         let Some(idx) = guard.as_ref() else {
-            return Ok(None);
+            return Ok(IndexedPdfSearch::IndexUnavailable);
         };
         idx.indexed_document_for_path(path)?
     };
     let Some((text, source_map)) = document else {
-        return Ok(None);
+        return Ok(IndexedPdfSearch::DocumentUnavailable);
     };
-    Ok(Some(search_text_and_map(&text, &source_map, matcher)?))
+    Ok(IndexedPdfSearch::Served(search_text_and_map(
+        &text,
+        &source_map,
+        matcher,
+    )?))
 }
 
 /// Run the exact matcher over already-extracted `text`, resolving each match's
@@ -841,7 +892,6 @@ mod tests {
         while let Some(m) = rx.blocking_recv() {
             results.push(m);
         }
-
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, scoped);
         assert_eq!(results[0].matches.len(), 1);
@@ -906,17 +956,18 @@ mod tests {
 
         let provider = GrepSearchProvider::new().with_index(Some(handle));
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        std::thread::spawn(move || {
+        let search = std::thread::spawn(move || {
             let documents = test_documents(&query);
             provider
                 .search(&query, &extractors, tx, &documents)
-                .unwrap();
+                .unwrap()
         });
 
         let mut results = Vec::new();
         while let Some(m) = rx.blocking_recv() {
             results.push(m);
         }
+        let outcome = search.join().unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].matches.len(), 1);
@@ -925,6 +976,9 @@ mod tests {
             SourceOrigin::PdfPage { page, .. } => assert_eq!(*page, 1),
             other => panic!("expected pdf page origin, got {other:?}"),
         }
+        assert_eq!(outcome.indexed_pdf_reads, 1);
+        assert_eq!(outcome.live_pdf_fallbacks, 0);
+        assert_eq!(outcome.index_unavailable_fallbacks, 0);
     }
 
     struct FailingPdfExtractor;

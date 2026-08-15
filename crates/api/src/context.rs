@@ -2376,38 +2376,69 @@ impl AppContext {
         self.on_zotero_settings_maybe_changed(&before, &updated);
         self.on_semantic_scholar_settings_maybe_changed(&before, &updated);
         self.on_openalex_settings_maybe_changed(&before, &updated);
-        self.on_semantic_pref_maybe_changed(&before, &updated);
+        self.on_search_runtime_settings_maybe_changed(&before, &updated);
         self.on_generation_settings_maybe_changed(&before, &updated);
         Ok(updated)
     }
 
-    /// React to the user toggling semantic search on or off. `search_prefer_semantic`
-    /// is the single owner of whether the semantic subsystem is active: turning it
-    /// off tears down the watcher so file changes stop triggering reindexes; turning
-    /// it on reloads the index and watcher from the on-disk DB (no rebuild).
-    fn on_semantic_pref_maybe_changed(self: &Arc<Self>, before: &Settings, after: &Settings) {
-        if before.search_prefer_semantic == after.search_prefer_semantic {
+    /// Reconcile the two consumers of the shared index after a settings edit.
+    /// Semantic search owns the embedder; semantic search and index-backed exact
+    /// search jointly own index residency. Loads run off the settings write path,
+    /// while resources made unnecessary by the new state detach synchronously.
+    fn on_search_runtime_settings_maybe_changed(
+        self: &Arc<Self>,
+        before: &Settings,
+        after: &Settings,
+    ) {
+        if before.search_prefer_semantic == after.search_prefer_semantic
+            && before.grep_use_index == after.grep_use_index
+        {
             return;
         }
-        if after.search_prefer_semantic {
-            // Reload can install/probe the embedder, so do it off the settings
-            // write path; the caller's build flow covers the not-yet-built case.
+
+        if !after.search_prefer_semantic {
+            // Semantic search is off. Its model must not remain resident, but
+            // exact search may still own the already-open index.
+            self.detach_semantic_embedder();
+        }
+        if !after.search_prefer_semantic && !after.grep_use_index {
+            self.detach_search_index();
+            return;
+        }
+
+        let semantic_just_enabled = after.search_prefer_semantic && !before.search_prefer_semantic;
+        let exact_just_enabled = after.grep_use_index && !before.grep_use_index;
+        if semantic_just_enabled || (exact_just_enabled && !self.is_index_loaded()) {
+            // Reload can install/probe the embedder or open the index, so do it
+            // off the settings write path. Exact-only activation never touches
+            // the embedding model.
             let ctx = Arc::clone(self);
             tokio::spawn(async move {
-                ctx.activate_semantic_from_disk().await;
+                ctx.activate_required_search_runtime_from_disk().await;
             });
-        } else {
-            self.deactivate_semantic();
         }
     }
 
-    /// Stop maintaining the semantic index: halt the watcher and release the
-    /// resident embedder + index so filesystem changes no longer reindex. The
-    /// on-disk DB is preserved so re-enabling is cheap.
-    fn deactivate_semantic(&self) {
+    /// Release the semantic-only model state while preserving an index still
+    /// owned by index-backed exact search.
+    fn detach_semantic_embedder(&self) {
+        self.invalidate_topic_tree_cache();
+        *self.embedder.lock() = None;
+    }
+
+    /// Release the shared index after its final consumer is disabled. The
+    /// on-disk DB is preserved so either consumer can reactivate it cheaply.
+    fn detach_search_index(&self) {
         self.invalidate_topic_tree_cache();
         *self.index.lock() = Arc::new(Mutex::new(None));
-        *self.embedder.lock() = None;
+    }
+
+    fn is_index_loaded(&self) -> bool {
+        self.index
+            .lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
     }
 
     /// Reload the embedder, index, and watcher from the on-disk DB when a usable
@@ -2417,10 +2448,52 @@ impl AppContext {
             return;
         }
         let settings = self.get_settings().await;
+        if !settings.search_prefer_semantic {
+            return;
+        }
         if let Some(loaded) = self.load_restore_state(settings).await {
+            if !self.get_settings().await.search_prefer_semantic {
+                return;
+            }
             self.finish_restore_state(&loaded.plan, loaded.embedder, loaded.index)
                 .await;
         }
+    }
+
+    /// Activate every search resource required by the latest settings. Exact
+    /// index restoration is attempted after semantic restoration so it can
+    /// still succeed when the embedding model is unavailable.
+    async fn activate_required_search_runtime_from_disk(self: &Arc<Self>) {
+        let settings = self.get_settings().await;
+        if settings.search_prefer_semantic {
+            self.activate_semantic_from_disk().await;
+        }
+        let settings = self.get_settings().await;
+        if settings.grep_use_index && !self.is_index_loaded() {
+            self.activate_exact_index_from_disk().await;
+        }
+    }
+
+    /// Open only the existing index for exact search. This intentionally does
+    /// not install, probe, or retain an embedding model. Files changed while no
+    /// embedder is resident are rejected by identity checks and extracted live.
+    async fn activate_exact_index_from_disk(self: &Arc<Self>) {
+        if self.is_index_loaded() {
+            return;
+        }
+        let settings = self.get_settings().await;
+        if !settings.grep_use_index {
+            return;
+        }
+        let Some((_plan, index)) = self.load_restore_index_only(settings).await else {
+            return;
+        };
+        let latest = self.get_settings().await;
+        if !latest.grep_use_index || self.is_index_loaded() {
+            return;
+        }
+        self.restore_store_index_only(index);
+        info!("restore_state: exact-search index restored without embedder");
     }
 
     /// React to a change in Zotero configuration by keeping the metadata cache
@@ -3126,6 +3199,9 @@ impl AppContext {
         initiated_by: &str,
     ) -> Result<SearchHandle, String> {
         let settings = self.settings().await;
+        if query.mode == SearchMode::Grep && settings.grep_use_index && !self.is_index_loaded() {
+            self.activate_exact_index_from_disk().await;
+        }
         let (resolved_library_roots, library_root_errors) = library_roots(&settings);
         query = Self::prepare_search_query(
             query,
@@ -3147,6 +3223,7 @@ impl AppContext {
         let mut documents = Vec::new();
         let mut catalog_errors = Vec::new();
         let mut seen_paths = std::collections::HashSet::new();
+        let catalog_started = std::time::Instant::now();
         for root in &eligibility_roots {
             match self
                 .list_files_filtered_with_ignore(
@@ -3190,22 +3267,27 @@ impl AppContext {
                 Err(error) => catalog_errors.push(format!("{}: {error:#}", root.display())),
             }
         }
+        let catalog_elapsed_ms = catalog_started.elapsed().as_millis() as u64;
 
         let mut semantic_indexing = None;
         if query.scope == SearchScope::All {
             catalog_errors.splice(0..0, library_root_errors);
         }
-        let (embedder, index) = if query.mode == SearchMode::Semantic {
-            let runtime = if query.scope == SearchScope::All {
-                self.prepare_global_semantic_runtime(&settings).await?
-            } else {
-                self.prepare_semantic_runtime(&query.root, &settings)
-                    .await?
-            };
-            semantic_indexing = Some(runtime.indexing);
-            (Some(runtime.embedder), Some(runtime.index))
-        } else {
-            (None, None)
+        let (embedder, index) = match query.mode {
+            SearchMode::Semantic => {
+                let runtime = if query.scope == SearchScope::All {
+                    self.prepare_global_semantic_runtime(&settings).await?
+                } else {
+                    self.prepare_semantic_runtime(&query.root, &settings)
+                        .await?
+                };
+                semantic_indexing = Some(runtime.indexing);
+                (Some(runtime.embedder), Some(runtime.index))
+            }
+            SearchMode::Grep => {
+                let index = settings.grep_use_index.then(|| self.index.lock().clone());
+                (None, index)
+            }
         };
 
         let log = {
@@ -3241,6 +3323,7 @@ impl AppContext {
             generator,
             settings.grep_use_index,
         )
+        .with_catalog_elapsed_ms(catalog_elapsed_ms)
         .with_metadata(self.metadata_cache(), primary_metadata_source))
     }
 
@@ -4354,13 +4437,10 @@ impl AppContext {
         }
     }
 
-    async fn load_restore_state(
-        self: &Arc<Self>,
-        settings: Settings,
-    ) -> Option<RestoreLoadedState> {
+    async fn load_restore_plan(&self, settings: Settings) -> Option<RestoreStatePlan> {
         let db_status = self.load_restore_db_status(&settings).await?;
-        let plan = match Self::prepare_restore_state_plan(settings, db_status) {
-            RestoreStatePreparation::Ready(plan) => plan,
+        match Self::prepare_restore_state_plan(settings, db_status) {
+            RestoreStatePreparation::Ready(plan) => Some(plan),
             RestoreStatePreparation::ResetStaleSelection {
                 db_status,
                 selected,
@@ -4370,9 +4450,16 @@ impl AppContext {
                     db_status.engine, db_status.model_id, selected.engine, selected.model.model_id()
                 );
                 self.clear_restore_state_settings().await;
-                return None;
+                None
             }
-        };
+        }
+    }
+
+    async fn load_restore_state(
+        self: &Arc<Self>,
+        settings: Settings,
+    ) -> Option<RestoreLoadedState> {
+        let plan = self.load_restore_plan(settings).await?;
 
         let embedder = self
             .restore_embedder(&plan.selected, plan.device.clone())
@@ -4386,6 +4473,17 @@ impl AppContext {
             embedder,
             index,
         })
+    }
+
+    async fn load_restore_index_only(
+        &self,
+        settings: Settings,
+    ) -> Option<(RestoreStatePlan, SemanticIndex)> {
+        let plan = self.load_restore_plan(settings).await?;
+        let index = self
+            .restore_index(&plan.selected, plan.db_status.dimension)
+            .await?;
+        Some((plan, index))
     }
 
     async fn restore_embedder(
@@ -4468,6 +4566,13 @@ impl AppContext {
         index_arc
     }
 
+    fn restore_store_index_only(&self, index: SemanticIndex) -> Arc<Mutex<Option<SemanticIndex>>> {
+        self.invalidate_topic_tree_cache();
+        let index_arc = Arc::new(Mutex::new(Some(index)));
+        *self.index.lock() = Arc::clone(&index_arc);
+        index_arc
+    }
+
     async fn finish_restore_state(
         &self,
         plan: &RestoreStatePlan,
@@ -4486,8 +4591,9 @@ impl AppContext {
         info!("restore_state: embedder and index restored");
     }
 
-    /// Reload the embedder and index from disk if they were previously built,
-    /// and restart the filesystem watcher. Run this once after `new`.
+    /// Restore the search resources required by current settings and restart
+    /// the filesystem watcher. Semantic search loads the embedder plus index;
+    /// index-backed exact search can load the index alone. Run once after `new`.
     pub async fn restore_state(self: Arc<Self>) {
         let settings = match get_scoped_settings(&self.settings_path, &self.workspace_path).await {
             Ok(s) => s,
@@ -4509,20 +4615,11 @@ impl AppContext {
                 }
             });
         }
-        // `search_prefer_semantic` is the single owner of whether the semantic
-        // subsystem is active. A leftover index DB on disk must not resurrect the
-        // embedder behind a toggle the user turned off. The directory watcher is
-        // independent and remains active for file-list invalidation.
-        if !settings.search_prefer_semantic {
-            info!("restore_state: semantic search disabled by preference, skipping restore");
+        if !settings.search_prefer_semantic && !settings.grep_use_index {
+            info!("restore_state: no search consumer requires the index");
             return;
         }
-        let Some(loaded) = self.load_restore_state(settings).await else {
-            return;
-        };
-
-        self.finish_restore_state(&loaded.plan, loaded.embedder, loaded.index)
-            .await;
+        self.activate_required_search_runtime_from_disk().await;
     }
 }
 
@@ -4922,6 +5019,8 @@ mod tests {
     use tokio::sync::mpsc;
     use tracing::subscriber;
     use tracing_subscriber::prelude::*;
+    use wilkes_core::embed::index::chunk::Chunk;
+    use wilkes_core::embed::index::db::PreparedFile;
     use wilkes_core::embed::MockEmbedder;
     use wilkes_core::generate::mock::MockGenerator;
     use wilkes_core::types::EmbeddingEngine;
@@ -5107,7 +5206,8 @@ mod tests {
         assert_eq!(capped.sampled_chunk_count, 3);
 
         let revision = ctx.semantic_index_revision.load(Ordering::Acquire);
-        ctx.deactivate_semantic();
+        ctx.detach_semantic_embedder();
+        ctx.detach_search_index();
         assert!(ctx.topic_tree_caches.lock().root.is_none());
         assert!(ctx.topic_tree_caches.lock().document.is_none());
         assert!(ctx.semantic_index_revision.load(Ordering::Acquire) > revision);
@@ -6633,13 +6733,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_restore_state_skips_when_semantic_pref_off() {
+    async fn test_restore_state_skips_index_when_both_consumers_are_off() {
         let (dir, ctx) = test_ctx();
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
 
         // A fully restorable index DB sits on disk with the default selection,
-        // so the only thing that can prevent restore is the user's toggle.
+        // so only the absence of both runtime consumers can prevent restore.
         let selected = SelectedEmbedder::default();
         SemanticIndex::create(
             &ctx.data_dir,
@@ -6650,9 +6750,8 @@ mod tests {
         )
         .unwrap();
 
-        // Persist settings with the semantic toggle OFF while the built index is
-        // still marked enabled and its path present (the exact state a user is in
-        // after building and then unchecking semantic search).
+        // Persist settings with both semantic preference and index-backed exact
+        // search off while the built index remains recorded on disk.
         let disabled = Settings {
             search_prefer_semantic: false,
             last_directory: Some(root),
@@ -6669,9 +6768,8 @@ mod tests {
         )
         .unwrap();
 
-        // Positive control: the same settings with the toggle ON would be deemed
-        // restorable (selection matches the DB), proving `search_prefer_semantic`
-        // is the decisive gate rather than a stale-selection reset.
+        // Positive control: the same index is structurally restorable, proving
+        // the consumer settings are the gate rather than stale-selection reset.
         let enabled = Settings {
             search_prefer_semantic: true,
             ..disabled.clone()
@@ -6691,7 +6789,48 @@ mod tests {
         // for file-list invalidation even when semantic search is disabled.
         assert!(ctx.directory_watcher.lock().is_some());
         assert!(ctx.embedder.lock().is_none());
+        assert!(!ctx.is_index_loaded());
         assert!(!ctx.get_settings().await.search_prefer_semantic);
+    }
+
+    #[tokio::test]
+    async fn restore_state_loads_index_without_embedder_for_exact_search() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let selected = SelectedEmbedder::default();
+        SemanticIndex::create(
+            &ctx.data_dir,
+            selected.model.model_id(),
+            selected.dimension,
+            selected.engine,
+            None,
+        )
+        .unwrap();
+        let settings = Settings {
+            search_prefer_semantic: false,
+            grep_use_index: true,
+            last_directory: Some(root),
+            semantic: SemanticSettings {
+                enabled: true,
+                index_path: Some(ctx.data_dir.join("semantic_index.db")),
+                selected,
+                ..SemanticSettings::default()
+            },
+            ..Settings::default()
+        };
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string(&settings).unwrap(),
+        )
+        .unwrap();
+
+        Arc::clone(&ctx).restore_state().await;
+
+        assert!(ctx.is_index_loaded());
+        assert!(ctx.embedder.lock().is_none());
+        assert!(!ctx.is_semantic_ready());
+        assert!(ctx.directory_watcher.lock().is_some());
     }
 
     #[tokio::test]
@@ -6719,7 +6858,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_settings_pref_off_keeps_directory_watcher_and_tears_down_semantic() {
+    async fn semantic_pref_off_with_no_exact_consumer_releases_embedder_and_index() {
         let (dir, ctx) = test_ctx();
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -6765,6 +6904,124 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn semantic_pref_off_retains_index_for_exact_search() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string(&Settings {
+                search_prefer_semantic: true,
+                grep_use_index: true,
+                last_directory: Some(root.clone()),
+                ..Settings::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let index = SemanticIndex::create(
+            &ctx.data_dir,
+            "retained-model",
+            384,
+            EmbeddingEngine::Candle,
+            None,
+        )
+        .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
+        *ctx.embedder.lock() = Some(Arc::new(MockEmbedder::default()) as Arc<dyn Embedder>);
+        ctx.start_directory_watcher(root);
+
+        ctx.update_settings(serde_json::json!({ "search_prefer_semantic": false }))
+            .await
+            .unwrap();
+
+        assert!(ctx.embedder.lock().is_none());
+        assert!(ctx.is_index_loaded());
+        assert!(ctx.directory_watcher.lock().is_some());
+    }
+
+    #[tokio::test]
+    async fn exact_index_toggle_loads_and_releases_index_without_embedder() {
+        let (dir, ctx) = test_ctx();
+        let selected = SelectedEmbedder::default();
+        SemanticIndex::create(
+            &ctx.data_dir,
+            selected.model.model_id(),
+            selected.dimension,
+            selected.engine,
+            None,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string(&Settings {
+                search_prefer_semantic: false,
+                grep_use_index: false,
+                semantic: SemanticSettings {
+                    enabled: true,
+                    index_path: Some(ctx.data_dir.join("semantic_index.db")),
+                    selected,
+                    ..SemanticSettings::default()
+                },
+                ..Settings::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        ctx.update_settings(serde_json::json!({ "grep_use_index": true }))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !ctx.is_index_loaded() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("index-only activation should finish");
+        assert!(ctx.embedder.lock().is_none());
+
+        ctx.update_settings(serde_json::json!({ "grep_use_index": false }))
+            .await
+            .unwrap();
+        assert!(!ctx.is_index_loaded());
+        assert!(ctx.embedder.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn disabling_exact_index_keeps_semantic_runtime_resident() {
+        let (dir, ctx) = test_ctx();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string(&Settings {
+                search_prefer_semantic: true,
+                grep_use_index: true,
+                ..Settings::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let index = SemanticIndex::create(
+            &ctx.data_dir,
+            "semantic-model",
+            384,
+            EmbeddingEngine::Candle,
+            None,
+        )
+        .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
+        *ctx.embedder.lock() = Some(Arc::new(MockEmbedder::default()) as Arc<dyn Embedder>);
+
+        ctx.update_settings(serde_json::json!({ "grep_use_index": false }))
+            .await
+            .unwrap();
+
+        assert!(ctx.is_index_loaded());
+        assert!(ctx.embedder.lock().is_some());
+        assert!(ctx.is_semantic_ready());
     }
 
     #[tokio::test]
@@ -7556,6 +7813,142 @@ exit 0
         );
         assert!(handle.next().await.is_none());
         assert!(handle.finish().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_search_setting_routes_the_shared_index_and_reports_fallbacks() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let pdf = root.join("paper.pdf");
+        // Intentionally not a valid PDF: successful matching proves the app
+        // boundary supplied indexed text instead of silently extracting live.
+        std::fs::write(&pdf, "%PDF-1.7 opaque bytes").unwrap();
+
+        let emitter = Arc::new(MockEmitter {
+            events: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (ctx, _rx, _loop) = AppContext::new(
+            root.clone(),
+            root.join("settings.json"),
+            WorkerPaths {
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
+            },
+            emitter,
+        );
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({
+                "last_directory": root,
+                "grep_use_index": true
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut index = SemanticIndex::create(
+            &ctx.data_dir,
+            "test-model",
+            3,
+            EmbeddingEngine::Candle,
+            Some(&root),
+        )
+        .unwrap();
+        index
+            .write_file(PreparedFile {
+                path: pdf.clone(),
+                full_text: "alpha beta gamma".to_string(),
+                chunks: vec![(
+                    Chunk {
+                        file_path: pdf.clone(),
+                        text: "alpha beta gamma".to_string(),
+                        byte_range: ByteRange { start: 0, end: 16 },
+                        origin: SourceOrigin::PdfPage {
+                            page: 1,
+                            bbox: None,
+                        },
+                    },
+                    vec![1.0, 0.0, 0.0],
+                )],
+            })
+            .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
+
+        let query = SearchQuery {
+            pattern: "beta".to_string(),
+            is_regex: false,
+            case_sensitive: true,
+            root: root.clone(),
+            max_results: 10,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: SearchMode::Grep,
+            scope: SearchScope::File { path: pdf.clone() },
+            supported_extensions: Vec::new(),
+            collection_id: None,
+            tag_ids: Vec::new(),
+        };
+
+        let mut indexed_results = Vec::new();
+        let indexed_stats = ctx
+            .clone()
+            .start_search(query.clone())
+            .await
+            .unwrap()
+            .run(|result| {
+                indexed_results.push(result);
+                async { true }
+            })
+            .await;
+        assert_eq!(indexed_results.len(), 1);
+        assert_eq!(indexed_results[0].matches[0].matched_text, "beta");
+        assert_eq!(indexed_stats.indexed_pdf_reads, 1);
+        assert_eq!(indexed_stats.live_pdf_fallbacks, 0);
+        assert_eq!(indexed_stats.index_unavailable_fallbacks, 0);
+        assert!(indexed_stats.errors.is_empty());
+
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "grep_use_index": false }),
+        )
+        .await
+        .unwrap();
+        let disabled_stats = ctx
+            .clone()
+            .start_search(query.clone())
+            .await
+            .unwrap()
+            .run(|_| async { true })
+            .await;
+        assert_eq!(disabled_stats.indexed_pdf_reads, 0);
+        assert_eq!(disabled_stats.live_pdf_fallbacks, 1);
+        assert_eq!(disabled_stats.index_unavailable_fallbacks, 0);
+        assert_eq!(disabled_stats.errors.len(), 1);
+
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "grep_use_index": true }),
+        )
+        .await
+        .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(None));
+        std::fs::remove_file(ctx.data_dir.join("semantic_index.db")).unwrap();
+        let unavailable_stats = ctx
+            .clone()
+            .start_search(query)
+            .await
+            .unwrap()
+            .run(|_| async { true })
+            .await;
+        assert_eq!(unavailable_stats.indexed_pdf_reads, 0);
+        assert_eq!(unavailable_stats.live_pdf_fallbacks, 1);
+        assert_eq!(unavailable_stats.index_unavailable_fallbacks, 1);
+        assert_eq!(unavailable_stats.errors.len(), 1);
     }
 
     #[test]

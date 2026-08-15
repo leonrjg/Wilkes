@@ -24,6 +24,7 @@ pub struct SearchHandle {
     worker: JoinHandle<SearchOutcome>,
     log: Option<SearchLogTracker>,
     metadata: Option<SearchMetadata>,
+    catalog_elapsed_ms: u64,
 }
 
 struct SearchMetadata {
@@ -41,6 +42,11 @@ impl SearchHandle {
             cache,
             primary_source,
         });
+        self
+    }
+
+    pub fn with_catalog_elapsed_ms(mut self, catalog_elapsed_ms: u64) -> Self {
+        self.catalog_elapsed_ms = catalog_elapsed_ms;
         self
     }
 
@@ -129,7 +135,11 @@ impl SearchHandle {
         SearchStats {
             files_scanned: outcome.files_scanned.unwrap_or(files_with_matches),
             total_matches,
+            catalog_elapsed_ms: self.catalog_elapsed_ms,
             elapsed_ms,
+            indexed_pdf_reads: outcome.indexed_pdf_reads,
+            live_pdf_fallbacks: outcome.live_pdf_fallbacks,
+            index_unavailable_fallbacks: outcome.index_unavailable_fallbacks,
             errors: outcome.errors,
             hyde_documents: outcome.hyde_documents,
         }
@@ -138,7 +148,9 @@ impl SearchHandle {
 
 /// Spawn a search and return a `SearchHandle` whose `rx` streams `FileMatches`.
 ///
-/// For `SearchMode::Grep`: `embedder` and `index` are ignored.
+/// For `SearchMode::Grep`: `embedder` is ignored. When `grep_use_index` is
+/// enabled, `index` supplies stored PDF text and individual unavailable files
+/// fall back to live extraction.
 /// For `SearchMode::Semantic`: both must be `Some`, otherwise the search returns
 /// an immediate error. The desktop validates presence before calling.
 #[allow(clippy::too_many_arguments)]
@@ -206,6 +218,7 @@ pub fn start_search(
         worker,
         log,
         metadata: None,
+        catalog_elapsed_ms: 0,
     }
 }
 
@@ -273,6 +286,7 @@ mod tests {
             worker,
             log: None,
             metadata: None,
+            catalog_elapsed_ms: 0,
         }
         .with_metadata(Some(cache), MetadataSource::File);
 
@@ -462,7 +476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_handle_reports_hyde_documents_from_the_provider_outcome() {
+    async fn search_handle_reports_provider_outcome_diagnostics() {
         let (tx, rx) = mpsc::channel(1);
         drop(tx);
         let worker = tokio::spawn(async {
@@ -470,6 +484,9 @@ mod tests {
                 errors: Vec::new(),
                 hyde_documents: vec!["The exact generated passage.".to_string()],
                 files_scanned: None,
+                indexed_pdf_reads: 2,
+                live_pdf_fallbacks: 3,
+                index_unavailable_fallbacks: 1,
             }
         });
         let handle = SearchHandle {
@@ -477,11 +494,17 @@ mod tests {
             worker,
             log: None,
             metadata: None,
-        };
+            catalog_elapsed_ms: 0,
+        }
+        .with_catalog_elapsed_ms(7);
 
         let stats = handle.run(|_| async { true }).await;
 
         assert_eq!(stats.hyde_documents, vec!["The exact generated passage."]);
+        assert_eq!(stats.catalog_elapsed_ms, 7);
+        assert_eq!(stats.indexed_pdf_reads, 2);
+        assert_eq!(stats.live_pdf_fallbacks, 3);
+        assert_eq!(stats.index_unavailable_fallbacks, 1);
     }
 
     #[tokio::test]
@@ -583,6 +606,7 @@ mod tests {
             worker,
             log: None,
             metadata: None,
+            catalog_elapsed_ms: 0,
         };
         let errors = handle.finish().await;
         assert!(!errors.is_empty());
