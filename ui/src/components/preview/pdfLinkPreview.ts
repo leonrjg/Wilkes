@@ -1,17 +1,12 @@
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { resolveDestination, type PdfDestination } from "./pdfDestinations";
+import { loadPdfPageText, type PositionedPdfText } from "./pdfTextContent";
+
+export type { PositionedPdfText } from "./pdfTextContent";
 
 export interface PdfLinkPreview {
   pageNumber: number;
   text: string;
-}
-
-export interface PositionedPdfText {
-  text: string;
-  x: number;
-  top: number;
-  width: number;
-  height: number;
 }
 
 interface TextLine {
@@ -58,67 +53,6 @@ function destinationKey(dest: PdfDestination): string {
     // not prevent a preview from being generated.
     return `explicit:${dest.map((part) => String(part)).join("|")}`;
   }
-}
-
-function positionPdfTextItem(
-  viewportTransform: number[],
-  item: {
-    str: string;
-    transform: number[];
-    width: number;
-    height: number;
-  },
-): PositionedPdfText | null {
-  if (!item.str.trim()) return null;
-
-  const [v0, v1, v2, v3, v4, v5] = viewportTransform;
-  const [t0, t1, t2, t3, t4, t5] = item.transform;
-  // Matrix multiplication equivalent to pdf.js' Util.transform, kept local so
-  // this geometry-only module does not pull the browser canvas runtime into
-  // Node/jsdom unit tests.
-  const [a, b, c, d, e, f] = [
-    v0 * t0 + v2 * t1,
-    v1 * t0 + v3 * t1,
-    v0 * t2 + v2 * t3,
-    v1 * t2 + v3 * t3,
-    v0 * t4 + v2 * t5 + v4,
-    v1 * t4 + v3 * t5 + v5,
-  ];
-  const advanceScale = Math.hypot(a, b);
-  const advanceX = advanceScale > 0 ? a / advanceScale : 1;
-  const advanceY = advanceScale > 0 ? b / advanceScale : 0;
-  const width = Math.abs(item.width);
-  const fallbackHeight = Math.abs(item.height);
-  const verticalX = Number.isFinite(c) ? c : 0;
-  const verticalY = Number.isFinite(d) ? d : -fallbackHeight;
-
-  // The transformed text origin is its baseline. Combine its advance and
-  // vertical vectors into an axis-aligned envelope. This remains valid when a
-  // page viewport is cropped or rotated; no bottom-left/top-left assumptions
-  // leak into the excerpt selection.
-  const corners = [
-    [e, f],
-    [e + advanceX * width, f + advanceY * width],
-    [e + verticalX, f + verticalY],
-    [
-      e + advanceX * width + verticalX,
-      f + advanceY * width + verticalY,
-    ],
-  ];
-  const xs = corners.map(([x]) => x);
-  const ys = corners.map(([, y]) => y);
-  const left = Math.min(...xs);
-  const right = Math.max(...xs);
-  const top = Math.min(...ys);
-  const bottom = Math.max(...ys);
-
-  return {
-    text: item.str,
-    x: left,
-    top,
-    width: Math.max(right - left, 0.5),
-    height: Math.max(bottom - top, fallbackHeight, 0.5),
-  };
 }
 
 function joinItems(items: PositionedPdfText[]): string {
@@ -401,24 +335,8 @@ async function loadPageLines(
   if (cached) return cached;
 
   const promise = (async () => {
-    const page = await pdf.getPage(pageIndex + 1);
-    const viewport = page.getViewport({ scale: 1 });
-    const content = await page.getTextContent();
-    const items: PositionedPdfText[] = [];
-    for (const item of content.items) {
-      if (!("str" in item)) continue;
-      const positioned = positionPdfTextItem(
-        viewport.transform,
-        item as {
-          str: string;
-          transform: number[];
-          width: number;
-          height: number;
-        },
-      );
-      if (positioned) items.push(positioned);
-    }
-    return groupPdfTextLines(items);
+    const items = await loadPdfPageText(pdf, pageIndex + 1);
+    return groupPdfTextLines(items.filter((item) => item.text.trim()));
   })();
   documentPages.set(pageIndex, promise);
   promise.catch(() => documentPages?.delete(pageIndex));

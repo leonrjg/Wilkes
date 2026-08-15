@@ -4,6 +4,8 @@ import { Search as SearchIcon, List } from "react-feather";
 import { Page, pdfjs } from "react-pdf";
 import type { BoundingBox } from "../../lib/types";
 import { usePdfInnerSearch, type InnerMatch } from "./usePdfInnerSearch";
+import { usePdfSearchResult } from "./usePdfSearchResult";
+import type { PdfSearchLocator } from "./pdfTextLocator";
 import { useDocumentFind } from "./useDocumentFind";
 import FindBar from "./FindBar";
 import ZoomControls, { ZOOM_STEP } from "./ZoomControls";
@@ -41,6 +43,9 @@ export interface PdfViewerProps {
   /** Precise per-line rects for the navigation target (bookmarks). When set,
    *  the emphasis is drawn per line instead of over `highlight_bbox`'s union. */
   highlight_rects?: BoundingBox[] | null;
+  /** Raw search evidence used to correct a chunk-level indexed origin against
+   *  nearby PDF.js pages. It is transient viewer state, never index data. */
+  search_locator?: PdfSearchLocator | null;
   bookmarkHighlights?: Array<{ id: string; page: number; rects: BoundingBox[] }>;
   onBookmarkOpen?: BookmarkOpenHandler;
   onRenderSuccess?: () => void;
@@ -87,6 +92,14 @@ function median(values: number[]): number {
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
+
+/** Diameter of the navigation-target ripple, as a fraction of the target's
+ *  shorter side. Sizing off the shorter side rather than the longer one keeps
+ *  the ripple the same modest size whether the target is one word or a
+ *  paragraph-wide union box — length of the match says nothing about how big
+ *  the "look here" pulse should be. The `animate-ping` keyframes scale it to
+ *  2x over its lifetime, so the value is the starting size. */
+const PING_SIZE_RATIO = 1.2;
 
 /** Place a highlight overlay on a rendered page. Geometry only — the palette,
  *  radius and padding belong to `.pdf-highlight` in styles.css, shared with
@@ -210,6 +223,7 @@ export default function PdfViewer({
   page,
   highlight_bbox,
   highlight_rects = null,
+  search_locator = null,
   bookmarkHighlights = [],
   onBookmarkOpen,
   onRenderSuccess,
@@ -249,6 +263,12 @@ export default function PdfViewer({
   // unmounts), so navigating back to a recently opened file is instant.
   const pdf = usePdfDocument(url, loadAttempt, onLoadError);
   const numPages = pdf?.numPages ?? null;
+  const locatedSearchResult = usePdfSearchResult(pdf, page, search_locator);
+  const targetPage = locatedSearchResult?.page ?? page;
+  const targetBbox =
+    locatedSearchResult?.bbox ?? (search_locator ? null : highlight_bbox);
+  const targetRects =
+    locatedSearchResult?.rects ?? (search_locator ? null : highlight_rects);
   const [isOutlineOpen, setIsOutlineOpen] = useState(false);
   const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
 
@@ -629,8 +649,8 @@ export default function PdfViewer({
     const prevTarget = prevNavigationTargetRef.current;
     const navigationChanged =
       !prevTarget ||
-      prevTarget.page !== page ||
-      prevTarget.bbox !== highlight_bbox;
+      prevTarget.page !== targetPage ||
+      prevTarget.bbox !== targetBbox;
 
     if (hasPageMetrics && !isSearchOpen && navigationChanged) {
       // On the first navigation for this document, a plain open (page 1, no
@@ -638,13 +658,13 @@ export default function PdfViewer({
       // reader was last left. An explicit target (a search hit or bookmark)
       // always wins over the remembered position.
       const isInitial = prevTarget === null;
-      const isDefaultTarget = page === 1 && highlight_bbox === null;
+      const isDefaultTarget = targetPage === 1 && targetBbox === null;
       const remembered = isInitial && isDefaultTarget ? readPdfScrollPosition(url) : null;
       if (remembered) {
         restoreScrollPosition(remembered);
       } else {
-        virtualizer.scrollToIndex(page - 1, { align: "start" });
-        setCurrentPage(page);
+        virtualizer.scrollToIndex(targetPage - 1, { align: "start" });
+        setCurrentPage(targetPage);
       }
 
       if (isInitial) {
@@ -653,7 +673,7 @@ export default function PdfViewer({
         // remembered page (clamped the same way restoreScrollPosition clamps).
         const landing = remembered
           ? Math.min(Math.max(remembered.page, 1), pageMetrics.length)
-          : page;
+          : targetPage;
         landingPageRef.current = landing;
         // A top-of-document open can paint the landing page before this effect
         // runs; that page's onRenderSuccess has already fired and won't fire
@@ -665,9 +685,19 @@ export default function PdfViewer({
     }
 
     if (hasPageMetrics) {
-      prevNavigationTargetRef.current = { page, bbox: highlight_bbox };
+      prevNavigationTargetRef.current = { page: targetPage, bbox: targetBbox };
     }
-  }, [page, hasPageMetrics, highlight_bbox, isSearchOpen, virtualizer, url, restoreScrollPosition, pageMetrics, signalInitialRender]);
+  }, [
+    targetPage,
+    hasPageMetrics,
+    targetBbox,
+    isSearchOpen,
+    virtualizer,
+    url,
+    restoreScrollPosition,
+    pageMetrics,
+    signalInitialRender,
+  ]);
 
   // Remember where the reader is as it scrolls, so reopening this document later
   // in the same session lands back here. Captured live (not on unmount): by the
@@ -791,21 +821,21 @@ export default function PdfViewer({
               const pageScale = renderedWidth / pageMetric.width;
               const pageHeight = getScaledPageHeight(pageMetric, renderedWidth);
 
-              const isTargetPage = pageNum === page;
-              const targetBbox = isTargetPage ? highlight_bbox : null;
+              const isTargetPage = pageNum === targetPage;
+              const pageTargetBbox = isTargetPage ? targetBbox : null;
               // Precise emphasis for a bookmark target; when present it replaces
               // the coarse single-box emphasis below.
-              const targetRects =
-                isTargetPage && !isSearchOpen ? highlight_rects : null;
+              const pageTargetRects =
+                isTargetPage && !isSearchOpen ? targetRects : null;
 
               const innerMatch = innerMatches[currentMatchIdx];
               const innerBbox = innerMatch && innerMatch.page === pageNum ? innerMatch.bbox : null;
 
               const activeBbox = isSearchOpen
                 ? innerBbox
-                : targetRects && targetRects.length > 0
+                : pageTargetRects && pageTargetRects.length > 0
                   ? null
-                  : targetBbox;
+                  : pageTargetBbox;
               const pageBookmarkHighlights = bookmarkHighlights.filter(
                 (highlight) => highlight.page === pageNum,
               );
@@ -876,7 +906,7 @@ export default function PdfViewer({
                       )),
                     )}
                     {overlayStyle && <div className="pdf-highlight" style={overlayStyle} />}
-                    {targetRects?.map((rect, rectIndex) => (
+                    {pageTargetRects?.map((rect, rectIndex) => (
                       <div
                         key={`target-${rectIndex}`}
                         data-testid="target-highlight"
@@ -891,7 +921,7 @@ export default function PdfViewer({
                         const { x, y, width, height } = targetBbox;
                         const cx = (x + width / 2) * pageScale;
                         const cy = (y + height / 2) * pageScale;
-                        const r = Math.max(width, height) * pageScale;
+                        const r = Math.min(width, height) * pageScale * PING_SIZE_RATIO;
                         return (
                           <div
                             key={`${x}-${y}-${width}-${height}`}

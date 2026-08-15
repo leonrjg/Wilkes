@@ -3,23 +3,34 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { usePdfInnerSearch } from "./usePdfInnerSearch";
 
 describe("usePdfInnerSearch", () => {
-  const mockPage = {
-    getTextContent: vi.fn().mockResolvedValue({
-      items: [
-        { str: "Hello world", transform: [1, 0, 0, 1, 10, 10], width: 50 },
-      ],
-    }),
-    getViewport: vi.fn().mockReturnValue({ width: 600, height: 800 }),
-  };
-
-  const mockPdf = {
-    numPages: 2,
-    getPage: vi.fn().mockResolvedValue(mockPage),
-  };
+  let mockPdf: { numPages: number; getPage: ReturnType<typeof vi.fn> };
 
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
+    const mockPage = {
+      getTextContent: vi.fn().mockResolvedValue({
+        items: [
+          {
+            str: "Hello world",
+            hasEOL: false,
+            dir: "ltr",
+            transform: [1, 0, 0, 1, 10, 10],
+            width: 50,
+            height: 1,
+          },
+        ],
+      }),
+      getViewport: vi.fn().mockReturnValue({
+        width: 600,
+        height: 800,
+        transform: [1, 0, 0, -1, 0, 800],
+      }),
+    };
+    mockPdf = {
+      numPages: 2,
+      getPage: vi.fn().mockResolvedValue(mockPage),
+    };
   });
 
   it("returns no matches without a query", () => {

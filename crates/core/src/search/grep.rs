@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{
-    document_field_matches, exact_matcher, prioritize_and_limit_results, SearchOutcome,
-    SearchProvider, SearchResultTx,
+    document_field_matches, exact_matcher, pdf_projection, prioritize_and_limit_results,
+    SearchOutcome, SearchProvider, SearchResultTx,
 };
 
 /// Shared handle to the live semantic index, as held by the API layer.
@@ -67,6 +67,12 @@ impl SearchProvider for GrepSearchProvider {
         documents: &[SearchDocument],
     ) -> anyhow::Result<SearchOutcome> {
         let matcher = Self::build_matcher(query)?;
+        let has_pdf = documents
+            .iter()
+            .any(|document| document.file_type == FileType::Pdf);
+        let pdf_literal_matcher = (!query.is_regex && has_pdf)
+            .then(|| pdf_projection::literal_matcher(&query.pattern, query.case_sensitive))
+            .transpose()?;
         let errors = Mutex::new(Vec::new());
         let files_scanned = AtomicUsize::new(0);
         let diagnostics = GrepDiagnostics::default();
@@ -113,6 +119,7 @@ impl SearchProvider for GrepSearchProvider {
                     query,
                     extractors,
                     &matcher,
+                    pdf_literal_matcher.as_ref(),
                     index,
                     &diagnostics,
                 ) {
@@ -217,6 +224,7 @@ fn search_document_content(
     query: &SearchQuery,
     extractors: &ExtractorRegistry,
     matcher: &RegexMatcher,
+    pdf_literal_matcher: Option<&RegexMatcher>,
     index: Option<&IndexHandle>,
     diagnostics: &GrepDiagnostics,
 ) -> anyhow::Result<Vec<Match>> {
@@ -231,13 +239,14 @@ fn search_document_content(
             // logged and demoted to live extraction rather than failing the
             // file; "not indexed / stale / pre-v4" simply returns None.
             let from_index = match index {
-                Some(handle) => indexed_pdf_matches(handle, path, matcher).unwrap_or_else(|e| {
-                    tracing::warn!(
-                        "index-backed grep failed for {}, extracting live: {e:#}",
-                        path.display()
-                    );
-                    IndexedPdfSearch::DocumentUnavailable
-                }),
+                Some(handle) => indexed_pdf_matches(handle, path, matcher, pdf_literal_matcher)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "index-backed grep failed for {}, extracting live: {e:#}",
+                            path.display()
+                        );
+                        IndexedPdfSearch::DocumentUnavailable
+                    }),
                 None => IndexedPdfSearch::Disabled,
             };
             match from_index {
@@ -254,13 +263,13 @@ fn search_document_content(
                     diagnostics
                         .index_unavailable_fallbacks
                         .fetch_add(1, Ordering::Relaxed);
-                    live_pdf_matches(path, extractors, matcher)
+                    live_pdf_matches(path, extractors, matcher, pdf_literal_matcher)
                 }
                 IndexedPdfSearch::Disabled | IndexedPdfSearch::DocumentUnavailable => {
                     diagnostics
                         .live_pdf_fallbacks
                         .fetch_add(1, Ordering::Relaxed);
-                    live_pdf_matches(path, extractors, matcher)
+                    live_pdf_matches(path, extractors, matcher, pdf_literal_matcher)
                 }
             }
         }
@@ -350,12 +359,18 @@ fn live_pdf_matches(
     path: &Path,
     extractors: &ExtractorRegistry,
     matcher: &RegexMatcher,
+    pdf_literal_matcher: Option<&RegexMatcher>,
 ) -> anyhow::Result<Vec<Match>> {
     let extractor = extractors
         .find(path, None)
         .ok_or_else(|| anyhow::anyhow!("no extractor registered"))?;
     let content = extractor.extract(path)?;
-    search_text_and_map(&content.text, &content.source_map, matcher)
+    search_text_and_map(
+        &content.text,
+        &content.source_map,
+        matcher,
+        pdf_literal_matcher,
+    )
 }
 
 /// Search a PDF's text as held by the semantic index. Returns `None` when the
@@ -372,6 +387,7 @@ fn indexed_pdf_matches(
     index: &IndexHandle,
     path: &Path,
     matcher: &RegexMatcher,
+    pdf_literal_matcher: Option<&RegexMatcher>,
 ) -> anyhow::Result<IndexedPdfSearch> {
     // Hold the index lock only long enough to copy out the stored text; run the
     // regex afterwards so we do not block indexing for the scan itself.
@@ -391,41 +407,73 @@ fn indexed_pdf_matches(
         &text,
         &source_map,
         matcher,
+        pdf_literal_matcher,
     )?))
 }
 
-/// Run the exact matcher over already-extracted `text`, resolving each match's
-/// source position through `source_map`. Shared by the live and index-backed
-/// PDF paths so both produce identical `Match` shapes.
+/// Search already-extracted PDF text and resolve every result against the raw
+/// extraction. Literal queries use an artifact-normalized projection; regex
+/// queries retain their historical raw-text semantics. Shared by the live and
+/// index-backed paths so both produce identical `Match` shapes.
 fn search_text_and_map(
     full: &str,
     source_map: &SourceMap,
     matcher: &RegexMatcher,
+    pdf_literal_matcher: Option<&RegexMatcher>,
 ) -> anyhow::Result<Vec<Match>> {
-    let text = full.as_bytes();
+    if let Some(literal_matcher) = pdf_literal_matcher {
+        let projection = pdf_projection::PdfSearchProjection::new(full);
+        return collect_pdf_matches(
+            full,
+            source_map,
+            projection.as_bytes(),
+            literal_matcher,
+            |range| projection.raw_range(range),
+        );
+    }
+
+    collect_pdf_matches(full, source_map, full.as_bytes(), matcher, Some)
+}
+
+fn collect_pdf_matches(
+    full: &str,
+    source_map: &SourceMap,
+    searchable: &[u8],
+    matcher: &RegexMatcher,
+    map_range: impl Fn(ByteRange) -> Option<ByteRange>,
+) -> anyhow::Result<Vec<Match>> {
+    let raw = full.as_bytes();
     let mut matches = Vec::new();
 
     matcher
-        .find_iter(text, |m| {
-            let start = m.start();
-            let end = m.end();
-            let matched_text = String::from_utf8_lossy(&text[start..end]).into_owned();
-            let origin = source_map
-                .resolve_range(ByteRange { start, end })
-                .unwrap_or(SourceOrigin::PdfPage {
-                    page: 1,
-                    bbox: None,
-                });
+        .find_iter(searchable, |m| {
+            let Some(raw_range) = map_range(ByteRange {
+                start: m.start(),
+                end: m.end(),
+            }) else {
+                return true;
+            };
+            let matched_text =
+                String::from_utf8_lossy(&raw[raw_range.start..raw_range.end]).into_owned();
+            let origin =
+                source_map
+                    .resolve_range(raw_range.clone())
+                    .unwrap_or(SourceOrigin::PdfPage {
+                        page: 1,
+                        bbox: None,
+                    });
 
             // Extract ~120-char context windows around the match using char
             // boundaries so we don't split UTF-8 sequences.
             // We replace newlines with spaces in the context so the result looks
             // clean in the UI list even if it spans a line break.
-            let ctx_before = extract_context_before(full, start, 120).replace(['\n', '\r'], " ");
-            let ctx_after = extract_context_after(full, end, 120).replace(['\n', '\r'], " ");
+            let ctx_before =
+                extract_context_before(full, raw_range.start, 120).replace(['\n', '\r'], " ");
+            let ctx_after =
+                extract_context_after(full, raw_range.end, 120).replace(['\n', '\r'], " ");
 
             matches.push(Match {
-                text_range: Some(ByteRange { start, end }),
+                text_range: Some(raw_range),
                 matched_text,
                 context_before: ctx_before,
                 context_after: ctx_after,
@@ -680,12 +728,106 @@ mod tests {
             tag_ids: Vec::new(),
         };
         let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
-        let matches = search_text_and_map(&content.text, &content.source_map, &matcher).unwrap();
+        let literal_matcher =
+            pdf_projection::literal_matcher(&query.pattern, query.case_sensitive).unwrap();
+        let matches = search_text_and_map(
+            &content.text,
+            &content.source_map,
+            &matcher,
+            Some(&literal_matcher),
+        )
+        .unwrap();
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].matched_text, "fox");
         assert_eq!(matches[0].context_before, "The quick brown ");
         assert_eq!(matches[0].context_after, " jumps over the lazy dog");
+    }
+
+    #[test]
+    fn literal_pdf_match_maps_artifacts_back_to_raw_range_and_page() {
+        use crate::types::{BoundingBox, SourceSegment};
+
+        let raw = "prefix The topic should also be some-\nthing that interests you. suffix";
+        let some_start = raw.find("some-").unwrap();
+        let some_end = some_start + "some-".len();
+        let thing_start = raw.find("thing").unwrap();
+        let thing_end = thing_start + "thing".len();
+        let source_map = SourceMap {
+            segments: vec![
+                SourceSegment {
+                    text_range: ByteRange {
+                        start: some_start,
+                        end: some_end,
+                    },
+                    origin: SourceOrigin::PdfPage {
+                        page: 4,
+                        bbox: Some(BoundingBox {
+                            x: 100.0,
+                            y: 200.0,
+                            width: 40.0,
+                            height: 10.0,
+                        }),
+                    },
+                },
+                SourceSegment {
+                    text_range: ByteRange {
+                        start: thing_start,
+                        end: thing_end,
+                    },
+                    origin: SourceOrigin::PdfPage {
+                        page: 4,
+                        bbox: Some(BoundingBox {
+                            x: 100.0,
+                            y: 215.0,
+                            width: 35.0,
+                            height: 10.0,
+                        }),
+                    },
+                },
+            ],
+        };
+        let query = "The topic should also be something that interests you.";
+        let raw_matcher = RegexMatcher::new(&regex::escape(query)).unwrap();
+        let literal_matcher = pdf_projection::literal_matcher(query, true).unwrap();
+
+        let matches =
+            search_text_and_map(raw, &source_map, &raw_matcher, Some(&literal_matcher)).unwrap();
+
+        assert_eq!(matches.len(), 1);
+        let found = &matches[0];
+        let range = found.text_range.as_ref().unwrap();
+        assert_eq!(
+            &raw[range.start..range.end],
+            "The topic should also be some-\nthing that interests you."
+        );
+        assert_eq!(found.matched_text, &raw[range.start..range.end]);
+        match &found.origin {
+            SourceOrigin::PdfPage { page, bbox } => {
+                assert_eq!(*page, 4);
+                let bbox = bbox.as_ref().unwrap();
+                assert_eq!(bbox.x, 100.0);
+                assert_eq!(bbox.y, 200.0);
+                assert_eq!(bbox.width, 40.0);
+                assert_eq!(bbox.height, 25.0);
+            }
+            other => panic!("expected PDF origin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn regex_pdf_search_keeps_raw_extraction_semantics() {
+        let raw = "some-\nthing";
+        let source_map = SourceMap { segments: vec![] };
+        let unhyphenated = RegexMatcher::new("something").unwrap();
+        let raw_artifact = RegexMatcher::new("some-\\nthing").unwrap();
+
+        assert!(search_text_and_map(raw, &source_map, &unhyphenated, None)
+            .unwrap()
+            .is_empty());
+        let matches = search_text_and_map(raw, &source_map, &raw_artifact, None).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].matched_text, raw);
     }
 
     #[test]
@@ -915,12 +1057,12 @@ mod tests {
             SemanticIndex::create(root, "m", 3, EmbeddingEngine::Candle, Some(root)).unwrap();
         idx.write_file(PreparedFile {
             path: pdf.clone(),
-            full_text: "alpha beta gamma".to_string(),
+            full_text: "alpha some-\nthing gamma".to_string(),
             chunks: vec![(
                 Chunk {
                     file_path: pdf.clone(),
-                    text: "alpha beta gamma".to_string(),
-                    byte_range: ByteRange { start: 0, end: 16 },
+                    text: "alpha some-\nthing gamma".to_string(),
+                    byte_range: ByteRange { start: 0, end: 23 },
                     origin: SourceOrigin::PdfPage {
                         page: 1,
                         bbox: None,
@@ -933,7 +1075,7 @@ mod tests {
         let handle = Arc::new(Mutex::new(Some(idx)));
 
         let query = SearchQuery {
-            pattern: "beta".to_string(),
+            pattern: "something".to_string(),
             is_regex: false,
             case_sensitive: true,
             root: root.to_path_buf(),
@@ -971,7 +1113,9 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].matches.len(), 1);
-        assert_eq!(results[0].matches[0].matched_text, "beta");
+        assert_eq!(results[0].matches[0].matched_text, "some-\nthing");
+        let range = results[0].matches[0].text_range.as_ref().unwrap();
+        assert_eq!((range.start, range.end), (6, 17));
         match &results[0].matches[0].origin {
             SourceOrigin::PdfPage { page, .. } => assert_eq!(*page, 1),
             other => panic!("expected pdf page origin, got {other:?}"),

@@ -143,13 +143,13 @@ describe("App", () => {
       );
     });
     expect(screen.getByPlaceholderText("Search…")).toBeInTheDocument();
-    expect(screen.getByText("Open folder")).toBeInTheDocument();
+    expect(screen.getByText("Open")).toBeInTheDocument();
   });
 
   it("loads settings on mount", async () => {
     const loadMock = vi.fn().mockResolvedValue(undefined);
     useSettingsStore.setState({ load: loadMock });
-    
+
     await act(async () => {
       render(
         <ToastProvider>
@@ -157,7 +157,7 @@ describe("App", () => {
         </ToastProvider>
       );
     });
-    
+
     expect(loadMock).toHaveBeenCalled();
   });
 
@@ -194,10 +194,10 @@ describe("App", () => {
         </ToastProvider>
       );
     });
-    
+
     const settingsButton = screen.getByRole("button", { name: "Settings" });
     fireEvent.click(settingsButton);
-    
+
     expect(screen.getByTestId("settings-modal")).toBeInTheDocument();
   });
 
@@ -299,7 +299,7 @@ describe("App", () => {
         </ToastProvider>
       );
     });
-    expect(screen.getByText("Open folder")).toBeInTheDocument();
+    expect(screen.getByText("Open")).toBeInTheDocument();
   });
 
   it("imports files copied to the native clipboard on paste", async () => {

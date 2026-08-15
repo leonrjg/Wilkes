@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import type { BoundingBox } from "../../lib/types";
+import { findAllPdfTextMatches } from "./pdfTextLocator";
 
 export interface InnerMatch {
   page: number;
@@ -27,36 +28,12 @@ export function usePdfInnerSearch(pdf: PDFDocumentProxy | null, query: string, i
 
     const search = async () => {
       setIsSearching(true);
-      const found: InnerMatch[] = [];
-      const needle = query.toLowerCase();
 
       try {
-        for (let i = 1; i <= pdf.numPages; i++) {
-          if (abort.signal.aborted) return;
-          const p = await pdf.getPage(i);
-          const textContent = await p.getTextContent();
-
-          for (const item of textContent.items) {
-            if ("str" in item) {
-              const text = item.str.toLowerCase();
-              if (text.includes(needle)) {
-                const [scX, _skY, _skX, scY, tx, ty] = item.transform;
-                const vp = p.getViewport({ scale: 1 });
-                found.push({
-                  page: i,
-                  bbox: {
-                    x: tx,
-                    y: vp.height - ty - scY,
-                    width: item.width || text.length * scX * 0.6,
-                    height: Math.abs(scY),
-                  },
-                });
-              }
-            }
-          }
+        const found = await findAllPdfTextMatches(pdf, query, abort.signal);
+        if (!abort.signal.aborted) {
+          setMatches(found.map(({ page, bbox }) => ({ page, bbox })));
         }
-
-        if (!abort.signal.aborted) setMatches(found);
       } catch (e) {
         console.error("PDF inner search failed:", e);
       } finally {

@@ -11,7 +11,7 @@ import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useChatStore } from "../stores/useChatStore";
 import { api, isTauri } from "../services";
-import type { BoundingBox, DocumentMetadata } from "../lib/types";
+import type { BoundingBox, DocumentMetadata, Match, MatchRef } from "../lib/types";
 import { buildExternalLinks } from "../lib/externalLinks";
 import { formatDocumentMonthYear } from "../lib/dateFormatting";
 import { useToasts } from "./Toast";
@@ -27,6 +27,7 @@ import { useSemanticStore } from "../stores/useSemanticStore";
 import DocumentTopicCloudPane from "./DocumentTopicCloudPane";
 import CitationGraphPane from "./CitationGraphPane";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useSearchStore } from "../stores/useSearchStore";
 
 type ViewerSidePanel = "related" | "citations" | "summary" | "topics" | null;
 
@@ -72,6 +73,34 @@ function metadataBadgeClassName() {
   ].join(" ");
 }
 
+function isReferencedPdfMatch(candidate: Match, selected: MatchRef): boolean {
+  if (!("PdfPage" in candidate.origin) || !("PdfPage" in selected.origin)) {
+    return false;
+  }
+  const candidateRange = candidate.text_range;
+  const selectedRange = selected.text_range;
+  const sameRange =
+    (candidateRange == null && selectedRange == null) ||
+    (candidateRange != null &&
+      selectedRange != null &&
+      candidateRange.start === selectedRange.start &&
+      candidateRange.end === selectedRange.end);
+  if (!sameRange || candidate.origin.PdfPage.page !== selected.origin.PdfPage.page) {
+    return false;
+  }
+  const candidateBox = candidate.origin.PdfPage.bbox;
+  const selectedBox = selected.origin.PdfPage.bbox;
+  return (
+    candidateBox === selectedBox ||
+    (candidateBox != null &&
+      selectedBox != null &&
+      candidateBox.x === selectedBox.x &&
+      candidateBox.y === selectedBox.y &&
+      candidateBox.width === selectedBox.width &&
+      candidateBox.height === selectedBox.height)
+  );
+}
+
 export default function PreviewPane() {
   const activeTab = useViewerStore(activeViewerTab);
   const goBack = useViewerStore((state) => state.goBack);
@@ -98,6 +127,7 @@ export default function PreviewPane() {
   const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
   const generationReady = useGenerationStore((state) => state.ready);
   const semanticReady = useSemanticStore((state) => state.readyForCurrentRoot);
+  const searchResults = useSearchStore((state) => state.results);
   const listedDoi = useSettingsStore((state) =>
     selectedMatch
       ? state.fileList.find((entry) => entry.path === selectedMatch.path)?.doi ?? null
@@ -233,6 +263,22 @@ export default function PreviewPane() {
     selectedMatch.text_range == null;
   const pdfPage = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.page : 1;
   const pdfBbox = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.bbox : null;
+  const selectedSearchMatch = isPdfFile
+    ? searchResults
+        .find((file) => file.path === selectedMatch.path)
+        ?.matches.find((match) => isReferencedPdfMatch(match, selectedMatch))
+    : undefined;
+  // Semantic results intentionally keep their indexed chunk highlight. Their
+  // matched text is the whole chunk, whereas exact results carry the bounded
+  // raw quote that can be localized reliably against nearby PDF.js pages.
+  const pdfSearchLocator =
+    selectedSearchMatch && selectedSearchMatch.score == null
+      ? {
+          matched_text: selectedSearchMatch.matched_text,
+          context_before: selectedSearchMatch.context_before,
+          context_after: selectedSearchMatch.context_after,
+        }
+      : null;
   const bookmarkHighlights = bookmarks.flatMap((bookmark) => {
     if (bookmark.path !== selectedMatch.path || !("PdfPage" in bookmark.origin)) {
       return [];
@@ -256,7 +302,7 @@ export default function PreviewPane() {
       ? selectedMatch.text_range ?? displayData.Text.highlight_range
       : { start: 0, end: 0 };
   // When the navigation target is one of this file's bookmarks, emphasise its
-  // exact per-line rects instead of the union bbox the search path uses.
+  // exact persisted per-line rects instead of its union bbox.
   const bboxesEqual = (a: BoundingBox | null, b: BoundingBox | null) =>
     a != null &&
     b != null &&
@@ -597,6 +643,7 @@ export default function PreviewPane() {
                 page={pdfPage}
                 highlight_bbox={pdfBbox}
                 highlight_rects={targetBookmarkRects}
+                search_locator={pdfSearchLocator}
                 bookmarkHighlights={bookmarkHighlights}
                 onBookmarkOpen={handleOpenBookmark}
                 onRenderSuccess={() => setIsPdfRendering(false)}

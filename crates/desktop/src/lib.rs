@@ -121,6 +121,23 @@ async fn rename_file_for_path(
         .map_err(|e| e.to_string())
 }
 
+/// On macOS the `trash` crate defaults to driving Finder over AppleScript, which fails unless the
+/// user grants the app Apple-events automation permission. `NSFileManager::trashItemAtURL` performs
+/// the same move into the volume's Trash without that permission.
+#[cfg(target_os = "macos")]
+fn move_to_trash(path: &std::path::Path) -> Result<(), trash::Error> {
+    use trash::macos::{DeleteMethod, TrashContextExtMacos};
+
+    let mut context = trash::TrashContext::default();
+    context.set_delete_method(DeleteMethod::NsFileManager);
+    context.delete(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn move_to_trash(path: &std::path::Path) -> Result<(), trash::Error> {
+    trash::delete(path)
+}
+
 async fn trash_file_for_path(path: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         let path = PathBuf::from(path);
@@ -129,7 +146,7 @@ async fn trash_file_for_path(path: String) -> Result<(), String> {
         if !metadata.file_type().is_file() {
             return Err(format!("Cannot trash non-file path: {}", path.display()));
         }
-        trash::delete(&path)
+        move_to_trash(&path)
             .map_err(|error| format!("Failed to move {} to Trash: {error}", path.display()))
     })
     .await
@@ -3348,3 +3365,4 @@ mod tests {
         assert!(logs.is_empty());
     }
 }
+

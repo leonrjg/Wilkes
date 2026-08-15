@@ -245,7 +245,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   };
 
   return (
-    <div className="flex flex-col gap-2 p-2 border-b border-[var(--border-main)] bg-[var(--bg-app)]">
+    <div className="flex flex-col gap-1 p-2 border-b border-[var(--border-main)] bg-[var(--bg-app)]">
       {/* Top row: toggles + pattern */}
       <div className="flex min-w-0 items-center gap-2">
         <Toggle tooltip="Regular expression" active={isRegex} onToggle={handleToggleRegex}>

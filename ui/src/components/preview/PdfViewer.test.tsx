@@ -58,6 +58,17 @@ const { mockUsePdfPageMetrics } = vi.hoisted(() => ({
   },
 }));
 
+const { mockUsePdfSearchResult } = vi.hoisted(() => ({
+  mockUsePdfSearchResult: {
+    value: null as null | {
+      page: number;
+      bbox: { x: number; y: number; width: number; height: number };
+      rects: Array<{ x: number; y: number; width: number; height: number }>;
+      contextScore: number;
+    },
+  },
+}));
+
 // The `pdf` document proxy handed to the viewer via <Document onLoadSuccess>.
 // Defaults to a textless stub so auto-zoom measures no body text and stays at
 // 100%; auto-zoom tests override `getPage` to return sized glyphs.
@@ -129,6 +140,10 @@ vi.mock("@tanstack/react-virtual", () => ({
 
 vi.mock("./usePdfInnerSearch", () => ({
   usePdfInnerSearch: vi.fn(() => mockUsePdfInnerSearch.value),
+}));
+
+vi.mock("./usePdfSearchResult", () => ({
+  usePdfSearchResult: vi.fn(() => mockUsePdfSearchResult.value),
 }));
 
 vi.mock("./useDocumentFind", () => ({
@@ -232,6 +247,7 @@ describe("PdfViewer", () => {
       matches: [],
       isSearching: false,
     };
+    mockUsePdfSearchResult.value = null;
     mockUseDocumentFind.value = {
       inputRef: { current: null },
       isOpen: false,
@@ -547,6 +563,39 @@ describe("PdfViewer", () => {
     expect(document.querySelectorAll("div.pdf-highlight")).toHaveLength(2);
   });
 
+  it("uses a PDF.js-localized search page and rectangles instead of the coarse origin", async () => {
+    mockUsePdfSearchResult.value = {
+      page: 2,
+      bbox: { x: 20, y: 25, width: 110, height: 23 },
+      rects: [
+        { x: 100, y: 25, width: 30, height: 8 },
+        { x: 20, y: 40, width: 90, height: 8 },
+      ],
+      contextScore: 40,
+    };
+
+    render(
+      <PdfViewer
+        {...defaultProps}
+        page={1}
+        search_locator={{
+          matched_text: "reason-\nable by reasonable people",
+          context_before: "found to be ",
+          context_after: ". An effort",
+        }}
+      />,
+    );
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    expect(mockVirtualizer.scrollToIndex).toHaveBeenCalledWith(1, { align: "start" });
+    const targets = screen.getAllByTestId("target-highlight");
+    expect(targets).toHaveLength(2);
+    expect(targets[0]).toHaveStyle({ left: "100px", top: "25px", width: "30px" });
+  });
+
   it("renders persisted bookmark highlights with scaled PDF coordinates", async () => {
     render(
       <PdfViewer
@@ -770,8 +819,11 @@ describe("PdfViewer", () => {
 
     const ping = document.querySelector(".animate-ping") as HTMLElement | null;
     expect(ping).toBeInTheDocument();
-    expect(ping?.style.left).toBe("10px");
-    expect(ping?.style.top).toBe("5px");
+    // Sized from the shorter side (height 10 x 1.2 = 12), centred on the bbox
+    // centre (30, 25).
+    expect(ping?.style.width).toBe("12px");
+    expect(ping?.style.left).toBe("24px");
+    expect(ping?.style.top).toBe("19px");
   });
 
   it("updates the page indicator while scrolling", async () => {

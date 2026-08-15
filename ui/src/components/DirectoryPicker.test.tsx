@@ -56,7 +56,7 @@ describe("DirectoryPicker", () => {
 
   it("renders with folders list", () => {
     renderWithToasts();
-    expect(screen.getByText("Open folder")).toBeInTheDocument();
+    expect(screen.getByText("Open")).toBeInTheDocument();
     expect(screen.getByText("other")).toBeInTheDocument();
     expect(screen.getByText("recent")).toBeInTheDocument();
     expect(screen.getByText("project")).toBeInTheDocument();

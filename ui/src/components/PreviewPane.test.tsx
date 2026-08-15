@@ -695,6 +695,76 @@ describe("PreviewPane", () => {
     expect(call.highlight_bbox).toEqual({ x: 1, y: 2, width: 3, height: 4 });
   });
 
+  it("passes transient PDF search evidence to the viewer locator", () => {
+    const locator = {
+      matched_text: "reason-\nable by reasonable people",
+      context_before: "found to be ",
+      context_after: ". An effort",
+    };
+    setViewerState({
+      selectedMatch: {
+        path: "paper.pdf",
+        origin: { PdfPage: { page: 30, bbox: null } },
+        text_range: { start: 10, end: 45 },
+      },
+      previewData: { Pdf: { page: 30, highlight_bbox: null } },
+    });
+    useSearchStore.setState({
+      results: [
+        {
+          path: "paper.pdf",
+          file_type: "Pdf",
+          matches: [
+            {
+              text_range: { start: 10, end: 45 },
+              matched_text: locator.matched_text,
+              context_before: locator.context_before,
+              context_after: locator.context_after,
+              origin: { PdfPage: { page: 30, bbox: null } },
+            },
+          ],
+        },
+      ],
+    });
+
+    render(<PreviewPane />);
+
+    expect(mockPdfViewer.mock.lastCall?.[0].search_locator).toEqual(locator);
+  });
+
+  it("does not replace semantic chunk geometry with exact-result localization", () => {
+    const origin = {
+      PdfPage: { page: 30, bbox: { x: 1, y: 2, width: 3, height: 4 } },
+    };
+    setViewerState({
+      selectedMatch: { path: "paper.pdf", origin },
+      previewData: { Pdf: { page: 30, highlight_bbox: origin.PdfPage.bbox } },
+    });
+    useSearchStore.setState({
+      results: [
+        {
+          path: "paper.pdf",
+          file_type: "Pdf",
+          matches: [
+            {
+              text_range: null,
+              matched_text: "an entire semantic chunk",
+              context_before: "",
+              context_after: "",
+              origin,
+              score: 0.9,
+            },
+          ],
+        },
+      ],
+    });
+
+    render(<PreviewPane />);
+
+    expect(mockPdfViewer.mock.lastCall?.[0].search_locator).toBeNull();
+    expect(mockPdfViewer.mock.lastCall?.[0].highlight_bbox).toEqual(origin.PdfPage.bbox);
+  });
+
   it("passes only current-file PDF bookmarks to PdfViewer", () => {
     setViewerState({
       selectedMatch: {

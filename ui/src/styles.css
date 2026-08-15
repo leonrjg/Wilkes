@@ -44,7 +44,12 @@ body,
   --hl-bookmark-bg: rgba(250, 204, 21, 0.18);
   --hl-bookmark-border: rgba(202, 138, 4, 0.75);
   --hl-radius: 5px;
-  --hl-pad: 3px;
+  /* Deliberately hairline. A highlight is sized from the text's own bounding
+     box, so any padding grows it vertically as well: books are set with tight
+     leading, and a few px on each side is enough for a highlight to bleed into
+     the lines above and below — and for two highlighted lines to overlap each
+     other. Keep this at 1px; put breathing room nowhere but the corners. */
+  --hl-pad: 1px;
   --hl-underline: 2px;
 }
 
@@ -180,13 +185,16 @@ body,
 
 /* One-shot ripple that draws the eye to a navigation target. Pairs with
    Tailwind's `animate-ping`; the longhands below override the shorthand's
-   infinite repeat. */
+   1s duration and infinite repeat with a slower, twice-only pulse — the point
+   is to be noticed calmly, not to flash. Its size is set by the component,
+   which is the only place the target's dimensions are known. */
 .pdf-highlight-ping {
   position: absolute;
   border-radius: 50%;
   background-color: var(--hl-active-border);
   opacity: 0.55;
   pointer-events: none;
+  animation-duration: 1.8s;
   animation-iteration-count: 2;
   animation-fill-mode: forwards;
 }

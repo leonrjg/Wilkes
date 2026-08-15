@@ -12,7 +12,16 @@ function line(
   width = Math.max(text.length * 4, 20),
   height = 8,
 ): PositionedPdfText {
-  return { text, x, top, width, height };
+  return {
+    text,
+    hasEOL: false,
+    direction: "ltr",
+    x,
+    top,
+    width,
+    height,
+    horizontal: true,
+  };
 }
 
 describe("extractTextBlockAtDestination", () => {

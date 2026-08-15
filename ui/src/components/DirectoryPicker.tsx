@@ -254,7 +254,7 @@ export default function DirectoryPicker({
             className="h-full text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] px-3 flex-shrink-0 flex items-center gap-1.5"
           >
             <Folder size={12} />
-            <span>Open folder</span>
+            <span>Open</span>
           </button>
         </Tooltip>
       </div>
