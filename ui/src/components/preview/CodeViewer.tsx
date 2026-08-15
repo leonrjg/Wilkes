@@ -46,14 +46,16 @@ const highlightField = StateField.define<DecorationSet>({
   provide: (f) => EditorView.decorations.from(f),
 });
 
+/** Colours come from the shared highlight tokens in styles.css — `baseTheme`
+ *  emits real CSS, so `var()` resolves against the app's `:root`. */
 const highlightTheme = EditorView.baseTheme({
   ".cm-highlight-match": {
-    backgroundColor: "rgba(250, 204, 21, 0.25)",
-    borderBottom: "2px solid rgba(250, 204, 21, 0.7)",
+    backgroundColor: "var(--hl-active-bg)",
+    borderBottom: "var(--hl-underline) solid var(--hl-active-border)",
   },
   ".cm-bookmark-highlight": {
-    backgroundColor: "rgba(59, 130, 246, 0.16)",
-    borderBottom: "1px solid rgba(59, 130, 246, 0.55)",
+    backgroundColor: "var(--hl-bookmark-bg)",
+    borderBottom: "var(--hl-underline) solid var(--hl-bookmark-border)",
   },
 });
 

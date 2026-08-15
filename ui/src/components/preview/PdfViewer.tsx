@@ -88,6 +88,19 @@ function median(values: number[]): number {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+/** Place a highlight overlay on a rendered page. Geometry only — the palette,
+ *  radius and padding belong to `.pdf-highlight` in styles.css, shared with
+ *  every other viewer. */
+function highlightRectStyle(rect: BoundingBox, pageScale: number): React.CSSProperties {
+  const { x, y, width, height } = rect;
+  return {
+    left: `${x * pageScale}px`,
+    top: `${y * pageScale}px`,
+    width: `${Math.max(width * pageScale, 4)}px`,
+    height: `${Math.max(height * pageScale, 4)}px`,
+  };
+}
+
 /** Merge client rects that belong to the same visual text line into one
  *  rectangle. `Range.getClientRects()` can emit several fragments per line
  *  (one per text node); rendering them as separate translucent highlights
@@ -797,25 +810,9 @@ export default function PdfViewer({
                 (highlight) => highlight.page === pageNum,
               );
 
-              let overlayStyle: React.CSSProperties | undefined;
-              if (activeBbox) {
-                const { x, y, width, height } = activeBbox;
-                overlayStyle = {
-                  position: "absolute",
-                  left: `${x * pageScale}px`,
-                  top: `${y * pageScale}px`,
-                  width: `${Math.max(width * pageScale, 4)}px`,
-                  height: `${Math.max(height * pageScale, 4)}px`,
-                  backgroundColor: isSearchOpen
-                    ? "rgba(59, 130, 246, 0.25)"
-                    : "rgba(250, 204, 21, 0.25)",
-                  border: isSearchOpen
-                    ? "1px solid rgba(59, 130, 246, 0.8)"
-                    : "1px solid rgba(250, 204, 21, 0.8)",
-                  borderRadius: "2px",
-                  pointerEvents: "none",
-                };
-              }
+              const overlayStyle = activeBbox
+                ? highlightRectStyle(activeBbox, pageScale)
+                : undefined;
 
               return (
                 <div
@@ -849,68 +846,44 @@ export default function PdfViewer({
                       />
                     )}
                     {pageBookmarkHighlights.flatMap((highlight) =>
-                      highlight.rects.map((rect, rectIndex) => {
-                        const { x, y, width, height } = rect;
-                        return (
-                          <div
-                            key={`${highlight.id}-${rectIndex}`}
-                            data-testid="bookmark-highlight"
-                            data-bookmark-id={highlight.id}
-                            style={{
-                              position: "absolute",
-                              // Keep highlights above selectable text, but below
-                              // PDF links so overlapping links still hover/open.
-                              zIndex: 1,
-                              left: `${x * pageScale}px`,
-                              top: `${y * pageScale}px`,
-                              width: `${Math.max(width * pageScale, 4)}px`,
-                              height: `${Math.max(height * pageScale, 4)}px`,
-                              backgroundColor: "rgba(250, 204, 21, 0.16)",
-                              borderBottom: "2px solid rgba(202, 138, 4, 0.75)",
-                              borderRadius: "2px",
-                              cursor: onBookmarkOpen ? "pointer" : undefined,
-                              pointerEvents: onBookmarkOpen ? "auto" : "none",
-                            }}
-                            role={onBookmarkOpen ? "button" : undefined}
-                            tabIndex={onBookmarkOpen ? 0 : undefined}
-                            aria-label={onBookmarkOpen ? "Open bookmark" : undefined}
-                            onClick={(event) =>
-                              onBookmarkOpen?.(highlight.id, bookmarkAnchorFor(event.currentTarget))
-                            }
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter" || event.key === " ") {
-                                event.preventDefault();
-                                onBookmarkOpen?.(
-                                  highlight.id,
-                                  bookmarkAnchorFor(event.currentTarget),
-                                );
-                              }
-                            }}
-                          />
-                        );
-                      }),
-                    )}
-                    {overlayStyle && <div style={overlayStyle} />}
-                    {targetRects?.map((rect, rectIndex) => {
-                      const { x, y, width, height } = rect;
-                      return (
+                      highlight.rects.map((rect, rectIndex) => (
                         <div
-                          key={`target-${rectIndex}`}
-                          data-testid="target-highlight"
-                          style={{
-                            position: "absolute",
-                            left: `${x * pageScale}px`,
-                            top: `${y * pageScale}px`,
-                            width: `${Math.max(width * pageScale, 4)}px`,
-                            height: `${Math.max(height * pageScale, 4)}px`,
-                            backgroundColor: "rgba(250, 204, 21, 0.25)",
-                            border: "1px solid rgba(250, 204, 21, 0.8)",
-                            borderRadius: "2px",
-                            pointerEvents: "none",
+                          key={`${highlight.id}-${rectIndex}`}
+                          data-testid="bookmark-highlight"
+                          data-bookmark-id={highlight.id}
+                          className={
+                            onBookmarkOpen
+                              ? "pdf-highlight pdf-highlight--bookmark pdf-highlight--clickable"
+                              : "pdf-highlight pdf-highlight--bookmark"
+                          }
+                          style={highlightRectStyle(rect, pageScale)}
+                          role={onBookmarkOpen ? "button" : undefined}
+                          tabIndex={onBookmarkOpen ? 0 : undefined}
+                          aria-label={onBookmarkOpen ? "Open bookmark" : undefined}
+                          onClick={(event) =>
+                            onBookmarkOpen?.(highlight.id, bookmarkAnchorFor(event.currentTarget))
+                          }
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
+                              onBookmarkOpen?.(
+                                highlight.id,
+                                bookmarkAnchorFor(event.currentTarget),
+                              );
+                            }
                           }}
                         />
-                      );
-                    })}
+                      )),
+                    )}
+                    {overlayStyle && <div className="pdf-highlight" style={overlayStyle} />}
+                    {targetRects?.map((rect, rectIndex) => (
+                      <div
+                        key={`target-${rectIndex}`}
+                        data-testid="target-highlight"
+                        className="pdf-highlight"
+                        style={highlightRectStyle(rect, pageScale)}
+                      />
+                    ))}
                     {!isSearchOpen &&
                       targetBbox &&
                       isTargetPage &&
@@ -922,17 +895,12 @@ export default function PdfViewer({
                         return (
                           <div
                             key={`${x}-${y}-${width}-${height}`}
-                            className="animate-ping pointer-events-none"
+                            className="pdf-highlight-ping animate-ping"
                             style={{
-                              position: "absolute",
                               left: cx - r / 2,
                               top: cy - r / 2,
                               width: r,
                               height: r,
-                              borderRadius: "50%",
-                              backgroundColor: "rgba(202, 138, 4, 0.45)",
-                              animationIterationCount: 2,
-                              animationFillMode: "forwards",
                             }}
                           />
                         );

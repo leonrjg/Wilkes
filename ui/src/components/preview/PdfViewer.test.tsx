@@ -393,8 +393,8 @@ describe("PdfViewer", () => {
       await new Promise(resolve => setTimeout(resolve, 10));
     });
     
-    // The highlight div should be present. It has background color rgba(250, 204, 21, 0.25)
-    const highlight = document.querySelector('div[style*="background-color: rgba(250, 204, 21, 0.25)"]');
+    // Appearance lives in styles.css; the overlay is identified by its class.
+    const highlight = document.querySelector("div.pdf-highlight");
     expect(highlight).toBeInTheDocument();
   });
 
@@ -544,9 +544,7 @@ describe("PdfViewer", () => {
     expect(targets).toHaveLength(2);
     expect(targets[0]).toHaveStyle({ left: "5px", top: "5px", width: "30px", height: "8px" });
     // The coarse union overlay must not also be present.
-    expect(
-      document.querySelectorAll('div[style*="background-color: rgba(250, 204, 21, 0.25)"]'),
-    ).toHaveLength(2);
+    expect(document.querySelectorAll("div.pdf-highlight")).toHaveLength(2);
   });
 
   it("renders persisted bookmark highlights with scaled PDF coordinates", async () => {
@@ -567,12 +565,13 @@ describe("PdfViewer", () => {
     const highlights = screen.getAllByTestId("bookmark-highlight");
     expect(highlights).toHaveLength(2);
     expect(highlights[0]).toHaveStyle({
-      zIndex: "1",
       left: "20px",
       top: "30px",
       width: "40px",
       height: "10px",
     });
+    // Stacking and palette come from the shared class, not inline styles.
+    expect(highlights[0]).toHaveClass("pdf-highlight", "pdf-highlight--bookmark");
   });
 
   it("opens a persisted bookmark highlight", async () => {

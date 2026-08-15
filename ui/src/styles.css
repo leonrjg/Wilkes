@@ -30,6 +30,22 @@ body,
   --accent-blue: #2563eb;
   --accent-blue-hover: #1d4ed8;
   --accent-blue-muted: #dbeafe;
+
+  /* Highlight roles — the single source of truth for every viewer (PDF,
+     Markdown, CodeMirror, result list). Hue carries the source: blue is text
+     the app found, amber is text the user saved. Alpha carries the state: a
+     weak wash for other hits, a strong one for the current/target hit.
+     One palette for both themes: these are translucent washes over the
+     content, and the PDF canvas stays light even in dark mode. */
+  --hl-match-bg: rgba(59, 130, 246, 0.14);
+  --hl-match-border: rgba(59, 130, 246, 0.45);
+  --hl-active-bg: rgba(59, 130, 246, 0.3);
+  --hl-active-border: rgba(59, 130, 246, 0.8);
+  --hl-bookmark-bg: rgba(250, 204, 21, 0.18);
+  --hl-bookmark-border: rgba(202, 138, 4, 0.75);
+  --hl-radius: 5px;
+  --hl-pad: 3px;
+  --hl-underline: 2px;
 }
 
 .dark {
@@ -115,11 +131,12 @@ body,
   background-color: #111318;
 }
 
-/* Match highlight in result list */
+/* Match highlight in result list — the snippet span the row matched on, so it
+   reads as the current hit rather than a passive one. */
 .match-highlight {
-  background-color: rgb(250 204 21 / 0.4);
-  border-radius: 2px;
-  padding: 0 1px;
+  background-color: var(--hl-active-bg);
+  border-radius: var(--hl-radius);
+  padding: 0 var(--hl-pad);
 }
 
 /* PDF Viewer Styling */
@@ -130,6 +147,48 @@ body,
 .react-pdf__Page canvas {
   background-color: white; /* Only used in light mode */
   box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+}
+
+/* PDF highlight overlays. The component sets only left/top/width/height, which
+   are data (PDF coordinates scaled to the rendered page); everything about how
+   they look lives here. `content-box` is the local override that lets the
+   padding actually inflate the box — the app is border-box globally, where
+   padding on a box with an explicit width would shrink the content instead. */
+.pdf-highlight {
+  position: absolute;
+  box-sizing: content-box;
+  margin: calc(-1 * var(--hl-pad));
+  padding: var(--hl-pad);
+  border-radius: var(--hl-radius);
+  background-color: var(--hl-active-bg);
+  border: 1px solid var(--hl-active-border);
+  pointer-events: none;
+}
+
+.pdf-highlight--bookmark {
+  background-color: var(--hl-bookmark-bg);
+  border-color: var(--hl-bookmark-border);
+  /* Above the selectable text layer, below the link layer, so links that
+     overlap a bookmark still hover and open. */
+  z-index: 1;
+}
+
+.pdf-highlight--clickable {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+/* One-shot ripple that draws the eye to a navigation target. Pairs with
+   Tailwind's `animate-ping`; the longhands below override the shorthand's
+   infinite repeat. */
+.pdf-highlight-ping {
+  position: absolute;
+  border-radius: 50%;
+  background-color: var(--hl-active-border);
+  opacity: 0.55;
+  pointer-events: none;
+  animation-iteration-count: 2;
+  animation-fill-mode: forwards;
 }
 
 .pdf-dark-mode .react-pdf__Page canvas {
@@ -165,14 +224,17 @@ body,
   overflow-wrap: anywhere;
 }
 
+/* Inline highlights (Markdown). Text in flow can wrap, so these carry an
+   underline where the absolutely positioned PDF boxes carry a full border;
+   the colours come from the same role tokens. */
 .markdown-search-highlight {
-  background-color: rgba(250, 204, 21, 0.25);
-  border-bottom: 2px solid rgba(250, 204, 21, 0.7);
+  background-color: var(--hl-active-bg);
+  border-bottom: var(--hl-underline) solid var(--hl-active-border);
 }
 
 .markdown-bookmark-highlight {
-  background-color: rgba(59, 130, 246, 0.16);
-  box-shadow: inset 0 -1px rgba(59, 130, 246, 0.55);
+  background-color: var(--hl-bookmark-bg);
+  border-bottom: var(--hl-underline) solid var(--hl-bookmark-border);
   cursor: pointer;
 }
 
@@ -181,18 +243,19 @@ body,
 }
 
 .markdown-search-highlight.markdown-bookmark-highlight {
-  background: linear-gradient(rgba(250, 204, 21, 0.25), rgba(250, 204, 21, 0.25)),
-    linear-gradient(rgba(59, 130, 246, 0.16), rgba(59, 130, 246, 0.16));
+  background: linear-gradient(var(--hl-active-bg), var(--hl-active-bg)),
+    linear-gradient(var(--hl-bookmark-bg), var(--hl-bookmark-bg));
 }
 
-/* In-document find (rendered Markdown), painted via the CSS Custom Highlight API. */
+/* In-document find (rendered Markdown), painted via the CSS Custom Highlight
+   API, which only accepts colour properties — no border, so the passive and
+   active hits are separated by alpha alone. */
 ::highlight(wilkes-find) {
-  background-color: rgba(249, 115, 22, 0.28);
+  background-color: var(--hl-match-bg);
 }
 
 ::highlight(wilkes-find-active) {
-  background-color: rgba(249, 115, 22, 0.65);
-  color: #1a1a1a;
+  background-color: var(--hl-active-bg);
 }
 
 .prose-document {
