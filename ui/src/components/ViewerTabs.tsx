@@ -1,9 +1,8 @@
 import { useEffect, useRef } from "react";
-import { Paperclip, X } from "react-feather";
-import { useViewerStore, type ViewerTab } from "../stores/useViewerStore";
-import { useEditorStore } from "../stores/useEditorStore";
+import { X } from "react-feather";
+import { useViewerStore } from "../stores/useViewerStore";
 import { fileName } from "./DocumentEntryRow";
-import { ContextMenu, useContextMenu } from "./ContextMenu";
+import { useFileContextMenu } from "./FileContextMenu";
 import { Tooltip } from "./Tooltip";
 
 export default function ViewerTabs() {
@@ -11,8 +10,7 @@ export default function ViewerTabs() {
   const activeTabId = useViewerStore((state) => state.activeTabId);
   const activateTab = useViewerStore((state) => state.activateTab);
   const closeTab = useViewerStore((state) => state.closeTab);
-  const activeEditorPath = useEditorStore((state) => state.activeEditorPath);
-  const { menu, openMenu, closeMenu } = useContextMenu<ViewerTab>();
+  const { openFileMenu, fileMenu } = useFileContextMenu();
   const tabRefs = useRef(new Map<string, HTMLButtonElement>());
 
   useEffect(() => {
@@ -58,28 +56,12 @@ export default function ViewerTabs() {
           return (
             <div
               key={tab.id}
-              onContextMenu={(event) => {
-                if (!activeEditorPath || tab.path === activeEditorPath) return;
-                const pinned =
-                  useEditorStore
-                    .getState()
-                    .buffers[activeEditorPath]?.scope.pinned.includes(tab.path) ?? false;
-                openMenu({
-                  event,
-                  target: tab,
-                  items: [
-                    {
-                      id: "pin-completion-context",
-                      label: pinned
-                        ? "Unpin from completion context"
-                        : "Pin to completion context",
-                      icon: Paperclip,
-                      run: () =>
-                        useEditorStore.getState().togglePin(activeEditorPath, tab.path),
-                    },
-                  ],
-                });
-              }}
+              onContextMenu={(event) =>
+                openFileMenu(event, {
+                  kind: "file",
+                  path: tab.path,
+                  open: () => activateTab(tab.id),
+                })}
               className={[
                 "group flex h-9 min-w-[8rem] max-w-[14rem] flex-shrink-0 items-center border-r border-t-2 border-[var(--border-main)]",
                 active
@@ -149,7 +131,7 @@ export default function ViewerTabs() {
           );
         })}
       </div>
-      <ContextMenu menu={menu} onClose={closeMenu} />
+      {fileMenu}
     </>
   );
 }

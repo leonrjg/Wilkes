@@ -2,7 +2,16 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import { useEditorStore } from "../stores/useEditorStore";
 import { useViewerStore, type ViewerTab } from "../stores/useViewerStore";
+import { ToastProvider } from "./Toast";
 import ViewerTabs from "./ViewerTabs";
+
+function renderTabs() {
+  return render(
+    <ToastProvider>
+      <ViewerTabs />
+    </ToastProvider>,
+  );
+}
 
 function tab(id: string, path: string): ViewerTab {
   const match = {
@@ -39,7 +48,7 @@ describe("ViewerTabs", () => {
   });
 
   it("renders an accessible tablist and activates a clicked document", () => {
-    render(<ViewerTabs />);
+    renderTabs();
 
     expect(screen.getByRole("tablist", { name: "Open documents" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "one.txt" })).toHaveAttribute(
@@ -61,7 +70,7 @@ describe("ViewerTabs", () => {
   });
 
   it("supports arrow, Home, and End keyboard navigation", () => {
-    render(<ViewerTabs />);
+    renderTabs();
     const first = screen.getByRole("tab", { name: "one.txt" });
 
     fireEvent.keyDown(first, { key: "ArrowRight" });
@@ -75,7 +84,7 @@ describe("ViewerTabs", () => {
   });
 
   it("closes tabs from the close button, Delete key, and middle click", () => {
-    render(<ViewerTabs />);
+    renderTabs();
 
     fireEvent.click(screen.getByRole("button", { name: "Close two.txt" }));
     fireEvent.keyDown(screen.getByRole("tab", { name: "one.txt" }), { key: "Delete" });
@@ -88,11 +97,30 @@ describe("ViewerTabs", () => {
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
   });
 
+  it("offers the shared file context menu on a tab", () => {
+    renderTabs();
+
+    fireEvent.contextMenu(screen.getByRole("tab", { name: "two.txt" }));
+
+    expect(screen.getByRole("menuitem", { name: "Open" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Copy path" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
+  });
+
+  it("activates the tab from the context menu Open item", () => {
+    renderTabs();
+
+    fireEvent.contextMenu(screen.getByRole("tab", { name: "three.txt" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Open" }));
+
+    expect(useViewerStore.getState().activeTabId).toBe("three");
+  });
+
   it("pins another viewer tab into the active editor completion scope", () => {
     const editor = useEditorStore.getState();
     editor.ensureBuffer("/docs/one.txt", "Draft");
     editor.setActiveEditor("/docs/one.txt");
-    render(<ViewerTabs />);
+    renderTabs();
 
     fireEvent.contextMenu(screen.getByRole("tab", { name: "two.txt" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "Pin to completion context" }));
