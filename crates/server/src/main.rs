@@ -526,6 +526,48 @@ async fn is_semantic_ready_handler(State(state): State<Arc<AppState>>) -> Json<b
     Json(state.context().is_semantic_ready())
 }
 
+#[derive(Deserialize)]
+struct EmbedTextBody {
+    texts: Vec<String>,
+}
+
+/// Embed arbitrary strings with the model the semantic index uses. Sidecar
+/// consumers (Underdog) pin the returned model id + dimension.
+async fn embed_text_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<EmbedTextBody>,
+) -> Result<Json<wilkes_api::context::EmbeddedTexts>, (StatusCode, Json<ErrorBody>)> {
+    if body.texts.is_empty() {
+        return Err(err("texts must not be empty"));
+    }
+    state
+        .context()
+        .embed_texts(body.texts)
+        .await
+        .map(Json)
+        .map_err(server_err)
+}
+
+#[derive(Deserialize)]
+struct ExportChunksBody {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+/// Chunk + vector export for one indexed file: text, byte ranges, source
+/// origins, and stored embeddings, in extraction order.
+async fn export_chunks_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ExportChunksBody>,
+) -> Result<Json<wilkes_api::context::FileChunkExport>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .export_file_chunks(body.root, body.path)
+        .await
+        .map(Json)
+        .map_err(server_err)
+}
+
 /// The backend half of the gate. The UI gate prevents the request; this one
 /// makes the API honest if something calls it anyway — the server is reachable
 /// without the desktop UI, so neither is redundant with the other.
@@ -1442,6 +1484,8 @@ async fn main() -> anyhow::Result<()> {
             post(openalex_lookup_handler),
         )
         .route("/api/embed/ready", get(is_semantic_ready_handler))
+        .route("/api/embed/text", post(embed_text_handler))
+        .route("/api/export/chunks", post(export_chunks_handler))
         .route("/api/generation/ready", get(is_generation_ready_handler))
         .route(
             "/api/generation/models",

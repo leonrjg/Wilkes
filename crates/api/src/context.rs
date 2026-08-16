@@ -357,6 +357,39 @@ struct CompletionOperation {
     cancel: Arc<AtomicBool>,
 }
 
+/// Result of `embed_texts`: vectors from the same model the index uses,
+/// with the identity consumers pin against.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct EmbeddedTexts {
+    pub engine: String,
+    pub model_id: String,
+    pub dimension: usize,
+    pub vectors: Vec<Vec<f32>>,
+}
+
+/// One exported chunk: text, locators (byte range into the extracted text
+/// plus resolved source origin), and the stored vector.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ExportedChunk {
+    pub chunk_id: i64,
+    pub ordinal: usize,
+    pub text: String,
+    pub byte_range: wilkes_core::types::ByteRange,
+    pub origin: wilkes_core::types::SourceOrigin,
+    pub embedding: Vec<f32>,
+}
+
+/// Result of `export_file_chunks`, in extraction order. `model_id` is absent
+/// when no embedder is currently loaded (the stored vectors remain valid for
+/// the model that built the index).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FileChunkExport {
+    pub file_path: PathBuf,
+    pub model_id: Option<String>,
+    pub dimension: Option<usize>,
+    pub chunks: Vec<ExportedChunk>,
+}
+
 /// Shared application state and lifecycle logic. Both the desktop (Tauri) and
 /// the server (axum) create exactly one `Arc<AppContext>` and delegate all
 /// business operations to it.
@@ -1125,6 +1158,126 @@ impl AppContext {
             // The index changed while Ward was building. Discard the stale
             // tree and retry against the new revision before serving results.
         }
+    }
+
+    /// Embed arbitrary short strings with the same model the semantic index
+    /// uses. Consumers (the Underdog sidecar client) pin the returned model
+    /// id and dimension and treat any later mismatch as a hard error, so the
+    /// response always names both.
+    pub async fn embed_texts(&self, texts: Vec<String>) -> Result<EmbeddedTexts, String> {
+        if texts.is_empty() {
+            return Err("No texts provided".to_string());
+        }
+        let embedder = self.embedder.lock().clone().ok_or_else(|| {
+            "Semantic model unavailable. Build or restore the semantic index first.".to_string()
+        })?;
+        let engine = embedder.engine().as_str().to_string();
+        let model_id = embedder.model_id().to_string();
+        let dimension = embedder.dimension();
+
+        let expected = texts.len();
+        let embedder_for_task = Arc::clone(&embedder);
+        let vectors = tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            embedder_for_task.embed_passages(&refs)
+        })
+        .await
+        .map_err(|e| format!("Text embedding task panicked: {e}"))?
+        .map_err(|e| format!("Could not embed texts: {e:#}"))?;
+
+        if vectors.len() != expected {
+            return Err(format!(
+                "Embedder returned {} vectors for {expected} inputs",
+                vectors.len()
+            ));
+        }
+        for vector in &vectors {
+            if vector.len() != dimension {
+                return Err(format!(
+                    "Text embedding dimension mismatch. Expected {dimension}, received {}",
+                    vector.len()
+                ));
+            }
+            if vector.iter().any(|value| !value.is_finite()) {
+                return Err("Embedder returned a non-finite text vector".to_string());
+            }
+        }
+        Ok(EmbeddedTexts {
+            engine,
+            model_id,
+            dimension,
+            vectors,
+        })
+    }
+
+    /// Export one indexed document's chunks with their locators and stored
+    /// vectors — the source of segment positions for consumers that must
+    /// never re-extract (Underdog requirement E1). Read-only over the live
+    /// semantic index.
+    pub async fn export_file_chunks(
+        &self,
+        root: PathBuf,
+        path: PathBuf,
+    ) -> Result<FileChunkExport, String> {
+        self.ensure_no_active_embed_task(
+            "Semantic index is currently being built. Please wait before exporting chunks.",
+        )?;
+        let settings = self.settings().await;
+        let (library_roots, _) = library_roots(&settings);
+        let root = Self::canonicalize_search_root(&root)?;
+        Self::ensure_path_in_library(&root, &library_roots, "Chunk export root")?;
+        let (path, _) = Self::canonicalize_supported_file(
+            &root,
+            &path,
+            &settings.supported_extensions,
+            "Chunk export",
+        )?;
+        Self::ensure_path_in_library(&path, &library_roots, "Chunk export file")?;
+
+        let model_id = self
+            .embedder
+            .lock()
+            .clone()
+            .map(|embedder| embedder.model_id().to_string());
+
+        let index_arc = self.index.lock().clone();
+        let task_root = root.clone();
+        let task_path = path.clone();
+        let mut chunks = tokio::task::spawn_blocking(move || {
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+            let index = guard.as_ref().ok_or_else(|| {
+                "Semantic index unavailable. Build or restore the semantic index first.".to_string()
+            })?;
+            index
+                .topic_chunks_for_file(&task_root, &task_path)
+                .map_err(|error| format!("Could not load indexed chunks: {error:#}"))
+        })
+        .await
+        .map_err(|error| format!("Chunk export task panicked: {error}"))??;
+
+        // Stable reading order: extraction position, not row id.
+        chunks.sort_by_key(|chunk| chunk.extraction_byte_range.start);
+        let dimension = chunks.first().map(|chunk| chunk.embedding.len());
+        let chunks = chunks
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, chunk)| ExportedChunk {
+                chunk_id: chunk.chunk_id,
+                ordinal,
+                text: chunk.chunk_text,
+                byte_range: chunk.extraction_byte_range,
+                origin: chunk.origin,
+                embedding: chunk.embedding,
+            })
+            .collect();
+        Ok(FileChunkExport {
+            file_path: path,
+            model_id,
+            dimension,
+            chunks,
+        })
     }
 
     pub async fn chunk_topics(
@@ -5230,6 +5383,113 @@ mod tests {
         assert!(ctx.topic_tree_caches.lock().root.is_none());
         assert!(ctx.topic_tree_caches.lock().document.is_none());
         assert!(ctx.semantic_index_revision.load(Ordering::Acquire) > revision);
+    }
+
+    #[tokio::test]
+    async fn embed_texts_returns_pinned_identity_and_validated_vectors() {
+        let (_dir, ctx) = test_ctx();
+
+        // No embedder loaded: loud, actionable error.
+        let err = ctx.embed_texts(vec!["a".to_string()]).await.unwrap_err();
+        assert!(err.contains("Semantic model unavailable"), "{err}");
+
+        *ctx.embedder.lock() = Some(Arc::new(TopicEmbedder {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+
+        let err = ctx.embed_texts(Vec::new()).await.unwrap_err();
+        assert!(err.contains("No texts provided"), "{err}");
+
+        let result = ctx
+            .embed_texts(vec!["cat concept".to_string(), "dog concept".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(result.model_id, "topic-test");
+        assert_eq!(result.dimension, 2);
+        assert_eq!(result.vectors.len(), 2);
+        assert_eq!(result.vectors[0], vec![1.0, 0.0]);
+        assert_eq!(result.vectors[1], vec![0.0, 1.0]);
+    }
+
+    #[tokio::test]
+    async fn export_file_chunks_returns_extraction_ordered_chunks_with_vectors() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("export-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let document = root.join("paper.txt");
+        std::fs::write(&document, "chunk export passages").unwrap();
+        let mut settings = Settings::default();
+        settings.last_directory = Some(root.clone());
+        std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        // No index yet: loud, actionable error.
+        let err = ctx
+            .export_file_chunks(root.clone(), document.clone())
+            .await
+            .unwrap_err();
+        assert!(err.contains("Semantic index unavailable"), "{err}");
+
+        let mut index = SemanticIndex::create(
+            dir.path(),
+            "export-model",
+            2,
+            EmbeddingEngine::Candle,
+            Some(&root),
+        )
+        .unwrap();
+        // Written out of extraction order on purpose: the export must sort
+        // by byte range, not row id.
+        let chunks = vec![
+            (
+                wilkes_core::embed::index::chunk::Chunk {
+                    file_path: document.clone(),
+                    text: "second passage".to_string(),
+                    byte_range: ByteRange { start: 50, end: 64 },
+                    origin: SourceOrigin::TextFile { line: 5, col: 1 },
+                },
+                vec![0.0, 1.0],
+            ),
+            (
+                wilkes_core::embed::index::chunk::Chunk {
+                    file_path: document.clone(),
+                    text: "first passage".to_string(),
+                    byte_range: ByteRange { start: 0, end: 13 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vec![1.0, 0.0],
+            ),
+        ];
+        index
+            .write_file(wilkes_core::embed::index::db::PreparedFile {
+                full_text: String::new(),
+                path: document.clone(),
+                chunks,
+            })
+            .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
+
+        let export = ctx
+            .export_file_chunks(root.clone(), document.clone())
+            .await
+            .unwrap();
+        assert_eq!(export.dimension, Some(2));
+        assert_eq!(export.model_id, None, "no live embedder loaded");
+        assert_eq!(export.chunks.len(), 2);
+        assert_eq!(export.chunks[0].ordinal, 0);
+        assert_eq!(export.chunks[0].text, "first passage");
+        assert_eq!(export.chunks[0].byte_range.start, 0);
+        assert_eq!(export.chunks[0].embedding, vec![1.0, 0.0]);
+        assert_eq!(export.chunks[1].ordinal, 1);
+        assert_eq!(export.chunks[1].text, "second passage");
+
+        // Files outside the library are refused.
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        let err = ctx
+            .export_file_chunks(root.clone(), outside)
+            .await
+            .unwrap_err();
+        assert!(!err.is_empty());
     }
 
     #[tokio::test]
