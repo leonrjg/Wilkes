@@ -4563,6 +4563,7 @@ impl AppContext {
         *self.embedder.lock() = Some(Arc::clone(&embedder));
         let index_arc = Arc::new(Mutex::new(Some(index)));
         *self.index.lock() = Arc::clone(&index_arc);
+        self.spawn_full_text_backfill();
         index_arc
     }
 
@@ -4570,7 +4571,25 @@ impl AppContext {
         self.invalidate_topic_tree_cache();
         let index_arc = Arc::new(Mutex::new(Some(index)));
         *self.index.lock() = Arc::clone(&index_arc);
+        self.spawn_full_text_backfill();
         index_arc
+    }
+
+    /// Converge `full_text` right after a restored-from-disk index is installed.
+    /// Legacy rows that carry chunks but no stored text force exact search to
+    /// re-extract them live on every query; fill them once, in the background,
+    /// off the index lock. Self-limiting: a cheap no-op query once nothing is
+    /// stale, so it is safe to run on every load (startup and runtime toggle).
+    fn spawn_full_text_backfill(&self) {
+        let index_arc = Arc::clone(&*self.index.lock());
+        tokio::task::spawn_blocking(move || {
+            let mut registry = ExtractorRegistry::new();
+            registry.register(Box::new(PdfExtractor::new()));
+            let filled = SemanticIndex::backfill_missing_full_text(&index_arc, &registry);
+            if filled > 0 {
+                info!("full_text backfill: filled {filled} legacy row(s)");
+            }
+        });
     }
 
     async fn finish_restore_state(

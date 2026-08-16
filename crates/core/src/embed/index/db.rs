@@ -1468,6 +1468,74 @@ mod tests {
     }
 
     #[test]
+    fn test_backfill_missing_full_text_fills_only_unchanged_stale_rows() {
+        use std::sync::Mutex;
+
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+
+        // A legacy row: chunks present, full_text NULL, on-disk identity intact.
+        let stale_path = root.join("stale.txt");
+        fs::write(&stale_path, "stale body").unwrap();
+        // A row whose file is edited after indexing: its stored text is stale, so
+        // backfill must leave it for the watcher rather than persist old content.
+        let changed_path = root.join("changed.txt");
+        fs::write(&changed_path, "original").unwrap();
+
+        let mut idx =
+            SemanticIndex::create(&data_dir, "counting", 1, EmbeddingEngine::Candle, Some(&root))
+                .unwrap();
+        idx.write_file(PreparedFile {
+            path: stale_path.clone(),
+            full_text: "stale body".to_string(),
+            chunks: vec![(test_chunk(&stale_path, "stale body"), vec![1.0])],
+        })
+        .unwrap();
+        idx.write_file(PreparedFile {
+            path: changed_path.clone(),
+            full_text: "original".to_string(),
+            chunks: vec![(test_chunk(&changed_path, "original"), vec![1.0])],
+        })
+        .unwrap();
+        // Strip stored text from both rows to reproduce a pre-v4 index.
+        idx.conn
+            .execute("UPDATE files SET full_text = NULL", [])
+            .unwrap();
+        // Change one file on disk so its identity no longer matches the index.
+        fs::write(&changed_path, "original body is now longer").unwrap();
+
+        let index = Arc::new(Mutex::new(Some(idx)));
+        let registry = ExtractorRegistry::new();
+
+        let filled = SemanticIndex::backfill_missing_full_text(&index, &registry);
+        assert_eq!(filled, 1, "only the unchanged legacy row is backfilled");
+
+        let guard = index.lock().unwrap();
+        let idx = guard.as_ref().unwrap();
+        // The unchanged file's text is restored and now served from the index.
+        let (text, _) = idx
+            .indexed_document_for_path(&stale_path)
+            .unwrap()
+            .expect("stale row should now have stored full text");
+        assert_eq!(text, "stale body");
+        // The edited file was skipped: still no stored text, so grep stays live.
+        assert!(idx
+            .indexed_document_for_path(&changed_path)
+            .unwrap()
+            .is_none());
+        drop(guard);
+
+        // Idempotent: the filled row is no longer stale and the edited row is
+        // still correctly skipped, so a second pass writes nothing.
+        assert_eq!(
+            SemanticIndex::backfill_missing_full_text(&index, &registry),
+            0
+        );
+    }
+
+    #[test]
     fn test_build_second_root_preserves_first_root() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().join("data");
@@ -2738,6 +2806,124 @@ impl SemanticIndex {
             full_text,
         })?;
         Ok(true)
+    }
+
+    /// Fill `full_text` for rows that carry chunks but no stored text — legacy
+    /// rows indexed before schema v4 that have neither changed on disk nor been
+    /// rebuilt since, so no existing path (fresh build, build-time reuse, or the
+    /// incremental watcher) has ever backfilled them. Until filled they force
+    /// exact (grep) search to re-extract the file live on every query — exactly
+    /// the cost the column exists to remove.
+    ///
+    /// Only text is written; chunks and embeddings are left untouched. Extraction
+    /// runs without holding the index lock — only the initial read of the stale
+    /// set and each per-file write briefly take it — so concurrent search stays
+    /// responsive. A row whose file is gone or whose on-disk identity no longer
+    /// matches is skipped so stale text is never stored, and the write is guarded
+    /// on that identity so a concurrent incremental refresh always wins. Returns
+    /// the number of rows filled.
+    pub fn backfill_missing_full_text(
+        index: &Arc<std::sync::Mutex<Option<SemanticIndex>>>,
+        extractors: &ExtractorRegistry,
+    ) -> usize {
+        // Phase 1: snapshot the stale set under a brief lock, then release it so
+        // extraction never blocks search.
+        let stale: Vec<(i64, PathBuf, i64, i64)> = {
+            let guard = match index.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let Some(idx) = guard.as_ref() else {
+                return 0;
+            };
+            let mut stmt = match idx.conn.prepare(
+                "SELECT f.id, f.file_path, f.size_bytes, f.modified_at_ms
+                   FROM files f
+                  WHERE (f.full_text IS NULL OR f.full_text = '')
+                    AND EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id)",
+            ) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    error!("[SemanticIndex::backfill] prepare stale query: {e:#}");
+                    return 0;
+                }
+            };
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            });
+            match rows.and_then(|r| r.collect::<Result<Vec<_>, _>>()) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    error!("[SemanticIndex::backfill] read stale rows: {e:#}");
+                    return 0;
+                }
+            }
+        };
+        if stale.is_empty() {
+            return 0;
+        }
+
+        let mut filled = 0usize;
+        for (file_id, path, size_bytes, modified_at_ms) in stale {
+            // Phase 2: extract with no lock held. Skip files that vanished or
+            // changed since indexing so we never persist text that no longer
+            // matches what is on disk.
+            let Some(identity) = FileIdentity::for_path(&path) else {
+                continue;
+            };
+            if identity.size_bytes != size_bytes || identity.modified_at_ms != modified_at_ms {
+                continue;
+            }
+            let text = match Self::extract_content(&path, extractors) {
+                Ok(content) => content.text,
+                Err(e) => {
+                    error!(
+                        "[SemanticIndex::backfill] extract {}: {e:#}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            // A chunked row cannot legitimately extract to empty text; empty now
+            // means the file changed underneath us, so skip rather than store an
+            // empty string that would later read as "populated".
+            if text.is_empty() {
+                continue;
+            }
+
+            // Phase 3: write under a brief lock, guarded on the identity we read.
+            // The guard makes a concurrent incremental refresh authoritative: if
+            // it already rewrote the row (new identity + text), this update finds
+            // no matching row and changes nothing.
+            let guard = match index.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let Some(idx) = guard.as_ref() else {
+                break;
+            };
+            match idx.conn.execute(
+                "UPDATE files
+                    SET full_text = ?1
+                  WHERE id = ?2
+                    AND size_bytes = ?3
+                    AND modified_at_ms = ?4
+                    AND (full_text IS NULL OR full_text = '')",
+                params![text, file_id, size_bytes, modified_at_ms],
+            ) {
+                Ok(changed) => filled += changed,
+                Err(e) => error!(
+                    "[SemanticIndex::backfill] write {}: {e:#}",
+                    path.display()
+                ),
+            }
+        }
+        filled
     }
 
     /// Return a file's stored extracted text plus a chunk-granular `SourceMap`,
