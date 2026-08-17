@@ -4,7 +4,8 @@ use mupdf::{Document, MetadataName, TextPageFlags};
 use tracing::trace;
 
 use crate::types::{
-    BoundingBox, ByteRange, ExtractedContent, FileMetadata, SourceMap, SourceOrigin, SourceSegment,
+    BoundingBox, ByteRange, ExtractedContent, FileMetadata, OutlineEntry, SourceMap, SourceOrigin,
+    SourceSegment,
 };
 
 use super::backend::PdfBackend;
@@ -53,6 +54,42 @@ impl PdfBackend for MuPdfBackend {
                 page_count: Some(page_count),
             },
         })
+    }
+
+    fn outline(&self, path: &Path) -> anyhow::Result<Vec<OutlineEntry>> {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?;
+        trace!("mupdf: reading outline of {:?}", path);
+        let doc = Document::open(path_str)?;
+        let mut entries = Vec::new();
+        flatten_outline(&doc.outlines()?, 0, &mut entries);
+        Ok(entries)
+    }
+}
+
+/// Depth-first flattening of the bookmark tree into reading order.
+///
+/// Entries whose destination does not resolve to a page are dropped rather
+/// than kept with a missing locator: a bookmark pointing at an external URL or
+/// a named destination this document no longer contains marks no position in
+/// the text, and a consumer segmenting by these entries would place a section
+/// boundary wherever it guessed. `mupdf` reports the page 0-based; extraction
+/// numbers pages from one (`extract_page_words`), and the two must agree.
+fn flatten_outline(outlines: &[mupdf::Outline], level: u32, out: &mut Vec<OutlineEntry>) {
+    for outline in outlines {
+        if let Some(dest) = &outline.dest {
+            let title = outline.title.trim();
+            if !title.is_empty() {
+                out.push(OutlineEntry {
+                    title: title.to_string(),
+                    level,
+                    page: Some(dest.loc.page_number + 1),
+                    byte_offset: None,
+                });
+            }
+        }
+        flatten_outline(&outline.down, level + 1, out);
     }
 }
 
@@ -248,5 +285,88 @@ mod tests {
         assert_eq!(content.metadata.page_count, Some(1));
         assert_eq!(content.metadata.mime.as_deref(), Some("application/pdf"));
         assert!(!content.source_map.segments.is_empty());
+    }
+
+    /// Two chapters and one nested section, destinations on pages 1 and 2.
+    /// Hand-built rather than fixtured so the bookmark tree — the thing under
+    /// test — is visible in the source that asserts about it.
+    const OUTLINED_PDF_BASE64: &str = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgL091dGxpbmVzIDUgMCBSIC9QYWdlTW9kZSAvVXNlT3V0bGluZXMgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUiA2IDAgUl0gL0NvdW50IDIgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAyMDAgMjAwXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgOSAwIFIgPj4gPj4gPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCA0NSA+PgpzdHJlYW0KQlQgL0YxIDEyIFRmIDIwIDEwMCBUZCAoQWxwaGEgcGFnZSBvbmUpIFRqIEVUCmVuZHN0cmVhbQplbmRvYmoKNSAwIG9iago8PCAvVHlwZSAvT3V0bGluZXMgL0ZpcnN0IDcgMCBSIC9MYXN0IDggMCBSIC9Db3VudCAyID4+CmVuZG9iago2IDAgb2JqCjw8IC9UeXBlIC9QYWdlIC9QYXJlbnQgMiAwIFIgL01lZGlhQm94IFswIDAgMjAwIDIwMF0gL0NvbnRlbnRzIDEwIDAgUiAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA5IDAgUiA+PiA+PiA+PgplbmRvYmoKNyAwIG9iago8PCAvVGl0bGUgKENoYXB0ZXIgT25lKSAvUGFyZW50IDUgMCBSIC9EZXN0IFszIDAgUiAvRml0XSAvTmV4dCA4IDAgUiAvRmlyc3QgMTEgMCBSIC9MYXN0IDExIDAgUiAvQ291bnQgMSA+PgplbmRvYmoKOCAwIG9iago8PCAvVGl0bGUgKENoYXB0ZXIgVHdvKSAvUGFyZW50IDUgMCBSIC9EZXN0IFs2IDAgUiAvRml0XSAvUHJldiA3IDAgUiA+PgplbmRvYmoKOSAwIG9iago8PCAvVHlwZSAvRm9udCAvU3VidHlwZSAvVHlwZTEgL0Jhc2VGb250IC9IZWx2ZXRpY2EgPj4KZW5kb2JqCjEwIDAgb2JqCjw8IC9MZW5ndGggNDQgPj4Kc3RyZWFtCkJUIC9GMSAxMiBUZiAyMCAxMDAgVGQgKEJldGEgcGFnZSB0d28pIFRqIEVUCmVuZHN0cmVhbQplbmRvYmoKMTEgMCBvYmoKPDwgL1RpdGxlIChTZWN0aW9uIDEuMSkgL1BhcmVudCA3IDAgUiAvRGVzdCBbNiAwIFIgL0ZpdF0gPj4KZW5kb2JqCnhyZWYKMCAxMgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA5NyAwMDAwMCBuIAowMDAwMDAwMTYwIDAwMDAwIG4gCjAwMDAwMDAyODYgMDAwMDAgbiAKMDAwMDAwMDM4MSAwMDAwMCBuIAowMDAwMDAwNDUyIDAwMDAwIG4gCjAwMDAwMDA1NzkgMDAwMDAgbiAKMDAwMDAwMDcwMiAwMDAwMCBuIAowMDAwMDAwNzg5IDAwMDAwIG4gCjAwMDAwMDA4NTkgMDAwMDAgbiAKMDAwMDAwMDk1NCAwMDAwMCBuIAp0cmFpbGVyCjw8IC9TaXplIDEyIC9Sb290IDEgMCBSID4+CnN0YXJ0eHJlZgoxMDMwCiUlRU9GCg==";
+
+    fn write_pdf(dir: &std::path::Path, name: &str, base64: &str) -> std::path::PathBuf {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let path = dir.join(name);
+        fs::write(&path, STANDARD.decode(base64).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn reads_the_bookmark_tree_in_reading_order_with_one_based_pages() {
+        let dir = tempdir().unwrap();
+        let path = write_pdf(dir.path(), "outlined.pdf", OUTLINED_PDF_BASE64);
+
+        let outline = MuPdfBackend.outline(&path).expect("outline reads");
+        let seen: Vec<(&str, u32, Option<u32>)> = outline
+            .iter()
+            .map(|e| (e.title.as_str(), e.level, e.page))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("Chapter One", 0, Some(1)),
+                // Depth-first: the nested section follows its parent, before
+                // the parent's sibling, which is the order a reader meets them.
+                ("Section 1.1", 1, Some(2)),
+                ("Chapter Two", 0, Some(2)),
+            ]
+        );
+        // A page locator, never a byte offset — extraction paginates PDFs.
+        assert!(outline.iter().all(|e| e.byte_offset.is_none()));
+    }
+
+    /// The same numbering extraction uses, checked against extraction itself
+    /// rather than asserted twice: a bookmark on page 1 must land in the text
+    /// that `extract` attributes to page 1.
+    #[test]
+    fn outline_pages_agree_with_the_pages_extraction_reports() {
+        let dir = tempdir().unwrap();
+        let path = write_pdf(dir.path(), "outlined.pdf", OUTLINED_PDF_BASE64);
+
+        let content = MuPdfBackend.extract(&path).expect("extracts");
+        let outline = MuPdfBackend.outline(&path).expect("outline reads");
+
+        let chapter_two = outline
+            .iter()
+            .find(|e| e.title == "Chapter Two")
+            .expect("second chapter");
+        let page = chapter_two.page.expect("resolved page");
+        let first_on_page = content
+            .source_map
+            .segments
+            .iter()
+            .find(|segment| {
+                matches!(segment.origin, SourceOrigin::PdfPage { page: at, .. } if at == page)
+            })
+            .expect("extraction attributed text to that page");
+        assert!(
+            content.text[first_on_page.text_range.start..].starts_with("Beta"),
+            "page {page} starts the second chapter's text"
+        );
+    }
+
+    #[test]
+    fn a_pdf_without_bookmarks_declares_no_outline() {
+        let dir = tempdir().unwrap();
+        // The plain single-page PDF the extraction test uses.
+        let path = write_pdf(dir.path(), "plain.pdf", "JVBERi0xLjQKMSAwIG9iago8PAovVHlwZSAvQ2F0YWxvZwovUGFnZXMgMiAwIFIKPj4KZW5kb2JqCjIgMCBvYmoKPDwKL1R5cGUgL1BhZ2VzCi9LaWRzIFszIDAgUl0KL0NvdW50IDEKPj4KZW5kb2JqCjMgMCBvYmoKPDwKL1R5cGUgL1BhZ2UKL1BhcmVudCAyIDAgUgovTWVkaWFCb3ggWzAgMCAzMDAgMTQ0XQovQ29udGVudHMgNCAwIFIKL1Jlc291cmNlcyA8PAovRm9udCA8PAovRjEgPDwKL1R5cGUgL0ZvbnQKL1N1YnR5cGUgL1R5cGUxCi9CYXNlRm9udCAvSGVsdmV0aWNhCj4+Cj4+Cj4+Cj4+CjBlbmRvYmoKNCAwIG9iago8PAovTGVuZ3RoIDQxCj4+CnN0cmVhbQpCVAovRjEgMTggVGYKMCBldAo1MCA1MCBUZAooSGVsbG8gV29ybGQpIFRqCkVUCmVuZHN0cmVhbQplbmRvYmoKeHJlZgowIDUKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTYgMDAwMDAgbiAKMDAwMDAwMDExMSAwMDAwMCBuIAowMDAwMDAwMjgyIDAwMDAwIG4gCnRyYWlsZXIKPDwKL1NpemUgNQovUm9vdCAxIDAgUgo+PgpzdGFydHhyZWYKMzcyCiUlRU9GCg==");
+
+        assert!(MuPdfBackend.outline(&path).expect("outline reads").is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_file_is_an_error_and_not_an_empty_outline() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("invalid.pdf");
+        fs::write(&path, "not a pdf").unwrap();
+        assert!(MuPdfBackend.outline(&path).is_err());
     }
 }

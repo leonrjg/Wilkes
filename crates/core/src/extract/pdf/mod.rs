@@ -6,7 +6,7 @@ use std::path::Path;
 use backend::PdfBackend;
 use mupdf::MuPdfBackend;
 
-use crate::types::ExtractedContent;
+use crate::types::{ExtractedContent, OutlineEntry};
 
 use super::ContentExtractor;
 
@@ -38,6 +38,10 @@ impl ContentExtractor for PdfExtractor {
 
     fn extract(&self, path: &Path) -> anyhow::Result<ExtractedContent> {
         self.backend.extract(path)
+    }
+
+    fn outline(&self, path: &Path) -> anyhow::Result<Vec<OutlineEntry>> {
+        self.backend.outline(path)
     }
 }
 

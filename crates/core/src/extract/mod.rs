@@ -1,6 +1,7 @@
+pub mod outline;
 pub mod pdf;
 
-use crate::types::ExtractedContent;
+use crate::types::{ExtractedContent, OutlineEntry};
 use std::path::Path;
 
 pub trait ContentExtractor: Send + Sync {
@@ -9,6 +10,34 @@ pub trait ContentExtractor: Send + Sync {
 
     /// Extract searchable text and a source map from the file.
     fn extract(&self, path: &Path) -> anyhow::Result<ExtractedContent>;
+
+    /// The document's declared table of contents, empty when it declares none.
+    ///
+    /// Required rather than defaulted: a format whose outline nobody
+    /// implemented would otherwise report "this document has no structure",
+    /// which is a different claim and one a consumer cannot tell from the
+    /// truth. Reading an outline must also stay cheap enough to ask for on its
+    /// own — callers ask for the outline *without* wanting the text (the chunk
+    /// export already holds it), so an implementation that extracts a whole
+    /// document to answer this defeats the point of the method existing.
+    fn outline(&self, path: &Path) -> anyhow::Result<Vec<OutlineEntry>>;
+}
+
+/// The declared outline of one file, dispatched exactly as extraction is: the
+/// registry's extractor where there is one, the plain-text reading where there
+/// is not (`SemanticIndex::extract_content` makes the same two choices, and the
+/// two must not disagree about what a file is).
+pub fn document_outline(
+    path: &Path,
+    extractors: &ExtractorRegistry,
+) -> anyhow::Result<Vec<OutlineEntry>> {
+    match extractors.find(path, None) {
+        Some(extractor) => extractor.outline(path),
+        None => {
+            let text = std::fs::read_to_string(path)?;
+            Ok(outline::markdown_outline(&text))
+        }
+    }
 }
 
 pub struct ExtractorRegistry {
@@ -54,6 +83,9 @@ mod tests {
         fn extract(&self, _path: &Path) -> anyhow::Result<ExtractedContent> {
             anyhow::bail!("mock")
         }
+        fn outline(&self, _path: &Path) -> anyhow::Result<Vec<OutlineEntry>> {
+            Ok(Vec::new())
+        }
     }
 
     #[test]
@@ -72,6 +104,9 @@ mod tests {
         }
         fn extract(&self, _path: &Path) -> anyhow::Result<ExtractedContent> {
             anyhow::bail!("mime")
+        }
+        fn outline(&self, _path: &Path) -> anyhow::Result<Vec<OutlineEntry>> {
+            Ok(Vec::new())
         }
     }
 

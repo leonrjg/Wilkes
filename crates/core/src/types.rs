@@ -351,6 +351,30 @@ pub enum SourceOrigin {
     },
 }
 
+/// One entry of a document's declared table of contents.
+///
+/// *Declared*, not inferred: a PDF bookmark tree or a Markdown heading, read
+/// from the file as the author wrote it. Nothing here is derived from the
+/// text's meaning, so an empty outline is a fact about the document rather
+/// than a failure to compute one.
+///
+/// The locator is whichever kind the document expresses — a PDF bookmark
+/// resolves to a page, a heading to a byte offset in the extracted text — and
+/// callers needing a single unit resolve it against material they already hold
+/// (the chunk export maps both onto chunk ordinals). Carrying both as options
+/// beats inventing the missing one: a page number derived from a byte offset
+/// would be a guess wearing a locator's clothes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OutlineEntry {
+    pub title: String,
+    /// Depth in the outline tree, 0 for a top-level entry.
+    pub level: u32,
+    /// 1-based page, for documents paginated at extraction (PDFs).
+    pub page: Option<u32>,
+    /// Byte offset into `ExtractedContent.text`, for documents that are not.
+    pub byte_offset: Option<usize>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BoundingBox {
     pub x: f32,

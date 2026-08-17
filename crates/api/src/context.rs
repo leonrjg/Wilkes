@@ -379,15 +379,79 @@ pub struct ExportedChunk {
     pub embedding: Vec<f32>,
 }
 
+/// One entry of the document's declared table of contents, resolved to the
+/// chunk the section starts at.
+///
+/// The resolution happens here because this is the only place that holds both
+/// halves: the outline says "page 41" or "byte 90210", the export says which
+/// chunk that is. A consumer given the raw locator would have to re-derive the
+/// mapping from the chunk list it was just handed — the same answer, computed
+/// twice, with two chances to disagree.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ExportedOutlineEntry {
+    pub title: String,
+    pub level: u32,
+    /// Ordinal of the first exported chunk at or after the entry's position.
+    pub chunk_ordinal: usize,
+    /// The locator as the document expressed it, kept for display.
+    pub page: Option<u32>,
+    pub byte_offset: Option<usize>,
+}
+
 /// Result of `export_file_chunks`, in extraction order. `model_id` is absent
 /// when no embedder is currently loaded (the stored vectors remain valid for
 /// the model that built the index).
+///
+/// `outline` is empty when the document declares no table of contents — a fact
+/// about the document, not a failure: a plain `.txt` without headings has no
+/// sections to report and says so.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct FileChunkExport {
     pub file_path: PathBuf,
     pub model_id: Option<String>,
     pub dimension: Option<usize>,
+    pub outline: Vec<ExportedOutlineEntry>,
     pub chunks: Vec<ExportedChunk>,
+}
+
+/// Maps each outline entry onto the first exported chunk at or after its
+/// position, dropping entries that resolve past the end of the document.
+///
+/// Ties are kept: a chapter and its first section legitimately begin at the
+/// same chunk, and collapsing them would lose the chapter's title. Entries
+/// that resolve nowhere — a bookmark pointing at a page whose text was not
+/// extracted, which is what a scanned appendix looks like — are dropped, since
+/// a section that starts nowhere is not a section.
+fn resolve_outline(
+    outline: &[wilkes_core::types::OutlineEntry],
+    chunks: &[ExportedChunk],
+) -> Vec<ExportedOutlineEntry> {
+    outline
+        .iter()
+        .filter_map(|entry| {
+            let ordinal = match (entry.page, entry.byte_offset) {
+                (Some(page), _) => chunks
+                    .iter()
+                    .find(|chunk| match chunk.origin {
+                        wilkes_core::types::SourceOrigin::PdfPage { page: at, .. } => at >= page,
+                        _ => false,
+                    })
+                    .map(|chunk| chunk.ordinal),
+                (None, Some(offset)) => chunks
+                    .iter()
+                    .find(|chunk| chunk.byte_range.end > offset)
+                    .map(|chunk| chunk.ordinal),
+                (None, None) => None,
+            }?;
+            Some(ExportedOutlineEntry {
+                title: entry.title.clone(),
+                level: entry.level,
+                chunk_ordinal: ordinal,
+                page: entry.page,
+                byte_offset: entry.byte_offset,
+            })
+        })
+        .collect()
 }
 
 /// Shared application state and lifecycle logic. Both the desktop (Tauri) and
@@ -1260,7 +1324,7 @@ impl AppContext {
         // Stable reading order: extraction position, not row id.
         chunks.sort_by_key(|chunk| chunk.extraction_byte_range.start);
         let dimension = chunks.first().map(|chunk| chunk.embedding.len());
-        let chunks = chunks
+        let chunks: Vec<ExportedChunk> = chunks
             .into_iter()
             .enumerate()
             .map(|(ordinal, chunk)| ExportedChunk {
@@ -1272,10 +1336,32 @@ impl AppContext {
                 embedding: chunk.embedding,
             })
             .collect();
+
+        // The declared outline, resolved against the chunks just exported.
+        //
+        // Read from the file rather than the index: an outline is what the
+        // author wrote, and the index stores what was extracted. Reading it
+        // costs a document open — no page text, no bounding boxes — which is
+        // why it can ride along with an export instead of needing an endpoint
+        // and a second round trip. A file whose outline cannot be read is
+        // reported as an error and not as an absent outline: "this document
+        // declares no sections" is a claim consumers act on.
+        let outline_path = path.clone();
+        let outline = tokio::task::spawn_blocking(move || {
+            let mut registry = ExtractorRegistry::new();
+            registry.register(Box::new(PdfExtractor::new()));
+            wilkes_core::extract::document_outline(&outline_path, &registry)
+                .map_err(|error| format!("Could not read the document outline: {error:#}"))
+        })
+        .await
+        .map_err(|error| format!("Outline task panicked: {error}"))??;
+        let outline = resolve_outline(&outline, &chunks);
+
         Ok(FileChunkExport {
             file_path: path,
             model_id,
             dimension,
+            outline,
             chunks,
         })
     }
@@ -5481,6 +5567,10 @@ mod tests {
         assert_eq!(export.chunks[0].embedding, vec![1.0, 0.0]);
         assert_eq!(export.chunks[1].ordinal, 1);
         assert_eq!(export.chunks[1].text, "second passage");
+        assert!(
+            export.outline.is_empty(),
+            "the document declares no headings"
+        );
 
         // Files outside the library are refused.
         let outside = dir.path().join("outside.txt");
@@ -5490,6 +5580,120 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!err.is_empty());
+    }
+
+    /// The export is the only place that holds both the outline's locators and
+    /// the chunk list, so it is where the two are joined — a consumer given the
+    /// raw locators would have to re-derive this mapping from the chunks it was
+    /// just handed.
+    #[tokio::test]
+    async fn export_resolves_declared_headings_onto_chunk_ordinals() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("outline-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let document = root.join("notes.md");
+        let text = "# One\nalpha body\n## One point one\nbeta body\n";
+        std::fs::write(&document, text).unwrap();
+        let mut settings = Settings::default();
+        settings.last_directory = Some(root.clone());
+        std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        let second_heading = text.find("## One").unwrap();
+        let mut index = SemanticIndex::create(
+            dir.path(),
+            "outline-model",
+            2,
+            EmbeddingEngine::Candle,
+            Some(&root),
+        )
+        .unwrap();
+        index
+            .write_file(wilkes_core::embed::index::db::PreparedFile {
+                full_text: text.to_string(),
+                path: document.clone(),
+                chunks: vec![
+                    (
+                        wilkes_core::embed::index::chunk::Chunk {
+                            file_path: document.clone(),
+                            text: "# One\nalpha body".to_string(),
+                            byte_range: ByteRange {
+                                start: 0,
+                                end: second_heading,
+                            },
+                            origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                        },
+                        vec![1.0, 0.0],
+                    ),
+                    (
+                        wilkes_core::embed::index::chunk::Chunk {
+                            file_path: document.clone(),
+                            text: "## One point one\nbeta body".to_string(),
+                            byte_range: ByteRange {
+                                start: second_heading,
+                                end: text.len(),
+                            },
+                            origin: SourceOrigin::TextFile { line: 3, col: 1 },
+                        },
+                        vec![0.0, 1.0],
+                    ),
+                ],
+            })
+            .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
+
+        let export = ctx
+            .export_file_chunks(root.clone(), document.clone())
+            .await
+            .unwrap();
+        let outline: Vec<(&str, u32, usize)> = export
+            .outline
+            .iter()
+            .map(|e| (e.title.as_str(), e.level, e.chunk_ordinal))
+            .collect();
+        assert_eq!(
+            outline,
+            vec![("One", 0, 0), ("One point one", 1, 1)],
+            "each heading lands on the chunk its section starts in"
+        );
+        // The locator the document expressed survives alongside the resolution.
+        assert_eq!(export.outline[1].byte_offset, Some(second_heading));
+        assert_eq!(export.outline[1].page, None);
+    }
+
+    /// A section that starts after the last chunk starts nowhere — a bookmark
+    /// into a scanned appendix, say. Dropping it keeps every surviving entry a
+    /// position a consumer can act on.
+    #[test]
+    fn outline_entries_that_resolve_past_the_document_are_dropped() {
+        let chunk = |ordinal: usize, start: usize, end: usize, page: u32| ExportedChunk {
+            chunk_id: ordinal as i64,
+            ordinal,
+            text: String::new(),
+            byte_range: ByteRange { start, end },
+            origin: SourceOrigin::PdfPage { page, bbox: None },
+            embedding: Vec::new(),
+        };
+        let chunks = vec![chunk(0, 0, 10, 1), chunk(1, 10, 20, 4)];
+        let entry = |page: Option<u32>, byte_offset: Option<usize>| {
+            wilkes_core::types::OutlineEntry {
+                title: "T".to_string(),
+                level: 0,
+                page,
+                byte_offset,
+            }
+        };
+
+        // A bookmark on a page with no extracted text resolves forward to the
+        // next page that has some, which is where its section's text begins.
+        let resolved = resolve_outline(&[entry(Some(2), None)], &chunks);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].chunk_ordinal, 1);
+
+        // Past the end: nothing to point at.
+        assert!(resolve_outline(&[entry(Some(9), None)], &chunks).is_empty());
+        assert!(resolve_outline(&[entry(None, Some(999))], &chunks).is_empty());
+        // No locator at all is not a position either.
+        assert!(resolve_outline(&[entry(None, None)], &chunks).is_empty());
     }
 
     #[tokio::test]

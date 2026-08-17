@@ -1135,6 +1135,10 @@ mod tests {
         fn extract(&self, path: &Path) -> anyhow::Result<ExtractedContent> {
             anyhow::bail!("failed to extract {}", path.display());
         }
+
+        fn outline(&self, path: &Path) -> anyhow::Result<Vec<crate::types::OutlineEntry>> {
+            anyhow::bail!("failed to read the outline of {}", path.display());
+        }
     }
 
     #[test]
@@ -1387,6 +1391,9 @@ mod tests {
                         page_count: None,
                     },
                 })
+            }
+            fn outline(&self, _: &Path) -> anyhow::Result<Vec<crate::types::OutlineEntry>> {
+                Ok(Vec::new())
             }
         }
 
