@@ -8710,6 +8710,7 @@ dependencies = [
  "wilkes-agent",
  "wilkes-api",
  "wilkes-core",
+ "wilkes-server",
 ]
 
 [[package]]

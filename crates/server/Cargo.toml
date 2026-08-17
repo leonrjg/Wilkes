@@ -3,8 +3,13 @@ name = "wilkes-server"
 version.workspace = true
 edition = "2021"
 
+[lib]
+name = "wilkes_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "wilkes-server"
+path = "src/main.rs"
 
 [dependencies]
 wilkes-api = { path = "../api" }

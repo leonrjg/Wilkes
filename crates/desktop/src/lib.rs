@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 use wilkes_agent::session::{ChatConfigOption, ChatEvent, ChatSession};
@@ -20,9 +21,9 @@ use wilkes_core::types::{
     AddOutcome, AgentBackend, Bookmark, BookmarkClustersQuery, BookmarkClustersResult,
     ChunkTopicsQuery, ChunkTopicsResult, CitationResult, CollectionValidation, DataPaths,
     DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, ExternalMcpSettings, FileListResponse,
-    IndexStatus, IntegrationStatus, ModelDescriptor, NewBookmark, NewSmartCollection, NewTag,
-    OpenAlexWork, SearchLogEntry, SelectedEmbedder, SemanticScholarPaper, Settings,
-    SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
+    HttpApiSettings, IndexStatus, IntegrationStatus, ModelDescriptor, NewBookmark,
+    NewSmartCollection, NewTag, OpenAlexWork, SearchLogEntry, SelectedEmbedder,
+    SemanticScholarPaper, Settings, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::worker::manager::WorkerStatus;
 
@@ -604,6 +605,147 @@ fn external_mcp_manager_state(app: &AppHandle) -> Arc<ExternalMcpManager> {
     app.state::<Arc<ExternalMcpManager>>().inner().clone()
 }
 
+// ── HTTP API lifecycle ────────────────────────────────────────────────────────
+
+struct ManagedHttpApi {
+    bind_address: std::net::IpAddr,
+    port: u16,
+    runtime: wilkes_server::ApiRuntime,
+}
+
+/// Starts and stops the Wilkes HTTP API over the workspace this app already
+/// owns.
+///
+/// The point is not convenience. A workspace has exactly one owner, and a
+/// second process that opens the same directory races this one for
+/// `settings.json` and the semantic index. Serving the API from inside the
+/// owner is what lets another program read the library without becoming that
+/// second owner.
+struct HttpApiManager {
+    /// Built once and reused across restarts: it resolves the active workspace
+    /// per request, so toggling the listener must not re-derive which
+    /// workspace is current.
+    state: Arc<wilkes_server::http::state::AppState>,
+    runtime: tokio::sync::Mutex<Option<ManagedHttpApi>>,
+    last_error: Mutex<Option<String>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct HttpApiStatus {
+    enabled: bool,
+    running: bool,
+    bind_address: std::net::IpAddr,
+    port: u16,
+    url: Option<String>,
+    error: Option<String>,
+}
+
+impl HttpApiManager {
+    fn new(state: Arc<wilkes_server::http::state::AppState>) -> Self {
+        Self {
+            state,
+            runtime: tokio::sync::Mutex::new(None),
+            last_error: Mutex::new(None),
+        }
+    }
+
+    /// Brings the listener into the state `settings` describes.
+    ///
+    /// A failed start leaves nothing listening and says why. It deliberately
+    /// does not resurrect the previous listener: the settings would then
+    /// describe a port that is not the one in use, and a silently different
+    /// answer to "where is the API" is worse than none.
+    async fn apply(&self, settings: &HttpApiSettings) -> Result<(), String> {
+        let mut runtime = self.runtime.lock().await;
+
+        if !settings.enabled {
+            if let Some(managed) = runtime.take() {
+                managed.runtime.shutdown().await;
+            }
+            *self.last_error.lock().unwrap() = None;
+            return Ok(());
+        }
+
+        if runtime.as_ref().is_some_and(|managed| {
+            managed.bind_address == settings.bind_address && managed.port == settings.port
+        }) {
+            *self.last_error.lock().unwrap() = None;
+            return Ok(());
+        }
+
+        // The old listener goes down first and is awaited, so the new one
+        // cannot lose a race with it for the same port.
+        if let Some(managed) = runtime.take() {
+            managed.runtime.shutdown().await;
+        }
+
+        // The standalone server creates this before it serves, and the upload
+        // routes assume it. Without it the same request would succeed against
+        // one shell and fail against the other.
+        let uploads_dir = self.state.context().data_dir.join("uploads");
+        if let Err(error) = tokio::fs::create_dir_all(&uploads_dir).await {
+            // Not fatal: it fails only the upload routes, which the desktop
+            // does not use itself, and refusing to serve the rest over it
+            // would be the larger breakage.
+            error!(
+                "could not create {} for the HTTP API: {error:#}",
+                uploads_dir.display()
+            );
+        }
+
+        match wilkes_server::start_api(
+            settings.bind_address,
+            settings.port,
+            Arc::clone(&self.state),
+        )
+        .await
+        {
+            Ok(started) => {
+                info!("Wilkes HTTP API listening on {}", started.url());
+                *runtime = Some(ManagedHttpApi {
+                    bind_address: settings.bind_address,
+                    port: settings.port,
+                    runtime: started,
+                });
+                *self.last_error.lock().unwrap() = None;
+                Ok(())
+            }
+            Err(error) => {
+                let message = format!(
+                    "Could not start the Wilkes HTTP API on {}:{}: {error:#}",
+                    settings.bind_address, settings.port
+                );
+                error!("{message}");
+                *self.last_error.lock().unwrap() = Some(message.clone());
+                Err(message)
+            }
+        }
+    }
+
+    async fn status(&self, settings: &HttpApiSettings) -> HttpApiStatus {
+        let runtime = self.runtime.lock().await;
+        HttpApiStatus {
+            enabled: settings.enabled,
+            running: runtime.is_some(),
+            bind_address: settings.bind_address,
+            port: settings.port,
+            url: runtime.as_ref().map(|managed| managed.runtime.url()),
+            error: self.last_error.lock().unwrap().clone(),
+        }
+    }
+
+    async fn stop(&self) {
+        let managed = self.runtime.lock().await.take();
+        if let Some(managed) = managed {
+            managed.runtime.shutdown().await;
+        }
+    }
+}
+
+fn http_api_manager_state(app: &AppHandle) -> Arc<HttpApiManager> {
+    app.state::<Arc<HttpApiManager>>().inner().clone()
+}
+
 fn generate_external_mcp_token() -> String {
     format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
 }
@@ -653,9 +795,16 @@ fn write_external_mcp_token(path: &std::path::Path, token: &str) -> anyhow::Resu
     Ok(())
 }
 
-async fn update_settings_with_external_mcp(
+/// Applies a settings patch, keeping the two network listeners in step with it.
+///
+/// Both are settings whose effect is a bound port rather than a stored value,
+/// so the listener is moved *before* the write and moved back if the write
+/// fails — a saved setting that describes a listener which never started is
+/// the state this ordering exists to prevent.
+async fn update_settings_with_listeners(
     ctx: Arc<AppContext>,
-    manager: Arc<ExternalMcpManager>,
+    external_mcp: Arc<ExternalMcpManager>,
+    http_api: Arc<HttpApiManager>,
     patch: serde_json::Value,
 ) -> Result<Settings, String> {
     let before = ctx.get_settings().await;
@@ -665,20 +814,34 @@ async fn update_settings_with_external_mcp(
         .map(serde_json::from_value::<ExternalMcpSettings>)
         .transpose()
         .map_err(|error| format!("Invalid external MCP settings: {error}"))?;
+    let requested_http = patch
+        .get("http_api")
+        .cloned()
+        .map(serde_json::from_value::<HttpApiSettings>)
+        .transpose()
+        .map_err(|error| format!("Invalid HTTP API settings: {error}"))?;
 
-    if requested_external.is_none() {
+    if requested_external.is_none() && requested_http.is_none() {
         return update_settings_for_ctx(ctx, patch).await;
     }
 
     if let Some(requested) = &requested_external {
-        manager.apply(requested, Arc::clone(&ctx)).await?;
+        external_mcp.apply(requested, Arc::clone(&ctx)).await?;
+    }
+    if let Some(requested) = &requested_http {
+        http_api.apply(requested).await?;
     }
 
     match ctx.update_settings(patch).await {
         Ok(updated) => Ok(updated),
         Err(error) => {
             if requested_external.is_some() {
-                let _ = manager.apply(&before.external_mcp, Arc::clone(&ctx)).await;
+                let _ = external_mcp
+                    .apply(&before.external_mcp, Arc::clone(&ctx))
+                    .await;
+            }
+            if requested_http.is_some() {
+                let _ = http_api.apply(&before.http_api).await;
             }
             Err(error.to_string())
         }
@@ -702,9 +865,18 @@ fn handle_exit_event(app_handle: &AppHandle, event: tauri::RunEvent) {
         let external_mcp = app_handle
             .try_state::<Arc<ExternalMcpManager>>()
             .map(|manager| manager.inner().clone());
+        // Stopped before the workspace shuts down: the API answers *from* this
+        // workspace, so a listener outliving it would serve requests against a
+        // context that is already going away.
+        let http_api = app_handle
+            .try_state::<Arc<HttpApiManager>>()
+            .map(|manager| manager.inner().clone());
         tauri::async_runtime::spawn(async move {
             if let Some(external_mcp) = external_mcp {
                 external_mcp.stop().await;
+            }
+            if let Some(http_api) = http_api {
+                http_api.stop().await;
             }
             ctx.shutdown().await;
         });
@@ -719,6 +891,27 @@ impl EventEmitter for TauriEmitter {
     fn emit(&self, name: &str, payload: serde_json::Value) {
         let platform = TauriPlatform(self.0.clone());
         platform.emit(name, payload);
+    }
+}
+
+/// Workspace events, to the webview and to any HTTP subscriber.
+///
+/// `/api/events` streams from a broadcast channel, so serving the API without
+/// this fan-out would give HTTP consumers a route that connects and then
+/// reports nothing forever — an endpoint that exists on the standalone server
+/// and is silently dead here. Chat keeps using [`TauriEmitter`] directly: its
+/// events belong to one webview turn, not to the workspace.
+struct WorkspaceEmitter {
+    webview: TauriEmitter,
+    http: broadcast::Sender<(String, serde_json::Value)>,
+}
+
+impl EventEmitter for WorkspaceEmitter {
+    fn emit(&self, name: &str, payload: serde_json::Value) {
+        // No subscribers is the normal case (the API is off), and `send`
+        // reporting that is not a failure worth logging.
+        let _ = self.http.send((name.to_string(), payload.clone()));
+        self.webview.emit(name, payload);
     }
 }
 
@@ -1878,8 +2071,13 @@ async fn get_settings(app: AppHandle) -> Result<Settings, String> {
 
 #[tauri::command]
 async fn update_settings(patch: serde_json::Value, app: AppHandle) -> Result<Settings, String> {
-    update_settings_with_external_mcp(app_context(&app), external_mcp_manager_state(&app), patch)
-        .await
+    update_settings_with_listeners(
+        app_context(&app),
+        external_mcp_manager_state(&app),
+        http_api_manager_state(&app),
+        patch,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1895,9 +2093,10 @@ async fn configure_external_mcp(
     })?;
     let ctx = app_context(&app);
     let manager = external_mcp_manager_state(&app);
-    let settings = update_settings_with_external_mcp(
+    let settings = update_settings_with_listeners(
         Arc::clone(&ctx),
         Arc::clone(&manager),
+        http_api_manager_state(&app),
         serde_json::json!({
             "external_mcp": {
                 "enabled": enabled,
@@ -1909,6 +2108,42 @@ async fn configure_external_mcp(
     )
     .await?;
     Ok(manager.status(&settings.external_mcp).await)
+}
+
+/// Turns the HTTP API on or off and reports where it ended up listening.
+#[tauri::command]
+async fn configure_http_api(
+    enabled: bool,
+    bind_address: String,
+    port: u16,
+    app: AppHandle,
+) -> Result<HttpApiStatus, String> {
+    let bind_address = bind_address
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| "HTTP API bind address must be a valid IPv4 or IPv6 address".to_string())?;
+    let manager = http_api_manager_state(&app);
+    let settings = update_settings_with_listeners(
+        app_context(&app),
+        external_mcp_manager_state(&app),
+        Arc::clone(&manager),
+        serde_json::json!({
+            "http_api": {
+                "enabled": enabled,
+                "bind_address": bind_address,
+                "port": port,
+            }
+        }),
+    )
+    .await?;
+    Ok(manager.status(&settings.http_api).await)
+}
+
+#[tauri::command]
+async fn get_http_api_status(app: AppHandle) -> Result<HttpApiStatus, String> {
+    let settings = app_context(&app).get_settings().await;
+    Ok(http_api_manager_state(&app)
+        .status(&settings.http_api)
+        .await)
 }
 
 #[tauri::command]
@@ -2360,7 +2595,11 @@ pub fn run() {
                 return Ok(());
             }
 
-            let emitter: Arc<dyn EventEmitter> = Arc::new(TauriEmitter(handle.clone()));
+            let (events_tx, _) = broadcast::channel::<(String, serde_json::Value)>(1024);
+            let emitter: Arc<dyn EventEmitter> = Arc::new(WorkspaceEmitter {
+                webview: TauriEmitter(handle.clone()),
+                http: events_tx.clone(),
+            });
             let external_mcp = Arc::new(ExternalMcpManager::new(data_dir.clone()));
             let (workspaces, event_rx, loop_fut) =
                 match WorkspaceManager::new(data_dir, settings_path, emitter) {
@@ -2373,10 +2612,23 @@ pub fn run() {
                 };
             let ctx = workspaces.active();
 
+            // Workspace-scoped, not context-scoped: the state resolves the
+            // active workspace per request, so a workspace switch is followed
+            // by the API without restarting the listener.
+            let http_api = Arc::new(HttpApiManager::new(Arc::new(
+                wilkes_server::http::state::AppState {
+                    ctx: None,
+                    workspaces: Some(Arc::clone(&workspaces)),
+                    uploads_dir: ctx.data_dir.join("uploads"),
+                    events_tx,
+                },
+            )));
+
             app.manage(Arc::clone(&workspaces));
             app.manage(Arc::new(ActiveSearches(Mutex::new(HashMap::new()))));
             app.manage(Arc::new(ChatManager(Mutex::new(HashMap::new()))));
             app.manage(Arc::clone(&external_mcp));
+            app.manage(Arc::clone(&http_api));
 
             let ctx_c = Arc::clone(&ctx);
             tauri::async_runtime::spawn(async move {
@@ -2390,6 +2642,9 @@ pub fn run() {
                     .await
                 {
                     error!("external MCP startup failed: {error}");
+                }
+                if let Err(error) = http_api.apply(&settings.http_api).await {
+                    error!("HTTP API startup failed: {error}");
                 }
             });
 
@@ -2420,6 +2675,8 @@ pub fn run() {
             get_external_mcp_status,
             set_active_document,
             rotate_external_mcp_token,
+            configure_http_api,
+            get_http_api_status,
             list_bookmarks,
             add_bookmark,
             remove_bookmark,
@@ -3084,6 +3341,103 @@ mod tests {
         assert!(updated.semantic.enabled);
     }
 
+    /// A manager over a context that owns a workspace, as the app has at
+    /// startup.
+    fn http_api_manager(ctx: Arc<AppContext>) -> HttpApiManager {
+        let (events_tx, _) = broadcast::channel(16);
+        HttpApiManager::new(Arc::new(wilkes_server::http::state::AppState {
+            ctx: Some(Arc::clone(&ctx)),
+            workspaces: None,
+            uploads_dir: ctx.data_dir.join("uploads"),
+            events_tx,
+        }))
+    }
+
+    #[tokio::test]
+    async fn http_api_serves_the_workspace_this_process_already_owns() {
+        let (_dir, ctx) = test_ctx();
+        let manager = http_api_manager(ctx);
+
+        // Off is the default, and off means nothing is listening.
+        let settings = HttpApiSettings::default();
+        assert!(!settings.enabled);
+        manager.apply(&settings).await.unwrap();
+        assert!(!manager.status(&settings).await.running);
+
+        // A real port, the way the other listener's tests pick one: port 0 is
+        // rejected on purpose, since a setting the user cannot find the app on
+        // is not a valid setting.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let enabled = HttpApiSettings {
+            enabled: true,
+            port,
+            ..HttpApiSettings::default()
+        };
+        manager.apply(&enabled).await.unwrap();
+        let status = manager.status(&enabled).await;
+        assert!(status.running);
+        assert!(status.error.is_none());
+        let url = status.url.expect("a running listener reports its url");
+
+        // The point of the whole exercise: a consumer reaches this workspace
+        // over HTTP instead of opening its databases as a second owner.
+        let health = reqwest_get(&format!("{url}/health")).await;
+        assert_eq!(health, "200");
+
+        manager.stop().await;
+        assert!(!manager.status(&enabled).await.running);
+    }
+
+    #[tokio::test]
+    async fn a_port_already_taken_is_reported_and_leaves_nothing_listening() {
+        let (_dir, ctx) = test_ctx();
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+
+        let manager = http_api_manager(ctx);
+        let settings = HttpApiSettings {
+            enabled: true,
+            port,
+            ..HttpApiSettings::default()
+        };
+        let error = manager.apply(&settings).await.unwrap_err();
+        assert!(
+            error.contains("Could not start the Wilkes HTTP API"),
+            "{error}"
+        );
+
+        // Reported, and reported where the settings screen reads it — not
+        // logged and forgotten.
+        let status = manager.status(&settings).await;
+        assert!(!status.running);
+        assert_eq!(status.error.as_deref(), Some(error.as_str()));
+    }
+
+    /// Minimal HTTP/1.1 GET returning the status code, so the desktop crate
+    /// does not gain an HTTP client dependency for one assertion.
+    async fn reqwest_get(url: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let rest = url.strip_prefix("http://").expect("http url");
+        let (authority, path) = rest.split_once('/').expect("url has a path");
+        let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
+        stream
+            .write_all(
+                format!("GET /{path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+            .split_whitespace()
+            .nth(1)
+            .expect("status line")
+            .to_string()
+    }
+
     #[test]
     fn external_mcp_token_is_persistent() {
         let dir = tempdir().unwrap();
@@ -3365,4 +3719,3 @@ mod tests {
         assert!(logs.is_empty());
     }
 }
-

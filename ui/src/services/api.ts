@@ -42,6 +42,7 @@ import type {
   SearchLogEntry,
   SearchResultsSummaryInput,
   ExternalMcpStatus,
+  HttpApiStatus,
   BookmarkClusterLabelled,
   ChunkTopicLabelled,
   GeneratorDescriptor,
@@ -88,6 +89,14 @@ export interface SearchApi {
     port: number,
   ): Promise<ExternalMcpStatus>;
   rotateExternalMcpToken?(): Promise<ExternalMcpStatus>;
+  /** Desktop-only lifecycle controls for the opt-in HTTP API. The web build is
+   *  already served by a `wilkes-server`, which always exposes it. */
+  getHttpApiStatus?(): Promise<HttpApiStatus>;
+  configureHttpApi?(
+    enabled: boolean,
+    bindAddress: string,
+    port: number,
+  ): Promise<HttpApiStatus>;
   listBookmarks(): Promise<Bookmark[]>;
   addBookmark(bookmark: NewBookmark): Promise<Bookmark>;
   removeBookmark(id: string): Promise<void>;

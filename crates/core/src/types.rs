@@ -1210,6 +1210,45 @@ impl Default for ExternalMcpSettings {
     }
 }
 
+/// The Wilkes HTTP API, served by the desktop app over the workspace it
+/// already has open.
+///
+/// It exists so that another program on this machine does not have to open the
+/// workspace itself to read from it. A Wilkes workspace has one owner — the
+/// process holding its databases — and a second opener races it for
+/// `settings.json` and the semantic index. With this on, the app *is* the
+/// owner and everything else asks it over HTTP.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpApiSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_http_api_bind_address")]
+    pub bind_address: std::net::IpAddr,
+    #[serde(default = "default_http_api_port")]
+    pub port: u16,
+}
+
+fn default_http_api_bind_address() -> std::net::IpAddr {
+    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+}
+
+/// Not `wilkes-server`'s 2000: the two are different owners of the same
+/// workspace, and a shared default would have them fight for the port on the
+/// one machine where both might be started.
+fn default_http_api_port() -> u16 {
+    2020
+}
+
+impl Default for HttpApiSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: default_http_api_bind_address(),
+            port: default_http_api_port(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default, alias = "bookmarked_dirs")]
@@ -1274,6 +1313,10 @@ pub struct Settings {
     /// and is intentionally never serialized as part of Settings.
     #[serde(default)]
     pub external_mcp: ExternalMcpSettings,
+    /// The read/write HTTP API, off by default. Unauthenticated like
+    /// `wilkes-server` itself, which is why it binds loopback by default.
+    #[serde(default)]
+    pub http_api: HttpApiSettings,
     /// Local text generation. Off by default; every affordance that depends on
     /// it is invisible until it is both enabled and ready.
     #[serde(default)]
@@ -1327,6 +1370,7 @@ impl Default for Settings {
             chat_config: Vec::new(),
             chat_custom_instructions: String::new(),
             external_mcp: ExternalMcpSettings::default(),
+            http_api: HttpApiSettings::default(),
             generation: GenerationSettings::default(),
             retrieval: RetrievalSettings::default(),
         }

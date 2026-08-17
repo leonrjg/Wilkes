@@ -770,6 +770,8 @@ export interface Settings {
   chat_custom_instructions?: string;
   /** Optional MCP endpoint for regular Claude Code and Codex clients. */
   external_mcp?: ExternalMcpSettings;
+  /** Optional HTTP API, served over the workspace this app already has open. */
+  http_api?: HttpApiSettings;
 }
 
 export interface ExternalMcpSettings {
@@ -783,6 +785,18 @@ export interface ExternalMcpStatus extends ExternalMcpSettings {
   running: boolean;
   url: string | null;
   token: string | null;
+  error: string | null;
+}
+
+export interface HttpApiSettings {
+  enabled: boolean;
+  bind_address: string;
+  port: number;
+}
+
+export interface HttpApiStatus extends HttpApiSettings {
+  running: boolean;
+  url: string | null;
   error: string | null;
 }
 

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import type { SearchApi } from "../services/api";
-import type { ExternalMcpStatus, Settings } from "../lib/types";
+import type { ExternalMcpStatus, HttpApiStatus, Settings } from "../lib/types";
 import SemanticPanel from "./SemanticPanel";
 import GenerationPanel from "./GenerationPanel";
 import { useGenerationStore } from "../stores/useGenerationStore";
@@ -189,6 +189,11 @@ export default function SettingsModal({
   const [externalMcpPort, setExternalMcpPort] = useState(39217);
   const [externalMcpBusy, setExternalMcpBusy] = useState(false);
   const [externalMcpError, setExternalMcpError] = useState<string | null>(null);
+  const [httpApiStatus, setHttpApiStatus] = useState<HttpApiStatus | null>(null);
+  const [httpApiBindAddress, setHttpApiBindAddress] = useState("127.0.0.1");
+  const [httpApiPort, setHttpApiPort] = useState(2020);
+  const [httpApiBusy, setHttpApiBusy] = useState(false);
+  const [httpApiError, setHttpApiError] = useState<string | null>(null);
   const customInstructionsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const generationReady = useGenerationStore((state) => state.ready);
 
@@ -200,6 +205,8 @@ export default function SettingsModal({
         setExternalMcpRequireToken(nextSettings.external_mcp?.require_token ?? false);
         setExternalMcpBindAddress(nextSettings.external_mcp?.bind_address ?? "127.0.0.1");
         setExternalMcpPort(nextSettings.external_mcp?.port ?? 39217);
+        setHttpApiBindAddress(nextSettings.http_api?.bind_address ?? "127.0.0.1");
+        setHttpApiPort(nextSettings.http_api?.port ?? 2020);
       }).catch(console.error);
       if (api.getExternalMcpStatus) {
         api.getExternalMcpStatus()
@@ -211,6 +218,16 @@ export default function SettingsModal({
             setExternalMcpError(status.error);
           })
           .catch((error) => setExternalMcpError(error.toString()));
+      }
+      if (api.getHttpApiStatus) {
+        api.getHttpApiStatus()
+          .then((status) => {
+            setHttpApiStatus(status);
+            setHttpApiBindAddress(status.bind_address);
+            setHttpApiPort(status.port);
+            setHttpApiError(status.error);
+          })
+          .catch((error) => setHttpApiError(error.toString()));
       }
     }
   }, [isOpen, api]);
@@ -300,6 +317,34 @@ export default function SettingsModal({
       setExternalMcpError(error.toString());
     } finally {
       setExternalMcpBusy(false);
+    }
+  };
+
+  const configureHttpApi = async (
+    enabled: boolean,
+    bindAddress = httpApiBindAddress,
+    port = httpApiPort,
+  ) => {
+    if (!api.configureHttpApi) return;
+    setHttpApiBusy(true);
+    setHttpApiError(null);
+    try {
+      const status = await api.configureHttpApi(enabled, bindAddress.trim(), port);
+      setHttpApiStatus(status);
+      setHttpApiBindAddress(status.bind_address);
+      setHttpApiPort(status.port);
+      const http_api = {
+        enabled: status.enabled,
+        bind_address: status.bind_address,
+        port: status.port,
+      };
+      setSettings((current) => current ? { ...current, http_api } : current);
+      onSettingsUpdate?.({ http_api });
+      setHttpApiError(status.error);
+    } catch (error: any) {
+      setHttpApiError(error.toString());
+    } finally {
+      setHttpApiBusy(false);
     }
   };
 
@@ -903,6 +948,121 @@ export default function SettingsModal({
                       {externalMcpError && (
                         <div role="alert" className="p-2 bg-red-900/20 border border-red-900/50 rounded text-[10px] text-red-400 break-all">
                           {externalMcpError}
+                        </div>
+                      )}
+                    </div>
+                  </section>
+
+                  <section className="border-t border-[var(--border-main)] pt-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <div>
+                        <h3 className="text-[10px] font-medium text-[var(--text-dim)] uppercase tracking-wider">
+                          HTTP API
+                        </h3>
+                        <p className="text-[10px] text-[var(--text-dim)] mt-1">
+                          The same API <code>wilkes-server</code> serves, over the library this
+                          window has open. Lets another program read it without opening the
+                          workspace itself — two processes on one workspace overwrite each
+                          other&apos;s settings and index.
+                        </p>
+                      </div>
+                      <span className={`text-[10px] font-medium ${
+                        httpApiStatus?.running ? "text-emerald-500" : "text-[var(--text-dim)]"
+                      }`}>
+                        {httpApiStatus?.running ? "Listening" : "Stopped"}
+                      </span>
+                    </div>
+
+                    <div className="space-y-3">
+                      <label className="flex items-center gap-2.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          aria-label="Serve the HTTP API"
+                          checked={httpApiStatus?.enabled ?? settings.http_api?.enabled ?? false}
+                          disabled={httpApiBusy}
+                          onChange={(event) => void configureHttpApi(event.target.checked)}
+                          className="w-3.5 h-3.5 accent-[var(--accent-blue)]"
+                        />
+                        <span className="text-xs text-[var(--text-muted)]">
+                          Serve the HTTP API
+                        </span>
+                      </label>
+
+                      <div className="grid grid-cols-[minmax(0,2fr)_minmax(6rem,1fr)_auto] items-end gap-2">
+                        <label className="space-y-1">
+                          <span className="text-xs text-[var(--text-muted)]">Bind address</span>
+                          <input
+                            aria-label="HTTP API bind address"
+                            type="text"
+                            value={httpApiBindAddress}
+                            disabled={httpApiBusy}
+                            spellCheck={false}
+                            onChange={(event) => setHttpApiBindAddress(event.target.value)}
+                            placeholder="127.0.0.1"
+                            className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs font-mono text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)]"
+                          />
+                        </label>
+                        <label className="flex-1 space-y-1">
+                          <span className="text-xs text-[var(--text-muted)]">Port</span>
+                          <input
+                            aria-label="HTTP API port"
+                            type="number"
+                            min={1}
+                            max={65535}
+                            value={httpApiPort}
+                            disabled={httpApiBusy}
+                            onChange={(event) => setHttpApiPort(Number(event.target.value))}
+                            className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)]"
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          // Named, unlike the MCP section's: two buttons
+                          // reading "Apply" in one dialog say nothing about
+                          // which listener they move.
+                          aria-label="Apply HTTP API settings"
+                          disabled={
+                            httpApiBusy
+                            || httpApiBindAddress.trim().length === 0
+                            || httpApiPort < 1
+                            || httpApiPort > 65535
+                          }
+                          onClick={() => void configureHttpApi(
+                            httpApiStatus?.enabled ?? settings.http_api?.enabled ?? false,
+                            httpApiBindAddress,
+                            httpApiPort,
+                          )}
+                          className="px-3 py-1.5 text-xs rounded border border-[var(--border-main)] bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] disabled:opacity-50"
+                        >
+                          Apply
+                        </button>
+                      </div>
+
+                      {httpApiStatus?.running && httpApiStatus.url && (
+                        <div className="space-y-2 rounded border border-[var(--border-main)] bg-[var(--bg-active)]/30 p-2.5">
+                          <p className="text-[10px] text-[var(--text-dim)] mb-1">Endpoint</p>
+                          <button
+                            type="button"
+                            onClick={() => void copyExternalMcpText(httpApiStatus.url!)}
+                            className="w-full text-left text-[10px] font-mono break-all text-[var(--text-main)] hover:text-[var(--accent-blue)]"
+                            title="Copy endpoint"
+                          >
+                            {httpApiStatus.url}
+                          </button>
+                        </div>
+                      )}
+
+                      {httpApiBindAddress.trim() !== "::1" && !httpApiBindAddress.trim().startsWith("127.") && (
+                        <div role="status" className="p-2 bg-amber-900/20 border border-amber-800/50 rounded text-[10px] text-amber-300">
+                          A non-loopback address exposes this API without authentication, and it
+                          can write as well as read — anyone who can reach the address can change
+                          settings and rebuild the index. Use host firewall rules to restrict access.
+                        </div>
+                      )}
+
+                      {httpApiError && (
+                        <div role="alert" className="p-2 bg-red-900/20 border border-red-900/50 rounded text-[10px] text-red-400 break-all">
+                          {httpApiError}
                         </div>
                       )}
                     </div>

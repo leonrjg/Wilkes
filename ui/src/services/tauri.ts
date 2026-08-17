@@ -46,6 +46,7 @@ import type {
   CollectionValidation,
   SearchLogEntry,
   ExternalMcpStatus,
+  HttpApiStatus,
   BookmarkClusterLabelled,
   ChunkTopicLabelled,
   GeneratorDescriptor,
@@ -158,6 +159,22 @@ export class TauriSearchApi implements SearchApi {
 
   async rotateExternalMcpToken(): Promise<ExternalMcpStatus> {
     return invoke<ExternalMcpStatus>("rotate_external_mcp_token");
+  }
+
+  async getHttpApiStatus(): Promise<HttpApiStatus> {
+    return invoke<HttpApiStatus>("get_http_api_status");
+  }
+
+  async configureHttpApi(
+    enabled: boolean,
+    bindAddress: string,
+    port: number,
+  ): Promise<HttpApiStatus> {
+    return invoke<HttpApiStatus>("configure_http_api", {
+      enabled,
+      bindAddress,
+      port,
+    });
   }
 
   async listBookmarks(): Promise<Bookmark[]> {
