@@ -1547,7 +1547,16 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/embed/ready", get(is_semantic_ready_handler))
         .route("/api/embed/text", post(embed_text_handler))
         .route("/api/embed/centroid", post(embed_centroid_handler))
-        .route("/api/embed/similarity", post(embed_similarity_handler))
+        .route(
+            "/api/embed/similarity",
+            // The one endpoint whose *request* is large: MAX_SIMILARITY_PROBES
+            // vectors of the index's dimension, spelled out as JSON floats.
+            // 512 × 768 dims at ~13 bytes a float is a little over 5 MB, and
+            // axum's 2 MB default silently turned the documented cap into a
+            // 413 for anything past about half of it. A cap the transport
+            // cannot carry is not a cap, it is a trap.
+            post(embed_similarity_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
         .route("/api/export/chunks", post(export_chunks_handler))
         .route("/api/export/chunk-text", post(export_chunk_text_handler))
         .route("/api/export/files", post(export_files_handler))
