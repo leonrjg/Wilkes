@@ -1144,6 +1144,111 @@ mod tests {
     }
 
     #[test]
+    fn test_chunk_similarity_answers_both_directions_and_leaves_the_probe_as_given() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut idx =
+            SemanticIndex::create(root, "m", 2, EmbeddingEngine::Candle, Some(root)).unwrap();
+        let doc = root.join("doc.txt");
+        fs::write(&doc, "content").unwrap();
+        idx.write_file(PreparedFile {
+            full_text: String::new(),
+            path: doc.clone(),
+            chunks: vec![
+                (test_chunk(&doc, "east"), vec![5.0, 0.0]),
+                (test_chunk(&doc, "north"), vec![0.0, 1.0]),
+            ],
+        })
+        .unwrap();
+        let ids: Vec<i64> = idx
+            .topic_chunks_for_file(root, &doc)
+            .unwrap()
+            .iter()
+            .map(|chunk| chunk.chunk_id)
+            .collect();
+
+        let found = idx
+            .chunk_similarity(
+                &[
+                    SimilarityProbe {
+                        vector: vec![1.0, 0.0],
+                        scope: vec![],
+                    },
+                    SimilarityProbe {
+                        vector: vec![0.0, 1.0],
+                        scope: vec![],
+                    },
+                    // Half a unit vector: a caller sending the unnormalized
+                    // mean of a group wants the mean of the group's cosines
+                    // back, so nothing here may renormalize it.
+                    SimilarityProbe {
+                        vector: vec![0.5, 0.0],
+                        scope: ids.clone(),
+                    },
+                ],
+                &ids,
+            )
+            .unwrap();
+
+        assert_eq!(found.probes[0].nearest_chunk_id, Some(ids[0]));
+        assert!((found.probes[0].similarity.unwrap() - 1.0).abs() < 1e-5);
+        assert_eq!(found.probes[1].nearest_chunk_id, Some(ids[1]));
+        // The chunk's own norm never enters: `east` is five units long and
+        // still reads 1.0 against the direction it points in.
+        assert_eq!(found.chunks[0].probe, 0);
+        assert!((found.chunks[0].similarity - 1.0).abs() < 1e-5);
+        assert_eq!(found.chunks[1].probe, 1);
+        // mean over {east, north} of dot((0.5, 0), ·) = (0.5 + 0) / 2.
+        let mean = found.probes[2].scope_mean.unwrap();
+        assert!((mean - 0.25).abs() < 1e-5, "{mean}");
+        assert_eq!(found.probes[2].scope_size, 2);
+        assert!(found.probes[0].scope_mean.is_none(), "no scope, no mean");
+    }
+
+    #[test]
+    fn test_chunk_similarity_refuses_stale_ids_and_wrong_dimensions() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut idx =
+            SemanticIndex::create(root, "m", 2, EmbeddingEngine::Candle, Some(root)).unwrap();
+        let doc = root.join("doc.txt");
+        fs::write(&doc, "content").unwrap();
+        idx.write_file(PreparedFile {
+            full_text: String::new(),
+            path: doc.clone(),
+            chunks: vec![(test_chunk(&doc, "only"), vec![1.0, 0.0])],
+        })
+        .unwrap();
+        let id = idx.topic_chunks_for_file(root, &doc).unwrap()[0].chunk_id;
+        let probe = |scope: Vec<i64>| SimilarityProbe {
+            vector: vec![1.0, 0.0],
+            scope,
+        };
+
+        // A stale id in the searched set, and a stale id hiding in a scope,
+        // are the same failure: a reading over the ids that happened to
+        // survive, with nothing in the reply to say which.
+        assert!(idx
+            .chunk_similarity(&[probe(vec![])], &[id, 999_999])
+            .is_err());
+        let error = idx
+            .chunk_similarity(&[probe(vec![999_999])], &[id])
+            .expect_err("a stale scope id must refuse");
+        assert!(format!("{error:#}").contains("999999"), "{error:#}");
+
+        let error = idx
+            .chunk_similarity(
+                &[SimilarityProbe {
+                    vector: vec![1.0, 0.0, 0.0],
+                    scope: vec![],
+                }],
+                &[id],
+            )
+            .expect_err("a probe from another space must refuse");
+        assert!(format!("{error:#}").contains("dimension"), "{error:#}");
+    }
+
+    #[test]
     fn test_chunk_centroids_refuse_ids_the_index_does_not_hold() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -4298,37 +4403,25 @@ impl SemanticIndex {
         )
     }
 
-    /// The normalized mean of the stored vectors of named chunks, one mean per
-    /// group, in the order the groups arrived.
+    /// The stored vectors of named chunks, L2-normalized, keyed by chunk id.
     ///
-    /// The same accumulation [`Self::related_documents`] does at document
-    /// granularity — normalize each member, sum, divide, normalize the sum —
-    /// with the membership named by the caller instead of read off `file_id`.
-    /// Members are normalized *before* the mean because otherwise a long chunk
-    /// with a large-norm vector would out-vote several short ones, and the
-    /// question being asked ("what region do these passages occupy") weighs
-    /// passages, not magnitudes.
+    /// Shared by every endpoint that answers a question *about* named chunks
+    /// rather than handing the chunks out, because the rule they all need is
+    /// the same one and it is not a detail: a chunk id this index does not
+    /// hold refuses the whole request, naming the ids. Chunk ids are rowids
+    /// reissued when a file is re-indexed, so the alternative is answering
+    /// over whichever of the caller's ids happened to survive — a perfectly
+    /// well-formed number with nothing in it to say which passages it is
+    /// about.
     ///
-    /// A chunk id the index does not hold is an error, never a skipped member.
-    /// Chunk ids are rowids reissued when a file is re-indexed, so a caller
-    /// holding ids from an earlier index would otherwise be handed a mean over
-    /// whichever of its ids happened to survive — a different number, with
-    /// nothing in the reply to say so. The chunk-text lookup on the export
-    /// surface refuses stale ids for the same reason; here it matters more,
-    /// because a partial mean still looks like a perfectly good vector.
-    ///
-    /// Groups are scanned together: one pass over the union of the ids, so the
-    /// cost is the ids asked for and not the groups they are arranged into.
-    pub fn chunk_centroids(&self, groups: &[Vec<i64>]) -> anyhow::Result<Vec<Vec<f32>>> {
-        anyhow::ensure!(
-            groups.iter().all(|group| !group.is_empty()),
-            "A centroid over no chunks is not a vector; every group must name at least one chunk"
-        );
-        let wanted: HashSet<i64> = groups.iter().flatten().copied().collect();
-        if wanted.is_empty() {
-            return Ok(Vec::new());
-        }
-
+    /// `asked_for` opens the refusal message, so a caller reads "Centroid
+    /// request names 3 chunks…" rather than a sentence that could have come
+    /// from any of them.
+    fn normalized_chunk_vectors(
+        &self,
+        wanted: &HashSet<i64>,
+        asked_for: &str,
+    ) -> anyhow::Result<HashMap<i64, Vec<f32>>> {
         // Batched rather than one IN-list: the number of ids is the caller's,
         // and SQLite's bound-variable ceiling is the build's. A limit that
         // depends on how the library was compiled is not one this can honour
@@ -4370,8 +4463,9 @@ impl SemanticIndex {
             missing.sort_unstable();
             let shown: Vec<String> = missing.iter().take(10).map(i64::to_string).collect();
             anyhow::bail!(
-                "Centroid request names {} chunk{} this index does not hold ({}{}) — they were \
-                 re-indexed since those ids were recorded.",
+                "{} names {} chunk{} this index does not hold ({}{}) — they were re-indexed \
+                 since those ids were recorded.",
+                asked_for,
                 missing.len(),
                 if missing.len() == 1 { "" } else { "s" },
                 shown.join(", "),
@@ -4382,6 +4476,40 @@ impl SemanticIndex {
                 },
             );
         }
+        Ok(normalized)
+    }
+
+    /// The normalized mean of the stored vectors of named chunks, one mean per
+    /// group, in the order the groups arrived.
+    ///
+    /// The same accumulation [`Self::related_documents`] does at document
+    /// granularity — normalize each member, sum, divide, normalize the sum —
+    /// with the membership named by the caller instead of read off `file_id`.
+    /// Members are normalized *before* the mean because otherwise a long chunk
+    /// with a large-norm vector would out-vote several short ones, and the
+    /// question being asked ("what region do these passages occupy") weighs
+    /// passages, not magnitudes.
+    ///
+    /// A chunk id the index does not hold is an error, never a skipped member.
+    /// Chunk ids are rowids reissued when a file is re-indexed, so a caller
+    /// holding ids from an earlier index would otherwise be handed a mean over
+    /// whichever of its ids happened to survive — a different number, with
+    /// nothing in the reply to say so. The chunk-text lookup on the export
+    /// surface refuses stale ids for the same reason; here it matters more,
+    /// because a partial mean still looks like a perfectly good vector.
+    ///
+    /// Groups are scanned together: one pass over the union of the ids, so the
+    /// cost is the ids asked for and not the groups they are arranged into.
+    pub fn chunk_centroids(&self, groups: &[Vec<i64>]) -> anyhow::Result<Vec<Vec<f32>>> {
+        anyhow::ensure!(
+            groups.iter().all(|group| !group.is_empty()),
+            "A centroid over no chunks is not a vector; every group must name at least one chunk"
+        );
+        let wanted: HashSet<i64> = groups.iter().flatten().copied().collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let normalized = self.normalized_chunk_vectors(&wanted, "Centroid request")?;
 
         Ok(groups
             .iter()
@@ -4398,6 +4526,106 @@ impl SemanticIndex {
                 normalized_vector(&centroid(&sum, group.len()))
             })
             .collect())
+    }
+
+    /// How close each probe vector sits to a named set of chunks, both ways
+    /// round, without any chunk vector leaving this index.
+    ///
+    /// Two answers from one scan, because they are two readings of the same
+    /// matrix and a caller that asked for them separately would pay for it
+    /// twice:
+    ///
+    /// * per probe, the nearest chunk of `chunk_ids` and how near it is;
+    /// * per chunk, the nearest probe and how near it is.
+    ///
+    /// Plus, per probe, the **mean** similarity over its own `scope` — a
+    /// second set of chunk ids, unrelated to `chunk_ids`. That exists because
+    /// the consumer this was built for (Underdog's §6 conceptual coverage)
+    /// judges a reading against a bar it derives from a different set of
+    /// passages, and computing that bar on its side would mean receiving the
+    /// vectors this function exists to keep here.
+    ///
+    /// **The probe vector is used exactly as given.** It is dotted with the
+    /// L2-normalized chunk vector and nothing else is done to it, so a
+    /// normalized probe yields a cosine and an unnormalized mean of unit
+    /// vectors yields the mean of the cosines of its members. Normalizing here
+    /// would quietly destroy the second, which is the whole of how a caller
+    /// asks "how close is this *group* to these passages" in one probe.
+    ///
+    /// Chunk ids this index does not hold — in `chunk_ids` or in any scope —
+    /// refuse the whole request, for the reason
+    /// [`Self::normalized_chunk_vectors`] states.
+    pub fn chunk_similarity(
+        &self,
+        probes: &[SimilarityProbe],
+        chunk_ids: &[i64],
+    ) -> anyhow::Result<ChunkSimilarity> {
+        for (at, probe) in probes.iter().enumerate() {
+            anyhow::ensure!(
+                probe.vector.len() == self.dimension,
+                "Probe {} has dimension {}; this index embeds at {}.",
+                at,
+                probe.vector.len(),
+                self.dimension
+            );
+        }
+        let wanted: HashSet<i64> = chunk_ids
+            .iter()
+            .copied()
+            .chain(probes.iter().flat_map(|probe| probe.scope.iter().copied()))
+            .collect();
+        if wanted.is_empty() || probes.is_empty() {
+            return Ok(ChunkSimilarity::default());
+        }
+        let normalized = self.normalized_chunk_vectors(&wanted, "Similarity request")?;
+
+        // Nearest-probe per chunk accumulates as the probes are walked, so the
+        // matrix is never materialised: the reply is O(probes + chunks), which
+        // is what makes asking about a whole document affordable.
+        let mut chunks: Vec<ChunkNearest> = chunk_ids
+            .iter()
+            .map(|chunk_id| ChunkNearest {
+                chunk_id: *chunk_id,
+                probe: 0,
+                similarity: f32::NEG_INFINITY,
+            })
+            .collect();
+        let mut answers = Vec::with_capacity(probes.len());
+        for (at, probe) in probes.iter().enumerate() {
+            let mut nearest: Option<(i64, f32)> = None;
+            for held in chunks.iter_mut() {
+                let score = dot(&probe.vector, &normalized[&held.chunk_id]);
+                // Strictly greater, so a tie keeps the earlier probe and the
+                // earlier chunk — the caller's order is the tiebreak, and two
+                // runs of one request cannot disagree about it.
+                if score > held.similarity {
+                    held.similarity = score;
+                    held.probe = at;
+                }
+                if nearest.is_none_or(|(_, best)| score > best) {
+                    nearest = Some((held.chunk_id, score));
+                }
+            }
+            let scope_mean = (!probe.scope.is_empty()).then(|| {
+                let total: f32 = probe
+                    .scope
+                    .iter()
+                    .map(|chunk_id| dot(&probe.vector, &normalized[chunk_id]))
+                    .sum();
+                total / probe.scope.len() as f32
+            });
+            answers.push(ProbeSimilarity {
+                nearest_chunk_id: nearest.map(|(chunk_id, _)| chunk_id),
+                similarity: nearest.map(|(_, score)| score),
+                scope_mean,
+                scope_size: probe.scope.len(),
+            });
+        }
+
+        Ok(ChunkSimilarity {
+            probes: answers,
+            chunks,
+        })
     }
 
     /// Find other documents in the configured library roots that contain a
@@ -5241,6 +5469,54 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
     dot / (norm_a.sqrt() * norm_b.sqrt())
+}
+
+/// One question for [`SemanticIndex::chunk_similarity`]: a vector in the
+/// index's own space, and optionally a set of chunk ids to average it over.
+///
+/// `scope` is not a filter on the search — the nearest-chunk answer always
+/// ranges over the request's whole `chunk_ids`. It is a separate question
+/// asked in the same pass, because the caller that needs it needs both about
+/// the same probe.
+#[derive(Clone, Debug)]
+pub struct SimilarityProbe {
+    pub vector: Vec<f32>,
+    pub scope: Vec<i64>,
+}
+
+/// What one probe found. `None` for the nearest pair when the request named no
+/// chunks to search, which is a legitimate request: a caller may want only the
+/// scope means.
+#[derive(Clone, Debug)]
+pub struct ProbeSimilarity {
+    pub nearest_chunk_id: Option<i64>,
+    pub similarity: Option<f32>,
+    pub scope_mean: Option<f32>,
+    /// How many ids the mean was taken over, reported so a caller can tell a
+    /// mean of two from a mean of two hundred without keeping its own copy of
+    /// what it asked for.
+    pub scope_size: usize,
+}
+
+/// What one chunk found: the probe it sits closest to, by index into the
+/// request's probe list.
+#[derive(Clone, Debug)]
+pub struct ChunkNearest {
+    pub chunk_id: i64,
+    pub probe: usize,
+    pub similarity: f32,
+}
+
+/// Both directions of one similarity request. `chunks` follows the order the
+/// ids were asked in; `probes` follows the probe order.
+#[derive(Clone, Debug, Default)]
+pub struct ChunkSimilarity {
+    pub probes: Vec<ProbeSimilarity>,
+    pub chunks: Vec<ChunkNearest>,
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 fn normalized_vector(v: &[f32]) -> Vec<f32> {

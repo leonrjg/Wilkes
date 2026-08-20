@@ -394,6 +394,63 @@ pub struct ChunkCentroids {
     pub centroids: Vec<Vec<f32>>,
 }
 
+/// Most probes one `chunk_similarity` request may carry, and most chunk ids it
+/// may name across the searched set and every scope together.
+///
+/// The reply is two scalars per probe and one per chunk, so neither cap is
+/// about the size of what comes back — they bound the dot products, which is
+/// `probes × chunks`. 512 × 8,192 is a few million multiply-adds, well under a
+/// second, and a caller wanting more is measuring a library rather than a
+/// document and should say so one document at a time.
+pub const MAX_SIMILARITY_PROBES: usize = 512;
+pub const MAX_SIMILARITY_CHUNK_IDS: usize = 8_192;
+
+/// One probe of `chunk_similarity`: a vector in the index's space, and
+/// optionally the chunk ids to average it over.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct SimilarityProbeRequest {
+    pub vector: Vec<f32>,
+    #[serde(default)]
+    pub scope: Vec<i64>,
+}
+
+/// What one probe found: its nearest chunk among the searched set, and the
+/// mean similarity over its own scope when it named one.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ProbeSimilarity {
+    pub nearest_chunk_id: Option<i64>,
+    pub similarity: Option<f32>,
+    pub scope_mean: Option<f32>,
+    pub scope_size: usize,
+}
+
+/// What one searched chunk found: the probe it sits closest to, named by its
+/// index in the request.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ChunkNearest {
+    pub chunk_id: i64,
+    pub probe: usize,
+    pub similarity: f32,
+}
+
+/// Result of `chunk_similarity`: both directions of one comparison, plus the
+/// identity of the model whose stored vectors answered.
+///
+/// `model_id` and `dimension` travel for the reason they travel on
+/// [`ChunkCentroids`]: a consumer comparing these numbers against readings
+/// taken elsewhere has to be able to refuse rather than average across two
+/// spaces. Here it is sharper still — the probes are the consumer's own
+/// vectors, so a model mismatch makes every number in the reply a comparison
+/// between two different embedders and nothing in the shape says so.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ChunkSimilarities {
+    pub engine: String,
+    pub model_id: String,
+    pub dimension: usize,
+    pub probes: Vec<ProbeSimilarity>,
+    pub chunks: Vec<ChunkNearest>,
+}
+
 /// One exported chunk: text, locators (byte range into the extracted text
 /// plus resolved source origin), and the stored vector.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -1422,6 +1479,98 @@ impl AppContext {
         })
         .await
         .map_err(|error| format!("Centroid task panicked: {error}"))?
+    }
+
+    /// How close a consumer's own vectors sit to named passages of this index,
+    /// in both directions, plus a per-probe mean over a scope of the consumer's
+    /// choosing.
+    ///
+    /// The sibling of [`Self::chunk_centroids`] and it exists for the same
+    /// reason: a consumer that keeps its own vector space wants a *number*
+    /// about this index, and the way to give it one without handing over the
+    /// index's vectors is to do the arithmetic here. The centroid endpoint
+    /// answers "where do these passages sit"; this one answers "how far is
+    /// this from them", which is the question a coverage measurement asks in
+    /// both directions at once.
+    ///
+    /// Probe vectors are used as given — see `SemanticIndex::chunk_similarity`,
+    /// which owns that rule and explains why normalizing here would break the
+    /// group-mean probe.
+    pub async fn chunk_similarity(
+        &self,
+        probes: Vec<SimilarityProbeRequest>,
+        chunk_ids: Vec<i64>,
+    ) -> Result<ChunkSimilarities, String> {
+        if probes.is_empty() {
+            return Err("Similarity request names no probes.".to_string());
+        }
+        if probes.len() > MAX_SIMILARITY_PROBES {
+            return Err(format!(
+                "Similarity request names {} probes; {MAX_SIMILARITY_PROBES} is the most one \
+                 request may ask for.",
+                probes.len(),
+            ));
+        }
+        let total: usize =
+            chunk_ids.len() + probes.iter().map(|probe| probe.scope.len()).sum::<usize>();
+        if total > MAX_SIMILARITY_CHUNK_IDS {
+            return Err(format!(
+                "Similarity request names {total} chunk ids across the searched set and its \
+                 scopes; {MAX_SIMILARITY_CHUNK_IDS} is the most one request may ask for.",
+            ));
+        }
+        // The same refusal the centroid and the chunk export make: mid-rebuild,
+        // the ids in flight belong to neither the old index nor the new one.
+        self.ensure_no_active_embed_task(
+            "Semantic index is currently being built. Please wait before asking for similarities.",
+        )?;
+
+        let index_arc = self.index.lock().clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+            let index = guard.as_ref().ok_or_else(|| {
+                "Semantic index unavailable. Build or restore the semantic index first.".to_string()
+            })?;
+            let status = index.status();
+            let probes: Vec<wilkes_core::embed::index::db::SimilarityProbe> = probes
+                .into_iter()
+                .map(|probe| wilkes_core::embed::index::db::SimilarityProbe {
+                    vector: probe.vector,
+                    scope: probe.scope,
+                })
+                .collect();
+            let found = index
+                .chunk_similarity(&probes, &chunk_ids)
+                .map_err(|error| format!("Could not compute chunk similarities: {error:#}"))?;
+            Ok(ChunkSimilarities {
+                engine: status.engine.as_str().to_string(),
+                model_id: status.model_id,
+                dimension: status.dimension,
+                probes: found
+                    .probes
+                    .into_iter()
+                    .map(|probe| ProbeSimilarity {
+                        nearest_chunk_id: probe.nearest_chunk_id,
+                        similarity: probe.similarity,
+                        scope_mean: probe.scope_mean,
+                        scope_size: probe.scope_size,
+                    })
+                    .collect(),
+                chunks: found
+                    .chunks
+                    .into_iter()
+                    .map(|chunk| ChunkNearest {
+                        chunk_id: chunk.chunk_id,
+                        probe: chunk.probe,
+                        similarity: chunk.similarity,
+                    })
+                    .collect(),
+            })
+        })
+        .await
+        .map_err(|error| format!("Similarity task panicked: {error}"))?
     }
 
     /// One indexed document's chunks, in extraction order, with the ordinals

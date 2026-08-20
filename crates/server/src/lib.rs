@@ -587,6 +587,47 @@ async fn embed_centroid_handler(
 }
 
 #[derive(Deserialize)]
+struct EmbedSimilarityBody {
+    /// The consumer's own vectors, in the order the reply should carry them.
+    probes: Vec<wilkes_api::context::SimilarityProbeRequest>,
+    /// The chunks to search. May be empty when only the probes' scope means
+    /// are wanted — asking for a bar without asking for a nearest is a
+    /// legitimate request, not a malformed one.
+    #[serde(default)]
+    chunk_ids: Vec<i64>,
+    /// Which workspace's index holds those chunk ids. Absent means the active
+    /// one — and, as on `/api/embed/centroid`, this is not a filter: chunk ids
+    /// are per-index rowids, so answering from whichever workspace is open
+    /// would return confident similarities against the wrong passages.
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+/// How close a caller's own vectors sit to named chunks, both directions, plus
+/// a per-probe mean over a scope it names — for a consumer measuring its model
+/// of a document against the document, without receiving the document's
+/// vectors.
+///
+/// Beside `/api/embed/centroid` for the same reason that one sits beside
+/// `/api/embed/text`: what it answers with is a reading of this index's vector
+/// space, carrying the model id and dimension a consumer pins against.
+async fn embed_similarity_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<EmbedSimilarityBody>,
+) -> Result<Json<wilkes_api::context::ChunkSimilarities>, (StatusCode, Json<ErrorBody>)> {
+    if body.probes.is_empty() {
+        return Err(err("probes must not be empty"));
+    }
+    state
+        .context_for(body.workspace_id.as_deref())
+        .await?
+        .chunk_similarity(body.probes, body.chunk_ids)
+        .await
+        .map(Json)
+        .map_err(server_err)
+}
+
+#[derive(Deserialize)]
 struct ExportChunksBody {
     root: PathBuf,
     path: PathBuf,
@@ -1506,6 +1547,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/embed/ready", get(is_semantic_ready_handler))
         .route("/api/embed/text", post(embed_text_handler))
         .route("/api/embed/centroid", post(embed_centroid_handler))
+        .route("/api/embed/similarity", post(embed_similarity_handler))
         .route("/api/export/chunks", post(export_chunks_handler))
         .route("/api/export/chunk-text", post(export_chunk_text_handler))
         .route("/api/export/files", post(export_files_handler))
