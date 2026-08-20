@@ -1095,6 +1095,81 @@ mod tests {
     }
 
     #[test]
+    fn test_chunk_centroids_weighs_passages_not_magnitudes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut idx =
+            SemanticIndex::create(root, "m", 2, EmbeddingEngine::Candle, Some(root)).unwrap();
+        let doc = root.join("doc.txt");
+        fs::write(&doc, "content").unwrap();
+
+        // The long/short asymmetry the pre-normalisation exists for: a raw
+        // mean of these two would land at (0.75, 0.25) and call the region
+        // "mostly the first passage" on the strength of a vector norm.
+        idx.write_file(PreparedFile {
+            full_text: String::new(),
+            path: doc.clone(),
+            chunks: vec![
+                (test_chunk(&doc, "long"), vec![3.0, 0.0]),
+                (test_chunk(&doc, "short"), vec![0.0, 1.0]),
+            ],
+        })
+        .unwrap();
+
+        let ids: Vec<i64> = idx
+            .topic_chunks_for_file(root, &doc)
+            .unwrap()
+            .iter()
+            .map(|chunk| chunk.chunk_id)
+            .collect();
+        assert_eq!(ids.len(), 2);
+
+        let centroids = idx
+            .chunk_centroids(&[vec![ids[0], ids[1]], vec![ids[0]]])
+            .unwrap();
+        assert_eq!(centroids.len(), 2);
+        let halfway = std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            (centroids[0][0] - halfway).abs() < 1e-5,
+            "{:?}",
+            centroids[0]
+        );
+        assert!(
+            (centroids[0][1] - halfway).abs() < 1e-5,
+            "{:?}",
+            centroids[0]
+        );
+        // A group of one is that chunk's direction, magnitude discarded.
+        assert!((centroids[1][0] - 1.0).abs() < 1e-5, "{:?}", centroids[1]);
+    }
+
+    #[test]
+    fn test_chunk_centroids_refuse_ids_the_index_does_not_hold() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut idx =
+            SemanticIndex::create(root, "m", 2, EmbeddingEngine::Candle, Some(root)).unwrap();
+        let doc = root.join("doc.txt");
+        fs::write(&doc, "content").unwrap();
+        idx.write_file(PreparedFile {
+            full_text: String::new(),
+            path: doc.clone(),
+            chunks: vec![(test_chunk(&doc, "only"), vec![1.0, 0.0])],
+        })
+        .unwrap();
+        let id = idx.topic_chunks_for_file(root, &doc).unwrap()[0].chunk_id;
+
+        // A stale id must not quietly reduce the group to the chunks that
+        // survived: that answer is a vector too, and nothing about it says so.
+        let error = idx
+            .chunk_centroids(&[vec![id, 999_999]])
+            .expect_err("stale id must refuse");
+        assert!(format!("{error:#}").contains("999999"), "{error:#}");
+
+        assert!(idx.chunk_centroids(&[vec![]]).is_err(), "empty group");
+    }
+
+    #[test]
     fn test_related_documents_missing_source_errors() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -1484,9 +1559,14 @@ mod tests {
         let changed_path = root.join("changed.txt");
         fs::write(&changed_path, "original").unwrap();
 
-        let mut idx =
-            SemanticIndex::create(&data_dir, "counting", 1, EmbeddingEngine::Candle, Some(&root))
-                .unwrap();
+        let mut idx = SemanticIndex::create(
+            &data_dir,
+            "counting",
+            1,
+            EmbeddingEngine::Candle,
+            Some(&root),
+        )
+        .unwrap();
         idx.write_file(PreparedFile {
             path: stale_path.clone(),
             full_text: "stale body".to_string(),
@@ -2917,10 +2997,7 @@ impl SemanticIndex {
                 params![text, file_id, size_bytes, modified_at_ms],
             ) {
                 Ok(changed) => filled += changed,
-                Err(e) => error!(
-                    "[SemanticIndex::backfill] write {}: {e:#}",
-                    path.display()
-                ),
+                Err(e) => error!("[SemanticIndex::backfill] write {}: {e:#}", path.display()),
             }
         }
         filled
@@ -4158,6 +4235,48 @@ impl SemanticIndex {
         self.topic_chunks_filtered("rf.root_id = ?1", &[&root_id])
     }
 
+    /// How many exportable passages each document of one root holds, keyed by
+    /// the document's canonical path.
+    ///
+    /// The joins are the export's own (`root_files` → `files` → `chunks` →
+    /// `vec_chunks`), so a path this reports with a non-zero count is a path
+    /// `topic_chunks_for_file` will answer for. A file row alone is not the
+    /// question a caller is asking: a document that was walked but whose
+    /// passages never made it into the index would export nothing, and saying
+    /// otherwise would move the disappointment to the export call.
+    ///
+    /// A root the index has never seen is an empty map rather than an error —
+    /// "no passages here" is what an unindexed root truthfully has.
+    pub fn indexed_chunk_counts_for_root(
+        &self,
+        root: &Path,
+    ) -> anyhow::Result<HashMap<PathBuf, usize>> {
+        let Some(root_id) = self.root_id_for_path(root)? else {
+            return Ok(HashMap::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT f.file_path, count(*)
+             FROM root_files rf
+             JOIN files f ON f.id = rf.file_id
+             JOIN chunks c ON c.file_id = f.id
+             JOIN vec_chunks v ON v.rowid = c.id
+             WHERE rf.root_id = ?1
+             GROUP BY f.file_path",
+        )?;
+        let rows = stmt.query_map(params![root_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut counts = HashMap::new();
+        for row in rows {
+            let (stored, count) = row?;
+            counts.insert(
+                self.key_to_display_path(&stored),
+                usize::try_from(count).unwrap_or(0),
+            );
+        }
+        Ok(counts)
+    }
+
     /// Bulk-read vectors and passage metadata for one indexed document while
     /// proving that the file belongs to the requested root. Filtering in SQL
     /// avoids materialising the entire root for a within-document cloud.
@@ -4177,6 +4296,108 @@ impl SemanticIndex {
             "rf.root_id = ?1 AND f.file_path = ?2",
             &[&root_id, &path_key],
         )
+    }
+
+    /// The normalized mean of the stored vectors of named chunks, one mean per
+    /// group, in the order the groups arrived.
+    ///
+    /// The same accumulation [`Self::related_documents`] does at document
+    /// granularity — normalize each member, sum, divide, normalize the sum —
+    /// with the membership named by the caller instead of read off `file_id`.
+    /// Members are normalized *before* the mean because otherwise a long chunk
+    /// with a large-norm vector would out-vote several short ones, and the
+    /// question being asked ("what region do these passages occupy") weighs
+    /// passages, not magnitudes.
+    ///
+    /// A chunk id the index does not hold is an error, never a skipped member.
+    /// Chunk ids are rowids reissued when a file is re-indexed, so a caller
+    /// holding ids from an earlier index would otherwise be handed a mean over
+    /// whichever of its ids happened to survive — a different number, with
+    /// nothing in the reply to say so. The chunk-text lookup on the export
+    /// surface refuses stale ids for the same reason; here it matters more,
+    /// because a partial mean still looks like a perfectly good vector.
+    ///
+    /// Groups are scanned together: one pass over the union of the ids, so the
+    /// cost is the ids asked for and not the groups they are arranged into.
+    pub fn chunk_centroids(&self, groups: &[Vec<i64>]) -> anyhow::Result<Vec<Vec<f32>>> {
+        anyhow::ensure!(
+            groups.iter().all(|group| !group.is_empty()),
+            "A centroid over no chunks is not a vector; every group must name at least one chunk"
+        );
+        let wanted: HashSet<i64> = groups.iter().flatten().copied().collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Batched rather than one IN-list: the number of ids is the caller's,
+        // and SQLite's bound-variable ceiling is the build's. A limit that
+        // depends on how the library was compiled is not one this can honour
+        // by asserting.
+        const IDS_PER_QUERY: usize = 500;
+        let ids: Vec<i64> = wanted.iter().copied().collect();
+        let mut normalized: HashMap<i64, Vec<f32>> = HashMap::with_capacity(ids.len());
+        for batch in ids.chunks(IDS_PER_QUERY) {
+            let placeholders = vec!["?"; batch.len()].join(",");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT c.id, v.embedding
+                 FROM chunks c
+                 JOIN vec_chunks v ON v.rowid = c.id
+                 WHERE c.id IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(params_from_iter(batch.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            for row in rows {
+                let (chunk_id, blob) = row?;
+                let embedding = f32_slice_from_bytes(&blob)?;
+                anyhow::ensure!(
+                    embedding.len() == self.dimension,
+                    "Stored embedding dimension mismatch for chunk {}. Expected {}, received {}.",
+                    chunk_id,
+                    self.dimension,
+                    embedding.len()
+                );
+                normalized.insert(chunk_id, normalized_vector(&embedding));
+            }
+        }
+
+        if normalized.len() != wanted.len() {
+            let mut missing: Vec<i64> = wanted
+                .iter()
+                .filter(|id| !normalized.contains_key(id))
+                .copied()
+                .collect();
+            missing.sort_unstable();
+            let shown: Vec<String> = missing.iter().take(10).map(i64::to_string).collect();
+            anyhow::bail!(
+                "Centroid request names {} chunk{} this index does not hold ({}{}) — they were \
+                 re-indexed since those ids were recorded.",
+                missing.len(),
+                if missing.len() == 1 { "" } else { "s" },
+                shown.join(", "),
+                if missing.len() > shown.len() {
+                    ", …"
+                } else {
+                    ""
+                },
+            );
+        }
+
+        Ok(groups
+            .iter()
+            .map(|group| {
+                let mut sum = vec![0.0f32; self.dimension];
+                for chunk_id in group {
+                    // Present: the missing-id check above left no other case.
+                    // A repeated id counts twice, which is the caller's
+                    // arithmetic and not this function's to silently correct.
+                    for (total, value) in sum.iter_mut().zip(&normalized[chunk_id]) {
+                        *total += value;
+                    }
+                }
+                normalized_vector(&centroid(&sum, group.len()))
+            })
+            .collect())
     }
 
     /// Find other documents in the configured library roots that contain a

@@ -205,6 +205,7 @@ async fn list_workspaces_handler(
         .ok_or_else(|| server_err("Workspace manager is unavailable"))?;
     manager
         .state()
+        .await
         .map(Json)
         .map_err(|error| server_err(error.to_string()))
 }
@@ -219,6 +220,7 @@ async fn create_workspace_handler(
         .ok_or_else(|| server_err("Workspace manager is unavailable"))?;
     manager
         .create(body.name)
+        .await
         .map(Json)
         .map_err(|error| server_err(error.to_string()))
 }
@@ -234,6 +236,7 @@ async fn rename_workspace_handler(
         .ok_or_else(|| server_err("Workspace manager is unavailable"))?;
     manager
         .rename(&workspace_id, body.name)
+        .await
         .map(Json)
         .map_err(|error| server_err(error.to_string()))
 }
@@ -516,6 +519,14 @@ async fn is_semantic_ready_handler(State(state): State<Arc<AppState>>) -> Json<b
 #[derive(Deserialize)]
 struct EmbedTextBody {
     texts: Vec<String>,
+    /// Which workspace's embedder to use. Absent means the active one.
+    ///
+    /// A consumer keeping one vector space across workspaces (Underdog pins
+    /// model + dimension) cannot let "whichever workspace the user last
+    /// opened" decide what embeds its text: the model would change under it
+    /// when the user switches windows.
+    #[serde(default)]
+    workspace_id: Option<String>,
 }
 
 /// Embed arbitrary strings with the model the semantic index uses. Sidecar
@@ -528,8 +539,48 @@ async fn embed_text_handler(
         return Err(err("texts must not be empty"));
     }
     state
-        .context()
+        .context_for(body.workspace_id.as_deref())
+        .await?
         .embed_texts(body.texts)
+        .await
+        .map(Json)
+        .map_err(server_err)
+}
+
+#[derive(Deserialize)]
+struct EmbedCentroidBody {
+    /// One group of chunk ids per centroid wanted, in the order the reply
+    /// should carry them.
+    groups: Vec<Vec<i64>>,
+    /// Which workspace's index holds those chunk ids. Absent means the active
+    /// one.
+    ///
+    /// Not a filter: chunk ids are per-index rowids, so the same number names
+    /// a different passage in every workspace. Answering from "whichever one
+    /// is open" would return a centroid of the wrong passages rather than an
+    /// error about ids that do not exist.
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+/// The normalized mean of named chunks' stored vectors, one per group — for a
+/// consumer that keeps its own vector space and wants a region of this index
+/// expressed in it, without receiving the index's vectors to average itself.
+///
+/// Beside `/api/embed/text` rather than under `/api/export` because that is
+/// what it answers with: a vector in the index's space, carrying the model id
+/// and dimension a consumer pins against, exactly as text embedding does.
+async fn embed_centroid_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<EmbedCentroidBody>,
+) -> Result<Json<wilkes_api::context::ChunkCentroids>, (StatusCode, Json<ErrorBody>)> {
+    if body.groups.is_empty() {
+        return Err(err("groups must not be empty"));
+    }
+    state
+        .context_for(body.workspace_id.as_deref())
+        .await?
+        .chunk_centroids(body.groups)
         .await
         .map(Json)
         .map_err(server_err)
@@ -539,6 +590,13 @@ async fn embed_text_handler(
 struct ExportChunksBody {
     root: PathBuf,
     path: PathBuf,
+    /// Which workspace indexed this file. Absent means the active one.
+    ///
+    /// Each workspace owns its index, so this is not a filter — it names the
+    /// database the chunks are read from. Without it, exporting a document
+    /// from another library meant switching the whole server to it first.
+    #[serde(default)]
+    workspace_id: Option<String>,
 }
 
 /// Chunk + vector export for one indexed file: text, byte ranges, source
@@ -548,8 +606,67 @@ async fn export_chunks_handler(
     Json(body): Json<ExportChunksBody>,
 ) -> Result<Json<wilkes_api::context::FileChunkExport>, (StatusCode, Json<ErrorBody>)> {
     state
-        .context()
+        .context_for(body.workspace_id.as_deref())
+        .await?
         .export_file_chunks(body.root, body.path)
+        .await
+        .map(Json)
+        .map_err(server_err)
+}
+
+#[derive(Deserialize)]
+struct ExportFilesBody {
+    root: PathBuf,
+    /// Which workspace's library and index to read. Absent means the active
+    /// one, as everywhere else on the export surface.
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+/// The documents one library root holds, each with the passage count that says
+/// whether `/api/export/chunks` can answer for it.
+///
+/// Deliberately not `/api/files`: that endpoint is confined to the uploads
+/// directory, which is the right jail for a browser talking to a shared
+/// server and the wrong one for a consumer asking about the library itself.
+/// This one is confined to the workspace's own library roots, exactly as the
+/// chunk export is.
+async fn export_files_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ExportFilesBody>,
+) -> Result<Json<wilkes_api::context::LibraryFileExport>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context_for(body.workspace_id.as_deref())
+        .await?
+        .export_library_files(body.root)
+        .await
+        .map(Json)
+        .map_err(server_err)
+}
+
+#[derive(Deserialize)]
+struct ExportChunkTextBody {
+    root: PathBuf,
+    path: PathBuf,
+    /// Chunk ids as `/api/export/chunks` reported them, which is where a caller
+    /// gets them.
+    chunk_ids: Vec<i64>,
+    /// The workspace those chunk ids belong to — they are keyed per index, so
+    /// reading them against another workspace would answer about other text.
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+/// The text of named chunks of one indexed file, without their vectors — the
+/// lookup behind "show me the passage this came from".
+async fn export_chunk_text_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ExportChunkTextBody>,
+) -> Result<Json<wilkes_api::context::ChunkTextExport>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context_for(body.workspace_id.as_deref())
+        .await?
+        .export_chunk_text(body.root, body.path, body.chunk_ids)
         .await
         .map(Json)
         .map_err(server_err)
@@ -1388,7 +1505,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/embed/ready", get(is_semantic_ready_handler))
         .route("/api/embed/text", post(embed_text_handler))
+        .route("/api/embed/centroid", post(embed_centroid_handler))
         .route("/api/export/chunks", post(export_chunks_handler))
+        .route("/api/export/chunk-text", post(export_chunk_text_handler))
+        .route("/api/export/files", post(export_files_handler))
         .route("/api/generation/ready", get(is_generation_ready_handler))
         .route(
             "/api/generation/models",

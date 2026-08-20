@@ -367,6 +367,33 @@ pub struct EmbeddedTexts {
     pub vectors: Vec<Vec<f32>>,
 }
 
+/// Most groups one `chunk_centroids` request may name, and most chunk ids it
+/// may name across all of them.
+///
+/// The reply is one vector per group, so the group cap bounds what comes back
+/// (256 groups at 384 dimensions is under half a megabyte) and the id cap
+/// bounds the index scan that produces it. Both are generous by the standard
+/// of the question: a caller asking for more than a few hundred regions in one
+/// request is building a projection of the index, which is what
+/// `export_file_chunks` is for.
+pub const MAX_CENTROID_GROUPS: usize = 256;
+pub const MAX_CENTROID_CHUNK_IDS: usize = 4_096;
+
+/// Result of `chunk_centroids`: one normalized mean per requested group, in
+/// the order the groups were asked for.
+///
+/// `model_id` and `dimension` are the index's own — the identity of the model
+/// that produced the vectors being averaged, not of whatever embedder happens
+/// to be loaded — because a consumer storing these beside vectors of its own
+/// refuses on a mismatch and needs the comparison to be about the same thing.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ChunkCentroids {
+    pub engine: String,
+    pub model_id: String,
+    pub dimension: usize,
+    pub centroids: Vec<Vec<f32>>,
+}
+
 /// One exported chunk: text, locators (byte range into the extracted text
 /// plus resolved source origin), and the stored vector.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -412,6 +439,63 @@ pub struct FileChunkExport {
     pub dimension: Option<usize>,
     pub outline: Vec<ExportedOutlineEntry>,
     pub chunks: Vec<ExportedChunk>,
+}
+
+/// One document Wilkes serves under a library root, as a consumer that wants to
+/// ingest it needs to see it.
+///
+/// `chunk_count` is the fact that decides whether the document can be exported
+/// at all: it counts the passages the semantic index holds for this file under
+/// this root, so zero means an export would come back empty. It is a count
+/// rather than a flag because a consumer showing the file to a person has a
+/// use for the size of what it is about to read, and a flag would have thrown
+/// that away to say less.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LibraryFile {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub extension: String,
+    pub modified_at_ms: Option<i64>,
+    /// Title from Wilkes's metadata cache, absent until it has read the file.
+    pub title: Option<String>,
+    pub chunk_count: usize,
+}
+
+/// Result of `export_library_files`: one root's documents, ascending by path.
+///
+/// The root comes back canonicalised because that is the root the counts were
+/// read against — a consumer that asked with a symlinked or relative path can
+/// see which directory answered.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LibraryFileExport {
+    pub root: PathBuf,
+    pub files: Vec<LibraryFile>,
+}
+
+/// Most chunks one `export_chunk_text` request may name.
+///
+/// A bound rather than a preference: the endpoint exists so that displaying a
+/// passage costs a passage, and a caller that can ask for a thousand chunks has
+/// simply rebuilt the full export with extra steps. Generous enough for a long
+/// section, small enough that no reply is a surprise.
+pub const MAX_CHUNK_TEXT_IDS: usize = 64;
+
+/// One chunk's text and locators, without the vector.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ChunkText {
+    pub chunk_id: i64,
+    pub ordinal: usize,
+    pub text: String,
+    pub byte_range: wilkes_core::types::ByteRange,
+    pub origin: wilkes_core::types::SourceOrigin,
+}
+
+/// Result of `export_chunk_text`, ascending by ordinal — reading order, not the
+/// order the ids were asked for.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ChunkTextExport {
+    pub file_path: PathBuf,
+    pub chunks: Vec<ChunkText>,
 }
 
 /// Maps each outline entry onto the first exported chunk at or after its
@@ -1274,15 +1358,86 @@ impl AppContext {
         })
     }
 
-    /// Export one indexed document's chunks with their locators and stored
-    /// vectors — the source of segment positions for consumers that must
-    /// never re-extract (Underdog requirement E1). Read-only over the live
-    /// semantic index.
-    pub async fn export_file_chunks(
+    /// The normalized mean of the stored vectors of named chunks, one mean per
+    /// group.
+    ///
+    /// This is the whole of what a consumer needs when it wants to know *where
+    /// in the corpus* a set of passages sits, and it is deliberately not a way
+    /// to get the passages' vectors. `export_file_chunks` hands those out for
+    /// ingestion — a consumer that must never re-extract has to receive what
+    /// the index holds — but a consumer keeping a vector space of its own is
+    /// better served by asking Wilkes for the number than by rebuilding the
+    /// arithmetic on its side, where the mean, the normalisation and the
+    /// dimension check would all become a second definition of a vector this
+    /// index already knows how to make.
+    ///
+    /// Groups rather than a single set for the same reason `embed_texts` takes
+    /// a list: a caller computing one region per concept has hundreds of them,
+    /// and one request per region turns a scan into a stampede.
+    ///
+    /// Chunk ids the index does not hold are an error, not an omission — see
+    /// `SemanticIndex::chunk_centroids`, which owns that rule.
+    pub async fn chunk_centroids(&self, groups: Vec<Vec<i64>>) -> Result<ChunkCentroids, String> {
+        if groups.is_empty() {
+            return Err("Centroid request names no groups.".to_string());
+        }
+        if groups.len() > MAX_CENTROID_GROUPS {
+            return Err(format!(
+                "Centroid request names {} groups; {MAX_CENTROID_GROUPS} is the most one request \
+                 may ask for.",
+                groups.len(),
+            ));
+        }
+        let total: usize = groups.iter().map(Vec::len).sum();
+        if total > MAX_CENTROID_CHUNK_IDS {
+            return Err(format!(
+                "Centroid request names {total} chunk ids; {MAX_CENTROID_CHUNK_IDS} is the most \
+                 one request may ask for.",
+            ));
+        }
+        // The same refusal the chunk export makes: mid-rebuild, the ids in
+        // flight belong to neither the old index nor the new one.
+        self.ensure_no_active_embed_task(
+            "Semantic index is currently being built. Please wait before asking for centroids.",
+        )?;
+
+        let index_arc = self.index.lock().clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+            let index = guard.as_ref().ok_or_else(|| {
+                "Semantic index unavailable. Build or restore the semantic index first.".to_string()
+            })?;
+            let status = index.status();
+            let centroids = index
+                .chunk_centroids(&groups)
+                .map_err(|error| format!("Could not compute chunk centroids: {error:#}"))?;
+            Ok(ChunkCentroids {
+                engine: status.engine.as_str().to_string(),
+                model_id: status.model_id,
+                dimension: status.dimension,
+                centroids,
+            })
+        })
+        .await
+        .map_err(|error| format!("Centroid task panicked: {error}"))?
+    }
+
+    /// One indexed document's chunks, in extraction order, with the ordinals
+    /// every chunk export speaks in.
+    ///
+    /// Shared by [`Self::export_file_chunks`] and [`Self::export_chunk_text`]
+    /// rather than written out twice. An ordinal is a position in *this*
+    /// ordering and has no meaning apart from it, so a second copy of the sort
+    /// would be a second definition of what "chunk 12" is — and a consumer that
+    /// stored an ordinal from one export and redeemed it against the other
+    /// would be reading whatever the drift left there.
+    async fn indexed_chunks(
         &self,
         root: PathBuf,
         path: PathBuf,
-    ) -> Result<FileChunkExport, String> {
+    ) -> Result<(PathBuf, Vec<ExportedChunk>), String> {
         self.ensure_no_active_embed_task(
             "Semantic index is currently being built. Please wait before exporting chunks.",
         )?;
@@ -1297,12 +1452,6 @@ impl AppContext {
             "Chunk export",
         )?;
         Self::ensure_path_in_library(&path, &library_roots, "Chunk export file")?;
-
-        let model_id = self
-            .embedder
-            .lock()
-            .clone()
-            .map(|embedder| embedder.model_id().to_string());
 
         let index_arc = self.index.lock().clone();
         let task_root = root.clone();
@@ -1323,8 +1472,7 @@ impl AppContext {
 
         // Stable reading order: extraction position, not row id.
         chunks.sort_by_key(|chunk| chunk.extraction_byte_range.start);
-        let dimension = chunks.first().map(|chunk| chunk.embedding.len());
-        let chunks: Vec<ExportedChunk> = chunks
+        let chunks = chunks
             .into_iter()
             .enumerate()
             .map(|(ordinal, chunk)| ExportedChunk {
@@ -1336,6 +1484,26 @@ impl AppContext {
                 embedding: chunk.embedding,
             })
             .collect();
+        Ok((path, chunks))
+    }
+
+    /// Export one indexed document's chunks with their locators and stored
+    /// vectors — the source of segment positions for consumers that must
+    /// never re-extract (Underdog requirement E1). Read-only over the live
+    /// semantic index.
+    pub async fn export_file_chunks(
+        &self,
+        root: PathBuf,
+        path: PathBuf,
+    ) -> Result<FileChunkExport, String> {
+        let model_id = self
+            .embedder
+            .lock()
+            .clone()
+            .map(|embedder| embedder.model_id().to_string());
+
+        let (path, chunks) = self.indexed_chunks(root, path).await?;
+        let dimension = chunks.first().map(|chunk| chunk.embedding.len());
 
         // The declared outline, resolved against the chunks just exported.
         //
@@ -1363,6 +1531,151 @@ impl AppContext {
             dimension,
             outline,
             chunks,
+        })
+    }
+
+    /// Every document Wilkes serves under one library root, each with the
+    /// number of passages the index holds for it.
+    ///
+    /// This is the browse half of the export surface. Wilkes decides what
+    /// counts as a document — its supported extensions, its size limit, its
+    /// ignore rules — and its index decides what can be exported, so a
+    /// consumer that walked the directory itself would be reimplementing two
+    /// rules it does not own and would disagree with `export_file_chunks` the
+    /// moment either changed. `/api/files` cannot answer this: it is confined
+    /// to the uploads directory, which a real library root never is.
+    ///
+    /// The listing is the filesystem's, the counts are the index's, and they
+    /// are reported together rather than merged into a verdict: a file present
+    /// but unindexed is a normal state with a fix in Wilkes, and only the
+    /// caller knows whether it wants to show it, hide it or refuse it.
+    pub async fn export_library_files(&self, root: PathBuf) -> Result<LibraryFileExport, String> {
+        // The same refusal the chunk export makes, for the same reason: while
+        // the index is being rewritten its counts describe neither the old
+        // index nor the new one, and a listing that invited a person to pick
+        // from them would be handing out exports that are about to fail.
+        self.ensure_no_active_embed_task(
+            "Semantic index is currently being built. Please wait before listing library files.",
+        )?;
+        let settings = self.settings().await;
+        let (library_roots, _) = library_roots(&settings);
+        let root = Self::canonicalize_search_root(&root)?;
+        Self::ensure_path_in_library(&root, &library_roots, "Library listing root")?;
+
+        let listing = self
+            .list_files(root.clone())
+            .await
+            .map_err(|error| format!("Could not list library files: {error:#}"))?;
+
+        let index_arc = self.index.lock().clone();
+        let counts_root = root.clone();
+        let counts = tokio::task::spawn_blocking(move || {
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+            // No index is not an error here. The directory still has documents
+            // in it, and "none of them is indexed yet" is exactly what a
+            // person who has not built the index should be told — by seeing
+            // their files with nothing behind them, not by an empty screen.
+            let Some(index) = guard.as_ref() else {
+                return Ok::<_, String>(std::collections::HashMap::new());
+            };
+            index
+                .indexed_chunk_counts_for_root(&counts_root)
+                .map_err(|error| format!("Could not read indexed passage counts: {error:#}"))
+        })
+        .await
+        .map_err(|error| format!("Library listing task panicked: {error}"))??;
+
+        let mut files: Vec<LibraryFile> = listing
+            .files
+            .into_iter()
+            .map(|entry| LibraryFile {
+                chunk_count: counts.get(&entry.path).copied().unwrap_or(0),
+                path: entry.path,
+                size_bytes: entry.size_bytes,
+                extension: entry.extension,
+                modified_at_ms: entry.modified_at_ms,
+                title: entry.title,
+            })
+            .collect();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+
+        Ok(LibraryFileExport { root, files })
+    }
+
+    /// The text of named chunks of one indexed document, without their vectors
+    /// — for a consumer that already knows which passage it wants and needs to
+    /// show it to a person.
+    ///
+    /// Separate from [`Self::export_file_chunks`] because the two answer
+    /// different questions at different scales. A full export is a
+    /// once-per-document ingestion step whose reply runs to megabytes, nearly
+    /// all of it embeddings; this is a per-view lookup of a paragraph or two,
+    /// and asking for a whole book to display one of them would make the size
+    /// of the reply a function of the document rather than of the request.
+    ///
+    /// Chunks are named by `chunk_id` because that is the addressing a consumer
+    /// keeps: an export hands back both, but it is the id that gets written down
+    /// against whatever the consumer derived from the passage. The reply carries
+    /// the ordinal too, so positional locators recorded from an export stay
+    /// usable without a second round trip to translate them.
+    ///
+    /// An id this document does not have is an error rather than an omission. It
+    /// means the file was re-indexed since the caller recorded that id, and
+    /// returning the chunks that *did* resolve would show a person a passage
+    /// from the wrong place while looking like a complete answer.
+    pub async fn export_chunk_text(
+        &self,
+        root: PathBuf,
+        path: PathBuf,
+        chunk_ids: Vec<i64>,
+    ) -> Result<ChunkTextExport, String> {
+        if chunk_ids.is_empty() {
+            return Err("Chunk text export names no chunks.".to_string());
+        }
+        if chunk_ids.len() > MAX_CHUNK_TEXT_IDS {
+            return Err(format!(
+                "Chunk text export asks for {} chunks; {MAX_CHUNK_TEXT_IDS} is the most one \
+                 request may name. Ask for the passage you mean to show, not the document.",
+                chunk_ids.len(),
+            ));
+        }
+
+        let (path, chunks) = self.indexed_chunks(root, path).await?;
+
+        let mut wanted: Vec<i64> = chunk_ids;
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut found: Vec<ChunkText> = chunks
+            .iter()
+            .filter(|chunk| wanted.binary_search(&chunk.chunk_id).is_ok())
+            .map(|chunk| ChunkText {
+                chunk_id: chunk.chunk_id,
+                ordinal: chunk.ordinal,
+                text: chunk.text.clone(),
+                byte_range: chunk.byte_range.clone(),
+                origin: chunk.origin.clone(),
+            })
+            .collect();
+        if found.len() != wanted.len() {
+            let missing: Vec<String> = wanted
+                .iter()
+                .filter(|id| !found.iter().any(|chunk| chunk.chunk_id == **id))
+                .map(i64::to_string)
+                .collect();
+            return Err(format!(
+                "Chunk text export asks for chunk{} {} which this document does not have — it was \
+                 re-indexed since those ids were recorded.",
+                if missing.len() == 1 { "" } else { "s" },
+                missing.join(", "),
+            ));
+        }
+        // Ascending by ordinal: reading order, whatever order the ids arrived in.
+        found.sort_by_key(|chunk| chunk.ordinal);
+        Ok(ChunkTextExport {
+            file_path: path,
+            chunks: found,
         })
     }
 
@@ -4492,6 +4805,12 @@ impl AppContext {
         info!("AppContext::cancel_embed: completed");
     }
 
+    /// Whether [`Self::shutdown`] has run. For callers that own several
+    /// contexts and have to assert they released all of them.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
+    }
+
     pub async fn shutdown(&self) {
         if self.shutting_down.swap(true, Ordering::AcqRel) {
             return;
@@ -5582,6 +5901,89 @@ mod tests {
         assert!(!err.is_empty());
     }
 
+    /// Browsing a root answers two questions at once, and the test holds both:
+    /// which documents Wilkes serves there (its rules, not the caller's), and
+    /// how much of each one the index can actually export.
+    #[tokio::test]
+    async fn library_file_export_lists_served_documents_with_indexed_passage_counts() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("browse-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let indexed = root.join("indexed.txt");
+        let unindexed = root.join("unindexed.txt");
+        std::fs::write(&indexed, "alpha passage").unwrap();
+        std::fs::write(&unindexed, "beta passage").unwrap();
+        let mut settings = Settings::default();
+        settings.last_directory = Some(root.clone());
+        std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        // No index at all: the documents are still there to be seen, and every
+        // count is zero rather than the listing being an error.
+        let export = ctx.export_library_files(root.clone()).await.unwrap();
+        assert_eq!(export.root, root.canonicalize().unwrap());
+        assert_eq!(export.files.len(), 2);
+        assert!(export.files.iter().all(|file| file.chunk_count == 0));
+
+        let mut index = SemanticIndex::create(
+            dir.path(),
+            "browse-model",
+            2,
+            EmbeddingEngine::Candle,
+            Some(&root),
+        )
+        .unwrap();
+        index
+            .write_file(wilkes_core::embed::index::db::PreparedFile {
+                full_text: String::new(),
+                path: indexed.clone(),
+                chunks: vec![(
+                    wilkes_core::embed::index::chunk::Chunk {
+                        file_path: indexed.clone(),
+                        text: "alpha passage".to_string(),
+                        byte_range: ByteRange { start: 0, end: 13 },
+                        origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                    },
+                    vec![1.0, 0.0],
+                )],
+            })
+            .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
+
+        let export = ctx.export_library_files(root.clone()).await.unwrap();
+        let by_path: std::collections::HashMap<_, _> = export
+            .files
+            .iter()
+            .map(|file| (file.path.clone(), file.chunk_count))
+            .collect();
+        assert_eq!(
+            by_path.get(&indexed.canonicalize().unwrap()),
+            Some(&1),
+            "the indexed document reports the passages an export would return"
+        );
+        assert_eq!(
+            by_path.get(&unindexed.canonicalize().unwrap()),
+            Some(&0),
+            "a served but unindexed document is listed, not hidden"
+        );
+        // Ascending by path, so a consumer rendering the list does not have to
+        // decide the order Wilkes already knows.
+        let mut sorted = export
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect::<Vec<_>>();
+        let unsorted = sorted.clone();
+        sorted.sort();
+        assert_eq!(unsorted, sorted);
+
+        // A directory outside the library is refused, exactly as the chunk
+        // export refuses a file outside it.
+        let outside = dir.path().join("outside-root");
+        std::fs::create_dir_all(&outside).unwrap();
+        let err = ctx.export_library_files(outside).await.unwrap_err();
+        assert!(err.contains("not in the library"), "{err}");
+    }
+
     /// The export is the only place that holds both the outline's locators and
     /// the chunk list, so it is where the two are joined — a consumer given the
     /// raw locators would have to re-derive this mapping from the chunks it was
@@ -5674,14 +6076,13 @@ mod tests {
             embedding: Vec::new(),
         };
         let chunks = vec![chunk(0, 0, 10, 1), chunk(1, 10, 20, 4)];
-        let entry = |page: Option<u32>, byte_offset: Option<usize>| {
-            wilkes_core::types::OutlineEntry {
+        let entry =
+            |page: Option<u32>, byte_offset: Option<usize>| wilkes_core::types::OutlineEntry {
                 title: "T".to_string(),
                 level: 0,
                 page,
                 byte_offset,
-            }
-        };
+            };
 
         // A bookmark on a page with no extracted text resolves forward to the
         // next page that has some, which is where its section's text begins.
