@@ -14,7 +14,7 @@ candle-metal = ["candle", "candle-core/metal", "candle-nn/metal", "candle-transf
 # accelerate CPU backend bails on f16 matmul, which breaks quantized generation
 # on the CPU fallback path. See docs/internal/specs/generation-engine.md §2.3.
 candle-accelerate = ["candle", "candle-core/accelerate"]
-generate = ["candle", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "dep:sha2"]
+generate = ["candle", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
 
 [dependencies]
 grep-matcher = "0.1"
@@ -82,7 +82,6 @@ optional = true
 
 [dependencies.sha2]
 version = "0.10"
-optional = true
 
 [target.'cfg(target_os = "macos")'.dependencies.candle-core]
 version = "0.11"

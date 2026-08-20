@@ -1,6 +1,6 @@
 use super::ipc::{WorkerEvent, WorkerRequest, WorkerRole};
 use super::manager::{ManagerCommand, WorkerManager};
-use crate::embed::Embedder;
+use crate::embed::{Embedder, EmbeddingSpaceIdentity};
 use crate::types::EmbeddingEngine;
 
 pub struct WorkerEmbedderConfig {
@@ -12,6 +12,7 @@ pub struct WorkerEmbedderConfig {
     pub data_dir: std::path::PathBuf,
     pub query_prefix: String,
     pub passage_prefix: String,
+    pub embedding_space_identity: EmbeddingSpaceIdentity,
 }
 
 /// Implements `Embedder` by dispatching to a worker subprocess via `WorkerManager`.
@@ -28,6 +29,7 @@ pub struct WorkerEmbedder {
     data_dir: std::path::PathBuf,
     query_prefix: String,
     passage_prefix: String,
+    embedding_space_identity: EmbeddingSpaceIdentity,
 }
 
 impl WorkerEmbedder {
@@ -42,6 +44,7 @@ impl WorkerEmbedder {
             data_dir: config.data_dir,
             query_prefix: config.query_prefix,
             passage_prefix: config.passage_prefix,
+            embedding_space_identity: config.embedding_space_identity,
         }
     }
 
@@ -132,6 +135,10 @@ impl Embedder for WorkerEmbedder {
     fn engine(&self) -> EmbeddingEngine {
         self.engine
     }
+
+    fn embedding_space_identity(&self) -> EmbeddingSpaceIdentity {
+        self.embedding_space_identity.clone()
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +168,11 @@ mod tests {
             data_dir: PathBuf::from("data"),
             query_prefix: "query: ".to_string(),
             passage_prefix: "passage: ".to_string(),
+            embedding_space_identity: EmbeddingSpaceIdentity::for_runtime(
+                EmbeddingEngine::Fastembed,
+                "test-model",
+                384,
+            ),
         };
 
         let embedder = WorkerEmbedder::new(manager, config);
@@ -191,6 +203,11 @@ mod tests {
             data_dir: PathBuf::from("data"),
             query_prefix: "q: ".to_string(),
             passage_prefix: "p: ".to_string(),
+            embedding_space_identity: EmbeddingSpaceIdentity::for_runtime(
+                EmbeddingEngine::Fastembed,
+                "test-model",
+                384,
+            ),
         };
 
         let embedder = Arc::new(WorkerEmbedder::new(manager, config));
@@ -257,6 +274,11 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             query_prefix: "".to_string(),
             passage_prefix: "".to_string(),
+            embedding_space_identity: EmbeddingSpaceIdentity::for_runtime(
+                EmbeddingEngine::Fastembed,
+                "test-model",
+                384,
+            ),
         };
 
         let embedder = WorkerEmbedder::new(manager, config);

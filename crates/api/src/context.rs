@@ -16,11 +16,14 @@ use wilkes_core::completion::{
 };
 use wilkes_core::directory_watcher::{DirectoryChangeBatch, DirectoryWatcher};
 use wilkes_core::embed::cluster::WardTree;
-use wilkes_core::embed::index::db::{TopicChunkData, TopicCoveragePrototype};
+use wilkes_core::embed::index::db::{
+    ChunkAccumulation, ManagedChunkData, ManagedDocumentData, TopicChunkData,
+    TopicCoveragePrototype,
+};
 use wilkes_core::embed::index::semantic_updater::process_directory_change;
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::installer::EmbedderInstaller;
-use wilkes_core::embed::{dispatch, Embedder};
+use wilkes_core::embed::{dispatch, ChunkRef, Embedder, ExtractionRecipe};
 use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::{ContentExtractor, ExtractorRegistry};
 use wilkes_core::generate::engines::dispatch as generate_dispatch;
@@ -357,6 +360,21 @@ struct CompletionOperation {
     cancel: Arc<AtomicBool>,
 }
 
+struct PendingManagedOperation<'a>(&'a AtomicU64);
+
+impl<'a> PendingManagedOperation<'a> {
+    fn new(counter: &'a AtomicU64) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for PendingManagedOperation<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Result of `embed_texts`: vectors from the same model the index uses,
 /// with the identity consumers pin against.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -365,6 +383,102 @@ pub struct EmbeddedTexts {
     pub model_id: String,
     pub dimension: usize,
     pub vectors: Vec<Vec<f32>>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ManagedEmbeddedTexts {
+    pub embedding_space_id: String,
+    pub engine: String,
+    pub model_id: String,
+    pub dimension: usize,
+    pub vectors: Vec<Vec<f32>>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ManagedChunkExport {
+    pub chunk_ref: ChunkRef,
+    pub ordinal: usize,
+    pub text: String,
+    pub text_sha256: String,
+    pub byte_range: wilkes_core::types::ByteRange,
+    pub origin: wilkes_core::types::SourceOrigin,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ManagedEmbeddingWork {
+    pub chunks: usize,
+    pub reused: usize,
+    pub computed: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ManagedDocumentExport {
+    pub corpus_id: String,
+    pub source_sha256: String,
+    pub source_byte_len: u64,
+    pub media_type: String,
+    pub snapshot_id: String,
+    pub rendition_id: String,
+    pub extraction_recipe_id: String,
+    pub extracted_content_sha256: String,
+    pub chunk_count: usize,
+    pub embedding_space_id: String,
+    pub engine: String,
+    pub model_id: String,
+    pub dimension: usize,
+    pub passage_input_recipe: String,
+    pub outline: Vec<ExportedOutlineEntry>,
+    pub chunks: Vec<ManagedChunkExport>,
+    pub embedding_work: ManagedEmbeddingWork,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ManagedAccumulation {
+    pub sum: Vec<f32>,
+    pub member_count: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ManagedAccumulations {
+    pub embedding_space_id: String,
+    pub dimension: usize,
+    pub groups: Vec<ManagedAccumulation>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ManagedChunkResolution {
+    pub embedding_space_id: String,
+    pub chunks: Vec<ManagedChunkExport>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ManagedSimilarityProbeRequest {
+    pub vector: Vec<f32>,
+    #[serde(default)]
+    pub scope: Vec<ChunkRef>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ManagedProbeSimilarity {
+    pub nearest_chunk_ref: Option<ChunkRef>,
+    pub similarity: Option<f32>,
+    pub scope_mean: Option<f32>,
+    pub scope_size: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ManagedChunkNearest {
+    pub chunk_ref: ChunkRef,
+    pub probe: usize,
+    pub similarity: f32,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ManagedChunkSimilarities {
+    pub embedding_space_id: String,
+    pub dimension: usize,
+    pub probes: Vec<ManagedProbeSimilarity>,
+    pub chunks: Vec<ManagedChunkNearest>,
 }
 
 /// Most groups one `chunk_centroids` request may name, and most chunk ids it
@@ -563,9 +677,43 @@ pub struct ChunkTextExport {
 /// that resolve nowhere — a bookmark pointing at a page whose text was not
 /// extracted, which is what a scanned appendix looks like — are dropped, since
 /// a section that starts nowhere is not a section.
-fn resolve_outline(
+trait OutlineChunk {
+    fn outline_ordinal(&self) -> usize;
+    fn outline_byte_range(&self) -> &wilkes_core::types::ByteRange;
+    fn outline_origin(&self) -> &wilkes_core::types::SourceOrigin;
+}
+
+impl OutlineChunk for ExportedChunk {
+    fn outline_ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    fn outline_byte_range(&self) -> &wilkes_core::types::ByteRange {
+        &self.byte_range
+    }
+
+    fn outline_origin(&self) -> &wilkes_core::types::SourceOrigin {
+        &self.origin
+    }
+}
+
+impl OutlineChunk for ManagedChunkData {
+    fn outline_ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    fn outline_byte_range(&self) -> &wilkes_core::types::ByteRange {
+        &self.extraction_byte_range
+    }
+
+    fn outline_origin(&self) -> &wilkes_core::types::SourceOrigin {
+        &self.origin
+    }
+}
+
+fn resolve_outline<T: OutlineChunk>(
     outline: &[wilkes_core::types::OutlineEntry],
-    chunks: &[ExportedChunk],
+    chunks: &[T],
 ) -> Vec<ExportedOutlineEntry> {
     outline
         .iter()
@@ -573,15 +721,15 @@ fn resolve_outline(
             let ordinal = match (entry.page, entry.byte_offset) {
                 (Some(page), _) => chunks
                     .iter()
-                    .find(|chunk| match chunk.origin {
-                        wilkes_core::types::SourceOrigin::PdfPage { page: at, .. } => at >= page,
+                    .find(|chunk| match chunk.outline_origin() {
+                        wilkes_core::types::SourceOrigin::PdfPage { page: at, .. } => *at >= page,
                         _ => false,
                     })
-                    .map(|chunk| chunk.ordinal),
+                    .map(OutlineChunk::outline_ordinal),
                 (None, Some(offset)) => chunks
                     .iter()
-                    .find(|chunk| chunk.byte_range.end > offset)
-                    .map(|chunk| chunk.ordinal),
+                    .find(|chunk| chunk.outline_byte_range().end > offset)
+                    .map(OutlineChunk::outline_ordinal),
                 (None, None) => None,
             }?;
             Some(ExportedOutlineEntry {
@@ -654,6 +802,10 @@ pub struct AppContext {
     completion_operations: PLMutex<HashMap<String, CompletionOperation>>,
     events: Arc<dyn EventEmitter>,
     settings_lock: tokio::sync::Mutex<()>,
+    managed_runtime_lock: tokio::sync::Mutex<()>,
+    managed_import_lock: tokio::sync::Mutex<()>,
+    managed_pending_builds: AtomicU64,
+    managed_pending_imports: AtomicU64,
     bookmarks_lock: tokio::sync::Mutex<()>,
 }
 
@@ -721,6 +873,10 @@ impl AppContext {
             completion_operations: PLMutex::new(HashMap::new()),
             events,
             settings_lock: tokio::sync::Mutex::new(()),
+            managed_runtime_lock: tokio::sync::Mutex::new(()),
+            managed_import_lock: tokio::sync::Mutex::new(()),
+            managed_pending_builds: AtomicU64::new(0),
+            managed_pending_imports: AtomicU64::new(0),
             bookmarks_lock: tokio::sync::Mutex::new(()),
         });
 
@@ -1413,6 +1569,651 @@ impl AppContext {
             dimension,
             vectors,
         })
+    }
+
+    /// Attach the immutable managed workspace configuration to a concrete
+    /// embedder and index. This is idempotent and refuses any exact-space
+    /// mismatch; it never rewrites the managed manifest.
+    pub async fn ensure_managed_runtime(self: &Arc<Self>) -> Result<String, String> {
+        let _pending = PendingManagedOperation::new(&self.managed_pending_builds);
+        let _runtime_guard = self.managed_runtime_lock.lock().await;
+        if let Some(embedder) = self.embedder.lock().clone() {
+            let identity = embedder.embedding_space_identity();
+            let index_arc = self.index.lock().clone();
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+            if guard
+                .as_ref()
+                .is_some_and(|index| index.validate_embedding_space(&identity).is_ok())
+            {
+                return Ok(identity.id().0);
+            }
+        }
+        let settings = self.settings().await;
+        let selected = settings.semantic.selected.clone();
+        let device = settings.semantic.device_for(selected.engine).to_string();
+        let installer = dispatch::get_installer(
+            selected.engine,
+            selected.model.clone(),
+            self.worker_manager.clone(),
+            device,
+        );
+        let (progress_tx, _progress_rx) = mpsc::channel(8);
+        installer
+            .install(&self.shared_data_dir, progress_tx)
+            .await
+            .map_err(|error| format!("Could not install managed embedding model: {error:#}"))?;
+        let shared_data_dir = self.shared_data_dir.clone();
+        let installer_for_build = Arc::clone(&installer);
+        let embedder =
+            tokio::task::spawn_blocking(move || installer_for_build.build(&shared_data_dir))
+                .await
+                .map_err(|error| format!("Managed embedder task panicked: {error}"))?
+                .map_err(|error| format!("Could not load managed embedder: {error:#}"))?;
+        if embedder.dimension() != selected.dimension {
+            return Err(format!(
+                "MANAGED_WORKSPACE_CONFIGURATION_MISMATCH: configured dimension {}, runtime dimension {}",
+                selected.dimension,
+                embedder.dimension()
+            ));
+        }
+        let expected_identity = embedder.embedding_space_identity();
+        let data_dir = self.data_dir.clone();
+        let root = data_dir.join("managed_sources");
+        let model_id = embedder.model_id().to_string();
+        let dimension = embedder.dimension();
+        let expected_for_index = expected_identity.clone();
+        let index = tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&root)?;
+            let mut index = if data_dir.join("semantic_index.db").exists() {
+                SemanticIndex::open(&data_dir, &model_id, dimension)?
+            } else {
+                SemanticIndex::create_exact(&data_dir, &expected_for_index, Some(&root))?
+            };
+            index.validate_embedding_space(&expected_for_index)?;
+            index.activate_root(&root)?;
+            Ok::<_, anyhow::Error>(index)
+        })
+        .await
+        .map_err(|error| format!("Managed index task panicked: {error}"))?
+        .map_err(|error| format!("Could not open managed index: {error:#}"))?;
+
+        self.invalidate_topic_tree_cache();
+        *self.embedder.lock() = Some(embedder);
+        *self.index.lock() = Arc::new(Mutex::new(Some(index)));
+        Ok(expected_identity.id().0)
+    }
+
+    fn sanitize_managed_source_name(path: &Path) -> String {
+        let original = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("source");
+        let sanitized: String = original
+            .chars()
+            .map(|character| {
+                if character.is_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if sanitized.is_empty() {
+            "source".to_string()
+        } else {
+            sanitized
+        }
+    }
+
+    fn retain_managed_snapshot(
+        data_dir: &Path,
+        source: &Path,
+    ) -> anyhow::Result<(PathBuf, PathBuf, String)> {
+        let source = std::fs::canonicalize(source)
+            .map_err(|error| anyhow::anyhow!("External source cannot be read: {error}"))?;
+        anyhow::ensure!(source.is_file(), "External source is not a regular file");
+        let before = std::fs::metadata(&source)?;
+        let managed_sources = data_dir.join("managed_sources");
+        let temporary_dir = managed_sources.join(".imports");
+        std::fs::create_dir_all(&temporary_dir)?;
+        let temporary = temporary_dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::copy(&source, &temporary)?;
+        let after = std::fs::metadata(&source)?;
+        let copied = std::fs::metadata(&temporary)?;
+        let source_sha256 = wilkes_core::embed::identity::sha256_file(&temporary)?;
+        let source_after_sha256 = wilkes_core::embed::identity::sha256_file(&source)?;
+        if before.len() != after.len()
+            || before.modified().ok() != after.modified().ok()
+            || copied.len() != before.len()
+            || source_after_sha256 != source_sha256
+        {
+            let _ = std::fs::remove_file(&temporary);
+            anyhow::bail!("SOURCE_CHANGED_DURING_IMPORT");
+        }
+        let snapshot_dir = managed_sources.join(&source_sha256);
+        std::fs::create_dir_all(&snapshot_dir)?;
+
+        // Identical bytes already retained under another original name reuse
+        // that immutable copy; display provenance remains in the index row.
+        let source_extension = source.extension().and_then(|value| value.to_str());
+        let existing = std::fs::read_dir(&snapshot_dir)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.is_file()
+                    && path.extension().and_then(|value| value.to_str()) == source_extension
+            });
+        let snapshot = if let Some(existing) = existing {
+            if wilkes_core::embed::identity::sha256_file(&existing)? != source_sha256 {
+                let _ = std::fs::remove_file(&temporary);
+                anyhow::bail!("DOCUMENT_INDEX_INCOMPLETE: retained snapshot digest mismatch");
+            }
+            let _ = std::fs::remove_file(&temporary);
+            existing
+        } else {
+            let destination = snapshot_dir.join(Self::sanitize_managed_source_name(&source));
+            match std::fs::rename(&temporary, &destination) {
+                Ok(()) => destination,
+                Err(_error) if destination.exists() => {
+                    if wilkes_core::embed::identity::sha256_file(&destination)? != source_sha256 {
+                        let _ = std::fs::remove_file(&temporary);
+                        anyhow::bail!(
+                            "DOCUMENT_INDEX_INCOMPLETE: retained snapshot digest mismatch"
+                        );
+                    }
+                    let _ = std::fs::remove_file(&temporary);
+                    destination
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let mut permissions = std::fs::metadata(&snapshot)?.permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&snapshot, permissions)?;
+        let relative = snapshot.strip_prefix(data_dir)?.to_path_buf();
+        Ok((snapshot, relative, source_sha256))
+    }
+
+    /// Resolve a `wilkes_file` import through the same library confinement as
+    /// ordinary exports. The returned canonical path is the only path the
+    /// managed importer is allowed to open for this source variant.
+    pub async fn authorize_managed_workspace_file(
+        &self,
+        root: PathBuf,
+        path: PathBuf,
+    ) -> Result<PathBuf, String> {
+        let settings = self.settings().await;
+        let (library_roots, _) = library_roots(&settings);
+        let root = Self::canonicalize_search_root(&root)?;
+        Self::ensure_path_in_library(&root, &library_roots, "Managed import root")?;
+        let (path, _) = Self::canonicalize_supported_file(
+            &root,
+            &path,
+            &settings.supported_extensions,
+            "Managed import",
+        )?;
+        Self::ensure_path_in_library(&path, &library_roots, "Managed import file")?;
+        Ok(path)
+    }
+
+    pub async fn import_managed_document(
+        self: &Arc<Self>,
+        corpus_id: String,
+        idempotency_key: String,
+        source_path: PathBuf,
+        source_workspace: Option<Arc<AppContext>>,
+        original_source_provenance: serde_json::Value,
+    ) -> Result<ManagedDocumentExport, String> {
+        let _pending = PendingManagedOperation::new(&self.managed_pending_imports);
+        let _import_guard = self.managed_import_lock.lock().await;
+        if idempotency_key.trim().is_empty() || idempotency_key.len() > 256 {
+            return Err(
+                "IDEMPOTENCY_KEY_CONFLICT: idempotency key must contain 1 to 256 bytes".to_string(),
+            );
+        }
+        let settings = self.settings().await;
+        let extension = source_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if !settings
+            .supported_extensions
+            .iter()
+            .any(|supported| supported.eq_ignore_ascii_case(extension))
+        {
+            return Err(format!("Unsupported managed import extension: {extension}"));
+        }
+        let metadata = std::fs::metadata(&source_path)
+            .map_err(|error| format!("External source cannot be read: {error}"))?;
+        if metadata.len() > settings.max_file_size {
+            return Err(format!(
+                "Managed import exceeds the configured {} byte file limit",
+                settings.max_file_size
+            ));
+        }
+        let (snapshot_path, relative_path, source_sha256) = {
+            let data_dir = self.data_dir.clone();
+            let source_path = source_path.clone();
+            tokio::task::spawn_blocking(move || {
+                Self::retain_managed_snapshot(&data_dir, &source_path)
+            })
+            .await
+            .map_err(|error| format!("Snapshot task panicked: {error}"))?
+            .map_err(|error| format!("Could not retain managed snapshot: {error:#}"))?
+        };
+        let expected_identity = {
+            let guard = self.index.lock().clone();
+            let guard = guard
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned")?;
+            guard
+                .as_ref()
+                .ok_or_else(|| "MANAGED_WORKSPACE_NOT_FOUND: runtime is not ready".to_string())?
+                .embedding_space_identity()
+                .map_err(|error| error.to_string())?
+        };
+        let expected_space = expected_identity.id();
+        let recipe = ExtractionRecipe::for_path(
+            &snapshot_path,
+            settings.semantic.chunk_size,
+            settings.semantic.chunk_overlap,
+        );
+
+        if let Some(existing) = {
+            let index_arc = self.index.lock().clone();
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned")?;
+            guard
+                .as_ref()
+                .ok_or_else(|| "Managed index unavailable".to_string())?
+                .managed_document_for_import_key(&idempotency_key, &source_sha256, &recipe.id())
+                .map_err(|error| error.to_string())?
+        } {
+            return Self::managed_export(
+                corpus_id,
+                existing,
+                &expected_identity,
+                snapshot_path,
+                true,
+            );
+        }
+
+        if let Some(existing) = {
+            let index_arc = self.index.lock().clone();
+            let mut guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned")?;
+            let index = guard
+                .as_mut()
+                .ok_or_else(|| "Managed index unavailable".to_string())?;
+            let existing = index
+                .managed_document_for_path(&snapshot_path)
+                .map_err(|error| error.to_string())?;
+            if let Some(existing) = existing.as_ref() {
+                index
+                    .bind_managed_import_key(&idempotency_key, existing)
+                    .map_err(|error| error.to_string())?;
+            }
+            existing
+        } {
+            return Self::managed_export(
+                corpus_id,
+                existing,
+                &expected_identity,
+                snapshot_path,
+                true,
+            );
+        }
+
+        let adopted = if let Some(source_context) = source_workspace {
+            let source_index_arc = source_context.index.lock().clone();
+            let source_guard = source_index_arc
+                .lock()
+                .map_err(|_| "Source semantic index lock was poisoned")?;
+            source_guard
+                .as_ref()
+                .map(|source_index| {
+                    source_index.verified_file_for_adoption(
+                        &source_sha256,
+                        &recipe,
+                        &expected_space,
+                        &snapshot_path,
+                    )
+                })
+                .transpose()
+                .map_err(|error| format!("Could not verify source rendition: {error:#}"))?
+                .flatten()
+        } else {
+            None
+        };
+
+        let reused = adopted.is_some();
+        let prepared = if let Some(prepared) = adopted {
+            prepared
+        } else {
+            let embedder = self.embedder.lock().clone().ok_or_else(|| {
+                "MANAGED_WORKSPACE_NOT_FOUND: managed embedder is unavailable".to_string()
+            })?;
+            let snapshot_for_task = snapshot_path.clone();
+            let chunk_size = settings.semantic.chunk_size;
+            let chunk_overlap = settings.semantic.chunk_overlap;
+            tokio::task::spawn_blocking(move || {
+                let mut extractors = ExtractorRegistry::new();
+                extractors.register(Box::new(PdfExtractor::new()));
+                SemanticIndex::prepare_file(
+                    &snapshot_for_task,
+                    &extractors,
+                    embedder.as_ref(),
+                    chunk_size,
+                    chunk_overlap,
+                )
+            })
+            .await
+            .map_err(|error| format!("Managed extraction task panicked: {error}"))?
+            .map_err(|error| format!("Could not extract/embed managed snapshot: {error:#}"))?
+        };
+        let expected_chunks = prepared.chunks.len();
+        if expected_chunks == 0 {
+            return Err("DOCUMENT_INDEX_INCOMPLETE: document produced no chunks".to_string());
+        }
+        let managed = {
+            let index_arc = self.index.lock().clone();
+            let mut guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned")?;
+            let index = guard
+                .as_mut()
+                .ok_or_else(|| "Managed index unavailable".to_string())?;
+            let managed = index
+                .write_file_with_recipe(
+                    prepared,
+                    &recipe,
+                    Some(&relative_path),
+                    Some(&original_source_provenance),
+                    true,
+                    reused,
+                    Some(&idempotency_key),
+                )
+                .map_err(|error| format!("Could not publish managed rendition: {error:#}"))?;
+            managed
+        };
+        if managed.source_sha256 != source_sha256 || managed.chunks.len() != expected_chunks {
+            return Err("DOCUMENT_INDEX_INCOMPLETE: publication verification failed".to_string());
+        }
+        Self::managed_export(
+            corpus_id,
+            managed,
+            &expected_identity,
+            snapshot_path,
+            reused,
+        )
+    }
+
+    pub fn managed_pending_operations(&self) -> (u64, u64) {
+        (
+            self.managed_pending_imports.load(Ordering::Acquire),
+            self.managed_pending_builds.load(Ordering::Acquire),
+        )
+    }
+
+    fn managed_export(
+        corpus_id: String,
+        document: ManagedDocumentData,
+        embedding_identity: &wilkes_core::embed::EmbeddingSpaceIdentity,
+        snapshot_path: PathBuf,
+        reused: bool,
+    ) -> Result<ManagedDocumentExport, String> {
+        let source_byte_len = std::fs::metadata(&snapshot_path)
+            .map_err(|error| format!("Could not read retained snapshot metadata: {error}"))?
+            .len();
+        let media_type = match snapshot_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "pdf" => "application/pdf",
+            "md" | "markdown" => "text/markdown",
+            "txt" => "text/plain",
+            _ => "application/octet-stream",
+        }
+        .to_string();
+        let mut registry = ExtractorRegistry::new();
+        registry.register(Box::new(PdfExtractor::new()));
+        let declared_outline = wilkes_core::extract::document_outline(&snapshot_path, &registry)
+            .map_err(|error| format!("Could not read retained document outline: {error:#}"))?;
+        let outline = resolve_outline(&declared_outline, &document.chunks);
+        let chunk_count = document.chunks.len();
+        Ok(ManagedDocumentExport {
+            corpus_id,
+            source_sha256: document.source_sha256,
+            source_byte_len,
+            media_type,
+            snapshot_id: document.snapshot_id.0,
+            rendition_id: document.rendition_id.0,
+            extraction_recipe_id: document.extraction_recipe_id,
+            extracted_content_sha256: document.extracted_content_sha256,
+            chunk_count,
+            embedding_space_id: embedding_identity.id().0,
+            engine: embedding_identity.engine.as_str().to_string(),
+            model_id: embedding_identity.model_id.clone(),
+            dimension: embedding_identity.dimension,
+            passage_input_recipe: embedding_identity.passage_input_recipe.clone(),
+            outline,
+            chunks: document
+                .chunks
+                .into_iter()
+                .map(|chunk| ManagedChunkExport {
+                    chunk_ref: chunk.chunk_ref,
+                    ordinal: chunk.ordinal,
+                    text: chunk.text,
+                    text_sha256: chunk.text_sha256,
+                    byte_range: chunk.extraction_byte_range,
+                    origin: chunk.origin,
+                })
+                .collect(),
+            embedding_work: ManagedEmbeddingWork {
+                chunks: chunk_count,
+                reused: if reused { chunk_count } else { 0 },
+                computed: if reused { 0 } else { chunk_count },
+            },
+        })
+    }
+
+    pub async fn managed_embed_texts(
+        &self,
+        texts: Vec<String>,
+    ) -> Result<ManagedEmbeddedTexts, String> {
+        let embedded = self.embed_texts(texts).await?;
+        let space = {
+            let index_arc = self.index.lock().clone();
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned")?;
+            guard
+                .as_ref()
+                .ok_or_else(|| "Managed index unavailable".to_string())?
+                .embedding_space_id()
+                .map_err(|error| error.to_string())?
+        };
+        Ok(ManagedEmbeddedTexts {
+            embedding_space_id: space.0,
+            engine: embedded.engine,
+            model_id: embedded.model_id,
+            dimension: embedded.dimension,
+            vectors: embedded.vectors,
+        })
+    }
+
+    pub async fn managed_accumulate(
+        &self,
+        groups: Vec<Vec<ChunkRef>>,
+    ) -> Result<ManagedAccumulations, String> {
+        if groups.is_empty() {
+            return Err("Aggregate request names no groups".to_string());
+        }
+        let total: usize = groups.iter().map(Vec::len).sum();
+        if groups.len() > MAX_CENTROID_GROUPS || total > MAX_CENTROID_CHUNK_IDS {
+            return Err("Aggregate request exceeds the documented request cap".to_string());
+        }
+        let index_arc = self.index.lock().clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+            let index = guard
+                .as_ref()
+                .ok_or_else(|| "Managed index unavailable".to_string())?;
+            let space = index
+                .embedding_space_id()
+                .map_err(|error| error.to_string())?;
+            let groups: Vec<ChunkAccumulation> = index
+                .accumulate_chunk_refs(&groups)
+                .map_err(|error| error.to_string())?;
+            Ok(ManagedAccumulations {
+                embedding_space_id: space.0,
+                dimension: index.status().dimension,
+                groups: groups
+                    .into_iter()
+                    .map(|group| ManagedAccumulation {
+                        sum: group.sum,
+                        member_count: group.member_count,
+                    })
+                    .collect(),
+            })
+        })
+        .await
+        .map_err(|error| format!("Aggregate task panicked: {error}"))?
+    }
+
+    pub async fn managed_resolve_chunks(
+        &self,
+        refs: Vec<ChunkRef>,
+    ) -> Result<ManagedChunkResolution, String> {
+        if refs.is_empty() {
+            return Err("Resolve request names no chunk refs".to_string());
+        }
+        if refs.len() > MAX_SIMILARITY_CHUNK_IDS {
+            return Err("Resolve request exceeds the documented request cap".to_string());
+        }
+        let index_arc = self.index.lock().clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+            let index = guard
+                .as_ref()
+                .ok_or_else(|| "Managed index unavailable".to_string())?;
+            let chunks = index
+                .managed_chunks_for_refs(&refs)
+                .map_err(|error| error.to_string())?;
+            Ok(ManagedChunkResolution {
+                embedding_space_id: index
+                    .embedding_space_id()
+                    .map_err(|error| error.to_string())?
+                    .0,
+                chunks: chunks
+                    .into_iter()
+                    .map(|chunk| ManagedChunkExport {
+                        chunk_ref: chunk.chunk_ref,
+                        ordinal: chunk.ordinal,
+                        text: chunk.text,
+                        text_sha256: chunk.text_sha256,
+                        byte_range: chunk.extraction_byte_range,
+                        origin: chunk.origin,
+                    })
+                    .collect(),
+            })
+        })
+        .await
+        .map_err(|error| format!("Resolve task panicked: {error}"))?
+    }
+
+    pub async fn managed_chunk_similarity(
+        &self,
+        probes: Vec<ManagedSimilarityProbeRequest>,
+        chunk_refs: Vec<ChunkRef>,
+    ) -> Result<ManagedChunkSimilarities, String> {
+        if probes.is_empty() {
+            return Err("Similarity request names no probes".to_string());
+        }
+        let total = chunk_refs.len() + probes.iter().map(|probe| probe.scope.len()).sum::<usize>();
+        if probes.len() > MAX_SIMILARITY_PROBES || total > MAX_SIMILARITY_CHUNK_IDS {
+            return Err("Similarity request exceeds the documented request cap".to_string());
+        }
+        let index_arc = self.index.lock().clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+            let index = guard
+                .as_ref()
+                .ok_or_else(|| "Managed index unavailable".to_string())?;
+            let wanted: HashSet<ChunkRef> = chunk_refs
+                .iter()
+                .cloned()
+                .chain(probes.iter().flat_map(|probe| probe.scope.iter().cloned()))
+                .collect();
+            let resolved = index
+                .resolve_chunk_refs(&wanted)
+                .map_err(|error| error.to_string())?;
+            let reverse: HashMap<i64, ChunkRef> = resolved
+                .iter()
+                .map(|(stable_ref, rowid)| (*rowid, stable_ref.clone()))
+                .collect();
+            let searched: Vec<i64> = chunk_refs
+                .iter()
+                .map(|stable_ref| resolved[stable_ref])
+                .collect();
+            let probes: Vec<wilkes_core::embed::index::db::SimilarityProbe> = probes
+                .into_iter()
+                .map(|probe| wilkes_core::embed::index::db::SimilarityProbe {
+                    vector: probe.vector,
+                    scope: probe
+                        .scope
+                        .iter()
+                        .map(|stable_ref| resolved[stable_ref])
+                        .collect(),
+                })
+                .collect();
+            let found = index
+                .chunk_similarity(&probes, &searched)
+                .map_err(|error| error.to_string())?;
+            Ok(ManagedChunkSimilarities {
+                embedding_space_id: index
+                    .embedding_space_id()
+                    .map_err(|error| error.to_string())?
+                    .0,
+                dimension: index.status().dimension,
+                probes: found
+                    .probes
+                    .into_iter()
+                    .map(|probe| ManagedProbeSimilarity {
+                        nearest_chunk_ref: probe
+                            .nearest_chunk_id
+                            .map(|rowid| reverse[&rowid].clone()),
+                        similarity: probe.similarity,
+                        scope_mean: probe.scope_mean,
+                        scope_size: probe.scope_size,
+                    })
+                    .collect(),
+                chunks: found
+                    .chunks
+                    .into_iter()
+                    .map(|chunk| ManagedChunkNearest {
+                        chunk_ref: reverse[&chunk.chunk_id].clone(),
+                        probe: chunk.probe,
+                        similarity: chunk.similarity,
+                    })
+                    .collect(),
+            })
+        })
+        .await
+        .map_err(|error| format!("Similarity task panicked: {error}"))?
     }
 
     /// The normalized mean of the stored vectors of named chunks, one mean per
@@ -4639,10 +5440,9 @@ impl AppContext {
     async fn open_built_index(
         &self,
         data_dir: PathBuf,
-        model_id: String,
-        dim: usize,
+        identity: wilkes_core::embed::EmbeddingSpaceIdentity,
     ) -> Result<SemanticIndex, String> {
-        match tokio::task::spawn_blocking(move || SemanticIndex::open(&data_dir, &model_id, dim))
+        match tokio::task::spawn_blocking(move || SemanticIndex::open_exact(&data_dir, &identity))
             .await
         {
             Ok(Ok(index)) => Ok(index),
@@ -4668,10 +5468,8 @@ impl AppContext {
         data_dir: &Path,
         embedder: Arc<dyn Embedder>,
     ) -> Result<(), String> {
-        let dim = embedder.dimension();
-        let model_id = selected.model.model_id().to_string();
         let mut index = self
-            .open_built_index(data_dir.to_path_buf(), model_id, dim)
+            .open_built_index(data_dir.to_path_buf(), embedder.embedding_space_identity())
             .await?;
         index
             .activate_root(&plan.root_path)
@@ -5174,6 +5972,12 @@ impl AppContext {
         let index = self
             .restore_index(&plan.selected, embedder.dimension())
             .await?;
+        if let Err(error) =
+            index.validate_local_embedding_space(&embedder.embedding_space_identity())
+        {
+            error!("restore_state: incompatible embedding space: {error:#}");
+            return None;
+        }
 
         Some(RestoreLoadedState {
             plan,
@@ -7563,7 +8367,14 @@ mod tests {
     async fn test_open_built_index_error_and_store_loaded_state() {
         let (dir, ctx) = test_ctx();
         let err = match ctx
-            .open_built_index(dir.path().to_path_buf(), "missing-model".to_string(), 384)
+            .open_built_index(
+                dir.path().to_path_buf(),
+                wilkes_core::embed::EmbeddingSpaceIdentity::for_runtime(
+                    EmbeddingEngine::Candle,
+                    "missing-model",
+                    384,
+                ),
+            )
             .await
         {
             Ok(_) => panic!("expected open_built_index to fail"),
@@ -8139,7 +8950,10 @@ mod tests {
             model: EmbedderModel("build-model".to_string()),
             dimension: 384,
         };
-        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder {
+            model_id: "build-model".to_string(),
+            ..MockEmbedder::default()
+        });
 
         ctx.finish_build_index(&plan, &selected, &data_dir, embedder)
             .await

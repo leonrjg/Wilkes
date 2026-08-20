@@ -423,6 +423,14 @@ impl EmbedderInstaller for FastembedInstaller {
     fn build(&self, data_dir: &Path) -> anyhow::Result<Arc<dyn Embedder>> {
         let info = find_model_info(&self.model.0)?;
         let prefixes = super::aux_config::load_prefixes(data_dir, &self.model.0);
+        let artifact_revision =
+            crate::embed::identity::artifact_revision_for_cache(data_dir, &info.model_code)?;
+        let embedding_space_identity = crate::embed::EmbeddingSpaceIdentity::with_artifact_revision(
+            EmbeddingEngine::Fastembed,
+            &self.model.0,
+            info.dimension,
+            artifact_revision,
+        );
         Ok(Arc::new(crate::worker::embedder::WorkerEmbedder::new(
             self.manager.clone(),
             crate::worker::embedder::WorkerEmbedderConfig {
@@ -433,6 +441,7 @@ impl EmbedderInstaller for FastembedInstaller {
                 data_dir: data_dir.to_path_buf(),
                 query_prefix: prefixes.query_prefix,
                 passage_prefix: prefixes.passage_prefix,
+                embedding_space_identity,
             },
         )))
     }

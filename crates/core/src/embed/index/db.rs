@@ -18,6 +18,13 @@ use crate::types::{
 
 use super::super::Embedder;
 use super::chunk::{chunk_content, Chunk};
+use crate::embed::identity::{
+    chunk_ref, rendition_id, sha256_bytes, sha256_file, snapshot_id, ChunkDescriptor,
+};
+use crate::embed::{
+    ChunkRef, DocumentSnapshotId, EmbeddingSpaceId, EmbeddingSpaceIdentity, ExtractionRecipe,
+    IndexEmbeddingMetadata, RenditionId,
+};
 use crate::models::progress::{EmbedProgress, IndexBuildProgress, ProgressTx};
 
 fn system_time_ms(value: SystemTime) -> Option<i64> {
@@ -54,8 +61,84 @@ fn db_path(data_dir: &Path) -> PathBuf {
     data_dir.join("semantic_index.db")
 }
 
+fn replacement_backup_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("semantic_index.db.replacement-backup")
+}
+
+fn remove_sqlite_sidecars(path: &Path) {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let mut shm = path.as_os_str().to_owned();
+    shm.push("-shm");
+    let _ = std::fs::remove_file(wal);
+    let _ = std::fs::remove_file(shm);
+}
+
+/// Complete or roll back a replacement interrupted after the old database was
+/// moved aside. A fully created temporary database is renamed before the
+/// backup is removed, so every crash point retains at least one complete copy.
+fn recover_interrupted_index_replacement(data_dir: &Path) -> anyhow::Result<()> {
+    let final_path = db_path(data_dir);
+    let backup_path = replacement_backup_path(data_dir);
+    if !backup_path.exists() {
+        return Ok(());
+    }
+    if !final_path.exists() {
+        std::fs::rename(&backup_path, &final_path).with_context(|| {
+            format!(
+                "Failed to restore interrupted index replacement from {}",
+                backup_path.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    let replacement_is_complete = (|| -> anyhow::Result<bool> {
+        let conn = Connection::open(&final_path)?;
+        configure_connection(&conn, &final_path)?;
+        let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        let schema_version: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(quick_check == "ok"
+            && schema_version
+                .as_deref()
+                .and_then(|version| version.parse::<i64>().ok())
+                == Some(SCHEMA_VERSION))
+    })()
+    .unwrap_or(false);
+
+    if replacement_is_complete {
+        std::fs::remove_file(&backup_path).with_context(|| {
+            format!(
+                "Failed to finish index replacement by removing {}",
+                backup_path.display()
+            )
+        })?;
+    } else {
+        std::fs::remove_file(&final_path).with_context(|| {
+            format!(
+                "Failed to discard incomplete replacement {}",
+                final_path.display()
+            )
+        })?;
+        remove_sqlite_sidecars(&final_path);
+        std::fs::rename(&backup_path, &final_path).with_context(|| {
+            format!(
+                "Failed to roll back index replacement from {}",
+                backup_path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 10;
 
 fn configure_connection(conn: &Connection, path: &Path) -> anyhow::Result<()> {
     conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
@@ -328,6 +411,7 @@ mod tests {
 
         assert_eq!(stored_text(&legacy_path), None);
         assert_eq!(stored_text(&empty_path), Some(String::new()));
+        assert!(idx.embedding_metadata().unwrap().exact_identity.is_none());
         assert_eq!(
             idx.conn
                 .query_row(
@@ -336,8 +420,158 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "5"
+            "10"
         );
+    }
+
+    #[test]
+    fn v9_unresolved_identity_migrates_to_legacy_metadata_and_remains_locally_usable() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("legacy.txt");
+        fs::write(&file, "legacy body").unwrap();
+        let unresolved =
+            EmbeddingSpaceIdentity::for_runtime(EmbeddingEngine::Candle, "legacy-model", 1);
+        let mut index = SemanticIndex::create_exact(root, &unresolved, Some(root)).unwrap();
+        index
+            .write_file(PreparedFile {
+                path: file.clone(),
+                full_text: "legacy body".to_string(),
+                chunks: vec![(test_chunk(&file, "legacy body"), vec![1.0])],
+            })
+            .unwrap();
+        index
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('embedding_space_id', ?1)",
+                params![unresolved.id().0],
+            )
+            .unwrap();
+        index
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('embedding_space_identity_json', ?1)",
+                params![serde_json::to_string(&unresolved).unwrap()],
+            )
+            .unwrap();
+        index
+            .conn
+            .execute_batch(
+                "DELETE FROM meta WHERE key = 'index_embedding_metadata_json';
+                 UPDATE meta SET value = '9' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        drop(index);
+
+        let migrated = SemanticIndex::open(root, "legacy-model", 1).unwrap();
+        let metadata = migrated.embedding_metadata().unwrap();
+        assert_eq!(metadata.engine, EmbeddingEngine::Candle);
+        assert_eq!(metadata.model_id, "legacy-model");
+        assert_eq!(metadata.dimension, 1);
+        assert!(metadata.exact_identity.is_none());
+        assert_eq!(migrated.query(&[1.0], 1).unwrap().len(), 1);
+
+        let current = EmbeddingSpaceIdentity::with_artifact_revision(
+            EmbeddingEngine::Candle,
+            "legacy-model",
+            1,
+            "artifact-sha256:current".to_string(),
+        );
+        migrated.validate_local_embedding_space(&current).unwrap();
+        assert!(migrated.validate_embedding_space(&current).is_err());
+        assert!(migrated
+            .verified_file_for_adoption(
+                "unused",
+                &ExtractionRecipe::new(100, 0),
+                &current.id(),
+                &file,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn v9_resolved_identity_migrates_without_losing_exact_evidence() {
+        let dir = tempdir().unwrap();
+        let identity = EmbeddingSpaceIdentity::with_artifact_revision(
+            EmbeddingEngine::Fastembed,
+            "exact-model",
+            3,
+            "artifact-sha256:resolved".to_string(),
+        );
+        let index = SemanticIndex::create_exact(dir.path(), &identity, None).unwrap();
+        index
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('embedding_space_id', ?1)",
+                params![identity.id().0],
+            )
+            .unwrap();
+        index
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('embedding_space_identity_json', ?1)",
+                params![serde_json::to_string(&identity).unwrap()],
+            )
+            .unwrap();
+        index
+            .conn
+            .execute_batch(
+                "DELETE FROM meta WHERE key = 'index_embedding_metadata_json';
+                 UPDATE meta SET value = '9' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        drop(index);
+
+        let migrated = SemanticIndex::open_exact(dir.path(), &identity).unwrap();
+        assert_eq!(
+            migrated.embedding_metadata().unwrap().exact_identity,
+            Some(identity)
+        );
+    }
+
+    #[test]
+    fn interrupted_replacement_restores_the_preserved_index() {
+        let dir = tempdir().unwrap();
+        let index = SemanticIndex::create(
+            dir.path(),
+            "preserved-model",
+            1,
+            EmbeddingEngine::Candle,
+            None,
+        )
+        .unwrap();
+        drop(index);
+        let final_path = db_path(dir.path());
+        let backup_path = replacement_backup_path(dir.path());
+        fs::rename(&final_path, &backup_path).unwrap();
+
+        let restored = SemanticIndex::open(dir.path(), "preserved-model", 1).unwrap();
+        assert_eq!(restored.status().model_id, "preserved-model");
+        assert!(final_path.exists());
+        assert!(!backup_path.exists());
+    }
+
+    #[test]
+    fn corrupt_published_replacement_rolls_back_to_the_preserved_index() {
+        let dir = tempdir().unwrap();
+        let index = SemanticIndex::create(
+            dir.path(),
+            "preserved-model",
+            1,
+            EmbeddingEngine::Candle,
+            None,
+        )
+        .unwrap();
+        drop(index);
+        let final_path = db_path(dir.path());
+        let backup_path = replacement_backup_path(dir.path());
+        fs::rename(&final_path, &backup_path).unwrap();
+        fs::write(&final_path, b"incomplete replacement").unwrap();
+
+        let restored = SemanticIndex::open(dir.path(), "preserved-model", 1).unwrap();
+        assert_eq!(restored.status().model_id, "preserved-model");
+        assert!(!backup_path.exists());
     }
 
     #[test]
@@ -404,10 +638,13 @@ mod tests {
 
         let idx = SemanticIndex::create(&idx_dir, "m", 3, EmbeddingEngine::Candle, None).unwrap();
         let db_file = idx_dir.join("semantic_index.db");
+        let backup_file = replacement_backup_path(&idx_dir);
+        fs::write(&backup_file, b"stale replacement backup").unwrap();
         assert!(db_file.exists());
 
         idx.delete(&idx_dir).unwrap();
         assert!(!db_file.exists());
+        assert!(!backup_file.exists());
     }
 
     #[test]
@@ -1144,6 +1381,217 @@ mod tests {
     }
 
     #[test]
+    fn managed_refs_resolve_and_aggregate_without_exposing_rowids() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("managed_sources");
+        fs::create_dir_all(&root).unwrap();
+        let document = root.join("document.txt");
+        fs::write(&document, "east north").unwrap();
+        let mut index =
+            SemanticIndex::create(dir.path(), "m", 2, EmbeddingEngine::Candle, Some(&root))
+                .unwrap();
+        let recipe = ExtractionRecipe::new(100, 0);
+        let managed = index
+            .write_file_with_recipe(
+                PreparedFile {
+                    path: document.clone(),
+                    full_text: "east north".to_string(),
+                    chunks: vec![
+                        (test_chunk(&document, "east"), vec![3.0, 0.0]),
+                        (test_chunk(&document, "north"), vec![0.0, 4.0]),
+                    ],
+                },
+                &recipe,
+                Some(Path::new("managed_sources/document.txt")),
+                Some(&serde_json::json!({"kind": "path"})),
+                true,
+                false,
+                Some("job-1"),
+            )
+            .unwrap();
+
+        assert_eq!(managed.chunks.len(), 2);
+        assert_eq!(index.managed_embedding_work_totals().unwrap(), (0, 2));
+        assert!(index
+            .managed_document_for_import_key(
+                "job-1",
+                &managed.source_sha256,
+                &managed.extraction_recipe_id,
+            )
+            .unwrap()
+            .is_some());
+        assert!(index
+            .managed_document_for_import_key(
+                "job-1",
+                "different-source",
+                &managed.extraction_recipe_id,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("IDEMPOTENCY_KEY_CONFLICT"));
+        assert_ne!(managed.chunks[0].chunk_ref, managed.chunks[1].chunk_ref);
+        let groups = vec![vec![
+            managed.chunks[0].chunk_ref.clone(),
+            managed.chunks[1].chunk_ref.clone(),
+        ]];
+        let accumulated = index.accumulate_chunk_refs(&groups).unwrap();
+        assert_eq!(accumulated[0].member_count, 2);
+        assert_eq!(accumulated[0].sum, vec![1.0, 1.0]);
+        let resolved = index
+            .managed_chunks_for_refs(&groups[0])
+            .expect("stable refs resolve");
+        assert_eq!(resolved[0].text, "east");
+        assert!(index
+            .accumulate_chunk_refs(&[vec![ChunkRef("chunk-missing".to_string())]])
+            .unwrap_err()
+            .to_string()
+            .contains("CHUNK_REF_NOT_FOUND"));
+    }
+
+    #[test]
+    fn exact_whole_document_adoption_survives_source_index_deletion_and_rebuild() {
+        let recipe = ExtractionRecipe::new(100, 0);
+        let target_dir = tempdir().unwrap();
+        let target_root = target_dir.path().join("managed_sources");
+        fs::create_dir_all(&target_root).unwrap();
+        let target_path = target_root.join("document.txt");
+        fs::write(&target_path, "retained body").unwrap();
+
+        let adopted =
+            {
+                let source_dir = tempdir().unwrap();
+                let source_path = source_dir.path().join("document.txt");
+                fs::write(&source_path, "retained body").unwrap();
+                let mut source = SemanticIndex::create(
+                    source_dir.path(),
+                    "m",
+                    2,
+                    EmbeddingEngine::Candle,
+                    Some(source_dir.path()),
+                )
+                .unwrap();
+                source
+                    .write_file_with_recipe(
+                        PreparedFile {
+                            path: source_path,
+                            full_text: "retained body".to_string(),
+                            chunks: vec![
+                                (test_chunk(&target_path, "retained"), vec![1.0, 0.0]),
+                                (test_chunk(&target_path, "body"), vec![0.0, 1.0]),
+                            ],
+                        },
+                        &recipe,
+                        None,
+                        None,
+                        false,
+                        false,
+                        None,
+                    )
+                    .unwrap();
+                let space = source.embedding_space_id().unwrap();
+                assert!(source
+                    .verified_file_for_adoption(
+                        &sha256_file(&target_path).unwrap(),
+                        &ExtractionRecipe::new(50, 0),
+                        &space,
+                        &target_path,
+                    )
+                    .unwrap()
+                    .is_none());
+                assert!(source
+                    .verified_file_for_adoption(
+                        &sha256_file(&target_path).unwrap(),
+                        &recipe,
+                        &EmbeddingSpaceIdentity::for_runtime(
+                            EmbeddingEngine::Candle,
+                            "other-model",
+                            2,
+                        )
+                        .id(),
+                        &target_path,
+                    )
+                    .unwrap()
+                    .is_none());
+                source
+                    .verified_file_for_adoption(
+                        &sha256_file(&target_path).unwrap(),
+                        &recipe,
+                        &space,
+                        &target_path,
+                    )
+                    .unwrap()
+                    .expect("exact rendition is adoptable")
+            };
+
+        let mut target = SemanticIndex::create(
+            target_dir.path(),
+            "m",
+            2,
+            EmbeddingEngine::Candle,
+            Some(&target_root),
+        )
+        .unwrap();
+        let first = target
+            .write_file_with_recipe(
+                adopted,
+                &recipe,
+                Some(Path::new("managed_sources/document.txt")),
+                Some(&serde_json::json!({"kind": "wilkes_file"})),
+                true,
+                true,
+                Some("adoption-job"),
+            )
+            .unwrap();
+        let refs: Vec<_> = first
+            .chunks
+            .iter()
+            .map(|chunk| chunk.chunk_ref.clone())
+            .collect();
+        assert_eq!(target.managed_embedding_work_totals().unwrap(), (2, 0));
+        assert_eq!(target.managed_chunks_for_refs(&refs).unwrap().len(), 2);
+
+        let rebuilt_dir = tempdir().unwrap();
+        let rebuilt_root = rebuilt_dir.path().join("managed_sources");
+        fs::create_dir_all(&rebuilt_root).unwrap();
+        let rebuilt_path = rebuilt_root.join("document.txt");
+        fs::write(&rebuilt_path, "retained body").unwrap();
+        let mut rebuilt = SemanticIndex::create(
+            rebuilt_dir.path(),
+            "m",
+            2,
+            EmbeddingEngine::Candle,
+            Some(&rebuilt_root),
+        )
+        .unwrap();
+        let second = rebuilt
+            .write_file_with_recipe(
+                PreparedFile {
+                    path: rebuilt_path.clone(),
+                    full_text: "retained body".to_string(),
+                    chunks: vec![
+                        (test_chunk(&rebuilt_path, "retained"), vec![1.0, 0.0]),
+                        (test_chunk(&rebuilt_path, "body"), vec![0.0, 1.0]),
+                    ],
+                },
+                &recipe,
+                Some(Path::new("managed_sources/document.txt")),
+                None,
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            refs,
+            second
+                .chunks
+                .iter()
+                .map(|chunk| chunk.chunk_ref.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_chunk_similarity_answers_both_directions_and_leaves_the_probe_as_given() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -1595,7 +2043,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_reuse_backfills_missing_full_text_without_reembedding() {
+    fn test_build_reembeds_legacy_rows_without_exact_identity() {
         for missing_text in [None, Some("")] {
             let dir = tempdir().unwrap();
             let data_dir = dir.path().join("data");
@@ -1638,7 +2086,10 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(embedder.calls(), 0);
+            // Matching model/dimension and unchanged path metadata are not a
+            // compatibility proof. This row lacks source/recipe/rendition
+            // identity, so a fresh embedding is the safe outcome.
+            assert_eq!(embedder.calls(), 1);
             let (full_text, _) = rebuilt
                 .indexed_document_for_path(&path)
                 .unwrap()
@@ -2121,6 +2572,33 @@ pub struct TopicChunkData {
     pub embedding: Vec<f32>,
 }
 
+/// Stable, vector-free passage export used by managed-corpus consumers.
+#[derive(Clone, Debug)]
+pub struct ManagedChunkData {
+    pub chunk_ref: ChunkRef,
+    pub ordinal: usize,
+    pub text: String,
+    pub text_sha256: String,
+    pub extraction_byte_range: ByteRange,
+    pub origin: SourceOrigin,
+}
+
+#[derive(Clone, Debug)]
+pub struct ManagedDocumentData {
+    pub source_sha256: String,
+    pub snapshot_id: DocumentSnapshotId,
+    pub extraction_recipe_id: String,
+    pub rendition_id: RenditionId,
+    pub extracted_content_sha256: String,
+    pub chunks: Vec<ManagedChunkData>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChunkAccumulation {
+    pub sum: Vec<f32>,
+    pub member_count: usize,
+}
+
 /// A document-local topic projected across the configured indexed library.
 /// `mean_member_embedding` is the arithmetic mean of normalized member
 /// embeddings, so its dot product with a normalized candidate is that
@@ -2152,6 +2630,21 @@ struct IndexedFileRecord {
     identity: FileIdentity,
 }
 
+struct FileSemanticIdentity {
+    source_sha256: String,
+    snapshot_id: DocumentSnapshotId,
+    extraction_recipe_id: String,
+    rendition_id: RenditionId,
+    extracted_content_sha256: String,
+    embedding_reused_chunks: Option<usize>,
+    embedding_computed_chunks: Option<usize>,
+    idempotency_key: Option<String>,
+    chunk_descriptors: Vec<ChunkDescriptor>,
+    managed_snapshot_relative_path: Option<String>,
+    original_source_provenance_json: Option<String>,
+    admission_state: Option<String>,
+}
+
 #[derive(Clone, Copy)]
 pub enum SemanticQueryScope<'a> {
     Corpus,
@@ -2176,6 +2669,91 @@ impl SemanticIndex {
             || msg.starts_with("Worker finished without returning embeddings")
     }
 
+    pub fn embedding_metadata(&self) -> anyhow::Result<IndexEmbeddingMetadata> {
+        let json: String = self.conn.query_row(
+            "SELECT value FROM meta WHERE key = 'index_embedding_metadata_json'",
+            [],
+            |row| row.get(0),
+        )?;
+        let metadata: IndexEmbeddingMetadata = serde_json::from_str(&json)?;
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
+    pub fn embedding_space_identity(&self) -> anyhow::Result<EmbeddingSpaceIdentity> {
+        self.embedding_metadata()?
+            .exact_identity
+            .ok_or_else(|| anyhow::anyhow!("INDEX_EMBEDDING_IDENTITY_UNVERIFIED"))
+    }
+
+    pub fn embedding_space_id(&self) -> anyhow::Result<EmbeddingSpaceId> {
+        Ok(self.embedding_space_identity()?.id())
+    }
+
+    pub fn validate_embedding_space(
+        &self,
+        expected: &EmbeddingSpaceIdentity,
+    ) -> anyhow::Result<()> {
+        let actual = self.embedding_space_identity()?;
+        anyhow::ensure!(
+            &actual == expected,
+            "EMBEDDING_SPACE_MISMATCH: index={}, runtime={}",
+            actual.id().as_str(),
+            expected.id().as_str()
+        );
+        Ok(())
+    }
+
+    /// Validate an index for ordinary Wilkes semantic search. Exact indexes
+    /// still require a full identity match; migrated legacy indexes retain the
+    /// historical engine/model/dimension compatibility rule without thereby
+    /// becoming eligible for managed-corpus vector reuse.
+    pub fn validate_local_embedding_space(
+        &self,
+        expected: &EmbeddingSpaceIdentity,
+    ) -> anyhow::Result<()> {
+        let metadata = self.embedding_metadata()?;
+        anyhow::ensure!(
+            metadata.is_locally_compatible_with(expected),
+            "EMBEDDING_SPACE_MISMATCH: index metadata is incompatible with runtime {}",
+            expected.id().as_str()
+        );
+        Ok(())
+    }
+
+    pub fn managed_completeness(&self) -> anyhow::Result<(usize, usize, usize)> {
+        let ready_documents = self.conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE admission_state = 'ready'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        let required_chunks = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks c JOIN files f ON f.id = c.file_id
+             WHERE f.admission_state = 'ready'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        let embedded_chunks = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks c JOIN files f ON f.id = c.file_id
+             JOIN vec_chunks v ON v.rowid = c.id
+             WHERE f.admission_state = 'ready'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        Ok((ready_documents, required_chunks, embedded_chunks))
+    }
+
+    pub fn managed_embedding_work_totals(&self) -> anyhow::Result<(usize, usize)> {
+        let (reused, computed) = self.conn.query_row(
+            "SELECT COALESCE(SUM(embedding_reused_chunks), 0),
+                    COALESCE(SUM(embedding_computed_chunks), 0)
+             FROM files WHERE admission_state = 'ready'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        Ok((reused as usize, computed as usize))
+    }
+
     /// Open an existing index. Returns `Err` if no index exists at `data_dir` or
     /// if `model_id` in the stored metadata mismatches the parameter.
     /// The dimension is read from the DB; callers can inspect it via `status()`.
@@ -2185,6 +2763,7 @@ impl SemanticIndex {
         expected_dimension: usize,
     ) -> anyhow::Result<Self> {
         load_sqlite_vec();
+        recover_interrupted_index_replacement(data_dir)?;
 
         let path = db_path(data_dir);
         anyhow::ensure!(
@@ -2246,6 +2825,26 @@ impl SemanticIndex {
             Self::migrate_v4_to_v5(&conn)?;
             schema_version = 5;
         }
+        if schema_version == 5 {
+            Self::migrate_v5_to_v6(&conn)?;
+            schema_version = 6;
+        }
+        if schema_version == 6 {
+            Self::migrate_v6_to_v7(&conn)?;
+            schema_version = 7;
+        }
+        if schema_version == 7 {
+            Self::migrate_v7_to_v8(&conn)?;
+            schema_version = 8;
+        }
+        if schema_version == 8 {
+            Self::migrate_v8_to_v9(&conn)?;
+            schema_version = 9;
+        }
+        if schema_version == 9 {
+            Self::migrate_v9_to_v10(&conn)?;
+            schema_version = 10;
+        }
         anyhow::ensure!(
             schema_version == SCHEMA_VERSION,
             "Index schema version {} is not supported (expected {}); rebuild the index",
@@ -2292,8 +2891,15 @@ impl SemanticIndex {
         })
     }
 
+    pub fn open_exact(data_dir: &Path, expected: &EmbeddingSpaceIdentity) -> anyhow::Result<Self> {
+        let index = Self::open(data_dir, &expected.model_id, expected.dimension)?;
+        index.validate_embedding_space(expected)?;
+        Ok(index)
+    }
+
     pub fn open_for_maintenance(data_dir: &Path) -> anyhow::Result<Self> {
         load_sqlite_vec();
+        recover_interrupted_index_replacement(data_dir)?;
         let path = db_path(data_dir);
         anyhow::ensure!(
             path.exists(),
@@ -2324,6 +2930,26 @@ impl SemanticIndex {
         if schema_version == 4 {
             Self::migrate_v4_to_v5(&conn)?;
             schema_version = 5;
+        }
+        if schema_version == 5 {
+            Self::migrate_v5_to_v6(&conn)?;
+            schema_version = 6;
+        }
+        if schema_version == 6 {
+            Self::migrate_v6_to_v7(&conn)?;
+            schema_version = 7;
+        }
+        if schema_version == 7 {
+            Self::migrate_v7_to_v8(&conn)?;
+            schema_version = 8;
+        }
+        if schema_version == 8 {
+            Self::migrate_v8_to_v9(&conn)?;
+            schema_version = 9;
+        }
+        if schema_version == 9 {
+            Self::migrate_v9_to_v10(&conn)?;
+            schema_version = 10;
         }
         anyhow::ensure!(
             schema_version == SCHEMA_VERSION,
@@ -2357,6 +2983,18 @@ impl SemanticIndex {
         engine: EmbeddingEngine,
         root_path: Option<&Path>,
     ) -> anyhow::Result<Self> {
+        Self::create_at_path_exact(
+            path,
+            &EmbeddingSpaceIdentity::for_runtime(engine, model_id, dimension),
+            root_path,
+        )
+    }
+
+    fn create_at_path_exact(
+        path: &Path,
+        embedding_identity: &EmbeddingSpaceIdentity,
+        root_path: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         load_sqlite_vec();
 
         if let Some(parent) = path.parent() {
@@ -2379,7 +3017,7 @@ impl SemanticIndex {
             .with_context(|| format!("Failed to create index at {}", path.display()))?;
         configure_connection(&conn, path)?;
 
-        Self::create_schema(&conn, model_id, dimension, engine)?;
+        Self::create_schema(&conn, embedding_identity)?;
 
         let built_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2392,7 +3030,7 @@ impl SemanticIndex {
 
         let mut index = Self {
             conn,
-            dimension,
+            dimension: embedding_identity.dimension,
             active_root: None,
             active_root_id: None,
         };
@@ -2412,6 +3050,14 @@ impl SemanticIndex {
         root_path: Option<&Path>,
     ) -> anyhow::Result<Self> {
         Self::create_at_path(&db_path(data_dir), model_id, dimension, engine, root_path)
+    }
+
+    pub fn create_exact(
+        data_dir: &Path,
+        identity: &EmbeddingSpaceIdentity,
+        root_path: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        Self::create_at_path_exact(&db_path(data_dir), identity, root_path)
     }
 
     /// Full build: creates the database at `data_dir`, indexes every path, and
@@ -2435,19 +3081,16 @@ impl SemanticIndex {
 
         // Reuse compatible global embeddings while keeping the temporary index
         // as the atomic root-membership boundary.
-        let reusable = Self::open(data_dir, embedder.model_id(), embedder.dimension()).ok();
+        let embedding_identity = embedder.embedding_space_identity();
+        let reusable = Self::open_exact(data_dir, &embedding_identity).ok();
 
-        let mut idx = Self::create_at_path(
-            &tmp_path,
-            embedder.model_id(),
-            embedder.dimension(),
-            embedder.engine(),
-            Some(root_path),
-        )?;
+        let mut idx = Self::create_at_path_exact(&tmp_path, &embedding_identity, Some(root_path))?;
 
         // Extract, embed, and write one file at a time so peak memory is bounded
         // to a single file's chunks + embeddings on top of the model weights.
         for (i, path) in paths.iter().enumerate() {
+            let extraction_recipe =
+                ExtractionRecipe::for_path(path, indexing.chunk_size, indexing.chunk_overlap);
             anyhow::ensure!(
                 !cancel_flag.load(Ordering::Relaxed),
                 "Index build cancelled"
@@ -2460,7 +3103,7 @@ impl SemanticIndex {
             }));
 
             if let Some(source) = reusable.as_ref() {
-                match idx.reuse_unchanged_file_from(source, path, extractors) {
+                match idx.reuse_unchanged_file_from(source, path, extractors, &extraction_recipe) {
                     Ok(true) => continue,
                     Ok(false) => {}
                     Err(e) => error!(
@@ -2516,7 +3159,15 @@ impl SemanticIndex {
                 chunks: chunks.into_iter().zip(embeddings).collect(),
                 full_text,
             };
-            if let Err(e) = idx.write_file(prepared) {
+            if let Err(e) = idx.write_file_with_recipe(
+                prepared,
+                &extraction_recipe,
+                None,
+                None,
+                false,
+                false,
+                None,
+            ) {
                 error!(
                     "[SemanticIndex::build] skipping {}: failed to write index entry: {e:#}",
                     path.display()
@@ -2531,6 +3182,14 @@ impl SemanticIndex {
         )?;
 
         idx.finish_active_root_build()?;
+        idx.validate_embedding_space(&embedding_identity)?;
+        let integrity: String = idx
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            integrity == "ok",
+            "Temporary semantic index failed integrity check: {integrity}"
+        );
 
         let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
             files_processed: total_files,
@@ -2539,7 +3198,14 @@ impl SemanticIndex {
             done: true,
         }));
 
-        let mut live = match Self::open(data_dir, embedder.model_id(), embedder.dimension()) {
+        if let Some(source) = reusable.as_ref() {
+            source
+                .conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        }
+        drop(reusable);
+
+        let mut live = match Self::open_exact(data_dir, &embedding_identity) {
             Ok(mut live) => {
                 live.merge_root_from(&idx, root_path)?;
                 drop(idx);
@@ -2552,34 +3218,45 @@ impl SemanticIndex {
                 tracing::info!(
                     "SemanticIndex::build: replacing index because existing DB could not be reused: {err:#}"
                 );
-                let model_id = embedder.model_id().to_string();
-                let dimension = embedder.dimension();
                 drop(idx);
 
-                let _ = std::fs::remove_file(&final_path);
-                let _ = std::fs::remove_file(data_dir.join("semantic_index.db-wal"));
-                let _ = std::fs::remove_file(data_dir.join("semantic_index.db-shm"));
-
-                std::fs::rename(&tmp_path, &final_path).with_context(|| {
-                    format!(
-                        "Failed to rename {} to {}",
-                        tmp_path.display(),
-                        final_path.display()
-                    )
-                })?;
-                Self::open(data_dir, &model_id, dimension)?
+                let backup_path = replacement_backup_path(data_dir);
+                anyhow::ensure!(
+                    !backup_path.exists(),
+                    "Cannot replace index while recovery backup exists at {}",
+                    backup_path.display()
+                );
+                remove_sqlite_sidecars(&final_path);
+                if final_path.exists() {
+                    std::fs::rename(&final_path, &backup_path).with_context(|| {
+                        format!(
+                            "Failed to preserve existing index at {}",
+                            backup_path.display()
+                        )
+                    })?;
+                }
+                if let Err(rename_error) = std::fs::rename(&tmp_path, &final_path) {
+                    if backup_path.exists() {
+                        let _ = std::fs::rename(&backup_path, &final_path);
+                    }
+                    return Err(rename_error).with_context(|| {
+                        format!(
+                            "Failed to publish replacement index from {}",
+                            tmp_path.display()
+                        )
+                    });
+                }
+                Self::open_exact(data_dir, &embedding_identity)?
             }
         };
         live.activate_root(root_path)?;
         Ok(live)
     }
 
-    fn create_schema(
-        conn: &Connection,
-        model_id: &str,
-        dimension: usize,
-        engine: EmbeddingEngine,
-    ) -> anyhow::Result<()> {
+    fn create_schema(conn: &Connection, identity: &EmbeddingSpaceIdentity) -> anyhow::Result<()> {
+        let model_id = &identity.model_id;
+        let dimension = identity.dimension;
+        let engine = identity.engine;
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -2593,7 +3270,17 @@ impl SemanticIndex {
                 size_bytes     INTEGER NOT NULL,
                 modified_at_ms INTEGER NOT NULL,
                 indexed_at_ms  INTEGER NOT NULL,
-                full_text      TEXT
+                full_text      TEXT,
+                source_sha256  TEXT,
+                snapshot_id    TEXT,
+                extraction_recipe_id TEXT,
+                rendition_id   TEXT,
+                extracted_content_sha256 TEXT,
+                embedding_reused_chunks INTEGER,
+                embedding_computed_chunks INTEGER,
+                managed_snapshot_relative_path TEXT,
+                original_source_provenance_json TEXT,
+                admission_state TEXT
             );
             CREATE TABLE IF NOT EXISTS indexed_roots (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2606,6 +3293,13 @@ impl SemanticIndex {
                 file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                 seen_at_ms INTEGER NOT NULL,
                 PRIMARY KEY(root_id, file_id)
+            );
+            CREATE TABLE IF NOT EXISTS managed_import_keys (
+                idempotency_key TEXT PRIMARY KEY,
+                source_sha256 TEXT NOT NULL,
+                extraction_recipe_id TEXT NOT NULL,
+                rendition_id TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS chunks (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2621,11 +3315,17 @@ impl SemanticIndex {
                 bbox_y      REAL,
                 bbox_w      REAL,
                 bbox_h      REAL,
-                chunk_text  TEXT    NOT NULL
+                chunk_text  TEXT    NOT NULL,
+                chunk_ref   TEXT,
+                text_sha256 TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_files_identity
                 ON files(size_bytes, modified_at_ms);
             CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
+            CREATE INDEX IF NOT EXISTS idx_files_rendition_id
+                ON files(rendition_id) WHERE rendition_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_chunks_chunk_ref
+                ON chunks(chunk_ref) WHERE chunk_ref IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_root_files_file_id ON root_files(file_id);
             PRAGMA foreign_keys = ON;
             ",
@@ -2649,6 +3349,12 @@ impl SemanticIndex {
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('dimension', ?1)",
             params![dimension.to_string()],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('index_embedding_metadata_json', ?1)",
+            params![serde_json::to_string(&IndexEmbeddingMetadata::exact(
+                identity.clone()
+            ))?],
         )?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",
@@ -2784,6 +3490,250 @@ impl SemanticIndex {
         Ok(())
     }
 
+    /// v5 -> v6: introduce durable semantic identities. Existing file/chunk
+    /// rows deliberately remain unidentified: the historical index never
+    /// recorded enough extraction facts to prove a rendition, so treating
+    /// them as reusable would turn missing evidence into a compatibility hit.
+    fn migrate_v5_to_v6(conn: &Connection) -> anyhow::Result<()> {
+        fn has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(names.iter().any(|name| name == column))
+        }
+        for (table, column) in [
+            ("files", "source_sha256"),
+            ("files", "snapshot_id"),
+            ("files", "extraction_recipe_id"),
+            ("files", "rendition_id"),
+            ("files", "managed_snapshot_relative_path"),
+            ("files", "original_source_provenance_json"),
+            ("files", "admission_state"),
+            ("chunks", "chunk_ref"),
+            ("chunks", "text_sha256"),
+        ] {
+            if !has_column(conn, table, column)? {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT;"))?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_files_rendition_id
+                ON files(rendition_id) WHERE rendition_id IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_chunks_chunk_ref
+                ON chunks(chunk_ref) WHERE chunk_ref IS NOT NULL;",
+        )?;
+
+        let engine: String =
+            conn.query_row("SELECT value FROM meta WHERE key = 'engine'", [], |row| {
+                row.get(0)
+            })?;
+        let engine = match engine.as_str() {
+            "sbert" | "python" => EmbeddingEngine::SBERT,
+            "fastembed" => EmbeddingEngine::Fastembed,
+            _ => EmbeddingEngine::Candle,
+        };
+        let model_id: String =
+            conn.query_row("SELECT value FROM meta WHERE key = 'model_id'", [], |row| {
+                row.get(0)
+            })?;
+        let dimension: usize = conn.query_row(
+            "SELECT value FROM meta WHERE key = 'dimension'",
+            [],
+            |row| {
+                let value: String = row.get(0)?;
+                Ok(value.parse().unwrap_or(0))
+            },
+        )?;
+        let identity = EmbeddingSpaceIdentity::for_runtime(engine, &model_id, dimension);
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('embedding_space_id', ?1)",
+            params![identity.id().0],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('embedding_space_identity_json', ?1)",
+            params![serde_json::to_string(&identity)?],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('identity_schema_version', ?1)",
+            params![identity.identity_schema_version.to_string()],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '6')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// v6 -> v7: retain a digest of the extracted full text so a managed
+    /// export can prove that its replay body is the one Wilkes admitted.
+    fn migrate_v6_to_v7(conn: &Connection) -> anyhow::Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(files)")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        if !columns
+            .iter()
+            .any(|column| column == "extracted_content_sha256")
+        {
+            conn.execute_batch("ALTER TABLE files ADD COLUMN extracted_content_sha256 TEXT;")?;
+        }
+        let rows = {
+            let mut stmt = conn.prepare(
+                "SELECT id, full_text FROM files
+                 WHERE source_sha256 IS NOT NULL AND full_text IS NOT NULL
+                   AND extracted_content_sha256 IS NULL",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (file_id, full_text) in rows {
+            conn.execute(
+                "UPDATE files SET extracted_content_sha256 = ?2 WHERE id = ?1",
+                params![file_id, sha256_bytes(full_text.as_bytes())],
+            )?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '7')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// v7 -> v8: retain per-document import work diagnostics. These values do
+    /// not affect identity; they explain whether the ready managed mapping was
+    /// copied exactly or computed by the corpus embedder.
+    fn migrate_v7_to_v8(conn: &Connection) -> anyhow::Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(files)")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for column in ["embedding_reused_chunks", "embedding_computed_chunks"] {
+            if !columns.iter().any(|existing| existing == column) {
+                conn.execute_batch(&format!("ALTER TABLE files ADD COLUMN {column} INTEGER;"))?;
+            }
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '8')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// v8 -> v9: make a managed import job's retry identity durable rather
+    /// than relying only on content deduplication.
+    fn migrate_v8_to_v9(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS managed_import_keys (
+                idempotency_key TEXT PRIMARY KEY,
+                source_sha256 TEXT NOT NULL,
+                extraction_recipe_id TEXT NOT NULL,
+                rendition_id TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );",
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '9')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// v9 -> v10: distinguish exact embedding evidence from the display tuple
+    /// available in historical indexes. Earlier migrations synthesized an
+    /// `unresolved-runtime` identity for legacy rows; that value is deliberately
+    /// downgraded to `exact_identity: None` rather than being treated as proof.
+    fn migrate_v9_to_v10(conn: &Connection) -> anyhow::Result<()> {
+        let engine_name: String =
+            conn.query_row("SELECT value FROM meta WHERE key = 'engine'", [], |row| {
+                row.get(0)
+            })?;
+        let engine = match engine_name.as_str() {
+            "sbert" | "python" => EmbeddingEngine::SBERT,
+            "fastembed" => EmbeddingEngine::Fastembed,
+            _ => EmbeddingEngine::Candle,
+        };
+        let model_id: String =
+            conn.query_row("SELECT value FROM meta WHERE key = 'model_id'", [], |row| {
+                row.get(0)
+            })?;
+        let dimension: usize = conn.query_row(
+            "SELECT value FROM meta WHERE key = 'dimension'",
+            [],
+            |row| {
+                let value: String = row.get(0)?;
+                Ok(value.parse().unwrap_or(0))
+            },
+        )?;
+
+        let old_identity_json: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'embedding_space_identity_json'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let exact_identity = old_identity_json
+            .map(|json| serde_json::from_str::<EmbeddingSpaceIdentity>(&json))
+            .transpose()?
+            .filter(|identity| {
+                !identity
+                    .artifact_revision
+                    .starts_with("unresolved-runtime-")
+            });
+        if let Some(identity) = exact_identity.as_ref() {
+            anyhow::ensure!(
+                identity.engine == engine
+                    && identity.model_id == model_id
+                    && identity.dimension == dimension,
+                "Index embedding metadata contradicts its exact identity"
+            );
+            if let Some(stored_id) = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'embedding_space_id'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                anyhow::ensure!(
+                    identity.id().as_str() == stored_id,
+                    "Index embedding-space identity is corrupt"
+                );
+            }
+        }
+
+        let metadata = IndexEmbeddingMetadata {
+            engine,
+            model_id,
+            dimension,
+            exact_identity,
+        };
+        metadata.validate()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('index_embedding_metadata_json', ?1)",
+            params![serde_json::to_string(&metadata)?],
+        )?;
+        conn.execute_batch(
+            "DELETE FROM meta WHERE key IN (
+                'embedding_space_id',
+                'embedding_space_identity_json',
+                'identity_schema_version'
+             );",
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '10')",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// Extract a file's canonical content without chunking or embedding it.
     fn extract_content(
         path: &Path,
@@ -2870,14 +3820,21 @@ impl SemanticIndex {
         source: &SemanticIndex,
         path: &Path,
         extractors: &ExtractorRegistry,
+        recipe: &ExtractionRecipe,
     ) -> anyhow::Result<bool> {
+        if self.embedding_space_id()? != source.embedding_space_id()? {
+            return Ok(false);
+        }
         let key = Self::canonical_path(path);
         let key_str = key.to_string_lossy().into_owned();
         let identity = Self::identity_for_path(path)?;
+        let source_sha256 = sha256_file(path)?;
         let source_file = source
             .conn
             .query_row(
-                "SELECT id, size_bytes, modified_at_ms, full_text
+                "SELECT id, size_bytes, modified_at_ms, full_text,
+                        source_sha256, extraction_recipe_id, rendition_id,
+                        extracted_content_sha256
                  FROM files
                  WHERE file_path = ?1",
                 params![key_str],
@@ -2887,14 +3844,33 @@ impl SemanticIndex {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((source_file_id, size_bytes, modified_at_ms, full_text)) = source_file else {
+        let Some((
+            source_file_id,
+            size_bytes,
+            modified_at_ms,
+            full_text,
+            stored_source_sha256,
+            stored_recipe_id,
+            stored_rendition_id,
+            stored_extracted_content_sha256,
+        )) = source_file
+        else {
             return Ok(false);
         };
-        if size_bytes != identity.size_bytes || modified_at_ms != identity.modified_at_ms {
+        if size_bytes != identity.size_bytes
+            || modified_at_ms != identity.modified_at_ms
+            || stored_source_sha256.as_deref() != Some(source_sha256.as_str())
+            || stored_recipe_id.as_deref() != Some(recipe.id().as_str())
+            || stored_rendition_id.is_none()
+        {
             return Ok(false);
         }
 
@@ -2984,12 +3960,41 @@ impl SemanticIndex {
             Some(text) if !text.is_empty() => text,
             _ => Self::extract_content(path, extractors)?.text,
         };
+        if stored_extracted_content_sha256.as_deref()
+            != Some(sha256_bytes(full_text.as_bytes()).as_str())
+        {
+            return Ok(false);
+        }
 
-        self.write_file(PreparedFile {
-            path: path.to_path_buf(),
-            chunks,
-            full_text,
-        })?;
+        let descriptors: Vec<ChunkDescriptor> = chunks
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (chunk, _))| ChunkDescriptor {
+                ordinal,
+                text_sha256: sha256_bytes(chunk.text.as_bytes()),
+                byte_range: chunk.byte_range.clone(),
+                origin: chunk.origin.clone(),
+            })
+            .collect();
+        let expected_rendition =
+            rendition_id(&snapshot_id(&source_sha256), &recipe.id(), &descriptors);
+        if stored_rendition_id.as_deref() != Some(expected_rendition.as_str()) {
+            return Ok(false);
+        }
+
+        self.write_file_with_recipe(
+            PreparedFile {
+                path: path.to_path_buf(),
+                chunks,
+                full_text,
+            },
+            recipe,
+            None,
+            None,
+            false,
+            false,
+            None,
+        )?;
         Ok(true)
     }
 
@@ -3311,13 +4316,21 @@ impl SemanticIndex {
     }
 
     fn merge_root_from(&mut self, source: &SemanticIndex, root: &Path) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.embedding_space_id()? == source.embedding_space_id()?,
+            "EMBEDDING_SPACE_MISMATCH: refusing cross-index vector copy"
+        );
         let target_root_id = self.activate_root(root)?;
         let source_root_id = source.root_id_for_path(root)?.ok_or_else(|| {
             anyhow::anyhow!("Source index has no coverage for {}", root.display())
         })?;
 
         let mut source_stmt = source.conn.prepare(
-            "SELECT f.id, f.file_path, f.size_bytes, f.modified_at_ms, f.indexed_at_ms, f.full_text
+            "SELECT f.id, f.file_path, f.size_bytes, f.modified_at_ms, f.indexed_at_ms, f.full_text,
+                    f.source_sha256, f.snapshot_id, f.extraction_recipe_id, f.rendition_id,
+                    f.extracted_content_sha256, f.embedding_reused_chunks,
+                    f.embedding_computed_chunks, f.managed_snapshot_relative_path,
+                    f.original_source_provenance_json, f.admission_state
              FROM root_files rf
              JOIN files f ON f.id = rf.file_id
              WHERE rf.root_id = ?1",
@@ -3331,6 +4344,16 @@ impl SemanticIndex {
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, Option<i64>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -3341,8 +4364,24 @@ impl SemanticIndex {
             params![target_root_id],
         )?;
 
-        for (source_file_id, file_path, size_bytes, modified_at_ms, indexed_at_ms, full_text) in
-            source_files
+        for (
+            source_file_id,
+            file_path,
+            size_bytes,
+            modified_at_ms,
+            indexed_at_ms,
+            full_text,
+            source_sha256,
+            snapshot_id,
+            extraction_recipe_id,
+            rendition_id,
+            extracted_content_sha256,
+            embedding_reused_chunks,
+            embedding_computed_chunks,
+            managed_snapshot_relative_path,
+            original_source_provenance_json,
+            admission_state,
+        ) in source_files
         {
             let target_file_id: Option<i64> = tx
                 .query_row(
@@ -3355,22 +4394,45 @@ impl SemanticIndex {
                 Self::delete_chunks_for_file_tx(&tx, file_id)?;
                 tx.execute(
                     "UPDATE files
-                     SET size_bytes = ?2, modified_at_ms = ?3, indexed_at_ms = ?4, full_text = ?5
+                     SET size_bytes = ?2, modified_at_ms = ?3, indexed_at_ms = ?4, full_text = ?5,
+                         source_sha256 = ?6, snapshot_id = ?7, extraction_recipe_id = ?8,
+                         rendition_id = ?9, extracted_content_sha256 = ?10,
+                         embedding_reused_chunks = ?11, embedding_computed_chunks = ?12,
+                         managed_snapshot_relative_path = ?13,
+                         original_source_provenance_json = ?14, admission_state = ?15
                      WHERE id = ?1",
                     params![
                         file_id,
                         size_bytes,
                         modified_at_ms,
                         indexed_at_ms,
-                        full_text
+                        full_text,
+                        source_sha256,
+                        snapshot_id,
+                        extraction_recipe_id,
+                        rendition_id,
+                        extracted_content_sha256,
+                        embedding_reused_chunks,
+                        embedding_computed_chunks,
+                        managed_snapshot_relative_path,
+                        original_source_provenance_json,
+                        admission_state,
                     ],
                 )?;
                 file_id
             } else {
                 tx.execute(
-                    "INSERT INTO files (file_path, size_bytes, modified_at_ms, indexed_at_ms, full_text)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![file_path, size_bytes, modified_at_ms, indexed_at_ms, full_text],
+                    "INSERT INTO files (file_path, size_bytes, modified_at_ms, indexed_at_ms, full_text,
+                                        source_sha256, snapshot_id, extraction_recipe_id, rendition_id,
+                                        extracted_content_sha256, embedding_reused_chunks,
+                                        embedding_computed_chunks, managed_snapshot_relative_path,
+                                        original_source_provenance_json, admission_state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    params![file_path, size_bytes, modified_at_ms, indexed_at_ms, full_text,
+                            source_sha256, snapshot_id, extraction_recipe_id, rendition_id,
+                            extracted_content_sha256, embedding_reused_chunks,
+                            embedding_computed_chunks, managed_snapshot_relative_path,
+                            original_source_provenance_json, admission_state],
                 )?;
                 tx.last_insert_rowid()
             };
@@ -3385,7 +4447,7 @@ impl SemanticIndex {
                 "SELECT c.chunk_idx, c.byte_start, c.byte_end,
                         c.origin_type, c.page, c.line, c.col,
                         c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.chunk_text,
-                        v.embedding
+                        c.chunk_ref, c.text_sha256, v.embedding
                  FROM chunks c
                  JOIN vec_chunks v ON v.rowid = c.id
                  WHERE c.file_id = ?1
@@ -3406,7 +4468,9 @@ impl SemanticIndex {
                         row.get::<_, Option<f64>>(9)?,
                         row.get::<_, Option<f64>>(10)?,
                         row.get::<_, String>(11)?,
-                        row.get::<_, Vec<u8>>(12)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Vec<u8>>(14)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3424,14 +4488,17 @@ impl SemanticIndex {
                 bbox_w,
                 bbox_h,
                 chunk_text,
+                stable_ref,
+                text_sha256,
                 embedding,
             ) in chunks
             {
                 tx.execute(
                     "INSERT INTO chunks (file_id, chunk_idx, byte_start, byte_end,
                                          origin_type, page, line, col,
-                                         bbox_x, bbox_y, bbox_w, bbox_h, chunk_text)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                         bbox_x, bbox_y, bbox_w, bbox_h, chunk_text,
+                                         chunk_ref, text_sha256)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     params![
                         target_file_id,
                         chunk_idx,
@@ -3446,6 +4513,8 @@ impl SemanticIndex {
                         bbox_w,
                         bbox_h,
                         chunk_text,
+                        stable_ref,
+                        text_sha256,
                     ],
                 )?;
                 let chunk_id = tx.last_insert_rowid();
@@ -3666,9 +4735,75 @@ impl SemanticIndex {
         Ok(errors)
     }
 
-    /// Write previously prepared chunks into the index, removing any existing chunks
-    /// for that path first.
+    /// Write a generic workspace file. Stable managed identities are omitted
+    /// unless the caller supplies the extraction recipe through
+    /// [`Self::write_file_with_recipe`]; legacy callers therefore cannot
+    /// accidentally authorize managed reuse with guessed metadata.
     pub fn write_file(&mut self, prepared: PreparedFile) -> anyhow::Result<()> {
+        self.write_file_internal(prepared, None).map(|_| ())
+    }
+
+    /// Write a file with the complete source/rendition/chunk identity used by
+    /// exact whole-document adoption and managed APIs.
+    pub fn write_file_with_recipe(
+        &mut self,
+        prepared: PreparedFile,
+        recipe: &ExtractionRecipe,
+        managed_snapshot_relative_path: Option<&Path>,
+        original_source_provenance: Option<&serde_json::Value>,
+        admitted: bool,
+        reused: bool,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<ManagedDocumentData> {
+        let source_sha256 = sha256_file(&prepared.path)?;
+        let snapshot = snapshot_id(&source_sha256);
+        let extraction_recipe_id = recipe.id();
+        let descriptors: Vec<ChunkDescriptor> = prepared
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (chunk, _))| ChunkDescriptor {
+                ordinal,
+                text_sha256: sha256_bytes(chunk.text.as_bytes()),
+                byte_range: chunk.byte_range.clone(),
+                origin: chunk.origin.clone(),
+            })
+            .collect();
+        let rendition = rendition_id(&snapshot, &extraction_recipe_id, &descriptors);
+        let identity = FileSemanticIdentity {
+            source_sha256,
+            snapshot_id: snapshot,
+            extraction_recipe_id,
+            rendition_id: rendition,
+            extracted_content_sha256: sha256_bytes(prepared.full_text.as_bytes()),
+            embedding_reused_chunks: admitted.then_some(if reused {
+                prepared.chunks.len()
+            } else {
+                0
+            }),
+            embedding_computed_chunks: admitted.then_some(if reused {
+                0
+            } else {
+                prepared.chunks.len()
+            }),
+            idempotency_key: idempotency_key.map(str::to_string),
+            chunk_descriptors: descriptors,
+            managed_snapshot_relative_path: managed_snapshot_relative_path
+                .map(|path| path.to_string_lossy().into_owned()),
+            original_source_provenance_json: original_source_provenance
+                .map(serde_json::to_string)
+                .transpose()?,
+            admission_state: admitted.then(|| "ready".to_string()),
+        };
+        self.write_file_internal(prepared, Some(identity))?
+            .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: identity was not published"))
+    }
+
+    fn write_file_internal(
+        &mut self,
+        prepared: PreparedFile,
+        semantic_identity: Option<FileSemanticIdentity>,
+    ) -> anyhow::Result<Option<ManagedDocumentData>> {
         let abs_path_str = prepared.path.to_string_lossy().into_owned();
         let key = self.path_key_for_existing_path(&prepared.path);
         let key_str = key.to_string_lossy().into_owned();
@@ -3681,6 +4816,11 @@ impl SemanticIndex {
                 "Dimension mismatch: expected {}, received {} for path {}",
                 self.dimension,
                 embedding.len(),
+                abs_path_str
+            );
+            anyhow::ensure!(
+                embedding.iter().all(|value| value.is_finite()),
+                "DOCUMENT_INDEX_INCOMPLETE: non-finite embedding for path {}",
                 abs_path_str
             );
         }
@@ -3699,7 +4839,12 @@ impl SemanticIndex {
             Self::delete_chunks_for_file_tx(&tx, file_id)?;
             tx.execute(
                 "UPDATE files
-                 SET size_bytes = ?2, modified_at_ms = ?3, indexed_at_ms = ?4, full_text = ?5
+                 SET size_bytes = ?2, modified_at_ms = ?3, indexed_at_ms = ?4, full_text = ?5,
+                     source_sha256 = ?6, snapshot_id = ?7, extraction_recipe_id = ?8,
+                     rendition_id = ?9, extracted_content_sha256 = ?10,
+                     embedding_reused_chunks = ?11, embedding_computed_chunks = ?12,
+                     managed_snapshot_relative_path = ?13,
+                     original_source_provenance_json = ?14, admission_state = ?15
                  WHERE id = ?1",
                 params![
                     file_id,
@@ -3707,19 +4852,63 @@ impl SemanticIndex {
                     identity.modified_at_ms,
                     now,
                     prepared.full_text,
+                    semantic_identity
+                        .as_ref()
+                        .map(|value| value.source_sha256.as_str()),
+                    semantic_identity
+                        .as_ref()
+                        .map(|value| value.snapshot_id.as_str()),
+                    semantic_identity
+                        .as_ref()
+                        .map(|value| value.extraction_recipe_id.as_str()),
+                    semantic_identity
+                        .as_ref()
+                        .map(|value| value.rendition_id.as_str()),
+                    semantic_identity
+                        .as_ref()
+                        .map(|value| value.extracted_content_sha256.as_str()),
+                    semantic_identity
+                        .as_ref()
+                        .and_then(|value| value.embedding_reused_chunks),
+                    semantic_identity
+                        .as_ref()
+                        .and_then(|value| value.embedding_computed_chunks),
+                    semantic_identity
+                        .as_ref()
+                        .and_then(|value| value.managed_snapshot_relative_path.as_deref()),
+                    semantic_identity
+                        .as_ref()
+                        .and_then(|value| value.original_source_provenance_json.as_deref()),
+                    semantic_identity
+                        .as_ref()
+                        .and_then(|value| value.admission_state.as_deref()),
                 ],
             )?;
             file_id
         } else {
             tx.execute(
-                "INSERT INTO files (file_path, size_bytes, modified_at_ms, indexed_at_ms, full_text)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO files (file_path, size_bytes, modified_at_ms, indexed_at_ms, full_text,
+                                    source_sha256, snapshot_id, extraction_recipe_id, rendition_id,
+                                    extracted_content_sha256, embedding_reused_chunks,
+                                    embedding_computed_chunks, managed_snapshot_relative_path,
+                                    original_source_provenance_json, admission_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     key_str,
                     identity.size_bytes,
                     identity.modified_at_ms,
                     now,
                     prepared.full_text,
+                    semantic_identity.as_ref().map(|value| value.source_sha256.as_str()),
+                    semantic_identity.as_ref().map(|value| value.snapshot_id.as_str()),
+                    semantic_identity.as_ref().map(|value| value.extraction_recipe_id.as_str()),
+                    semantic_identity.as_ref().map(|value| value.rendition_id.as_str()),
+                    semantic_identity.as_ref().map(|value| value.extracted_content_sha256.as_str()),
+                    semantic_identity.as_ref().and_then(|value| value.embedding_reused_chunks),
+                    semantic_identity.as_ref().and_then(|value| value.embedding_computed_chunks),
+                    semantic_identity.as_ref().and_then(|value| value.managed_snapshot_relative_path.as_deref()),
+                    semantic_identity.as_ref().and_then(|value| value.original_source_provenance_json.as_deref()),
+                    semantic_identity.as_ref().and_then(|value| value.admission_state.as_deref()),
                 ],
             )?;
             tx.last_insert_rowid()
@@ -3759,11 +4948,18 @@ impl SemanticIndex {
                     ("pdf_page", Some(*page as i64), None, None, bx, by, bw, bh)
                 }
             };
+            let descriptor = semantic_identity
+                .as_ref()
+                .and_then(|value| value.chunk_descriptors.get(i));
+            let stable_ref = semantic_identity
+                .as_ref()
+                .map(|value| chunk_ref(&value.rendition_id, i));
             tx.execute(
                 "INSERT INTO chunks (file_id, chunk_idx, byte_start, byte_end,
                                      origin_type, page, line, col,
-                                     bbox_x, bbox_y, bbox_w, bbox_h, chunk_text)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                     bbox_x, bbox_y, bbox_w, bbox_h, chunk_text,
+                                     chunk_ref, text_sha256)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     file_id,
                     i as i64,
@@ -3778,6 +4974,8 @@ impl SemanticIndex {
                     bbox_w,
                     bbox_h,
                     chunk.text,
+                    stable_ref.as_ref().map(ChunkRef::as_str),
+                    descriptor.map(|value| value.text_sha256.as_str()),
                 ],
             )?;
             let chunk_id = tx.last_insert_rowid();
@@ -3787,8 +4985,56 @@ impl SemanticIndex {
                 params![chunk_id, blob],
             )?;
         }
+        if let Some(identity) = semantic_identity.as_ref() {
+            if let Some(idempotency_key) = identity.idempotency_key.as_deref() {
+                let existing = tx
+                    .query_row(
+                        "SELECT source_sha256, extraction_recipe_id, rendition_id
+                         FROM managed_import_keys WHERE idempotency_key = ?1",
+                        params![idempotency_key],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some((source, recipe, rendition)) = existing {
+                    anyhow::ensure!(
+                        source == identity.source_sha256
+                            && recipe == identity.extraction_recipe_id
+                            && rendition == identity.rendition_id.as_str(),
+                        "IDEMPOTENCY_KEY_CONFLICT: managed import key is already bound to a different rendition"
+                    );
+                } else {
+                    tx.execute(
+                        "INSERT INTO managed_import_keys
+                            (idempotency_key, source_sha256, extraction_recipe_id, rendition_id, created_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            idempotency_key,
+                            identity.source_sha256,
+                            identity.extraction_recipe_id,
+                            identity.rendition_id.as_str(),
+                            Self::now_ms(),
+                        ],
+                    )?;
+                }
+            }
+        }
         tx.commit()?;
-        Ok(())
+        semantic_identity
+            .map(|identity| {
+                self.managed_document_by_rendition(identity.rendition_id.as_str())?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "DOCUMENT_INDEX_INCOMPLETE: published rendition cannot be read"
+                        )
+                    })
+            })
+            .transpose()
     }
 
     /// Convenience: `prepare_file` then `write_file`.
@@ -3800,8 +5046,18 @@ impl SemanticIndex {
         chunk_size: usize,
         chunk_overlap: usize,
     ) -> anyhow::Result<()> {
+        self.validate_local_embedding_space(&embedder.embedding_space_identity())?;
         let prepared = Self::prepare_file(path, extractors, embedder, chunk_size, chunk_overlap)?;
-        self.write_file(prepared)
+        self.write_file_with_recipe(
+            prepared,
+            &ExtractionRecipe::for_path(path, chunk_size, chunk_overlap),
+            None,
+            None,
+            false,
+            false,
+            None,
+        )?;
+        Ok(())
     }
 
     /// Remove all chunks for the given path.
@@ -4403,6 +5659,543 @@ impl SemanticIndex {
         )
     }
 
+    pub fn managed_document_for_path(
+        &self,
+        path: &Path,
+    ) -> anyhow::Result<Option<ManagedDocumentData>> {
+        let key = self.path_key_for_known_path(path);
+        let rendition: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT rendition_id FROM files
+                 WHERE file_path = ?1 AND admission_state = 'ready'",
+                params![key.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        rendition
+            .map(|rendition| self.managed_document_by_rendition(&rendition))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn managed_document_for_import_key(
+        &self,
+        idempotency_key: &str,
+        source_sha256: &str,
+        extraction_recipe_id: &str,
+    ) -> anyhow::Result<Option<ManagedDocumentData>> {
+        let binding = self
+            .conn
+            .query_row(
+                "SELECT source_sha256, extraction_recipe_id, rendition_id
+                 FROM managed_import_keys WHERE idempotency_key = ?1",
+                params![idempotency_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((bound_source, bound_recipe, rendition)) = binding else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            bound_source == source_sha256 && bound_recipe == extraction_recipe_id,
+            "IDEMPOTENCY_KEY_CONFLICT: managed import key is already bound to different content"
+        );
+        self.managed_document_by_rendition(&rendition)
+    }
+
+    pub fn bind_managed_import_key(
+        &mut self,
+        idempotency_key: &str,
+        document: &ManagedDocumentData,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !idempotency_key.trim().is_empty(),
+            "IDEMPOTENCY_KEY_CONFLICT: idempotency key is empty"
+        );
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT source_sha256, extraction_recipe_id, rendition_id
+                 FROM managed_import_keys WHERE idempotency_key = ?1",
+                params![idempotency_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((source, recipe, rendition)) = existing {
+            anyhow::ensure!(
+                source == document.source_sha256
+                    && recipe == document.extraction_recipe_id
+                    && rendition == document.rendition_id.as_str(),
+                "IDEMPOTENCY_KEY_CONFLICT: managed import key is already bound to a different rendition"
+            );
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO managed_import_keys
+                (idempotency_key, source_sha256, extraction_recipe_id, rendition_id, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                idempotency_key,
+                document.source_sha256,
+                document.extraction_recipe_id,
+                document.rendition_id.as_str(),
+                Self::now_ms(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn managed_document_by_rendition(
+        &self,
+        rendition_id: &str,
+    ) -> anyhow::Result<Option<ManagedDocumentData>> {
+        let header = self
+            .conn
+            .query_row(
+                "SELECT source_sha256, snapshot_id, extraction_recipe_id, rendition_id,
+                        full_text, extracted_content_sha256
+                 FROM files WHERE rendition_id = ?1",
+                params![rendition_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            source_sha256,
+            snapshot,
+            extraction_recipe_id,
+            rendition,
+            full_text,
+            extracted_content_sha256,
+        )) = header
+        else {
+            return Ok(None);
+        };
+        let source_sha256 = source_sha256
+            .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: source hash is absent"))?;
+        let snapshot = snapshot
+            .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: snapshot id is absent"))?;
+        let extraction_recipe_id = extraction_recipe_id.ok_or_else(|| {
+            anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: extraction recipe id is absent")
+        })?;
+        let rendition = rendition
+            .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: rendition id is absent"))?;
+        let full_text = full_text
+            .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: retained text is absent"))?;
+        let extracted_content_sha256 = extracted_content_sha256.ok_or_else(|| {
+            anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: extracted-content hash is absent")
+        })?;
+        anyhow::ensure!(
+            sha256_bytes(full_text.as_bytes()) == extracted_content_sha256,
+            "DOCUMENT_INDEX_INCOMPLETE: extracted-content hash does not match retained text"
+        );
+        anyhow::ensure!(
+            snapshot_id(&source_sha256).as_str() == snapshot,
+            "DOCUMENT_INDEX_INCOMPLETE: snapshot identity does not match source hash"
+        );
+
+        let mut stmt = self.conn.prepare(
+            "SELECT c.chunk_ref, c.chunk_idx, c.chunk_text, c.text_sha256,
+                    c.byte_start, c.byte_end, c.origin_type, c.page, c.line, c.col,
+                    c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, v.embedding
+             FROM chunks c JOIN files f ON f.id = c.file_id
+             JOIN vec_chunks v ON v.rowid = c.id
+             WHERE f.rendition_id = ?1
+             ORDER BY c.chunk_idx",
+        )?;
+        let rows = stmt
+            .query_map(params![rendition_id], |row| {
+                let origin_type: String = row.get(6)?;
+                let origin = source_origin_from_parts(
+                    &origin_type,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                )
+                .ok_or_else(|| {
+                    rusqlite::Error::InvalidColumnType(
+                        6,
+                        "origin_type".to_string(),
+                        rusqlite::types::Type::Text,
+                    )
+                })?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    origin,
+                    row.get::<_, Vec<u8>>(14)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        anyhow::ensure!(
+            !rows.is_empty(),
+            "DOCUMENT_INDEX_INCOMPLETE: rendition has no complete chunk/vector mapping"
+        );
+        let mut chunks = Vec::with_capacity(rows.len());
+        let mut descriptors = Vec::with_capacity(rows.len());
+        for (expected_ordinal, row) in rows.into_iter().enumerate() {
+            let (stored_ref, ordinal, text, stored_text_sha256, byte_start, byte_end, origin, blob) =
+                row;
+            anyhow::ensure!(
+                ordinal >= 0 && ordinal as usize == expected_ordinal,
+                "DOCUMENT_INDEX_INCOMPLETE: chunk ordinals are not contiguous"
+            );
+            anyhow::ensure!(
+                byte_start >= 0 && byte_end >= byte_start,
+                "DOCUMENT_INDEX_INCOMPLETE: invalid chunk byte range"
+            );
+            let text_sha256 = sha256_bytes(text.as_bytes());
+            anyhow::ensure!(
+                text_sha256 == stored_text_sha256,
+                "DOCUMENT_INDEX_INCOMPLETE: chunk text hash mismatch"
+            );
+            let embedding = f32_slice_from_bytes(&blob)?;
+            anyhow::ensure!(
+                embedding.len() == self.dimension
+                    && embedding.iter().all(|value| value.is_finite()),
+                "DOCUMENT_INDEX_INCOMPLETE: invalid stored vector"
+            );
+            let byte_range = ByteRange {
+                start: byte_start as usize,
+                end: byte_end as usize,
+            };
+            descriptors.push(ChunkDescriptor {
+                ordinal: expected_ordinal,
+                text_sha256: text_sha256.clone(),
+                byte_range: byte_range.clone(),
+                origin: origin.clone(),
+            });
+            chunks.push(ManagedChunkData {
+                chunk_ref: ChunkRef(stored_ref),
+                ordinal: expected_ordinal,
+                text,
+                text_sha256,
+                extraction_byte_range: byte_range,
+                origin,
+            });
+        }
+        let recomputed_rendition = crate::embed::identity::rendition_id(
+            &DocumentSnapshotId(snapshot.clone()),
+            &extraction_recipe_id,
+            &descriptors,
+        );
+        anyhow::ensure!(
+            recomputed_rendition.as_str() == rendition,
+            "DOCUMENT_INDEX_INCOMPLETE: rendition identity mismatch"
+        );
+        for chunk in &chunks {
+            anyhow::ensure!(
+                chunk.chunk_ref == chunk_ref(&recomputed_rendition, chunk.ordinal),
+                "DOCUMENT_INDEX_INCOMPLETE: stable chunk reference mismatch"
+            );
+        }
+        Ok(Some(ManagedDocumentData {
+            source_sha256,
+            snapshot_id: DocumentSnapshotId(snapshot),
+            extraction_recipe_id,
+            rendition_id: RenditionId(rendition),
+            extracted_content_sha256,
+            chunks,
+        }))
+    }
+
+    /// Materialize an exactly verified whole rendition for copying into a
+    /// different index. The returned vectors are owned values; the target will
+    /// allocate fresh rowids and never depend on this index's lifecycle.
+    pub fn verified_file_for_adoption(
+        &self,
+        source_sha256: &str,
+        recipe: &ExtractionRecipe,
+        expected_space_id: &EmbeddingSpaceId,
+        target_path: &Path,
+    ) -> anyhow::Result<Option<PreparedFile>> {
+        let Some(exact_identity) = self.embedding_metadata()?.exact_identity else {
+            return Ok(None);
+        };
+        if &exact_identity.id() != expected_space_id {
+            return Ok(None);
+        }
+        let recipe_id = recipe.id();
+        let file = self
+            .conn
+            .query_row(
+                "SELECT id, full_text, rendition_id, extracted_content_sha256 FROM files
+                 WHERE source_sha256 = ?1 AND extraction_recipe_id = ?2
+                 LIMIT 1",
+                params![source_sha256, recipe_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((file_id, full_text, stored_rendition, stored_extracted_content_sha256)) = file
+        else {
+            return Ok(None);
+        };
+        let (Some(full_text), Some(stored_rendition), Some(stored_extracted_content_sha256)) =
+            (full_text, stored_rendition, stored_extracted_content_sha256)
+        else {
+            return Ok(None);
+        };
+        if sha256_bytes(full_text.as_bytes()) != stored_extracted_content_sha256 {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT c.chunk_idx, c.byte_start, c.byte_end, c.origin_type,
+                    c.page, c.line, c.col, c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h,
+                    c.chunk_text, c.text_sha256, v.embedding
+             FROM chunks c JOIN vec_chunks v ON v.rowid = c.id
+             WHERE c.file_id = ?1 ORDER BY c.chunk_idx",
+        )?;
+        let rows = stmt
+            .query_map(params![file_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<f64>>(7)?,
+                    row.get::<_, Option<f64>>(8)?,
+                    row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, Option<f64>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Vec<u8>>(13)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let mut prepared_chunks = Vec::with_capacity(rows.len());
+        let mut descriptors = Vec::with_capacity(rows.len());
+        for (
+            ordinal,
+            byte_start,
+            byte_end,
+            origin_type,
+            page,
+            line,
+            col,
+            bbox_x,
+            bbox_y,
+            bbox_w,
+            bbox_h,
+            text,
+            stored_text_sha256,
+            embedding_blob,
+        ) in rows
+        {
+            let Some(origin) = source_origin_from_parts(
+                &origin_type,
+                page,
+                line,
+                col,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+            ) else {
+                return Ok(None);
+            };
+            let text_sha256 = sha256_bytes(text.as_bytes());
+            if stored_text_sha256.as_deref() != Some(text_sha256.as_str()) {
+                return Ok(None);
+            }
+            let embedding = f32_slice_from_bytes(&embedding_blob)?;
+            if embedding.len() != self.dimension || embedding.iter().any(|value| !value.is_finite())
+            {
+                return Ok(None);
+            }
+            let byte_range = ByteRange {
+                start: byte_start as usize,
+                end: byte_end as usize,
+            };
+            descriptors.push(ChunkDescriptor {
+                ordinal: ordinal as usize,
+                text_sha256,
+                byte_range: byte_range.clone(),
+                origin: origin.clone(),
+            });
+            prepared_chunks.push((
+                Chunk {
+                    file_path: target_path.to_path_buf(),
+                    text,
+                    byte_range,
+                    origin,
+                },
+                embedding,
+            ));
+        }
+        let recomputed = rendition_id(&snapshot_id(source_sha256), &recipe.id(), &descriptors);
+        if recomputed.as_str() != stored_rendition {
+            return Ok(None);
+        }
+        Ok(Some(PreparedFile {
+            path: target_path.to_path_buf(),
+            chunks: prepared_chunks,
+            full_text,
+        }))
+    }
+
+    /// Resolve opaque refs to local execution rowids. All refs must resolve;
+    /// rowids never leave this method's callers in the managed surface.
+    pub fn resolve_chunk_refs(
+        &self,
+        refs: &HashSet<ChunkRef>,
+    ) -> anyhow::Result<HashMap<ChunkRef, i64>> {
+        const REFS_PER_QUERY: usize = 400;
+        let refs: Vec<ChunkRef> = refs.iter().cloned().collect();
+        let mut found = HashMap::with_capacity(refs.len());
+        for batch in refs.chunks(REFS_PER_QUERY) {
+            let placeholders = vec!["?"; batch.len()].join(",");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT chunk_ref, id FROM chunks
+                 WHERE chunk_ref IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(
+                params_from_iter(batch.iter().map(ChunkRef::as_str)),
+                |row| Ok((ChunkRef(row.get(0)?), row.get::<_, i64>(1)?)),
+            )?;
+            for row in rows {
+                let (stable_ref, rowid) = row?;
+                found.insert(stable_ref, rowid);
+            }
+        }
+        if found.len() != refs.len() {
+            let mut missing: Vec<&str> = refs
+                .iter()
+                .filter(|stable_ref| !found.contains_key(*stable_ref))
+                .map(ChunkRef::as_str)
+                .collect();
+            missing.sort_unstable();
+            anyhow::bail!(
+                "CHUNK_REF_NOT_FOUND: {} reference(s) do not belong to this corpus: {}",
+                missing.len(),
+                missing.into_iter().take(10).collect::<Vec<_>>().join(", ")
+            );
+        }
+        Ok(found)
+    }
+
+    pub fn managed_chunks_for_refs(
+        &self,
+        refs: &[ChunkRef],
+    ) -> anyhow::Result<Vec<ManagedChunkData>> {
+        let wanted: HashSet<ChunkRef> = refs.iter().cloned().collect();
+        self.resolve_chunk_refs(&wanted)?;
+        const REFS_PER_QUERY: usize = 300;
+        let unique: Vec<ChunkRef> = wanted.into_iter().collect();
+        let mut found = HashMap::with_capacity(unique.len());
+        for batch in unique.chunks(REFS_PER_QUERY) {
+            let placeholders = vec!["?"; batch.len()].join(",");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT chunk_ref, chunk_idx, chunk_text, text_sha256,
+                        byte_start, byte_end, origin_type, page, line, col,
+                        bbox_x, bbox_y, bbox_w, bbox_h
+                 FROM chunks WHERE chunk_ref IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(
+                params_from_iter(batch.iter().map(ChunkRef::as_str)),
+                |row| {
+                    let origin = source_origin_from_parts(
+                        &row.get::<_, String>(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                    )
+                    .ok_or_else(|| {
+                        rusqlite::Error::InvalidColumnType(
+                            6,
+                            "origin_type".to_string(),
+                            rusqlite::types::Type::Text,
+                        )
+                    })?;
+                    Ok(ManagedChunkData {
+                        chunk_ref: ChunkRef(row.get(0)?),
+                        ordinal: row.get::<_, i64>(1)? as usize,
+                        text: row.get(2)?,
+                        text_sha256: row.get(3)?,
+                        extraction_byte_range: ByteRange {
+                            start: row.get::<_, i64>(4)? as usize,
+                            end: row.get::<_, i64>(5)? as usize,
+                        },
+                        origin,
+                    })
+                },
+            )?;
+            for row in rows {
+                let chunk = row?;
+                found.insert(chunk.chunk_ref.clone(), chunk);
+            }
+        }
+        Ok(refs
+            .iter()
+            .map(|stable_ref| found[stable_ref].clone())
+            .collect())
+    }
+
+    pub fn accumulate_chunk_refs(
+        &self,
+        groups: &[Vec<ChunkRef>],
+    ) -> anyhow::Result<Vec<ChunkAccumulation>> {
+        anyhow::ensure!(
+            groups.iter().all(|group| !group.is_empty()),
+            "An aggregate over no chunks is not a vector"
+        );
+        let wanted: HashSet<ChunkRef> = groups.iter().flatten().cloned().collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rowids = self.resolve_chunk_refs(&wanted)?;
+        let rowid_groups: Vec<Vec<i64>> = groups
+            .iter()
+            .map(|group| group.iter().map(|stable_ref| rowids[stable_ref]).collect())
+            .collect();
+        self.accumulate_chunk_ids(&rowid_groups, "Aggregate request")
+    }
+
     /// The stored vectors of named chunks, L2-normalized, keyed by chunk id.
     ///
     /// Shared by every endpoint that answers a question *about* named chunks
@@ -4479,6 +6272,37 @@ impl SemanticIndex {
         Ok(normalized)
     }
 
+    fn accumulate_chunk_ids(
+        &self,
+        groups: &[Vec<i64>],
+        asked_for: &str,
+    ) -> anyhow::Result<Vec<ChunkAccumulation>> {
+        anyhow::ensure!(
+            groups.iter().all(|group| !group.is_empty()),
+            "An aggregate over no chunks is not a vector"
+        );
+        let wanted: HashSet<i64> = groups.iter().flatten().copied().collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let normalized = self.normalized_chunk_vectors(&wanted, asked_for)?;
+        Ok(groups
+            .iter()
+            .map(|group| {
+                let mut sum = vec![0.0; self.dimension];
+                for chunk_id in group {
+                    for (total, value) in sum.iter_mut().zip(&normalized[chunk_id]) {
+                        *total += value;
+                    }
+                }
+                ChunkAccumulation {
+                    sum,
+                    member_count: group.len(),
+                }
+            })
+            .collect())
+    }
+
     /// The normalized mean of the stored vectors of named chunks, one mean per
     /// group, in the order the groups arrived.
     ///
@@ -4501,30 +6325,10 @@ impl SemanticIndex {
     /// Groups are scanned together: one pass over the union of the ids, so the
     /// cost is the ids asked for and not the groups they are arranged into.
     pub fn chunk_centroids(&self, groups: &[Vec<i64>]) -> anyhow::Result<Vec<Vec<f32>>> {
-        anyhow::ensure!(
-            groups.iter().all(|group| !group.is_empty()),
-            "A centroid over no chunks is not a vector; every group must name at least one chunk"
-        );
-        let wanted: HashSet<i64> = groups.iter().flatten().copied().collect();
-        if wanted.is_empty() {
-            return Ok(Vec::new());
-        }
-        let normalized = self.normalized_chunk_vectors(&wanted, "Centroid request")?;
-
-        Ok(groups
-            .iter()
-            .map(|group| {
-                let mut sum = vec![0.0f32; self.dimension];
-                for chunk_id in group {
-                    // Present: the missing-id check above left no other case.
-                    // A repeated id counts twice, which is the caller's
-                    // arithmetic and not this function's to silently correct.
-                    for (total, value) in sum.iter_mut().zip(&normalized[chunk_id]) {
-                        *total += value;
-                    }
-                }
-                normalized_vector(&centroid(&sum, group.len()))
-            })
+        Ok(self
+            .accumulate_chunk_ids(groups, "Centroid request")?
+            .into_iter()
+            .map(|group| normalized_vector(&centroid(&group.sum, group.member_count)))
             .collect())
     }
 
@@ -5277,6 +7081,8 @@ impl SemanticIndex {
         data_dir: &Path,
         root: Option<&Path>,
     ) -> anyhow::Result<IndexStatus> {
+        load_sqlite_vec();
+        recover_interrupted_index_replacement(data_dir)?;
         let path = db_path(data_dir);
         anyhow::ensure!(path.exists(), "No semantic index found");
         let conn = Connection::open(&path)
@@ -5317,6 +7123,26 @@ impl SemanticIndex {
         if schema_version == 4 {
             Self::migrate_v4_to_v5(&conn)?;
             schema_version = 5;
+        }
+        if schema_version == 5 {
+            Self::migrate_v5_to_v6(&conn)?;
+            schema_version = 6;
+        }
+        if schema_version == 6 {
+            Self::migrate_v6_to_v7(&conn)?;
+            schema_version = 7;
+        }
+        if schema_version == 7 {
+            Self::migrate_v7_to_v8(&conn)?;
+            schema_version = 8;
+        }
+        if schema_version == 8 {
+            Self::migrate_v8_to_v9(&conn)?;
+            schema_version = 9;
+        }
+        if schema_version == 9 {
+            Self::migrate_v9_to_v10(&conn)?;
+            schema_version = 10;
         }
         anyhow::ensure!(
             schema_version == SCHEMA_VERSION,
@@ -5436,6 +7262,12 @@ impl SemanticIndex {
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
+        remove_sqlite_sidecars(&path);
+        let backup = replacement_backup_path(data_dir);
+        if backup.exists() {
+            std::fs::remove_file(&backup)?;
+        }
+        remove_sqlite_sidecars(&backup);
         Ok(())
     }
 }

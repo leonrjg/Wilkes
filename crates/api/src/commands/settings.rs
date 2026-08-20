@@ -90,6 +90,25 @@ pub async fn update_scoped_settings(
         return update_settings(global_path, patch).await;
     }
 
+    let manifest = read_manifest(workspace_path)?;
+    if manifest.is_application_managed() {
+        let changes_managed_configuration = patch.as_object().is_some_and(|object| {
+            [
+                "favorites",
+                "bookmarked_dirs",
+                "recent_dirs",
+                "last_directory",
+                "semantic",
+            ]
+            .iter()
+            .any(|key| object.contains_key(*key))
+        });
+        anyhow::ensure!(
+            !changes_managed_configuration,
+            "MANAGED_WORKSPACE_PROTECTED: roots and semantic configuration are immutable"
+        );
+    }
+
     // Validate and normalize workspace-owned values before writing either
     // file, so a malformed mixed patch cannot partially update global prefs.
     let object = patch.as_object();

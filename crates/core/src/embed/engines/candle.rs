@@ -782,6 +782,14 @@ impl EmbedderInstaller for CandleInstaller {
         let model_id = &self.model.0;
         let dimension = read_dimension(data_dir, model_id)?;
         let prefixes = super::aux_config::load_prefixes(data_dir, model_id);
+        let artifact_revision =
+            crate::embed::identity::artifact_revision_for_cache(data_dir, model_id)?;
+        let embedding_space_identity = crate::embed::EmbeddingSpaceIdentity::with_artifact_revision(
+            EmbeddingEngine::Candle,
+            model_id,
+            dimension,
+            artifact_revision,
+        );
         Ok(Arc::new(crate::worker::embedder::WorkerEmbedder::new(
             self.manager.clone(),
             crate::worker::embedder::WorkerEmbedderConfig {
@@ -792,6 +800,7 @@ impl EmbedderInstaller for CandleInstaller {
                 data_dir: data_dir.to_path_buf(),
                 query_prefix: prefixes.query_prefix,
                 passage_prefix: prefixes.passage_prefix,
+                embedding_space_identity,
             },
         )))
     }

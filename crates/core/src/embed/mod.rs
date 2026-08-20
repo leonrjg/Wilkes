@@ -1,5 +1,6 @@
 pub mod cluster;
 pub mod engines;
+pub mod identity;
 pub mod index;
 pub mod installer;
 
@@ -9,11 +10,24 @@ use std::sync::Arc;
 
 use crate::types::EmbeddingEngine;
 
+pub use identity::{
+    ChunkRef, DocumentSnapshotId, EmbeddingSpaceId, EmbeddingSpaceIdentity, ExtractionRecipe,
+    IndexEmbeddingMetadata, RenditionId,
+};
+
 pub trait Embedder: Send + Sync {
     fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>>;
     fn model_id(&self) -> &str;
     fn dimension(&self) -> usize;
     fn engine(&self) -> EmbeddingEngine;
+
+    /// Exact, versioned description of the coordinate system produced by this
+    /// runtime. Changing an artifact, preprocessing, pooling, or normalization
+    /// recipe must change this identity before an existing index can be opened
+    /// or copied from.
+    fn embedding_space_identity(&self) -> EmbeddingSpaceIdentity {
+        EmbeddingSpaceIdentity::for_runtime(self.engine(), self.model_id(), self.dimension())
+    }
 
     /// Suggested batch size for this model.
     /// `None` means the entire input should be embedded as a single batch

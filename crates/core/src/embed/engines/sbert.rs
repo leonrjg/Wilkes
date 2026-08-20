@@ -243,6 +243,14 @@ impl EmbedderInstaller for SBERTInstaller {
             })?;
 
         let prefixes = aux_config::load_prefixes(_data_dir, model_id);
+        let artifact_revision =
+            crate::embed::identity::artifact_revision_for_cache(_data_dir, model_id)?;
+        let embedding_space_identity = crate::embed::EmbeddingSpaceIdentity::with_artifact_revision(
+            EmbeddingEngine::SBERT,
+            model_id,
+            dimension,
+            artifact_revision,
+        );
 
         Ok(Arc::new(WorkerEmbedder::new(
             self.manager.clone(),
@@ -254,6 +262,7 @@ impl EmbedderInstaller for SBERTInstaller {
                 data_dir: _data_dir.to_path_buf(),
                 query_prefix: prefixes.query_prefix,
                 passage_prefix: prefixes.passage_prefix,
+                embedding_space_identity,
             },
         )))
     }

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::http::errors::{err, server_err, ErrorBody};
+use crate::http::errors::{err, managed_err, server_err, ErrorBody};
 use crate::http::search::forward_search_results;
 #[cfg(test)]
 use crate::http::state::BroadcastEmitter;
@@ -31,16 +31,18 @@ use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
-#[cfg(test)]
 use wilkes_api::context::AppContext;
-use wilkes_api::workspace::{WorkspaceState, WorkspaceSummary};
+use wilkes_api::workspace::{
+    EnsureManagedWorkspace, ManagedWorkspaceStatus, WorkspaceState, WorkspaceSummary,
+};
 use wilkes_core::completion::{CompletionFeedback, CompletionRequest};
+use wilkes_core::embed::ChunkRef;
 use wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryInput;
 use wilkes_core::types::{
     AddOutcome, BookmarkClustersQuery, ChunkTopicsQuery, CitationLinksQuery, CitationResult,
@@ -64,6 +66,7 @@ fn confine_to_uploads(
         (
             StatusCode::NOT_FOUND,
             Json(ErrorBody {
+                code: None,
                 error: "Path not found".into(),
             }),
         )
@@ -254,6 +257,265 @@ async fn switch_workspace_handler(
         .await
         .map(Json)
         .map_err(|error| server_err(error.to_string()))
+}
+
+async fn ensure_underdog_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<EnsureManagedWorkspace>,
+) -> Result<Json<ManagedWorkspaceStatus>, (StatusCode, Json<ErrorBody>)> {
+    let manager = state.workspaces.as_ref().ok_or_else(|| {
+        managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
+    })?;
+    let initial = manager
+        .ensure_underdog_workspace(request)
+        .await
+        .map_err(|error| managed_err(format!("{error:#}")))?;
+    let context = manager
+        .context_for(&initial.corpus_id)
+        .await
+        .map_err(|error| managed_err(format!("{error:#}")))?;
+    context
+        .ensure_managed_runtime()
+        .await
+        .map_err(managed_err)?;
+    let status = manager
+        .underdog_workspace_status(&initial.corpus_id)
+        .await
+        .map_err(|error| managed_err(format!("{error:#}")))?;
+    Ok(Json(managed_status_with_pending(status, &context)))
+}
+
+fn managed_status_with_pending(
+    mut status: ManagedWorkspaceStatus,
+    context: &AppContext,
+) -> ManagedWorkspaceStatus {
+    let (imports, builds) = context.managed_pending_operations();
+    status.pending_imports = imports;
+    status.pending_builds = builds;
+    status
+}
+
+#[derive(Deserialize)]
+struct ManagedStatusQuery {
+    corpus_id: String,
+}
+
+async fn underdog_workspace_status_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ManagedStatusQuery>,
+) -> Result<Json<ManagedWorkspaceStatus>, (StatusCode, Json<ErrorBody>)> {
+    let manager = state.workspaces.as_ref().ok_or_else(|| {
+        managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
+    })?;
+    let status = manager
+        .underdog_workspace_status(&query.corpus_id)
+        .await
+        .map_err(|error| managed_err(format!("{error:#}")))?;
+    let context = manager
+        .context_for(&query.corpus_id)
+        .await
+        .map_err(|error| managed_err(format!("{error:#}")))?;
+    Ok(Json(managed_status_with_pending(status, &context)))
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ManagedImportSource {
+    Path {
+        path: PathBuf,
+    },
+    WilkesFile {
+        workspace_id: String,
+        root: PathBuf,
+        path: PathBuf,
+    },
+}
+
+#[derive(Deserialize)]
+struct ManagedImportBody {
+    corpus_id: String,
+    expected_embedding_space_id: String,
+    idempotency_key: String,
+    source: ManagedImportSource,
+}
+
+async fn import_underdog_document_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ManagedImportBody>,
+) -> Result<Json<wilkes_api::context::ManagedDocumentExport>, (StatusCode, Json<ErrorBody>)> {
+    let manager = state.workspaces.as_ref().ok_or_else(|| {
+        managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
+    })?;
+    let status = manager
+        .underdog_workspace_status(&body.corpus_id)
+        .await
+        .map_err(|error| managed_err(format!("{error:#}")))?;
+    if status.embedding_space_id != body.expected_embedding_space_id {
+        return Err(managed_err(format!(
+            "EMBEDDING_SPACE_MISMATCH: corpus={}, request={}",
+            status.embedding_space_id, body.expected_embedding_space_id
+        )));
+    }
+    let managed = manager
+        .context_for(&body.corpus_id)
+        .await
+        .map_err(|error| managed_err(format!("{error:#}")))?;
+    managed
+        .ensure_managed_runtime()
+        .await
+        .map_err(managed_err)?;
+    let (path, source_workspace) = match &body.source {
+        ManagedImportSource::Path { path } => (path.clone(), None),
+        ManagedImportSource::WilkesFile {
+            workspace_id,
+            root,
+            path,
+        } => {
+            let source = manager
+                .context_for(workspace_id)
+                .await
+                .map_err(|error| managed_err(format!("{error:#}")))?;
+            let path = source
+                .authorize_managed_workspace_file(root.clone(), path.clone())
+                .await
+                .map_err(managed_err)?;
+            (path, Some(source))
+        }
+    };
+    let provenance = serde_json::to_value(&body.source)
+        .map_err(|error| managed_err(format!("Could not encode import provenance: {error}")))?;
+    managed
+        .import_managed_document(
+            body.corpus_id,
+            body.idempotency_key,
+            path,
+            source_workspace,
+            provenance,
+        )
+        .await
+        .map(Json)
+        .map_err(managed_err)
+}
+
+#[derive(Deserialize)]
+struct ManagedGroupsBody {
+    corpus_id: String,
+    expected_embedding_space_id: String,
+    groups: Vec<Vec<ChunkRef>>,
+}
+
+#[derive(Deserialize)]
+struct ManagedResolveBody {
+    corpus_id: String,
+    expected_embedding_space_id: String,
+    chunk_refs: Vec<ChunkRef>,
+}
+
+async fn underdog_resolve_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ManagedResolveBody>,
+) -> Result<Json<wilkes_api::context::ManagedChunkResolution>, (StatusCode, Json<ErrorBody>)> {
+    let context =
+        managed_context(&state, &body.corpus_id, &body.expected_embedding_space_id).await?;
+    context
+        .managed_resolve_chunks(body.chunk_refs)
+        .await
+        .map(Json)
+        .map_err(managed_err)
+}
+
+async fn underdog_accumulate_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ManagedGroupsBody>,
+) -> Result<Json<wilkes_api::context::ManagedAccumulations>, (StatusCode, Json<ErrorBody>)> {
+    let context =
+        managed_context(&state, &body.corpus_id, &body.expected_embedding_space_id).await?;
+    context
+        .managed_accumulate(body.groups)
+        .await
+        .map(Json)
+        .map_err(managed_err)
+}
+
+#[derive(Deserialize)]
+struct ManagedSimilarityBody {
+    corpus_id: String,
+    expected_embedding_space_id: String,
+    probes: Vec<wilkes_api::context::ManagedSimilarityProbeRequest>,
+    #[serde(default)]
+    chunk_refs: Vec<ChunkRef>,
+}
+
+async fn underdog_similarity_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ManagedSimilarityBody>,
+) -> Result<Json<wilkes_api::context::ManagedChunkSimilarities>, (StatusCode, Json<ErrorBody>)> {
+    let context =
+        managed_context(&state, &body.corpus_id, &body.expected_embedding_space_id).await?;
+    context
+        .managed_chunk_similarity(body.probes, body.chunk_refs)
+        .await
+        .map(Json)
+        .map_err(managed_err)
+}
+
+#[derive(Deserialize)]
+struct ManagedEmbedTextBody {
+    corpus_id: String,
+    expected_embedding_space_id: String,
+    texts: Vec<String>,
+}
+
+async fn underdog_embed_text_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ManagedEmbedTextBody>,
+) -> Result<Json<wilkes_api::context::ManagedEmbeddedTexts>, (StatusCode, Json<ErrorBody>)> {
+    let context =
+        managed_context(&state, &body.corpus_id, &body.expected_embedding_space_id).await?;
+    context
+        .managed_embed_texts(body.texts)
+        .await
+        .map(Json)
+        .map_err(managed_err)
+}
+
+async fn managed_context(
+    state: &Arc<AppState>,
+    corpus_id: &str,
+    expected_embedding_space_id: &str,
+) -> Result<Arc<wilkes_api::context::AppContext>, (StatusCode, Json<ErrorBody>)> {
+    let manager = state.workspaces.as_ref().ok_or_else(|| {
+        managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
+    })?;
+    let status = manager
+        .underdog_workspace_status(corpus_id)
+        .await
+        .map_err(|error| managed_err(format!("{error:#}")))?;
+    if status.embedding_space_id != expected_embedding_space_id {
+        return Err(managed_err(format!(
+            "EMBEDDING_SPACE_MISMATCH: corpus={}, request={expected_embedding_space_id}",
+            status.embedding_space_id
+        )));
+    }
+    if !status.ready {
+        return Err(managed_err(
+            "MANAGED_WORKSPACE_NOT_FOUND: managed index is not ready",
+        ));
+    }
+    let context = manager
+        .context_for(corpus_id)
+        .await
+        .map_err(|error| managed_err(format!("{error:#}")))?;
+    let actual = context
+        .ensure_managed_runtime()
+        .await
+        .map_err(managed_err)?;
+    if actual != expected_embedding_space_id {
+        return Err(managed_err(format!(
+            "EMBEDDING_SPACE_MISMATCH: runtime={actual}, request={expected_embedding_space_id}"
+        )));
+    }
+    Ok(context)
 }
 
 async fn list_bookmarks_handler(
@@ -1188,6 +1450,7 @@ async fn delete_upload_handler(
         (
             StatusCode::NOT_FOUND,
             Json(ErrorBody {
+                code: None,
                 error: "Not found".into(),
             }),
         )
@@ -1482,6 +1745,34 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/workspaces/{id}/activate",
             post(switch_workspace_handler),
+        )
+        .route(
+            "/api/integrations/underdog/workspace",
+            put(ensure_underdog_workspace_handler),
+        )
+        .route(
+            "/api/integrations/underdog/status",
+            get(underdog_workspace_status_handler),
+        )
+        .route(
+            "/api/integrations/underdog/documents/import",
+            post(import_underdog_document_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/api/integrations/underdog/chunks/resolve",
+            post(underdog_resolve_handler),
+        )
+        .route(
+            "/api/integrations/underdog/chunks/accumulate",
+            post(underdog_accumulate_handler),
+        )
+        .route(
+            "/api/integrations/underdog/chunks/similarity",
+            post(underdog_similarity_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/api/integrations/underdog/embed/text",
+            post(underdog_embed_text_handler),
         )
         .route("/api/bookmarks", get(list_bookmarks_handler))
         .route("/api/bookmarks", post(add_bookmark_handler))
@@ -2744,5 +3035,49 @@ mod tests {
         events_tx
             .send(("test".to_string(), serde_json::json!({})))
             .unwrap();
+    }
+
+    #[test]
+    fn managed_contract_fixture_matches_the_server_wire_schema() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/internal/specs/fixtures/managed-semantic-corpus-v1.json"
+        ))
+        .unwrap();
+        let ensure: EnsureManagedWorkspace =
+            serde_json::from_value(fixture["ensure_request"].clone()).unwrap();
+        assert_eq!(ensure.corpus_key, "store-018f");
+
+        let import: ManagedImportBody =
+            serde_json::from_value(fixture["import_request"].clone()).unwrap();
+        assert_eq!(import.corpus_id, "managed-corpus-018f");
+        match import.source {
+            ManagedImportSource::WilkesFile {
+                workspace_id,
+                root,
+                path,
+            } => {
+                assert_eq!(workspace_id, "workspace-example");
+                assert_eq!(root, PathBuf::from("/library"));
+                assert_eq!(path, PathBuf::from("/library/paper.pdf"));
+            }
+            ManagedImportSource::Path { .. } => panic!("expected wilkes_file fixture"),
+        }
+
+        let response = &fixture["import_response"];
+        for required in [
+            "corpus_id",
+            "snapshot_id",
+            "rendition_id",
+            "extracted_content_sha256",
+            "embedding_space_id",
+            "outline",
+            "chunks",
+            "embedding_work",
+        ] {
+            assert!(
+                response.get(required).is_some(),
+                "missing fixture field {required}"
+            );
+        }
     }
 }

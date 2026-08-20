@@ -188,6 +188,7 @@ pub async fn asset_access_plan(
         (
             StatusCode::NOT_FOUND,
             Json(ErrorBody {
+                code: None,
                 error: "File not found".into(),
             }),
         )
@@ -216,6 +217,7 @@ pub async fn confined_root_for_search(
         (
             StatusCode::NOT_FOUND,
             Json(ErrorBody {
+                code: None,
                 error: "Path not found".into(),
             }),
         )

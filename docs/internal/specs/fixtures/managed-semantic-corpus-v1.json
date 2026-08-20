@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "ensure_request": {
+    "corpus_key": "store-018f",
+    "embedding": {
+      "engine": "candle",
+      "model": "sentence-transformers/all-MiniLM-L6-v2",
+      "dimension": 384
+    },
+    "chunk_size": 1000,
+    "chunk_overlap": 100
+  },
+  "import_request": {
+    "corpus_id": "managed-corpus-018f",
+    "expected_embedding_space_id": "space-example",
+    "idempotency_key": "job-018f",
+    "source": {
+      "kind": "wilkes_file",
+      "workspace_id": "workspace-example",
+      "root": "/library",
+      "path": "/library/paper.pdf"
+    }
+  },
+  "import_response": {
+    "corpus_id": "managed-corpus-018f",
+    "source_sha256": "source-sha256-example",
+    "source_byte_len": 12345,
+    "media_type": "application/pdf",
+    "snapshot_id": "snapshot-example",
+    "rendition_id": "rendition-example",
+    "extraction_recipe_id": "extract-example",
+    "extracted_content_sha256": "content-sha256-example",
+    "chunk_count": 1,
+    "embedding_space_id": "space-example",
+    "engine": "candle",
+    "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+    "dimension": 384,
+    "passage_input_recipe": "wilkes-passage-input-v1",
+    "outline": [
+      {
+        "title": "Introduction",
+        "level": 1,
+        "chunk_ordinal": 0,
+        "page": 1,
+        "byte_offset": null
+      }
+    ],
+    "chunks": [
+      {
+        "chunk_ref": "chunk-example",
+        "ordinal": 0,
+        "text": "Example passage.",
+        "text_sha256": "text-sha256-example",
+        "byte_range": { "start": 0, "end": 16 },
+        "origin": {
+          "PdfPage": {
+            "page": 1,
+            "bbox": null
+          }
+        }
+      }
+    ],
+    "embedding_work": {
+      "chunks": 1,
+      "reused": 1,
+      "computed": 0
+    }
+  },
+  "accumulate_request": {
+    "corpus_id": "managed-corpus-018f",
+    "expected_embedding_space_id": "space-example",
+    "groups": [["chunk-example"]]
+  },
+  "accumulate_response": {
+    "embedding_space_id": "space-example",
+    "dimension": 384,
+    "groups": [
+      {
+        "sum": [0.25, -0.5],
+        "member_count": 1
+      }
+    ]
+  },
+  "error_response": {
+    "code": "EMBEDDING_SPACE_MISMATCH",
+    "error": "EMBEDDING_SPACE_MISMATCH: corpus=space-example, request=space-other"
+  }
+}

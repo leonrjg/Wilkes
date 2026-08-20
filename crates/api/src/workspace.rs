@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::{mpsc, Mutex};
+use wilkes_core::embed::{EmbeddingSpaceIdentity, ExtractionRecipe};
 use wilkes_core::types::{SelectedEmbedder, SemanticSettings};
 use wilkes_core::worker::manager::{ManagerEvent, WorkerPaths};
 
@@ -38,12 +39,58 @@ pub struct WorkspaceState {
     pub workspaces: Vec<WorkspaceSummary>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkspaceKind {
+    #[default]
+    User,
+    ApplicationManaged {
+        owner: String,
+        purpose: String,
+        corpus_key: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureManagedWorkspace {
+    pub corpus_key: String,
+    pub embedding: SelectedEmbedder,
+    pub chunk_size: usize,
+    pub chunk_overlap: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ManagedWorkspaceStatus {
+    /// Opaque corpus token. It is implemented by a workspace id but does not
+    /// grant generic workspace capabilities.
+    pub corpus_id: String,
+    pub embedding_space_id: String,
+    pub embedding_space_identity: EmbeddingSpaceIdentity,
+    pub extraction_recipe_id: String,
+    pub ready: bool,
+    pub indexed_documents: usize,
+    pub indexed_chunks: usize,
+    pub required_chunks: usize,
+    pub embedded_chunks: usize,
+    pub reused_chunks: usize,
+    pub computed_chunks: usize,
+    pub managed_source_bytes: u64,
+    pub temporary_bytes: u64,
+    pub index_bytes: u64,
+    pub total_managed_bytes: u64,
+    pub integrity_checked_at_ms: i64,
+    pub pending_imports: u64,
+    pub pending_builds: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct WorkspaceManifest {
     #[serde(default = "manifest_version")]
     version: u32,
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub kind: WorkspaceKind,
     #[serde(default)]
     pub favorites: Vec<PathBuf>,
     #[serde(default)]
@@ -64,11 +111,16 @@ impl WorkspaceManifest {
             version: MANIFEST_VERSION,
             id,
             name,
+            kind: WorkspaceKind::User,
             favorites: Vec::new(),
             recent_roots: Vec::new(),
             active_root: None,
             semantic: None,
         }
+    }
+
+    pub(crate) fn is_application_managed(&self) -> bool {
+        matches!(self.kind, WorkspaceKind::ApplicationManaged { .. })
     }
 
     fn summary(&self, embedding: SelectedEmbedder) -> WorkspaceSummary {
@@ -116,6 +168,7 @@ fn contains_legacy_library(app_data_dir: &Path) -> bool {
     [
         "semantic_index.db",
         "semantic_index.db.tmp",
+        "semantic_index.db.replacement-backup",
         "file_metadata.db",
         "research.db",
         "chat-conversations.json",
@@ -305,7 +358,9 @@ pub async fn read_workspace_state(
             "workspace manifest id mismatch for {id}"
         );
         let settings = get_scoped_settings(settings_path, &manifest_path).await?;
-        workspaces.push(manifest.summary(settings.semantic.selected));
+        if !manifest.is_application_managed() {
+            workspaces.push(manifest.summary(settings.semantic.selected));
+        }
     }
     Ok(WorkspaceState {
         active_workspace_id: registry.active_workspace_id,
@@ -525,6 +580,10 @@ impl WorkspaceManager {
             );
             let path = workspace_manifest_path(&self.app_data_dir, id);
             let manifest = update_manifest(&path, |manifest| {
+                anyhow::ensure!(
+                    !manifest.is_application_managed(),
+                    "MANAGED_WORKSPACE_PROTECTED: managed workspaces cannot be renamed"
+                );
                 manifest.name = name.to_string();
                 Ok(())
             })?;
@@ -544,6 +603,11 @@ impl WorkspaceManager {
             anyhow::ensure!(
                 registry.workspace_ids.iter().any(|item| item == id),
                 "Unknown workspace"
+            );
+            let manifest = read_manifest(&workspace_manifest_path(&self.app_data_dir, id))?;
+            anyhow::ensure!(
+                !manifest.is_application_managed(),
+                "MANAGED_WORKSPACE_PROTECTED: managed workspaces cannot be activated"
             );
 
             if registry.active_workspace_id == id {
@@ -598,6 +662,191 @@ impl WorkspaceManager {
             serde_json::to_value(&state).unwrap_or_default(),
         );
         Ok(state)
+    }
+
+    /// Create or retrieve Underdog's protected corpus workspace. Configuration
+    /// is immutable after the first successful ensure.
+    pub async fn ensure_underdog_workspace(
+        &self,
+        request: EnsureManagedWorkspace,
+    ) -> anyhow::Result<ManagedWorkspaceStatus> {
+        let corpus_key = request.corpus_key.trim();
+        anyhow::ensure!(!corpus_key.is_empty(), "corpus_key must not be empty");
+        anyhow::ensure!(request.chunk_size > 0, "chunk_size must be positive");
+        anyhow::ensure!(
+            request.chunk_overlap < request.chunk_size,
+            "chunk_overlap must be smaller than chunk_size"
+        );
+
+        let mut semantic = get_scoped_settings(&self.settings_path, &self.settings_path)
+            .await?
+            .semantic;
+        semantic.enabled = true;
+        semantic.selected = request.embedding.clone();
+        semantic.chunk_size = request.chunk_size;
+        semantic.chunk_overlap = request.chunk_overlap;
+
+        let id = {
+            let _guard = self.registry_lock.lock();
+            let mut registry = load_registry(&self.app_data_dir)?;
+            let mut existing = None;
+            for id in &registry.workspace_ids {
+                let manifest = read_manifest(&workspace_manifest_path(&self.app_data_dir, id))?;
+                if matches!(
+                    &manifest.kind,
+                    WorkspaceKind::ApplicationManaged { owner, purpose, corpus_key: key }
+                        if owner == "underdog" && purpose == "semantic-corpus" && key == corpus_key
+                ) {
+                    existing = Some(manifest);
+                    break;
+                }
+            }
+            if let Some(manifest) = existing {
+                let configured = manifest.semantic.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("MANAGED_WORKSPACE_CONFIGURATION_MISMATCH: semantic configuration is absent")
+                })?;
+                anyhow::ensure!(
+                    configured.selected == request.embedding
+                        && configured.chunk_size == request.chunk_size
+                        && configured.chunk_overlap == request.chunk_overlap,
+                    "MANAGED_WORKSPACE_CONFIGURATION_MISMATCH: existing corpus uses a different embedding or extraction configuration"
+                );
+                manifest.id
+            } else {
+                let id = uuid::Uuid::new_v4().to_string();
+                let managed_sources =
+                    workspace_root(&self.app_data_dir, &id).join("managed_sources");
+                std::fs::create_dir_all(&managed_sources)?;
+                semantic.index_path =
+                    Some(workspace_root(&self.app_data_dir, &id).join("semantic_index.db"));
+                let manifest = WorkspaceManifest {
+                    version: MANIFEST_VERSION,
+                    id: id.clone(),
+                    name: "Underdog semantic corpus".to_string(),
+                    kind: WorkspaceKind::ApplicationManaged {
+                        owner: "underdog".to_string(),
+                        purpose: "semantic-corpus".to_string(),
+                        corpus_key: corpus_key.to_string(),
+                    },
+                    favorites: vec![managed_sources.clone()],
+                    recent_roots: Vec::new(),
+                    active_root: Some(managed_sources),
+                    semantic: Some(semantic),
+                };
+                write_manifest(&workspace_manifest_path(&self.app_data_dir, &id), &manifest)?;
+                registry.workspace_ids.push(id.clone());
+                atomic_write_json(&registry_path(&self.app_data_dir), &registry)?;
+                id
+            }
+        };
+        self.underdog_workspace_status(&id).await
+    }
+
+    pub async fn underdog_workspace_status(
+        &self,
+        corpus_id: &str,
+    ) -> anyhow::Result<ManagedWorkspaceStatus> {
+        let manifest = read_manifest(&workspace_manifest_path(&self.app_data_dir, corpus_id))?;
+        anyhow::ensure!(
+            matches!(
+                manifest.kind,
+                WorkspaceKind::ApplicationManaged { ref owner, ref purpose, .. }
+                    if owner == "underdog" && purpose == "semantic-corpus"
+            ),
+            "MANAGED_WORKSPACE_NOT_FOUND"
+        );
+        let semantic = manifest.semantic.ok_or_else(|| {
+            anyhow::anyhow!(
+                "MANAGED_WORKSPACE_CONFIGURATION_MISMATCH: semantic configuration is absent"
+            )
+        })?;
+        let configured_identity = EmbeddingSpaceIdentity::for_runtime(
+            semantic.selected.engine,
+            semantic.selected.model.model_id(),
+            semantic.selected.dimension,
+        );
+        let index_root = workspace_root(&self.app_data_dir, corpus_id);
+        let opened = wilkes_core::embed::index::SemanticIndex::open_for_maintenance(&index_root)
+            .and_then(|index| {
+                Ok((
+                    index.embedding_space_identity()?,
+                    index.managed_completeness()?,
+                    index.managed_embedding_work_totals()?,
+                ))
+            })
+            .ok();
+        let stored_identity = opened.as_ref().map(|(identity, _, _)| identity.clone());
+        let completeness = opened
+            .as_ref()
+            .map(|(_, counts, _)| *counts)
+            .unwrap_or((0, 0, 0));
+        let embedding_work = opened
+            .as_ref()
+            .map(|(_, _, totals)| *totals)
+            .unwrap_or((0, 0));
+        let ready = stored_identity.as_ref().is_some_and(|identity| {
+            identity.engine == semantic.selected.engine
+                && identity.model_id == semantic.selected.model.model_id()
+                && identity.dimension == semantic.selected.dimension
+        }) && completeness.1 == completeness.2;
+        let identity = stored_identity.unwrap_or(configured_identity);
+        fn directory_bytes(path: &Path) -> u64 {
+            let mut bytes = 0;
+            let mut pending = vec![path.to_path_buf()];
+            while let Some(directory) = pending.pop() {
+                let Ok(entries) = std::fs::read_dir(directory) else {
+                    continue;
+                };
+                for entry in entries.filter_map(Result::ok) {
+                    match entry.metadata() {
+                        Ok(metadata) if metadata.is_dir() => pending.push(entry.path()),
+                        Ok(metadata) => bytes += metadata.len(),
+                        Err(_) => {}
+                    }
+                }
+            }
+            bytes
+        }
+        let managed_sources = index_root.join("managed_sources");
+        let all_managed_source_bytes = directory_bytes(&managed_sources);
+        let temporary_bytes = directory_bytes(&managed_sources.join(".imports"));
+        let managed_source_bytes = all_managed_source_bytes.saturating_sub(temporary_bytes);
+        let index_bytes = [
+            "semantic_index.db",
+            "semantic_index.db-wal",
+            "semantic_index.db-shm",
+        ]
+        .iter()
+        .map(|name| {
+            std::fs::metadata(index_root.join(name))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        })
+        .sum();
+        Ok(ManagedWorkspaceStatus {
+            corpus_id: corpus_id.to_string(),
+            embedding_space_id: identity.id().0,
+            embedding_space_identity: identity,
+            extraction_recipe_id: ExtractionRecipe::new(
+                semantic.chunk_size,
+                semantic.chunk_overlap,
+            )
+            .id(),
+            ready,
+            indexed_documents: completeness.0,
+            indexed_chunks: completeness.2,
+            required_chunks: completeness.1,
+            embedded_chunks: completeness.2,
+            reused_chunks: embedding_work.0,
+            computed_chunks: embedding_work.1,
+            managed_source_bytes,
+            temporary_bytes,
+            index_bytes,
+            total_managed_bytes: managed_source_bytes + temporary_bytes + index_bytes,
+            integrity_checked_at_ms: chrono::Utc::now().timestamp_millis(),
+            pending_imports: 0,
+            pending_builds: 0,
+        })
     }
 }
 
@@ -655,6 +904,55 @@ mod tests {
             state.workspaces[0].embedding,
             wilkes_core::types::Settings::default().semantic.selected
         );
+    }
+
+    #[tokio::test]
+    async fn managed_workspace_is_idempotent_hidden_and_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("global-settings.json");
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings_path, events).unwrap();
+        let request = EnsureManagedWorkspace {
+            corpus_key: "store-1".to_string(),
+            embedding: SelectedEmbedder::default(),
+            chunk_size: 600,
+            chunk_overlap: 128,
+        };
+        let first = manager
+            .ensure_underdog_workspace(request.clone())
+            .await
+            .unwrap();
+        let second = manager.ensure_underdog_workspace(request).await.unwrap();
+        assert_eq!(first.corpus_id, second.corpus_id);
+        assert_eq!(manager.state().await.unwrap().workspaces.len(), 1);
+        assert!(manager
+            .rename(&first.corpus_id, "Visible".to_string())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("MANAGED_WORKSPACE_PROTECTED"));
+        assert!(manager
+            .switch(&first.corpus_id)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("MANAGED_WORKSPACE_PROTECTED"));
+
+        let mut mismatch = SelectedEmbedder::default();
+        mismatch.dimension += 1;
+        assert!(manager
+            .ensure_underdog_workspace(EnsureManagedWorkspace {
+                corpus_key: "store-1".to_string(),
+                embedding: mismatch,
+                chunk_size: 600,
+                chunk_overlap: 128,
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("MANAGED_WORKSPACE_CONFIGURATION_MISMATCH"));
+        manager.shutdown_all().await;
     }
 
     #[test]

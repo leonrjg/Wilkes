@@ -849,9 +849,12 @@ fn default_ollama_url() -> String {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum EmbeddingEngine {
+    #[serde(alias = "sbert")]
     SBERT,
+    #[serde(alias = "candle")]
     Candle,
     #[default]
+    #[serde(alias = "fastembed")]
     Fastembed,
 }
 
