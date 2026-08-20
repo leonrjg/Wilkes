@@ -659,7 +659,7 @@ pub enum PreviewData {
 /// Identifies an embedding model. For fastembed models this is the Debug representation
 /// of the `EmbeddingModel` enum variant (e.g. "BGEBaseENV15"); for SBERT/Candle models
 /// it is the HuggingFace model code. Serialises as a plain string.
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct EmbedderModel(pub String);
 
@@ -676,7 +676,7 @@ impl<'de> Deserialize<'de> for EmbedderModel {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SelectedEmbedder {
     pub engine: EmbeddingEngine,
     pub model: EmbedderModel,

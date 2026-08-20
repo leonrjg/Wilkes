@@ -856,7 +856,7 @@ fn handle_exit_event(app_handle: &AppHandle, event: tauri::RunEvent) {
         let Some(workspaces) = app_handle.try_state::<Arc<WorkspaceManager>>() else {
             return;
         };
-        let ctx = workspaces.active();
+        let workspaces = workspaces.inner().clone();
         // Kill any in-flight turn and the chat subprocesses themselves before
         // the process tree goes away, rather than leaving orphaned CLIs behind.
         if let Some(chat_manager) = app_handle.try_state::<Arc<ChatManager>>() {
@@ -878,7 +878,9 @@ fn handle_exit_event(app_handle: &AppHandle, event: tauri::RunEvent) {
             if let Some(http_api) = http_api {
                 http_api.stop().await;
             }
-            ctx.shutdown().await;
+            // Every workspace this manager opened, not only the active one:
+            // the HTTP API can have opened contexts for others.
+            workspaces.shutdown_all().await;
         });
     }
 }
@@ -1248,6 +1250,7 @@ async fn get_data_paths(app: AppHandle) -> Result<DataPaths, String> {
 async fn list_workspaces(app: AppHandle) -> Result<WorkspaceState, String> {
     workspace_manager(&app)
         .state()
+        .await
         .map_err(|error| error.to_string())
 }
 
@@ -1255,6 +1258,7 @@ async fn list_workspaces(app: AppHandle) -> Result<WorkspaceState, String> {
 async fn create_workspace(app: AppHandle, name: String) -> Result<WorkspaceSummary, String> {
     workspace_manager(&app)
         .create(name)
+        .await
         .map_err(|error| error.to_string())
 }
 
@@ -1266,13 +1270,14 @@ async fn rename_workspace(
 ) -> Result<WorkspaceSummary, String> {
     workspace_manager(&app)
         .rename(&workspace_id, name)
+        .await
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 async fn switch_workspace(app: AppHandle, workspace_id: String) -> Result<WorkspaceState, String> {
     let manager = workspace_manager(&app);
-    let current = manager.state().map_err(|error| error.to_string())?;
+    let current = manager.state().await.map_err(|error| error.to_string())?;
     if current.active_workspace_id == workspace_id {
         return Ok(current);
     }

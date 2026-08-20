@@ -38,7 +38,7 @@ async fn shutdown_signal(workspaces: Arc<WorkspaceManager>) {
         _ = terminate => {}
     }
 
-    workspaces.active().shutdown().await;
+    workspaces.shutdown_all().await;
 }
 
 #[tokio::main]

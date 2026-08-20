@@ -44,6 +44,30 @@ impl AppState {
     pub fn context(&self) -> Arc<wilkes_api::context::AppContext> {
         self.workspace_snapshot().0
     }
+
+    /// The context for a named workspace, or the active one when the request
+    /// names none.
+    ///
+    /// Naming a workspace does not activate it: this opens that workspace's
+    /// context alongside the active one, so a request can read a document out
+    /// of a library the user is not currently looking at without the registry,
+    /// the window, or anyone else's in-flight request moving.
+    pub async fn context_for(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> Result<Arc<wilkes_api::context::AppContext>, (StatusCode, Json<ErrorBody>)> {
+        let Some(id) = workspace_id else {
+            return Ok(self.context());
+        };
+        let manager = self
+            .workspaces
+            .as_ref()
+            .ok_or_else(|| server_err("Workspace manager is unavailable"))?;
+        manager
+            .context_for(id)
+            .await
+            .map_err(|error| server_err(error.to_string()))
+    }
 }
 
 pub struct BroadcastEmitter {
