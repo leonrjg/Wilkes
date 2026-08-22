@@ -21,11 +21,19 @@ the tokio worker thread they run on rather than yielding it.
 ### Evidence
 
 Single-file searches (scan work ≈ 0, which isolates the catalog phase) against
-the live MCP server, measuring `catalog_elapsed_ms` as concurrency rises:
+the live MCP server, measuring `catalog_elapsed_ms` as concurrency rises.
+
+Measured *after* the single-path catalog fix landed — use this as the baseline:
 
 | concurrency | 1 | 2 | 3 | 6 | 8 |
 |---|---|---|---|---|---|
-| catalog time | 1.0x | 1.3x | 1.4x | 1.9x | 2.6x |
+| catalog time | 3.0ms (1.0x) | 3.5ms (1.2x) | 5.0ms (1.7x) | 14.0ms (4.7x) | 13.5ms (4.5x) |
+
+The original reading, before that fix, was 5.0ms growing to 13.0ms (2.6x). The
+absolute cost at low concurrency dropped because a one-file query no longer
+walks the root, but the ceiling under load did not move — so the contention is
+*more* visible now, not less. A single-entry listing still takes both
+process-wide locks; only the work done while holding them got smaller.
 
 Contention is real but sub-linear, so this is a drag rather than a hard
 serialiser. It is why three concurrent low-CPU calls reached only a 1.66x
