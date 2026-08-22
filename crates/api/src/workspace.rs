@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::{mpsc, Mutex};
+use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::{EmbeddingSpaceIdentity, ExtractionRecipe};
 use wilkes_core::types::{SelectedEmbedder, SemanticSettings};
 use wilkes_core::worker::manager::{ManagerEvent, WorkerPaths};
 
 use crate::commands::settings::get_scoped_settings;
-use crate::context::{AppContext, EventEmitter};
+use crate::context::{AppContext, EventEmitter, ManagedCorpusBackup};
 use crate::startup::{StartupAction, StartupBlocker};
 
 const REGISTRY_VERSION: u32 = 1;
@@ -848,6 +849,218 @@ impl WorkspaceManager {
             pending_builds: 0,
         })
     }
+
+    /// Restores a self-verifying backup from Wilkes's own managed-backup
+    /// directory. The caller names only one directory leaf, never an arbitrary
+    /// path. A pre-created corpus for the same Underdog store may be replaced
+    /// only while it is empty; an established corpus is never overwritten.
+    pub async fn restore_underdog_workspace(
+        self: &Arc<Self>,
+        backup_name: &str,
+        expected_corpus_id: &str,
+        expected_embedding_space_id: &str,
+        expected_corpus_key: &str,
+    ) -> anyhow::Result<ManagedWorkspaceStatus> {
+        anyhow::ensure!(
+            !backup_name.is_empty()
+                && backup_name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()
+                        || matches!(character, '-' | '_' | '.')),
+            "invalid managed backup name"
+        );
+        let backup_root = self.app_data_dir.join("managed_backups").join(backup_name);
+        let backup: ManagedCorpusBackup =
+            serde_json::from_slice(&std::fs::read(backup_root.join("backup-manifest.json"))?)?;
+        anyhow::ensure!(
+            backup.format == "wilkes-managed-corpus-backup/v1",
+            "unsupported managed backup format"
+        );
+        anyhow::ensure!(
+            backup.corpus_id == expected_corpus_id,
+            "backup corpus mismatch"
+        );
+        anyhow::ensure!(
+            backup.embedding_space_id == expected_embedding_space_id,
+            "backup embedding-space mismatch"
+        );
+        verify_managed_backup_directory(&backup_root, &backup)?;
+        let mut manifest = read_manifest(&backup_root.join("workspace.json"))?;
+        anyhow::ensure!(
+            manifest.id == expected_corpus_id,
+            "workspace manifest corpus mismatch"
+        );
+        anyhow::ensure!(
+            matches!(
+                &manifest.kind,
+                WorkspaceKind::ApplicationManaged { owner, purpose, corpus_key }
+                    if owner == "underdog"
+                        && purpose == "semantic-corpus"
+                        && corpus_key == expected_corpus_key
+            ),
+            "backup belongs to a different managed owner or corpus key"
+        );
+
+        let _switch_guard = self.switch_lock.lock().await;
+        let existing = {
+            let _registry_guard = self.registry_lock.lock();
+            let registry = load_registry(&self.app_data_dir)?;
+            registry.workspace_ids.iter().find_map(|id| {
+                let found = read_manifest(&workspace_manifest_path(&self.app_data_dir, id)).ok()?;
+                matches!(
+                    &found.kind,
+                    WorkspaceKind::ApplicationManaged { owner, purpose, corpus_key }
+                        if owner == "underdog"
+                            && purpose == "semantic-corpus"
+                            && corpus_key == expected_corpus_key
+                )
+                .then(|| id.clone())
+            })
+        };
+        if let Some(existing_id) = existing.as_deref() {
+            let root = workspace_root(&self.app_data_dir, existing_id);
+            let documents = SemanticIndex::open_for_maintenance(&root)
+                .ok()
+                .and_then(|index| index.managed_completeness().ok())
+                .map(|counts| counts.0)
+                .unwrap_or(0);
+            if documents > 0 {
+                anyhow::ensure!(
+                    existing_id == expected_corpus_id,
+                    "RESTORE_TARGET_NOT_EMPTY"
+                );
+                drop(_switch_guard);
+                let status = self.underdog_workspace_status(existing_id).await?;
+                anyhow::ensure!(
+                    status.ready && status.embedding_space_id == expected_embedding_space_id,
+                    "existing restored corpus is not ready in the expected embedding space"
+                );
+                return Ok(status);
+            }
+            let scoped_context = { self.scoped.lock().remove(existing_id) };
+            if let Some(context) = scoped_context {
+                context.shutdown().await;
+            }
+            std::fs::remove_dir_all(&root)?;
+        }
+
+        let final_root = workspace_root(&self.app_data_dir, expected_corpus_id);
+        anyhow::ensure!(!final_root.exists(), "restored corpus id already exists");
+        let staging = final_root.with_extension(format!("restore-{}", uuid::Uuid::new_v4()));
+        copy_workspace_backup(&backup_root, &staging)?;
+        let managed_sources = final_root.join("managed_sources");
+        let semantic = manifest.semantic.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("managed workspace manifest has no semantic configuration")
+        })?;
+        semantic.index_path = Some(final_root.join("semantic_index.db"));
+        manifest.favorites = vec![managed_sources.clone()];
+        manifest.active_root = Some(managed_sources);
+        manifest.recent_roots.clear();
+        write_manifest(&staging.join("workspace.json"), &manifest)?;
+
+        let restored_index = SemanticIndex::open_for_maintenance(&staging)?;
+        anyhow::ensure!(
+            restored_index.embedding_space_identity()?.id().0 == expected_embedding_space_id,
+            "restored index embedding-space mismatch"
+        );
+        let completeness = restored_index.managed_completeness()?;
+        anyhow::ensure!(
+            completeness.1 == completeness.2,
+            "restored managed index is incomplete"
+        );
+        drop(restored_index);
+        std::fs::rename(&staging, &final_root)?;
+
+        {
+            let _registry_guard = self.registry_lock.lock();
+            let mut registry = load_registry(&self.app_data_dir)?;
+            if let Some(existing_id) = existing {
+                registry.workspace_ids.retain(|id| id != &existing_id);
+            }
+            if !registry
+                .workspace_ids
+                .iter()
+                .any(|id| id == expected_corpus_id)
+            {
+                registry.workspace_ids.push(expected_corpus_id.to_string());
+            }
+            atomic_write_json(&registry_path(&self.app_data_dir), &registry)?;
+        }
+        drop(_switch_guard);
+        self.underdog_workspace_status(expected_corpus_id).await
+    }
+}
+
+fn verify_managed_backup_directory(
+    root: &Path,
+    backup: &ManagedCorpusBackup,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        backup.files.len() == backup.file_count,
+        "backup file count mismatch"
+    );
+    let mut expected = backup.files.clone();
+    expected.sort_by(|a, b| a.path.cmp(&b.path));
+    anyhow::ensure!(
+        expected.windows(2).all(|pair| pair[0].path != pair[1].path),
+        "duplicate path in managed backup manifest"
+    );
+    for file in &expected {
+        let relative = Path::new(&file.path);
+        anyhow::ensure!(
+            !relative.is_absolute()
+                && !relative
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir)),
+            "unsafe path in managed backup"
+        );
+        let path = root.join(relative);
+        let metadata = std::fs::metadata(&path)?;
+        anyhow::ensure!(metadata.len() == file.byte_len, "backup size mismatch");
+        anyhow::ensure!(
+            wilkes_core::embed::identity::sha256_file(&path)? == file.sha256,
+            "backup digest mismatch"
+        );
+    }
+    let mut actual = crate::context::managed_backup_files(root)?;
+    actual.retain(|file| file.path != "backup-manifest.json");
+    actual.sort_by(|a, b| a.path.cmp(&b.path));
+    anyhow::ensure!(
+        actual == expected,
+        "backup contents do not match the manifest inventory"
+    );
+    Ok(())
+}
+
+fn copy_workspace_backup(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir(destination)?;
+    for name in ["workspace.json", "semantic_index.db"] {
+        std::fs::copy(source.join(name), destination.join(name))?;
+    }
+    copy_workspace_tree(
+        &source.join("managed_sources"),
+        &destination.join("managed_sources"),
+    )
+}
+
+fn copy_workspace_tree(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if kind.is_dir() {
+            copy_workspace_tree(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), target)?;
+        } else {
+            anyhow::bail!(
+                "managed restore refuses non-file entry {}",
+                entry.path().display()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -867,6 +1080,120 @@ mod tests {
         fn emit(&self, name: &str, _payload: serde_json::Value) {
             self.0.lock().unwrap().push(name.to_string());
         }
+    }
+
+    #[tokio::test]
+    async fn managed_backup_restores_over_only_an_empty_same_store_corpus() {
+        let source = tempfile::tempdir().unwrap();
+        let source_settings = source.path().join("global-settings.json");
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (source_manager, _events, _worker_loop) = WorkspaceManager::new(
+            source.path().to_path_buf(),
+            source_settings,
+            Arc::clone(&events),
+        )
+        .unwrap();
+        let embedding = SelectedEmbedder::default();
+        let source_status = source_manager
+            .ensure_underdog_workspace(EnsureManagedWorkspace {
+                corpus_key: "store-restore".to_string(),
+                embedding: embedding.clone(),
+                chunk_size: 600,
+                chunk_overlap: 128,
+            })
+            .await
+            .unwrap();
+        let source_root = workspace_root(source.path(), &source_status.corpus_id);
+        std::fs::write(
+            source_root.join("managed_sources").join("retained.txt"),
+            b"retained across restore",
+        )
+        .unwrap();
+        let index = SemanticIndex::create(
+            &source_root,
+            embedding.model.model_id(),
+            embedding.dimension,
+            embedding.engine,
+            None,
+        )
+        .unwrap();
+        let space = index.embedding_space_identity().unwrap().id().0;
+        drop(index);
+        let source_backup = source.path().join("managed_backups").join("exported");
+        crate::context::backup_managed_directory(
+            &source_root,
+            &source_status.corpus_id,
+            &space,
+            &source_backup,
+        )
+        .unwrap();
+
+        let target = tempfile::tempdir().unwrap();
+        let (target_manager, _events, _worker_loop) = WorkspaceManager::new(
+            target.path().to_path_buf(),
+            target.path().join("global-settings.json"),
+            events,
+        )
+        .unwrap();
+        let empty = target_manager
+            .ensure_underdog_workspace(EnsureManagedWorkspace {
+                corpus_key: "store-restore".to_string(),
+                embedding,
+                chunk_size: 600,
+                chunk_overlap: 128,
+            })
+            .await
+            .unwrap();
+        assert_ne!(empty.corpus_id, source_status.corpus_id);
+        let target_backup = target.path().join("managed_backups").join("inbox");
+        std::fs::create_dir_all(target_backup.join("managed_sources")).unwrap();
+        for name in [
+            "workspace.json",
+            "semantic_index.db",
+            "backup-manifest.json",
+        ] {
+            std::fs::copy(source_backup.join(name), target_backup.join(name)).unwrap();
+        }
+        std::fs::copy(
+            source_backup.join("managed_sources").join("retained.txt"),
+            target_backup.join("managed_sources").join("retained.txt"),
+        )
+        .unwrap();
+        std::fs::write(target_backup.join("unlisted.txt"), b"not in manifest").unwrap();
+        let inventory_error = target_manager
+            .restore_underdog_workspace("inbox", &source_status.corpus_id, &space, "store-restore")
+            .await
+            .unwrap_err();
+        assert!(inventory_error
+            .to_string()
+            .contains("contents do not match the manifest inventory"));
+        std::fs::remove_file(target_backup.join("unlisted.txt")).unwrap();
+
+        let restored = target_manager
+            .restore_underdog_workspace("inbox", &source_status.corpus_id, &space, "store-restore")
+            .await
+            .unwrap();
+        assert_eq!(restored.corpus_id, source_status.corpus_id);
+        assert_eq!(restored.embedding_space_id, space);
+        assert!(restored.ready);
+        assert_eq!(target_manager.state().await.unwrap().workspaces.len(), 1);
+        let retried = target_manager
+            .restore_underdog_workspace("inbox", &source_status.corpus_id, &space, "store-restore")
+            .await
+            .unwrap();
+        assert_eq!(retried.corpus_id, restored.corpus_id);
+        assert!(retried.ready);
+        assert_eq!(
+            std::fs::read(
+                workspace_root(target.path(), &source_status.corpus_id)
+                    .join("managed_sources")
+                    .join("retained.txt")
+            )
+            .unwrap(),
+            b"retained across restore"
+        );
+        source_manager.shutdown_all().await;
+        target_manager.shutdown_all().await;
     }
 
     #[test]

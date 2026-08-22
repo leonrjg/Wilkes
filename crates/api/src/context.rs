@@ -436,6 +436,144 @@ pub struct ManagedDocumentExport {
     pub embedding_work: ManagedEmbeddingWork,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ManagedCorpusBackup {
+    pub format: String,
+    pub corpus_id: String,
+    pub embedding_space_id: String,
+    pub path: String,
+    pub file_count: usize,
+    pub byte_len: u64,
+    pub files: Vec<ManagedBackupFile>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ManagedBackupFile {
+    pub path: String,
+    pub byte_len: u64,
+    pub sha256: String,
+}
+
+pub(crate) fn backup_managed_directory(
+    data_dir: &Path,
+    corpus_id: &str,
+    expected_embedding_space_id: &str,
+    destination: &Path,
+) -> anyhow::Result<ManagedCorpusBackup> {
+    anyhow::ensure!(!destination.exists(), "backup destination already exists");
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("backup destination has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+
+    let index = SemanticIndex::open_for_maintenance(data_dir)?;
+    let actual_space = index.embedding_space_identity()?.id().0;
+    anyhow::ensure!(
+        actual_space == expected_embedding_space_id,
+        "EMBEDDING_SPACE_MISMATCH: index={actual_space}, request={expected_embedding_space_id}"
+    );
+    drop(index);
+
+    let leaf = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("managed-corpus");
+    let staging = parent.join(format!(".{leaf}.partial-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&staging)?;
+    let result = (|| -> anyhow::Result<ManagedCorpusBackup> {
+        copy_managed_tree(
+            &data_dir.join("managed_sources"),
+            &staging.join("managed_sources"),
+        )?;
+        std::fs::copy(
+            data_dir.join("workspace.json"),
+            staging.join("workspace.json"),
+        )?;
+
+        let live_db = data_dir.join("semantic_index.db");
+        anyhow::ensure!(live_db.is_file(), "managed semantic index is absent");
+        let snapshot_db = staging.join("semantic_index.db");
+        let connection = rusqlite::Connection::open(&live_db)?;
+        connection.execute(
+            "VACUUM INTO ?1",
+            [snapshot_db.to_string_lossy().to_string()],
+        )?;
+
+        let mut files = managed_backup_files(&staging)?;
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let byte_len = files.iter().map(|file| file.byte_len).sum();
+        let backup = ManagedCorpusBackup {
+            format: "wilkes-managed-corpus-backup/v1".to_string(),
+            corpus_id: corpus_id.to_string(),
+            embedding_space_id: actual_space,
+            path: destination.display().to_string(),
+            file_count: files.len(),
+            byte_len,
+            files,
+        };
+        std::fs::write(
+            staging.join("backup-manifest.json"),
+            serde_json::to_vec_pretty(&backup)?,
+        )?;
+        std::fs::rename(&staging, destination)?;
+        Ok(backup)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+fn copy_managed_tree(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(source.is_dir(), "managed source directory is absent");
+    std::fs::create_dir(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_managed_tree(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            std::fs::copy(entry.path(), target)?;
+        } else {
+            anyhow::bail!(
+                "managed backup refuses non-file entry {}",
+                entry.path().display()
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn managed_backup_files(root: &Path) -> anyhow::Result<Vec<ManagedBackupFile>> {
+    fn walk(root: &Path, directory: &Path, out: &mut Vec<ManagedBackupFile>) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                walk(root, &entry.path(), out)?;
+            } else if file_type.is_file() {
+                let relative = entry.path().strip_prefix(root)?.to_path_buf();
+                let metadata = entry.metadata()?;
+                out.push(ManagedBackupFile {
+                    path: relative.to_string_lossy().replace('\\', "/"),
+                    byte_len: metadata.len(),
+                    sha256: wilkes_core::embed::identity::sha256_file(&entry.path())?,
+                });
+            } else {
+                anyhow::bail!(
+                    "managed backup refuses non-file entry {}",
+                    entry.path().display()
+                );
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out)?;
+    Ok(out)
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ManagedAccumulation {
     pub sum: Vec<f32>,
@@ -1732,7 +1870,14 @@ impl AppContext {
             match std::fs::rename(&temporary, &destination) {
                 Ok(()) => destination,
                 Err(_error) if destination.exists() => {
-                    if wilkes_core::embed::identity::sha256_file(&destination)? != source_sha256 {
+                    let destination_sha256 = wilkes_core::embed::identity::sha256_file(
+                        &destination,
+                    )
+                    .map_err(|error| {
+                        let _ = std::fs::remove_file(&temporary);
+                        error
+                    })?;
+                    if destination_sha256 != source_sha256 {
                         let _ = std::fs::remove_file(&temporary);
                         anyhow::bail!(
                             "DOCUMENT_INDEX_INCOMPLETE: retained snapshot digest mismatch"
@@ -1741,7 +1886,10 @@ impl AppContext {
                     let _ = std::fs::remove_file(&temporary);
                     destination
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    let _ = std::fs::remove_file(&temporary);
+                    return Err(error.into());
+                }
             }
         };
         let mut permissions = std::fs::metadata(&snapshot)?.permissions();
@@ -1972,6 +2120,37 @@ impl AppContext {
             self.managed_pending_imports.load(Ordering::Acquire),
             self.managed_pending_builds.load(Ordering::Acquire),
         )
+    }
+
+    /// Writes one point-in-time, self-verifying managed-corpus directory.
+    /// Imports and runtime replacement are excluded for the whole snapshot;
+    /// immutable sources are copied under that lock and SQLite supplies the
+    /// index snapshot through `VACUUM INTO`, so WAL/checkpoint timing cannot
+    /// produce a database assembled from different instants.
+    pub async fn backup_managed_corpus(
+        &self,
+        corpus_id: String,
+        expected_embedding_space_id: String,
+    ) -> Result<ManagedCorpusBackup, String> {
+        let _import_guard = self.managed_import_lock.lock().await;
+        let _runtime_guard = self.managed_runtime_lock.lock().await;
+        let data_dir = self.data_dir.clone();
+        let destination = self.shared_data_dir.join("managed_backups").join(format!(
+            "{}-{}",
+            corpus_id,
+            uuid::Uuid::new_v4()
+        ));
+        tokio::task::spawn_blocking(move || {
+            backup_managed_directory(
+                &data_dir,
+                &corpus_id,
+                &expected_embedding_space_id,
+                &destination,
+            )
+        })
+        .await
+        .map_err(|error| format!("Managed backup task panicked: {error}"))?
+        .map_err(|error| format!("Could not back up managed corpus: {error:#}"))
     }
 
     fn managed_export(
@@ -3655,8 +3834,35 @@ impl AppContext {
         }
     }
 
+    /// Whether this context belongs to a workspace an application owns rather
+    /// than a person (Underdog's semantic corpus is the only one today).
+    ///
+    /// Such a workspace has exactly one writer of its semantic index: the
+    /// managed import API, which publishes rows carrying the document identity
+    /// its consumer's stable chunk refs are derived from. The interactive
+    /// indexing machinery — the directory watcher and the background reindex it
+    /// feeds — must never run there. Its root is `managed_sources`, which every
+    /// import writes into, so it would otherwise re-index each imported
+    /// document through the identity-less path and strip the very refs the
+    /// import just handed out.
+    fn is_application_managed(&self) -> bool {
+        if self.workspace_path == self.settings_path {
+            return false;
+        }
+        crate::workspace::read_manifest(&self.workspace_path)
+            .map(|manifest| manifest.is_application_managed())
+            .unwrap_or(false)
+    }
+
     fn start_directory_watcher(self: &Arc<Self>, root: PathBuf) {
         self.stop_directory_watcher();
+        if self.is_application_managed() {
+            info!(
+                "not watching {}: an application-managed corpus is written only by its import API",
+                root.display()
+            );
+            return;
+        }
         if !root.exists() || !root.is_dir() {
             error!("directory watcher root is invalid: {}", root.display());
             return;
@@ -4673,6 +4879,13 @@ impl AppContext {
         embedder: Arc<dyn Embedder>,
         root: &Path,
     ) {
+        if self.is_application_managed() {
+            info!(
+                "not reindexing {}: an application-managed corpus is written only by its import API",
+                root.display()
+            );
+            return;
+        }
         let already_building = {
             let guard = self.embed_task.lock();
             guard.as_ref().is_some_and(|t| !t.join.is_finished())
@@ -6562,6 +6775,78 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
     use tempfile::tempdir;
+
+    #[test]
+    fn managed_backup_is_a_self_verifying_sqlite_snapshot() {
+        let dir = tempdir().unwrap();
+        let managed_sources = dir.path().join("managed_sources");
+        std::fs::create_dir(&managed_sources).unwrap();
+        std::fs::write(managed_sources.join("source.txt"), b"retained source").unwrap();
+        std::fs::write(dir.path().join("workspace.json"), b"{\"version\":1}").unwrap();
+        let index = SemanticIndex::create(
+            dir.path(),
+            "backup-test-model",
+            2,
+            EmbeddingEngine::Candle,
+            None,
+        )
+        .unwrap();
+        let space = index.embedding_space_identity().unwrap().id().0;
+        drop(index);
+
+        let destination = dir.path().join("backup");
+        let backup =
+            backup_managed_directory(dir.path(), "corpus-test", &space, &destination).unwrap();
+
+        assert_eq!(backup.format, "wilkes-managed-corpus-backup/v1");
+        assert_eq!(backup.corpus_id, "corpus-test");
+        assert_eq!(backup.embedding_space_id, space);
+        assert!(destination.join("semantic_index.db").is_file());
+        assert!(destination.join("backup-manifest.json").is_file());
+        assert!(backup
+            .files
+            .iter()
+            .any(|file| file.path == "managed_sources/source.txt"));
+        for file in &backup.files {
+            let path = destination.join(&file.path);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), file.byte_len);
+            assert_eq!(
+                wilkes_core::embed::identity::sha256_file(&path).unwrap(),
+                file.sha256
+            );
+        }
+
+        let mismatch = dir.path().join("wrong-space-backup");
+        let error =
+            backup_managed_directory(dir.path(), "corpus-test", "space-not-the-index", &mismatch)
+                .unwrap_err();
+        assert!(error.to_string().contains("EMBEDDING_SPACE_MISMATCH"));
+        assert!(!mismatch.exists());
+    }
+
+    #[test]
+    fn interrupted_snapshot_placement_leaves_no_temporary_source() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        std::fs::write(&source, b"immutable source").unwrap();
+        let digest = wilkes_core::embed::identity::sha256_file(&source).unwrap();
+        let obstructing_destination = dir
+            .path()
+            .join("managed_sources")
+            .join(digest)
+            .join("source.txt");
+        std::fs::create_dir_all(&obstructing_destination).unwrap();
+
+        AppContext::retain_managed_snapshot(dir.path(), &source)
+            .expect_err("a directory cannot be published as an immutable source file");
+
+        let imports = dir.path().join("managed_sources").join(".imports");
+        assert_eq!(
+            std::fs::read_dir(imports).unwrap().count(),
+            0,
+            "a failed atomic placement must clean its staging file"
+        );
+    }
     use tokio::sync::mpsc;
     use tracing::subscriber;
     use tracing_subscriber::prelude::*;
@@ -8153,6 +8438,76 @@ mod tests {
         let (_tmp, ctx) = test_ctx();
         ctx.start_directory_watcher(dir.path().join("missing"));
         assert!(ctx.directory_watcher.lock().is_none());
+    }
+
+    fn scoped_ctx(dir: &std::path::Path, kind: serde_json::Value) -> Arc<AppContext> {
+        let workspace_path = dir.join("workspace.json");
+        std::fs::write(
+            &workspace_path,
+            serde_json::json!({
+                "version": 1,
+                "id": "workspace-under-test",
+                "name": "under test",
+                "kind": kind,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("python"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: dir.to_path_buf(),
+        };
+        let (ctx, _rx, _loop) = AppContext::new_scoped(
+            dir.to_path_buf(),
+            dir.to_path_buf(),
+            dir.join("settings.json"),
+            workspace_path,
+            paths,
+            Arc::new(MockEmitter {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+        ctx
+    }
+
+    /// The managed import API is the only writer of an application-managed
+    /// index. A watcher on `managed_sources` would re-index every imported
+    /// document through the identity-less path, dropping the stable chunk refs
+    /// the import had already handed to its consumer.
+    #[tokio::test]
+    async fn test_application_managed_root_is_never_watched() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("managed_sources");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let managed = scoped_ctx(
+            dir.path(),
+            serde_json::json!({
+                "kind": "application_managed",
+                "owner": "underdog",
+                "purpose": "semantic-corpus",
+                "corpus_key": "store-id",
+            }),
+        );
+        managed.start_directory_watcher(root.clone());
+        assert!(
+            managed.directory_watcher.lock().is_none(),
+            "an application-managed corpus must not be watched"
+        );
+
+        let personal = tempdir().unwrap();
+        let personal_root = personal.path().join("library");
+        std::fs::create_dir_all(&personal_root).unwrap();
+        let user = scoped_ctx(personal.path(), serde_json::json!({ "kind": "user" }));
+        user.start_directory_watcher(personal_root);
+        assert!(
+            user.directory_watcher.lock().is_some(),
+            "an ordinary workspace is still watched"
+        );
     }
 
     fn running_embed_task() -> EmbedTaskHandle {

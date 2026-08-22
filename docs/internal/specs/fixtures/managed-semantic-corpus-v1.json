@@ -92,6 +92,31 @@
       }
     ]
   },
+  "backup_request": {
+    "corpus_id": "managed-corpus-018f",
+    "expected_embedding_space_id": "space-example"
+  },
+  "backup_response": {
+    "format": "wilkes-managed-corpus-backup/v1",
+    "corpus_id": "managed-corpus-018f",
+    "embedding_space_id": "space-example",
+    "path": "/managed_backups/managed-corpus-018f-example",
+    "file_count": 1,
+    "byte_len": 12345,
+    "files": [
+      {
+        "path": "semantic_index.db",
+        "byte_len": 12345,
+        "sha256": "backup-file-sha256-example"
+      }
+    ]
+  },
+  "restore_request": {
+    "backup_name": "restore-example",
+    "expected_corpus_id": "managed-corpus-018f",
+    "expected_embedding_space_id": "space-example",
+    "expected_corpus_key": "store-018f"
+  },
   "error_response": {
     "code": "EMBEDDING_SPACE_MISMATCH",
     "error": "EMBEDDING_SPACE_MISMATCH: corpus=space-example, request=space-other"

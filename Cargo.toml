@@ -5,9 +5,33 @@ resolver = "2"
 [workspace.package]
 version = "0.9.5"
 
+# Cargo's stock `dev` is unoptimized and carries full debug info for every
+# dependency, which is most of what target/debug weighs. This does not touch
+# `just dev` — that runs `tauri dev --release` — but it does reach
+# `cargo test --workspace`, `just check` and `just server-dev`.
+#
+# It stays a debug profile: assertions and overflow checks are on.
+[profile.dev]
+opt-level = 1
+# Our own crates keep file:line in panic backtraces; line tables cost a
+# fraction of what full DWARF does.
+debug = "line-tables-only"
+debug-assertions = true
+overflow-checks = true
+
+# Dependencies are compiled once and then cached, so optimizing them is paid
+# for on the first build and never again. Their debug info is the bulk of
+# target/debug and is of no use to us.
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
 # mupdf-sys compiles bundled C code with /MDd (debug CRT) at opt-level 0,
 # but ort-sys ships pre-built ONNX Runtime objects compiled with /MD (release CRT).
 # MSVC refuses to link these together (_ITERATOR_DEBUG_LEVEL mismatch).
 # Raising opt-level for mupdf-sys makes the cc crate switch to /MD in all profiles.
+# Kept as its own entry rather than left to the glob above: the Windows link
+# depends on this being >= 1, and that must not silently ride on an unrelated
+# blanket setting someone may later tune down.
 [profile.dev.package.mupdf-sys]
 opt-level = 2

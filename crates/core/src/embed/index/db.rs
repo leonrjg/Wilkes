@@ -17,7 +17,7 @@ use crate::types::{
 };
 
 use super::super::Embedder;
-use super::chunk::{chunk_content, Chunk};
+use super::chunk::{chunk_content, ensure_chunks_reconstruct, Chunk};
 use crate::embed::identity::{
     chunk_ref, rendition_id, sha256_bytes, sha256_file, snapshot_id, ChunkDescriptor,
 };
@@ -3774,6 +3774,18 @@ impl SemanticIndex {
     ) -> anyhow::Result<(String, Vec<Chunk>)> {
         let content = Self::extract_content(path, extractors)?;
         let chunks = chunk_content(&content, path.to_path_buf(), chunk_size, chunk_overlap);
+        ensure_chunks_reconstruct(
+            &content.text,
+            chunks
+                .iter()
+                .map(|chunk| (&chunk.byte_range, chunk.text.as_str())),
+        )
+        .with_context(|| {
+            format!(
+                "DOCUMENT_INDEX_INCOMPLETE: chunks of {} do not rebuild its extracted content",
+                path.display()
+            )
+        })?;
         Ok((content.text, chunks))
     }
 

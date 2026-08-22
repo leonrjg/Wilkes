@@ -296,6 +296,7 @@ fn managed_status_with_pending(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedStatusQuery {
     corpus_id: String,
 }
@@ -332,6 +333,7 @@ enum ManagedImportSource {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedImportBody {
     corpus_id: String,
     expected_embedding_space_id: String,
@@ -398,6 +400,7 @@ async fn import_underdog_document_handler(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedGroupsBody {
     corpus_id: String,
     expected_embedding_space_id: String,
@@ -405,6 +408,7 @@ struct ManagedGroupsBody {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedResolveBody {
     corpus_id: String,
     expected_embedding_space_id: String,
@@ -438,6 +442,7 @@ async fn underdog_accumulate_handler(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedSimilarityBody {
     corpus_id: String,
     expected_embedding_space_id: String,
@@ -460,10 +465,59 @@ async fn underdog_similarity_handler(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedEmbedTextBody {
     corpus_id: String,
     expected_embedding_space_id: String,
     texts: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedBackupBody {
+    corpus_id: String,
+    expected_embedding_space_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedRestoreBody {
+    backup_name: String,
+    expected_corpus_id: String,
+    expected_embedding_space_id: String,
+    expected_corpus_key: String,
+}
+
+async fn underdog_backup_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ManagedBackupBody>,
+) -> Result<Json<wilkes_api::context::ManagedCorpusBackup>, (StatusCode, Json<ErrorBody>)> {
+    let context =
+        managed_context(&state, &body.corpus_id, &body.expected_embedding_space_id).await?;
+    context
+        .backup_managed_corpus(body.corpus_id, body.expected_embedding_space_id)
+        .await
+        .map(Json)
+        .map_err(managed_err)
+}
+
+async fn underdog_restore_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ManagedRestoreBody>,
+) -> Result<Json<ManagedWorkspaceStatus>, (StatusCode, Json<ErrorBody>)> {
+    let manager = state.workspaces.as_ref().ok_or_else(|| {
+        managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
+    })?;
+    manager
+        .restore_underdog_workspace(
+            &body.backup_name,
+            &body.expected_corpus_id,
+            &body.expected_embedding_space_id,
+            &body.expected_corpus_key,
+        )
+        .await
+        .map(Json)
+        .map_err(|error| managed_err(format!("{error:#}")))
 }
 
 async fn underdog_embed_text_handler(
@@ -1773,6 +1827,14 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/integrations/underdog/embed/text",
             post(underdog_embed_text_handler),
+        )
+        .route(
+            "/api/integrations/underdog/backup",
+            post(underdog_backup_handler),
+        )
+        .route(
+            "/api/integrations/underdog/restore",
+            post(underdog_restore_handler),
         )
         .route("/api/bookmarks", get(list_bookmarks_handler))
         .route("/api/bookmarks", post(add_bookmark_handler))
@@ -3094,5 +3156,21 @@ mod tests {
         let extraction: wilkes_core::types::ExtractionDiagnostics =
             serde_json::from_value(response["extraction"].clone()).unwrap();
         assert_eq!(extraction.pages, 1);
+
+        let backup: ManagedBackupBody =
+            serde_json::from_value(fixture["backup_request"].clone()).unwrap();
+        assert_eq!(backup.expected_embedding_space_id, "space-example");
+        let restore: ManagedRestoreBody =
+            serde_json::from_value(fixture["restore_request"].clone()).unwrap();
+        assert_eq!(restore.backup_name, "restore-example");
+        assert!(
+            serde_json::from_value::<ManagedBackupBody>(serde_json::json!({
+                "corpus_id": "managed-corpus-018f",
+                "expected_embedding_space_id": "space-example",
+                "destination": "/arbitrary/path"
+            }))
+            .is_err(),
+            "managed backup must never accept an arbitrary destination"
+        );
     }
 }
