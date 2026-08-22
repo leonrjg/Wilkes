@@ -3204,10 +3204,18 @@ impl AppContext {
             tag_ids,
             collection_expression,
             true,
+            None,
         )
         .await
     }
 
+    /// List the searchable files under `root`, enriched with metadata, tags and
+    /// collection eligibility.
+    ///
+    /// `only_path` narrows the enumeration step to a single known file. The
+    /// enrichment and filtering below are unchanged by it — they simply operate
+    /// on a one-entry listing — so a targeted query pays for one file instead of
+    /// walking the whole root to discard all but one result.
     async fn list_files_filtered_with_ignore(
         &self,
         root: PathBuf,
@@ -3215,15 +3223,28 @@ impl AppContext {
         tag_ids: &[String],
         collection_expression: Option<&str>,
         respect_gitignore: bool,
+        only_path: Option<PathBuf>,
     ) -> anyhow::Result<wilkes_core::types::FileListResponse> {
         let s = self.get_settings().await;
-        let mut response = crate::commands::files::list_files_with_ignore(
-            root.clone(),
-            s.supported_extensions.clone(),
-            s.max_file_size,
-            respect_gitignore,
-        )
-        .await?;
+        let mut response = match only_path {
+            Some(path) => {
+                crate::commands::files::list_single_file(
+                    path,
+                    s.supported_extensions.clone(),
+                    s.max_file_size,
+                )
+                .await?
+            }
+            None => {
+                crate::commands::files::list_files_with_ignore(
+                    root.clone(),
+                    s.supported_extensions.clone(),
+                    s.max_file_size,
+                    respect_gitignore,
+                )
+                .await?
+            }
+        };
 
         // Populate document metadata from the cache and
         // schedule background extraction for anything not yet cached.
@@ -5002,6 +5023,12 @@ impl AppContext {
         let mut catalog_errors = Vec::new();
         let mut seen_paths = std::collections::HashSet::new();
         let catalog_started = std::time::Instant::now();
+        // A `File` scope names exactly one document, so the catalog step
+        // resolves that path directly instead of enumerating the root.
+        let only_path = match &query.scope {
+            SearchScope::File { path } => Some(path.clone()),
+            _ => None,
+        };
         for root in &eligibility_roots {
             match self
                 .list_files_filtered_with_ignore(
@@ -5009,7 +5036,8 @@ impl AppContext {
                     query.collection_id.as_deref(),
                     &query.tag_ids,
                     None,
-                    query.respect_gitignore && !matches!(query.scope, SearchScope::File { .. }),
+                    query.respect_gitignore && only_path.is_none(),
+                    only_path.clone(),
                 )
                 .await
             {
@@ -5029,10 +5057,6 @@ impl AppContext {
                         }
                     }
                     for entry in listed.files {
-                        if matches!(&query.scope, SearchScope::File { path } if entry.path != *path)
-                        {
-                            continue;
-                        }
                         if seen_paths.insert(entry.path.clone()) {
                             documents.push(SearchDocument {
                                 path: entry.path,

@@ -42,86 +42,15 @@ pub async fn list_files_with_ignore(
                 .map(|t: std::fs::FileType| t.is_file())
                 .unwrap_or(false)
             {
-                let path = entry.path().to_path_buf();
-                let extension = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-
-                // File size filter
-                let meta = entry.metadata().ok();
-                let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                let created_at_ms = meta
-                    .as_ref()
-                    .and_then(|m| m.created().ok())
-                    .and_then(system_time_ms);
-                let modified_at_ms = meta
-                    .as_ref()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(system_time_ms);
-                let file_type = FileType::detect(&path, &supported_extensions);
-
-                if file_type.is_none() {
-                    omitted.push(OmittedFileEntry {
-                        file: FileEntry {
-                            path,
-                            size_bytes,
-                            file_type: FileType::PlainText,
-                            extension,
-                            created_at_ms,
-                            modified_at_ms,
-                            title: None,
-                            author: None,
-                            doi: None,
-                            publication_date: None,
-                            citation_count: None,
-                            metadata_conflicts: Default::default(),
-                            tags: Vec::new(),
-                        },
-                        reason: OmittedFileReason::UnsupportedExtension,
-                    });
-                    continue;
+                match classify_file(
+                    entry.path().to_path_buf(),
+                    entry.metadata().ok(),
+                    &supported_extensions,
+                    max_file_size,
+                ) {
+                    Classified::Searchable(file) => files.push(file),
+                    Classified::Omitted(entry) => omitted.push(entry),
                 }
-                let file_type = file_type.expect("checked is_some above");
-
-                if max_file_size > 0 && size_bytes > max_file_size {
-                    omitted.push(OmittedFileEntry {
-                        file: FileEntry {
-                            path,
-                            size_bytes,
-                            file_type,
-                            extension,
-                            created_at_ms,
-                            modified_at_ms,
-                            title: None,
-                            author: None,
-                            doi: None,
-                            publication_date: None,
-                            citation_count: None,
-                            metadata_conflicts: Default::default(),
-                            tags: Vec::new(),
-                        },
-                        reason: OmittedFileReason::TooLarge,
-                    });
-                    continue;
-                }
-
-                files.push(FileEntry {
-                    path,
-                    size_bytes,
-                    file_type,
-                    extension,
-                    created_at_ms,
-                    modified_at_ms,
-                    title: None,
-                    author: None,
-                    doi: None,
-                    publication_date: None,
-                    citation_count: None,
-                    metadata_conflicts: Default::default(),
-                    tags: Vec::new(),
-                });
             }
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -129,6 +58,110 @@ pub async fn list_files_with_ignore(
         Ok(FileListResponse { files, omitted })
     })
     .await?
+}
+
+/// Resolve a single known path into the same `FileListResponse` shape the
+/// directory walk produces.
+///
+/// A query that names one file needs one file classified, not the whole root
+/// enumerated and then filtered down to one survivor. Both paths share
+/// `classify_file`, so eligibility rules cannot drift between them.
+pub async fn list_single_file(
+    path: PathBuf,
+    supported_extensions: Vec<String>,
+    max_file_size: u64,
+) -> anyhow::Result<FileListResponse> {
+    tokio::task::spawn_blocking(move || {
+        let metadata = std::fs::metadata(&path);
+        if let Err(error) = &metadata {
+            // A path that cannot be stat'ed is reported as an empty listing;
+            // the caller turns that into its own "not searchable" message.
+            tracing::warn!("single-file listing {}: {error:#}", path.display());
+        }
+        let is_file = metadata
+            .as_ref()
+            .map(|meta| meta.is_file())
+            .unwrap_or(false);
+        if !is_file {
+            return Ok(FileListResponse {
+                files: Vec::new(),
+                omitted: Vec::new(),
+            });
+        }
+        let (mut files, mut omitted) = (Vec::new(), Vec::new());
+        match classify_file(path, metadata.ok(), &supported_extensions, max_file_size) {
+            Classified::Searchable(file) => files.push(file),
+            Classified::Omitted(entry) => omitted.push(entry),
+        }
+        Ok(FileListResponse { files, omitted })
+    })
+    .await?
+}
+
+/// The outcome of applying the extension and size rules to one file.
+enum Classified {
+    Searchable(FileEntry),
+    Omitted(OmittedFileEntry),
+}
+
+/// Apply the extension and size rules to one file.
+///
+/// This is the single owner of that decision for both the directory walk and
+/// single-path resolution.
+fn classify_file(
+    path: PathBuf,
+    meta: Option<std::fs::Metadata>,
+    supported_extensions: &[String],
+    max_file_size: u64,
+) -> Classified {
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let created_at_ms = meta
+        .as_ref()
+        .and_then(|m| m.created().ok())
+        .and_then(system_time_ms);
+    let modified_at_ms = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(system_time_ms);
+    let detected = FileType::detect(&path, supported_extensions);
+
+    let entry = |file_type: FileType| FileEntry {
+        path: path.clone(),
+        size_bytes,
+        file_type,
+        extension: extension.clone(),
+        created_at_ms,
+        modified_at_ms,
+        title: None,
+        author: None,
+        doi: None,
+        publication_date: None,
+        citation_count: None,
+        metadata_conflicts: Default::default(),
+        tags: Vec::new(),
+    };
+
+    let Some(file_type) = detected else {
+        return Classified::Omitted(OmittedFileEntry {
+            file: entry(FileType::PlainText),
+            reason: OmittedFileReason::UnsupportedExtension,
+        });
+    };
+
+    if max_file_size > 0 && size_bytes > max_file_size {
+        return Classified::Omitted(OmittedFileEntry {
+            file: entry(file_type),
+            reason: OmittedFileReason::TooLarge,
+        });
+    }
+
+    Classified::Searchable(entry(file_type))
 }
 
 fn system_time_ms(time: SystemTime) -> Option<i64> {
@@ -351,6 +384,71 @@ mod tests {
             files.omitted[0].reason,
             OmittedFileReason::UnsupportedExtension
         );
+    }
+
+    /// Resolving one path must classify it exactly as the directory walk would.
+    /// Both routes share `classify_file`; this guards against the two drifting
+    /// apart if either grows its own eligibility rule.
+    #[tokio::test]
+    async fn single_file_listing_matches_the_walk_for_the_same_path() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(root.join("ok.txt"), "hello").unwrap();
+        fs::write(root.join("unsupported.exe"), "executable").unwrap();
+        fs::write(root.join("huge.txt"), "far too many bytes for the limit").unwrap();
+
+        let extensions = vec!["txt".to_string(), "pdf".to_string()];
+        let max_size = 8;
+        let walked =
+            list_files_with_ignore(root.to_path_buf(), extensions.clone(), max_size, false)
+                .await
+                .unwrap();
+
+        for name in ["ok.txt", "unsupported.exe", "huge.txt"] {
+            let path = root.join(name);
+            let single = list_single_file(path.clone(), extensions.clone(), max_size)
+                .await
+                .unwrap();
+
+            let walked_file = walked.files.iter().find(|entry| entry.path == path);
+            let walked_omitted = walked.omitted.iter().find(|entry| entry.file.path == path);
+
+            assert_eq!(
+                single.files.len(),
+                walked_file.iter().count(),
+                "{name}: searchable-entry count disagrees with the walk"
+            );
+            assert_eq!(
+                single.omitted.len(),
+                walked_omitted.iter().count(),
+                "{name}: omitted-entry count disagrees with the walk"
+            );
+            if let (Some(single), Some(walked)) = (single.files.first(), walked_file) {
+                assert_eq!(single.file_type, walked.file_type, "{name}: file type");
+                assert_eq!(single.size_bytes, walked.size_bytes, "{name}: size");
+                assert_eq!(single.extension, walked.extension, "{name}: extension");
+            }
+            if let (Some(single), Some(walked)) = (single.omitted.first(), walked_omitted) {
+                assert_eq!(single.reason, walked.reason, "{name}: omission reason");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn single_file_listing_of_a_missing_or_directory_path_is_empty() {
+        let dir = tempdir().unwrap();
+        let extensions = vec!["txt".to_string()];
+
+        let missing = list_single_file(dir.path().join("absent.txt"), extensions.clone(), 0)
+            .await
+            .unwrap();
+        assert!(missing.files.is_empty() && missing.omitted.is_empty());
+
+        let directory = list_single_file(dir.path().to_path_buf(), extensions, 0)
+            .await
+            .unwrap();
+        assert!(directory.files.is_empty() && directory.omitted.is_empty());
     }
 
     #[tokio::test]
