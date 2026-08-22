@@ -100,7 +100,7 @@ export interface FileMatches {
   matches: Match[];
 }
 
-export type SearchField = "filename" | "title";
+export type SearchField = "filename" | "title" | "author";
 
 export interface SearchFieldMatch {
   field: SearchField;

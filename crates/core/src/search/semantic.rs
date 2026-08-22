@@ -580,6 +580,7 @@ mod tests {
                         path: std::fs::canonicalize(&path).unwrap_or(path),
                         file_type,
                         title: None,
+                        author: None,
                     },
                 )
             })
@@ -963,6 +964,7 @@ mod tests {
             path: canonical_path.clone(),
             file_type: crate::types::FileType::PlainText,
             title: Some("Unrelated title".into()),
+            author: None,
         }];
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
 

@@ -86,14 +86,14 @@ pub(crate) fn field_matcher(query: &SearchQuery) -> anyhow::Result<RegexMatcher>
         .build(&regex::escape(&query.pattern))?)
 }
 
-/// Match filename and cached title without inventing a document-content
+/// Match filename and cached title/author without inventing a document-content
 /// position. One hit per field is enough to admit the file and avoids a short
 /// query consuming the global result budget repeatedly within one title.
 pub(crate) fn document_field_matches(
     matcher: &RegexMatcher,
     document: &SearchDocument,
 ) -> anyhow::Result<Vec<SearchFieldMatch>> {
-    let mut matches = Vec::with_capacity(2);
+    let mut matches = Vec::with_capacity(3);
     if let Some(file_name) = document.path.file_name() {
         let filename = file_name.to_string_lossy();
         if let Some(found) = matcher.find(filename.as_bytes())? {
@@ -105,18 +105,15 @@ pub(crate) fn document_field_matches(
             ));
         }
     }
-    if let Some(title) = document
-        .title
-        .as_deref()
-        .filter(|title| !title.trim().is_empty())
-    {
-        if let Some(found) = matcher.find(title.as_bytes())? {
-            matches.push(field_match(
-                SearchField::Title,
-                title,
-                found.start(),
-                found.end(),
-            ));
+    for (field, value) in [
+        (SearchField::Title, document.title.as_deref()),
+        (SearchField::Author, document.author.as_deref()),
+    ] {
+        let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        if let Some(found) = matcher.find(value.as_bytes())? {
+            matches.push(field_match(field, value, found.start(), found.end()));
         }
     }
     Ok(matches)
@@ -198,6 +195,7 @@ mod tests {
             path: std::path::PathBuf::from("/library/Résumé Paper.txt"),
             file_type: FileType::PlainText,
             title: None,
+            author: None,
         };
         let insensitive = field_matcher(&query(r"^résumé\s", false)).unwrap();
         let matched = document_field_matches(&insensitive, &document).unwrap();
@@ -208,5 +206,28 @@ mod tests {
         assert!(document_field_matches(&sensitive, &document)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn field_matching_admits_cached_author_alongside_title() {
+        let document = SearchDocument {
+            path: std::path::PathBuf::from("/library/paper.txt"),
+            file_type: FileType::PlainText,
+            title: Some("Lattice Dynamics".into()),
+            author: Some("Ada Lovelace; Grace Hopper".into()),
+        };
+        let matcher = field_matcher(&query("lovelace", false)).unwrap();
+        let matched = document_field_matches(&matcher, &document).unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].field, SearchField::Author);
+        assert_eq!(matched[0].matched_text, "Lovelace");
+        assert_eq!(matched[0].context_before, "Ada ");
+        assert_eq!(matched[0].context_after, "; Grace Hopper");
+
+        let blank = SearchDocument {
+            author: Some("   ".into()),
+            ..document
+        };
+        assert!(document_field_matches(&matcher, &blank).unwrap().is_empty());
     }
 }

@@ -234,6 +234,7 @@ mod tests {
             path,
             file_type: FileType::PlainText,
             title: None,
+            author: None,
         }
     }
 

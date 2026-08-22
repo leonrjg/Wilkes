@@ -40,6 +40,7 @@ import type {
   Match,
   MatchRef,
   OmittedFileEntry,
+  SearchField,
   SearchFieldMatch,
   SourceOrigin,
 } from "../lib/types";
@@ -189,6 +190,12 @@ const SORT_KEY_LABELS: Record<FileSortKey, string> = {
   publication: "Publication date",
   citations: "Citations",
   size: "Size",
+};
+
+const FIELD_MATCH_LABELS: Record<SearchField, string> = {
+  filename: "Name",
+  title: "Title",
+  author: "Author",
 };
 
 function displayFieldValue(entry: FileEntry, field: FileDisplayField): string | null {
@@ -1265,7 +1272,7 @@ function FieldMatchRow({
       className="w-full flex select-none items-start gap-2 px-3 py-1 text-left hover:bg-[var(--bg-hover)] transition-colors"
     >
       <span className="text-xs text-[var(--accent-blue)] w-10 flex-shrink-0 text-right pt-px">
-        {fieldMatch.field === "filename" ? "Name" : "Title"}
+        {FIELD_MATCH_LABELS[fieldMatch.field]}
       </span>
       <span className="text-xs line-clamp-3 flex-1 break-all">
         {highlightMatch(

@@ -128,6 +128,7 @@ pub struct SearchDocument {
     pub path: PathBuf,
     pub file_type: FileType,
     pub title: Option<String>,
+    pub author: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,6 +136,7 @@ pub struct SearchDocument {
 pub enum SearchField {
     Filename,
     Title,
+    Author,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

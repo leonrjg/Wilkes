@@ -864,6 +864,7 @@ enum SearchMatchKindResponse {
     Content,
     Filename,
     Title,
+    Author,
 }
 
 #[tool_router]
@@ -961,7 +962,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Search Wilkes-readable documents, including direct filename and cached-title matches. You must explicitly set mode='exact' for literal/regex matching or mode='semantic' for meaning-based content search plus case-insensitive literal filename/title matching; mode has no default. Each returned match has kind='content', 'filename', or 'title'. Set scope='all' to search every configured library root; omit scope to search the current root. If the user asks about a specific document, set file to that document path; omit file only for corpus-wide searches."
+        description = "Search Wilkes-readable documents, including direct filename, cached-title and cached-author matches. You must explicitly set mode='exact' for literal/regex matching or mode='semantic' for meaning-based content search plus case-insensitive literal filename/title/author matching; mode has no default. Each returned match has kind='content', 'filename', 'title', or 'author'. Set scope='all' to search every configured library root; omit scope to search the current root. If the user asks about a specific document, set file to that document path; omit file only for corpus-wide searches."
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         match search_documents_for_mcp(self, params).await {
@@ -1751,6 +1752,7 @@ impl From<wilkes_core::types::SearchFieldMatch> for SearchMatchResponse {
         let kind = match matched.field {
             wilkes_core::types::SearchField::Filename => SearchMatchKindResponse::Filename,
             wilkes_core::types::SearchField::Title => SearchMatchKindResponse::Title,
+            wilkes_core::types::SearchField::Author => SearchMatchKindResponse::Author,
         };
         Self {
             kind,
@@ -2999,12 +3001,20 @@ mod tests {
                     path: path.clone(),
                     file_type: FileType::Pdf,
                     title: None,
-                    field_matches: vec![SearchFieldMatch {
-                        field: SearchField::Filename,
-                        matched_text: "paper".into(),
-                        context_before: String::new(),
-                        context_after: ".pdf".into(),
-                    }],
+                    field_matches: vec![
+                        SearchFieldMatch {
+                            field: SearchField::Filename,
+                            matched_text: "paper".into(),
+                            context_before: String::new(),
+                            context_after: ".pdf".into(),
+                        },
+                        SearchFieldMatch {
+                            field: SearchField::Author,
+                            matched_text: "IO".into(),
+                            context_before: "Ada L".into(),
+                            context_after: "vecchi".into(),
+                        },
+                    ],
                     matches: vec![Match {
                         text_range: None,
                         matched_text: "IO programming".to_string(),
@@ -3074,14 +3084,20 @@ mod tests {
         assert_eq!(response.matches[0].matches[0].page, None);
         assert_eq!(
             response.matches[0].matches[1].kind,
+            SearchMatchKindResponse::Author
+        );
+        assert_eq!(response.matches[0].matches[1].text, "Ada LIOvecchi");
+        assert_eq!(response.matches[0].matches[1].page, None);
+        assert_eq!(
+            response.matches[0].matches[2].kind,
             SearchMatchKindResponse::Content
         );
-        assert_eq!(response.matches[0].matches[1].page, Some(3));
+        assert_eq!(response.matches[0].matches[2].page, Some(3));
         assert_eq!(
-            response.matches[0].matches[1].text,
+            response.matches[0].matches[2].text,
             "before IO programming after"
         );
-        let serialized = serde_json::to_value(&response.matches[0].matches[1]).unwrap();
+        let serialized = serde_json::to_value(&response.matches[0].matches[2]).unwrap();
         assert_eq!(serialized["kind"], "content");
         assert!(serialized.get("context_before").is_none());
         assert!(serialized.get("context_after").is_none());

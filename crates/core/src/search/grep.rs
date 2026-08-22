@@ -535,6 +535,7 @@ mod tests {
             file_type: FileType::detect(&path, &query.supported_extensions).unwrap(),
             path,
             title: None,
+            author: None,
         }
     }
 
@@ -1484,6 +1485,7 @@ mod tests {
                 path: title_path.clone(),
                 file_type: FileType::PlainText,
                 title: Some("Annual Research Report".into()),
+                author: None,
             },
         ];
         let provider = GrepSearchProvider::new();
@@ -1584,6 +1586,7 @@ mod eligibility_tests {
             path: included.clone(),
             file_type: FileType::PlainText,
             title: None,
+            author: None,
         }];
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);

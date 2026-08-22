@@ -5062,6 +5062,7 @@ impl AppContext {
                                 path: entry.path,
                                 file_type: entry.file_type,
                                 title: entry.title,
+                                author: entry.author,
                             });
                         }
                     }
