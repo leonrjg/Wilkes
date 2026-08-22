@@ -10788,16 +10788,18 @@ exit 0
         std::fs::write(&cited, "cited").unwrap();
 
         let cache = ctx.metadata_cache().expect("cache opens");
-        let id = FileIdentity {
-            size_bytes: 1,
-            modified_at_ms: 1,
-        };
+        // Seed each row under the file's real identity. A fabricated identity
+        // would make every listing treat the file as uncached and schedule a
+        // background re-extraction, which would then own (and overwrite) the
+        // DOI these edges are keyed by.
+        let source_id = FileIdentity::for_path(&source).unwrap();
+        let cited_id = FileIdentity::for_path(&cited).unwrap();
         {
             let guard = cache.lock().unwrap();
             guard
                 .upsert(
                     &source,
-                    id,
+                    source_id,
                     &DocumentMetadata {
                         doi: Some("10.1000/source".into()),
                         ..DocumentMetadata::default()
@@ -10808,7 +10810,7 @@ exit 0
             guard
                 .upsert(
                     &cited,
-                    id,
+                    cited_id,
                     &DocumentMetadata {
                         doi: Some("10.1000/cited.long".into()),
                         ..DocumentMetadata::default()
