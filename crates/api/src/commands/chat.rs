@@ -371,22 +371,22 @@ pub fn branch_history_text(messages: &[ChatMessageRecord]) -> String {
 pub async fn start(
     backend: AgentBackend,
     cwd: PathBuf,
-    search: Option<Arc<dyn wilkes_agent::search::SearchService>>,
+    workspaces: Option<Arc<dyn wilkes_agent::search::WorkspaceCatalog>>,
     integrations: IntegrationsSettings,
 ) -> anyhow::Result<SpawnedChatSession> {
-    wilkes_agent::session::spawn_with_services(backend, cwd, search, integrations).await
+    wilkes_agent::session::spawn_with_services(backend, cwd, workspaces, integrations).await
 }
 
 pub async fn open(
     record: &ChatConversationRecord,
-    search: Option<Arc<dyn wilkes_agent::search::SearchService>>,
+    workspaces: Option<Arc<dyn wilkes_agent::search::WorkspaceCatalog>>,
     integrations: IntegrationsSettings,
 ) -> anyhow::Result<SpawnedChatSession> {
     wilkes_agent::session::load_with_services(
         record.backend,
         PathBuf::from(&record.cwd),
         record.backend_session_id.clone(),
-        search,
+        workspaces,
         integrations,
     )
     .await

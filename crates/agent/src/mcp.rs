@@ -29,7 +29,7 @@ use wilkes_core::types::IntegrationsSettings;
 use crate::{
     context::{ActiveDoc, ContextFile},
     reader,
-    search::SearchService,
+    search::{SearchService, WorkspaceCatalog, WorkspaceDescriptor},
     session::ContextStateHandle,
 };
 
@@ -47,6 +47,8 @@ const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 const SEMANTIC_INDEX_GUIDANCE: &str = "The user can enable the semantic index in Wilkes Settings. Use exact search with mode='exact' instead in the meantime.";
 const EXTERNAL_DOCUMENT_PATH_REQUIRED: &str =
     "External Wilkes MCP does not default document tools to the active document; pass path explicitly after reading list_context.";
+const WORKSPACE_DOCUMENT_PATH_REQUIRED: &str =
+    "The active document belongs to the workspace open in Wilkes, not the workspace this call names; pass path explicitly.";
 
 /// Names of the read-only tools this server exposes. Shared with the permission
 /// boundary in `session.rs` so calls to Wilkes's *own* MCP server are
@@ -102,7 +104,7 @@ impl Drop for McpRuntime {
 pub(crate) async fn start(
     context: ContextStateHandle,
     cwd: PathBuf,
-    search: Option<Arc<dyn SearchService>>,
+    workspaces: Option<Arc<dyn WorkspaceCatalog>>,
     integrations: IntegrationsSettings,
 ) -> anyhow::Result<McpRuntime> {
     let token = uuid::Uuid::new_v4().to_string();
@@ -113,7 +115,7 @@ pub(crate) async fn start(
         Some(token),
         McpContext::Session(context),
         cwd,
-        search,
+        workspaces,
         Some(integrations),
         HostValidation::LoopbackOnly,
         "chat",
@@ -188,7 +190,7 @@ pub async fn start_external(
     bind_address: IpAddr,
     port: u16,
     token: Option<String>,
-    search: Arc<dyn SearchService>,
+    workspaces: Arc<dyn WorkspaceCatalog>,
     context: ExternalMcpContext,
 ) -> anyhow::Result<ExternalMcpRuntime> {
     if port == 0 {
@@ -201,7 +203,7 @@ pub async fn start_external(
         token,
         McpContext::Library(context),
         PathBuf::new(),
-        Some(search),
+        Some(workspaces),
         None,
         HostValidation::Any,
         "external",
@@ -229,7 +231,7 @@ async fn start_server(
     token: Option<String>,
     context: McpContext,
     cwd: PathBuf,
-    search: Option<Arc<dyn SearchService>>,
+    workspaces: Option<Arc<dyn WorkspaceCatalog>>,
     integrations: Option<IntegrationsSettings>,
     host_validation: HostValidation,
     lifecycle: &'static str,
@@ -253,7 +255,7 @@ async fn start_server(
             Ok(WilkesMcp::new(
                 context.clone(),
                 cwd.clone(),
-                search.clone(),
+                workspaces.clone(),
                 integrations.clone(),
             ))
         },
@@ -319,7 +321,9 @@ async fn require_bearer_token(
 struct WilkesMcp {
     context: McpContext,
     cwd: PathBuf,
-    search: Option<Arc<dyn SearchService>>,
+    /// Resolves the library a call reads. Held instead of a `SearchService` so
+    /// no server is pinned to the workspace that was active when it started.
+    workspaces: Option<Arc<dyn WorkspaceCatalog>>,
     integrations: Option<IntegrationsSettings>,
     tool_router: ToolRouter<Self>,
 }
@@ -328,7 +332,7 @@ impl WilkesMcp {
     fn new(
         context: McpContext,
         cwd: PathBuf,
-        search: Option<Arc<dyn SearchService>>,
+        workspaces: Option<Arc<dyn WorkspaceCatalog>>,
         integrations: Option<IntegrationsSettings>,
     ) -> Self {
         let mut tool_router = Self::tool_router();
@@ -336,7 +340,7 @@ impl WilkesMcp {
         Self {
             context,
             cwd,
-            search,
+            workspaces,
             integrations,
             tool_router,
         }
@@ -437,19 +441,96 @@ impl std::fmt::Debug for WilkesMcp {
         f.debug_struct("WilkesMcp")
             .field("context", &self.context)
             .field("cwd", &self.cwd)
-            .field("search", &self.search.as_ref().map(|_| "SearchService"))
+            .field(
+                "workspaces",
+                &self.workspaces.as_ref().map(|_| "WorkspaceCatalog"),
+            )
             .field("integrations", &self.integrations)
             .finish_non_exhaustive()
     }
 }
 
+/// One tool call's resolved workspace: which library it reads and the service
+/// that reads it.
+///
+/// Resolved once at the tool boundary and passed down, so the workspace a call
+/// names governs every step of it — roots, access boundary and index — and an
+/// unknown id fails once, up front, instead of degrading into an empty answer
+/// somewhere further in.
+struct WorkspaceScope {
+    named: Option<String>,
+    search: Option<Arc<dyn SearchService>>,
+}
+
+impl WorkspaceScope {
+    fn named(&self) -> Option<&str> {
+        self.named.as_deref()
+    }
+
+    fn search(&self) -> Option<Arc<dyn SearchService>> {
+        self.search.clone()
+    }
+
+    fn require_search(&self, unavailable: &str) -> Result<Arc<dyn SearchService>, String> {
+        self.search.clone().ok_or_else(|| unavailable.to_string())
+    }
+}
+
 impl WilkesMcp {
-    async fn context_snapshot(&self) -> crate::session::ContextSnapshot {
+    /// Resolve the workspace a call names, or the active one when it names
+    /// none. Naming a workspace opens its context alongside the active one; it
+    /// never activates it.
+    async fn scope(&self, workspace: Option<&str>) -> Result<WorkspaceScope, String> {
+        let named = workspace
+            .map(str::trim)
+            .filter(|workspace| !workspace.is_empty())
+            .map(str::to_string);
+        let Some(catalog) = self.workspaces.as_ref() else {
+            // A server without a catalog can still answer for whatever context
+            // it was given, but it cannot honour a named workspace.
+            if let Some(named) = named {
+                return Err(format!(
+                    "Workspace {named} cannot be resolved: this session has no Wilkes workspace access."
+                ));
+            }
+            return Ok(WorkspaceScope {
+                named: None,
+                search: None,
+            });
+        };
+        let search = catalog.search_for(named.as_deref()).await?;
+        Ok(WorkspaceScope {
+            named,
+            search: Some(search),
+        })
+    }
+
+    async fn workspace_descriptors(&self) -> Result<Vec<WorkspaceDescriptor>, String> {
+        match &self.workspaces {
+            Some(catalog) => catalog.workspaces().await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn context_snapshot(&self, scope: &WorkspaceScope) -> crate::session::ContextSnapshot {
         match &self.context {
-            McpContext::Session(context) => context.snapshot(),
+            // A named workspace overrides the chat's own root: the caller asked
+            // about that library, not the one this conversation opened in.
+            McpContext::Session(context) if scope.named().is_none() => context.snapshot(),
+            McpContext::Session(context) => {
+                let snapshot = context.snapshot();
+                let root = match scope.search() {
+                    Some(search) => search.default_root().await,
+                    None => None,
+                };
+                crate::session::ContextSnapshot {
+                    root: crate::context::root_context(root.as_deref()),
+                    ..snapshot
+                }
+            }
             McpContext::Library(context) => {
-                let root = match &self.search {
-                    Some(search) => search.clone().default_root().await,
+                let root = match scope.search() {
+                    Some(search) => search.default_root().await,
                     None => None,
                 };
                 crate::session::ContextSnapshot {
@@ -462,54 +543,67 @@ impl WilkesMcp {
         }
     }
 
-    async fn library_roots(&self) -> Vec<PathBuf> {
-        match &self.search {
-            Some(search) => search.clone().library_roots().await,
+    async fn library_roots(&self, scope: &WorkspaceScope) -> Vec<PathBuf> {
+        match scope.search() {
+            Some(search) => search.library_roots().await,
             None => Vec::new(),
         }
     }
 
-    async fn is_path_allowed(&self, path: &Path) -> bool {
+    async fn is_path_allowed(&self, path: &Path, scope: &WorkspaceScope) -> bool {
+        let within_roots = is_within_roots(path, &self.library_roots(scope).await);
         match &self.context {
-            McpContext::Session(context) => {
-                context.is_allowed(path) || is_within_roots(path, &self.library_roots().await)
+            // A chat's own context files belong to the workspace it opened in,
+            // so a call that names another workspace is admitted only by that
+            // workspace's roots.
+            McpContext::Session(context) if scope.named().is_none() => {
+                context.is_allowed(path) || within_roots
             }
-            McpContext::Library(_) => is_within_roots(path, &self.library_roots().await),
+            _ => within_roots,
         }
     }
 
-    async fn current_root(&self) -> Result<PathBuf, String> {
+    async fn current_root(&self, scope: &WorkspaceScope) -> Result<PathBuf, String> {
         match &self.context {
-            McpContext::Session(context) => {
+            McpContext::Session(context) if scope.named().is_none() => {
                 if let Some(root) = context.search_root() {
                     return Ok(root);
                 }
-                if let Some(search) = &self.search {
-                    if let Some(root) = search.clone().default_root().await {
+                if let Some(search) = scope.search() {
+                    if let Some(root) = search.default_root().await {
                         return Ok(root);
                     }
                 }
                 Ok(self.cwd.clone())
             }
-            McpContext::Library(_) => {
-                let search = self
-                    .search
-                    .clone()
-                    .ok_or_else(|| "Wilkes search is not available.".to_string())?;
-                search.default_root().await.ok_or_else(|| {
-                    "No current Wilkes library root is configured. Open a directory in Wilkes first."
-                        .to_string()
+            _ => {
+                let search = scope.require_search("Wilkes search is not available.")?;
+                search.default_root().await.ok_or_else(|| match scope.named() {
+                    Some(workspace) => format!(
+                        "Workspace {workspace} has no current library root. Open a directory in it, or pass root explicitly."
+                    ),
+                    None => "No current Wilkes library root is configured. Open a directory in Wilkes first."
+                        .to_string(),
                 })
             }
         }
     }
 
+    /// Literature and provider settings are global rather than per-workspace,
+    /// so this deliberately resolves through the active workspace only.
     async fn integrations(&self) -> IntegrationsSettings {
         if let Some(integrations) = &self.integrations {
             return integrations.clone();
         }
-        match &self.search {
-            Some(search) => search.clone().integrations().await,
+        let search = match self.scope(None).await {
+            Ok(scope) => scope.search(),
+            Err(error) => {
+                info!(%error, "mcp: integrations settings unavailable");
+                None
+            }
+        };
+        match search {
+            Some(search) => search.integrations().await,
             None => IntegrationsSettings::default(),
         }
     }
@@ -526,11 +620,27 @@ fn is_within_roots(path: &Path, roots: &[PathBuf]) -> bool {
     })
 }
 
-fn mcp_access_error(path: &Path) -> String {
-    format!(
-        "{} is not in a configured Wilkes library root or this chat's context. Open its containing directory as a Wilkes root or add the file to the chat context.",
-        path.display()
-    )
+/// Name the library the path was actually checked against. A caller that named
+/// a workspace has to be able to tell "wrong workspace" from "outside every
+/// root", and the two produce the same refusal otherwise.
+fn mcp_access_error(path: &Path, scope: &WorkspaceScope) -> String {
+    match scope.named() {
+        Some(workspace) => format!(
+            "{} is not in a configured library root of workspace {workspace}. Pass a different workspace, or open its containing directory as a root of that workspace.",
+            path.display()
+        ),
+        None => format!(
+            "{} is not in a configured Wilkes library root or this chat's context. Open its containing directory as a Wilkes root or add the file to the chat context.",
+            path.display()
+        ),
+    }
+}
+
+fn no_roots_error(scope: &WorkspaceScope) -> String {
+    match scope.named() {
+        Some(workspace) => format!("Workspace {workspace} has no configured library roots."),
+        None => "No Wilkes library roots are configured.".to_string(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -579,6 +689,14 @@ where
     }
 }
 
+/// Parameters for the tools whose only input is which workspace to read.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct WorkspaceParams {
+    /// Workspace id to read, from list_context. Omit for the workspace that is
+    /// active in Wilkes. Naming one does not switch the app to it.
+    workspace: Option<String>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetDocumentTextParams {
     /// Document to read. Required for external MCP clients; an in-app chat may
@@ -594,6 +712,9 @@ struct GetDocumentTextParams {
     #[serde(default, deserialize_with = "deserialize_optional_integer")]
     #[schemars(with = "Option<usize>")]
     max_chars: Option<usize>,
+    /// Workspace id to read, from list_context. Omit for the workspace that is
+    /// active in Wilkes. Naming one does not switch the app to it.
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -601,6 +722,9 @@ struct GetDocumentOutlineParams {
     /// Document whose declared outline to read. Required for external MCP
     /// clients; an in-app chat may omit it to use that chat's active document.
     path: Option<String>,
+    /// Workspace id to read, from list_context. Omit for the workspace that is
+    /// active in Wilkes. Naming one does not switch the app to it.
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -634,6 +758,9 @@ struct SearchParams {
     context_lines: Option<u32>,
     /// Optional saved smart collection ID to intersect with the chosen scope.
     collection_id: Option<String>,
+    /// Workspace id to read, from list_context. Omit for the workspace that is
+    /// active in Wilkes. Naming one does not switch the app to it.
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -651,6 +778,9 @@ struct GetRelatedDocumentsParams {
     limit: Option<usize>,
     /// Optional saved smart collection ID to constrain returned documents.
     collection_id: Option<String>,
+    /// Workspace id to read, from list_context. Omit for the workspace that is
+    /// active in Wilkes. Naming one does not switch the app to it.
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -670,6 +800,9 @@ struct GetFileMetadataParams {
     /// Document to read metadata for. Required for external MCP clients; an
     /// in-app chat may omit it to use its active document.
     path: Option<String>,
+    /// Workspace id to read, from list_context. Omit for the workspace that is
+    /// active in Wilkes. Naming one does not switch the app to it.
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -682,6 +815,9 @@ struct ListDocumentsParams {
     #[serde(default, deserialize_with = "deserialize_optional_integer")]
     #[schemars(with = "Option<usize>")]
     limit: Option<usize>,
+    /// Workspace id to read, from list_context. Omit for the workspace that is
+    /// active in Wilkes. Naming one does not switch the app to it.
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -690,6 +826,9 @@ struct DownloadParams {
     url: String,
     /// File name inside the current Wilkes root. Must not contain directories.
     filename: Option<String>,
+    /// Workspace id to read, from list_context. Omit for the workspace that is
+    /// active in Wilkes. Naming one does not switch the app to it.
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -734,11 +873,43 @@ struct PageRange {
 
 #[derive(Debug, Serialize)]
 struct ListContextResponse {
+    /// The workspace the reported roots and documents belong to: the one named
+    /// by the call, otherwise the workspace active in Wilkes.
+    workspace: Option<WorkspaceInfo>,
+    /// Every workspace this Wilkes instance holds. Pass one of these ids as
+    /// `workspace` to read that library without switching the app to it.
+    workspaces: Vec<WorkspaceInfo>,
     current_root: Option<String>,
     roots: Vec<String>,
     first_files: Vec<String>,
     active_doc: Option<ActiveDocInfo>,
     context_files: Vec<ContextFileInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkspaceInfo {
+    id: String,
+    name: String,
+    roots: Vec<String>,
+    current_root: Option<String>,
+    /// Whether tool calls that name no workspace reach this one.
+    active: bool,
+}
+
+impl From<WorkspaceDescriptor> for WorkspaceInfo {
+    fn from(workspace: WorkspaceDescriptor) -> Self {
+        Self {
+            id: workspace.id,
+            name: workspace.name,
+            roots: workspace
+                .roots
+                .iter()
+                .map(|root| display_path(root))
+                .collect(),
+            current_root: workspace.active_root.as_deref().map(display_path),
+            active: workspace.active,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -870,25 +1041,45 @@ enum SearchMatchKindResponse {
 #[tool_router]
 impl WilkesMcp {
     #[tool(
-        description = "List the current Wilkes context: configured library roots, active root, the document currently visible in Wilkes, and any files explicitly added to an in-app chat."
+        description = "List the current Wilkes context: every workspace and its id, the configured library roots and active root of the workspace read, the document currently visible in Wilkes, and any files explicitly added to an in-app chat. Read this first to learn the workspace ids other tools accept."
     )]
-    async fn list_context(&self) -> CallToolResult {
-        let snapshot = self.context_snapshot().await;
-        let roots = self.library_roots().await;
+    async fn list_context(
+        &self,
+        Parameters(params): Parameters<WorkspaceParams>,
+    ) -> CallToolResult {
+        let scope = match self.scope(params.workspace.as_deref()).await {
+            Ok(scope) => scope,
+            Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
+        };
+        let workspaces = match self.workspace_descriptors().await {
+            Ok(workspaces) => workspaces,
+            Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
+        };
+        let snapshot = self.context_snapshot(&scope).await;
+        let roots = self.library_roots(&scope).await;
         structured(ListContextResponse::from_snapshot(
             snapshot.root,
             snapshot.active_doc,
             snapshot.context_files,
             roots,
+            workspaces,
+            scope.named(),
         ))
     }
 
     #[tool(
-        description = "List saved Wilkes smart collections and their IDs for collection-scoped searches."
+        description = "List saved Wilkes smart collections and their IDs for collection-scoped searches. Collections are per workspace; omit workspace for the active one."
     )]
-    async fn list_smart_collections(&self) -> CallToolResult {
-        match &self.search {
-            Some(search) => match search.clone().list_smart_collections().await {
+    async fn list_smart_collections(
+        &self,
+        Parameters(params): Parameters<WorkspaceParams>,
+    ) -> CallToolResult {
+        let scope = match self.scope(params.workspace.as_deref()).await {
+            Ok(scope) => scope,
+            Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
+        };
+        match scope.search() {
+            Some(search) => match search.list_smart_collections().await {
                 Ok(collections) => structured(collections),
                 Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
             },
@@ -897,7 +1088,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Read Wilkes-extracted document text from any configured Wilkes library root. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. Use page for one PDF page or page_range in \"N-M\" format (for example, \"7-9\") for an inclusive PDF page range."
+        description = "Read Wilkes-extracted document text from any configured Wilkes library root. Reads the active workspace unless workspace names another. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. Use page for one PDF page or page_range in \"N-M\" format (for example, \"7-9\") for an inclusive PDF page range."
     )]
     async fn get_document_text(
         &self,
@@ -910,7 +1101,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Read a document's declared outline (PDF bookmarks or Markdown headings) without requiring the semantic index. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. An empty outline means the document declares no table of contents."
+        description = "Read a document's declared outline (PDF bookmarks or Markdown headings) without requiring the semantic index. Reads the active workspace unless workspace names another. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. An empty outline means the document declares no table of contents."
     )]
     async fn get_document_outline(
         &self,
@@ -923,7 +1114,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Find documents semantically related to a document in Wilkes. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. Set scope='all' to search the whole library; otherwise results are limited to the current root."
+        description = "Find documents semantically related to a document in Wilkes. Searches the active workspace unless workspace names another. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. Set scope='all' to search that workspace's whole library; otherwise results are limited to its current root."
     )]
     async fn get_related_documents(
         &self,
@@ -936,7 +1127,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Read full bibliographic metadata for a document in any configured Wilkes library root: title, author, DOI, publication date, and any Semantic Scholar / OpenAlex enrichment. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document."
+        description = "Read full bibliographic metadata for a document in any configured Wilkes library root: title, author, DOI, publication date, and any Semantic Scholar / OpenAlex enrichment. Reads the active workspace unless workspace names another. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document."
     )]
     async fn get_file_metadata(
         &self,
@@ -949,7 +1140,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "List documents in the Wilkes library with their title, author, and DOI. Set scope='all' to list the whole library; otherwise lists the current root. Use this to browse what documents exist rather than searching their contents."
+        description = "List documents in the Wilkes library with their title, author, and DOI. Lists the active workspace unless workspace names another. Set scope='all' to list that workspace's whole library; otherwise lists its current root. Use this to browse what documents exist rather than searching their contents."
     )]
     async fn list_documents(
         &self,
@@ -962,7 +1153,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Search Wilkes-readable documents, including direct filename, cached-title and cached-author matches. You must explicitly set mode='exact' for literal/regex matching or mode='semantic' for meaning-based content search plus case-insensitive literal filename/title/author matching; mode has no default. Each returned match has kind='content', 'filename', 'title', or 'author'. Set scope='all' to search every configured library root; omit scope to search the current root. If the user asks about a specific document, set file to that document path; omit file only for corpus-wide searches."
+        description = "Search Wilkes-readable documents, including direct filename, cached-title and cached-author matches. You must explicitly set mode='exact' for literal/regex matching or mode='semantic' for meaning-based content search plus case-insensitive literal filename/title/author matching; mode has no default. Each returned match has kind='content', 'filename', 'title', or 'author'. Searches the active workspace unless workspace names another. Set scope='all' to search every configured library root of that workspace; omit scope to search its current root. If the user asks about a specific document, set file to that document path; omit file only for corpus-wide searches."
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         match search_documents_for_mcp(self, params).await {
@@ -1036,10 +1227,14 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Download a direct HTTP(S) file URL into the current Wilkes root. Use only when the user asks to import or download a file. Pass filename to choose the saved name; existing files are never overwritten. Literature search results may provide pdf_url values suitable for this tool."
+        description = "Download a direct HTTP(S) file URL into the current Wilkes root of the active workspace, or of the workspace named by workspace. Use only when the user asks to import or download a file. Pass filename to choose the saved name; existing files are never overwritten. Literature search results may provide pdf_url values suitable for this tool."
     )]
     async fn download(&self, Parameters(params): Parameters<DownloadParams>) -> CallToolResult {
-        let root = match self.current_root().await {
+        let scope = match self.scope(params.workspace.as_deref()).await {
+            Ok(scope) => scope,
+            Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
+        };
+        let root = match self.current_root(&scope).await {
             Ok(root) => root,
             Err(message) => {
                 return CallToolResult::error(vec![ContentBlock::text(message)]);
@@ -1201,8 +1396,23 @@ impl ListContextResponse {
         active_doc: Option<ActiveDoc>,
         context_files: Vec<ContextFile>,
         roots: Vec<PathBuf>,
+        workspaces: Vec<WorkspaceDescriptor>,
+        requested_workspace: Option<&str>,
     ) -> Self {
+        let workspaces: Vec<WorkspaceInfo> =
+            workspaces.into_iter().map(WorkspaceInfo::from).collect();
+        // Which workspace the rest of this response describes: the named one,
+        // otherwise whichever the catalog reports as active.
+        let workspace = workspaces
+            .iter()
+            .find(|workspace| match requested_workspace {
+                Some(requested) => workspace.id == requested,
+                None => workspace.active,
+            })
+            .cloned();
         Self {
+            workspace,
+            workspaces,
             current_root: root.path.map(|path| path.to_string_lossy().into_owned()),
             roots: roots.into_iter().map(|path| display_path(&path)).collect(),
             first_files: root
@@ -1229,9 +1439,13 @@ async fn get_document_text_for_mcp(
     mcp: &WilkesMcp,
     params: GetDocumentTextParams,
 ) -> Result<GetDocumentTextResponse, String> {
+    let scope = mcp.scope(params.workspace.as_deref()).await?;
     let (path, default_page) = match (&mcp.context, params.path.as_ref()) {
         (_, Some(path)) if !path.trim().is_empty() => (PathBuf::from(path), None),
         (_, Some(_)) => return Err("Document path cannot be empty.".to_string()),
+        (McpContext::Session(_), None) if scope.named().is_some() => {
+            return Err(WORKSPACE_DOCUMENT_PATH_REQUIRED.to_string());
+        }
         (McpContext::Session(context), None) => {
             let active_doc = context
                 .snapshot()
@@ -1247,8 +1461,8 @@ async fn get_document_text_for_mcp(
     if params.page.is_some() && params.page_range.is_some() {
         return Err("Pass either page or page_range, not both.".to_string());
     }
-    if !mcp.is_path_allowed(&path).await {
-        return Err(mcp_access_error(&path));
+    if !mcp.is_path_allowed(&path, &scope).await {
+        return Err(mcp_access_error(&path, &scope));
     }
     get_document_text_at_path(path, default_page, params)
 }
@@ -1257,7 +1471,8 @@ async fn get_document_outline_for_mcp(
     mcp: &WilkesMcp,
     params: GetDocumentOutlineParams,
 ) -> Result<GetDocumentOutlineResponse, String> {
-    let path = resolve_document_path(mcp, params.path).await?;
+    let scope = mcp.scope(params.workspace.as_deref()).await?;
+    let path = resolve_document_path(mcp, params.path, &scope).await?;
     let outline_path = path.clone();
     let declared_outline = tokio::task::spawn_blocking(move || {
         let mut registry = ExtractorRegistry::new();
@@ -1353,29 +1568,32 @@ async fn search_documents_for_mcp(
     mcp: &WilkesMcp,
     mut params: SearchParams,
 ) -> Result<SearchResponse, String> {
+    let scope = mcp.scope(params.workspace.as_deref()).await?;
     match &mcp.context {
-        McpContext::Session(context) => {
-            search_documents(context, mcp.search.clone(), &mcp.cwd, params).await
+        McpContext::Session(context) if scope.named().is_none() => {
+            search_documents(context, scope.search(), &mcp.cwd, params).await
         }
-        McpContext::Library(_) => {
+        // Naming a workspace makes the call library-scoped even inside a chat:
+        // the chat's own root and context files belong to another library.
+        _ => {
             let root = match params.root.as_ref() {
                 Some(root) if !root.trim().is_empty() => PathBuf::from(root),
                 Some(_) => return Err("Search root cannot be empty.".to_string()),
-                None => mcp.current_root().await?,
+                None => mcp.current_root(&scope).await?,
             };
-            if !is_within_roots(&root, &mcp.library_roots().await) {
-                return Err(mcp_access_error(&root));
+            if !is_within_roots(&root, &mcp.library_roots(&scope).await) {
+                return Err(mcp_access_error(&root, &scope));
             }
             if let Some(file) = params.file.as_ref() {
                 let file = PathBuf::from(file);
-                if !mcp.is_path_allowed(&file).await {
-                    return Err(mcp_access_error(&file));
+                if !mcp.is_path_allowed(&file, &scope).await {
+                    return Err(mcp_access_error(&file, &scope));
                 }
             }
             params.root = Some(root.to_string_lossy().into_owned());
             search_documents(
                 &ContextStateHandle::default(),
-                mcp.search.clone(),
+                scope.search(),
                 Path::new(""),
                 params,
             )
@@ -1457,13 +1675,22 @@ async fn search_documents(
 /// Resolve the document path for a single-document tool: an explicit `path`
 /// when given, otherwise the session's active document. Enforces the same
 /// read-access boundary every other document tool uses.
-async fn resolve_document_path(mcp: &WilkesMcp, path: Option<String>) -> Result<PathBuf, String> {
+async fn resolve_document_path(
+    mcp: &WilkesMcp,
+    path: Option<String>,
+    scope: &WorkspaceScope,
+) -> Result<PathBuf, String> {
     let explicit = path
         .as_ref()
         .filter(|p| !p.trim().is_empty())
         .map(PathBuf::from);
     let path = match (&mcp.context, explicit) {
         (_, Some(path)) => path,
+        // The active document belongs to the workspace Wilkes is showing, so a
+        // call that names another workspace cannot inherit it.
+        (McpContext::Session(_), None) if scope.named().is_some() => {
+            return Err(WORKSPACE_DOCUMENT_PATH_REQUIRED.to_string());
+        }
         (McpContext::Session(context), None) => context
             .snapshot()
             .active_doc
@@ -1473,8 +1700,8 @@ async fn resolve_document_path(mcp: &WilkesMcp, path: Option<String>) -> Result<
             return Err(EXTERNAL_DOCUMENT_PATH_REQUIRED.to_string());
         }
     };
-    if !mcp.is_path_allowed(&path).await {
-        return Err(mcp_access_error(&path));
+    if !mcp.is_path_allowed(&path, scope).await {
+        return Err(mcp_access_error(&path, scope));
     }
     Ok(path)
 }
@@ -1483,11 +1710,10 @@ async fn get_file_metadata_for_mcp(
     mcp: &WilkesMcp,
     params: GetFileMetadataParams,
 ) -> Result<GetFileMetadataResponse, String> {
-    let path = resolve_document_path(mcp, params.path).await?;
-    let search = mcp
-        .search
-        .clone()
-        .ok_or_else(|| "Wilkes document metadata is not available in this session.".to_string())?;
+    let scope = mcp.scope(params.workspace.as_deref()).await?;
+    let path = resolve_document_path(mcp, params.path, &scope).await?;
+    let search =
+        scope.require_search("Wilkes document metadata is not available in this session.")?;
     let metadata = search.document_metadata(path.clone()).await?;
     Ok(GetFileMetadataResponse {
         path: display_path(&path),
@@ -1499,10 +1725,9 @@ async fn list_documents_for_mcp(
     mcp: &WilkesMcp,
     params: ListDocumentsParams,
 ) -> Result<ListDocumentsResponse, String> {
-    let search = mcp
-        .search
-        .clone()
-        .ok_or_else(|| "Wilkes document listing is not available in this session.".to_string())?;
+    let scope = mcp.scope(params.workspace.as_deref()).await?;
+    let search =
+        scope.require_search("Wilkes document listing is not available in this session.")?;
     let all = params.scope == Some(SearchScopeParam::All);
     let limit = params
         .limit
@@ -1510,23 +1735,24 @@ async fn list_documents_for_mcp(
         .clamp(1, MAX_LIST_DOCUMENTS_LIMIT);
 
     let roots: Vec<PathBuf> = if all {
-        let roots = mcp.library_roots().await;
+        let roots = mcp.library_roots(&scope).await;
         if roots.is_empty() {
-            return Err("No Wilkes library roots are configured.".to_string());
+            return Err(no_roots_error(&scope));
         }
         roots
     } else {
         let root = match params.root.as_ref() {
             Some(root) if !root.trim().is_empty() => PathBuf::from(root),
             Some(_) => return Err("List-documents root cannot be empty.".to_string()),
-            None => mcp.current_root().await?,
+            None => mcp.current_root(&scope).await?,
         };
         // The external, library-scoped server must not list outside configured
-        // roots; a session server already trusts its own root.
-        if matches!(mcp.context, McpContext::Library(_))
-            && !is_within_roots(&root, &mcp.library_roots().await)
+        // roots, and neither may a call that reaches past its own workspace; a
+        // session server already trusts its own root.
+        if (matches!(mcp.context, McpContext::Library(_)) || scope.named().is_some())
+            && !is_within_roots(&root, &mcp.library_roots(&scope).await)
         {
-            return Err(mcp_access_error(&root));
+            return Err(mcp_access_error(&root, &scope));
         }
         vec![root]
     };
@@ -1566,26 +1792,27 @@ async fn get_related_documents_for_mcp(
     mcp: &WilkesMcp,
     mut params: GetRelatedDocumentsParams,
 ) -> Result<GetRelatedDocumentsResponse, String> {
-    let path = resolve_document_path(mcp, params.path.clone()).await?;
+    let scope = mcp.scope(params.workspace.as_deref()).await?;
+    let path = resolve_document_path(mcp, params.path.clone(), &scope).await?;
     params.path = Some(path.to_string_lossy().into_owned());
 
     match &mcp.context {
-        McpContext::Session(context) => {
-            get_related_documents(context, mcp.search.clone(), &mcp.cwd, params).await
+        McpContext::Session(context) if scope.named().is_none() => {
+            get_related_documents(context, scope.search(), &mcp.cwd, params).await
         }
-        McpContext::Library(_) => {
+        _ => {
             let root = match params.root.as_ref() {
                 Some(root) if !root.trim().is_empty() => PathBuf::from(root),
                 Some(_) => return Err("Related-documents root cannot be empty.".to_string()),
-                None => mcp.current_root().await?,
+                None => mcp.current_root(&scope).await?,
             };
-            if !is_within_roots(&root, &mcp.library_roots().await) {
-                return Err(mcp_access_error(&root));
+            if !is_within_roots(&root, &mcp.library_roots(&scope).await) {
+                return Err(mcp_access_error(&root, &scope));
             }
             params.root = Some(root.to_string_lossy().into_owned());
             get_related_documents(
                 &ContextStateHandle::default(),
-                mcp.search.clone(),
+                scope.search(),
                 Path::new(""),
                 params,
             )
@@ -2065,6 +2292,8 @@ mod tests {
             snapshot.active_doc,
             snapshot.context_files,
             vec![dir.path().to_path_buf()],
+            Vec::new(),
+            None,
         );
 
         assert_eq!(response.current_root.as_deref(), dir.path().to_str());
@@ -2158,6 +2387,68 @@ mod tests {
         }
     }
 
+    /// Test catalog: several named workspaces, each with its own service, and a
+    /// record of which id every call resolved through.
+    struct FakeWorkspaces {
+        active: String,
+        workspaces: Vec<(String, Arc<FakeSearch>)>,
+        resolved: Mutex<Vec<Option<String>>>,
+    }
+
+    impl FakeWorkspaces {
+        fn new(active: &str, workspaces: Vec<(&str, Arc<FakeSearch>)>) -> Self {
+            Self {
+                active: active.to_string(),
+                workspaces: workspaces
+                    .into_iter()
+                    .map(|(id, search)| (id.to_string(), search))
+                    .collect(),
+                resolved: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn resolutions(&self) -> Vec<Option<String>> {
+            self.resolved.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl WorkspaceCatalog for FakeWorkspaces {
+        async fn workspaces(&self) -> Result<Vec<WorkspaceDescriptor>, String> {
+            Ok(self
+                .workspaces
+                .iter()
+                .map(|(id, search)| WorkspaceDescriptor {
+                    id: id.clone(),
+                    name: format!("Workspace {id}"),
+                    roots: search.library_roots.clone(),
+                    active_root: search.default_root.clone(),
+                    active: *id == self.active,
+                })
+                .collect())
+        }
+
+        async fn search_for(
+            &self,
+            workspace_id: Option<&str>,
+        ) -> Result<Arc<dyn SearchService>, String> {
+            self.resolved
+                .lock()
+                .unwrap()
+                .push(workspace_id.map(str::to_string));
+            let id = workspace_id.unwrap_or(&self.active);
+            self.workspaces
+                .iter()
+                .find(|(candidate, _)| candidate == id)
+                .map(|(_, search)| Arc::clone(search) as Arc<dyn SearchService>)
+                .ok_or_else(|| format!("Workspace {id} is not available: Unknown workspace"))
+        }
+    }
+
+    fn single_workspace(search: Arc<FakeSearch>) -> Arc<FakeWorkspaces> {
+        Arc::new(FakeWorkspaces::new("active", vec![("active", search)]))
+    }
+
     fn fake_search_with_root(root: PathBuf) -> Arc<FakeSearch> {
         Arc::new(FakeSearch {
             last_query: Mutex::new(None),
@@ -2171,6 +2462,270 @@ mod tests {
         })
     }
 
+    fn two_workspaces(
+        active_root: PathBuf,
+        other_root: PathBuf,
+    ) -> (Arc<FakeWorkspaces>, Arc<FakeSearch>) {
+        let other = fake_search_with_root(other_root);
+        let catalog = Arc::new(FakeWorkspaces::new(
+            "active-id",
+            vec![
+                ("active-id", fake_search_with_root(active_root)),
+                ("other-id", Arc::clone(&other)),
+            ],
+        ));
+        (catalog, other)
+    }
+
+    #[tokio::test]
+    async fn list_context_reports_every_workspace_and_defaults_to_the_active_one() {
+        let active = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let (catalog, _) = two_workspaces(active.path().to_path_buf(), other.path().to_path_buf());
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(Arc::clone(&catalog) as Arc<dyn WorkspaceCatalog>),
+            None,
+        );
+
+        let response = serde_json::to_value(
+            mcp.list_context(Parameters(WorkspaceParams { workspace: None }))
+                .await,
+        )
+        .unwrap();
+        let context = &response["structuredContent"];
+        assert_eq!(context["workspaces"].as_array().unwrap().len(), 2);
+        assert_eq!(context["workspaces"][0]["id"], "active-id");
+        assert_eq!(context["workspaces"][0]["active"], true);
+        assert_eq!(context["workspaces"][1]["id"], "other-id");
+        assert_eq!(context["workspaces"][1]["active"], false);
+        assert_eq!(context["workspace"]["id"], "active-id");
+        assert_eq!(context["current_root"], display_path(active.path()));
+
+        // Naming a workspace describes that workspace's roots instead.
+        let response = serde_json::to_value(
+            mcp.list_context(Parameters(WorkspaceParams {
+                workspace: Some("other-id".to_string()),
+            }))
+            .await,
+        )
+        .unwrap();
+        let context = &response["structuredContent"];
+        assert_eq!(context["workspace"]["id"], "other-id");
+        assert_eq!(context["current_root"], display_path(other.path()));
+        assert_eq!(
+            catalog.resolutions(),
+            vec![None, Some("other-id".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn named_workspace_reads_its_own_library_without_activating_it() {
+        let active = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let document = other.path().join("paper.txt");
+        std::fs::write(&document, "text from the other workspace").unwrap();
+        let (catalog, _) = two_workspaces(active.path().to_path_buf(), other.path().to_path_buf());
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(Arc::clone(&catalog) as Arc<dyn WorkspaceCatalog>),
+            None,
+        );
+
+        // The active workspace's roots do not admit it...
+        let denied = get_document_text_for_mcp(
+            &mcp,
+            GetDocumentTextParams {
+                path: Some(document.to_string_lossy().into_owned()),
+                page: None,
+                page_range: None,
+                max_chars: None,
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(denied.contains("not in a configured Wilkes library root"));
+
+        // ...and naming the workspace that owns it does.
+        let response = get_document_text_for_mcp(
+            &mcp,
+            GetDocumentTextParams {
+                path: Some(document.to_string_lossy().into_owned()),
+                page: None,
+                page_range: None,
+                max_chars: None,
+                workspace: Some("other-id".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.text, "text from the other workspace");
+        assert_eq!(
+            catalog.resolutions(),
+            vec![None, Some("other-id".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn refusal_names_the_workspace_the_path_was_checked_against() {
+        let active = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let stray = tempdir().unwrap();
+        let document = stray.path().join("paper.txt");
+        std::fs::write(&document, "outside every workspace").unwrap();
+        let (catalog, _) = two_workspaces(active.path().to_path_buf(), other.path().to_path_buf());
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(catalog),
+            None,
+        );
+
+        let error = get_document_text_for_mcp(
+            &mcp,
+            GetDocumentTextParams {
+                path: Some(document.to_string_lossy().into_owned()),
+                page: None,
+                page_range: None,
+                max_chars: None,
+                workspace: Some("other-id".to_string()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("library root of workspace other-id"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_workspace_fails_the_call_instead_of_reading_the_active_one() {
+        let active = tempdir().unwrap();
+        let document = active.path().join("paper.txt");
+        std::fs::write(&document, "active workspace text").unwrap();
+        let other = tempdir().unwrap();
+        let (catalog, _) = two_workspaces(active.path().to_path_buf(), other.path().to_path_buf());
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(catalog),
+            None,
+        );
+
+        let error = get_document_text_for_mcp(
+            &mcp,
+            GetDocumentTextParams {
+                path: Some(document.to_string_lossy().into_owned()),
+                page: None,
+                page_range: None,
+                max_chars: None,
+                workspace: Some("missing-id".to_string()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("Workspace missing-id is not available"),
+            "unexpected error: {error}"
+        );
+
+        let listing = list_documents_for_mcp(
+            &mcp,
+            ListDocumentsParams {
+                root: None,
+                scope: None,
+                limit: None,
+                workspace: Some("missing-id".to_string()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(listing.contains("Workspace missing-id is not available"));
+    }
+
+    #[tokio::test]
+    async fn chat_session_naming_a_workspace_leaves_its_own_context_behind() {
+        let chat_root = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let context_file = tempdir().unwrap();
+        let added = context_file.path().join("added.txt");
+        std::fs::write(&added, "explicitly added to the chat").unwrap();
+
+        let context = ContextStateHandle::default();
+        context.set_search_root(Some(chat_root.path().to_string_lossy().into_owned()));
+        context.add_context(added.to_string_lossy().into_owned(), None);
+        let (catalog, _) =
+            two_workspaces(chat_root.path().to_path_buf(), other.path().to_path_buf());
+        let mcp = WilkesMcp::new(
+            McpContext::Session(context),
+            chat_root.path().to_path_buf(),
+            Some(catalog),
+            None,
+        );
+
+        // The chat's own context file is readable while the call stays in the
+        // chat's workspace.
+        let response = get_document_text_for_mcp(
+            &mcp,
+            GetDocumentTextParams {
+                path: Some(added.to_string_lossy().into_owned()),
+                page: None,
+                page_range: None,
+                max_chars: None,
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.text, "explicitly added to the chat");
+
+        // Naming another workspace makes the call that workspace's, so the
+        // chat's own context no longer admits the path.
+        let error = get_document_text_for_mcp(
+            &mcp,
+            GetDocumentTextParams {
+                path: Some(added.to_string_lossy().into_owned()),
+                page: None,
+                page_range: None,
+                max_chars: None,
+                workspace: Some("other-id".to_string()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("library root of workspace other-id"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_without_workspace_access_refuses_a_named_workspace() {
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            None,
+            None,
+        );
+        let error = match mcp.scope(Some("any-id")).await {
+            Ok(_) => panic!("expected a named workspace to be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("no Wilkes workspace access"),
+            "unexpected error: {error}"
+        );
+        let scope = match mcp.scope(None).await {
+            Ok(scope) => scope,
+            Err(error) => panic!("expected an unnamed scope to resolve: {error}"),
+        };
+        assert!(scope.search().is_none());
+    }
+
     #[tokio::test]
     async fn external_context_reads_only_configured_library_roots() {
         let library = tempdir().unwrap();
@@ -2182,7 +2737,9 @@ mod tests {
         let mcp = WilkesMcp::new(
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
-            Some(fake_search_with_root(library.path().to_path_buf())),
+            Some(single_workspace(fake_search_with_root(
+                library.path().to_path_buf(),
+            ))),
             None,
         );
 
@@ -2193,6 +2750,7 @@ mod tests {
                 page: None,
                 page_range: None,
                 max_chars: None,
+                workspace: None,
             },
         )
         .await
@@ -2206,6 +2764,7 @@ mod tests {
                 page: None,
                 page_range: None,
                 max_chars: None,
+                workspace: None,
             },
         )
         .await
@@ -2219,7 +2778,9 @@ mod tests {
         let mcp = WilkesMcp::new(
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
-            Some(fake_search_with_root(library.path().to_path_buf())),
+            Some(single_workspace(fake_search_with_root(
+                library.path().to_path_buf(),
+            ))),
             None,
         );
 
@@ -2230,6 +2791,7 @@ mod tests {
                 page: None,
                 page_range: None,
                 max_chars: None,
+                workspace: None,
             },
         )
         .await
@@ -2244,7 +2806,9 @@ mod tests {
         let mcp = WilkesMcp::new(
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
-            Some(fake_search_with_root(library.path().to_path_buf())),
+            Some(single_workspace(fake_search_with_root(
+                library.path().to_path_buf(),
+            ))),
             None,
         );
 
@@ -2261,6 +2825,7 @@ mod tests {
                 is_regex: None,
                 context_lines: None,
                 collection_id: None,
+                workspace: None,
             },
         )
         .await
@@ -2353,7 +2918,7 @@ mod tests {
             "127.0.0.1".parse().unwrap(),
             port,
             None,
-            fake_search_with_root(library.path().to_path_buf()),
+            single_workspace(fake_search_with_root(library.path().to_path_buf())),
             ExternalMcpContext::default(),
         )
         .await
@@ -2444,7 +3009,7 @@ mod tests {
             "127.0.0.1".parse().unwrap(),
             port,
             Some("test-token".to_string()),
-            fake_search_with_root(library.path().to_path_buf()),
+            single_workspace(fake_search_with_root(library.path().to_path_buf())),
             ExternalMcpContext::default(),
         )
         .await
@@ -2501,6 +3066,7 @@ mod tests {
                 page: None,
                 page_range: None,
                 max_chars: None,
+                workspace: None,
             },
         )
         .await
@@ -2524,9 +3090,15 @@ mod tests {
             None,
         );
 
-        let response = get_document_outline_for_mcp(&mcp, GetDocumentOutlineParams { path: None })
-            .await
-            .unwrap();
+        let response = get_document_outline_for_mcp(
+            &mcp,
+            GetDocumentOutlineParams {
+                path: None,
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(response.path, display_path(&path));
         assert_eq!(response.outline.len(), 2);
@@ -2543,13 +3115,21 @@ mod tests {
         let mcp = WilkesMcp::new(
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
-            Some(fake_search_with_root(library.path().to_path_buf())),
+            Some(single_workspace(fake_search_with_root(
+                library.path().to_path_buf(),
+            ))),
             None,
         );
 
-        let error = get_document_outline_for_mcp(&mcp, GetDocumentOutlineParams { path: None })
-            .await
-            .unwrap_err();
+        let error = get_document_outline_for_mcp(
+            &mcp,
+            GetDocumentOutlineParams {
+                path: None,
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(error.contains("pass path explicitly"));
     }
@@ -2575,6 +3155,7 @@ mod tests {
                 page: None,
                 page_range: None,
                 max_chars: None,
+                workspace: None,
             },
         )
         .await
@@ -2606,6 +3187,7 @@ mod tests {
                 page: None,
                 page_range: None,
                 max_chars: None,
+                workspace: None,
             },
         )
         .await
@@ -2639,13 +3221,15 @@ mod tests {
         let mcp = WilkesMcp::new(
             McpContext::Session(context),
             current_root,
-            Some(search),
+            Some(single_workspace(search)),
             None,
         );
 
-        let resolved = resolve_document_path(&mcp, Some(path.to_string_lossy().into_owned()))
-            .await
-            .unwrap();
+        let scope = mcp.scope(None).await.unwrap();
+        let resolved =
+            resolve_document_path(&mcp, Some(path.to_string_lossy().into_owned()), &scope)
+                .await
+                .unwrap();
         assert_eq!(resolved, path);
 
         let response = get_document_text_for_mcp(
@@ -2655,6 +3239,7 @@ mod tests {
                 page: None,
                 page_range: None,
                 max_chars: None,
+                workspace: None,
             },
         )
         .await
@@ -2677,7 +3262,7 @@ mod tests {
         let mcp = WilkesMcp::new(
             McpContext::Session(context),
             root.clone(),
-            Some(fake_search_with_root(root)),
+            Some(single_workspace(fake_search_with_root(root))),
             None,
         );
 
@@ -2688,6 +3273,7 @@ mod tests {
                 page: None,
                 page_range: None,
                 max_chars: None,
+                workspace: None,
             },
         )
         .await
@@ -2719,7 +3305,7 @@ mod tests {
         let mcp = WilkesMcp::new(
             McpContext::Session(context),
             root.clone(),
-            Some(fake_search_with_root(root)),
+            Some(single_workspace(fake_search_with_root(root))),
             None,
         );
 
@@ -2730,6 +3316,7 @@ mod tests {
                 page: None,
                 page_range: None,
                 max_chars: None,
+                workspace: None,
             },
         )
         .await
@@ -2759,6 +3346,7 @@ mod tests {
                 page: None,
                 page_range: None,
                 max_chars: Some(3),
+                workspace: None,
             },
         )
         .await
@@ -2789,6 +3377,7 @@ mod tests {
                 page: None,
                 page_range: Some("1-5".to_string()),
                 max_chars: None,
+                workspace: None,
             },
         )
         .await
@@ -2816,6 +3405,7 @@ mod tests {
                 is_regex: Some(true),
                 context_lines: Some(100),
                 collection_id: None,
+                workspace: None,
             },
             23 * 1024 * 1024,
         )
@@ -2849,6 +3439,7 @@ mod tests {
                 is_regex: Some(true),
                 context_lines: None,
                 collection_id: None,
+                workspace: None,
             },
             0,
         )
@@ -2876,6 +3467,7 @@ mod tests {
                 is_regex: None,
                 context_lines: None,
                 collection_id: None,
+                workspace: None,
             },
             0,
         )
@@ -2905,6 +3497,7 @@ mod tests {
                 is_regex: None,
                 context_lines: None,
                 collection_id: None,
+                workspace: None,
             },
             0,
         )
@@ -2934,6 +3527,7 @@ mod tests {
                 is_regex: None,
                 context_lines: None,
                 collection_id: None,
+                workspace: None,
             },
             0,
         )
@@ -2971,6 +3565,7 @@ mod tests {
                 root: None,
                 limit: Some(100),
                 collection_id: None,
+                workspace: None,
             },
         )
         .await
@@ -3062,6 +3657,7 @@ mod tests {
                 is_regex: None,
                 context_lines: None,
                 collection_id: None,
+                workspace: None,
             },
         )
         .await
@@ -3144,6 +3740,7 @@ mod tests {
                 is_regex: None,
                 context_lines: None,
                 collection_id: None,
+                workspace: None,
             },
         )
         .await
@@ -3172,6 +3769,7 @@ mod tests {
                 is_regex: None,
                 context_lines: None,
                 collection_id: None,
+                workspace: None,
             },
         )
         .await
@@ -3188,6 +3786,7 @@ mod tests {
             DownloadParams {
                 url: "https://example.test/paper.pdf".to_string(),
                 filename: Some("../paper.pdf".to_string()),
+                workspace: None,
             },
         )
         .await
@@ -3201,6 +3800,7 @@ mod tests {
             DownloadParams {
                 url: "https://example.test/paper.pdf".to_string(),
                 filename: Some("paper.pdf".to_string()),
+                workspace: None,
             },
         )
         .await
@@ -3270,7 +3870,7 @@ mod tests {
         let mcp = WilkesMcp::new(
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
-            Some(service),
+            Some(single_workspace(service)),
             None,
         );
 
@@ -3280,6 +3880,7 @@ mod tests {
                 root: None,
                 scope: None,
                 limit: Some(2),
+                workspace: None,
             },
         )
         .await
@@ -3310,7 +3911,7 @@ mod tests {
         let mcp = WilkesMcp::new(
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
-            Some(service),
+            Some(single_workspace(service)),
             None,
         );
 
@@ -3318,6 +3919,7 @@ mod tests {
             &mcp,
             GetFileMetadataParams {
                 path: Some(doc.to_string_lossy().into_owned()),
+                workspace: None,
             },
         )
         .await
@@ -3335,13 +3937,21 @@ mod tests {
         let mcp = WilkesMcp::new(
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
-            Some(fake_search_with_root(library.path().to_path_buf())),
+            Some(single_workspace(fake_search_with_root(
+                library.path().to_path_buf(),
+            ))),
             None,
         );
 
-        let error = get_file_metadata_for_mcp(&mcp, GetFileMetadataParams { path: None })
-            .await
-            .unwrap_err();
+        let error = get_file_metadata_for_mcp(
+            &mcp,
+            GetFileMetadataParams {
+                path: None,
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(error.contains("pass path explicitly"));
     }
 
@@ -3355,11 +3965,14 @@ mod tests {
         let mcp = WilkesMcp::new(
             McpContext::Library(context),
             PathBuf::new(),
-            Some(fake_search_with_root(library.path().to_path_buf())),
+            Some(single_workspace(fake_search_with_root(
+                library.path().to_path_buf(),
+            ))),
             None,
         );
 
-        let snapshot = mcp.context_snapshot().await;
+        let scope = mcp.scope(None).await.unwrap();
+        let snapshot = mcp.context_snapshot(&scope).await;
         let active_doc = snapshot.active_doc.expect("active document");
         assert_eq!(active_doc.path, active.to_string_lossy());
         assert_eq!(active_doc.page, Some(4));
@@ -3371,6 +3984,7 @@ mod tests {
                 page: None,
                 page_range: None,
                 max_chars: None,
+                workspace: None,
             },
         )
         .await
@@ -3385,15 +3999,22 @@ mod tests {
                 root: None,
                 limit: None,
                 collection_id: None,
+                workspace: None,
             },
         )
         .await
         .unwrap_err();
         assert!(related_error.contains("pass path explicitly"));
 
-        let metadata_error = get_file_metadata_for_mcp(&mcp, GetFileMetadataParams { path: None })
-            .await
-            .unwrap_err();
+        let metadata_error = get_file_metadata_for_mcp(
+            &mcp,
+            GetFileMetadataParams {
+                path: None,
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(metadata_error.contains("pass path explicitly"));
     }
 
@@ -3449,6 +4070,7 @@ mod tests {
                 is_regex: None,
                 context_lines: None,
                 collection_id: None,
+                workspace: None,
             },
         )
         .await

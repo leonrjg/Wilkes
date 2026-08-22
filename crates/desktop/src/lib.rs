@@ -445,10 +445,13 @@ impl ExternalMcpManager {
         self.context.set_active_document(path, page);
     }
 
+    /// The listener is given the workspace manager rather than one workspace's
+    /// context, so it answers for whichever workspace is active — and for any
+    /// workspace a call names — without being restarted.
     async fn apply(
         &self,
         settings: &ExternalMcpSettings,
-        ctx: Arc<AppContext>,
+        workspaces: Arc<WorkspaceManager>,
     ) -> Result<(), String> {
         if !settings.enabled {
             let managed = self.runtime.lock().await.take();
@@ -486,13 +489,13 @@ impl ExternalMcpManager {
             return Ok(());
         }
 
-        let search: Arc<dyn wilkes_agent::search::SearchService> = ctx;
+        let workspaces: Arc<dyn wilkes_agent::search::WorkspaceCatalog> = workspaces;
         let start = || {
             wilkes_agent::mcp::start_external(
                 settings.bind_address,
                 settings.port,
                 token.clone(),
-                Arc::clone(&search),
+                Arc::clone(&workspaces),
                 self.context.clone(),
             )
         };
@@ -529,7 +532,7 @@ impl ExternalMcpManager {
                         previous_address,
                         previous_port,
                         previous_token,
-                        search,
+                        workspaces,
                         self.context.clone(),
                     )
                     .await
@@ -803,6 +806,7 @@ fn write_external_mcp_token(path: &std::path::Path, token: &str) -> anyhow::Resu
 /// the state this ordering exists to prevent.
 async fn update_settings_with_listeners(
     ctx: Arc<AppContext>,
+    workspaces: Arc<WorkspaceManager>,
     external_mcp: Arc<ExternalMcpManager>,
     http_api: Arc<HttpApiManager>,
     patch: serde_json::Value,
@@ -826,7 +830,9 @@ async fn update_settings_with_listeners(
     }
 
     if let Some(requested) = &requested_external {
-        external_mcp.apply(requested, Arc::clone(&ctx)).await?;
+        external_mcp
+            .apply(requested, Arc::clone(&workspaces))
+            .await?;
     }
     if let Some(requested) = &requested_http {
         http_api.apply(requested).await?;
@@ -837,7 +843,7 @@ async fn update_settings_with_listeners(
         Err(error) => {
             if requested_external.is_some() {
                 let _ = external_mcp
-                    .apply(&before.external_mcp, Arc::clone(&ctx))
+                    .apply(&before.external_mcp, Arc::clone(&workspaces))
                     .await;
             }
             if requested_http.is_some() {
@@ -1291,28 +1297,15 @@ async fn switch_workspace(app: AppHandle, workspace_id: String) -> Result<Worksp
 
     active_searches_state(&app).cancel_all();
     chat_manager_state(&app).close_all();
-    let external_mcp = external_mcp_manager_state(&app);
-    external_mcp.stop().await;
 
-    let state = match manager.switch(&workspace_id).await {
-        Ok(state) => state,
-        Err(error) => {
-            let ctx = manager.active();
-            let settings = ctx.get_settings().await;
-            if let Err(restart_error) = external_mcp.apply(&settings.external_mcp, ctx).await {
-                error!(
-                    "Workspace switch failed and external MCP could not restart: {restart_error}"
-                );
-            }
-            return Err(error.to_string());
-        }
-    };
-    let ctx = manager.active();
-    let settings = ctx.get_settings().await;
-    if let Err(error) = external_mcp.apply(&settings.external_mcp, ctx).await {
-        error!("Workspace switched, but external MCP failed to restart: {error}");
-    }
-    Ok(state)
+    // The external MCP listener is not stopped and restarted around the
+    // switch: it resolves its workspace through the manager on every call, so
+    // it follows the active workspace on its own. Restarting it here would
+    // only drop connected clients.
+    manager
+        .switch(&workspace_id)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1480,10 +1473,14 @@ async fn chat_start(
     let ctx = app_context(&app);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     let integrations = ctx.get_settings().await.integrations;
-    let spawned =
-        wilkes_api::commands::chat::start(backend, cwd.clone(), Some(ctx.clone()), integrations)
-            .await
-            .map_err(|e| e.to_string())?;
+    let spawned = wilkes_api::commands::chat::start(
+        backend,
+        cwd.clone(),
+        Some(workspace_manager(&app)),
+        integrations,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let wilkes_agent::session::SpawnedChatSession {
         session,
         events,
@@ -1551,9 +1548,10 @@ async fn chat_open_conversation(
     let record = wilkes_api::commands::chat::get_conversation(&ctx.data_dir, &conversation_id)
         .map_err(|e| e.to_string())?;
     let integrations = ctx.get_settings().await.integrations;
-    let spawned = wilkes_api::commands::chat::open(&record, Some(ctx.clone()), integrations)
-        .await
-        .map_err(|e| e.to_string())?;
+    let spawned =
+        wilkes_api::commands::chat::open(&record, Some(workspace_manager(&app)), integrations)
+            .await
+            .map_err(|e| e.to_string())?;
     let wilkes_agent::session::SpawnedChatSession {
         session,
         events,
@@ -1627,7 +1625,7 @@ async fn chat_fork_conversation(
     let spawned = wilkes_api::commands::chat::start(
         source.backend,
         PathBuf::from(&source.cwd),
-        Some(ctx.clone()),
+        Some(workspace_manager(&app)),
         integrations,
     )
     .await
@@ -2078,6 +2076,7 @@ async fn get_settings(app: AppHandle) -> Result<Settings, String> {
 async fn update_settings(patch: serde_json::Value, app: AppHandle) -> Result<Settings, String> {
     update_settings_with_listeners(
         app_context(&app),
+        workspace_manager(&app),
         external_mcp_manager_state(&app),
         http_api_manager_state(&app),
         patch,
@@ -2100,6 +2099,7 @@ async fn configure_external_mcp(
     let manager = external_mcp_manager_state(&app);
     let settings = update_settings_with_listeners(
         Arc::clone(&ctx),
+        workspace_manager(&app),
         Arc::clone(&manager),
         http_api_manager_state(&app),
         serde_json::json!({
@@ -2129,6 +2129,7 @@ async fn configure_http_api(
     let manager = http_api_manager_state(&app);
     let settings = update_settings_with_listeners(
         app_context(&app),
+        workspace_manager(&app),
         external_mcp_manager_state(&app),
         Arc::clone(&manager),
         serde_json::json!({
@@ -2640,10 +2641,11 @@ pub fn run() {
                 ctx_c.spawn_background_tasks(event_rx, loop_fut);
             });
             let ctx_c = Arc::clone(&ctx);
+            let workspaces_for_listeners = Arc::clone(&workspaces);
             tauri::async_runtime::spawn(async move {
                 let settings = ctx_c.get_settings().await;
                 if let Err(error) = external_mcp
-                    .apply(&settings.external_mcp, Arc::clone(&ctx_c))
+                    .apply(&settings.external_mcp, workspaces_for_listeners)
                     .await
                 {
                     error!("external MCP startup failed: {error}");
@@ -3261,6 +3263,18 @@ mod tests {
         assert!(active.0.lock().unwrap().is_empty());
     }
 
+    /// A workspace manager over a temporary data directory, for the listener
+    /// tests: the external MCP resolves its library through one of these
+    /// rather than through a single context.
+    fn test_workspaces() -> (tempfile::TempDir, Arc<WorkspaceManager>) {
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let emitter: Arc<dyn wilkes_api::context::EventEmitter> = Arc::new(MockEmitter);
+        let (workspaces, _rx, _loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings_path, emitter).unwrap();
+        (dir, workspaces)
+    }
+
     fn test_ctx() -> (tempfile::TempDir, Arc<AppContext>) {
         let dir = tempdir().unwrap();
         let settings_path = dir.path().join("settings.json");
@@ -3466,13 +3480,15 @@ mod tests {
 
     #[tokio::test]
     async fn external_mcp_manager_starts_and_stops_with_setting() {
-        let (_dir, ctx) = test_ctx();
+        let (_dir, workspaces) = test_workspaces();
         let library = tempdir().unwrap();
-        ctx.update_settings(serde_json::json!({
-            "last_directory": library.path()
-        }))
-        .await
-        .unwrap();
+        workspaces
+            .active()
+            .update_settings(serde_json::json!({
+                "last_directory": library.path()
+            }))
+            .await
+            .unwrap();
         let token_dir = tempdir().unwrap();
         let manager = ExternalMcpManager::new(token_dir.path().to_path_buf());
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3485,7 +3501,10 @@ mod tests {
             port,
         };
 
-        manager.apply(&enabled, Arc::clone(&ctx)).await.unwrap();
+        manager
+            .apply(&enabled, Arc::clone(&workspaces))
+            .await
+            .unwrap();
         let status = manager.status(&enabled).await;
         assert!(status.enabled);
         assert!(status.running);
@@ -3500,7 +3519,7 @@ mod tests {
             bind_address: "127.0.0.1".parse().unwrap(),
             port,
         };
-        manager.apply(&disabled, ctx).await.unwrap();
+        manager.apply(&disabled, workspaces).await.unwrap();
         let status = manager.status(&disabled).await;
         assert!(!status.running);
         assert!(status.token.is_none());
@@ -3508,7 +3527,7 @@ mod tests {
 
     #[tokio::test]
     async fn external_mcp_manager_toggles_token_authentication_live() {
-        let (_dir, ctx) = test_ctx();
+        let (_dir, workspaces) = test_workspaces();
         let token_dir = tempdir().unwrap();
         let manager = ExternalMcpManager::new(token_dir.path().to_path_buf());
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3520,7 +3539,7 @@ mod tests {
             bind_address: "127.0.0.1".parse().unwrap(),
             port,
         };
-        manager.apply(&open, Arc::clone(&ctx)).await.unwrap();
+        manager.apply(&open, Arc::clone(&workspaces)).await.unwrap();
         let url = manager.status(&open).await.url.unwrap();
         assert!(manager.status(&open).await.token.is_none());
         assert!(manager.rotate_token(&open).await.is_err());
@@ -3530,14 +3549,14 @@ mod tests {
             ..open.clone()
         };
         manager
-            .apply(&authenticated, Arc::clone(&ctx))
+            .apply(&authenticated, Arc::clone(&workspaces))
             .await
             .unwrap();
         let status = manager.status(&authenticated).await;
         assert!(status.token.is_some());
         assert_eq!(status.url.as_deref(), Some(url.as_str()));
 
-        manager.apply(&open, Arc::clone(&ctx)).await.unwrap();
+        manager.apply(&open, Arc::clone(&workspaces)).await.unwrap();
         let status = manager.status(&open).await;
         assert_eq!(status.url.as_deref(), Some(url.as_str()));
         assert!(status.token.is_none());
@@ -3549,7 +3568,7 @@ mod tests {
                     enabled: false,
                     ..open
                 },
-                ctx,
+                workspaces,
             )
             .await
             .unwrap();
@@ -3557,7 +3576,7 @@ mod tests {
 
     #[tokio::test]
     async fn external_mcp_manager_reports_port_collision_without_fallback() {
-        let (_dir, ctx) = test_ctx();
+        let (_dir, workspaces) = test_workspaces();
         let token_dir = tempdir().unwrap();
         let manager = ExternalMcpManager::new(token_dir.path().to_path_buf());
         let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3569,7 +3588,7 @@ mod tests {
             port,
         };
 
-        let error = manager.apply(&enabled, ctx).await.unwrap_err();
+        let error = manager.apply(&enabled, workspaces).await.unwrap_err();
         assert!(error.contains(&port.to_string()));
         let status = manager.status(&enabled).await;
         assert!(!status.running);
@@ -3578,7 +3597,7 @@ mod tests {
 
     #[tokio::test]
     async fn external_mcp_manager_switches_bind_address_on_the_same_port() {
-        let (_dir, ctx) = test_ctx();
+        let (_dir, workspaces) = test_workspaces();
         let token_dir = tempdir().unwrap();
         let manager = ExternalMcpManager::new(token_dir.path().to_path_buf());
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3591,7 +3610,10 @@ mod tests {
             bind_address: "127.0.0.1".parse().unwrap(),
             port,
         };
-        manager.apply(&loopback, Arc::clone(&ctx)).await.unwrap();
+        manager
+            .apply(&loopback, Arc::clone(&workspaces))
+            .await
+            .unwrap();
 
         let all_interfaces = ExternalMcpSettings {
             enabled: true,
@@ -3600,7 +3622,7 @@ mod tests {
             port,
         };
         manager
-            .apply(&all_interfaces, Arc::clone(&ctx))
+            .apply(&all_interfaces, Arc::clone(&workspaces))
             .await
             .unwrap();
         let status = manager.status(&all_interfaces).await;
@@ -3615,7 +3637,7 @@ mod tests {
                     enabled: false,
                     ..all_interfaces
                 },
-                ctx,
+                workspaces,
             )
             .await
             .unwrap();

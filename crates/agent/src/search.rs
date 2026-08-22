@@ -73,3 +73,37 @@ pub trait SearchService: Send + Sync {
         Err("Document metadata is not available in this session.".to_string())
     }
 }
+
+/// One Wilkes workspace as an MCP client sees it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WorkspaceDescriptor {
+    pub id: String,
+    pub name: String,
+    pub roots: Vec<PathBuf>,
+    pub active_root: Option<PathBuf>,
+    /// Whether this is the workspace a tool call reaches when it names none.
+    pub active: bool,
+}
+
+/// Resolves which workspace's library a single tool call reads.
+///
+/// Each workspace owns its own roots, metadata cache and index, so a
+/// [`SearchService`] answers for exactly one of them. Holding one service for
+/// the lifetime of a server therefore pins it to whichever workspace was
+/// active when it started; this boundary resolves the service per call
+/// instead, from an id the caller may name.
+///
+/// Naming a workspace must never activate it: the registry, the desktop
+/// window and the active context stay where they are.
+#[async_trait]
+pub trait WorkspaceCatalog: Send + Sync {
+    /// Every workspace, with the active one flagged.
+    async fn workspaces(&self) -> Result<Vec<WorkspaceDescriptor>, String>;
+
+    /// The service reading `workspace_id`, or the active workspace when the
+    /// caller names none. Errors when the id is unknown.
+    async fn search_for(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> Result<Arc<dyn SearchService>, String>;
+}

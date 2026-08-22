@@ -24,7 +24,7 @@ use wilkes_core::types::{AgentBackend, IntegrationsSettings};
 use crate::context::{
     build_context_block, root_context, ActiveDoc, ActiveDocText, ContextFile, RootContext,
 };
-use crate::search::SearchService;
+use crate::search::WorkspaceCatalog;
 
 const ACTIVE_DOC_CONTEXT_CHAR_LIMIT: usize = 12_000;
 const READ_ACCESS_GUIDANCE: &str = "The user can either move the file to this root, switch to that root, or add it to the context using the right-click menu on the file list";
@@ -497,21 +497,13 @@ pub async fn spawn(backend: AgentBackend, cwd: PathBuf) -> anyhow::Result<Spawne
     .await
 }
 
-pub async fn spawn_with_search(
-    backend: AgentBackend,
-    cwd: PathBuf,
-    search: Option<Arc<dyn SearchService>>,
-) -> anyhow::Result<SpawnedChatSession> {
-    spawn_with_services(backend, cwd, search, IntegrationsSettings::default()).await
-}
-
 pub async fn spawn_with_services(
     backend: AgentBackend,
     cwd: PathBuf,
-    search: Option<Arc<dyn SearchService>>,
+    workspaces: Option<Arc<dyn WorkspaceCatalog>>,
     integrations: IntegrationsSettings,
 ) -> anyhow::Result<SpawnedChatSession> {
-    spawn_with_mode(backend, cwd, SessionOpenMode::New, search, integrations).await
+    spawn_with_mode(backend, cwd, SessionOpenMode::New, workspaces, integrations).await
 }
 
 pub async fn load(
@@ -529,34 +521,18 @@ pub async fn load(
     .await
 }
 
-pub async fn load_with_search(
-    backend: AgentBackend,
-    cwd: PathBuf,
-    backend_session_id: String,
-    search: Option<Arc<dyn SearchService>>,
-) -> anyhow::Result<SpawnedChatSession> {
-    load_with_services(
-        backend,
-        cwd,
-        backend_session_id,
-        search,
-        IntegrationsSettings::default(),
-    )
-    .await
-}
-
 pub async fn load_with_services(
     backend: AgentBackend,
     cwd: PathBuf,
     backend_session_id: String,
-    search: Option<Arc<dyn SearchService>>,
+    workspaces: Option<Arc<dyn WorkspaceCatalog>>,
     integrations: IntegrationsSettings,
 ) -> anyhow::Result<SpawnedChatSession> {
     spawn_with_mode(
         backend,
         cwd,
         SessionOpenMode::Load { backend_session_id },
-        search,
+        workspaces,
         integrations,
     )
     .await
@@ -566,7 +542,7 @@ async fn spawn_with_mode(
     backend: AgentBackend,
     cwd: PathBuf,
     open_mode: SessionOpenMode,
-    search: Option<Arc<dyn SearchService>>,
+    workspaces: Option<Arc<dyn WorkspaceCatalog>>,
     integrations: IntegrationsSettings,
 ) -> anyhow::Result<SpawnedChatSession> {
     let spec = crate::resolve_launch_spec(backend)?;
@@ -583,7 +559,7 @@ async fn spawn_with_mode(
 
     let state = ContextStateHandle::default();
     let mcp_runtime = if matches!(backend, AgentBackend::ClaudeCode | AgentBackend::Codex) {
-        Some(crate::mcp::start(state.clone(), cwd.clone(), search, integrations).await?)
+        Some(crate::mcp::start(state.clone(), cwd.clone(), workspaces, integrations).await?)
     } else {
         None
     };

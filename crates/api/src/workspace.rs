@@ -415,6 +415,41 @@ fn scoped_events(
     })
 }
 
+/// The MCP servers reach every workspace through this rather than through one
+/// context captured at startup: a tool call names a workspace and reads it
+/// without the registry, the window or the active context moving.
+#[async_trait::async_trait]
+impl wilkes_agent::search::WorkspaceCatalog for WorkspaceManager {
+    async fn workspaces(&self) -> Result<Vec<wilkes_agent::search::WorkspaceDescriptor>, String> {
+        let state = self.state().await.map_err(|error| error.to_string())?;
+        Ok(state
+            .workspaces
+            .into_iter()
+            .map(|workspace| wilkes_agent::search::WorkspaceDescriptor {
+                active: workspace.id == state.active_workspace_id,
+                id: workspace.id,
+                name: workspace.name,
+                roots: workspace.roots,
+                active_root: workspace.active_root,
+            })
+            .collect())
+    }
+
+    async fn search_for(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> Result<Arc<dyn wilkes_agent::search::SearchService>, String> {
+        let ctx = match workspace_id {
+            Some(id) => self
+                .context_for(id)
+                .await
+                .map_err(|error| format!("Workspace {id} is not available: {error}"))?,
+            None => self.active(),
+        };
+        Ok(ctx)
+    }
+}
+
 impl WorkspaceManager {
     pub fn new(
         app_data_dir: PathBuf,
@@ -491,7 +526,7 @@ impl WorkspaceManager {
     /// [`Self::switch`], which rewrites the registry on disk, shuts the
     /// previous context down and moves the user's window. A read had to
     /// perform a write to happen.
-    pub async fn context_for(self: &Arc<Self>, id: &str) -> anyhow::Result<Arc<AppContext>> {
+    pub async fn context_for(&self, id: &str) -> anyhow::Result<Arc<AppContext>> {
         // The same lock `switch` takes: while this decides whether `id` is
         // active and opens a context for it, the active workspace cannot move
         // out from under the decision.
@@ -1484,5 +1519,57 @@ mod tests {
         assert!(error.to_string().contains("Unknown workspace"));
 
         manager.active().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_catalog_lists_every_workspace_and_resolves_each_without_switching() {
+        use wilkes_agent::search::WorkspaceCatalog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("global-settings.json");
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings_path, events).unwrap();
+        let active_id = manager.state().await.unwrap().active_workspace_id;
+        let second = manager.create("Second".to_string()).await.unwrap();
+
+        let listed = manager.workspaces().await.unwrap();
+        assert_eq!(listed.len(), 2);
+        let active = listed
+            .iter()
+            .find(|workspace| workspace.active)
+            .expect("exactly one workspace is active");
+        assert_eq!(active.id, active_id);
+        assert!(listed
+            .iter()
+            .any(|workspace| workspace.id == second.id && !workspace.active));
+
+        // An unnamed call reads the active workspace; a named one reads that
+        // workspace and leaves the active one where it was.
+        let unnamed = manager.search_for(None).await.unwrap();
+        assert!(
+            std::ptr::addr_eq(
+                Arc::as_ptr(&unnamed).cast::<u8>(),
+                Arc::as_ptr(&manager.active()).cast::<u8>()
+            ),
+            "an unnamed call must read the active workspace's own context"
+        );
+        let named = manager.search_for(Some(&second.id)).await.unwrap();
+        assert!(!std::ptr::addr_eq(
+            Arc::as_ptr(&named).cast::<u8>(),
+            Arc::as_ptr(&manager.active()).cast::<u8>()
+        ));
+        assert_eq!(
+            manager.state().await.unwrap().active_workspace_id,
+            active_id,
+            "resolving a workspace must not activate it"
+        );
+
+        let error = manager.search_for(Some("no-such-workspace")).await;
+        assert!(error
+            .err()
+            .is_some_and(|error| error.contains("no-such-workspace")));
+
+        manager.shutdown_all().await;
     }
 }

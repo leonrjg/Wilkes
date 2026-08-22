@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- MCP tools accept a `workspace` id and read that workspace's library — its
+  roots, access boundary and index — without switching the app to it.
+  `list_context` reports every workspace and marks the active one; omitting
+  `workspace` reads the active workspace as before. The external listener
+  resolves its workspace per call, so switching workspaces in Wilkes no longer
+  restarts it.
+- Search matches cached author alongside filename and title. Author hits are
+  reported as `kind='author'` over MCP and labelled `Author` in the result
+  list.
+
 ### Changed
 
 - PDF extraction produces one canonical reading of a document instead of a

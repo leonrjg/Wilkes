@@ -115,9 +115,18 @@ The endpoint:
 - reads only documents inside the current, favorite, or recent Wilkes library
   roots.
 
+The endpoint is workspace-aware. `list_context` reports every workspace with
+its id, roots and current root, and marks the active one. Tools read the active
+workspace by default; passing `workspace: "<id>"` reads that workspace's
+library instead — its roots, its access boundary and its index — without
+switching the app to it. Switching workspaces in Wilkes therefore does not
+restart the listener or drop connected clients.
+
 The active document reported by `list_context` is informational. External
 clients must continue to pass an explicit document path to `get_document_text`,
-`get_related_documents`, and `get_file_metadata`.
+`get_related_documents`, and `get_file_metadata`. A call that names a workspace
+must always pass the path explicitly, since the visible document belongs to the
+workspace open in Wilkes.
 
 Binding beyond loopback makes the endpoint reachable from the corresponding
 network interfaces. Without token authentication, anyone who can reach the
