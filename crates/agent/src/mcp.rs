@@ -3022,6 +3022,7 @@ mod tests {
                     total_matches: 2,
                     catalog_elapsed_ms: 0,
                     elapsed_ms: 4,
+                    admission_wait_ms: 0,
                     indexed_pdf_reads: 0,
                     live_pdf_fallbacks: 0,
                     index_unavailable_fallbacks: 0,

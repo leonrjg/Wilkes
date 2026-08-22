@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::research::SearchLogTracker;
@@ -96,6 +97,8 @@ pub struct SearchHandle {
     log: Option<SearchLogTracker>,
     metadata: Option<SearchMetadata>,
     catalog_elapsed_ms: u64,
+    /// Filled in by the worker once it knows how long admission took.
+    admission_wait_ms: Arc<AtomicU64>,
 }
 
 struct SearchMetadata {
@@ -187,7 +190,8 @@ impl SearchHandle {
             error!("search worker panicked: {e}");
             vec![format!("search worker panicked: {e}")].into()
         });
-        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let admission_wait_ms = self.admission_wait_ms.load(Ordering::Relaxed);
+        let elapsed_ms = (started.elapsed().as_millis() as u64).saturating_sub(admission_wait_ms);
         if let Some(log) = &mut self.log {
             let status = if outcome.errors.iter().any(|error| {
                 error.starts_with("search failed:") || error.contains("worker panicked")
@@ -208,6 +212,7 @@ impl SearchHandle {
             total_matches,
             catalog_elapsed_ms: self.catalog_elapsed_ms,
             elapsed_ms,
+            admission_wait_ms,
             indexed_pdf_reads: outcome.indexed_pdf_reads,
             live_pdf_fallbacks: outcome.live_pdf_fallbacks,
             index_unavailable_fallbacks: outcome.index_unavailable_fallbacks,
@@ -238,8 +243,11 @@ pub fn start_search(
     grep_use_index: bool,
 ) -> SearchHandle {
     let (tx, rx) = mpsc::channel::<FileMatches>(64);
+    let admission_wait = Arc::new(AtomicU64::new(0));
+    let worker_admission_wait = Arc::clone(&admission_wait);
 
     let worker = tokio::task::spawn_blocking(move || {
+        let admission_wait = worker_admission_wait;
         let mut registry = ExtractorRegistry::new();
         registry.register(Box::new(PdfExtractor::new()));
 
@@ -274,7 +282,12 @@ pub fn start_search(
         };
 
         // Held for the duration of the fan-out; released when this worker ends.
+        let admission_started = std::time::Instant::now();
         let _admission = needs_admission(documents.len()).then(|| CORPUS_SCAN_ADMISSION.acquire());
+        admission_wait.store(
+            admission_started.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
 
         let mut outcome = provider
             .search(&query, &registry, tx, &documents)
@@ -293,6 +306,7 @@ pub fn start_search(
         log,
         metadata: None,
         catalog_elapsed_ms: 0,
+        admission_wait_ms: admission_wait,
     }
 }
 
@@ -345,6 +359,76 @@ mod tests {
         assert!(!needs_admission(CORPUS_SCAN_MIN_DOCUMENTS - 1));
         assert!(needs_admission(CORPUS_SCAN_MIN_DOCUMENTS));
         assert!(needs_admission(223));
+    }
+
+    /// A queued scan must not bill another search's work to its own
+    /// `elapsed_ms`; the wait is reported as `admission_wait_ms` instead.
+    #[tokio::test]
+    async fn queue_time_is_reported_apart_from_worker_time() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let documents: Vec<_> = (0..CORPUS_SCAN_MIN_DOCUMENTS)
+            .map(|i| {
+                let path = root.join(format!("doc{i}.txt"));
+                fs::write(&path, "hello world").unwrap();
+                text_document(path)
+            })
+            .collect();
+        assert!(needs_admission(documents.len()));
+
+        let query = SearchQuery {
+            pattern: "hello".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root,
+            max_results: 100,
+            respect_gitignore: true,
+            max_file_size: 1024 * 1024,
+            context_lines: 0,
+            mode: SearchMode::Grep,
+            scope: Default::default(),
+            supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
+        };
+
+        // Occupy the only permit so the search below has to queue for it.
+        let blocker = CORPUS_SCAN_ADMISSION.acquire();
+        let search = tokio::spawn(async move {
+            start_search(
+                query,
+                documents,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                RetrievalSettings::default(),
+                None,
+                false,
+            )
+            .run(|_| async { true })
+            .await
+        });
+
+        let held = std::time::Duration::from_millis(150);
+        tokio::time::sleep(held).await;
+        drop(blocker);
+
+        let stats = search.await.unwrap();
+        assert!(
+            stats.admission_wait_ms >= 100,
+            "expected the queued scan to report its wait, got {}ms",
+            stats.admission_wait_ms
+        );
+        // The scan itself greps a handful of tiny files, so once the wait is
+        // removed the remaining worker time must be far below the wait.
+        assert!(
+            stats.elapsed_ms < stats.admission_wait_ms,
+            "elapsed_ms {}ms still carries the {}ms queue wait",
+            stats.elapsed_ms,
+            stats.admission_wait_ms
+        );
     }
 
     fn text_document(path: std::path::PathBuf) -> SearchDocument {
@@ -405,6 +489,7 @@ mod tests {
             log: None,
             metadata: None,
             catalog_elapsed_ms: 0,
+            admission_wait_ms: Arc::new(AtomicU64::new(0)),
         }
         .with_metadata(Some(cache), MetadataSource::File);
 
@@ -613,6 +698,7 @@ mod tests {
             log: None,
             metadata: None,
             catalog_elapsed_ms: 0,
+            admission_wait_ms: Arc::new(AtomicU64::new(0)),
         }
         .with_catalog_elapsed_ms(7);
 
@@ -725,6 +811,7 @@ mod tests {
             log: None,
             metadata: None,
             catalog_elapsed_ms: 0,
+            admission_wait_ms: Arc::new(AtomicU64::new(0)),
         };
         let errors = handle.finish().await;
         assert!(!errors.is_empty());

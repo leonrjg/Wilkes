@@ -1857,6 +1857,11 @@ pub struct SearchStats {
     #[serde(default)]
     pub catalog_elapsed_ms: u64,
     pub elapsed_ms: u64,
+    /// Time this search spent waiting for a corpus-scan admission permit before
+    /// its worker began. Excluded from `elapsed_ms` so that stays worker time:
+    /// a queued scan should not report another search's work as its own.
+    #[serde(default)]
+    pub admission_wait_ms: u64,
     /// PDFs served from stored semantic-index text during an exact search.
     #[serde(default)]
     pub indexed_pdf_reads: usize,
