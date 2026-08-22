@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+use wilkes_core::extract::{pdf::PdfExtractor, ExtractorRegistry};
 use wilkes_core::integrations::{
     openalex::OpenAlexClient, semantic_scholar::SemanticScholarClient,
 };
@@ -55,6 +56,7 @@ const EXTERNAL_DOCUMENT_PATH_REQUIRED: &str =
 pub(crate) const WILKES_MCP_TOOL_NAMES: &[&str] = &[
     "list_context",
     "get_document_text",
+    "get_document_outline",
     "get_related_documents",
     "get_file_metadata",
     "list_documents",
@@ -595,6 +597,13 @@ struct GetDocumentTextParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GetDocumentOutlineParams {
+    /// Document whose declared outline to read. Required for external MCP
+    /// clients; an in-app chat may omit it to use that chat's active document.
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SearchParams {
     /// Text to search for.
     query: String,
@@ -754,6 +763,16 @@ struct GetDocumentTextResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct GetDocumentOutlineResponse {
+    path: String,
+    /// The document's declared table of contents. Empty means the document
+    /// declares no outline; it is not an extraction failure.
+    outline: Vec<wilkes_core::types::OutlineEntry>,
+    /// Per-document extraction decisions made while resolving the outline.
+    extraction: wilkes_core::types::ExtractionDiagnostics,
+}
+
+#[derive(Debug, Serialize)]
 struct SearchResponse {
     query: String,
     mode: SearchModeParam,
@@ -884,6 +903,19 @@ impl WilkesMcp {
         Parameters(params): Parameters<GetDocumentTextParams>,
     ) -> CallToolResult {
         match get_document_text_for_mcp(self, params).await {
+            Ok(response) => structured(response),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        }
+    }
+
+    #[tool(
+        description = "Read a document's declared outline (PDF bookmarks or Markdown headings) without requiring the semantic index. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. An empty outline means the document declares no table of contents."
+    )]
+    async fn get_document_outline(
+        &self,
+        Parameters(params): Parameters<GetDocumentOutlineParams>,
+    ) -> CallToolResult {
+        match get_document_outline_for_mcp(self, params).await {
             Ok(response) => structured(response),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
@@ -1218,6 +1250,28 @@ async fn get_document_text_for_mcp(
         return Err(mcp_access_error(&path));
     }
     get_document_text_at_path(path, default_page, params)
+}
+
+async fn get_document_outline_for_mcp(
+    mcp: &WilkesMcp,
+    params: GetDocumentOutlineParams,
+) -> Result<GetDocumentOutlineResponse, String> {
+    let path = resolve_document_path(mcp, params.path).await?;
+    let outline_path = path.clone();
+    let declared_outline = tokio::task::spawn_blocking(move || {
+        let mut registry = ExtractorRegistry::new();
+        registry.register(Box::new(PdfExtractor::new()));
+        wilkes_core::extract::document_outline(&outline_path, &registry)
+    })
+    .await
+    .map_err(|error| format!("Document outline task panicked: {error}"))?
+    .map_err(|error| format!("Failed to read outline from {}: {error:#}", path.display()))?;
+
+    Ok(GetDocumentOutlineResponse {
+        path: display_path(&path),
+        outline: declared_outline.entries,
+        extraction: declared_outline.diagnostics,
+    })
 }
 
 fn get_document_text_at_path(
@@ -2359,6 +2413,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"search"));
         assert!(names.contains(&"get_document_text"));
+        assert!(names.contains(&"get_document_outline"));
         assert!(names.contains(&"download"));
         let search = tools["result"]["tools"]
             .as_array()
@@ -2451,6 +2506,50 @@ mod tests {
 
         assert_eq!(response.text, "active document text");
         assert!(!response.truncated);
+    }
+
+    #[tokio::test]
+    async fn document_outline_reads_active_document_without_a_semantic_index() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("active.md");
+        std::fs::write(&path, "# Overview\ntext\n## Details\nmore text\n").unwrap();
+        let context = ContextStateHandle::default();
+        context.set_active_doc(Some(path.to_string_lossy().into_owned()), None);
+        let mcp = WilkesMcp::new(
+            McpContext::Session(context),
+            dir.path().to_path_buf(),
+            None,
+            None,
+        );
+
+        let response = get_document_outline_for_mcp(&mcp, GetDocumentOutlineParams { path: None })
+            .await
+            .unwrap();
+
+        assert_eq!(response.path, display_path(&path));
+        assert_eq!(response.outline.len(), 2);
+        assert_eq!(response.outline[0].title, "Overview");
+        assert_eq!(response.outline[0].level, 0);
+        assert_eq!(response.outline[1].title, "Details");
+        assert_eq!(response.outline[1].level, 1);
+        assert_eq!(response.extraction.pages, 0);
+    }
+
+    #[tokio::test]
+    async fn external_document_outline_requires_an_explicit_path() {
+        let library = tempdir().unwrap();
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(fake_search_with_root(library.path().to_path_buf())),
+            None,
+        );
+
+        let error = get_document_outline_for_mcp(&mcp, GetDocumentOutlineParams { path: None })
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("pass path explicitly"));
     }
 
     #[tokio::test]

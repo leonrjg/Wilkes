@@ -956,6 +956,17 @@ struct ExportChunksBody {
     workspace_id: Option<String>,
 }
 
+/// The document scope shared by export routes that read one source file.
+#[derive(Deserialize)]
+struct ExportOutlineBody {
+    root: PathBuf,
+    path: PathBuf,
+    /// Which workspace owns the configured library root. Absent means the
+    /// active workspace, consistent with the rest of the export surface.
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
 /// Chunk + vector export for one indexed file: text, byte ranges, source
 /// origins, and stored embeddings, in extraction order.
 async fn export_chunks_handler(
@@ -966,6 +977,22 @@ async fn export_chunks_handler(
         .context_for(body.workspace_id.as_deref())
         .await?
         .export_file_chunks(body.root, body.path)
+        .await
+        .map(Json)
+        .map_err(server_err)
+}
+
+/// Declared PDF/document outline without opening the semantic index or
+/// returning embeddings. Entries retain the source document's page and byte
+/// locators; `/api/export/chunks` additionally resolves them to chunk ordinals.
+async fn export_outline_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ExportOutlineBody>,
+) -> Result<Json<wilkes_api::context::FileOutlineExport>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context_for(body.workspace_id.as_deref())
+        .await?
+        .export_file_outline(body.root, body.path)
         .await
         .map(Json)
         .map_err(server_err)
@@ -1911,6 +1938,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             post(embed_similarity_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route("/api/export/chunks", post(export_chunks_handler))
+        .route("/api/export/outline", post(export_outline_handler))
         .route("/api/export/chunk-text", post(export_chunk_text_handler))
         .route("/api/export/files", post(export_files_handler))
         .route("/api/generation/ready", get(is_generation_ready_handler))

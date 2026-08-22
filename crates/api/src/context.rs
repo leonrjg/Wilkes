@@ -758,6 +758,18 @@ pub struct FileChunkExport {
     pub chunks: Vec<ExportedChunk>,
 }
 
+/// A document's declared structure, independent of its semantic-index state.
+///
+/// Unlike [`FileChunkExport`], this deliberately carries the locators the
+/// document expressed rather than resolving them to chunk ordinals. Reading a
+/// PDF's bookmarks must not require an index or return embedding vectors.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FileOutlineExport {
+    pub file_path: PathBuf,
+    pub outline: Vec<wilkes_core::types::OutlineEntry>,
+    pub extraction: wilkes_core::types::ExtractionDiagnostics,
+}
+
 /// One document Wilkes serves under a library root, as a consumer that wants to
 /// ingest it needs to see it.
 ///
@@ -2586,17 +2598,7 @@ impl AppContext {
         self.ensure_no_active_embed_task(
             "Semantic index is currently being built. Please wait before exporting chunks.",
         )?;
-        let settings = self.settings().await;
-        let (library_roots, _) = library_roots(&settings);
-        let root = Self::canonicalize_search_root(&root)?;
-        Self::ensure_path_in_library(&root, &library_roots, "Chunk export root")?;
-        let (path, _) = Self::canonicalize_supported_file(
-            &root,
-            &path,
-            &settings.supported_extensions,
-            "Chunk export",
-        )?;
-        Self::ensure_path_in_library(&path, &library_roots, "Chunk export file")?;
+        let (root, path) = self.export_file_path(root, path, "Chunk export").await?;
 
         let index_arc = self.index.lock().clone();
         let task_root = root.clone();
@@ -2630,6 +2632,51 @@ impl AppContext {
             })
             .collect();
         Ok((path, chunks))
+    }
+
+    /// Canonicalize one library document for an export route. All file export
+    /// endpoints share this boundary so a new read surface cannot accidentally
+    /// weaken the library-root or supported-file restrictions.
+    async fn export_file_path(
+        &self,
+        root: PathBuf,
+        path: PathBuf,
+        label: &str,
+    ) -> Result<(PathBuf, PathBuf), String> {
+        let settings = self.settings().await;
+        let (library_roots, _) = library_roots(&settings);
+        let root = Self::canonicalize_search_root(&root)?;
+        Self::ensure_path_in_library(&root, &library_roots, &format!("{label} root"))?;
+        let (path, _) =
+            Self::canonicalize_supported_file(&root, &path, &settings.supported_extensions, label)?;
+        Self::ensure_path_in_library(&path, &library_roots, &format!("{label} file"))?;
+        Ok((root, path))
+    }
+
+    /// Export one document's declared outline without loading an index or an
+    /// embedder. The outline retains the document's native page/byte locators;
+    /// callers that need chunk ordinals should use [`Self::export_file_chunks`].
+    pub async fn export_file_outline(
+        &self,
+        root: PathBuf,
+        path: PathBuf,
+    ) -> Result<FileOutlineExport, String> {
+        let (_, path) = self.export_file_path(root, path, "Outline export").await?;
+        let outline_path = path.clone();
+        let declared_outline = tokio::task::spawn_blocking(move || {
+            let mut registry = ExtractorRegistry::new();
+            registry.register(Box::new(PdfExtractor::new()));
+            wilkes_core::extract::document_outline(&outline_path, &registry)
+                .map_err(|error| format!("Could not read the document outline: {error:#}"))
+        })
+        .await
+        .map_err(|error| format!("Outline export task panicked: {error}"))??;
+
+        Ok(FileOutlineExport {
+            file_path: path,
+            outline: declared_outline.entries,
+            extraction: declared_outline.diagnostics,
+        })
     }
 
     /// Export one indexed document's chunks with their locators and stored
@@ -7153,6 +7200,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!err.is_empty());
+    }
+
+    #[tokio::test]
+    async fn outline_export_reads_declared_headings_without_a_semantic_index() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("outline-only-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let document = root.join("notes.md");
+        std::fs::write(&document, "# One\nbody\n## Two\nmore body\n").unwrap();
+        let mut settings = Settings::default();
+        settings.last_directory = Some(root.clone());
+        std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        // No semantic index or embedder is installed. A declared outline is
+        // source structure, not an embedding export, so this still succeeds.
+        let export = ctx
+            .export_file_outline(root.clone(), document.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(export.file_path, std::fs::canonicalize(&document).unwrap());
+        assert_eq!(export.outline.len(), 2);
+        assert_eq!(export.outline[0].title, "One");
+        assert_eq!(export.outline[0].level, 0);
+        assert_eq!(
+            export.outline[0].anchor,
+            wilkes_core::types::OutlineAnchor::TextOffset
+        );
+        assert_eq!(export.outline[1].title, "Two");
+        assert_eq!(export.outline[1].level, 1);
+        assert_eq!(export.extraction.pages, 0);
+
+        let outside = dir.path().join("outside.md");
+        std::fs::write(&outside, "# Not in the library\n").unwrap();
+        let err = ctx.export_file_outline(root, outside).await.unwrap_err();
+        assert!(err.contains("not in the library"), "{err}");
     }
 
     /// Browsing a root answers two questions at once, and the test holds both:
