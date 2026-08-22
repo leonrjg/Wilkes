@@ -371,8 +371,79 @@ pub struct OutlineEntry {
     pub level: u32,
     /// 1-based page, for documents paginated at extraction (PDFs).
     pub page: Option<u32>,
-    /// Byte offset into `ExtractedContent.text`, for documents that are not.
+    /// Byte offset into `ExtractedContent.text`. Exact for documents whose
+    /// outline lives in the text; for a PDF it is whatever [`OutlineAnchor`]
+    /// says it is, and absent when nothing could establish it.
     pub byte_offset: Option<usize>,
+    /// How `byte_offset` was established — see [`OutlineAnchor`].
+    pub anchor: OutlineAnchor,
+}
+
+/// What established an [`OutlineEntry`]'s position in the extracted reading.
+///
+/// Reported per entry because the answer differs per entry, and a consumer
+/// segmenting a document by its outline has to know which boundaries are exact.
+/// A document whose entries are mostly `Page` is a document still segmented a
+/// page at a time, and that is a fact worth surfacing here rather than leaving
+/// a consumer to discover it as a section that starts in the wrong place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutlineAnchor {
+    /// The heading's own position in the text (Markdown). Exact by
+    /// construction: the outline *is* text here.
+    TextOffset,
+    /// A PDF destination's vertical coordinate, resolved to the first word at
+    /// or below it on the destination page.
+    DestinationCoordinate,
+    /// The bookmark title, found in the destination page's text. Used when the
+    /// destination carries no coordinate, or carries one nothing sits below.
+    TitleMatch,
+    /// Neither was available. The entry carries its page and no offset, and a
+    /// consumer resolving it lands on the first passage of that page.
+    Page,
+}
+
+/// One document's declared outline, with what its extraction had to decide.
+///
+/// The two travel together because they are produced together: resolving a
+/// bookmark to a byte offset means reading the document, and reading the
+/// document is where the sanitation judgements are made. A caller that asks
+/// for the outline is therefore holding the evidence for how good the offsets
+/// it just received are, without a second call to go and find it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DeclaredOutline {
+    pub entries: Vec<OutlineEntry>,
+    pub diagnostics: ExtractionDiagnostics,
+}
+
+/// What a document's extraction had to decide for itself, counted.
+///
+/// Sanitation is not a pure function of the page: whether a repeating band is
+/// furniture, and whether a page's words cluster into one body column, are
+/// judgements made from the document's own geometry. A judgement that is made
+/// silently is one nobody can check, so each is counted here and reported with
+/// the document rather than only logged.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractionDiagnostics {
+    pub pages: u32,
+    /// Pages whose words clustered into one dominant body column.
+    pub body_column_pages: u32,
+    /// Pages left in raster order because the clustering was ambiguous — two
+    /// columns, a table, a full-page figure. Marginalia on these pages stay
+    /// where the page put them.
+    pub ambiguous_column_pages: u32,
+    /// Blocks moved out of the reading order to the end of their own page.
+    pub relocated_marginalia_blocks: u32,
+    /// Repeating head/foot runs removed from the reading.
+    pub removed_furniture_runs: u32,
+    /// Line-wrap hyphens the document's own vocabulary said to join.
+    pub joined_wrap_hyphens: u32,
+    /// Line-wrap hyphens kept, for want of that evidence.
+    pub kept_wrap_hyphens: u32,
+    /// Words still broken across a line, because the half that would complete
+    /// them sits on the far side of a relocated margin box. The only way a
+    /// reading still contains a hyphen-broken word.
+    pub unjoinable_wrap_breaks: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

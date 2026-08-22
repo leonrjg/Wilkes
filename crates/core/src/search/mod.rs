@@ -1,5 +1,5 @@
 pub mod grep;
-mod pdf_projection;
+pub(crate) mod pdf_projection;
 pub mod semantic;
 
 use crate::extract::ExtractorRegistry;

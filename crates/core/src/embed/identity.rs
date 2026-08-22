@@ -6,7 +6,13 @@ use crate::types::{ByteRange, EmbeddingEngine, SourceOrigin};
 pub const IDENTITY_SCHEMA_VERSION: u32 = 1;
 pub const PASSAGE_INPUT_RECIPE: &str = "wilkes-passage-input-v1";
 pub const POOLING_NORMALIZATION_RECIPE: &str = "engine-native-pooling+l2-output-v1";
-pub const EXTRACTOR_RECIPE_VERSION: &str = "wilkes-extractors-v1";
+/// v2 is the sanitized reading: line-wrapped words joined, page furniture
+/// removed, marginalia moved out of the reading order, and PDF outline entries
+/// anchored at a byte offset rather than a page. It changes
+/// `ExtractionRecipe::id()`, hence rendition identity, hence
+/// `extracted_content_sha256` — so every managed document re-extracts and
+/// re-embeds rather than a v1 reading being mixed with a v2 one.
+pub const EXTRACTOR_RECIPE_VERSION: &str = "wilkes-extractors-v2";
 pub const CHUNKER_RECIPE_VERSION: &str = "text-splitter-0.27-trim-v1";
 
 macro_rules! opaque_id {

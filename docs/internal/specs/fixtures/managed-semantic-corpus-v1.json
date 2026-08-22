@@ -42,9 +42,20 @@
         "level": 1,
         "chunk_ordinal": 0,
         "page": 1,
-        "byte_offset": null
+        "byte_offset": 0,
+        "anchor": "destination_coordinate"
       }
     ],
+    "extraction": {
+      "pages": 1,
+      "body_column_pages": 1,
+      "ambiguous_column_pages": 0,
+      "relocated_marginalia_blocks": 0,
+      "removed_furniture_runs": 0,
+      "joined_wrap_hyphens": 0,
+      "kept_wrap_hyphens": 0,
+      "unjoinable_wrap_breaks": 0
+    },
     "chunks": [
       {
         "chunk_ref": "chunk-example",

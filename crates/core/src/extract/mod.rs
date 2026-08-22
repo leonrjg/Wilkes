@@ -1,7 +1,7 @@
 pub mod outline;
 pub mod pdf;
 
-use crate::types::{ExtractedContent, OutlineEntry};
+use crate::types::{DeclaredOutline, ExtractedContent};
 use std::path::Path;
 
 pub trait ContentExtractor: Send + Sync {
@@ -11,16 +11,18 @@ pub trait ContentExtractor: Send + Sync {
     /// Extract searchable text and a source map from the file.
     fn extract(&self, path: &Path) -> anyhow::Result<ExtractedContent>;
 
-    /// The document's declared table of contents, empty when it declares none.
+    /// The document's declared table of contents, empty when it declares none,
+    /// with each entry anchored in the reading `extract` produces.
     ///
     /// Required rather than defaulted: a format whose outline nobody
     /// implemented would otherwise report "this document has no structure",
     /// which is a different claim and one a consumer cannot tell from the
-    /// truth. Reading an outline must also stay cheap enough to ask for on its
-    /// own — callers ask for the outline *without* wanting the text (the chunk
-    /// export already holds it), so an implementation that extracts a whole
-    /// document to answer this defeats the point of the method existing.
-    fn outline(&self, path: &Path) -> anyhow::Result<Vec<OutlineEntry>>;
+    /// truth. Callers ask for the outline *without* wanting the text (the
+    /// chunk export already holds it), which is why this is its own method —
+    /// but an anchored entry is an offset into the reading, so an
+    /// implementation of a paginated format has to produce that reading to
+    /// answer, and costs accordingly.
+    fn outline(&self, path: &Path) -> anyhow::Result<DeclaredOutline>;
 }
 
 /// The declared outline of one file, dispatched exactly as extraction is: the
@@ -30,12 +32,18 @@ pub trait ContentExtractor: Send + Sync {
 pub fn document_outline(
     path: &Path,
     extractors: &ExtractorRegistry,
-) -> anyhow::Result<Vec<OutlineEntry>> {
+) -> anyhow::Result<DeclaredOutline> {
     match extractors.find(path, None) {
         Some(extractor) => extractor.outline(path),
         None => {
             let text = std::fs::read_to_string(path)?;
-            Ok(outline::markdown_outline(&text))
+            Ok(DeclaredOutline {
+                entries: outline::markdown_outline(&text),
+                // A text file is not paginated, has no margin columns and no
+                // running heads: there is nothing here for sanitation to
+                // decide, and reporting zeros says exactly that.
+                diagnostics: Default::default(),
+            })
         }
     }
 }
@@ -83,8 +91,8 @@ mod tests {
         fn extract(&self, _path: &Path) -> anyhow::Result<ExtractedContent> {
             anyhow::bail!("mock")
         }
-        fn outline(&self, _path: &Path) -> anyhow::Result<Vec<OutlineEntry>> {
-            Ok(Vec::new())
+        fn outline(&self, _path: &Path) -> anyhow::Result<DeclaredOutline> {
+            Ok(DeclaredOutline::default())
         }
     }
 
@@ -105,8 +113,8 @@ mod tests {
         fn extract(&self, _path: &Path) -> anyhow::Result<ExtractedContent> {
             anyhow::bail!("mime")
         }
-        fn outline(&self, _path: &Path) -> anyhow::Result<Vec<OutlineEntry>> {
-            Ok(Vec::new())
+        fn outline(&self, _path: &Path) -> anyhow::Result<DeclaredOutline> {
+            Ok(DeclaredOutline::default())
         }
     }
 

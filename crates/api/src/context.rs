@@ -428,6 +428,10 @@ pub struct ManagedDocumentExport {
     pub dimension: usize,
     pub passage_input_recipe: String,
     pub outline: Vec<ExportedOutlineEntry>,
+    /// What this document's extraction had to decide for itself — which pages
+    /// clustered into a body column and which were too ambiguous to reorder,
+    /// what was removed as furniture, how the wrap hyphens resolved.
+    pub extraction: wilkes_core::types::ExtractionDiagnostics,
     pub chunks: Vec<ManagedChunkExport>,
     pub embedding_work: ManagedEmbeddingWork,
 }
@@ -594,6 +598,10 @@ pub struct ExportedOutlineEntry {
     /// The locator as the document expressed it, kept for display.
     pub page: Option<u32>,
     pub byte_offset: Option<usize>,
+    /// What established `byte_offset` — the rung of the resolution ladder that
+    /// answered. A consumer segmenting by this outline needs it to know which
+    /// boundaries are exact and which are snapped to a page.
+    pub anchor: wilkes_core::types::OutlineAnchor,
 }
 
 /// Result of `export_file_chunks`, in extraction order. `model_id` is absent
@@ -711,6 +719,12 @@ impl OutlineChunk for ManagedChunkData {
     }
 }
 
+/// Position first, page second.
+///
+/// A byte offset is where the heading is; a page is where the heading's page
+/// starts, which for a heading halfway down a page is up to a page early. Both
+/// are exported, so a consumer can see which one it got and how — the entry's
+/// `anchor` says which rung of the resolution ladder answered.
 fn resolve_outline<T: OutlineChunk>(
     outline: &[wilkes_core::types::OutlineEntry],
     chunks: &[T],
@@ -718,17 +732,17 @@ fn resolve_outline<T: OutlineChunk>(
     outline
         .iter()
         .filter_map(|entry| {
-            let ordinal = match (entry.page, entry.byte_offset) {
-                (Some(page), _) => chunks
+            let ordinal = match (entry.byte_offset, entry.page) {
+                (Some(offset), _) => chunks
+                    .iter()
+                    .find(|chunk| chunk.outline_byte_range().end > offset)
+                    .map(OutlineChunk::outline_ordinal),
+                (None, Some(page)) => chunks
                     .iter()
                     .find(|chunk| match chunk.outline_origin() {
                         wilkes_core::types::SourceOrigin::PdfPage { page: at, .. } => *at >= page,
                         _ => false,
                     })
-                    .map(OutlineChunk::outline_ordinal),
-                (None, Some(offset)) => chunks
-                    .iter()
-                    .find(|chunk| chunk.outline_byte_range().end > offset)
                     .map(OutlineChunk::outline_ordinal),
                 (None, None) => None,
             }?;
@@ -738,6 +752,7 @@ fn resolve_outline<T: OutlineChunk>(
                 chunk_ordinal: ordinal,
                 page: entry.page,
                 byte_offset: entry.byte_offset,
+                anchor: entry.anchor,
             })
         })
         .collect()
@@ -1986,7 +2001,7 @@ impl AppContext {
         registry.register(Box::new(PdfExtractor::new()));
         let declared_outline = wilkes_core::extract::document_outline(&snapshot_path, &registry)
             .map_err(|error| format!("Could not read retained document outline: {error:#}"))?;
-        let outline = resolve_outline(&declared_outline, &document.chunks);
+        let outline = resolve_outline(&declared_outline.entries, &document.chunks);
         let chunk_count = document.chunks.len();
         Ok(ManagedDocumentExport {
             corpus_id,
@@ -2004,6 +2019,7 @@ impl AppContext {
             dimension: embedding_identity.dimension,
             passage_input_recipe: embedding_identity.passage_input_recipe.clone(),
             outline,
+            extraction: declared_outline.diagnostics,
             chunks: document
                 .chunks
                 .into_iter()
@@ -2458,12 +2474,12 @@ impl AppContext {
         // The declared outline, resolved against the chunks just exported.
         //
         // Read from the file rather than the index: an outline is what the
-        // author wrote, and the index stores what was extracted. Reading it
-        // costs a document open — no page text, no bounding boxes — which is
-        // why it can ride along with an export instead of needing an endpoint
-        // and a second round trip. A file whose outline cannot be read is
-        // reported as an error and not as an absent outline: "this document
-        // declares no sections" is a claim consumers act on.
+        // author wrote, and the index stores what was extracted. It rides
+        // along with an export instead of needing an endpoint and a second
+        // round trip — the export is already the request that wants to know
+        // where this document's sections begin. A file whose outline cannot be
+        // read is reported as an error and not as an absent outline: "this
+        // document declares no sections" is a claim consumers act on.
         let outline_path = path.clone();
         let outline = tokio::task::spawn_blocking(move || {
             let mut registry = ExtractorRegistry::new();
@@ -2473,7 +2489,7 @@ impl AppContext {
         })
         .await
         .map_err(|error| format!("Outline task panicked: {error}"))??;
-        let outline = resolve_outline(&outline, &chunks);
+        let outline = resolve_outline(&outline.entries, &chunks);
 
         Ok(FileChunkExport {
             file_path: path,
@@ -7035,6 +7051,7 @@ mod tests {
                 level: 0,
                 page,
                 byte_offset,
+                anchor: wilkes_core::types::OutlineAnchor::Page,
             };
 
         // A bookmark on a page with no extracted text resolves forward to the

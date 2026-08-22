@@ -1,21 +1,9 @@
 use crate::types::ByteRange;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 
-/// Internal projection symbol for a discretionary hyphen at a visual line
-/// boundary. Literal occurrences are escaped while constructing the projection,
-/// so this symbol cannot collide with document content.
-const WRAP_HYPHEN: char = '\u{e000}';
-const LITERAL_ESCAPE: char = '\u{e001}';
-
 #[derive(Clone, Debug)]
-enum NormalizedUnitKind {
-    Char(char),
-    WrapHyphen,
-}
-
-#[derive(Clone, Debug)]
-struct NormalizedUnit {
-    kind: NormalizedUnitKind,
+struct NormalizedChar {
+    c: char,
     raw_range: ByteRange,
 }
 
@@ -25,9 +13,17 @@ struct ProjectionSpan {
     raw_range: ByteRange,
 }
 
-/// Search-only view of extracted PDF text. `text` is normalized enough to
-/// ignore layout artifacts, while `spans` maps every emitted scalar back to the
-/// original extraction bytes used by SourceMap and preview highlighting.
+/// Search-only view of extracted PDF text: whitespace collapsed, ligatures
+/// expanded, typographic quotes and dashes folded, while `spans` maps every
+/// emitted scalar back to the extraction bytes SourceMap and preview
+/// highlighting are expressed in.
+///
+/// It does not repair line-wrap hyphenation. It used to, and that was
+/// compensation for a defect in the stored reading: a word the typesetter
+/// broke across a line was stored broken, and only literal search knew better.
+/// The reading is now sanitized where it is produced
+/// (`extract::pdf::sanitize`), so what remains here is a view over *how a page
+/// set* the text — never a second opinion about what the text says.
 #[derive(Clone, Debug)]
 pub(crate) struct PdfSearchProjection {
     text: String,
@@ -36,23 +32,13 @@ pub(crate) struct PdfSearchProjection {
 
 impl PdfSearchProjection {
     pub(crate) fn new(raw: &str) -> Self {
-        let units = normalize(raw, false);
+        let chars = normalize_text(raw);
         let mut projection = Self {
             text: String::with_capacity(raw.len()),
-            spans: Vec::with_capacity(units.len()),
+            spans: Vec::with_capacity(chars.len()),
         };
-        for unit in units {
-            match unit.kind {
-                NormalizedUnitKind::WrapHyphen => {
-                    projection.push_scalar(WRAP_HYPHEN, unit.raw_range);
-                }
-                NormalizedUnitKind::Char(c) => {
-                    if matches!(c, WRAP_HYPHEN | LITERAL_ESCAPE) {
-                        projection.push_scalar(LITERAL_ESCAPE, unit.raw_range.clone());
-                    }
-                    projection.push_scalar(c, unit.raw_range);
-                }
-            }
+        for NormalizedChar { c, raw_range } in chars {
+            projection.push_scalar(c, raw_range);
         }
         projection
     }
@@ -90,38 +76,37 @@ impl PdfSearchProjection {
     }
 }
 
-/// Compile a non-regex PDF query against [`PdfSearchProjection`]. A visual
-/// line-wrap hyphen may appear between adjacent letters without being present
-/// in the query; an explicit query hyphen matches either a real hyphen or a
-/// visual wrap hyphen, but a real document hyphen is never made optional.
+/// One unit of a query. A query is the one side that can still carry a visual
+/// line wrap: it may have been pasted out of a PDF viewer, which shows the
+/// page's line breaks and not the document's words.
+#[derive(Clone, Debug)]
+enum QueryUnit {
+    Char(char),
+    /// A hyphen the paste's own line break marks as discretionary. The reading
+    /// either joined that word or kept the hyphen — which one is the
+    /// document's business — so the query accepts both.
+    WrapHyphen,
+}
+
+/// Compile a non-regex PDF query against [`PdfSearchProjection`].
+///
+/// A hyphen a paste shows at a line end is optional, because the reading
+/// resolved that break one of two ways and the person pasting cannot know
+/// which. A hyphen the query states inline is required: it is the one thing
+/// the person typing can be taken at their word about.
 pub(crate) fn literal_matcher(query: &str, case_sensitive: bool) -> anyhow::Result<RegexMatcher> {
-    let units = normalize(query, true);
+    let units = normalize_query(query);
     anyhow::ensure!(
         !units.is_empty(),
         "PDF search query is empty after removing extraction artifacts"
     );
 
-    let wrap = regex::escape(&WRAP_HYPHEN.to_string());
-    let hyphen = regex::escape("-");
-    let wrap_or_hyphen = format!("(?:{wrap}|{hyphen})");
-    let optional_wrap = format!("(?:{wrap})?");
+    let optional_hyphen = format!("(?:{})?", regex::escape("-"));
     let mut pattern = String::with_capacity(query.len().saturating_mul(2));
-
-    for (index, unit) in units.iter().enumerate() {
-        let between_letters = previous_is_letter(&units, index) && next_is_letter(&units, index);
-        match unit.kind {
-            NormalizedUnitKind::WrapHyphen if between_letters => {
-                pattern.push_str(&wrap_or_hyphen);
-            }
-            NormalizedUnitKind::WrapHyphen => pattern.push_str(&wrap),
-            NormalizedUnitKind::Char('-') if between_letters => {
-                pattern.push_str(&wrap_or_hyphen);
-            }
-            NormalizedUnitKind::Char(c) => push_literal_pattern(&mut pattern, c),
-        }
-
-        if unit_is_letter(unit) && units.get(index + 1).is_some_and(unit_is_letter) {
-            pattern.push_str(&optional_wrap);
+    for unit in &units {
+        match unit {
+            QueryUnit::WrapHyphen => pattern.push_str(&optional_hyphen),
+            QueryUnit::Char(c) => pattern.push_str(&regex::escape(&c.to_string())),
         }
     }
 
@@ -130,61 +115,112 @@ pub(crate) fn literal_matcher(query: &str, case_sensitive: bool) -> anyhow::Resu
         .build(&pattern)?)
 }
 
-fn push_literal_pattern(pattern: &mut String, c: char) {
-    if matches!(c, WRAP_HYPHEN | LITERAL_ESCAPE) {
-        pattern.push_str(&regex::escape(&LITERAL_ESCAPE.to_string()));
+/// How one scalar folds for matching. Shared by both sides so a query and the
+/// text it is matched against fold identically — the only difference between
+/// them is the line-wrap question, which only a query can ask.
+enum Folded {
+    /// Invisible: a zero-width mark, or a soft hyphen the renderer only shows
+    /// when it breaks a line.
+    Skip,
+    One(char),
+    Many(&'static str),
+}
+
+fn fold(c: char) -> Folded {
+    match c {
+        '\u{fb00}' => Folded::Many("ff"),
+        '\u{fb01}' => Folded::Many("fi"),
+        '\u{fb02}' => Folded::Many("fl"),
+        '\u{fb03}' => Folded::Many("ffi"),
+        '\u{fb04}' => Folded::Many("ffl"),
+        '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' | '\u{02bc}' => Folded::One('\''),
+        '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => Folded::One('"'),
+        '\u{2010}' | '\u{2011}' => Folded::One('-'),
+        '\u{200b}' | '\u{2060}' | '\u{feff}' | '\u{00ad}' => Folded::Skip,
+        c => Folded::One(c),
     }
-    pattern.push_str(&regex::escape(&c.to_string()));
 }
 
-fn previous_is_letter(units: &[NormalizedUnit], index: usize) -> bool {
-    index
-        .checked_sub(1)
-        .and_then(|previous| units.get(previous))
-        .is_some_and(unit_is_letter)
-}
-
-fn next_is_letter(units: &[NormalizedUnit], index: usize) -> bool {
-    units.get(index + 1).is_some_and(unit_is_letter)
-}
-
-fn unit_is_letter(unit: &NormalizedUnit) -> bool {
-    matches!(unit.kind, NormalizedUnitKind::Char(c) if c.is_alphabetic())
-}
-
-fn normalize(input: &str, trim_outer_whitespace: bool) -> Vec<NormalizedUnit> {
+/// Fold extracted text, collapsing each whitespace run to one space and
+/// keeping every emitted scalar's raw byte range.
+fn normalize_text(input: &str) -> Vec<NormalizedChar> {
     let chars = input.char_indices().collect::<Vec<_>>();
-    let mut units = Vec::with_capacity(chars.len());
+    let mut out: Vec<NormalizedChar> = Vec::with_capacity(chars.len());
     let mut index = 0;
 
     while index < chars.len() {
         let (start, c) = chars[index];
-        let end = char_end(input, &chars, index);
+
+        if c.is_whitespace() {
+            let mut next = index + 1;
+            while next < chars.len() && chars[next].1.is_whitespace() {
+                next += 1;
+            }
+            let whitespace_end = chars.get(next).map_or(input.len(), |(start, _)| *start);
+            push_space(
+                &mut out,
+                ByteRange {
+                    start,
+                    end: whitespace_end,
+                },
+            );
+            index = next;
+            continue;
+        }
+
+        let raw_range = ByteRange {
+            start,
+            end: char_end(input, &chars, index),
+        };
+        match fold(c) {
+            Folded::Skip => {}
+            Folded::One(c) => out.push(NormalizedChar { c, raw_range }),
+            Folded::Many(expansion) => out.extend(expansion.chars().map(|c| NormalizedChar {
+                c,
+                raw_range: raw_range.clone(),
+            })),
+        }
+        index += 1;
+    }
+
+    out
+}
+
+/// A whitespace run is one space, and two runs in a row are still one space —
+/// with the raw range extended so a match still resolves to every byte it
+/// covered.
+fn push_space(out: &mut Vec<NormalizedChar>, raw_range: ByteRange) {
+    if let Some(previous) = out.last_mut() {
+        if previous.c == ' ' {
+            previous.raw_range.end = raw_range.end;
+            return;
+        }
+    }
+    out.push(NormalizedChar { c: ' ', raw_range });
+}
+
+/// Fold a query the same way, additionally recognising a hyphen the paste
+/// broke a line at, and dropping the whitespace at either end.
+fn normalize_query(input: &str) -> Vec<QueryUnit> {
+    let chars = input.char_indices().collect::<Vec<_>>();
+    let mut units: Vec<QueryUnit> = Vec::with_capacity(chars.len());
+    let mut index = 0;
+
+    while index < chars.len() {
+        let (_, c) = chars[index];
 
         if is_discretionary_hyphen(c) && index > 0 && chars[index - 1].1.is_alphabetic() {
             if let Some(continuation) = line_wrap_continuation(&chars, index) {
-                push_unit(
-                    &mut units,
-                    NormalizedUnitKind::WrapHyphen,
-                    ByteRange {
-                        start,
-                        end: chars[continuation].0,
-                    },
-                );
+                units.push(QueryUnit::WrapHyphen);
                 index = continuation;
                 continue;
             }
-
             if c == '\u{00ad}'
                 && chars
                     .get(index + 1)
                     .is_some_and(|(_, next)| next.is_alphabetic())
             {
-                push_unit(
-                    &mut units,
-                    NormalizedUnitKind::WrapHyphen,
-                    ByteRange { start, end },
-                );
+                units.push(QueryUnit::WrapHyphen);
                 index += 1;
                 continue;
             }
@@ -195,83 +231,25 @@ fn normalize(input: &str, trim_outer_whitespace: bool) -> Vec<NormalizedUnit> {
             while next < chars.len() && chars[next].1.is_whitespace() {
                 next += 1;
             }
-            let whitespace_end = if next < chars.len() {
-                chars[next].0
-            } else {
-                input.len()
-            };
-            if !trim_outer_whitespace || !units.is_empty() {
-                push_unit(
-                    &mut units,
-                    NormalizedUnitKind::Char(' '),
-                    ByteRange {
-                        start,
-                        end: whitespace_end,
-                    },
-                );
+            if !units.is_empty() && !matches!(units.last(), Some(QueryUnit::Char(' '))) {
+                units.push(QueryUnit::Char(' '));
             }
             index = next;
             continue;
         }
 
-        if is_ignored_format_character(c) || c == '\u{00ad}' {
-            index += 1;
-            continue;
-        }
-
-        let raw_range = ByteRange { start, end };
-        match c {
-            '\u{fb00}' => push_chars(&mut units, "ff", raw_range),
-            '\u{fb01}' => push_chars(&mut units, "fi", raw_range),
-            '\u{fb02}' => push_chars(&mut units, "fl", raw_range),
-            '\u{fb03}' => push_chars(&mut units, "ffi", raw_range),
-            '\u{fb04}' => push_chars(&mut units, "ffl", raw_range),
-            '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' | '\u{02bc}' => {
-                push_unit(&mut units, NormalizedUnitKind::Char('\''), raw_range);
-            }
-            '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => {
-                push_unit(&mut units, NormalizedUnitKind::Char('"'), raw_range);
-            }
-            '\u{2010}' | '\u{2011}' => {
-                push_unit(&mut units, NormalizedUnitKind::Char('-'), raw_range);
-            }
-            _ => push_unit(&mut units, NormalizedUnitKind::Char(c), raw_range),
+        match fold(c) {
+            Folded::Skip => {}
+            Folded::One(c) => units.push(QueryUnit::Char(c)),
+            Folded::Many(expansion) => units.extend(expansion.chars().map(QueryUnit::Char)),
         }
         index += 1;
     }
 
-    if trim_outer_whitespace
-        && matches!(
-            units.last(),
-            Some(NormalizedUnit {
-                kind: NormalizedUnitKind::Char(' '),
-                ..
-            })
-        )
-    {
+    if matches!(units.last(), Some(QueryUnit::Char(' '))) {
         units.pop();
     }
     units
-}
-
-fn push_chars(units: &mut Vec<NormalizedUnit>, chars: &str, raw_range: ByteRange) {
-    for c in chars.chars() {
-        push_unit(units, NormalizedUnitKind::Char(c), raw_range.clone());
-    }
-}
-
-fn push_unit(units: &mut Vec<NormalizedUnit>, kind: NormalizedUnitKind, raw_range: ByteRange) {
-    if matches!(kind, NormalizedUnitKind::Char(' ')) {
-        if let Some(NormalizedUnit {
-            kind: NormalizedUnitKind::Char(' '),
-            raw_range: previous,
-        }) = units.last_mut()
-        {
-            previous.end = raw_range.end;
-            return;
-        }
-    }
-    units.push(NormalizedUnit { kind, raw_range });
 }
 
 fn char_end(input: &str, chars: &[(usize, char)], index: usize) -> usize {
@@ -317,10 +295,6 @@ fn is_line_break(c: char) -> bool {
     matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
 }
 
-fn is_ignored_format_character(c: char) -> bool {
-    matches!(c, '\u{200b}' | '\u{2060}' | '\u{feff}')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,9 +320,11 @@ mod tests {
         ranges
     }
 
+    /// The reading a PDF now stores: words whole, lines still where the page
+    /// put them. A passage query spanning those lines still finds it.
     #[test]
-    fn literal_passage_ignores_pdf_line_wrap_hyphenation_and_whitespace() {
-        let raw = "The topic should be specific to your degree pro-\n  gramme. It should also be some-\r\nthing that interests you.";
+    fn literal_passage_ignores_the_lines_a_page_broke_the_passage_into() {
+        let raw = "The topic should be specific to your degree programme.\n  It should also be something\nthat interests you.";
         let query = "The topic should be specific to your degree programme.\nIt should also be something that interests you.";
         let ranges = matches(raw, query);
 
@@ -360,13 +336,24 @@ mod tests {
     fn genuine_inline_hyphen_is_not_optional() {
         assert!(matches("some-thing", "something").is_empty());
         assert_eq!(matches("some-thing", "some-thing").len(), 1);
-        assert_eq!(matches("state-\nof-the-art", "state-of-the-art").len(), 1);
+        assert_eq!(matches("state-of-the-art", "state-of-the-art").len(), 1);
     }
 
+    /// A user pasting a phrase out of a PDF viewer pastes the page's line
+    /// break with it. The reading resolved that break one way or the other,
+    /// and the query has to match whichever it chose.
     #[test]
-    fn pasted_wrap_hyphen_query_matches_inline_or_wrapped_hyphen() {
+    fn pasted_wrap_hyphen_query_matches_the_joined_or_the_hyphenated_reading() {
         assert_eq!(matches("state-of-the-art", "state-\nof-the-art").len(), 1);
-        assert_eq!(matches("state-\nof-the-art", "state-\nof-the-art").len(), 1);
+        assert_eq!(matches("stateof-the-art", "state-\nof-the-art").len(), 1);
+    }
+
+    /// A soft hyphen is invisible until it breaks a line, so it is invisible
+    /// to search on both sides.
+    #[test]
+    fn a_soft_hyphen_is_not_part_of_the_word_on_either_side() {
+        assert_eq!(matches("pre\u{00ad}shared", "preshared").len(), 1);
+        assert_eq!(matches("preshared", "pre\u{00ad}shared").len(), 1);
     }
 
     #[test]
@@ -382,21 +369,22 @@ mod tests {
 
     #[test]
     fn maps_multibyte_and_expanded_characters_to_valid_raw_boundaries() {
-        let raw = "Préface: \u{fb01}eld some-\nthing fin.";
+        let raw = "Préface: \u{fb01}eld something fin.";
         let ranges = matches(raw, "field something");
         assert_eq!(ranges.len(), 1);
         let range = &ranges[0];
         assert!(raw.is_char_boundary(range.start));
         assert!(raw.is_char_boundary(range.end));
-        assert_eq!(&raw[range.start..range.end], "\u{fb01}eld some-\nthing");
+        assert_eq!(&raw[range.start..range.end], "\u{fb01}eld something");
     }
 
+    /// The projection no longer reserves any character for itself, so a
+    /// document that happens to contain one is ordinary text.
     #[test]
-    fn escapes_literal_internal_projection_symbols_without_collisions() {
-        let raw = format!("a{WRAP_HYPHEN}b a{LITERAL_ESCAPE}b");
-        assert_eq!(matches(&raw, &format!("a{WRAP_HYPHEN}b")).len(), 1);
-        assert_eq!(matches(&raw, &format!("a{LITERAL_ESCAPE}b")).len(), 1);
-        assert!(matches(&raw, "ab").is_empty());
+    fn private_use_characters_are_ordinary_document_text() {
+        let raw = "a\u{e000}b ab";
+        assert_eq!(matches(raw, "a\u{e000}b").len(), 1);
+        assert_eq!(matches(raw, "ab").len(), 1);
     }
 
     #[test]
@@ -406,9 +394,9 @@ mod tests {
 
     #[test]
     fn case_sensitivity_is_applied_after_projection() {
-        let projection = PdfSearchProjection::new("some-\nthing");
-        let insensitive = literal_matcher("SOMETHING", false).unwrap();
-        let sensitive = literal_matcher("SOMETHING", true).unwrap();
+        let projection = PdfSearchProjection::new("some thing");
+        let insensitive = literal_matcher("SOME THING", false).unwrap();
+        let sensitive = literal_matcher("SOME THING", true).unwrap();
 
         assert!(insensitive.is_match(projection.as_bytes()).unwrap());
         assert!(!sensitive.is_match(projection.as_bytes()).unwrap());

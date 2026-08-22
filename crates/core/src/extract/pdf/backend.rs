@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::types::{ExtractedContent, OutlineEntry};
+use crate::types::{DeclaredOutline, ExtractedContent};
 
 /// Platform-specific PDF extraction backend.
 ///
@@ -9,8 +9,10 @@ use crate::types::{ExtractedContent, OutlineEntry};
 pub(super) trait PdfBackend: Send + Sync {
     fn extract(&self, path: &Path) -> anyhow::Result<ExtractedContent>;
 
-    /// The bookmark tree, flattened to depth-tagged entries in reading order.
-    /// Separate from `extract` because it costs a document open and nothing
-    /// else — no page rendering, no text, no bounding boxes.
-    fn outline(&self, path: &Path) -> anyhow::Result<Vec<OutlineEntry>>;
+    /// The bookmark tree, flattened to depth-tagged entries in reading order,
+    /// each anchored in the reading `extract` produces. Separate from
+    /// `extract` because callers want it without the text, not because it is
+    /// cheaper: anchoring a bookmark to a byte offset means reading the
+    /// document, so this costs what extraction costs.
+    fn outline(&self, path: &Path) -> anyhow::Result<DeclaredOutline>;
 }

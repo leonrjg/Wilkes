@@ -1,12 +1,13 @@
 mod backend;
 mod mupdf;
+mod sanitize;
 
 use std::path::Path;
 
 use backend::PdfBackend;
 use mupdf::MuPdfBackend;
 
-use crate::types::{ExtractedContent, OutlineEntry};
+use crate::types::{DeclaredOutline, ExtractedContent};
 
 use super::ContentExtractor;
 
@@ -40,7 +41,7 @@ impl ContentExtractor for PdfExtractor {
         self.backend.extract(path)
     }
 
-    fn outline(&self, path: &Path) -> anyhow::Result<Vec<OutlineEntry>> {
+    fn outline(&self, path: &Path) -> anyhow::Result<DeclaredOutline> {
         self.backend.outline(path)
     }
 }

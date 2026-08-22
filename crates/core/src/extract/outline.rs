@@ -7,7 +7,7 @@
 //! offsets, so a false heading cuts a section in the wrong place and every
 //! position downstream of it is wrong too.
 
-use crate::types::OutlineEntry;
+use crate::types::{OutlineAnchor, OutlineEntry};
 
 /// Markdown ATX headings, in document order, with their byte offsets.
 ///
@@ -53,6 +53,9 @@ fn heading(line: &str, offset: usize) -> Option<OutlineEntry> {
         level: hashes as u32 - 1,
         page: None,
         byte_offset: Some(offset),
+        // The heading is text at a position in the text: nothing was resolved
+        // and nothing could be wrong about it.
+        anchor: OutlineAnchor::TextOffset,
     })
 }
 
@@ -74,7 +77,10 @@ mod tests {
         // Closing hashes are decoration, not part of the title.
         assert_eq!(outline[1].title, "Section 1.1");
         assert_eq!(outline[1].level, 1);
-        assert_eq!(outline[1].byte_offset, Some(text.find("## Section").unwrap()));
+        assert_eq!(
+            outline[1].byte_offset,
+            Some(text.find("## Section").unwrap())
+        );
     }
 
     /// Each of these produced a section boundary in a document that has none.

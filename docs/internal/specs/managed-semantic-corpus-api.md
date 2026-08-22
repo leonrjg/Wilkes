@@ -74,11 +74,27 @@ and file and refuses paths outside that workspace's configured library:
 
 The managed import response includes `corpus_id`, source bytes/media metadata,
 snapshot and rendition identities, `extracted_content_sha256`, exact embedding
-space metadata, resolved outline entries, stable chunks, and
-`embedding_work`. `chunk_count == embedding_work.reused +
+space metadata, resolved outline entries, `extraction` diagnostics, stable
+chunks, and `embedding_work`. `chunk_count == embedding_work.reused +
 embedding_work.computed`; raw vectors, source-workspace identities, and SQLite
 rowids are absent. Underdog can recompute every returned text hash and the
 extracted-content hash before recording the document.
+
+Each outline entry carries `byte_offset` where Wilkes could establish one, and
+an `anchor` naming what established it: `destination_coordinate` (the PDF
+destination's own vertical position), `title_match` (the bookmark title found
+in the destination page's text), `text_offset` (a heading, which *is* text at a
+position), or `page` — the last meaning no offset was resolvable and the entry
+resolves to the first passage of its page. `byte_offset` remains nullable and
+consumers that ignore it keep working unchanged.
+
+`extraction` reports what the document's own reading had to decide: how many
+pages clustered into one body column and how many were too ambiguous to
+reorder, how many marginalia blocks were moved after their page, how many
+repeating head/foot runs were removed, and how the line-wrap hyphens resolved.
+A document dominated by `ambiguous_column_pages`, or by `page` anchors, is one
+whose structure Wilkes could only partly recover, and that is visible here
+rather than discovered later as a section boundary in the wrong place.
 
 The aggregate response contains an unnormalized sum of individually
 L2-normalized member vectors and the computed member count. This lets callers

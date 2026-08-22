@@ -3071,6 +3071,7 @@ mod tests {
             "extracted_content_sha256",
             "embedding_space_id",
             "outline",
+            "extraction",
             "chunks",
             "embedding_work",
         ] {
@@ -3079,5 +3080,19 @@ mod tests {
                 "missing fixture field {required}"
             );
         }
+
+        // The outline carries a position and says what established it, and the
+        // extraction says what it had to decide to produce that position.
+        // Both are part of the contract, so both are read back through the
+        // types the server serializes rather than only eyeballed in the file.
+        let anchor: wilkes_core::types::OutlineAnchor =
+            serde_json::from_value(response["outline"][0]["anchor"].clone()).unwrap();
+        assert_eq!(
+            anchor,
+            wilkes_core::types::OutlineAnchor::DestinationCoordinate
+        );
+        let extraction: wilkes_core::types::ExtractionDiagnostics =
+            serde_json::from_value(response["extraction"].clone()).unwrap();
+        assert_eq!(extraction.pages, 1);
     }
 }

@@ -1,6 +1,6 @@
 # Extraction Fidelity — Design
 
-Status: proposed (2026-08-22)
+Status: implemented (2026-08-22)
 Branch: `develop`
 Depends on: extractor registry, source maps, `ExtractionRecipe` identity, semantic index, PDF search projection
 
@@ -217,12 +217,15 @@ one that must be logged per document rather than silently applied.
    whose bbox begins at or below `top` gives an exact
    `SourceSegment.text_range.start`.
 
-   **Verify before relying on this.** PDF user space is origin-bottom-left with
-   y increasing upward; MuPDF page space is top-left, y down. Whether
-   `mupdf-0.6` normalizes a destination coordinate into page space is an
-   implementation question to answer with a test against a real bookmarked PDF,
-   not an assumption. If it does not, the transform is ours to apply, and the
-   test is the same test.
+   **Verified.** `mupdf-0.6` does normalize the coordinate into page space:
+   `populate_destination` applies the page's own transform before the
+   destination is formatted, so what arrives is origin-top-left, y down — the
+   space `extract_page_words` records boxes in, and no transform of ours is
+   needed. Held by
+   `a_destination_coordinate_anchors_the_entry_where_it_points`, whose PDF
+   bookmarks a line at user-space `y` 420 / page-space `y` 180: the two pick
+   different lines, so landing on the right one is proof of the space and not
+   merely of a resolution.
 
 2. **Title match on the destination page.** Match the bookmark title against
    that page's text, normalized as `PdfSearchProjection` normalizes — which is
@@ -320,7 +323,45 @@ Wilkes-side, on Wilkes's own consumers:
 - **Highlighting still lands** on the right words in the preview after
   relocation — the marginalia case is the one that can break it.
 
-## 10. Rejected alternatives
+## 10. Measured
+
+Against the three IU coursebooks §3 counted, after implementation:
+
+| | Cryptography | Databases | Networks |
+|---|---|---|---|
+| Wrap-hyphen candidates | 591 | 513 | 446 |
+| joined on corpus evidence | 514 | 405 | 372 |
+| hyphen kept, line joined | 77 | 106 | 73 |
+| left broken (§6a seam, below) | 0 | 2 | 1 |
+| Printed page numbers left in the reading | 0 | 0 | 0 |
+| Furniture runs removed | 122 | 135 | 105 |
+| Marginalia blocks relocated | 23 | 17 | 29 |
+| Pages with an ambiguous body column | 1 | 0 | 0 |
+| Outline entries / resolved by rung 1 | 46 / 46 | 0 / 0 | 39 / 39 |
+
+No genuine compound was destroyed: `zero-day`, `multi-factor`,
+`denial-of-service`, `pre-shared` and `public-key` occur only hyphenated in
+every reading, with zero joined occurrences. Every declared bookmark in both
+outlined books resolved by destination coordinate; no entry fell to rung 2 or
+rung 3.
+
+Two decisions the design left implicit were settled by these measurements:
+
+- **The line break goes even when the hyphen stays.** A compound broken at its
+  own hyphen reads `pre-shared`, never `pre-\nshared` — the break is layout in
+  both cases. This is what makes "hyphen-broken words → 0" a property that can
+  be checked, rather than a count of the joins that happened to succeed.
+- **A wrap whose continuation is on the far side of a relocated margin box is
+  left broken.** Joining it would have to delete the box, and the box is
+  authored content. Three occurrences in 1,550 candidates, counted as
+  `unjoinable_wrap_breaks` rather than hidden — the only way a reading can
+  still hold a hyphen-broken word.
+
+Not measured here: semantic-search retrieval on a fixed query set (§9). It
+needs an embedded corpus in both recipe versions, which the `v2` bump forces to
+be rebuilt before the comparison can be made.
+
+## 11. Rejected alternatives
 
 - **Widen `PdfSearchProjection` to every consumer.** Keeps two texts and makes
   the second one load-bearing everywhere. The projection's own doc comment

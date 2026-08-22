@@ -744,15 +744,19 @@ mod tests {
         assert_eq!(matches[0].context_after, " jumps over the lazy dog");
     }
 
+    /// The reading keeps the lines a page broke a sentence into, so a passage
+    /// query still crosses them, and the match still resolves to every segment
+    /// it covered — with their boxes merged, because a highlight is drawn over
+    /// both lines.
     #[test]
     fn literal_pdf_match_maps_artifacts_back_to_raw_range_and_page() {
         use crate::types::{BoundingBox, SourceSegment};
 
-        let raw = "prefix The topic should also be some-\nthing that interests you. suffix";
-        let some_start = raw.find("some-").unwrap();
-        let some_end = some_start + "some-".len();
-        let thing_start = raw.find("thing").unwrap();
-        let thing_end = thing_start + "thing".len();
+        let raw = "prefix The topic should also be something\nthat interests you. suffix";
+        let some_start = raw.find("something").unwrap();
+        let some_end = some_start + "something".len();
+        let thing_start = raw.find("that").unwrap();
+        let thing_end = thing_start + "that".len();
         let source_map = SourceMap {
             segments: vec![
                 SourceSegment {
@@ -799,7 +803,7 @@ mod tests {
         let range = found.text_range.as_ref().unwrap();
         assert_eq!(
             &raw[range.start..range.end],
-            "The topic should also be some-\nthing that interests you."
+            "The topic should also be something\nthat interests you."
         );
         assert_eq!(found.matched_text, &raw[range.start..range.end]);
         match &found.origin {
@@ -1057,12 +1061,12 @@ mod tests {
             SemanticIndex::create(root, "m", 3, EmbeddingEngine::Candle, Some(root)).unwrap();
         idx.write_file(PreparedFile {
             path: pdf.clone(),
-            full_text: "alpha some-\nthing gamma".to_string(),
+            full_text: "alpha something gamma".to_string(),
             chunks: vec![(
                 Chunk {
                     file_path: pdf.clone(),
-                    text: "alpha some-\nthing gamma".to_string(),
-                    byte_range: ByteRange { start: 0, end: 23 },
+                    text: "alpha something gamma".to_string(),
+                    byte_range: ByteRange { start: 0, end: 21 },
                     origin: SourceOrigin::PdfPage {
                         page: 1,
                         bbox: None,
@@ -1113,9 +1117,9 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].matches.len(), 1);
-        assert_eq!(results[0].matches[0].matched_text, "some-\nthing");
+        assert_eq!(results[0].matches[0].matched_text, "something");
         let range = results[0].matches[0].text_range.as_ref().unwrap();
-        assert_eq!((range.start, range.end), (6, 17));
+        assert_eq!((range.start, range.end), (6, 15));
         match &results[0].matches[0].origin {
             SourceOrigin::PdfPage { page, .. } => assert_eq!(*page, 1),
             other => panic!("expected pdf page origin, got {other:?}"),
@@ -1136,7 +1140,7 @@ mod tests {
             anyhow::bail!("failed to extract {}", path.display());
         }
 
-        fn outline(&self, path: &Path) -> anyhow::Result<Vec<crate::types::OutlineEntry>> {
+        fn outline(&self, path: &Path) -> anyhow::Result<crate::types::DeclaredOutline> {
             anyhow::bail!("failed to read the outline of {}", path.display());
         }
     }
@@ -1392,8 +1396,8 @@ mod tests {
                     },
                 })
             }
-            fn outline(&self, _: &Path) -> anyhow::Result<Vec<crate::types::OutlineEntry>> {
-                Ok(Vec::new())
+            fn outline(&self, _: &Path) -> anyhow::Result<crate::types::DeclaredOutline> {
+                Ok(crate::types::DeclaredOutline::default())
             }
         }
 
