@@ -41,11 +41,10 @@ speedup instead of the ~3x the workload allows.
 
 ### Why it was not fixed in the same pass
 
-The two changes shipped alongside this (single-path catalog resolution, and
-corpus-scan admission control) are contained within the search path. Narrowing
-these locks reaches into `MetadataCache` and `ResearchStore` ownership and
-changes who may hold what for how long, so it deserves its own change with its
-own tests rather than riding along.
+The single-path catalog resolution shipped separately and is contained within
+the search path. Narrowing these locks reaches into `MetadataCache` and
+`ResearchStore` ownership and changes who may hold what for how long, so it
+deserves its own change with its own tests rather than riding along.
 
 Note that the single-path fix reduces the *exposure* — a `File`-scope query now
 enriches a one-entry listing instead of the whole root — but it does not change

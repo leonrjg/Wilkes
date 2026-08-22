@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::research::SearchLogTracker;
@@ -19,77 +18,6 @@ use wilkes_core::types::{
     SearchQuery, SearchStats,
 };
 
-/// Admission control for corpus-wide scans.
-///
-/// `GrepSearchProvider` fans every scan out across the global rayon pool, so a
-/// single scan already saturates all cores. Running several at once buys no
-/// throughput: measured on an 8-core machine, three concurrent corpus searches
-/// gave a 1.05x speedup while spending 2.6x the CPU time (76ms -> 201ms of
-/// summed worker time), because three fan-outs oversubscribe the same pool.
-///
-/// Admitting one at a time keeps total work flat and lets each search finish as
-/// soon as its own work is done, instead of every search completing together at
-/// the end of the batch. Contention was already serialising these scans inside
-/// the thread scheduler; this makes the queue explicit and drops the thrash.
-const MAX_CONCURRENT_CORPUS_SCANS: usize = 1;
-
-/// Scans below this size do not meaningfully occupy the rayon pool, so they
-/// bypass admission entirely and a targeted lookup never queues behind a sweep.
-const CORPUS_SCAN_MIN_DOCUMENTS: usize = 8;
-
-struct ScanAdmission {
-    available: Mutex<usize>,
-    released: std::sync::Condvar,
-}
-
-impl ScanAdmission {
-    const fn new(permits: usize) -> Self {
-        Self {
-            available: Mutex::new(permits),
-            released: std::sync::Condvar::new(),
-        }
-    }
-
-    fn acquire(&self) -> ScanPermit<'_> {
-        let mut available = self
-            .available
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while *available == 0 {
-            available = self
-                .released
-                .wait(available)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        *available -= 1;
-        ScanPermit { admission: self }
-    }
-}
-
-struct ScanPermit<'a> {
-    admission: &'a ScanAdmission,
-}
-
-impl Drop for ScanPermit<'_> {
-    fn drop(&mut self) {
-        let mut available = self
-            .admission
-            .available
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *available += 1;
-        drop(available);
-        self.admission.released.notify_one();
-    }
-}
-
-static CORPUS_SCAN_ADMISSION: ScanAdmission = ScanAdmission::new(MAX_CONCURRENT_CORPUS_SCANS);
-
-/// Whether a scan over `document_count` documents must take an admission permit.
-fn needs_admission(document_count: usize) -> bool {
-    document_count >= CORPUS_SCAN_MIN_DOCUMENTS
-}
-
 /// Handle to a running search. Dropping the handle cancels the search.
 pub struct SearchHandle {
     pub rx: mpsc::Receiver<FileMatches>,
@@ -97,8 +25,6 @@ pub struct SearchHandle {
     log: Option<SearchLogTracker>,
     metadata: Option<SearchMetadata>,
     catalog_elapsed_ms: u64,
-    /// Filled in by the worker once it knows how long admission took.
-    admission_wait_ms: Arc<AtomicU64>,
 }
 
 struct SearchMetadata {
@@ -190,8 +116,7 @@ impl SearchHandle {
             error!("search worker panicked: {e}");
             vec![format!("search worker panicked: {e}")].into()
         });
-        let admission_wait_ms = self.admission_wait_ms.load(Ordering::Relaxed);
-        let elapsed_ms = (started.elapsed().as_millis() as u64).saturating_sub(admission_wait_ms);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
         if let Some(log) = &mut self.log {
             let status = if outcome.errors.iter().any(|error| {
                 error.starts_with("search failed:") || error.contains("worker panicked")
@@ -212,7 +137,6 @@ impl SearchHandle {
             total_matches,
             catalog_elapsed_ms: self.catalog_elapsed_ms,
             elapsed_ms,
-            admission_wait_ms,
             indexed_pdf_reads: outcome.indexed_pdf_reads,
             live_pdf_fallbacks: outcome.live_pdf_fallbacks,
             index_unavailable_fallbacks: outcome.index_unavailable_fallbacks,
@@ -243,11 +167,8 @@ pub fn start_search(
     grep_use_index: bool,
 ) -> SearchHandle {
     let (tx, rx) = mpsc::channel::<FileMatches>(64);
-    let admission_wait = Arc::new(AtomicU64::new(0));
-    let worker_admission_wait = Arc::clone(&admission_wait);
 
     let worker = tokio::task::spawn_blocking(move || {
-        let admission_wait = worker_admission_wait;
         let mut registry = ExtractorRegistry::new();
         registry.register(Box::new(PdfExtractor::new()));
 
@@ -281,14 +202,6 @@ pub fn start_search(
             }
         };
 
-        // Held for the duration of the fan-out; released when this worker ends.
-        let admission_started = std::time::Instant::now();
-        let _admission = needs_admission(documents.len()).then(|| CORPUS_SCAN_ADMISSION.acquire());
-        admission_wait.store(
-            admission_started.elapsed().as_millis() as u64,
-            Ordering::Relaxed,
-        );
-
         let mut outcome = provider
             .search(&query, &registry, tx, &documents)
             .unwrap_or_else(|e| vec![format!("search failed: {e:#}")].into());
@@ -306,7 +219,6 @@ pub fn start_search(
         log,
         metadata: None,
         catalog_elapsed_ms: 0,
-        admission_wait_ms: admission_wait,
     }
 }
 
@@ -316,120 +228,6 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
     use wilkes_core::types::{DocumentMetadata, FileType};
-
-    /// The whole point of admission control is that a second corpus scan waits
-    /// rather than competing for the same rayon pool.
-    #[test]
-    fn admission_lets_only_one_corpus_scan_run_at_a_time() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        static ADMISSION: ScanAdmission = ScanAdmission::new(1);
-        let live = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-
-        let workers: Vec<_> = (0..8)
-            .map(|_| {
-                let (live, peak) = (Arc::clone(&live), Arc::clone(&peak));
-                std::thread::spawn(move || {
-                    let _permit = ADMISSION.acquire();
-                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(now, Ordering::SeqCst);
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    live.fetch_sub(1, Ordering::SeqCst);
-                })
-            })
-            .collect();
-        for worker in workers {
-            worker.join().unwrap();
-        }
-
-        assert_eq!(
-            peak.load(Ordering::SeqCst),
-            1,
-            "more than one scan held admission at once"
-        );
-        // Every permit was handed back, so later scans are not locked out.
-        assert_eq!(live.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn small_scans_bypass_admission_so_targeted_lookups_do_not_queue() {
-        assert!(!needs_admission(0));
-        assert!(!needs_admission(1));
-        assert!(!needs_admission(CORPUS_SCAN_MIN_DOCUMENTS - 1));
-        assert!(needs_admission(CORPUS_SCAN_MIN_DOCUMENTS));
-        assert!(needs_admission(223));
-    }
-
-    /// A queued scan must not bill another search's work to its own
-    /// `elapsed_ms`; the wait is reported as `admission_wait_ms` instead.
-    #[tokio::test]
-    async fn queue_time_is_reported_apart_from_worker_time() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let documents: Vec<_> = (0..CORPUS_SCAN_MIN_DOCUMENTS)
-            .map(|i| {
-                let path = root.join(format!("doc{i}.txt"));
-                fs::write(&path, "hello world").unwrap();
-                text_document(path)
-            })
-            .collect();
-        assert!(needs_admission(documents.len()));
-
-        let query = SearchQuery {
-            pattern: "hello".to_string(),
-            is_regex: false,
-            case_sensitive: false,
-            root,
-            max_results: 100,
-            respect_gitignore: true,
-            max_file_size: 1024 * 1024,
-            context_lines: 0,
-            mode: SearchMode::Grep,
-            scope: Default::default(),
-            supported_extensions: vec!["txt".to_string()],
-            collection_id: None,
-            tag_ids: Vec::new(),
-        };
-
-        // Occupy the only permit so the search below has to queue for it.
-        let blocker = CORPUS_SCAN_ADMISSION.acquire();
-        let search = tokio::spawn(async move {
-            start_search(
-                query,
-                documents,
-                Vec::new(),
-                None,
-                None,
-                None,
-                None,
-                RetrievalSettings::default(),
-                None,
-                false,
-            )
-            .run(|_| async { true })
-            .await
-        });
-
-        let held = std::time::Duration::from_millis(150);
-        tokio::time::sleep(held).await;
-        drop(blocker);
-
-        let stats = search.await.unwrap();
-        assert!(
-            stats.admission_wait_ms >= 100,
-            "expected the queued scan to report its wait, got {}ms",
-            stats.admission_wait_ms
-        );
-        // The scan itself greps a handful of tiny files, so once the wait is
-        // removed the remaining worker time must be far below the wait.
-        assert!(
-            stats.elapsed_ms < stats.admission_wait_ms,
-            "elapsed_ms {}ms still carries the {}ms queue wait",
-            stats.elapsed_ms,
-            stats.admission_wait_ms
-        );
-    }
 
     fn text_document(path: std::path::PathBuf) -> SearchDocument {
         SearchDocument {
@@ -489,7 +287,6 @@ mod tests {
             log: None,
             metadata: None,
             catalog_elapsed_ms: 0,
-            admission_wait_ms: Arc::new(AtomicU64::new(0)),
         }
         .with_metadata(Some(cache), MetadataSource::File);
 
@@ -698,7 +495,6 @@ mod tests {
             log: None,
             metadata: None,
             catalog_elapsed_ms: 0,
-            admission_wait_ms: Arc::new(AtomicU64::new(0)),
         }
         .with_catalog_elapsed_ms(7);
 
@@ -811,7 +607,6 @@ mod tests {
             log: None,
             metadata: None,
             catalog_elapsed_ms: 0,
-            admission_wait_ms: Arc::new(AtomicU64::new(0)),
         };
         let errors = handle.finish().await;
         assert!(!errors.is_empty());

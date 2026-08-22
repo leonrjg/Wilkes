@@ -129,13 +129,22 @@ fn classify_file(
         .as_ref()
         .and_then(|m| m.modified().ok())
         .and_then(system_time_ms);
-    let detected = FileType::detect(&path, supported_extensions);
+    let (file_type, omitted_because) = match FileType::detect(&path, supported_extensions) {
+        None => (
+            FileType::PlainText,
+            Some(OmittedFileReason::UnsupportedExtension),
+        ),
+        Some(file_type) if max_file_size > 0 && size_bytes > max_file_size => {
+            (file_type, Some(OmittedFileReason::TooLarge))
+        }
+        Some(file_type) => (file_type, None),
+    };
 
-    let entry = |file_type: FileType| FileEntry {
-        path: path.clone(),
+    let file = FileEntry {
+        path,
         size_bytes,
         file_type,
-        extension: extension.clone(),
+        extension,
         created_at_ms,
         modified_at_ms,
         title: None,
@@ -147,21 +156,10 @@ fn classify_file(
         tags: Vec::new(),
     };
 
-    let Some(file_type) = detected else {
-        return Classified::Omitted(OmittedFileEntry {
-            file: entry(FileType::PlainText),
-            reason: OmittedFileReason::UnsupportedExtension,
-        });
-    };
-
-    if max_file_size > 0 && size_bytes > max_file_size {
-        return Classified::Omitted(OmittedFileEntry {
-            file: entry(file_type),
-            reason: OmittedFileReason::TooLarge,
-        });
+    match omitted_because {
+        Some(reason) => Classified::Omitted(OmittedFileEntry { file, reason }),
+        None => Classified::Searchable(file),
     }
-
-    Classified::Searchable(entry(file_type))
 }
 
 fn system_time_ms(time: SystemTime) -> Option<i64> {
