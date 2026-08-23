@@ -445,6 +445,14 @@ mod tests {
 
     struct MockEmbedder;
     impl Embedder for MockEmbedder {
+        fn embedding_space_identity(&self) -> crate::embed::EmbeddingSpaceIdentity {
+            crate::embed::EmbeddingSpaceIdentity::for_test(
+                self.engine(),
+                self.model_id(),
+                self.dimension(),
+            )
+        }
+
         fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
             Ok(vec![vec![1.0; 768]; texts.len()])
         }
@@ -988,6 +996,14 @@ mod tests {
     struct TinyMockEmbedder;
 
     impl Embedder for TinyMockEmbedder {
+        fn embedding_space_identity(&self) -> crate::embed::EmbeddingSpaceIdentity {
+            crate::embed::EmbeddingSpaceIdentity::for_test(
+                self.engine(),
+                self.model_id(),
+                self.dimension(),
+            )
+        }
+
         fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
             Ok(vec![vec![1.0, 0.0]])
         }

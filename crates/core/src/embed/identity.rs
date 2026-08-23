@@ -4,6 +4,10 @@ use sha2::{Digest, Sha256};
 use crate::types::{ByteRange, EmbeddingEngine, SourceOrigin};
 
 pub const IDENTITY_SCHEMA_VERSION: u32 = 1;
+/// Marks an artifact revision that names only the requested model, not the
+/// files that produced the vectors. One owner for the rule, so the index
+/// creation guard and the legacy migration cannot drift apart.
+pub const UNRESOLVED_ARTIFACT_REVISION_PREFIX: &str = "unresolved-runtime-";
 pub const PASSAGE_INPUT_RECIPE: &str = "wilkes-passage-input-v1";
 pub const POOLING_NORMALIZATION_RECIPE: &str = "engine-native-pooling+l2-output-v1";
 /// v2 is the sanitized reading: line-wrapped words joined, page furniture
@@ -108,13 +112,41 @@ impl IndexEmbeddingMetadata {
 }
 
 impl EmbeddingSpaceIdentity {
+    /// A placeholder identity: names the model but not the artifacts that
+    /// produced the vectors. Only the legacy-index migration and the managed
+    /// configuration check mint these; an embedder must never claim one, and
+    /// an index must never record one as its exact identity.
     pub fn for_runtime(engine: EmbeddingEngine, model_id: &str, dimension: usize) -> Self {
         Self::with_artifact_revision(
             engine,
             model_id,
             dimension,
-            format!("unresolved-runtime-v1:{}:{}", engine.as_str(), model_id),
+            format!(
+                "{UNRESOLVED_ARTIFACT_REVISION_PREFIX}v1:{}:{}",
+                engine.as_str(),
+                model_id
+            ),
         )
+    }
+
+    /// A resolved-shaped identity for tests, which have no model cache to
+    /// fingerprint. Distinct from every real artifact revision.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(engine: EmbeddingEngine, model_id: &str, dimension: usize) -> Self {
+        Self::with_artifact_revision(
+            engine,
+            model_id,
+            dimension,
+            format!("test-artifact-v1:{}:{}", engine.as_str(), model_id),
+        )
+    }
+
+    /// Whether this identity names the artifacts that produced the vectors,
+    /// rather than only the model that was requested.
+    pub fn is_resolved(&self) -> bool {
+        !self
+            .artifact_revision
+            .starts_with(UNRESOLVED_ARTIFACT_REVISION_PREFIX)
     }
 
     pub fn with_artifact_revision(
@@ -337,6 +369,31 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_fingerprinted_artifact_revision_counts_as_resolved() {
+        assert!(
+            !EmbeddingSpaceIdentity::for_runtime(EmbeddingEngine::Candle, "model", 384)
+                .is_resolved()
+        );
+        assert!(EmbeddingSpaceIdentity::with_artifact_revision(
+            EmbeddingEngine::Candle,
+            "model",
+            384,
+            "artifact-sha256:abc".to_string(),
+        )
+        .is_resolved());
+        assert!(EmbeddingSpaceIdentity::with_artifact_revision(
+            EmbeddingEngine::Candle,
+            "model",
+            384,
+            "installation-epoch:abc".to_string(),
+        )
+        .is_resolved());
+        assert!(
+            EmbeddingSpaceIdentity::for_test(EmbeddingEngine::Candle, "model", 384).is_resolved()
+        );
+    }
 
     #[test]
     fn identity_changes_with_every_coordinate_defining_display_input() {

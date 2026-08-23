@@ -309,6 +309,9 @@ pub struct FastEmbedder {
     model_id: String,
     dimension: usize,
     preferred_batch_size: Option<usize>,
+    /// Resolved from the same model cache the installer fingerprints, so an
+    /// index written in the worker carries the identity the host expects.
+    embedding_space_identity: crate::embed::EmbeddingSpaceIdentity,
 }
 
 impl FastEmbedder {
@@ -356,6 +359,10 @@ impl Embedder for FastEmbedder {
 
     fn engine(&self) -> EmbeddingEngine {
         EmbeddingEngine::Fastembed
+    }
+
+    fn embedding_space_identity(&self) -> crate::embed::EmbeddingSpaceIdentity {
+        self.embedding_space_identity.clone()
     }
 
     fn preferred_batch_size(&self) -> Option<usize> {
@@ -464,6 +471,12 @@ pub fn load_embedder(
     let dimension = info.dimension;
     let model_id = model.0.clone();
     let preferred_batch_size = get_preferred_batch_size(&model_id, &info.description);
+    let embedding_space_identity = crate::embed::EmbeddingSpaceIdentity::with_artifact_revision(
+        EmbeddingEngine::Fastembed,
+        &model_id,
+        dimension,
+        crate::embed::identity::artifact_revision_for_cache(data_dir, &info.model_code)?,
+    );
     let request = build_text_init_request(info, data_dir.to_path_buf(), device);
     tracing::info!("[fastembed] load_embedder: initializing runtime");
     let inner = RealFastembedRuntimeFactory
@@ -476,6 +489,7 @@ pub fn load_embedder(
         model_id,
         dimension,
         preferred_batch_size,
+        embedding_space_identity,
     }))
 }
 

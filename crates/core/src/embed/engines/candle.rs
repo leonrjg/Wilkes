@@ -335,6 +335,9 @@ impl CandleRuntimeFactory for RealCandleRuntimeFactory {
 pub(crate) struct CandleEmbedderBuildPlan {
     pub model_id: String,
     pub dimension: usize,
+    /// Fingerprint of the cached artifacts. The identity itself is only built
+    /// once the loaded model reports its true dimension.
+    pub artifact_revision: String,
     pub(crate) pooling: PoolingStrategy,
     pub query_prefix: String,
     pub passage_prefix: String,
@@ -353,9 +356,12 @@ pub(crate) fn build_embedder_plan(
     let prefixes = super::aux_config::load_prefixes(data_dir, model_id);
     let device_plan = select_device_plan(device);
     let dtype = select_dtype_for_plan(&device_plan);
+    let artifact_revision =
+        crate::embed::identity::artifact_revision_for_cache(data_dir, model_id)?;
     Ok(CandleEmbedderBuildPlan {
         model_id: model_id.to_string(),
         dimension,
+        artifact_revision,
         pooling,
         query_prefix: prefixes.query_prefix,
         passage_prefix: prefixes.passage_prefix,
@@ -370,6 +376,12 @@ pub(crate) fn assemble_candle_embedder(
     tokenizer: Tokenizer,
     device: Device,
 ) -> CandleEmbedder {
+    let embedding_space_identity = crate::embed::EmbeddingSpaceIdentity::with_artifact_revision(
+        EmbeddingEngine::Candle,
+        &plan.model_id,
+        plan.dimension,
+        plan.artifact_revision,
+    );
     CandleEmbedder {
         model,
         tokenizer,
@@ -380,6 +392,7 @@ pub(crate) fn assemble_candle_embedder(
         pooling: plan.pooling,
         query_prefix: plan.query_prefix,
         passage_prefix: plan.passage_prefix,
+        embedding_space_identity,
     }
 }
 
@@ -532,6 +545,9 @@ pub struct CandleEmbedder {
     pooling: PoolingStrategy,
     query_prefix: String,
     passage_prefix: String,
+    /// Resolved from the same model cache the installer fingerprints, so an
+    /// index written in the worker carries the identity the host expects.
+    embedding_space_identity: crate::embed::EmbeddingSpaceIdentity,
 }
 
 impl CandleEmbedder {
@@ -691,6 +707,10 @@ impl Embedder for CandleEmbedder {
 
     fn engine(&self) -> EmbeddingEngine {
         EmbeddingEngine::Candle
+    }
+
+    fn embedding_space_identity(&self) -> crate::embed::EmbeddingSpaceIdentity {
+        self.embedding_space_identity.clone()
     }
 
     fn preferred_batch_size(&self) -> Option<usize> {
@@ -1306,6 +1326,11 @@ mod tests {
             pooling: PoolingStrategy::Cls,
             query_prefix: "".to_string(),
             passage_prefix: "".to_string(),
+            embedding_space_identity: crate::embed::EmbeddingSpaceIdentity::for_test(
+                EmbeddingEngine::Candle,
+                "m",
+                3,
+            ),
         };
 
         let pooled = embedder.pool(&embeddings_t, &mask).unwrap();
@@ -1370,6 +1395,11 @@ mod tests {
             pooling: PoolingStrategy::Mean,
             query_prefix: "".to_string(),
             passage_prefix: "".to_string(),
+            embedding_space_identity: crate::embed::EmbeddingSpaceIdentity::for_test(
+                EmbeddingEngine::Candle,
+                "m",
+                3,
+            ),
         };
 
         let pooled = embedder.pool(&embeddings_t, &mask).unwrap();
@@ -1434,6 +1464,11 @@ mod tests {
             pooling: PoolingStrategy::Max,
             query_prefix: "".to_string(),
             passage_prefix: "".to_string(),
+            embedding_space_identity: crate::embed::EmbeddingSpaceIdentity::for_test(
+                EmbeddingEngine::Candle,
+                "m",
+                3,
+            ),
         };
 
         let pooled = embedder.pool(&embeddings_t, &mask).unwrap();
@@ -1490,6 +1525,11 @@ mod tests {
             pooling: PoolingStrategy::Mean,
             query_prefix: "q".to_string(),
             passage_prefix: "p".to_string(),
+            embedding_space_identity: crate::embed::EmbeddingSpaceIdentity::for_test(
+                EmbeddingEngine::Candle,
+                "m",
+                3,
+            ),
         };
 
         // These call embed_with_prefix
@@ -1552,6 +1592,11 @@ mod tests {
             pooling: PoolingStrategy::Mean,
             query_prefix: "".to_string(),
             passage_prefix: "".to_string(),
+            embedding_space_identity: crate::embed::EmbeddingSpaceIdentity::for_test(
+                EmbeddingEngine::Candle,
+                "m",
+                3,
+            ),
         };
 
         // embed_batch should return zeros if seq_len is 0

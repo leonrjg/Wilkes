@@ -1415,6 +1415,14 @@ mod tests {
     struct TestEmbedder;
 
     impl Embedder for TestEmbedder {
+        fn embedding_space_identity(&self) -> crate::embed::EmbeddingSpaceIdentity {
+            crate::embed::EmbeddingSpaceIdentity::for_test(
+                self.engine(),
+                self.model_id(),
+                self.dimension(),
+            )
+        }
+
         fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
             Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
         }
@@ -1435,6 +1443,14 @@ mod tests {
     struct FailingEmbedder;
 
     impl Embedder for FailingEmbedder {
+        fn embedding_space_identity(&self) -> crate::embed::EmbeddingSpaceIdentity {
+            crate::embed::EmbeddingSpaceIdentity::for_test(
+                self.engine(),
+                self.model_id(),
+                self.dimension(),
+            )
+        }
+
         fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
             anyhow::bail!("scripted embedding failure")
         }

@@ -7800,6 +7800,14 @@ mod tests {
     }
 
     impl Embedder for TopicEmbedder {
+        fn embedding_space_identity(&self) -> wilkes_core::embed::EmbeddingSpaceIdentity {
+            wilkes_core::embed::EmbeddingSpaceIdentity::for_test(
+                self.engine(),
+                self.model_id(),
+                self.dimension(),
+            )
+        }
+
         fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(texts

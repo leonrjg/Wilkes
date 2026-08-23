@@ -296,6 +296,14 @@ mod tests {
 
     struct TestEmbedder;
     impl Embedder for TestEmbedder {
+        fn embedding_space_identity(&self) -> wilkes_core::embed::EmbeddingSpaceIdentity {
+            wilkes_core::embed::EmbeddingSpaceIdentity::for_test(
+                self.engine(),
+                self.model_id(),
+                self.dimension(),
+            )
+        }
+
         fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
             Ok(vec![vec![0.0; 768]])
         }

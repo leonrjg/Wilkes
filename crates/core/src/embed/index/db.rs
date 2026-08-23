@@ -173,6 +173,14 @@ mod tests {
     }
 
     impl Embedder for CountingEmbedder {
+        fn embedding_space_identity(&self) -> crate::embed::EmbeddingSpaceIdentity {
+            crate::embed::EmbeddingSpaceIdentity::for_test(
+                self.engine(),
+                self.model_id(),
+                self.dimension(),
+            )
+        }
+
         fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
             self.calls.fetch_add(texts.len(), Ordering::Relaxed);
             Ok(vec![vec![1.0]; texts.len()])
@@ -425,6 +433,23 @@ mod tests {
     }
 
     #[test]
+    fn creating_an_index_with_an_unresolved_identity_is_refused() {
+        let dir = tempdir().unwrap();
+        let unresolved =
+            EmbeddingSpaceIdentity::for_runtime(EmbeddingEngine::Candle, "placeholder-model", 1);
+        let error = SemanticIndex::create_exact(dir.path(), &unresolved, None)
+            .err()
+            .expect("an unresolved identity must be refused");
+        assert!(
+            error.to_string().contains("UNRESOLVED_EMBEDDING_SPACE"),
+            "unexpected error: {error:#}"
+        );
+        // Refused before anything is written, so no half-built index is left
+        // for the next open to adopt.
+        assert!(!db_path(dir.path()).exists());
+    }
+
+    #[test]
     fn v9_unresolved_identity_migrates_to_legacy_metadata_and_remains_locally_usable() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -432,7 +457,15 @@ mod tests {
         fs::write(&file, "legacy body").unwrap();
         let unresolved =
             EmbeddingSpaceIdentity::for_runtime(EmbeddingEngine::Candle, "legacy-model", 1);
-        let mut index = SemanticIndex::create_exact(root, &unresolved, Some(root)).unwrap();
+        // Creating an index with an unresolved identity is refused now, so
+        // reproduce the v9 on-disk shape the way it actually arose: a valid
+        // index whose meta rows carry the placeholder a v9 runtime wrote.
+        let mut index = SemanticIndex::create_exact(
+            root,
+            &EmbeddingSpaceIdentity::for_test(EmbeddingEngine::Candle, "legacy-model", 1),
+            Some(root),
+        )
+        .unwrap();
         index
             .write_file(PreparedFile {
                 path: file.clone(),
@@ -1999,6 +2032,14 @@ mod tests {
         let registry = ExtractorRegistry::new();
         struct MockEmbedder;
         impl Embedder for MockEmbedder {
+            fn embedding_space_identity(&self) -> crate::embed::EmbeddingSpaceIdentity {
+                crate::embed::EmbeddingSpaceIdentity::for_test(
+                    self.engine(),
+                    self.model_id(),
+                    self.dimension(),
+                )
+            }
+
             fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
                 Ok(vec![vec![1.0]])
             }
@@ -2439,6 +2480,14 @@ mod tests {
         let registry = ExtractorRegistry::new();
         struct WrongDimEmbedder;
         impl Embedder for WrongDimEmbedder {
+            fn embedding_space_identity(&self) -> crate::embed::EmbeddingSpaceIdentity {
+                crate::embed::EmbeddingSpaceIdentity::for_test(
+                    self.engine(),
+                    self.model_id(),
+                    self.dimension(),
+                )
+            }
+
             fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
                 Ok(vec![vec![1.0, 2.0]])
             }
@@ -2976,6 +3025,10 @@ impl SemanticIndex {
     }
 
     /// Create a new empty index at the specified path.
+    ///
+    /// Test-only: production code creates an index from the identity of the
+    /// embedder that will fill it, never from a model name alone.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn create_at_path(
         path: &Path,
         model_id: &str,
@@ -2985,7 +3038,7 @@ impl SemanticIndex {
     ) -> anyhow::Result<Self> {
         Self::create_at_path_exact(
             path,
-            &EmbeddingSpaceIdentity::for_runtime(engine, model_id, dimension),
+            &EmbeddingSpaceIdentity::for_test(engine, model_id, dimension),
             root_path,
         )
     }
@@ -2995,6 +3048,15 @@ impl SemanticIndex {
         embedding_identity: &EmbeddingSpaceIdentity,
         root_path: Option<&Path>,
     ) -> anyhow::Result<Self> {
+        // An index records its identity as exact evidence. A placeholder
+        // revision names the model but not the artifacts, so no reader can
+        // reproduce it — refuse to write one rather than publish an index that
+        // only the process that built it can open.
+        anyhow::ensure!(
+            embedding_identity.is_resolved(),
+            "UNRESOLVED_EMBEDDING_SPACE: refusing to create an index with artifact revision '{}'",
+            embedding_identity.artifact_revision
+        );
         load_sqlite_vec();
 
         if let Some(parent) = path.parent() {
@@ -3042,6 +3104,9 @@ impl SemanticIndex {
 
     /// Create a new empty index at `data_dir` (schema only, no files indexed).
     /// Removes any existing index at that path.
+    ///
+    /// Test-only, for the same reason as [`Self::create_at_path`].
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn create(
         data_dir: &Path,
         model_id: &str,
@@ -3682,11 +3747,7 @@ impl SemanticIndex {
         let exact_identity = old_identity_json
             .map(|json| serde_json::from_str::<EmbeddingSpaceIdentity>(&json))
             .transpose()?
-            .filter(|identity| {
-                !identity
-                    .artifact_revision
-                    .starts_with("unresolved-runtime-")
-            });
+            .filter(EmbeddingSpaceIdentity::is_resolved);
         if let Some(identity) = exact_identity.as_ref() {
             anyhow::ensure!(
                 identity.engine == engine

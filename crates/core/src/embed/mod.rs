@@ -25,9 +25,11 @@ pub trait Embedder: Send + Sync {
     /// runtime. Changing an artifact, preprocessing, pooling, or normalization
     /// recipe must change this identity before an existing index can be opened
     /// or copied from.
-    fn embedding_space_identity(&self) -> EmbeddingSpaceIdentity {
-        EmbeddingSpaceIdentity::for_runtime(self.engine(), self.model_id(), self.dimension())
-    }
+    ///
+    /// Required rather than defaulted: an embedder that cannot name the
+    /// artifacts it loaded would write vectors under an identity no reader can
+    /// reproduce, so every implementation must resolve its own.
+    fn embedding_space_identity(&self) -> EmbeddingSpaceIdentity;
 
     /// Suggested batch size for this model.
     /// `None` means the entire input should be embedded as a single batch
@@ -73,6 +75,14 @@ impl Default for MockEmbedder {
 
 #[cfg(feature = "test-utils")]
 impl Embedder for MockEmbedder {
+    fn embedding_space_identity(&self) -> crate::embed::EmbeddingSpaceIdentity {
+        crate::embed::EmbeddingSpaceIdentity::for_test(
+            self.engine(),
+            self.model_id(),
+            self.dimension(),
+        )
+    }
+
     fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         Ok(vec![vec![0.0; self.dimension]; texts.len()])
     }
@@ -94,6 +104,14 @@ mod tests {
     struct TestEmbedder;
 
     impl Embedder for TestEmbedder {
+        fn embedding_space_identity(&self) -> crate::embed::EmbeddingSpaceIdentity {
+            crate::embed::EmbeddingSpaceIdentity::for_test(
+                self.engine(),
+                self.model_id(),
+                self.dimension(),
+            )
+        }
+
         fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
             Ok(vec![vec![1.0, 2.0]])
         }
