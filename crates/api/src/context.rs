@@ -623,6 +623,30 @@ pub struct ManagedChunkSimilarities {
     pub chunks: Vec<ManagedChunkNearest>,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ManagedChunkSearchHit {
+    pub chunk_ref: ChunkRef,
+    pub snapshot_id: String,
+    pub rendition_id: String,
+    pub ordinal: usize,
+    pub similarity: f32,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ManagedProbeSearch {
+    pub hits: Vec<ManagedChunkSearchHit>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ManagedChunkSearch {
+    pub embedding_space_id: String,
+    pub dimension: usize,
+    pub probes: Vec<ManagedProbeSearch>,
+}
+
+pub const MAX_MANAGED_SEARCH_PROBES: usize = 512;
+pub const MAX_MANAGED_SEARCH_TOP_K: usize = 100;
+
 /// Most groups one `chunk_centroids` request may name, and most chunk ids it
 /// may name across all of them.
 ///
@@ -2421,6 +2445,56 @@ impl AppContext {
         })
         .await
         .map_err(|error| format!("Similarity task panicked: {error}"))?
+    }
+
+    pub async fn managed_chunk_search(
+        &self,
+        probes: Vec<Vec<f32>>,
+        top_k: usize,
+        min_similarity: f32,
+    ) -> Result<ManagedChunkSearch, String> {
+        if probes.is_empty() {
+            return Err("Search request names no probes".to_string());
+        }
+        if probes.len() > MAX_MANAGED_SEARCH_PROBES || top_k == 0 || top_k > MAX_MANAGED_SEARCH_TOP_K {
+            return Err("Search request exceeds the documented request cap".to_string());
+        }
+        let index_arc = self.index.lock().clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+            let index = guard
+                .as_ref()
+                .ok_or_else(|| "Managed index unavailable".to_string())?;
+            let hits = index
+                .managed_chunk_search(&probes, top_k, min_similarity)
+                .map_err(|error| error.to_string())?;
+            Ok(ManagedChunkSearch {
+                embedding_space_id: index
+                    .embedding_space_id()
+                    .map_err(|error| error.to_string())?
+                    .0,
+                dimension: index.status().dimension,
+                probes: hits
+                    .into_iter()
+                    .map(|hits| ManagedProbeSearch {
+                        hits: hits
+                            .into_iter()
+                            .map(|hit| ManagedChunkSearchHit {
+                                chunk_ref: hit.chunk_ref,
+                                snapshot_id: hit.snapshot_id.0,
+                                rendition_id: hit.rendition_id.0,
+                                ordinal: hit.ordinal,
+                                similarity: hit.similarity,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+        })
+        .await
+        .map_err(|error| format!("Search task panicked: {error}"))?
     }
 
     /// The normalized mean of the stored vectors of named chunks, one mean per

@@ -1730,6 +1730,49 @@ mod tests {
     }
 
     #[test]
+    fn test_managed_chunk_search_covers_corpus_and_preserves_probe_scale() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut idx =
+            SemanticIndex::create(root, "m", 2, EmbeddingEngine::Candle, Some(root)).unwrap();
+        for (name, text, vector) in [
+            ("east.txt", "east", vec![4.0, 0.0]),
+            ("north.txt", "north", vec![0.0, 2.0]),
+        ] {
+            let path = root.join(name);
+            fs::write(&path, text).unwrap();
+            idx.write_file_with_recipe(
+                PreparedFile {
+                    full_text: text.to_string(),
+                    path: path.clone(),
+                    chunks: vec![(test_chunk(&path, text), vector)],
+                },
+                &ExtractionRecipe::new(100, 0),
+                Some(Path::new(name)),
+                None,
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+        }
+
+        let found = idx
+            .managed_chunk_search(&[vec![0.5, 0.0]], 8, 0.1)
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].len(), 1, "minimum similarity filters north");
+        assert_eq!(found[0][0].ordinal, 0);
+        assert!((found[0][0].similarity - 0.5).abs() < 1e-5);
+        assert!(!found[0][0].chunk_ref.as_str().is_empty());
+        assert!(!found[0][0].snapshot_id.as_str().is_empty());
+        assert!(!found[0][0].rendition_id.as_str().is_empty());
+
+        assert!(idx.managed_chunk_search(&[vec![1.0]], 8, 0.0).is_err());
+        assert!(idx.managed_chunk_search(&[vec![1.0, 0.0]], 0, 0.0).is_err());
+    }
+
+    #[test]
     fn test_chunk_centroids_refuse_ids_the_index_does_not_hold() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -6505,6 +6548,92 @@ impl SemanticIndex {
         })
     }
 
+    /// Nearest managed chunks across the entire corpus for each caller-owned
+    /// probe. Probes are dotted exactly as provided against L2-normalized
+    /// stored chunks; they are deliberately not normalized here because an
+    /// unnormalized probe is a meaningful caller choice in the managed API.
+    pub fn managed_chunk_search(
+        &self,
+        probes: &[Vec<f32>],
+        top_k: usize,
+        min_similarity: f32,
+    ) -> anyhow::Result<Vec<Vec<ManagedChunkSearchHit>>> {
+        anyhow::ensure!(!probes.is_empty(), "Search request names no probes");
+        anyhow::ensure!(top_k > 0, "Search top_k must be greater than zero");
+        anyhow::ensure!(min_similarity.is_finite(), "Search minimum similarity is not finite");
+        for (at, probe) in probes.iter().enumerate() {
+            anyhow::ensure!(
+                probe.len() == self.dimension,
+                "Probe {} has dimension {}; this index embeds at {}.",
+                at,
+                probe.len(),
+                self.dimension
+            );
+            anyhow::ensure!(
+                probe.iter().all(|value| value.is_finite()),
+                "Probe {at} contains a non-finite value"
+            );
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT c.chunk_ref, f.snapshot_id, f.rendition_id, c.chunk_idx, v.embedding
+               FROM chunks c
+               JOIN files f ON f.id = c.file_id
+               JOIN vec_chunks v ON v.rowid = c.id
+              ORDER BY f.id, c.chunk_idx, c.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })?;
+        let mut answers = vec![Vec::new(); probes.len()];
+        for row in rows {
+            let (chunk_ref, snapshot_id, rendition_id, ordinal, blob) = row?;
+            let chunk_ref = chunk_ref
+                .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: chunk ref is absent"))?;
+            let snapshot_id = snapshot_id
+                .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: snapshot id is absent"))?;
+            let rendition_id = rendition_id
+                .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: rendition id is absent"))?;
+            anyhow::ensure!(ordinal >= 0, "DOCUMENT_INDEX_INCOMPLETE: negative chunk ordinal");
+            let vector = f32_slice_from_bytes(&blob)?;
+            anyhow::ensure!(
+                vector.len() == self.dimension && vector.iter().all(|value| value.is_finite()),
+                "DOCUMENT_INDEX_INCOMPLETE: invalid stored vector"
+            );
+            let vector = normalized_vector(&vector);
+            for (probe_index, probe) in probes.iter().enumerate() {
+                let similarity = dot(probe, &vector);
+                if similarity < min_similarity {
+                    continue;
+                }
+                answers[probe_index].push(ManagedChunkSearchHit {
+                    chunk_ref: ChunkRef(chunk_ref.clone()),
+                    snapshot_id: DocumentSnapshotId(snapshot_id.clone()),
+                    rendition_id: RenditionId(rendition_id.clone()),
+                    ordinal: ordinal as usize,
+                    similarity,
+                });
+            }
+        }
+        for hits in &mut answers {
+            hits.sort_by(|left, right| {
+                right
+                    .similarity
+                    .total_cmp(&left.similarity)
+                    .then(left.rendition_id.as_str().cmp(right.rendition_id.as_str()))
+                    .then(left.ordinal.cmp(&right.ordinal))
+            });
+            hits.truncate(top_k);
+        }
+        Ok(answers)
+    }
+
     /// Find other documents in the configured library roots that contain a
     /// passage at least as similar to each topic as the topic's own members are
     /// to one another, retaining the strongest passages from every match.
@@ -7409,6 +7538,16 @@ pub struct ProbeSimilarity {
 pub struct ChunkNearest {
     pub chunk_id: i64,
     pub probe: usize,
+    pub similarity: f32,
+}
+
+/// One full-corpus vector hit addressed entirely by managed, stable ids.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ManagedChunkSearchHit {
+    pub chunk_ref: ChunkRef,
+    pub snapshot_id: DocumentSnapshotId,
+    pub rendition_id: RenditionId,
+    pub ordinal: usize,
     pub similarity: f32,
 }
 

@@ -471,6 +471,39 @@ async fn underdog_similarity_handler(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ManagedSearchProbe {
+    vector: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedSearchBody {
+    corpus_id: String,
+    expected_embedding_space_id: String,
+    probes: Vec<ManagedSearchProbe>,
+    top_k: usize,
+    min_similarity: f32,
+}
+
+async fn underdog_search_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ManagedSearchBody>,
+) -> Result<Json<wilkes_api::context::ManagedChunkSearch>, (StatusCode, Json<ErrorBody>)> {
+    let context =
+        managed_context(&state, &body.corpus_id, &body.expected_embedding_space_id).await?;
+    context
+        .managed_chunk_search(
+            body.probes.into_iter().map(|probe| probe.vector).collect(),
+            body.top_k,
+            body.min_similarity,
+        )
+        .await
+        .map(Json)
+        .map_err(managed_err)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedEmbedTextBody {
     corpus_id: String,
     expected_embedding_space_id: String,
@@ -1862,6 +1895,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/integrations/underdog/chunks/similarity",
             post(underdog_similarity_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/api/integrations/underdog/chunks/search",
+            post(underdog_search_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route(
             "/api/integrations/underdog/embed/text",
