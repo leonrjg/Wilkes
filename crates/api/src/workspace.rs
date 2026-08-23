@@ -1156,6 +1156,13 @@ mod tests {
         assert!(status.embedding_space_identity.is_none());
         assert!(!status.ready);
 
+        // The absent space is reported as an explicit null, not by dropping
+        // the key: a client reading this API can tell "no space yet" apart
+        // from a field it forgot to handle.
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(wire["embedding_space_id"], serde_json::Value::Null);
+        assert_eq!(wire["embedding_space_identity"], serde_json::Value::Null);
+
         let root = workspace_root(dir.path(), &status.corpus_id);
         let index = SemanticIndex::create(
             &root,
