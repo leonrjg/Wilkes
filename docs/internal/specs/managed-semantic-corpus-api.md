@@ -53,6 +53,15 @@ Every operation after ensure names `corpus_id` and the
 `expected_embedding_space_id` returned by ensure/status. A mismatch is a hard
 `409`, never a fallback to the active workspace.
 
+`embedding_space_id` is `null` until the corpus holds an index. A corpus has no
+coordinate system before its first vectors exist, and the id a build will
+produce cannot be derived from the configured engine, model, and dimension — so
+Wilkes reports nothing rather than an id no index will carry. Import is the only
+operation that can run in that state: it omits `expected_embedding_space_id`.
+Sending one for a corpus that has no space is a `409`, as is omitting it for a
+corpus that has one. Every other operation requires a ready corpus and therefore
+a space. Once reported, the id does not change for the life of the index.
+
 The import `source` is either an explicitly selected local path:
 
 ```json

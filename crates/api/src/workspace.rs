@@ -65,8 +65,11 @@ pub struct ManagedWorkspaceStatus {
     /// Opaque corpus token. It is implemented by a workspace id but does not
     /// grant generic workspace capabilities.
     pub corpus_id: String,
-    pub embedding_space_id: String,
-    pub embedding_space_identity: EmbeddingSpaceIdentity,
+    /// Absent until the corpus has an index. There is no embedding space
+    /// before one exists, and the id a future build will produce cannot be
+    /// known from configuration alone.
+    pub embedding_space_id: Option<String>,
+    pub embedding_space_identity: Option<EmbeddingSpaceIdentity>,
     pub extraction_recipe_id: String,
     pub ready: bool,
     pub indexed_documents: usize,
@@ -796,21 +799,29 @@ impl WorkspaceManager {
                 "MANAGED_WORKSPACE_CONFIGURATION_MISMATCH: semantic configuration is absent"
             )
         })?;
-        let configured_identity = EmbeddingSpaceIdentity::for_runtime(
-            semantic.selected.engine,
-            semantic.selected.model.model_id(),
-            semantic.selected.dimension,
-        );
         let index_root = workspace_root(&self.app_data_dir, corpus_id);
-        let opened = wilkes_core::embed::index::SemanticIndex::open_for_maintenance(&index_root)
-            .and_then(|index| {
-                Ok((
-                    index.embedding_space_identity()?,
-                    index.managed_completeness()?,
-                    index.managed_embedding_work_totals()?,
-                ))
-            })
-            .ok();
+        let opened =
+            match wilkes_core::embed::index::SemanticIndex::open_for_maintenance(&index_root)
+                .and_then(|index| {
+                    Ok((
+                        index.embedding_space_identity()?,
+                        index.managed_completeness()?,
+                        index.managed_embedding_work_totals()?,
+                    ))
+                }) {
+                Ok(opened) => Some(opened),
+                Err(error) => {
+                    // Absent before the first build, so this is not on its own an
+                    // error. Logged because the same arm covers a corrupt or
+                    // unreadable index, which the caller only sees as a corpus
+                    // that reports no embedding space.
+                    tracing::info!(
+                        "underdog_workspace_status: no readable index at {}: {error:#}",
+                        index_root.display()
+                    );
+                    None
+                }
+            };
         let stored_identity = opened.as_ref().map(|(identity, _, _)| identity.clone());
         let completeness = opened
             .as_ref()
@@ -825,7 +836,10 @@ impl WorkspaceManager {
                 && identity.model_id == semantic.selected.model.model_id()
                 && identity.dimension == semantic.selected.dimension
         }) && completeness.1 == completeness.2;
-        let identity = stored_identity.unwrap_or(configured_identity);
+        // A corpus with no index has no coordinate system yet. Reporting one
+        // derived from the manifest would advertise an id that no index will
+        // ever carry, so callers get nothing to echo back until vectors exist.
+        let identity = stored_identity;
         fn directory_bytes(path: &Path) -> u64 {
             let mut bytes = 0;
             let mut pending = vec![path.to_path_buf()];
@@ -861,7 +875,7 @@ impl WorkspaceManager {
         .sum();
         Ok(ManagedWorkspaceStatus {
             corpus_id: corpus_id.to_string(),
-            embedding_space_id: identity.id().0,
+            embedding_space_id: identity.as_ref().map(|identity| identity.id().0),
             embedding_space_identity: identity,
             extraction_recipe_id: ExtractionRecipe::new(
                 semantic.chunk_size,
@@ -967,7 +981,9 @@ impl WorkspaceManager {
                 drop(_switch_guard);
                 let status = self.underdog_workspace_status(existing_id).await?;
                 anyhow::ensure!(
-                    status.ready && status.embedding_space_id == expected_embedding_space_id,
+                    status.ready
+                        && status.embedding_space_id.as_deref()
+                            == Some(expected_embedding_space_id),
                     "existing restored corpus is not ready in the expected embedding space"
                 );
                 return Ok(status);
@@ -1118,6 +1134,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_corpus_without_an_index_reports_no_embedding_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("global-settings.json");
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings, Arc::clone(&events)).unwrap();
+        let embedding = SelectedEmbedder::default();
+        let status = manager
+            .ensure_underdog_workspace(EnsureManagedWorkspace {
+                corpus_key: "store-empty".to_string(),
+                embedding: embedding.clone(),
+                chunk_size: 600,
+                chunk_overlap: 128,
+            })
+            .await
+            .unwrap();
+        // Configured, but holding no vectors: there is no coordinate system to
+        // name yet, and the manifest cannot predict the one a build will make.
+        assert_eq!(status.embedding_space_id, None);
+        assert!(status.embedding_space_identity.is_none());
+        assert!(!status.ready);
+
+        let root = workspace_root(dir.path(), &status.corpus_id);
+        let index = SemanticIndex::create(
+            &root,
+            embedding.model.model_id(),
+            embedding.dimension,
+            embedding.engine,
+            None,
+        )
+        .unwrap();
+        let space = index.embedding_space_identity().unwrap().id().0;
+        drop(index);
+
+        // Once an index exists the corpus reports that index's own id, and
+        // keeps reporting it: the value never changes under the caller.
+        let status = manager
+            .underdog_workspace_status(&status.corpus_id)
+            .await
+            .unwrap();
+        assert_eq!(status.embedding_space_id, Some(space));
+    }
+
+    #[tokio::test]
     async fn managed_backup_restores_over_only_an_empty_same_store_corpus() {
         let source = tempfile::tempdir().unwrap();
         let source_settings = source.path().join("global-settings.json");
@@ -1209,7 +1269,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(restored.corpus_id, source_status.corpus_id);
-        assert_eq!(restored.embedding_space_id, space);
+        assert_eq!(restored.embedding_space_id, Some(space.clone()));
         assert!(restored.ready);
         assert_eq!(target_manager.state().await.unwrap().workspaces.len(), 1);
         let retried = target_manager

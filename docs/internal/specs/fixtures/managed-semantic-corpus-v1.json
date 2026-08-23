@@ -21,6 +21,11 @@
       "path": "/library/paper.pdf"
     }
   },
+  "import_request_empty_corpus": {
+    "corpus_id": "managed-corpus-018f",
+    "idempotency_key": "job-018f",
+    "source": { "kind": "path", "path": "/selected/paper.pdf" }
+  },
   "import_response": {
     "corpus_id": "managed-corpus-018f",
     "source_sha256": "source-sha256-example",

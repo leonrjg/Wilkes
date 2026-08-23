@@ -336,7 +336,11 @@ enum ManagedImportSource {
 #[serde(deny_unknown_fields)]
 struct ManagedImportBody {
     corpus_id: String,
-    expected_embedding_space_id: String,
+    /// Absent when the caller expects an empty corpus. Importing is how a
+    /// corpus gets its first vectors, so this is the one managed endpoint that
+    /// runs before an embedding space exists.
+    #[serde(default)]
+    expected_embedding_space_id: Option<String>,
     idempotency_key: String,
     source: ManagedImportSource,
 }
@@ -355,7 +359,8 @@ async fn import_underdog_document_handler(
     if status.embedding_space_id != body.expected_embedding_space_id {
         return Err(managed_err(format!(
             "EMBEDDING_SPACE_MISMATCH: corpus={}, request={}",
-            status.embedding_space_id, body.expected_embedding_space_id
+            describe_space(status.embedding_space_id.as_deref()),
+            describe_space(body.expected_embedding_space_id.as_deref())
         )));
     }
     let managed = manager
@@ -533,6 +538,13 @@ async fn underdog_embed_text_handler(
         .map_err(managed_err)
 }
 
+/// Render a corpus or request embedding space for an error message. A corpus
+/// with no index has no space, which is a distinct state from disagreeing
+/// about which space is in use.
+fn describe_space(space: Option<&str>) -> &str {
+    space.unwrap_or("none")
+}
+
 async fn managed_context(
     state: &Arc<AppState>,
     corpus_id: &str,
@@ -545,10 +557,10 @@ async fn managed_context(
         .underdog_workspace_status(corpus_id)
         .await
         .map_err(|error| managed_err(format!("{error:#}")))?;
-    if status.embedding_space_id != expected_embedding_space_id {
+    if status.embedding_space_id.as_deref() != Some(expected_embedding_space_id) {
         return Err(managed_err(format!(
             "EMBEDDING_SPACE_MISMATCH: corpus={}, request={expected_embedding_space_id}",
-            status.embedding_space_id
+            describe_space(status.embedding_space_id.as_deref())
         )));
     }
     if !status.ready {
@@ -3140,6 +3152,18 @@ mod tests {
         let import: ManagedImportBody =
             serde_json::from_value(fixture["import_request"].clone()).unwrap();
         assert_eq!(import.corpus_id, "managed-corpus-018f");
+        assert_eq!(
+            import.expected_embedding_space_id.as_deref(),
+            Some("space-example")
+        );
+
+        // Importing into a corpus that has no index yet: the caller has no
+        // space id to echo because the corpus has none, and omitting the field
+        // is how it says so. Sending one would claim a space that no index
+        // carries, which the handler refuses as a mismatch.
+        let first_import: ManagedImportBody =
+            serde_json::from_value(fixture["import_request_empty_corpus"].clone()).unwrap();
+        assert_eq!(first_import.expected_embedding_space_id, None);
         match import.source {
             ManagedImportSource::WilkesFile {
                 workspace_id,
