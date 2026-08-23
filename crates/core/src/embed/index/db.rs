@@ -1757,9 +1757,7 @@ mod tests {
             .unwrap();
         }
 
-        let found = idx
-            .managed_chunk_search(&[vec![0.5, 0.0]], 8, 0.1)
-            .unwrap();
+        let found = idx.managed_chunk_search(&[vec![0.5, 0.0]], 8, 0.1).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].len(), 1, "minimum similarity filters north");
         assert_eq!(found[0][0].ordinal, 0);
@@ -6560,7 +6558,10 @@ impl SemanticIndex {
     ) -> anyhow::Result<Vec<Vec<ManagedChunkSearchHit>>> {
         anyhow::ensure!(!probes.is_empty(), "Search request names no probes");
         anyhow::ensure!(top_k > 0, "Search top_k must be greater than zero");
-        anyhow::ensure!(min_similarity.is_finite(), "Search minimum similarity is not finite");
+        anyhow::ensure!(
+            min_similarity.is_finite(),
+            "Search minimum similarity is not finite"
+        );
         for (at, probe) in probes.iter().enumerate() {
             anyhow::ensure!(
                 probe.len() == self.dimension,
@@ -6596,11 +6597,16 @@ impl SemanticIndex {
             let (chunk_ref, snapshot_id, rendition_id, ordinal, blob) = row?;
             let chunk_ref = chunk_ref
                 .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: chunk ref is absent"))?;
-            let snapshot_id = snapshot_id
-                .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: snapshot id is absent"))?;
-            let rendition_id = rendition_id
-                .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: rendition id is absent"))?;
-            anyhow::ensure!(ordinal >= 0, "DOCUMENT_INDEX_INCOMPLETE: negative chunk ordinal");
+            let snapshot_id = snapshot_id.ok_or_else(|| {
+                anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: snapshot id is absent")
+            })?;
+            let rendition_id = rendition_id.ok_or_else(|| {
+                anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: rendition id is absent")
+            })?;
+            anyhow::ensure!(
+                ordinal >= 0,
+                "DOCUMENT_INDEX_INCOMPLETE: negative chunk ordinal"
+            );
             let vector = f32_slice_from_bytes(&blob)?;
             anyhow::ensure!(
                 vector.len() == self.dimension && vector.iter().all(|value| value.is_finite()),

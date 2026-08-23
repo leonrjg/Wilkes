@@ -2456,7 +2456,10 @@ impl AppContext {
         if probes.is_empty() {
             return Err("Search request names no probes".to_string());
         }
-        if probes.len() > MAX_MANAGED_SEARCH_PROBES || top_k == 0 || top_k > MAX_MANAGED_SEARCH_TOP_K {
+        if probes.len() > MAX_MANAGED_SEARCH_PROBES
+            || top_k == 0
+            || top_k > MAX_MANAGED_SEARCH_TOP_K
+        {
             return Err("Search request exceeds the documented request cap".to_string());
         }
         let index_arc = self.index.lock().clone();
