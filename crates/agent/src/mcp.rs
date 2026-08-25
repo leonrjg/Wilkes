@@ -17,9 +17,9 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ServerHandler,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+use wilkes_core::acquire::download_to_root;
 use wilkes_core::extract::{pdf::PdfExtractor, ExtractorRegistry};
 use wilkes_core::integrations::{
     openalex::OpenAlexClient, semantic_scholar::SemanticScholarClient,
@@ -43,7 +43,6 @@ const DEFAULT_RELATED_DOCUMENTS_LIMIT: usize = 8;
 const MAX_RELATED_DOCUMENTS_LIMIT: usize = 25;
 const DEFAULT_LIST_DOCUMENTS_LIMIT: usize = 50;
 const MAX_LIST_DOCUMENTS_LIMIT: usize = 500;
-const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 const SEMANTIC_INDEX_GUIDANCE: &str = "The user can enable the semantic index in Wilkes Settings. Use exact search with mode='exact' instead in the meantime.";
 const EXTERNAL_DOCUMENT_PATH_REQUIRED: &str =
     "External Wilkes MCP does not default document tools to the active document; pass path explicitly after reading list_context.";
@@ -845,13 +844,6 @@ struct LiteratureSearchResponse<T> {
     results: Vec<T>,
 }
 
-#[derive(Debug, Serialize)]
-struct DownloadResponse {
-    path: String,
-    bytes: usize,
-    already_present: bool,
-}
-
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum SearchModeParam {
@@ -1240,7 +1232,15 @@ impl WilkesMcp {
                 return CallToolResult::error(vec![ContentBlock::text(message)]);
             }
         };
-        match download_to_root(&root, params).await {
+        match download_to_root(
+            &root,
+            wilkes_core::acquire::DownloadParams {
+                url: params.url,
+                filename: params.filename,
+            },
+        )
+        .await
+        {
             Ok(response) => structured(response),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
@@ -1258,136 +1258,6 @@ impl ServerHandler for WilkesMcp {
             )
             .with_instructions("Wilkes document context and literature tools. Context and search tools are read-only. The download tool writes a file into the current root and must only be used when the user asks to import or download it.")
     }
-}
-
-async fn download_to_root(root: &Path, params: DownloadParams) -> Result<DownloadResponse, String> {
-    if !root.is_dir() {
-        return Err(format!(
-            "Current Wilkes root does not exist: {}",
-            root.display()
-        ));
-    }
-    let url = reqwest::Url::parse(params.url.trim())
-        .map_err(|error| format!("Invalid download URL: {error}"))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err("Download URL must use HTTP or HTTPS.".to_string());
-    }
-    let filename = params
-        .filename
-        .or_else(|| {
-            url.path_segments()
-                .and_then(|mut segments| segments.next_back())
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "download.pdf".to_string());
-    let filename_path = Path::new(&filename);
-    if filename_path.components().count() != 1
-        || !matches!(
-            filename_path.components().next(),
-            Some(std::path::Component::Normal(_))
-        )
-    {
-        return Err("filename must be a single file name without directories.".to_string());
-    }
-    let target = root.join(filename_path);
-    if target.exists() {
-        return Err(format!(
-            "Refusing to overwrite existing file: {}",
-            target.display()
-        ));
-    }
-
-    let response = reqwest::Client::new()
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| format!("Download failed: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("Download failed: {error}"))?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_DOWNLOAD_BYTES as u64)
-    {
-        return Err(format!(
-            "Download exceeds the {} MiB limit.",
-            MAX_DOWNLOAD_BYTES / 1024 / 1024
-        ));
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("Failed to read download: {error}"))?;
-    if bytes.len() > MAX_DOWNLOAD_BYTES {
-        return Err(format!(
-            "Download exceeds the {} MiB limit.",
-            MAX_DOWNLOAD_BYTES / 1024 / 1024
-        ));
-    }
-    if let Some(existing) = find_file_with_content(root, &target, &bytes)? {
-        return Ok(DownloadResponse {
-            path: display_path(&existing),
-            bytes: bytes.len(),
-            already_present: true,
-        });
-    }
-    std::fs::write(&target, &bytes)
-        .map_err(|error| format!("Failed to save {}: {error}", target.display()))?;
-    Ok(DownloadResponse {
-        path: display_path(&target),
-        bytes: bytes.len(),
-        already_present: false,
-    })
-}
-
-/// Find an existing regular file with exactly the downloaded content. Size is
-/// the cheap prefilter; SHA-256 is only computed for equal-size candidates.
-/// Symlinked directories are not followed, keeping the search inside `root`.
-fn find_file_with_content(
-    root: &Path,
-    target: &Path,
-    downloaded: &[u8],
-) -> Result<Option<PathBuf>, String> {
-    let expected_len = u64::try_from(downloaded.len()).unwrap_or(u64::MAX);
-    let expected_digest = Sha256::digest(downloaded);
-    let mut directories = vec![root.to_path_buf()];
-
-    while let Some(directory) = directories.pop() {
-        let entries = std::fs::read_dir(&directory)
-            .map_err(|error| format!("Failed to inspect {}: {error}", directory.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                format!(
-                    "Failed to inspect an entry in {}: {error}",
-                    directory.display()
-                )
-            })?;
-            let file_type = entry.file_type().map_err(|error| {
-                format!("Failed to inspect {}: {error}", entry.path().display())
-            })?;
-            if file_type.is_dir() {
-                directories.push(entry.path());
-                continue;
-            }
-            if !file_type.is_file() || entry.path() == target {
-                continue;
-            }
-            let path = entry.path();
-            let metadata = entry
-                .metadata()
-                .map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?;
-            if metadata.len() != expected_len {
-                continue;
-            }
-            let candidate = std::fs::read(&path)
-                .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-            if Sha256::digest(&candidate) == expected_digest {
-                return Ok(Some(path));
-            }
-        }
-    }
-
-    Ok(None)
 }
 
 impl ListContextResponse {
@@ -3776,65 +3646,6 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("not available"));
-    }
-
-    #[tokio::test]
-    async fn download_rejects_path_traversal_and_existing_files() {
-        let dir = tempdir().unwrap();
-        let traversal = download_to_root(
-            dir.path(),
-            DownloadParams {
-                url: "https://example.test/paper.pdf".to_string(),
-                filename: Some("../paper.pdf".to_string()),
-                workspace: None,
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(traversal.contains("single file name"));
-
-        let existing = dir.path().join("paper.pdf");
-        std::fs::write(&existing, b"existing").unwrap();
-        let overwrite = download_to_root(
-            dir.path(),
-            DownloadParams {
-                url: "https://example.test/paper.pdf".to_string(),
-                filename: Some("paper.pdf".to_string()),
-                workspace: None,
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(overwrite.contains("Refusing to overwrite"));
-        assert_eq!(std::fs::read(existing).unwrap(), b"existing");
-    }
-
-    #[test]
-    fn download_content_check_finds_equal_file_under_a_different_name() {
-        let dir = tempdir().unwrap();
-        let nested = dir.path().join("papers");
-        std::fs::create_dir(&nested).unwrap();
-        let existing = nested.join("original.pdf");
-        std::fs::write(&existing, b"same paper").unwrap();
-        std::fs::write(dir.path().join("same-size.pdf"), b"other text").unwrap();
-
-        let found =
-            find_file_with_content(dir.path(), &dir.path().join("new-name.pdf"), b"same paper")
-                .unwrap();
-
-        assert_eq!(found, Some(existing));
-    }
-
-    #[test]
-    fn download_content_check_ignores_target_and_different_content() {
-        let dir = tempdir().unwrap();
-        let target = dir.path().join("new-name.pdf");
-        std::fs::write(&target, b"same paper").unwrap();
-        std::fs::write(dir.path().join("other.pdf"), b"other text").unwrap();
-
-        let found = find_file_with_content(dir.path(), &target, b"same paper").unwrap();
-
-        assert_eq!(found, None);
     }
 
     fn doc_entry(path: PathBuf, title: &str, doi: Option<&str>) -> FileEntry {

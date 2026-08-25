@@ -696,6 +696,45 @@ async fn underdog_catalogue_sync_handler(
     }))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogueAcquireBody {
+    url: String,
+    #[serde(default)]
+    filename: Option<String>,
+}
+
+/// Fetches a candidate's bytes into this workspace's uploads directory.
+///
+/// Uploads rather than a library root because this is Wilkes writing into its
+/// own area: a library root is a place the user put their files, and a route
+/// that drops fetched bytes there would be writing to a directory whose
+/// contents the user believes they control. The import route reads from an
+/// absolute path, so nothing is lost by landing here first.
+///
+/// The download itself — URL scheme check, traversal guard, size cap and
+/// content dedup — is [`wilkes_core::acquire::download_to_root`], the same
+/// function behind the `download` MCP tool. There is one downloader.
+async fn underdog_catalogue_acquire_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CatalogueAcquireBody>,
+) -> Result<Json<wilkes_core::acquire::DownloadResponse>, (StatusCode, Json<ErrorBody>)> {
+    let (_ctx, uploads_dir) = state.workspace_snapshot();
+    tokio::fs::create_dir_all(&uploads_dir)
+        .await
+        .map_err(|error| server_err(format!("Cannot prepare uploads directory: {error}")))?;
+    wilkes_core::acquire::download_to_root(
+        &uploads_dir,
+        wilkes_core::acquire::DownloadParams {
+            url: body.url,
+            filename: body.filename,
+        },
+    )
+    .await
+    .map(Json)
+    .map_err(err)
+}
+
 #[derive(Serialize)]
 struct CatalogueStatusResponse {
     providers: Vec<wilkes_core::types::CatalogueProviderStatus>,
@@ -2144,6 +2183,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/integrations/underdog/catalogue/status",
             get(underdog_catalogue_status_handler),
+        )
+        .route(
+            "/api/integrations/underdog/catalogue/acquire",
+            post(underdog_catalogue_acquire_handler),
         )
         .route(
             "/api/integrations/underdog/embed/text",

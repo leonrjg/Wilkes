@@ -166,8 +166,10 @@ impl CatalogueStore {
             "DELETE FROM catalogue_records WHERE provider = ?1",
             [provider],
         )?;
-        let mut outcome = SyncOutcome::default();
-        outcome.offered = records.len();
+        let mut outcome = SyncOutcome {
+            offered: records.len(),
+            ..SyncOutcome::default()
+        };
         // Providers repeat themselves: LibreTexts and MIT OpenCourseWare both
         // return the same external id more than once across a paged fetch.
         // `INSERT OR REPLACE` would absorb that silently and leave the caller
@@ -296,7 +298,9 @@ impl CatalogueStore {
     pub fn total_records(&self) -> anyhow::Result<i64> {
         Ok(self
             .conn
-            .query_row("SELECT COUNT(*) FROM catalogue_records", [], |row| row.get(0))?)
+            .query_row("SELECT COUNT(*) FROM catalogue_records", [], |row| {
+                row.get(0)
+            })?)
     }
 }
 
@@ -398,14 +402,23 @@ mod tests {
             )
             .expect("search");
 
-        assert_eq!(hits.first().map(|h| h.record.title.as_str()), Some("Combinatorial Optimization"));
+        assert_eq!(
+            hits.first().map(|h| h.record.title.as_str()),
+            Some("Combinatorial Optimization")
+        );
     }
 
     #[test]
     fn punctuation_that_is_fts_syntax_does_not_blow_up_the_query() {
         let store = CatalogueStore::in_memory().expect("store");
         // Each of these is a syntax error if handed to FTS5 verbatim.
-        for probe in ["NP-complete", "\"unterminated", "a OR b AND (c", "C++ / C#", "*"] {
+        for probe in [
+            "NP-complete",
+            "\"unterminated",
+            "a OR b AND (c",
+            "C++ / C#",
+            "*",
+        ] {
             store.search(probe, None, 5).expect("must not error");
         }
     }
@@ -414,9 +427,15 @@ mod tests {
     fn a_probe_of_only_stopwords_returns_nothing_rather_than_everything() {
         let mut store = CatalogueStore::in_memory().expect("store");
         store
-            .replace_provider("test", &[record("1", "Anything", "At all", CatalogueGrain::Textbook)])
+            .replace_provider(
+                "test",
+                &[record("1", "Anything", "At all", CatalogueGrain::Textbook)],
+            )
             .expect("replace");
-        assert!(store.search("the and of it is", None, 5).expect("search").is_empty());
+        assert!(store
+            .search("the and of it is", None, 5)
+            .expect("search")
+            .is_empty());
     }
 
     #[test]
@@ -426,13 +445,27 @@ mod tests {
             .replace_provider(
                 "test",
                 &[
-                    record("1", "Python Language Reference", "Built-in sequence types and lists.", CatalogueGrain::Reference),
-                    record("2", "Python for Beginners", "Built-in sequence types and lists.", CatalogueGrain::Textbook),
+                    record(
+                        "1",
+                        "Python Language Reference",
+                        "Built-in sequence types and lists.",
+                        CatalogueGrain::Reference,
+                    ),
+                    record(
+                        "2",
+                        "Python for Beginners",
+                        "Built-in sequence types and lists.",
+                        CatalogueGrain::Textbook,
+                    ),
                 ],
             )
             .expect("replace");
         let hits = store
-            .search("built-in sequence types and lists", Some(CatalogueGrain::Reference), 5)
+            .search(
+                "built-in sequence types and lists",
+                Some(CatalogueGrain::Reference),
+                5,
+            )
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record.external_id, "1");
@@ -445,13 +478,31 @@ mod tests {
             .replace_provider(
                 "test",
                 &[
-                    record("1", "Kept Book", "Graph algorithms.", CatalogueGrain::Textbook),
-                    record("2", "Withdrawn Book", "Graph algorithms.", CatalogueGrain::Textbook),
+                    record(
+                        "1",
+                        "Kept Book",
+                        "Graph algorithms.",
+                        CatalogueGrain::Textbook,
+                    ),
+                    record(
+                        "2",
+                        "Withdrawn Book",
+                        "Graph algorithms.",
+                        CatalogueGrain::Textbook,
+                    ),
                 ],
             )
             .expect("first");
         store
-            .replace_provider("test", &[record("1", "Kept Book", "Graph algorithms.", CatalogueGrain::Textbook)])
+            .replace_provider(
+                "test",
+                &[record(
+                    "1",
+                    "Kept Book",
+                    "Graph algorithms.",
+                    CatalogueGrain::Textbook,
+                )],
+            )
             .expect("second");
 
         assert_eq!(store.total_records().expect("count"), 1);

@@ -167,7 +167,10 @@ impl CatalogueSource for LibreTexts {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut dry = 0usize;
         for page in 1..=MAX_PAGES {
-            let url = format!("{}/api/v1/commons/catalog?limit=100&page={page}", self.base_url);
+            let url = format!(
+                "{}/api/v1/commons/catalog?limit=100&page={page}",
+                self.base_url
+            );
             let body: LibreTextsPage = self.http.get_json(url, &[]).await?;
             if body.books.is_empty() {
                 break;
@@ -391,7 +394,10 @@ impl CatalogueSource for MitOpenCourseWare {
         let mut dry = 0usize;
         for page in 0..MAX_PAGES {
             let offset = page * 100;
-            let url = format!("{}/api/v1/courses/?limit=100&offset={offset}", self.base_url);
+            let url = format!(
+                "{}/api/v1/courses/?limit=100&offset={offset}",
+                self.base_url
+            );
             let body: MitPage = self.http.get_json(url, &[]).await?;
             if body.results.is_empty() {
                 break;
@@ -585,9 +591,24 @@ mod tests {
             )
             .create_async()
             .await;
+        // The walk stops on consecutive empty pages, so the pages after the
+        // first must answer too — a provider that simply runs out is the
+        // ordinary case and the test has to represent it.
+        let empty = server
+            .mock("GET", "/api/v1/commons/catalog")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"err":false,"numTotal":1,"books":[]}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
 
-        let records = LibreTexts::new(&server.url()).fetch_all().await.expect("fetch");
+        let records = LibreTexts::new(&server.url())
+            .fetch_all()
+            .await
+            .expect("fetch");
         mock.assert_async().await;
+        empty.assert_async().await;
 
         assert_eq!(records.len(), 1);
         let book = &records[0];
@@ -613,7 +634,10 @@ mod tests {
             .create_async()
             .await;
 
-        let records = DevDocs::new(&server.url()).fetch_all().await.expect("fetch");
+        let records = DevDocs::new(&server.url())
+            .fetch_all()
+            .await
+            .expect("fetch");
         mock.assert_async().await;
 
         assert_eq!(records.len(), 1);
