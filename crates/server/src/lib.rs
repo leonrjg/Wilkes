@@ -3718,6 +3718,33 @@ mod tests {
             ManagedImportSource::Path { .. } => panic!("expected wilkes_file fixture"),
         }
 
+        // The embedder manifest: the shape a consumer reads *before* it has a
+        // corpus, and the one that decides what a corpus gets built of. Both
+        // sides carry this fixture, and its two nulls are load-bearing — a
+        // dimension nobody has loaded, and a recipe nothing has read.
+        let manifest: wilkes_core::types::EmbedderCapabilityManifest =
+            serde_json::from_value(fixture["embedder_manifest_response"].clone()).unwrap();
+        let mini = manifest
+            .models
+            .iter()
+            .find(|model| model.model_id == "AllMiniLML6V2")
+            .expect("the pinned model");
+        assert_eq!(mini.dimension, Some(384));
+        assert_eq!(
+            mini.prefix_source,
+            wilkes_core::types::PrefixSource::NotDocumented
+        );
+        let added = manifest
+            .models
+            .iter()
+            .find(|model| !model.catalogued)
+            .expect("a hand-added model");
+        assert_eq!(added.dimension, None);
+        assert_eq!(
+            added.prefix_source,
+            wilkes_core::types::PrefixSource::Undetermined
+        );
+
         let response = &fixture["import_response"];
         for required in [
             "corpus_id",

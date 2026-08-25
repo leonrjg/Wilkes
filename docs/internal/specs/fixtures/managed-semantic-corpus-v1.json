@@ -10,6 +10,54 @@
     "chunk_size": 1000,
     "chunk_overlap": 100
   },
+  "embedder_manifest_response": {
+    "engines": [
+      "Fastembed",
+      "SBERT"
+    ],
+    "roles": [
+      "query",
+      "passage"
+    ],
+    "models": [
+      {
+        "engine": "Fastembed",
+        "model_id": "AllMiniLML6V2",
+        "display_name": "all-MiniLM-L6-v2",
+        "description": "Speed: high, accuracy: medium (English only)",
+        "repository_id": "Qdrant/all-MiniLM-L6-v2-onnx",
+        "dimension": 384,
+        "supported_dimensions": [
+          384
+        ],
+        "query_prefix": null,
+        "passage_prefix": null,
+        "prefix_source": "not_documented",
+        "max_input_tokens": 256,
+        "locally_available": true,
+        "size_bytes": 90000000,
+        "preferred_batch_size": 32,
+        "catalogued": true
+      },
+      {
+        "engine": "SBERT",
+        "model_id": "google/embeddinggemma-300m",
+        "display_name": "google/embeddinggemma-300m",
+        "description": "Added by hand; not in this engine's catalogue",
+        "repository_id": "google/embeddinggemma-300m",
+        "dimension": null,
+        "supported_dimensions": [],
+        "query_prefix": null,
+        "passage_prefix": null,
+        "prefix_source": "undetermined",
+        "max_input_tokens": null,
+        "locally_available": false,
+        "size_bytes": null,
+        "preferred_batch_size": null,
+        "catalogued": false
+      }
+    ]
+  },
   "import_request": {
     "corpus_id": "managed-corpus-018f",
     "expected_embedding_space_id": "space-example",
@@ -24,7 +72,10 @@
   "import_request_empty_corpus": {
     "corpus_id": "managed-corpus-018f",
     "idempotency_key": "job-018f",
-    "source": { "kind": "path", "path": "/selected/paper.pdf" }
+    "source": {
+      "kind": "path",
+      "path": "/selected/paper.pdf"
+    }
   },
   "import_response": {
     "corpus_id": "managed-corpus-018f",
@@ -67,7 +118,10 @@
         "ordinal": 0,
         "text": "Example passage.",
         "text_sha256": "text-sha256-example",
-        "byte_range": { "start": 0, "end": 16 },
+        "byte_range": {
+          "start": 0,
+          "end": 16
+        },
         "origin": {
           "PdfPage": {
             "page": 1,
@@ -85,14 +139,21 @@
   "accumulate_request": {
     "corpus_id": "managed-corpus-018f",
     "expected_embedding_space_id": "space-example",
-    "groups": [["chunk-example"]]
+    "groups": [
+      [
+        "chunk-example"
+      ]
+    ]
   },
   "accumulate_response": {
     "embedding_space_id": "space-example",
     "dimension": 384,
     "groups": [
       {
-        "sum": [0.25, -0.5],
+        "sum": [
+          0.25,
+          -0.5
+        ],
         "member_count": 1
       }
     ]
