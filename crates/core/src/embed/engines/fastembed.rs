@@ -130,7 +130,10 @@ pub fn install_local(data_dir: &Path, model: &EmbedderModel, device: &str) -> an
         .map_err(|e| anyhow::anyhow!("fastembed install: {e}"))?;
     tracing::info!("[fastembed] install_local: runtime initialized");
 
-    super::aux_config::fetch_aux_configs(data_dir, &model.0);
+    // The repository id, not the catalogue's enum name: `hf_hub` keys the
+    // cache by repo, so fetching under "AllMiniLML6V2" wrote the config into a
+    // directory `load_prefixes` and the artifact fingerprint both look past.
+    super::aux_config::fetch_aux_configs(data_dir, &info.model_code);
     tracing::info!("[fastembed] install_local: aux configs fetched");
     Ok(())
 }
@@ -429,7 +432,7 @@ impl EmbedderInstaller for FastembedInstaller {
 
     fn build(&self, data_dir: &Path) -> anyhow::Result<Arc<dyn Embedder>> {
         let info = find_model_info(&self.model.0)?;
-        let prefixes = super::aux_config::load_prefixes(data_dir, &self.model.0);
+        let prefixes = super::aux_config::load_prefixes(data_dir, &info.model_code);
         let artifact_revision =
             crate::embed::identity::artifact_revision_for_cache(data_dir, &info.model_code)?;
         let embedding_space_identity = crate::embed::EmbeddingSpaceIdentity::with_artifact_revision(

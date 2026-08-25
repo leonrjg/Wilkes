@@ -1730,7 +1730,16 @@ mod tests {
     }
 
     #[test]
-    fn test_managed_chunk_search_covers_corpus_and_preserves_probe_scale() {
+    /// Renamed from `…_preserves_probe_scale`, which pinned the opposite rule:
+    /// a probe of magnitude 0.5 scored 0.5 against a chunk pointing the same
+    /// way, so the field called `similarity` was cosine × ‖probe‖ and the
+    /// shared `min_similarity` floor filtered a short probe harder than a long
+    /// one. No caller wants that quantity — Underdog reads the value as a
+    /// cosine and two of its thresholds are calibrated as cosines — and every
+    /// live probe is engine-normalized, so the rule was invisible rather than
+    /// load-bearing.
+    #[test]
+    fn test_managed_chunk_search_covers_corpus_and_scores_cosine() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let mut idx =
@@ -1761,7 +1770,17 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].len(), 1, "minimum similarity filters north");
         assert_eq!(found[0][0].ordinal, 0);
-        assert!((found[0][0].similarity - 0.5).abs() < 1e-5);
+        assert!(
+            (found[0][0].similarity - 1.0).abs() < 1e-5,
+            "a probe pointing the same way as the chunk scores 1, whatever its magnitude"
+        );
+        let unit = idx.managed_chunk_search(&[vec![1.0, 0.0]], 8, 0.1).unwrap();
+        assert!(
+            (unit[0][0].similarity - found[0][0].similarity).abs() < 1e-6,
+            "probe magnitude does not move the score"
+        );
+        idx.managed_chunk_search(&[vec![0.0, 0.0]], 8, 0.0)
+            .expect_err("a probe with no direction is not a query");
         assert!(!found[0][0].chunk_ref.as_str().is_empty());
         assert!(!found[0][0].snapshot_id.as_str().is_empty());
         assert!(!found[0][0].rendition_id.as_str().is_empty());
@@ -6574,7 +6593,22 @@ impl SemanticIndex {
                 probe.iter().all(|value| value.is_finite()),
                 "Probe {at} contains a non-finite value"
             );
+            anyhow::ensure!(
+                probe.iter().any(|value| *value != 0.0),
+                "Probe {at} has zero magnitude and names no direction"
+            );
         }
+
+        // The stored side is normalized below, so the dot product is a cosine
+        // only if the probe is a unit vector too. Both engines normalize on
+        // output, which made that an invariant nobody stated and nothing
+        // enforced — while `min_similarity` reads as a cosine floor and two of
+        // Underdog's thresholds ride on it. Normalizing here costs one pass
+        // over a handful of probes and makes the name true by construction.
+        let probes: Vec<Vec<f32>> = probes
+            .iter()
+            .map(|probe| normalized_vector(probe))
+            .collect();
 
         let mut stmt = self.conn.prepare(
             "SELECT c.chunk_ref, f.snapshot_id, f.rendition_id, c.chunk_idx, v.embedding
