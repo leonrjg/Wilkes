@@ -1747,6 +1747,91 @@ pub struct LiteratureSearchResult {
     pub license: Option<String>,
 }
 
+/// What kind of source a catalogue record is, which decides what it can
+/// answer. A gap in an API's behaviour is answered by `Reference` and never
+/// well by `Textbook`; a subject with no ordering yet is answered by `Course`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogueGrain {
+    /// A concept built up from its prerequisites: an open textbook.
+    Textbook,
+    /// A subject with a sequence — a syllabus, lecture notes, a course.
+    Course,
+    /// An API, a language construct, a standard. Authoritative documentation,
+    /// where no textbook chapter is the right answer.
+    Reference,
+}
+
+impl CatalogueGrain {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CatalogueGrain::Textbook => "textbook",
+            CatalogueGrain::Course => "course",
+            CatalogueGrain::Reference => "reference",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "textbook" => Some(CatalogueGrain::Textbook),
+            "course" => Some(CatalogueGrain::Course),
+            "reference" => Some(CatalogueGrain::Reference),
+            _ => None,
+        }
+    }
+}
+
+/// Provider-neutral record for one acquirable teaching resource.
+///
+/// Deliberately not [`LiteratureSearchResult`]: that type is shaped by what a
+/// bibliographic index knows about a *paper* — DOI, venue, citation count —
+/// and a textbook has none of those while having a description, a subject and
+/// a licence that decide whether it may be kept. Neither substitutes for the
+/// other, so they do not share a struct.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CatalogueRecord {
+    pub provider: String,
+    pub external_id: String,
+    pub title: String,
+    /// The blurb. This is what a caller's probe is matched against, so a
+    /// record without one is close to unfindable.
+    pub summary: String,
+    pub subject: String,
+    pub authors: String,
+    pub license: String,
+    pub landing_url: Option<String>,
+    /// Present only where the provider serves the whole work at a stable URL.
+    /// Its absence is why admission stays a separate decision from discovery.
+    pub pdf_url: Option<String>,
+    pub outline_url: Option<String>,
+    pub grain: CatalogueGrain,
+    pub pages: Option<i64>,
+}
+
+/// One catalogue record matched against a text query, with the *recall* score
+/// that surfaced it.
+///
+/// The score is BM25 over title, subject and summary, and is explicitly not a
+/// ranking a caller should consume. It exists to cut thousands of records down
+/// to a few dozen that the caller can then rank properly against something
+/// Wilkes does not know about — which learner is asking, and what they already
+/// know. Wilkes cannot answer that and does not pretend to.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CatalogueHit {
+    #[serde(flatten)]
+    pub record: CatalogueRecord,
+    pub recall_score: f64,
+}
+
+/// Per-provider state of the local catalogue mirror.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CatalogueProviderStatus {
+    pub provider: String,
+    pub grain: CatalogueGrain,
+    pub records: i64,
+    pub synced_at_ms: Option<i64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub enum Theme {
     #[default]

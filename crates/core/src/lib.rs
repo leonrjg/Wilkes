@@ -1,3 +1,4 @@
+pub mod catalogue;
 pub mod completion;
 pub mod directory_watcher;
 pub mod embed;
