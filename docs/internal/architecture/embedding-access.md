@@ -105,6 +105,17 @@ It costs nothing today: the pinned model has no prompts, so `embed_passages`
 and `embed_query` are the same function. It is the reason a prefix model would
 deliver a fraction of its value if pinned tomorrow.
 
+**The consumer found this first.** Underdog's `docs/EMBEDDING_LEVERAGE.md` §13
+(2026-08-19) records the same hard-coding, the same "inert until a prefix model"
+caveat, and proposes an optional role field on the endpoint. What this
+assessment adds is that most prefix-trained models do not ship their prefixes
+in the file `aux_config` reads (§2), that the fastembed engine could not load
+them anyway (§6.1), and that the role belongs on the search endpoint rather than
+the embed one (§7). §13b there raises the half that lives on the consumer's
+side and cannot be fixed here: a stored knowledge-point vector is read back both
+as a passage and as a query probe, and one vector cannot be both under an
+asymmetric model.
+
 ---
 
 ## 4. The managed/plain split is a trust boundary, not a copy
