@@ -4,6 +4,18 @@
 
 ### Added
 
+- A local mirror of the open teaching catalogues — LibreTexts, OpenStax, MIT
+  OpenCourseWare and DevDocs — with BM25 search over it, at
+  `POST /api/integrations/underdog/catalogue/{search,sync}` and
+  `GET .../catalogue/status`. These catalogues are small enough to hold whole,
+  which is what makes searching them locally possible; papers are not, and
+  literature search is unchanged. Search returns *recall*, not a ranking:
+  deciding which of these teaches a particular reader best needs to know what
+  that reader already knows, which is not a fact about documents. Sync reports
+  what each provider offered against what was stored, because both LibreTexts
+  and MIT OpenCourseWare repeat ids across a paged fetch, and LibreTexts keeps
+  yielding new records well past the `numTotal` it reports.
+
 - MCP tools accept a `workspace` id and read that workspace's library — its
   roots, access boundary and index — without switching the app to it.
   `list_context` reports every workspace and marks the active one; omitting

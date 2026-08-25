@@ -92,7 +92,11 @@ struct LibreTextsPage {
     #[serde(default)]
     #[allow(dead_code)]
     err: bool,
+    /// Reported by the provider and deliberately not used for termination:
+    /// it undercounts what the pages actually contain. Kept because a future
+    /// divergence between it and the walked count is worth being able to see.
     #[serde(rename = "numTotal", default)]
+    #[allow(dead_code)]
     num_total: i64,
     #[serde(default)]
     books: Vec<LibreTextsBook>,
@@ -139,6 +143,15 @@ struct LibreTextsExportInfo {
 /// forever still terminates.
 const MAX_PAGES: usize = 200;
 
+/// How many consecutive pages may contribute nothing new before the walk stops.
+///
+/// One is not enough. LibreTexts interleaves repeats — a single page deep in
+/// the walk can be entirely ids already seen while the next page carries three
+/// hundred new ones — so stopping at the first dry page ended the walk at 1,452
+/// books out of a catalogue that keeps yielding past page 150. Three
+/// consecutive dry pages has not been observed mid-catalogue.
+const DRY_PAGES_BEFORE_STOP: usize = 3;
+
 #[async_trait]
 impl CatalogueSource for LibreTexts {
     fn id(&self) -> &'static str {
@@ -151,14 +164,19 @@ impl CatalogueSource for LibreTexts {
 
     async fn fetch_all(&self) -> anyhow::Result<Vec<CatalogueRecord>> {
         let mut out: Vec<CatalogueRecord> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut dry = 0usize;
         for page in 1..=MAX_PAGES {
             let url = format!("{}/api/v1/commons/catalog?limit=100&page={page}", self.base_url);
             let body: LibreTextsPage = self.http.get_json(url, &[]).await?;
             if body.books.is_empty() {
                 break;
             }
-            let total = body.num_total;
+            let before = seen.len();
             for book in body.books {
+                if !seen.insert(book.book_id.clone()) {
+                    continue;
+                }
                 out.push(CatalogueRecord {
                     provider: "libretexts".into(),
                     external_id: book.book_id,
@@ -178,8 +196,17 @@ impl CatalogueSource for LibreTexts {
                     pages: book.export_info.and_then(|e| e.content_page_count),
                 });
             }
-            if total > 0 && out.len() as i64 >= total {
-                break;
+            // Termination is by exhaustion, not by the provider's own count.
+            // `numTotal` (4,095) is reached by the *offered* count at page 41
+            // while new ids are still arriving at page 150, so trusting it lost
+            // roughly 1,700 books.
+            if seen.len() == before {
+                dry += 1;
+                if dry >= DRY_PAGES_BEFORE_STOP {
+                    break;
+                }
+            } else {
+                dry = 0;
             }
         }
         Ok(out)
@@ -322,6 +349,7 @@ impl MitOpenCourseWare {
 #[derive(Deserialize)]
 struct MitPage {
     #[serde(default)]
+    #[allow(dead_code)]
     count: i64,
     #[serde(default)]
     results: Vec<MitCourse>,
@@ -359,6 +387,8 @@ impl CatalogueSource for MitOpenCourseWare {
 
     async fn fetch_all(&self) -> anyhow::Result<Vec<CatalogueRecord>> {
         let mut out: Vec<CatalogueRecord> = Vec::new();
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut dry = 0usize;
         for page in 0..MAX_PAGES {
             let offset = page * 100;
             let url = format!("{}/api/v1/courses/?limit=100&offset={offset}", self.base_url);
@@ -366,8 +396,11 @@ impl CatalogueSource for MitOpenCourseWare {
             if body.results.is_empty() {
                 break;
             }
-            let count = body.count;
+            let before = seen.len();
             for course in body.results {
+                if !seen.insert(course.id) {
+                    continue;
+                }
                 out.push(CatalogueRecord {
                     provider: "mit_ocw".into(),
                     external_id: course.id.to_string(),
@@ -388,8 +421,13 @@ impl CatalogueSource for MitOpenCourseWare {
                     pages: None,
                 });
             }
-            if count > 0 && out.len() as i64 >= count {
-                break;
+            if seen.len() == before {
+                dry += 1;
+                if dry >= DRY_PAGES_BEFORE_STOP {
+                    break;
+                }
+            } else {
+                dry = 0;
             }
         }
         Ok(out)

@@ -485,6 +485,239 @@ struct ManagedSearchBody {
     min_similarity: f32,
 }
 
+/// The catalogue mirror lives in the active workspace's data directory.
+///
+/// One mirror per workspace duplicates a few thousand rows, which is the
+/// cheaper of the two mistakes available: the alternative is a second,
+/// global storage location existing solely for this feature, and a second
+/// place where Wilkes keeps state is exactly the divergence AGENTS.md asks
+/// us not to introduce. A duplicated mirror is re-syncable; a split storage
+/// model is not.
+///
+/// None of these three routes goes through `managed_context`, and that is
+/// deliberate rather than an oversight. Every other underdog route is scoped
+/// by a corpus and an embedding space because it reads the user's own
+/// documents. A catalogue record is not the user's document and has no
+/// vectors — it describes something nobody here holds yet. There is no
+/// corpus to pin, so pinning one would be theatre.
+fn catalogue_store(
+    state: &AppState,
+) -> Result<wilkes_core::catalogue::CatalogueStore, (StatusCode, Json<ErrorBody>)> {
+    let data_dir = state.context().data_dir.clone();
+    wilkes_core::catalogue::CatalogueStore::open(&data_dir)
+        .map_err(|error| server_err(format!("Catalogue store unavailable: {error:#}")))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogueQuery {
+    /// Echoed back on the matching result so a caller batching many gaps can
+    /// reattach each answer without relying on ordering.
+    key: String,
+    text: String,
+    #[serde(default)]
+    grain: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogueSearchBody {
+    queries: Vec<CatalogueQuery>,
+    #[serde(default = "default_catalogue_limit")]
+    limit: usize,
+}
+
+fn default_catalogue_limit() -> usize {
+    24
+}
+
+/// One query batched with many others may legitimately match nothing; the
+/// whole request failing because one probe was empty would make batching
+/// worse than looping.
+#[derive(Serialize)]
+struct CatalogueQueryResult {
+    key: String,
+    hits: Vec<wilkes_core::types::CatalogueHit>,
+}
+
+#[derive(Serialize)]
+struct CatalogueSearchResponse {
+    results: Vec<CatalogueQueryResult>,
+}
+
+const MAX_CATALOGUE_QUERIES: usize = 64;
+
+async fn underdog_catalogue_search_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CatalogueSearchBody>,
+) -> Result<Json<CatalogueSearchResponse>, (StatusCode, Json<ErrorBody>)> {
+    if body.queries.is_empty() {
+        return Err(err("Catalogue search names no queries"));
+    }
+    if body.queries.len() > MAX_CATALOGUE_QUERIES {
+        return Err(err(
+            "Catalogue search exceeds the documented request cap of 64 queries",
+        ));
+    }
+    for query in &body.queries {
+        if let Some(grain) = &query.grain {
+            if wilkes_core::types::CatalogueGrain::parse(grain).is_none() {
+                return Err(err(format!(
+                    "Unknown catalogue grain {grain:?}; expected textbook, course or reference"
+                )));
+            }
+        }
+    }
+    let store = catalogue_store(&state)?;
+    let limit = body.limit;
+    let queries = body.queries;
+    tokio::task::spawn_blocking(move || {
+        let mut results = Vec::with_capacity(queries.len());
+        for query in queries {
+            let grain = query
+                .grain
+                .as_deref()
+                .and_then(wilkes_core::types::CatalogueGrain::parse);
+            let hits = store
+                .search(&query.text, grain, limit)
+                .map_err(|error| format!("Catalogue search failed: {error:#}"))?;
+            results.push(CatalogueQueryResult {
+                key: query.key,
+                hits,
+            });
+        }
+        Ok::<_, String>(CatalogueSearchResponse { results })
+    })
+    .await
+    .map_err(|error| server_err(format!("Catalogue search task panicked: {error}")))?
+    .map(Json)
+    .map_err(server_err)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogueSyncBody {
+    /// Which catalogues to refresh. Absent means all of them, which is a
+    /// minutes-long request; a caller wanting progress should name one at a
+    /// time and drive the loop itself.
+    #[serde(default)]
+    providers: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct CatalogueSyncOutcome {
+    provider: String,
+    grain: &'static str,
+    /// Present on success. Absent with `error` set means this provider failed
+    /// and the others in the same request did not — a partial sync is reported
+    /// as partial rather than collapsed into one failure.
+    records: Option<usize>,
+    /// What the provider handed over, before deduplication. Both LibreTexts
+    /// and MIT OpenCourseWare repeat ids across a paged fetch, so `offered`
+    /// runs well ahead of `records`; a provider whose gap suddenly widens is
+    /// one whose pagination has changed under us.
+    offered: Option<usize>,
+    duplicates: Option<usize>,
+    unusable: Option<usize>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CatalogueSyncResponse {
+    providers: Vec<CatalogueSyncOutcome>,
+    total_records: i64,
+}
+
+async fn underdog_catalogue_sync_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CatalogueSyncBody>,
+) -> Result<Json<CatalogueSyncResponse>, (StatusCode, Json<ErrorBody>)> {
+    let requested = body.providers.unwrap_or_default();
+    let sources = wilkes_core::catalogue::registry();
+    if let Some(unknown) = requested
+        .iter()
+        .find(|name| !sources.iter().any(|source| source.id() == name.as_str()))
+    {
+        return Err(err(format!("Unknown catalogue provider {unknown:?}")));
+    }
+    let mut store = catalogue_store(&state)?;
+    let mut outcomes = Vec::new();
+    for source in sources {
+        if !requested.is_empty() && !requested.iter().any(|name| name == source.id()) {
+            continue;
+        }
+        // A provider that is down must not take the others with it, and must
+        // not be silent about it either: the failure is reported per provider
+        // and the mirror keeps whatever that provider last supplied.
+        match source.fetch_all().await {
+            Ok(records) => match store.replace_provider(source.id(), &records) {
+                Ok(written) => outcomes.push(CatalogueSyncOutcome {
+                    provider: source.id().to_string(),
+                    grain: source.grain().as_str(),
+                    records: Some(written.stored),
+                    offered: Some(written.offered),
+                    duplicates: Some(written.duplicates),
+                    unusable: Some(written.unusable),
+                    error: None,
+                }),
+                Err(error) => {
+                    tracing::warn!(provider = source.id(), "catalogue write failed: {error:#}");
+                    outcomes.push(CatalogueSyncOutcome {
+                        provider: source.id().to_string(),
+                        grain: source.grain().as_str(),
+                        records: None,
+                        offered: None,
+                        duplicates: None,
+                        unusable: None,
+                        error: Some(format!("{error:#}")),
+                    });
+                }
+            },
+            Err(error) => {
+                tracing::warn!(provider = source.id(), "catalogue fetch failed: {error:#}");
+                outcomes.push(CatalogueSyncOutcome {
+                    provider: source.id().to_string(),
+                    grain: source.grain().as_str(),
+                    records: None,
+                    offered: None,
+                    duplicates: None,
+                    unusable: None,
+                    error: Some(format!("{error:#}")),
+                });
+            }
+        }
+    }
+    let total_records = store
+        .total_records()
+        .map_err(|error| server_err(format!("Catalogue count failed: {error:#}")))?;
+    Ok(Json(CatalogueSyncResponse {
+        providers: outcomes,
+        total_records,
+    }))
+}
+
+#[derive(Serialize)]
+struct CatalogueStatusResponse {
+    providers: Vec<wilkes_core::types::CatalogueProviderStatus>,
+    total_records: i64,
+}
+
+async fn underdog_catalogue_status_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<CatalogueStatusResponse>, (StatusCode, Json<ErrorBody>)> {
+    let store = catalogue_store(&state)?;
+    let providers = store
+        .status()
+        .map_err(|error| server_err(format!("Catalogue status failed: {error:#}")))?;
+    let total_records = store
+        .total_records()
+        .map_err(|error| server_err(format!("Catalogue count failed: {error:#}")))?;
+    Ok(Json(CatalogueStatusResponse {
+        providers,
+        total_records,
+    }))
+}
+
 async fn underdog_search_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedSearchBody>,
@@ -1901,6 +2134,18 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             post(underdog_search_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route(
+            "/api/integrations/underdog/catalogue/search",
+            post(underdog_catalogue_search_handler),
+        )
+        .route(
+            "/api/integrations/underdog/catalogue/sync",
+            post(underdog_catalogue_sync_handler),
+        )
+        .route(
+            "/api/integrations/underdog/catalogue/status",
+            get(underdog_catalogue_status_handler),
+        )
+        .route(
             "/api/integrations/underdog/embed/text",
             post(underdog_embed_text_handler),
         )
@@ -2199,6 +2444,121 @@ mod tests {
             uploads_dir: dir.path().join("uploads"),
             events_tx,
         }));
+    }
+
+    /// Builds an `AppState` over a throwaway data dir, for handlers that need
+    /// only the workspace's path.
+    #[allow(clippy::type_complexity)]
+    fn catalogue_state() -> (tempfile::TempDir, Arc<AppState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads_dir = dir.path().join("uploads");
+        let settings_path = dir.path().join("settings.json");
+        std::fs::create_dir_all(&uploads_dir).unwrap();
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("python"),
+            python_package_dir: PathBuf::from("py_pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (events_tx, _) = broadcast::channel(1024);
+        let emitter = Arc::new(BroadcastEmitter {
+            tx: events_tx.clone(),
+        });
+        let (ctx, _event_rx, _loop_fut) =
+            AppContext::new(dir.path().to_path_buf(), settings_path, paths, emitter);
+        let state = Arc::new(AppState {
+            ctx: Some(ctx),
+            workspaces: None,
+            uploads_dir,
+            events_tx,
+        });
+        (dir, state)
+    }
+
+    #[tokio::test]
+    async fn catalogue_status_reports_an_unsynced_mirror_rather_than_failing() {
+        let (_dir, state) = catalogue_state();
+        let response = match underdog_catalogue_status_handler(State(state)).await {
+            Ok(response) => response,
+            Err(error) => panic!("status failed: {}", error.1 .0.error),
+        };
+        assert_eq!(response.0.total_records, 0);
+        assert!(response.0.providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalogue_search_refuses_an_unknown_grain_by_name() {
+        let (_dir, state) = catalogue_state();
+        let body = CatalogueSearchBody {
+            queries: vec![CatalogueQuery {
+                key: "k".into(),
+                text: "graph algorithms".into(),
+                grain: Some("monograph".into()),
+            }],
+            limit: 8,
+        };
+        let error = match underdog_catalogue_search_handler(State(state), Json(body)).await {
+            Ok(_) => panic!("unknown grain must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(
+            error.1 .0.error.contains("monograph"),
+            "the refusal must name the grain it rejected: {}",
+            error.1 .0.error
+        );
+    }
+
+    #[tokio::test]
+    async fn catalogue_search_refuses_an_empty_batch() {
+        let (_dir, state) = catalogue_state();
+        let body = CatalogueSearchBody {
+            queries: Vec::new(),
+            limit: 8,
+        };
+        let error = match underdog_catalogue_search_handler(State(state), Json(body)).await {
+            Ok(_) => panic!("empty batch must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn catalogue_search_refuses_a_batch_past_the_documented_cap() {
+        let (_dir, state) = catalogue_state();
+        let body = CatalogueSearchBody {
+            queries: (0..MAX_CATALOGUE_QUERIES + 1)
+                .map(|n| CatalogueQuery {
+                    key: n.to_string(),
+                    text: "graph algorithms".into(),
+                    grain: None,
+                })
+                .collect(),
+            limit: 8,
+        };
+        let error = match underdog_catalogue_search_handler(State(state), Json(body)).await {
+            Ok(_) => panic!("oversized batch must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn catalogue_sync_refuses_a_provider_it_does_not_have() {
+        let (_dir, state) = catalogue_state();
+        let body = CatalogueSyncBody {
+            providers: Some(vec!["nonexistent".into()]),
+        };
+        let error = match underdog_catalogue_sync_handler(State(state), Json(body)).await {
+            Ok(_) => panic!("unknown provider must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        // Refusing before any network call matters: a typo must not spend two
+        // minutes syncing the three providers that were spelled correctly.
+        assert!(error.1 .0.error.contains("nonexistent"));
     }
 
     #[tokio::test]

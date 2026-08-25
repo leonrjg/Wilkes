@@ -47,7 +47,22 @@ reuse the key for different bytes or a different recipe is refused.
 - `POST /api/integrations/underdog/chunks/resolve`
 - `POST /api/integrations/underdog/chunks/accumulate`
 - `POST /api/integrations/underdog/chunks/similarity`
+- `POST /api/integrations/underdog/chunks/search`
 - `POST /api/integrations/underdog/embed/text`
+- `POST /api/integrations/underdog/backup`
+- `POST /api/integrations/underdog/restore`
+
+The catalogue routes are the exception to everything below:
+
+- `POST /api/integrations/underdog/catalogue/search`
+- `POST /api/integrations/underdog/catalogue/sync`
+- `GET /api/integrations/underdog/catalogue/status`
+
+They name no `corpus_id` and no embedding space, and they do not pass through
+`managed_context`. A catalogue record describes a document nobody here holds
+yet — it has no snapshot, no rendition and no vectors — so there is no corpus
+to pin and pinning one would be theatre. Everything else on this page applies
+only to the managed routes.
 
 Every operation after ensure names `corpus_id` and the
 `expected_embedding_space_id` returned by ensure/status. A mismatch is a hard

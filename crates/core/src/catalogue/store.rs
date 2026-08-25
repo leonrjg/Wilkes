@@ -27,6 +27,21 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// What one provider sync actually did.
+///
+/// `offered` and `stored` differ whenever a provider repeats an id or ships a
+/// record with no identity, which both do. Reporting only `stored` would hide
+/// a provider that started sending nothing but duplicates; reporting only
+/// `offered` would overstate the mirror. Both are returned so neither failure
+/// is invisible.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncOutcome {
+    pub offered: usize,
+    pub stored: usize,
+    pub duplicates: usize,
+    pub unusable: usize,
+}
+
 pub struct CatalogueStore {
     conn: Connection,
 }
@@ -144,17 +159,25 @@ impl CatalogueStore {
         &mut self,
         provider: &str,
         records: &[CatalogueRecord],
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<SyncOutcome> {
         anyhow::ensure!(!provider.is_empty(), "catalogue provider id is empty");
         let tx = self.conn.transaction()?;
         tx.execute(
             "DELETE FROM catalogue_records WHERE provider = ?1",
             [provider],
         )?;
-        let mut written = 0usize;
+        let mut outcome = SyncOutcome::default();
+        outcome.offered = records.len();
+        // Providers repeat themselves: LibreTexts and MIT OpenCourseWare both
+        // return the same external id more than once across a paged fetch.
+        // `INSERT OR REPLACE` would absorb that silently and leave the caller
+        // told it stored 4,100 records when the table gained 2,219. Dedupe
+        // here instead, and report the drop, so the number a caller sees is
+        // the number of rows that exist.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         {
             let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO catalogue_records
+                "INSERT INTO catalogue_records
                     (provider, external_id, title, summary, subject, authors, license,
                      landing_url, pdf_url, outline_url, grain, pages)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
@@ -162,9 +185,12 @@ impl CatalogueStore {
             for record in records {
                 if record.external_id.trim().is_empty() || record.title.trim().is_empty() {
                     // A record with no identity or no name cannot be offered
-                    // or fetched later. Skipping is not suppression: the
-                    // returned count is what was actually stored, and the
-                    // caller compares it against what it handed over.
+                    // or fetched later.
+                    outcome.unusable += 1;
+                    continue;
+                }
+                if !seen.insert(record.external_id.as_str()) {
+                    outcome.duplicates += 1;
                     continue;
                 }
                 stmt.execute(params![
@@ -181,16 +207,16 @@ impl CatalogueStore {
                     record.grain.as_str(),
                     record.pages,
                 ])?;
-                written += 1;
+                outcome.stored += 1;
             }
         }
         tx.execute(
             "INSERT OR REPLACE INTO catalogue_sync (provider, synced_at_ms, records)
              VALUES (?1, ?2, ?3)",
-            params![provider, now_ms(), written as i64],
+            params![provider, now_ms(), outcome.stored as i64],
         )?;
         tx.commit()?;
-        Ok(written)
+        Ok(outcome)
     }
 
     /// BM25 recall over the mirror. See the module docs for why this is not a
@@ -439,7 +465,7 @@ mod tests {
     #[test]
     fn a_record_without_identity_or_title_is_not_stored() {
         let mut store = CatalogueStore::in_memory().expect("store");
-        let written = store
+        let outcome = store
             .replace_provider(
                 "test",
                 &[
@@ -449,8 +475,28 @@ mod tests {
                 ],
             )
             .expect("replace");
-        assert_eq!(written, 1);
+        assert_eq!(outcome.stored, 1);
+        assert_eq!(outcome.unusable, 2);
         assert_eq!(store.total_records().expect("count"), 1);
+    }
+
+    #[test]
+    fn a_provider_that_repeats_an_id_is_counted_honestly() {
+        let mut store = CatalogueStore::in_memory().expect("store");
+        let outcome = store
+            .replace_provider(
+                "test",
+                &[
+                    record("1", "Once", "Graph algorithms.", CatalogueGrain::Textbook),
+                    record("1", "Again", "Graph algorithms.", CatalogueGrain::Textbook),
+                    record("2", "Other", "Graph algorithms.", CatalogueGrain::Textbook),
+                ],
+            )
+            .expect("replace");
+        assert_eq!(outcome.offered, 3);
+        assert_eq!(outcome.stored, 2);
+        assert_eq!(outcome.duplicates, 1);
+        assert_eq!(store.total_records().expect("count"), 2);
     }
 
     #[test]
