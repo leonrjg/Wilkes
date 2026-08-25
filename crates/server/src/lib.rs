@@ -471,8 +471,44 @@ async fn underdog_similarity_handler(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ManagedSearchProbe {
+struct VectorProbe {
     vector: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextProbe {
+    text: String,
+}
+
+/// A probe is a vector the caller already holds or the text it wants searched
+/// for, and the two are not interchangeable in what they can express.
+///
+/// A caller sending text gets its query embedded in the **query** role, which
+/// is the only way that role can be reached: `embed/text` answers in the
+/// passage role and has to, because the vectors it returns are stored. So
+/// "search the corpus for this text" used to be two calls of which the first
+/// could not know what the text was for. Sending text is also one round trip
+/// instead of two, and it lets a later model with query prefixes work without
+/// the consumer learning that it exists.
+///
+/// Vectors stay, and not for compatibility: a caller searching for something
+/// it holds a vector *for* — a centroid, a stored embedding — has no text to
+/// send.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ManagedSearchProbe {
+    Vector(VectorProbe),
+    Text(TextProbe),
+}
+
+impl From<ManagedSearchProbe> for wilkes_api::context::ManagedSearchProbeInput {
+    fn from(probe: ManagedSearchProbe) -> Self {
+        match probe {
+            ManagedSearchProbe::Vector(probe) => Self::Vector(probe.vector),
+            ManagedSearchProbe::Text(probe) => Self::Text(probe.text),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -778,7 +814,7 @@ async fn underdog_search_handler(
         managed_context(&state, &body.corpus_id, &body.expected_embedding_space_id).await?;
     context
         .managed_chunk_search(
-            body.probes.into_iter().map(|probe| probe.vector).collect(),
+            body.probes.into_iter().map(Into::into).collect(),
             body.top_k,
             body.min_similarity,
         )
@@ -2453,6 +2489,36 @@ mod tests {
         let (status, body) = server_err("internal error");
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.0.error, "internal error");
+    }
+
+    /// The probe body is an untagged enum, which is the one place a wire
+    /// format can go quietly wrong: a shape matching neither variant, or both,
+    /// must be refused rather than resolved to whichever arm serde reaches
+    /// first.
+    #[test]
+    fn a_probe_is_a_vector_or_a_text_and_never_both() {
+        let vector: ManagedSearchProbe =
+            serde_json::from_str(r#"{"vector":[1.0,0.0]}"#).expect("a vector probe");
+        assert!(matches!(vector, ManagedSearchProbe::Vector(_)));
+
+        let text: ManagedSearchProbe =
+            serde_json::from_str(r#"{"text":"causal inference"}"#).expect("a text probe");
+        match text {
+            ManagedSearchProbe::Text(probe) => assert_eq!(probe.text, "causal inference"),
+            ManagedSearchProbe::Vector(_) => panic!("text read as a vector"),
+        }
+
+        for malformed in [
+            r#"{"vector":[1.0],"text":"both"}"#,
+            r#"{}"#,
+            r#"{"vector":[1.0],"role":"query"}"#,
+            r#"{"txt":"misspelled"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ManagedSearchProbe>(malformed).is_err(),
+                "{malformed} must be refused"
+            );
+        }
     }
 
     #[test]

@@ -375,6 +375,31 @@ impl Drop for PendingManagedOperation<'_> {
     }
 }
 
+/// Which side of a retrieval pair a text is.
+///
+/// An asymmetric model — E5, BGE, arctic-embed — is trained with a prefix on
+/// one side or both, and applying the wrong one is not a small loss: measured
+/// on a 6,600-record corpus, the same model placed the right answer at rank 52
+/// with the query prefix and rank 1792 without it, while every similarity rose
+/// (Underdog, ACQUISITION §12i). The role is therefore never a request field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmbedRole {
+    Query,
+    Passage,
+}
+
+/// One probe of a managed chunk search: a vector the caller already holds, or
+/// the text it wants searched for.
+///
+/// Text is the better form where the caller has a choice. It is one round trip
+/// rather than two, and it is the only form under which the query role can
+/// reach the embedder at all.
+#[derive(Clone, Debug)]
+pub enum ManagedSearchProbeInput {
+    Vector(Vec<f32>),
+    Text(String),
+}
+
 /// Result of `embed_texts`: vectors from the same model the index uses,
 /// with the identity consumers pin against.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -1715,6 +1740,18 @@ impl AppContext {
     /// id and dimension and treat any later mismatch as a hard error, so the
     /// response always names both.
     pub async fn embed_texts(&self, texts: Vec<String>) -> Result<EmbeddedTexts, String> {
+        self.embed_texts_in_role(texts, EmbedRole::Passage).await
+    }
+
+    /// The two roles an asymmetric model distinguishes. Which one applies is
+    /// decided by the endpoint a caller reached, never by a field it sets: a
+    /// flag that can be set correctly can be set wrongly, and the caller is the
+    /// party least able to know what the model was trained to expect.
+    async fn embed_texts_in_role(
+        &self,
+        texts: Vec<String>,
+        role: EmbedRole,
+    ) -> Result<EmbeddedTexts, String> {
         if texts.is_empty() {
             return Err("No texts provided".to_string());
         }
@@ -1729,7 +1766,10 @@ impl AppContext {
         let embedder_for_task = Arc::clone(&embedder);
         let vectors = tokio::task::spawn_blocking(move || {
             let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-            embedder_for_task.embed_passages(&refs)
+            match role {
+                EmbedRole::Passage => embedder_for_task.embed_passages(&refs),
+                EmbedRole::Query => embedder_for_task.embed_query(&refs),
+            }
         })
         .await
         .map_err(|e| format!("Text embedding task panicked: {e}"))?
@@ -2449,7 +2489,7 @@ impl AppContext {
 
     pub async fn managed_chunk_search(
         &self,
-        probes: Vec<Vec<f32>>,
+        probes: Vec<ManagedSearchProbeInput>,
         top_k: usize,
         min_similarity: f32,
     ) -> Result<ManagedChunkSearch, String> {
@@ -2462,6 +2502,7 @@ impl AppContext {
         {
             return Err("Search request exceeds the documented request cap".to_string());
         }
+        let probes = self.resolve_search_probes(probes).await?;
         let index_arc = self.index.lock().clone();
         tokio::task::spawn_blocking(move || {
             let guard = index_arc
@@ -2498,6 +2539,47 @@ impl AppContext {
         })
         .await
         .map_err(|error| format!("Search task panicked: {error}"))?
+    }
+
+    /// Turn a mixed probe list into vectors, embedding the text ones in the
+    /// query role and keeping the caller's order.
+    ///
+    /// The texts go in one batch because they must land in one space: two
+    /// embed calls are two chances for a model to be swapped between them.
+    async fn resolve_search_probes(
+        &self,
+        probes: Vec<ManagedSearchProbeInput>,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let texts: Vec<String> = probes
+            .iter()
+            .filter_map(|probe| match probe {
+                ManagedSearchProbeInput::Text(text) => Some(text.clone()),
+                ManagedSearchProbeInput::Vector(_) => None,
+            })
+            .collect();
+        if texts.is_empty() {
+            return Ok(probes
+                .into_iter()
+                .map(|probe| match probe {
+                    ManagedSearchProbeInput::Vector(vector) => vector,
+                    ManagedSearchProbeInput::Text(_) => unreachable!("no text probes"),
+                })
+                .collect());
+        }
+        if texts.iter().any(|text| text.trim().is_empty()) {
+            return Err("A text probe is empty and names nothing to search for".to_string());
+        }
+        let embedded = self.embed_texts_in_role(texts, EmbedRole::Query).await?;
+        let mut embedded = embedded.vectors.into_iter();
+        probes
+            .into_iter()
+            .map(|probe| match probe {
+                ManagedSearchProbeInput::Vector(vector) => Ok(vector),
+                ManagedSearchProbeInput::Text(_) => embedded
+                    .next()
+                    .ok_or_else(|| "Embedder returned fewer vectors than text probes".to_string()),
+            })
+            .collect()
     }
 
     /// The normalized mean of the stored vectors of named chunks, one mean per
@@ -9313,6 +9395,54 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .is_none());
+    }
+
+    /// A text probe reaches the embedder in the query role and lands where
+    /// the caller put it, beside vectors the caller already held.
+    #[tokio::test]
+    async fn text_probes_resolve_in_place_beside_vector_probes() {
+        let (_dir, ctx) = test_ctx();
+        *ctx.embedder.lock() = Some(Arc::new(MockEmbedder::default()) as Arc<dyn Embedder>);
+
+        let mut held = vec![0.0f32; 384];
+        held[7] = 1.0;
+        let resolved = ctx
+            .resolve_search_probes(vec![
+                ManagedSearchProbeInput::Text("what teaches this".to_string()),
+                ManagedSearchProbeInput::Vector(held.clone()),
+                ManagedSearchProbeInput::Text("and this".to_string()),
+            ])
+            .await
+            .expect("probes resolve");
+
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved[1], held, "a held vector passes through untouched");
+        assert_eq!(resolved[0].len(), 384);
+        assert_eq!(resolved[2].len(), 384);
+    }
+
+    /// Without a text probe there is nothing to embed, so a search over held
+    /// vectors must not require a live embedder.
+    #[tokio::test]
+    async fn vector_only_probes_need_no_embedder() {
+        let (_dir, ctx) = test_ctx();
+        assert!(ctx.embedder.lock().is_none());
+        let resolved = ctx
+            .resolve_search_probes(vec![ManagedSearchProbeInput::Vector(vec![1.0, 0.0])])
+            .await
+            .expect("vectors need no model");
+        assert_eq!(resolved, vec![vec![1.0, 0.0]]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_text_probe_is_refused() {
+        let (_dir, ctx) = test_ctx();
+        *ctx.embedder.lock() = Some(Arc::new(MockEmbedder::default()) as Arc<dyn Embedder>);
+        let error = ctx
+            .resolve_search_probes(vec![ManagedSearchProbeInput::Text("   ".to_string())])
+            .await
+            .expect_err("an empty probe names nothing");
+        assert!(error.contains("empty"), "{error}");
     }
 
     #[tokio::test]
