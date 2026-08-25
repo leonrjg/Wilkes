@@ -16,6 +16,14 @@
   and MIT OpenCourseWare repeat ids across a paged fetch, and LibreTexts keeps
   yielding new records well past the `numTotal` it reports.
 
+- A catalogue search query names the *set* of grains it will accept (`grains`)
+  rather than one. Which kinds of source could answer a question is a judgement
+  about the question and usually admits more than one; filtering to the single
+  preferred kind hid every provider publishing at another grain, and on this
+  mirror only one provider publishes courses — so a query for a broad subject
+  came back entirely from it, with no textbook on the subject anywhere in the
+  answer.
+
 - MCP tools accept a `workspace` id and read that workspace's library — its
   roots, access boundary and index — without switching the app to it.
   `list_context` reports every workspace and marks the active one; omitting

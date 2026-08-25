@@ -223,10 +223,18 @@ impl CatalogueStore {
 
     /// BM25 recall over the mirror. See the module docs for why this is not a
     /// ranking.
+    ///
+    /// `grains` is the set of kinds the caller will accept; empty means all of
+    /// them. A set rather than one value because the distinction that matters
+    /// is not always the one the caller asked for: a broad subject is better
+    /// served by a course than by a textbook, but a textbook still teaches it,
+    /// and filtering to the single preferred kind hides every other provider's
+    /// answer. Which kinds are admissible for a given question is a judgement
+    /// about the question, so it belongs to the caller — this only applies it.
     pub fn search(
         &self,
         query: &str,
-        grain: Option<CatalogueGrain>,
+        grains: &[CatalogueGrain],
         limit: usize,
     ) -> anyhow::Result<Vec<CatalogueHit>> {
         let expression = fts_expression(query);
@@ -244,34 +252,39 @@ impl CatalogueStore {
                      FROM catalogue_fts
                      JOIN catalogue_records r ON r.rowid = catalogue_fts.rowid
                     WHERE catalogue_fts MATCH ?1
-                      AND (?2 IS NULL OR r.grain = ?2)
+                      AND (?2 IS NULL OR r.grain IN (SELECT value FROM json_each(?2)))
                     ORDER BY bm25(catalogue_fts, 4.0, 2.0, 1.0)
                     LIMIT ?3";
+        // A JSON array rather than a generated placeholder list, so the SQL
+        // stays one static string whatever the caller accepts.
+        let accepted: Option<String> = if grains.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(
+                &grains.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
+            )?)
+        };
         let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map(
-            params![expression, grain.map(|g| g.as_str()), limit as i64],
-            |row| {
-                let grain_text: String = row.get(10)?;
-                Ok(CatalogueHit {
-                    record: CatalogueRecord {
-                        provider: row.get(0)?,
-                        external_id: row.get(1)?,
-                        title: row.get(2)?,
-                        summary: row.get(3)?,
-                        subject: row.get(4)?,
-                        authors: row.get(5)?,
-                        license: row.get(6)?,
-                        landing_url: row.get(7)?,
-                        pdf_url: row.get(8)?,
-                        outline_url: row.get(9)?,
-                        grain: CatalogueGrain::parse(&grain_text)
-                            .unwrap_or(CatalogueGrain::Textbook),
-                        pages: row.get(11)?,
-                    },
-                    recall_score: row.get(12)?,
-                })
-            },
-        )?;
+        let rows = stmt.query_map(params![expression, accepted, limit as i64], |row| {
+            let grain_text: String = row.get(10)?;
+            Ok(CatalogueHit {
+                record: CatalogueRecord {
+                    provider: row.get(0)?,
+                    external_id: row.get(1)?,
+                    title: row.get(2)?,
+                    summary: row.get(3)?,
+                    subject: row.get(4)?,
+                    authors: row.get(5)?,
+                    license: row.get(6)?,
+                    landing_url: row.get(7)?,
+                    pdf_url: row.get(8)?,
+                    outline_url: row.get(9)?,
+                    grain: CatalogueGrain::parse(&grain_text).unwrap_or(CatalogueGrain::Textbook),
+                    pages: row.get(11)?,
+                },
+                recall_score: row.get(12)?,
+            })
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -397,7 +410,7 @@ mod tests {
             .search(
                 "An introductory treatment of computational complexity covering NP-completeness \
                  and polynomial-time reductions.",
-                None,
+                &[],
                 5,
             )
             .expect("search");
@@ -419,7 +432,7 @@ mod tests {
             "C++ / C#",
             "*",
         ] {
-            store.search(probe, None, 5).expect("must not error");
+            store.search(probe, &[], 5).expect("must not error");
         }
     }
 
@@ -433,7 +446,7 @@ mod tests {
             )
             .expect("replace");
         assert!(store
-            .search("the and of it is", None, 5)
+            .search("the and of it is", &[], 5)
             .expect("search")
             .is_empty());
     }
@@ -463,12 +476,64 @@ mod tests {
         let hits = store
             .search(
                 "built-in sequence types and lists",
-                Some(CatalogueGrain::Reference),
+                &[CatalogueGrain::Reference],
                 5,
             )
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record.external_id, "1");
+    }
+
+    /// Accepting two kinds returns both, and that is the point of the set.
+    ///
+    /// A learner who declares a broad subject is best served by a course, so
+    /// the query stage says `course` — and a mirror where only one provider
+    /// publishes courses would then answer with that one provider and nothing
+    /// else, hiding every textbook on the subject. Measured against the live
+    /// mirror on 2026-08-25: "organic chemistry" filtered to `course` returned
+    /// 24 MIT OpenCourseWare records and zero LibreTexts, which holds an
+    /// organic chemistry library.
+    #[test]
+    fn a_query_that_accepts_two_grains_is_answered_by_both() {
+        let mut store = CatalogueStore::in_memory().expect("store");
+        store
+            .replace_provider(
+                "test",
+                &[
+                    record(
+                        "1",
+                        "Organic Chemistry I",
+                        "Structure, bonding and reaction mechanisms.",
+                        CatalogueGrain::Course,
+                    ),
+                    record(
+                        "2",
+                        "Organic Chemistry",
+                        "Structure, bonding and reaction mechanisms.",
+                        CatalogueGrain::Textbook,
+                    ),
+                    record(
+                        "3",
+                        "Organic Chemistry Reference",
+                        "Structure, bonding and reaction mechanisms.",
+                        CatalogueGrain::Reference,
+                    ),
+                ],
+            )
+            .expect("replace");
+        let hits = store
+            .search(
+                "structure bonding and reaction mechanisms",
+                &[CatalogueGrain::Course, CatalogueGrain::Textbook],
+                10,
+            )
+            .expect("search");
+        let ids: Vec<&str> = hits.iter().map(|h| h.record.external_id.as_str()).collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.contains(&"1") && ids.contains(&"2"), "{ids:?}");
+        // And the kind that was not accepted stays out: a set is still a
+        // filter, not a suggestion.
+        assert!(!ids.contains(&"3"), "{ids:?}");
     }
 
     #[test]
@@ -508,7 +573,7 @@ mod tests {
         assert_eq!(store.total_records().expect("count"), 1);
         // The FTS index must have been withdrawn with the row, not merely the
         // table: a stale posting would surface a record that cannot be fetched.
-        let hits = store.search("graph algorithms", None, 10).expect("search");
+        let hits = store.search("graph algorithms", &[], 10).expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record.title, "Kept Book");
     }

@@ -515,8 +515,16 @@ struct CatalogueQuery {
     /// reattach each answer without relying on ordering.
     key: String,
     text: String,
+    /// Which kinds of source this query will accept. Absent or empty means
+    /// all of them.
+    ///
+    /// A set rather than one value: the caller knows which kinds could answer
+    /// its question and that is often more than one — a broad subject is
+    /// better served by a course than a textbook, but a textbook still
+    /// teaches it, and filtering to the single preferred kind silently hides
+    /// every provider that publishes at another grain.
     #[serde(default)]
-    grain: Option<String>,
+    grains: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -560,7 +568,7 @@ async fn underdog_catalogue_search_handler(
         ));
     }
     for query in &body.queries {
-        if let Some(grain) = &query.grain {
+        for grain in query.grains.iter().flatten() {
             if wilkes_core::types::CatalogueGrain::parse(grain).is_none() {
                 return Err(err(format!(
                     "Unknown catalogue grain {grain:?}; expected textbook, course or reference"
@@ -574,12 +582,17 @@ async fn underdog_catalogue_search_handler(
     tokio::task::spawn_blocking(move || {
         let mut results = Vec::with_capacity(queries.len());
         for query in queries {
-            let grain = query
-                .grain
-                .as_deref()
-                .and_then(wilkes_core::types::CatalogueGrain::parse);
+            // Every name was checked above, so an unparseable one here would
+            // be a bug in that check rather than a caller's mistake; the
+            // filter cannot silently drop one.
+            let grains: Vec<wilkes_core::types::CatalogueGrain> = query
+                .grains
+                .iter()
+                .flatten()
+                .filter_map(|grain| wilkes_core::types::CatalogueGrain::parse(grain))
+                .collect();
             let hits = store
-                .search(&query.text, grain, limit)
+                .search(&query.text, &grains, limit)
                 .map_err(|error| format!("Catalogue search failed: {error:#}"))?;
             results.push(CatalogueQueryResult {
                 key: query.key,
@@ -2538,7 +2551,7 @@ mod tests {
             queries: vec![CatalogueQuery {
                 key: "k".into(),
                 text: "graph algorithms".into(),
-                grain: Some("monograph".into()),
+                grains: Some(vec!["monograph".into()]),
             }],
             limit: 8,
         };
@@ -2576,7 +2589,7 @@ mod tests {
                 .map(|n| CatalogueQuery {
                     key: n.to_string(),
                     text: "graph algorithms".into(),
-                    grain: None,
+                    grains: None,
                 })
                 .collect(),
             limit: 8,

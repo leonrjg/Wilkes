@@ -64,6 +64,16 @@ yet — it has no snapshot, no rendition and no vectors — so there is no corpu
 to pin and pinning one would be theatre. Everything else on this page applies
 only to the managed routes.
 
+Each query in a catalogue search carries a `key` echoed back on its result, the
+probe `text`, and an optional `grains` array naming the kinds of source it will
+accept (`textbook`, `course`, `reference`); absent or empty means all of them.
+It is a set rather than one value because which kinds could answer a question
+is a judgement about the question and often admits more than one — a broad
+subject is better served by a course than a textbook, but a textbook still
+teaches it. Filtering to a single preferred kind hides every provider that
+publishes at another grain, and on this mirror that is most of them: only one
+provider publishes courses. An unknown name is a `400` that names it.
+
 Every operation after ensure names `corpus_id` and the
 `expected_embedding_space_id` returned by ensure/status. A mismatch is a hard
 `409`, never a fallback to the active workspace.
