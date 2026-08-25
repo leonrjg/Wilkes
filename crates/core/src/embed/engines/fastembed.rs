@@ -269,6 +269,16 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
         .collect()
 }
 
+/// The HuggingFace repository a catalogue id stands for.
+///
+/// fastembed addresses models by an enum name of its own, so nothing outside
+/// this module can turn one into the repository whose config files carry the
+/// model's retrieval convention — which is the same mismatch that once let a
+/// download write its artifacts where the prefix reader could not find them.
+pub fn repository_id(model_id: &str) -> Option<String> {
+    find_model_info(model_id).ok().map(|info| info.model_code)
+}
+
 /// Fetch the total download size (in bytes) for `model_id` by querying the HuggingFace API.
 /// Only counts the specific files fastembed downloads, not the whole repo.
 pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {

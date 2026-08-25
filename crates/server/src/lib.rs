@@ -892,6 +892,24 @@ async fn underdog_embed_text_handler(
         .map_err(managed_err)
 }
 
+/// What this Wilkes can embed with — the models, their dimensions, and the
+/// input recipes they require.
+///
+/// Unscoped, like the catalogue routes and for the same reason: it reads
+/// nothing of the user's documents and there is no corpus for it to pin. It
+/// describes the host's embedders, and a consumer asks it *before* it has a
+/// corpus in the space it is asking about.
+async fn underdog_embedding_models_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<wilkes_core::types::EmbedderCapabilityManifest> {
+    let context = state.context();
+    let settings = context.get_settings().await;
+    Json(wilkes_core::embed::dispatch::model_capabilities(
+        &context.shared_data_dir,
+        &settings.semantic.custom_models,
+    ))
+}
+
 /// Render a corpus or request embedding space for an error message. A corpus
 /// with no index has no space, which is a distinct state from disagreeing
 /// about which space is in use.
@@ -2240,6 +2258,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/integrations/underdog/embed/text",
             post(underdog_embed_text_handler),
+        )
+        .route(
+            "/api/integrations/underdog/embed/models",
+            get(underdog_embedding_models_handler),
         )
         .route(
             "/api/integrations/underdog/backup",

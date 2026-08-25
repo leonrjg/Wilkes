@@ -1,16 +1,25 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::types::PrefixSource;
+
 /// Accumulated per-model configuration derived from auxiliary HF config files.
 #[derive(Default)]
 pub struct EmbedderConfig {
     pub query_prefix: String,
     pub passage_prefix: String,
+    /// The longest input the model was trained to take, when its own config
+    /// states one. Read rather than assumed: a caller that has to decide
+    /// whether a passage fits cannot get that from a model's name.
+    pub max_sequence_length: Option<usize>,
 }
 
 pub type AuxParser = (&'static str, fn(&str, &mut EmbedderConfig));
 
-pub const AUX_PARSERS: &[AuxParser] = &[("config_sentence_transformers.json", parse_st_config)];
+pub const AUX_PARSERS: &[AuxParser] = &[
+    ("config_sentence_transformers.json", parse_st_config),
+    ("sentence_bert_config.json", parse_sbert_config),
+];
 
 /// Prefixes for models that document their retrieval convention in the model
 /// card rather than in `config_sentence_transformers.json`.
@@ -107,29 +116,67 @@ fn parse_st_config(content: &str, config: &mut EmbedderConfig) {
     }
 }
 
+fn parse_sbert_config(content: &str, config: &mut EmbedderConfig) {
+    #[derive(serde::Deserialize)]
+    struct SbertConfig {
+        max_seq_length: Option<usize>,
+    }
+
+    match serde_json::from_str::<SbertConfig>(content) {
+        Ok(parsed) => config.max_sequence_length = parsed.max_seq_length,
+        Err(e) => tracing::debug!("Could not parse sentence_bert_config.json: {e}"),
+    }
+}
+
 /// Read auxiliary config files for `model_id` from `cache_root` and return the resulting config.
 /// Does not perform any network I/O — call this from `build()` after files are present.
 pub fn load_prefixes(cache_root: &Path, model_id: &str) -> EmbedderConfig {
+    describe(cache_root, model_id).0
+}
+
+/// The same read, with the provenance of the answer.
+///
+/// The embedder itself only needs the strings; a caller *choosing* a model
+/// needs to distinguish "this model documents no prefix" from "nothing here
+/// has read this model yet", because the second is a question and the first is
+/// an answer.
+pub fn describe(cache_root: &Path, model_id: &str) -> (EmbedderConfig, PrefixSource) {
     let mut config = EmbedderConfig::default();
     let cache = hf_hub::Cache::new(cache_root.to_path_buf());
     let repo = cache.repo(hf_hub::Repo::model(model_id.to_string()));
 
+    let mut read_any = false;
     for (filename, parser) in AUX_PARSERS {
         if let Some(path) = repo.get(filename) {
             match std::fs::read_to_string(&path) {
-                Ok(content) => parser(&content, &mut config),
+                Ok(content) => {
+                    read_any = true;
+                    parser(&content, &mut config)
+                }
                 Err(e) => tracing::debug!("Failed to read {filename} for {model_id}: {e}"),
             }
         }
     }
+    let discovered = !config.query_prefix.is_empty() || !config.passage_prefix.is_empty();
 
     apply_curated_prefixes(model_id, &mut config);
+    let curated =
+        !discovered && (!config.query_prefix.is_empty() || !config.passage_prefix.is_empty());
 
     if config.query_prefix.is_empty() {
         tracing::debug!("No prefix config found for {model_id} — prefixes will not be applied");
     }
 
-    config
+    let source = if discovered {
+        PrefixSource::Discovered
+    } else if curated {
+        PrefixSource::Curated
+    } else if read_any {
+        PrefixSource::NotDocumented
+    } else {
+        PrefixSource::Undetermined
+    };
+    (config, source)
 }
 
 /// Fill in prefixes the parsed config did not supply, for models this table
@@ -206,7 +253,7 @@ mod tests {
     fn test_curated_prefix_never_overrides_the_model_s_own_prompts() {
         let mut config = EmbedderConfig {
             query_prefix: "from the config: ".to_string(),
-            passage_prefix: String::new(),
+            ..EmbedderConfig::default()
         };
         apply_curated_prefixes("Snowflake/snowflake-arctic-embed-m", &mut config);
         assert_eq!(
@@ -309,6 +356,78 @@ mod tests {
 
         let config = load_prefixes(dir.path(), model_id);
         assert!(config.query_prefix.is_empty());
+    }
+
+    /// Writes one auxiliary config into `dir`'s cache as though it had been
+    /// downloaded, so a read can be tested without the network.
+    fn write_cached_aux(dir: &Path, model_id: &str, filename: &str, content: &str) {
+        let repo = dir.join(format!("models--{}", model_id.replace('/', "--")));
+        let snapshot = repo.join("snapshots").join("main");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(repo.join("refs")).unwrap();
+        fs::write(repo.join("refs").join("main"), "main").unwrap();
+        fs::write(snapshot.join(filename), content).unwrap();
+    }
+
+    /// The three answers a caller choosing a model must be able to tell
+    /// apart: the model said so, the table said so, and nobody has looked.
+    #[test]
+    fn prefix_provenance_separates_a_silent_model_from_an_unread_one() {
+        let dir = tempdir().unwrap();
+
+        let (_, unread) = describe(dir.path(), "some-org/never-downloaded");
+        assert_eq!(unread, PrefixSource::Undetermined);
+
+        let (curated, source) = describe(dir.path(), "intfloat/multilingual-e5-small");
+        assert_eq!(source, PrefixSource::Curated);
+        assert_eq!(curated.query_prefix, "query: ");
+
+        write_cached_aux(
+            dir.path(),
+            "some-org/silent",
+            "config_sentence_transformers.json",
+            "{}",
+        );
+        let (_, silent) = describe(dir.path(), "some-org/silent");
+        assert_eq!(
+            silent,
+            PrefixSource::NotDocumented,
+            "artifacts were read and named no prefix, which is an answer"
+        );
+
+        write_cached_aux(
+            dir.path(),
+            "some-org/speaks",
+            "config_sentence_transformers.json",
+            r#"{"prompts": {"query": "ask: ", "passage": "text: "}}"#,
+        );
+        let (spoken, source) = describe(dir.path(), "some-org/speaks");
+        assert_eq!(source, PrefixSource::Discovered);
+        assert_eq!(spoken.passage_prefix, "text: ");
+    }
+
+    #[test]
+    fn maximum_input_length_is_read_from_the_model_rather_than_assumed() {
+        let dir = tempdir().unwrap();
+        assert_eq!(
+            describe(dir.path(), "some-org/unknown")
+                .0
+                .max_sequence_length,
+            None
+        );
+
+        write_cached_aux(
+            dir.path(),
+            "some-org/bounded",
+            "sentence_bert_config.json",
+            r#"{"max_seq_length": 512, "do_lower_case": false}"#,
+        );
+        assert_eq!(
+            describe(dir.path(), "some-org/bounded")
+                .0
+                .max_sequence_length,
+            Some(512)
+        );
     }
 }
 

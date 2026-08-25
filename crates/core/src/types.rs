@@ -791,6 +791,89 @@ pub struct ModelDescriptor {
     pub preferred_batch_size: Option<usize>,
 }
 
+/// Where a model's retrieval prefixes came from, and whether the answer is
+/// known at all.
+///
+/// A prefix is not cosmetic — Underdog measured the same model putting the
+/// right answer at rank 52 with its query prefix and rank 1792 without it — so
+/// a consumer choosing a model needs to know not only what the prefixes are
+/// but whether anything has actually established them.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixSource {
+    /// Parsed from the model's own auxiliary config, which is authoritative.
+    Discovered,
+    /// Supplied by the curated table, for models that document their
+    /// convention only in the model card.
+    Curated,
+    /// The artifacts are here, they were read, and they name no prefix: this
+    /// model takes none.
+    NotDocumented,
+    /// The model is not local and nothing here has labelled it, so whether it
+    /// needs prefixes cannot be known until it is downloaded.
+    Undetermined,
+}
+
+/// Everything a consumer can learn about an embedding model *without* loading
+/// it, so that the choice of model is made where the models are.
+///
+/// This is deliberately more than [`ModelDescriptor`]. A descriptor answers
+/// "what may I show in a picker"; this answers "what would embedding under
+/// this model actually mean" — the dimension, the input recipe, whether the
+/// artifacts are here — which is what a caller migrating a corpus has to know
+/// before it commits. Every field is either something Wilkes can establish or
+/// an explicit absence; nothing here is inferred from a model's name.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EmbedderCapability {
+    pub engine: EmbeddingEngine,
+    /// The id this engine takes back: a catalogue key for fastembed, a
+    /// HuggingFace repository id for the engines that load one directly.
+    pub model_id: String,
+    pub display_name: String,
+    pub description: String,
+    /// The weights this model is, when the engine names a repository. Absent
+    /// where the engine's catalogue does not expose one.
+    pub repository_id: Option<String>,
+    /// The width of the vectors this model produces.
+    ///
+    /// `None` is a real answer and not a failure: a model the user added by
+    /// hand has no catalogue entry, and its dimension is a property of the
+    /// weights that only the first load reveals. A caller must not fill that
+    /// in from a picker — it is the one mistake a rebuilt corpus cannot
+    /// recover from.
+    pub dimension: Option<usize>,
+    /// Widths this model may be truncated to. One entry — its own dimension —
+    /// until an engine here implements a truncation contract; never a claim
+    /// copied from a model card Wilkes cannot honour.
+    pub supported_dimensions: Vec<usize>,
+    pub query_prefix: Option<String>,
+    pub passage_prefix: Option<String>,
+    pub prefix_source: PrefixSource,
+    /// Longest input the model accepts, when its own config says so.
+    pub max_input_tokens: Option<usize>,
+    /// Whether the artifacts are on this machine already.
+    pub locally_available: bool,
+    /// Bytes on disk once installed, where they are known — from disk for a
+    /// cached model, and otherwise only after an explicit size fetch.
+    pub size_bytes: Option<u64>,
+    pub preferred_batch_size: Option<usize>,
+    /// True for the entries the engine's own catalogue lists, false for a
+    /// model the user added by hand.
+    pub catalogued: bool,
+}
+
+/// What this Wilkes can embed with, as one answer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EmbedderCapabilityManifest {
+    pub engines: Vec<EmbeddingEngine>,
+    /// The input roles the managed surface can produce vectors for. A role is
+    /// implied by the endpoint that embeds — `chunks/search` embeds a query,
+    /// import and `embed/text` embed passages — so this names what a consumer
+    /// can ask for, not a flag it may set.
+    pub roles: Vec<String>,
+    pub models: Vec<EmbedderCapability>,
+}
+
 // ── Generation ────────────────────────────────────────────────────────────────
 
 /// The weights repo id of a generation model. The sibling of `EmbedderModel`.

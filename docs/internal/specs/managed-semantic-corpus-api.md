@@ -52,11 +52,13 @@ reuse the key for different bytes or a different recipe is refused.
 - `POST /api/integrations/underdog/backup`
 - `POST /api/integrations/underdog/restore`
 
-The catalogue routes are the exception to everything below:
+The catalogue routes and the embedder manifest are the exception to everything
+below:
 
 - `POST /api/integrations/underdog/catalogue/search`
 - `POST /api/integrations/underdog/catalogue/sync`
 - `GET /api/integrations/underdog/catalogue/status`
+- `GET /api/integrations/underdog/embed/models`
 
 They name no `corpus_id` and no embedding space, and they do not pass through
 `managed_context`. A catalogue record describes a document nobody here holds
@@ -73,6 +75,37 @@ subject is better served by a course than a textbook, but a textbook still
 teaches it. Filtering to a single preferred kind hides every provider that
 publishes at another grain, and on this mirror that is most of them: only one
 provider publishes courses. An unknown name is a `400` that names it.
+
+## What this Wilkes can embed with
+
+`GET /api/integrations/underdog/embed/models` answers what choosing a model
+would *mean*, so that the choice is made where the models are. It is asked
+before a corpus in the target space exists, which is why it is unscoped: it
+describes the host's embedders and reads none of the user's documents.
+
+The response is `{ engines, roles, models }`. `roles` names the input roles the
+managed surface can produce vectors for — a role is implied by the endpoint
+(`chunks/search` embeds a query, import and `embed/text` embed passages), not a
+flag a caller sets. Each model carries its engine, the `model_id` this API
+takes back, the `repository_id` its weights and config files live in, the
+`dimension` and `supported_dimensions`, the `query_prefix`/`passage_prefix` its
+recipe requires with a `prefix_source`, `max_input_tokens` where the model's own
+config states one, `locally_available`, `size_bytes`, and `catalogued`.
+
+Two absences are answers rather than failures:
+
+- `dimension` is `null` for a model the user added by hand. The width of the
+  vectors is a property of weights nobody has loaded, and a caller that fills it
+  in from a picker builds a corpus whose every later vector disagrees with it.
+- `prefix_source` distinguishes `discovered` (the model's own config said so),
+  `curated` (the table for models that document their convention only in the
+  model card), `not_documented` (the artifacts are here, they were read, and
+  they name no prefix), and `undetermined` (nothing local, nothing labelled —
+  the question is open until the model is downloaded).
+
+`supported_dimensions` holds one entry, the model's own. Wilkes does not yet
+implement a truncation contract, and a Matryoshka width copied off a model card
+would be a claim it could not honour.
 
 Every operation after ensure names `corpus_id` and the
 `expected_embedding_space_id` returned by ensure/status. A mismatch is a hard
