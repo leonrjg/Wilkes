@@ -36,6 +36,13 @@
 
 ### Fixed
 
+- Downloading the same content to the same name reports it as already present
+  instead of refusing. The name was checked before the request, so a fetch that
+  succeeded and failed downstream left a file that made every retry impossible
+  — the second attempt would have written exactly the same bytes. Different
+  content under the same name is still refused and the existing file is still
+  never overwritten.
+
 - A download whose URL ends without a file extension is named from the
   server's content type instead of being saved under a name nothing can type.
   LibreTexts serves whole books from `.../download/<id>/pdf`, which previously

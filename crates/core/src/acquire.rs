@@ -90,12 +90,6 @@ pub async fn download_to_root(
         return Err("filename must be a single file name without directories.".to_string());
     }
     let target = root.join(filename_path);
-    if target.exists() {
-        return Err(format!(
-            "Refusing to overwrite existing file: {}",
-            target.display()
-        ));
-    }
 
     let response = reqwest::Client::new()
         .get(url)
@@ -132,14 +126,7 @@ pub async fn download_to_root(
                      we can name; pass an explicit filename."
                 ));
             };
-            let renamed = target.with_extension(extension);
-            if renamed.exists() {
-                return Err(format!(
-                    "Refusing to overwrite existing file: {}",
-                    renamed.display()
-                ));
-            }
-            renamed
+            target.with_extension(extension)
         }
         _ => target,
     };
@@ -152,6 +139,29 @@ pub async fn download_to_root(
         return Err(format!(
             "Download exceeds the {} MiB limit.",
             MAX_DOWNLOAD_BYTES / 1024 / 1024
+        ));
+    }
+    // The name is checked here rather than before the request, because
+    // whether an existing file is a collision depends on what is in it. A
+    // caller that fetches the same record twice — an acquisition retried after
+    // the import failed, say — writes the same bytes to the same name, and
+    // refusing that is refusing a no-op: the second attempt could never
+    // succeed, and the first one's leftovers would have to be deleted by hand
+    // before the button worked again. Different content under the same name is
+    // still a refusal, and the user's file is still never overwritten.
+    if target.exists() {
+        let existing = std::fs::read(&target)
+            .map_err(|error| format!("Failed to read {}: {error}", target.display()))?;
+        if Sha256::digest(&existing) == Sha256::digest(&bytes) {
+            return Ok(DownloadResponse {
+                path: display_path(&target),
+                bytes: bytes.len(),
+                already_present: true,
+            });
+        }
+        return Err(format!(
+            "Refusing to overwrite existing file: {}",
+            target.display()
         ));
     }
     if let Some(existing) = find_file_with_content(root, &target, &bytes)? {
@@ -226,7 +236,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn download_rejects_path_traversal_and_existing_files() {
+    async fn download_rejects_a_filename_with_a_path_in_it() {
         let dir = tempdir().unwrap();
         let traversal = download_to_root(
             dir.path(),
@@ -238,20 +248,68 @@ mod tests {
         .await
         .unwrap_err();
         assert!(traversal.contains("single file name"));
+        // Refused before anything left the machine: the name is wrong on its
+        // own terms and no request could make it right.
+        assert!(!dir.path().join("paper.pdf").exists());
+    }
+
+    /// A file already there under the same name and holding different content
+    /// is a real collision, and the existing file survives it.
+    #[tokio::test]
+    async fn download_refuses_to_overwrite_a_different_file_of_the_same_name() {
+        let dir = tempdir().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/paper.pdf")
+            .with_status(200)
+            .with_body(b"downloaded")
+            .create_async()
+            .await;
 
         let existing = dir.path().join("paper.pdf");
         std::fs::write(&existing, b"existing").unwrap();
-        let overwrite = download_to_root(
+        let refusal = download_to_root(
             dir.path(),
             DownloadParams {
-                url: "https://example.test/paper.pdf".to_string(),
+                url: format!("{}/paper.pdf", server.url()),
                 filename: Some("paper.pdf".to_string()),
             },
         )
         .await
         .unwrap_err();
-        assert!(overwrite.contains("Refusing to overwrite"));
-        assert_eq!(std::fs::read(existing).unwrap(), b"existing");
+        assert!(refusal.contains("Refusing to overwrite"), "{refusal}");
+        assert_eq!(std::fs::read(&existing).unwrap(), b"existing");
+        mock.assert_async().await;
+    }
+
+    /// Fetching the same record twice is a no-op, not a refusal.
+    ///
+    /// The live case this comes from: an admission downloaded a book, the
+    /// import after it failed, and every retry then died on the leftover file
+    /// — a button that could not be pressed a second time until someone
+    /// deleted a file by hand.
+    #[tokio::test]
+    async fn downloading_the_same_content_to_the_same_name_reports_it_as_present() {
+        let dir = tempdir().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/paper.pdf")
+            .with_status(200)
+            .with_body(b"the same bytes")
+            .expect(2)
+            .create_async()
+            .await;
+        let params = || DownloadParams {
+            url: format!("{}/paper.pdf", server.url()),
+            filename: Some("paper.pdf".to_string()),
+        };
+
+        let first = download_to_root(dir.path(), params()).await.unwrap();
+        assert!(!first.already_present);
+        let second = download_to_root(dir.path(), params()).await.unwrap();
+        assert!(second.already_present, "a second fetch is not a collision");
+        assert_eq!(second.path, first.path);
+        mock.assert_async().await;
     }
 
     #[test]
