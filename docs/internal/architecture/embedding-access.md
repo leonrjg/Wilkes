@@ -65,7 +65,7 @@ query, `embed_passages` for the index
 | model | `prompts` |
 |---|---|
 | `Snowflake/snowflake-arctic-embed-m`, `-l`, `-m-v1.5` | query prefix present |
-| `mixedbread-ai/mxbai-embed-large-v1` | query **and** passage present |
+| `mixedbread-ai/mxbai-embed-large-v1` | query, document **and** passage present |
 | `BAAI/bge-base-en-v1.5`, `bge-large-en-v1.5` | absent |
 | `nomic-embed-text-v1.5`, `multilingual-e5-large-instruct` | absent |
 | `Alibaba-NLP/gte-modernbert-base`, `nomic-ai/modernbert-embed-base` | absent |
@@ -251,13 +251,13 @@ Not a recommendation to rotate — that is Underdog's call and
 `EMBEDDING_MODEL_CHANGE.md` records that online rotation is not an operational
 path yet. What the assessment says about the choice:
 
-* **Candle, not fastembed.** Custom models, Metal, and the prefix path that
-  actually works.
+* **Candle for a model nobody has catalogued.** Custom models and Metal are
+  its advantages, and they only apply to a model outside fastembed's list —
+  which arctic-embed and mxbai are not (corrected below).
 * **`Snowflake/snowflake-arctic-embed-m` (768)** is the best fit for the
-  measured failure: retrieval-trained with hard negatives, already in Candle's
-  catalogue, and one of the few models that ships the query prompt so §2's
-  machinery fires. `mxbai-embed-large-v1` (1024) is the step up, and ships both
-  prompts.
+  measured failure: retrieval-trained with hard negatives, and one of the few
+  models that ships the query prompt so §2's machinery fires.
+  `mxbai-embed-large-v1` (1024) is the step up, and ships both prompts.
 * **Not `all-mpnet-base-v2`.** Same symmetric-similarity family as the current
   pin, just larger: more capacity for the wrong objective.
 * **§7 first, or the query prefix never reaches a query.**
@@ -276,3 +276,59 @@ path yet. What the assessment says about the choice:
   adjacent band on the record `"econometrics"` already reaches at 0.578, and
   the cognitive-science course should fall below it. If neither moves, the
   failure is not the bi-encoder's objective and §6.3's reranker is the lead.
+
+
+---
+
+## 10. What has since been built, and what the measurement said (2026-08-25)
+
+Written the same day as the assessment above, after Underdog ran §9's test.
+Where this contradicts a section above, this wins.
+
+**Two corrections of fact.** `Snowflake/snowflake-arctic-embed-m` is in
+fastembed 5.13's catalogue, along with the rest of the arctic family and
+`mxbai-embed-large-v1` — so §8's "Candle, not fastembed" does not apply to
+either candidate, and the engine choice is open. And mxbai ships three prompts,
+not two: `query`, `document` and `passage`.
+
+**§9's acceptance criterion was in the wrong currency.** It asked whether
+`"causal inference"` clears the band `"econometrics"` reaches at 0.578. Cosine
+magnitudes are not comparable across models — the best similarity any probe
+reaches anywhere is 0.781 on the incumbent, 0.483 on arctic and 0.838 on
+mxbai — so the comparable statistic is rank. Underdog's ACQUISITION §12i has
+the full table; the short version is that both candidates improve the right
+answer's rank on every probe, 159 → 52 → 7 on the bare one, and neither
+reverses the specific pair §12e is named for. The residual is a pairwise
+ordering failure, which is §6.3's territory.
+
+**§7 is built.** `chunks/search` now takes `{"text": …}` as an alternative to
+`{"vector": …}` and embeds it with `embed_query`; the role is implied by the
+endpoint and cannot be set wrongly by a caller. `embed/text` is unchanged and
+still answers in the passage role, which is right for the vectors it returns
+because they are stored. Verified end to end against the live managed corpus:
+a text probe and the two-call embed-then-search path return identical hits and
+identical similarities under the pinned model, and a probe naming both forms or
+neither is refused with 422.
+
+That this changes no number today is the point — it is what stops a rotation
+from silently costing what §12i measured, which on the same model and corpus
+is the right answer at rank 52 with its query prefix and 1792 without it.
+
+**§6.1 is fixed, but not as this note proposed.** The proposal was to have the
+model registry own prefixes and delete the discovery path from fastembed.
+Leon's call, and it is the better one: discovery stays primary and unchanged,
+so a model nobody here has labelled behaves exactly as it did before. What was
+added is a curated table consulted *only* for a prefix the parsed config did
+not supply — BGE, E5, nomic and the ONNX mirrors of arctic and mxbai, which is
+where §2's sparsity actually bites. The wrong cache key is fixed separately:
+`fetch_aux_configs` and `load_prefixes` now receive `info.model_code` rather
+than the catalogue enum name.
+
+**§6.2 is fixed.** `managed_chunk_search` normalizes each probe on entry and
+refuses one with no direction, so the value it calls `similarity` is a cosine
+by construction rather than by the caller's good manners. This retired a test
+named `…_preserves_probe_scale`, which pinned the opposite rule: a probe of
+magnitude 0.5 scored 0.5 against a chunk pointing the same way, and the shared
+`min_similarity` floor therefore filtered a short probe harder than a long one.
+
+**§5 stands untouched**, and its re-measure trigger is unchanged.
