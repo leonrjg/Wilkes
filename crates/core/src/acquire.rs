@@ -36,6 +36,26 @@ fn display_path(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// The extension for a content type, for the cases a library actually serves.
+///
+/// Deliberately a short closed list rather than a mime database: an unknown
+/// type is reported, not guessed at, because a wrong extension produces a file
+/// that fails later and further away.
+fn extension_for_mime(mime: &str) -> Option<&'static str> {
+    match mime {
+        "application/pdf" => Some("pdf"),
+        "application/epub+zip" => Some("epub"),
+        "text/plain" => Some("txt"),
+        "text/markdown" => Some("md"),
+        "text/html" => Some("html"),
+        "application/json" => Some("json"),
+        "application/zip" => Some("zip"),
+        "application/msword" => Some("doc"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Some("docx"),
+        _ => None,
+    }
+}
+
 pub async fn download_to_root(
     root: &Path,
     params: DownloadParams,
@@ -93,6 +113,37 @@ pub async fn download_to_root(
             MAX_DOWNLOAD_BYTES / 1024 / 1024
         ));
     }
+    // A URL whose last path segment carries no extension leaves a file that
+    // nothing downstream can type: LibreTexts serves whole books from
+    // `.../download/<id>/pdf`, which yields a file literally named `pdf`, and
+    // an importer that reads the kind off the name then refuses it. When the
+    // caller did not name the file and the URL gave no extension, take one
+    // from what the server said it was sending.
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or(value).trim().to_string());
+    let target = match (target.extension(), content_type.as_deref()) {
+        (None, Some(mime)) => {
+            let Some(extension) = extension_for_mime(mime) else {
+                return Err(format!(
+                    "Download has no file extension and its content type {mime:?} is not one \
+                     we can name; pass an explicit filename."
+                ));
+            };
+            let renamed = target.with_extension(extension);
+            if renamed.exists() {
+                return Err(format!(
+                    "Refusing to overwrite existing file: {}",
+                    renamed.display()
+                ));
+            }
+            renamed
+        }
+        _ => target,
+    };
+
     let bytes = response
         .bytes()
         .await
@@ -201,6 +252,16 @@ mod tests {
         .unwrap_err();
         assert!(overwrite.contains("Refusing to overwrite"));
         assert_eq!(std::fs::read(existing).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn a_content_type_names_a_file_the_url_left_unnamed() {
+        // The real case: LibreTexts serves a whole book from `.../<id>/pdf`.
+        assert_eq!(extension_for_mime("application/pdf"), Some("pdf"));
+        assert_eq!(extension_for_mime("text/markdown"), Some("md"));
+        // Unknown types are refused rather than guessed: a wrong extension
+        // produces a file that fails somewhere further away.
+        assert_eq!(extension_for_mime("application/x-nonsense"), None);
     }
 
     #[test]

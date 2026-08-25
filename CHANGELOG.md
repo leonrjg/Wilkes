@@ -26,8 +26,19 @@
   reported as `kind='author'` over MCP and labelled `Author` in the result
   list.
 
+### Fixed
+
+- A download whose URL ends without a file extension is named from the
+  server's content type instead of being saved under a name nothing can type.
+  LibreTexts serves whole books from `.../download/<id>/pdf`, which previously
+  produced a file called `pdf` that the managed importer then refused. An
+  unrecognised content type is reported rather than guessed at.
+
 ### Changed
 
+- The downloader behind the `download` MCP tool moved to `wilkes-core` so the
+  catalogue acquisition route shares it. One set of answers to may-this-be-
+  fetched, where-may-it-land and is-this-already-here.
 - PDF extraction produces one canonical reading of a document instead of a
   transcription of its layout: words the typesetter broke across a line are
   joined on the document's own vocabulary, repeating page numbers and running
