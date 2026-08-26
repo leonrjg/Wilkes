@@ -15,7 +15,7 @@ function makePdf(annotations: unknown[]) {
       getAnnotations: vi.fn().mockResolvedValue(annotations),
       // Identity-ish mapping at scale 1 keeps the rect math easy to assert.
       getViewport: () => ({
-        convertToViewportRectangle: (rect: number[]) => rect,
+        convertToViewportPoint: (x: number, y: number) => [x, y],
       }),
     }),
   } as never;

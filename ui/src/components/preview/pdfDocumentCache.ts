@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getDocument } from "pdfjs-dist";
-import type { PDFDocumentProxy } from "pdfjs-dist";
+import type { PDFDocumentLoadingTask, PDFDocumentProxy } from "pdfjs-dist";
 
 // The parsed PDF documents (`PDFDocumentProxy`) for the N most-recently opened
 // files are kept alive here so switching back to a recent document is instant.
@@ -15,6 +15,10 @@ interface CacheEntry {
   promise: Promise<PDFDocumentProxy>;
   /** The resolved proxy once available, for synchronous revisit rendering. */
   proxy: PDFDocumentProxy | null;
+  /** Teardown lives on the loading task, not the proxy: pdf.js 6 removed
+   *  `PDFDocumentProxy.destroy()`, leaving the task as the single owner of the
+   *  worker and the network requests it started. */
+  loadingTask: PDFDocumentLoadingTask;
 }
 
 // Insertion order in a Map is its LRU order: the first key is least-recently
@@ -34,11 +38,9 @@ function evictExcess() {
     // The evicted document is, by definition, not the active one (the active
     // document is always the most-recently touched entry), so destroying it
     // cannot pull the rug from under a mounted viewer.
-    oldest?.promise
-      .then((proxy) => proxy.destroy())
-      .catch(() => {
-        /* Load already failed and was removed below; nothing to destroy. */
-      });
+    oldest?.loadingTask.destroy().catch((error) => {
+      console.error("Failed to destroy evicted PDF document:", error);
+    });
   }
 }
 
@@ -56,8 +58,8 @@ export function loadPdfDocument(url: string): Promise<PDFDocumentProxy> {
     return existing.promise;
   }
 
-  const loadingTask = getDocument(url);
-  const entry: CacheEntry = { proxy: null, promise: loadingTask.promise };
+  const loadingTask = getDocument({ url });
+  const entry: CacheEntry = { proxy: null, promise: loadingTask.promise, loadingTask };
   entry.promise = loadingTask.promise.then(
     (proxy) => {
       entry.proxy = proxy;

@@ -57,7 +57,11 @@ export default function PdfTextLayer({ pdf, pageNumber, scale }: Props) {
         // div, so we set both here. --user-unit defaults to 1, so total == scale.
         builder.div.style.setProperty("--scale-factor", String(scale));
         builder.div.style.setProperty("--total-scale-factor", String(scale));
-        await builder.render({ viewport });
+        // `images` drives pdf.js 6's right-click-to-extract-image placeholders,
+        // which this reader does not offer. `TextLayer` guards it
+        // (`if (this.#imagesHandler)`), so omitting it is supported; only the
+        // published type declares it required.
+        await builder.render({ viewport } as Parameters<TextLayerBuilder["render"]>[0]);
         if (cancelled) {
           builder.cancel();
           return;

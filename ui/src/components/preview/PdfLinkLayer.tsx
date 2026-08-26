@@ -188,10 +188,18 @@ export default function PdfLinkLayer({
           // Only annotations that actually navigate somewhere are clickable.
           if (!dest && !url) continue;
 
-          // convertToViewportRectangle maps the PDF-space rect (bottom-left
-          // origin) to top-left CSS pixels at the render scale; corners may come
-          // back unordered, so normalise to left/top/width/height.
-          const [x1, y1, x2, y2] = viewport.convertToViewportRectangle(annotation.rect);
+          // Map the PDF-space rect (bottom-left origin) to top-left CSS pixels
+          // at the render scale. pdf.js 6 dropped `convertToViewportRectangle`;
+          // it was exactly this -- the same affine transform applied to the two
+          // corners. They may come back unordered, so normalise below.
+          const [x1, y1] = viewport.convertToViewportPoint(
+            annotation.rect[0],
+            annotation.rect[1],
+          );
+          const [x2, y2] = viewport.convertToViewportPoint(
+            annotation.rect[2],
+            annotation.rect[3],
+          );
           rects.push({
             key: `${index}`,
             left: Math.min(x1, x2),
