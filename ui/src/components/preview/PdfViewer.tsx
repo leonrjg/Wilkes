@@ -11,6 +11,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { Search as SearchIcon, List } from "react-feather";
 import { GlobalWorkerOptions } from "pdfjs-dist";
 import type { PDFDocumentProxy } from "pdfjs-dist";
+import "./readableStreamAsyncIterator";
 import PdfPageCanvas from "./PdfPageCanvas";
 import type { BoundingBox } from "./documentCoordinates";
 import { usePdfInnerSearch, type InnerMatch } from "./usePdfInnerSearch";

@@ -1,3 +1,4 @@
+import "./readableStreamAsyncIterator";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 
 export interface PositionedPdfText {
