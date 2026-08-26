@@ -1,6 +1,5 @@
 import { screen, act, fireEvent } from "@testing-library/react";
-import { renderWithReaderHost as render } from "../../test/readerHost";
-import { useSettingsStore } from "../../stores/useSettingsStore";
+import { renderWithReaderHost as render } from "./testing/readerHarness";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import CodeViewer from "./CodeViewer";
 import { EditorView } from "@codemirror/view";
@@ -72,7 +71,6 @@ describe("CodeViewer", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     viewBuilds.count = 0;
-    useSettingsStore.setState({ colorScheme: "light" });
   });
 
   it("renders correctly", () => {
@@ -88,17 +86,16 @@ describe("CodeViewer", () => {
   });
 
   it("takes its appearance from the host, not from the document", () => {
-    useSettingsStore.setState({ colorScheme: "light" });
     // A contradictory class on the document proves the reader is no longer
     // reading it: the host's answer has to win.
     document.documentElement.classList.add("dark");
-    render(<CodeViewer {...defaultProps} />);
+    const { setHost } = render(<CodeViewer {...defaultProps} />, {
+      host: { colorScheme: "light" },
+    });
     const buildsWhileLight = viewBuilds.count;
     expect(buildsWhileLight).toBeGreaterThan(0);
 
-    act(() => {
-      useSettingsStore.setState({ colorScheme: "dark" });
-    });
+    setHost({ colorScheme: "dark" });
 
     // Switching appearance swaps the syntax theme, which rebuilds the editor.
     // Had the reader still been reading the document class, the contradictory

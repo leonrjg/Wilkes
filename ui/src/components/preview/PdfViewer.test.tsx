@@ -1,10 +1,9 @@
 import { screen, fireEvent, act, waitFor } from "@testing-library/react";
-import { renderWithReaderHost as render, selectionSlot } from "../../test/readerHost";
+import { renderWithReaderHost as render, stubSelectionSlot } from "./testing/readerHarness";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createRef, StrictMode } from "react";
 import PdfViewer, { type PdfReaderHandle } from "./PdfViewer";
 import { savePdfScrollPosition } from "./pdfScrollMemory";
-import { useSettingsStore } from "../../stores/useSettingsStore";
 
 const { mockVirtualizer } = vi.hoisted(() => ({
   mockVirtualizer: {
@@ -224,13 +223,11 @@ describe("PdfViewer", () => {
     highlight_bbox: { x: 10, y: 10, width: 50, height: 20 },
     onRenderSuccess: vi.fn(),
   };
+  // The auto-zoom target is a host setting; most tests want the default one.
+  const defaultHost = { pdfAutoZoomTargetPx: 15.5 };
 
   beforeEach(() => {
     vi.clearAllMocks();
-    useSettingsStore.setState({
-      settings: { pdf_auto_zoom_target_px: 15.5 } as never,
-      colorScheme: "light",
-    });
     mockPdfDoc.value = {
       numPages: 10,
       getPage: async (_pageNumber: number) => ({
@@ -279,7 +276,7 @@ describe("PdfViewer", () => {
   });
 
   it("renders correctly and handles load success", async () => {
-    render(<PdfViewer {...defaultProps} />);
+    render(<PdfViewer {...defaultProps} />, { host: defaultHost });
     expect(screen.getByTestId("pdf-page-1")).toBeInTheDocument();
 
     // Wait for async load success
@@ -292,7 +289,7 @@ describe("PdfViewer", () => {
   });
 
   it("changes zoom in 10 percent steps", async () => {
-    render(<PdfViewer {...defaultProps} />);
+    render(<PdfViewer {...defaultProps} />, { host: defaultHost });
 
     await act(async () => {
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -332,6 +329,7 @@ describe("PdfViewer", () => {
       <StrictMode>
         <PdfViewer {...defaultProps} />
       </StrictMode>,
+      { host: defaultHost },
     );
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -341,12 +339,11 @@ describe("PdfViewer", () => {
   });
 
   it("uses the configured auto-zoom target", async () => {
-    useSettingsStore.setState({
-      settings: { pdf_auto_zoom_target_px: 18 } as never,
-    });
     mockPdfDoc.value = sizedDoc(9, 612);
 
-    render(<PdfViewer {...defaultProps} url="configured-target.pdf" />);
+    render(<PdfViewer {...defaultProps} url="configured-target.pdf" />, {
+      host: { pdfAutoZoomTargetPx: 18 },
+    });
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     });
@@ -359,7 +356,7 @@ describe("PdfViewer", () => {
     // above target, so the computed zoom is floored to 1.0 (never shrink).
     mockPdfDoc.value = sizedDoc(12, 439);
 
-    render(<PdfViewer {...defaultProps} />);
+    render(<PdfViewer {...defaultProps} />, { host: defaultHost });
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     });
@@ -372,7 +369,7 @@ describe("PdfViewer", () => {
     // 15.5/16 < 1x, inside the deadband, so no setZoom fires.
     mockPdfDoc.value = sizedDoc(16, 900);
 
-    render(<PdfViewer {...defaultProps} />);
+    render(<PdfViewer {...defaultProps} />, { host: defaultHost });
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     });
@@ -382,7 +379,7 @@ describe("PdfViewer", () => {
 
   it("does not auto-zoom a textless (scanned) document", async () => {
     // mockPdfDoc defaults to empty text content -> no font samples.
-    render(<PdfViewer {...defaultProps} />);
+    render(<PdfViewer {...defaultProps} />, { host: defaultHost });
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     });
@@ -393,7 +390,7 @@ describe("PdfViewer", () => {
   it("uses an opaque white canvas background so PDF composition stays stable", async () => {
     document.documentElement.classList.add("dark");
 
-    render(<PdfViewer {...defaultProps} />);
+    render(<PdfViewer {...defaultProps} />, { host: defaultHost });
 
     await act(async () => {
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -404,7 +401,7 @@ describe("PdfViewer", () => {
   });
 
   it("renders highlight bounding box", async () => {
-    render(<PdfViewer {...defaultProps} />);
+    render(<PdfViewer {...defaultProps} />, { host: defaultHost });
     
     // Wait for async load success to set scale
     await act(async () => {
@@ -428,7 +425,7 @@ describe("PdfViewer", () => {
       isSearching: false,
     };
 
-    render(<PdfViewer {...defaultProps} />);
+    render(<PdfViewer {...defaultProps} />, { host: defaultHost });
 
     expect(mockVirtualizer.scrollToIndex).toHaveBeenCalledWith(1, { align: "start" });
     const container = document.querySelector<HTMLElement>(".overflow-auto")!;
@@ -459,7 +456,7 @@ describe("PdfViewer", () => {
       isSearching: false,
     };
 
-    render(<PdfViewer {...defaultProps} />);
+    render(<PdfViewer {...defaultProps} />, { host: defaultHost });
 
     const container = document.querySelector<HTMLElement>(".overflow-auto")!;
     const page = document.querySelector<HTMLElement>('[data-page-number="1"]')!;
@@ -486,7 +483,7 @@ describe("PdfViewer", () => {
       isSearching: false,
     };
 
-    render(<PdfViewer {...defaultProps} />);
+    render(<PdfViewer {...defaultProps} />, { host: defaultHost });
     fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
 
     const container = document.querySelector<HTMLElement>(".overflow-auto")!;
@@ -520,13 +517,13 @@ describe("PdfViewer", () => {
     };
     mockUsePdfInnerSearch.value = { matches, isSearching: false };
 
-    const { rerender } = render(<PdfViewer {...defaultProps} />);
+    const { rerender } = render(<PdfViewer {...defaultProps} />, { host: defaultHost });
 
     mockUseDocumentFind.value = {
       ...mockUseDocumentFind.value,
       currentIdx: 1,
     };
-    rerender(<PdfViewer {...defaultProps} />);
+    rerender(<PdfViewer {...defaultProps} />, { host: defaultHost });
 
     const container = document.querySelector<HTMLElement>(".overflow-auto")!;
     const page = document.querySelector<HTMLElement>('[data-page-number="1"]')!;
@@ -599,20 +596,18 @@ describe("PdfViewer", () => {
   });
 
   it("applies the dark treatment from the host, not from the document", async () => {
-    useSettingsStore.setState({ colorScheme: "dark" });
     // Contradictory state on the document: if the reader were still reading the
     // class it would come out light here.
     document.documentElement.classList.remove("dark");
     document.documentElement.classList.add("light");
 
-    const { rerender } = render(<PdfViewer {...defaultProps} />);
+    const { setHost } = render(<PdfViewer {...defaultProps} />, {
+      host: { ...defaultHost, colorScheme: "dark" },
+    });
     // `.pdf-dark-mode .pdf-page canvas` is what inverts the page.
     expect(document.querySelector(".pdf-dark-mode")).not.toBeNull();
 
-    await act(async () => {
-      useSettingsStore.setState({ colorScheme: "light" });
-    });
-    rerender(<PdfViewer {...defaultProps} />);
+    setHost({ colorScheme: "light" });
     expect(document.querySelector(".pdf-dark-mode")).toBeNull();
 
     document.documentElement.classList.remove("light");
@@ -791,7 +786,7 @@ describe("PdfViewer", () => {
     render(
       <PdfViewer
         {...defaultProps}
-        slots={{ selectionActions: selectionSlot({ onAddBookmark: vi.fn() }) }}
+        slots={{ selectionActions: stubSelectionSlot() }}
       />,
     );
 
@@ -835,7 +830,7 @@ describe("PdfViewer", () => {
 
     fireEvent.mouseUp(scrollContainer);
 
-    const button = screen.getByRole("button", { name: "Bookmark" });
+    const button = screen.getByRole("button", { name: "Stub action" });
     expect(button.closest(".absolute")).toHaveStyle({ top: "83px", left: "140px" });
   });
 
@@ -843,7 +838,7 @@ describe("PdfViewer", () => {
     render(
       <PdfViewer
         {...defaultProps}
-        slots={{ selectionActions: selectionSlot({ onAddBookmark: vi.fn() }) }}
+        slots={{ selectionActions: stubSelectionSlot() }}
       />,
     );
 
@@ -878,31 +873,23 @@ describe("PdfViewer", () => {
 
     fireEvent.mouseUp(scrollContainer);
 
-    expect(screen.getByRole("button", { name: "Bookmark" }).closest(".absolute")).toHaveStyle({
+    expect(screen.getByRole("button", { name: "Stub action" }).closest(".absolute")).toHaveStyle({
       top: "108px",
       left: "140px",
     });
   });
 
-  it("runs explain and inline ask actions for the selected text", async () => {
-    const onExplainSelection = vi.fn();
-    const onAskSelection = vi.fn();
+  it("holds the selection chrome open while the host has pinned it", async () => {
     render(
       <PdfViewer
         {...defaultProps}
-        slots={{
-          selectionActions: selectionSlot({
-            onAddBookmark: vi.fn(),
-            showChatActions: true,
-            onExplain: onExplainSelection,
-            onAsk: onAskSelection,
-          }),
-        }}
+        slots={{ selectionActions: stubSelectionSlot() }}
       />,
+      { host: defaultHost },
     );
 
     await act(async () => {
-      await new Promise(resolve => setTimeout(resolve, 10));
+      await new Promise((resolve) => setTimeout(resolve, 10));
     });
 
     const scrollContainer = document.querySelector(".overflow-auto") as HTMLElement;
@@ -915,15 +902,8 @@ describe("PdfViewer", () => {
       ({ top: 50, left: 40, width: 600, height: 800, bottom: 850, right: 640, x: 40, y: 50, toJSON: () => ({}) }) as DOMRect;
 
     const selectionDomRect = {
-      top: 70,
-      left: 60,
-      width: 100,
-      height: 20,
-      bottom: 90,
-      right: 160,
-      x: 60,
-      y: 70,
-      toJSON: () => ({}),
+      top: 70, left: 60, width: 100, height: 20,
+      bottom: 90, right: 160, x: 60, y: 70, toJSON: () => ({}),
     } as DOMRect;
     const range = {
       startContainer: pageWrapper,
@@ -931,33 +911,30 @@ describe("PdfViewer", () => {
       getBoundingClientRect: () => selectionDomRect,
       getClientRects: () => [selectionDomRect] as unknown as DOMRectList,
     };
-    const removeAllRanges = vi.fn();
-    vi.spyOn(window, "getSelection").mockReturnValue({
+    const liveSelection = {
       isCollapsed: false,
       rangeCount: 1,
       getRangeAt: () => range,
       toString: () => "selected text",
-      removeAllRanges,
-    } as any);
+      removeAllRanges: vi.fn(),
+    };
+    vi.spyOn(window, "getSelection").mockReturnValue(liveSelection as never);
 
     fireEvent.mouseUp(scrollContainer);
-    fireEvent.click(screen.getByRole("button", { name: "Explain" }));
+    const input = screen.getByPlaceholderText("Stub input");
 
-    expect(onExplainSelection).toHaveBeenCalledWith(
-      expect.objectContaining({ quote: "selected text" }),
-    );
-    expect(removeAllRanges).toHaveBeenCalled();
+    // Host chrome that takes focus collapses the document selection. Pinned, the
+    // reader must not dismiss -- otherwise focusing the chrome destroys it.
+    fireEvent.focus(input);
+    liveSelection.isCollapsed = true;
+    fireEvent(window.document, new Event("selectionchange"));
+    expect(screen.getByPlaceholderText("Stub input")).toBeInTheDocument();
 
-    fireEvent.mouseUp(scrollContainer);
-    fireEvent.click(screen.getByRole("button", { name: "Ask about this" }));
-    fireEvent.change(screen.getByPlaceholderText("Ask about this…"), {
-      target: { value: "Why is this important?" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Send" }));
-
-    expect(onAskSelection).toHaveBeenCalledWith(
-      expect.objectContaining({ quote: "selected text" }),
-      "Why is this important?",
+    // Unpinned, a collapsed selection dismisses as usual.
+    fireEvent.blur(input);
+    fireEvent(window.document, new Event("selectionchange"));
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText("Stub input")).not.toBeInTheDocument(),
     );
   });
 
@@ -983,7 +960,7 @@ describe("PdfViewer", () => {
   });
 
   it("updates the page indicator while scrolling", async () => {
-    render(<PdfViewer {...defaultProps} />);
+    render(<PdfViewer {...defaultProps} />, { host: defaultHost });
 
     await act(async () => {
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -1075,7 +1052,7 @@ describe("PdfViewer", () => {
     // (page 1, no highlight target) must land back on page 3, not page 1.
     savePdfScrollPosition("remembered.pdf", { page: 3, offsetRatio: 0, zoom: 1 });
 
-    render(<PdfViewer url="remembered.pdf" page={1} highlight_bbox={null} onRenderSuccess={vi.fn()} />);
+    render(<PdfViewer url="remembered.pdf" page={1} highlight_bbox={null} onRenderSuccess={vi.fn()} />, { host: defaultHost });
 
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1094,7 +1071,7 @@ describe("PdfViewer", () => {
     savePdfScrollPosition("zoomed.pdf", { page: 3, offsetRatio: 0, zoom: 1.5 });
     mockPdfDoc.value = sizedDoc(9, 612);
 
-    render(<PdfViewer url="zoomed.pdf" page={1} highlight_bbox={null} onRenderSuccess={vi.fn()} />);
+    render(<PdfViewer url="zoomed.pdf" page={1} highlight_bbox={null} onRenderSuccess={vi.fn()} />, { host: defaultHost });
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     });
@@ -1162,7 +1139,7 @@ describe("PdfViewer", () => {
       isOpen: true,
     };
 
-    const { rerender } = render(<PdfViewer {...defaultProps} />);
+    const { rerender } = render(<PdfViewer {...defaultProps} />, { host: defaultHost });
 
     await act(async () => {
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -1175,7 +1152,7 @@ describe("PdfViewer", () => {
       isOpen: false,
     };
 
-    rerender(<PdfViewer {...defaultProps} />);
+    rerender(<PdfViewer {...defaultProps} />, { host: defaultHost });
 
     await act(async () => {
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -1190,7 +1167,7 @@ describe("PdfViewer", () => {
       isOpen: true,
     };
 
-    render(<PdfViewer {...defaultProps} />);
+    render(<PdfViewer {...defaultProps} />, { host: defaultHost });
 
     const input = screen.getByPlaceholderText("Find in document...");
     expect(input.closest(".absolute")).toHaveClass("top-4");
@@ -1199,7 +1176,7 @@ describe("PdfViewer", () => {
 
   it("shows a disabled TOC button when the document has no outline", async () => {
     mockUsePdfOutline.value = null;
-    render(<PdfViewer {...defaultProps} />);
+    render(<PdfViewer {...defaultProps} />, { host: defaultHost });
 
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1213,7 +1190,7 @@ describe("PdfViewer", () => {
 
   it("opens the outline panel when the TOC button is clicked", async () => {
     mockUsePdfOutline.value = [{ title: "Chapter 1", dest: "ch1", url: null, items: [] }];
-    render(<PdfViewer {...defaultProps} />);
+    render(<PdfViewer {...defaultProps} />, { host: defaultHost });
 
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 10));

@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { createRef } from "react";
-import { selectionSlot } from "../../test/readerHost";
+import { stubSelectionSlot } from "./testing/readerHarness";
 import { describe, expect, it, vi } from "vitest";
 import MarkdownViewer, { type MarkdownReaderHandle } from "./MarkdownViewer";
 
@@ -164,13 +164,13 @@ describe("MarkdownViewer", () => {
   });
 
   it("maps a rendered selection back to the existing text bookmark shape", () => {
-    const onAddBookmark = vi.fn();
+    const onSelected = vi.fn();
     render(
       <MarkdownViewer
         documentPath="/notes.md"
         content={"# Title\n\nPick **this** text"}
         highlightRange={{ start: 0, end: 0 }}
-        slots={{ selectionActions: selectionSlot({ onAddBookmark }) }}
+        slots={{ selectionActions: stubSelectionSlot({ onAction: onSelected }) }}
       />,
     );
     const run = Array.from(document.querySelectorAll<HTMLElement>(".markdown-source-run"))
@@ -194,9 +194,9 @@ describe("MarkdownViewer", () => {
     } as unknown as Selection);
 
     fireEvent.mouseUp(run);
-    fireEvent.click(screen.getByRole("button", { name: "Bookmark" }));
+    fireEvent.click(screen.getByRole("button", { name: "Stub action" }));
 
-    expect(onAddBookmark).toHaveBeenCalledWith({
+    expect(onSelected).toHaveBeenCalledWith({
       quote: "this",
       origin: { TextFile: { line: 3, col: 7 } },
       text_range: { start: 16, end: 20 },
