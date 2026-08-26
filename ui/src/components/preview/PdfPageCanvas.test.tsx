@@ -161,6 +161,22 @@ describe("PdfPageCanvas", () => {
     errorSpy.mockRestore();
   });
 
+  it("releases the backing surface when the canvas goes away", async () => {
+    const { page } = makePage();
+    const { unmount } = render(<PdfPageCanvas pdf={makePdf(page)} pageNumber={1} width={600} />);
+    await waitFor(() => expect(page.render).toHaveBeenCalled());
+    const element = document.querySelector("canvas")!;
+    expect(element.width).toBeGreaterThan(0);
+
+    unmount();
+
+    // Without this a document scrolled end to end holds every canvas it ever
+    // painted. Reading the ref in the cleanup instead of capturing the element
+    // here would find null under React 19 and quietly release nothing.
+    expect(element.width).toBe(0);
+    expect(element.height).toBe(0);
+  });
+
   it("cancels an in-flight render when the page is unmounted", async () => {
     const { page, cancel } = makePage();
     const { unmount } = render(<PdfPageCanvas pdf={makePdf(page)} pageNumber={1} width={600} />);
@@ -183,8 +199,11 @@ describe("PdfPageCanvas", () => {
     // dropping this class silently removes both, which no canvas-level
     // assertion would notice.
     const wrapper = document.querySelector(".pdf-page")!;
-    expect(wrapper).toHaveAttribute("data-page-number", "1");
     expect(wrapper.querySelector("canvas")).toBeInTheDocument();
+    // Identity belongs to the reader's virtualized wrapper, which is where
+    // every geometry lookup resolves; a second copy here would give
+    // `querySelectorAll("[data-page-number]")` two candidates per page.
+    expect(wrapper).not.toHaveAttribute("data-page-number");
     // The wrapper itself stays transparent; the white belongs to the canvas.
     expect((wrapper as HTMLElement).style.backgroundColor).toBe("");
   });

@@ -33,19 +33,9 @@ import type { PDFDocumentProxy, PDFPageProxy, RenderTask } from "pdfjs-dist";
  *   * **`page.cleanup()` before each render**, so a re-render starts from
  *     scratch rather than inheriting prior state.
  *
- * Dropped deliberately, in both cases because they were already inert:
- *
- *   * react-pdf set `--scale-factor`, `--total-scale-factor` and `--user-unit`
- *     on the page wrapper. Nothing reads them -- the text layer sets its own on
- *     the builder's div, which is not a descendant of this element.
- *   * react-pdf zeroed the canvas dimensions in an unmount cleanup, to make the
- *     browser release the backing surface. Under React 19 the host ref is
- *     already null by the time a passive effect cleanup runs (verified against
- *     this app's React), so that code never had an element to zero. Carrying it
- *     over would mean shipping a comment that claims a memory optimisation the
- *     code does not perform. Implementing it properly -- capturing the element
- *     rather than reading the ref -- is a real change in memory behaviour and
- *     belongs to a commit that says so.
+ * Dropped deliberately: react-pdf set `--scale-factor`, `--total-scale-factor`
+ * and `--user-unit` on the page wrapper. Nothing reads them -- the text layer
+ * sets its own on the builder's div, which is not a descendant of this element.
  */
 
 interface PdfPageCanvasProps {
@@ -98,14 +88,15 @@ export default function PdfPageCanvas({
 
   return (
     <div
-      // Note: the reader's own virtualized wrapper also carries
-      // `data-page-number`, so each page has two. That predates this component
-      // -- react-pdf emitted this one -- and the reader's geometry code reads
-      // whichever the DOM order gives it. Kept as-is; untangling it is a
-      // behaviour change and belongs to its own commit.
-      data-page-number={pageNumber}
-      // The dark-mode canvas inversion in styles.css hooks onto this class.
-      // It is the reader's own page element, so the reader names it.
+      // Deliberately not `data-page-number`: the reader's virtualized wrapper
+      // carries that, and it is the element every geometry reader in PdfViewer
+      // actually resolves to -- `closest()` from the text layer, which is a
+      // sibling of this element rather than a descendant, and `querySelector`,
+      // which takes the first in document order. This element carried a second
+      // copy only because react-pdf emitted one, leaving `querySelectorAll`
+      // with two candidates per page whose centres differ by half the page gap.
+      // The class is the styling hook (`.pdf-page canvas`, and the dark-mode
+      // inversion); identity belongs to the wrapper.
       className="pdf-page"
       style={{
         position: "relative",
@@ -152,6 +143,24 @@ function PageCanvas({
   // fresh closure; re-running would cancel and repaint the page for nothing.
   const callbacksRef = useRef({ onRenderSuccess, onRenderError });
   callbacksRef.current = { onRenderSuccess, onRenderError };
+
+  // Release the backing surface when this canvas goes away. Zeroing the
+  // dimensions makes browsers drop it immediately; without it, a document
+  // scrolled end to end holds every canvas it ever painted, and at device
+  // resolution those are megabytes each.
+  //
+  // The element is captured here at setup rather than read from the ref in the
+  // cleanup, which is what react-pdf did: under React 19 the host ref is
+  // already null by the time a passive cleanup runs, so reading it there finds
+  // nothing and the release silently never happens.
+  useEffect(() => {
+    const canvas = canvasElement.current;
+    return () => {
+      if (!canvas) return;
+      canvas.width = 0;
+      canvas.height = 0;
+    };
+  }, []);
 
   useEffect(() => {
     const canvas = canvasElement.current;
