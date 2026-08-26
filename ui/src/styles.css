@@ -131,8 +131,12 @@ body,
   height: 100%;
 }
 
-.dark .plain-text-editor .cm-editor,
-.dark .plain-text-editor .cm-gutters {
+/* Keyed off the editor's own dark modifier rather than a `.dark` ancestor:
+   the reader is told its appearance through its host contract, so it can say
+   so itself, and a host that does not stamp `.dark` on the document still gets
+   a dark editor. Mirrors `.pdf-dark-mode` on the PDF reader. */
+.plain-text-editor--dark .cm-editor,
+.plain-text-editor--dark .cm-gutters {
   background-color: #111318;
 }
 

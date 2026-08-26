@@ -386,7 +386,12 @@ export default function DocumentEditor({
           Select and enable a model in Settings → Generation to enable grounded completions.
         </div>
       )}
-      <div ref={containerRef} className="plain-text-editor min-h-0 flex-1 overflow-auto text-sm" />
+      <div
+        ref={containerRef}
+        className={`plain-text-editor min-h-0 flex-1 overflow-auto text-sm ${
+          isDark ? "plain-text-editor--dark" : ""
+        }`}
+      />
       {shown && (
         <div className="relative flex items-center gap-2 border-t border-[var(--border-main)] bg-[var(--bg-header)] px-2 py-1 text-[10px]">
           <button type="button" onClick={() => void openInspector()} className="rounded bg-[var(--bg-active)] px-2 py-0.5 text-[var(--text-main)]">

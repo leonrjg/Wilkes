@@ -315,7 +315,12 @@ export default function CodeViewer({
 
   return (
     <div ref={rootRef} className="relative h-full w-full overflow-hidden">
-      <div ref={containerRef} className="plain-text-editor h-full w-full overflow-auto text-sm" />
+      <div
+        ref={containerRef}
+        className={`plain-text-editor h-full w-full overflow-auto text-sm ${
+          isDark ? "plain-text-editor--dark" : ""
+        }`}
+      />
       <SelectionLayer
         positioned={selectionAction}
         api={selectionSlot.api}
