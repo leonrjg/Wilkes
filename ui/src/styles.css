@@ -144,12 +144,13 @@ body,
   padding: 0 var(--hl-pad);
 }
 
-/* PDF Viewer Styling */
-.react-pdf__Page {
-  background-color: transparent !important;
-}
-
-.react-pdf__Page canvas {
+/* PDF Viewer Styling. The `.pdf-page` wrapper is deliberately left transparent
+   (the reader's own background shows through while a page is mid-render); the
+   white and the shadow belong to the canvas, which is the sheet of paper.
+   This used to need `background-color: transparent !important` to defeat an
+   inline style react-pdf hardcoded on its page div. The reader owns that
+   element now, so it simply does not set one. */
+.pdf-page canvas {
   background-color: white; /* Only used in light mode */
   box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
 }
@@ -199,7 +200,7 @@ body,
   animation-fill-mode: forwards;
 }
 
-.pdf-dark-mode .react-pdf__Page canvas {
+.pdf-dark-mode .pdf-page canvas {
   background-color: white !important;
   filter: invert(0.9) hue-rotate(180deg) brightness(1.1);
   box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.5);

@@ -173,6 +173,22 @@ describe("PdfPageCanvas", () => {
     expect(cancel).toHaveBeenCalled();
   });
 
+  it("carries the class the page styling hooks onto", async () => {
+    const { page } = makePage();
+    render(<PdfPageCanvas pdf={makePdf(page)} pageNumber={1} width={600} />);
+    await waitFor(() => expect(page.render).toHaveBeenCalled());
+
+    // `.pdf-page canvas` carries the sheet-of-paper white and drop shadow, and
+    // `.pdf-dark-mode .pdf-page canvas` the dark-mode inversion. Renaming or
+    // dropping this class silently removes both, which no canvas-level
+    // assertion would notice.
+    const wrapper = document.querySelector(".pdf-page")!;
+    expect(wrapper).toHaveAttribute("data-page-number", "1");
+    expect(wrapper.querySelector("canvas")).toBeInTheDocument();
+    // The wrapper itself stays transparent; the white belongs to the canvas.
+    expect((wrapper as HTMLElement).style.backgroundColor).toBe("");
+  });
+
   it("shows the loading message until the page proxy resolves", async () => {
     const pageProxy = deferred<unknown>();
     const pdf = { getPage: vi.fn(() => pageProxy.promise) } as never;

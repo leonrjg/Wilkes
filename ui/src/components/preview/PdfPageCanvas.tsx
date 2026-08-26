@@ -24,8 +24,10 @@ import type { PDFDocumentProxy, PDFPageProxy, RenderTask } from "pdfjs-dist";
  *     baked into the canvas. Passing DISABLE here would silently drop stamps,
  *     highlights and form field appearances from rendered pages.
  *   * **Hidden until rendered.** The canvas is sized, hidden, drawn, then
- *     revealed, so a partially painted page is never shown. The wrapper's white
- *     background is what the reader sees meanwhile.
+ *     revealed, so a partially painted page is never shown. `canvasBackground`
+ *     is the *render* background, not the wrapper's: the wrapper is transparent
+ *     (see `.pdf-page` in the app stylesheet), so what shows through meanwhile
+ *     is the reader's own background, as it always did.
  *   * **Remount on scale change.** The canvas element is keyed by scale, so a
  *     zoom discards the old element rather than redrawing into it.
  *   * **`page.cleanup()` before each render**, so a re-render starts from
@@ -102,8 +104,10 @@ export default function PdfPageCanvas({
       // whichever the DOM order gives it. Kept as-is; untangling it is a
       // behaviour change and belongs to its own commit.
       data-page-number={pageNumber}
+      // The dark-mode canvas inversion in styles.css hooks onto this class.
+      // It is the reader's own page element, so the reader names it.
+      className="pdf-page"
       style={{
-        backgroundColor: canvasBackground || "white",
         position: "relative",
         minWidth: "min-content",
         minHeight: "min-content",
