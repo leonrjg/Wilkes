@@ -1,12 +1,22 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud, Share2, Edit3 } from "react-feather";
-import CodeViewer from "./preview/CodeViewer";
 import DocumentEditor from "./DocumentEditor";
-import MarkdownViewer from "./preview/MarkdownViewer";
-import PdfViewer from "./preview/PdfViewer";
-import type { DocumentSelection } from "./preview/SelectionActions";
-import { utf8ByteRangeToUtf16Range } from "./preview/textOffsets";
-import { readMarkdownViewMode, saveMarkdownViewMode } from "./preview/textScrollMemory";
+// Everything this pane takes from the readers comes through their public
+// surface -- the same entry point Underdog will import. Reaching past it into
+// a reader's internals is how a shared package stops being shareable.
+import {
+  CodeViewer,
+  MarkdownViewer,
+  PdfViewer,
+  ReaderHostProvider,
+  utf8ByteRangeToUtf16Range,
+  type Decoration,
+  type DocumentSelection,
+  type ElementAnchor,
+  type ReaderHostServices,
+  type SelectionActionsSlot,
+} from "./preview";
+import { readMarkdownViewMode, saveMarkdownViewMode } from "./markdownViewMode";
 import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useChatStore } from "../stores/useChatStore";
@@ -18,11 +28,8 @@ import { useToasts } from "./Toast";
 import { Tooltip } from "./Tooltip";
 import { CopyButton } from "./CopyButton";
 import RelatedDocumentsPane from "./RelatedDocumentsPane";
-import BookmarkDetails from "./preview/BookmarkDetails";
-import type { Decoration, ElementAnchor } from "./preview/decorations";
-import SelectionActions from "./preview/SelectionActions";
-import { ReaderHostProvider, type ReaderHostServices } from "./preview/ReaderHost";
-import type { SelectionActionsSlot } from "./preview/slots";
+import BookmarkDetails from "./BookmarkDetails";
+import SelectionActions from "./SelectionActions";
 import ViewerTabs from "./ViewerTabs";
 import DocumentSummaryPane from "./DocumentSummaryPane";
 import { useGenerationStore } from "../stores/useGenerationStore";

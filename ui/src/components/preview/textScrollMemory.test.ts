@@ -1,10 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  readMarkdownViewMode,
-  readTextScrollPosition,
-  saveMarkdownViewMode,
-  saveTextScrollPosition,
-} from "./textScrollMemory";
+import { readTextScrollPosition, saveTextScrollPosition } from "./textScrollMemory";
 
 describe("textScrollMemory", () => {
   it("keeps source and rendered positions independent", () => {
@@ -21,14 +16,5 @@ describe("textScrollMemory", () => {
 
     expect(readTextScrollPosition("/clamped.md", "source")).toBe(0);
     expect(readTextScrollPosition("/clamped.md", "rendered")).toBe(1);
-  });
-
-  it("defaults Markdown documents to rendered while remembering their selected mode", () => {
-    expect(readMarkdownViewMode("/new.md")).toBe("rendered");
-
-    saveMarkdownViewMode("/notes.md", "source");
-
-    expect(readMarkdownViewMode("/notes.md")).toBe("source");
-    expect(readMarkdownViewMode("/other.md")).toBe("rendered");
   });
 });

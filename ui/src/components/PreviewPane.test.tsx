@@ -9,7 +9,7 @@ import { useSettingsStore } from "../stores/useSettingsStore";
 import { useTopicsStore } from "../stores/useTopicsStore";
 import { useSearchStore } from "../stores/useSearchStore";
 import { api } from "../services";
-import { saveMarkdownViewMode } from "./preview/textScrollMemory";
+import { saveMarkdownViewMode } from "./markdownViewMode";
 
 /** Invoke a reader's `selectionActions` slot and read back the chrome it
  *  produced, so tests can drive Wilkes' handlers without a real reader. */

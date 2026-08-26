@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type RefObject } from "react";
-import type { DocumentSelection, PositionedSelection } from "./SelectionActions";
+import type { DocumentSelection, PositionedSelection } from "./selection";
 import { useSelectionSlot } from "./selectionSlot";
 
 interface Options {

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { DocumentSelection } from "./SelectionActions";
+import type { DocumentSelection } from "./selection";
 
 /** What the reader hands a selection slot so the host's chrome can behave. */
 export interface SelectionSlotApi {

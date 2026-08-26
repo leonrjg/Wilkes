@@ -1,5 +1,5 @@
 import type { ByteRange } from "../../lib/types";
-import type { DocumentSelection } from "./SelectionActions";
+import type { DocumentSelection } from "./selection";
 
 const encoder = new TextEncoder();
 

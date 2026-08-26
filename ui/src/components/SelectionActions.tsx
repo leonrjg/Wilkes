@@ -1,19 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import type { BoundingBox, ByteRange, SourceOrigin } from "../../lib/types";
-import type { SelectionSlotApi } from "./slots";
-
-export interface DocumentSelection {
-  quote: string;
-  origin: SourceOrigin;
-  text_range?: ByteRange;
-  rects: BoundingBox[];
-}
-
-export interface PositionedSelection {
-  selection: DocumentSelection;
-  left: number;
-  top: number;
-}
+import type { DocumentSelection } from "./preview/selection";
+import type { SelectionSlotApi } from "./preview/slots";
 
 interface SelectionActionsProps {
   selection: DocumentSelection;
@@ -27,6 +14,10 @@ interface SelectionActionsProps {
 /**
  * Wilkes' own selection chrome, passed to a reader through the
  * `slots.selectionActions` slot.
+ *
+ * It lives outside `preview/` deliberately: "Bookmark", "Explain" and "Ask
+ * about this" are this application's offer, not a reading affordance, and the
+ * readers must not ship them to a host that has no chat and no bookmarks.
  *
  * It is no longer positioned here. Where a selection popover belongs is a fact
  * about the reader's geometry, which only the reader knows; what it offers is a

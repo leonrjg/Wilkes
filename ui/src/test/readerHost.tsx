@@ -2,8 +2,8 @@ import { useMemo, type ReactElement, type ReactNode } from "react";
 import { render as rtlRender, type RenderOptions } from "@testing-library/react";
 import { vi } from "vitest";
 import { ReaderHostProvider } from "../components/preview/ReaderHost";
-import SelectionActions from "../components/preview/SelectionActions";
-import type { DocumentSelection } from "../components/preview/SelectionActions";
+import SelectionActions from "../components/SelectionActions";
+import type { DocumentSelection } from "../components/preview/selection";
 import type { SelectionActionsSlot } from "../components/preview/slots";
 import { useSettingsStore } from "../stores/useSettingsStore";
 

@@ -1,4 +1,4 @@
-import type { PositionedSelection } from "./SelectionActions";
+import type { PositionedSelection } from "./selection";
 import type { SelectionActionsSlot, SelectionSlotApi } from "./slots";
 
 /**

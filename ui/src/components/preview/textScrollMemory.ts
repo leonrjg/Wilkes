@@ -4,7 +4,6 @@
 export type TextViewerMode = "source" | "rendered";
 
 const positions = new Map<string, number>();
-const markdownModes = new Map<string, TextViewerMode>();
 const markdownZooms = new Map<string, number>();
 
 export const MARKDOWN_MIN_ZOOM = 0.6;
@@ -20,14 +19,6 @@ export function saveTextScrollPosition(path: string, mode: TextViewerMode, ratio
 
 export function readTextScrollPosition(path: string, mode: TextViewerMode): number | null {
   return positions.get(key(path, mode)) ?? null;
-}
-
-export function saveMarkdownViewMode(path: string, mode: TextViewerMode): void {
-  markdownModes.set(path, mode);
-}
-
-export function readMarkdownViewMode(path: string): TextViewerMode {
-  return markdownModes.get(path) ?? "rendered";
 }
 
 export function saveMarkdownZoom(path: string, zoom: number): void {

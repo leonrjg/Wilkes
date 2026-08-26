@@ -32,7 +32,7 @@ import {
 } from "./pdfScrollMemory";
 import { usePdfDocument } from "./pdfDocumentCache";
 import { Tooltip } from "../Tooltip";
-import type { DocumentSelection } from "./SelectionActions";
+import type { DocumentSelection } from "./selection";
 import SelectionLayer from "./SelectionLayer";
 import { useDomDocumentSelection } from "./useDomDocumentSelection";
 import { useReaderHost } from "./ReaderHost";

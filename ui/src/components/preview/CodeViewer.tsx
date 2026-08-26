@@ -16,7 +16,7 @@ import { cpp } from "@codemirror/lang-cpp";
 import { java } from "@codemirror/lang-java";
 import { go } from "@codemirror/lang-go";
 import { yaml } from "@codemirror/lang-yaml";
-import type { PositionedSelection } from "./SelectionActions";
+import type { PositionedSelection } from "./selection";
 import SelectionLayer from "./SelectionLayer";
 import { useSelectionSlot } from "./selectionSlot";
 import { textSelectionFromUtf16Range, utf8ByteRangeToUtf16Range } from "./textOffsets";

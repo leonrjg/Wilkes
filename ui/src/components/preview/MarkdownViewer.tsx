@@ -10,7 +10,7 @@ import {
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ByteRange } from "../../lib/types";
-import type { DocumentSelection } from "./SelectionActions";
+import type { DocumentSelection } from "./selection";
 import SelectionLayer from "./SelectionLayer";
 import FindBar from "./FindBar";
 import ZoomControls, { ZOOM_STEP } from "./ZoomControls";
@@ -37,7 +37,7 @@ const SEARCH_DECORATION_ID = "reader:search";
 
 export interface MarkdownReaderHandle extends FindableReaderHandle, ZoomableReaderHandle {}
 
-interface MarkdownViewerProps {
+export interface MarkdownViewerProps {
   content: string;
   documentPath: string;
   restoreScrollPosition?: boolean;

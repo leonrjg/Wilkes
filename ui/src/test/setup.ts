@@ -23,6 +23,25 @@ Object.defineProperty(window, "localStorage", {
   },
 });
 
+// pdf.js constructs `new DOMMatrix()` at module-evaluation time (its canvas
+// module's SCALE_MATRIX), and jsdom does not implement DOMMatrix. Any test that
+// imports the readers' public surface therefore loads pdf.js and dies on
+// import, before a single assertion runs. No test renders a PDF canvas, so an
+// identity-matrix stand-in is enough to let the module evaluate; a test that
+// genuinely needs matrix maths should mock pdf.js itself rather than lean on
+// this.
+if (!("DOMMatrix" in globalThis)) {
+  class DOMMatrixStub {
+    a = 1; b = 0; c = 0; d = 1; e = 0; f = 0;
+    constructor(_init?: unknown) {}
+  }
+  Object.defineProperty(globalThis, "DOMMatrix", {
+    configurable: true,
+    writable: true,
+    value: DOMMatrixStub,
+  });
+}
+
 // Runs a cleanup after each test case (e.g. clearing jsdom)
 afterEach(() => {
   cleanup();
