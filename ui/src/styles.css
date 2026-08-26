@@ -246,7 +246,12 @@ body,
   cursor: pointer;
 }
 
+/* Applied by PreviewPane through the reader's `decorations` contract, so the
+   colour has to live here rather than in the source reader's CodeMirror theme —
+   the reader has no notion of a bookmark to theme. */
 .cm-bookmark-highlight {
+  background-color: var(--hl-bookmark-bg);
+  border-bottom: var(--hl-underline) solid var(--hl-bookmark-border);
   cursor: pointer;
 }
 

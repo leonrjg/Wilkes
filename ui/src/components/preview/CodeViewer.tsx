@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useImperativeHandle, useRef, useState, type Ref } from "react";
 import { EditorState, RangeSetBuilder, StateField, StateEffect } from "@codemirror/state";
 import { EditorView, Decoration, DecorationSet } from "@codemirror/view";
 import { basicSetup } from "codemirror";
@@ -16,14 +16,15 @@ import { cpp } from "@codemirror/lang-cpp";
 import { java } from "@codemirror/lang-java";
 import { go } from "@codemirror/lang-go";
 import { yaml } from "@codemirror/lang-yaml";
-import type { ByteRange } from "../../lib/types";
-import SelectionActions, {
-  type DocumentSelection,
-  type PositionedSelection,
-} from "./SelectionActions";
+import type { PositionedSelection } from "./SelectionActions";
+import SelectionLayer from "./SelectionLayer";
+import { useSelectionSlot } from "./selectionSlot";
 import { textSelectionFromUtf16Range, utf8ByteRangeToUtf16Range } from "./textOffsets";
 import { readTextScrollPosition, saveTextScrollPosition } from "./textScrollMemory";
-import { bookmarkAnchorFor, type BookmarkOpenHandler } from "./bookmarkPosition";
+// `Decoration` is CodeMirror's here; the reader contract's is aliased.
+import { elementAnchor, rangeDecorations, type Decoration as ReaderDecoration } from "./decorations";
+import type { ReaderSlots } from "./slots";
+import type { ReaderHandle } from "./readerHandle";
 
 // ── Highlight effect / field ──────────────────────────────────────────────────
 
@@ -46,33 +47,41 @@ const highlightField = StateField.define<DecorationSet>({
   provide: (f) => EditorView.decorations.from(f),
 });
 
-/** Colours come from the shared highlight tokens in styles.css — `baseTheme`
- *  emits real CSS, so `var()` resolves against the app's `:root`. */
+/** The reader's own navigation emphasis. Host decorations are *not* themed
+ *  here: their classes are the host's, and so is their palette. Colours come
+ *  from the shared highlight tokens in styles.css — `baseTheme` emits real CSS,
+ *  so `var()` resolves against the app's `:root`. */
 const highlightTheme = EditorView.baseTheme({
   ".cm-highlight-match": {
     backgroundColor: "var(--hl-active-bg)",
     borderBottom: "var(--hl-underline) solid var(--hl-active-border)",
   },
-  ".cm-bookmark-highlight": {
-    backgroundColor: "var(--hl-bookmark-bg)",
-    borderBottom: "var(--hl-underline) solid var(--hl-bookmark-border)",
-  },
 });
 
-const setBookmarkHighlights = StateEffect.define<Array<{ id: string; range: ByteRange }>>();
+/** Host decorations, already narrowed to ranges and converted to UTF-16. */
+interface CodeDecoration {
+  id: string;
+  range: { start: number; end: number };
+  className?: string;
+}
 
-const bookmarkHighlightField = StateField.define<DecorationSet>({
+const setDecorations = StateEffect.define<CodeDecoration[]>();
+
+const decorationField = StateField.define<DecorationSet>({
   create: () => Decoration.none,
   update(deco, tr) {
     for (const effect of tr.effects) {
-      if (effect.is(setBookmarkHighlights)) {
+      if (effect.is(setDecorations)) {
         const builder = new RangeSetBuilder<Decoration>();
-        for (const { id, range } of [...effect.value].sort((a, b) => a.range.start - b.range.start)) {
+        for (const { id, range, className } of [...effect.value].sort((a, b) => a.range.start - b.range.start)) {
           if (range.end <= range.start) continue;
           builder.add(
             range.start,
             range.end,
-            Decoration.mark({ class: "cm-bookmark-highlight", attributes: { "data-bookmark-id": id } }),
+            Decoration.mark({
+              class: className ?? "",
+              attributes: { "data-decoration-id": id },
+            }),
           );
         }
         return builder.finish();
@@ -129,12 +138,16 @@ export interface CodeViewerProps {
   restoreScrollPosition?: boolean;
   highlightLine: number;
   highlightRange: { start: number; end: number };
-  bookmarkHighlights?: Array<{ id: string; range: ByteRange }>;
-  onBookmarkOpen?: BookmarkOpenHandler;
-  onAddBookmark?: (selection: DocumentSelection) => void;
-  showChatSelectionActions?: boolean;
-  onExplainSelection?: (selection: DocumentSelection) => void;
-  onAskSelection?: (selection: DocumentSelection, question: string) => void;
+  /** Host-owned marks. Only `range`-anchored decorations are placeable here;
+   *  `rects` anchors belong to the PDF reader and are ignored. */
+  decorations?: ReaderDecoration[];
+  slots?: ReaderSlots;
+  ref?: Ref<CodeReaderHandle>;
+}
+
+export interface CodeReaderHandle extends ReaderHandle {
+  /** Scroll a 1-based source line to the centre of the viewport. */
+  goToLine: (line: number) => void;
 }
 
 export default function CodeViewer({
@@ -144,17 +157,22 @@ export default function CodeViewer({
   restoreScrollPosition = false,
   highlightLine,
   highlightRange,
-  bookmarkHighlights = [],
-  onBookmarkOpen,
-  onAddBookmark,
-  showChatSelectionActions = false,
-  onExplainSelection,
-  onAskSelection,
+  decorations = [],
+  slots,
+  ref,
 }: CodeViewerProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const [selectionAction, setSelectionAction] = useState<PositionedSelection | null>(null);
+  const selectionSlot = useSelectionSlot({
+    dismiss: () => setSelectionAction(null),
+    clear: () => {
+      const view = viewRef.current;
+      if (!view) return;
+      view.dispatch({ selection: { anchor: view.state.selection.main.head } });
+    },
+  });
   const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
 
   useEffect(() => {
@@ -173,7 +191,7 @@ export default function CodeViewer({
       basicSetup,
       EditorState.readOnly.of(true),
       highlightField,
-      bookmarkHighlightField,
+      decorationField,
       highlightTheme,
       EditorView.lineWrapping,
       EditorView.updateListener.of((update) => {
@@ -255,42 +273,60 @@ export default function CodeViewer({
   useEffect(() => {
     const view = viewRef.current;
     if (!view) return;
-    const converted = bookmarkHighlights.map(({ id, range }) => ({
+    const converted = rangeDecorations(decorations).map(({ id, range, className }) => ({
       id,
+      className,
       range: utf8ByteRangeToUtf16Range(content, range),
     }));
-    view.dispatch({ effects: setBookmarkHighlights.of(converted) });
-  }, [bookmarkHighlights, content]);
+    view.dispatch({ effects: setDecorations.of(converted) });
+  }, [decorations, content]);
 
   useEffect(() => {
     const container = containerRef.current;
-    if (!container || !onBookmarkOpen) return;
-    const openBookmark = (event: MouseEvent) => {
+    if (!container) return;
+    const activate = (event: MouseEvent) => {
       const target = event.target instanceof Element
-        ? event.target.closest<HTMLElement>("[data-bookmark-id]")
+        ? event.target.closest<HTMLElement>("[data-decoration-id]")
         : null;
-      const bookmarkId = target?.dataset.bookmarkId;
-      if (bookmarkId && target) onBookmarkOpen(bookmarkId, bookmarkAnchorFor(target));
+      const id = target?.dataset.decorationId;
+      if (!id || !target) return;
+      const decoration = decorations.find((candidate) => candidate.id === id);
+      decoration?.onActivate?.(id, elementAnchor(target));
     };
-    container.addEventListener("click", openBookmark);
-    return () => container.removeEventListener("click", openBookmark);
-  }, [onBookmarkOpen]);
+    container.addEventListener("click", activate);
+    return () => container.removeEventListener("click", activate);
+  }, [decorations]);
+
+  useImperativeHandle(
+    ref,
+    (): CodeReaderHandle => ({
+      goToLine: (line) => {
+        const view = viewRef.current;
+        if (!view || line < 1 || line > view.state.doc.lines) return;
+        view.dispatch({
+          effects: EditorView.scrollIntoView(view.state.doc.line(line).from, { y: "center" }),
+        });
+      },
+      scrollToDecoration: (id) => {
+        const view = viewRef.current;
+        const decoration = decorations.find((candidate) => candidate.id === id);
+        if (!view || decoration?.anchor.kind !== "range") return;
+        const { start } = utf8ByteRangeToUtf16Range(content, decoration.anchor.range);
+        view.dispatch({
+          effects: EditorView.scrollIntoView(Math.min(start, view.state.doc.length), { y: "center" }),
+        });
+      },
+    }),
+    [ref, decorations, content],
+  );
 
   return (
     <div ref={rootRef} className="relative h-full w-full overflow-hidden">
       <div ref={containerRef} className="plain-text-editor h-full w-full overflow-auto text-sm" />
-      <SelectionActions
+      <SelectionLayer
         positioned={selectionAction}
-        onAddBookmark={onAddBookmark}
-        showChatActions={showChatSelectionActions}
-        onExplain={onExplainSelection}
-        onAsk={onAskSelection}
-        onDismiss={() => setSelectionAction(null)}
-        onClearSelection={() => {
-          const view = viewRef.current;
-          if (!view) return;
-          view.dispatch({ selection: { anchor: view.state.selection.main.head } });
-        }}
+        api={selectionSlot.api}
+        slot={slots?.selectionActions}
       />
     </div>
   );

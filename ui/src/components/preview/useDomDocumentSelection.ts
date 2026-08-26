@@ -1,13 +1,25 @@
-import { useCallback, useState, type RefObject } from "react";
+import { useCallback, useEffect, useState, type RefObject } from "react";
 import type { DocumentSelection, PositionedSelection } from "./SelectionActions";
+import { useSelectionSlot } from "./selectionSlot";
 
 interface Options {
   rootRef: RefObject<HTMLElement | null>;
   mapSelection: (range: Range, selection: Selection) => DocumentSelection | null;
+  /** Dismiss the selection chrome as soon as the document selection collapses.
+   *  Suspended while the host has pinned itself. */
+  dismissOnCollapsedSelection?: boolean;
 }
 
-export function useDomDocumentSelection({ rootRef, mapSelection }: Options) {
+export function useDomDocumentSelection({
+  rootRef,
+  mapSelection,
+  dismissOnCollapsedSelection = false,
+}: Options) {
   const [positioned, setPositioned] = useState<PositionedSelection | null>(null);
+
+  const dismiss = useCallback(() => setPositioned(null), []);
+  const clearSelection = useCallback(() => window.getSelection()?.removeAllRanges(), []);
+  const { api, pinnedRef } = useSelectionSlot({ dismiss, clear: clearSelection });
 
   const readSelection = useCallback(() => {
     const root = rootRef.current;
@@ -37,10 +49,16 @@ export function useDomDocumentSelection({ rootRef, mapSelection }: Options) {
     });
   }, [mapSelection, rootRef]);
 
-  return {
-    positioned,
-    readSelection,
-    dismiss: () => setPositioned(null),
-    clearSelection: () => window.getSelection()?.removeAllRanges(),
-  };
+  useEffect(() => {
+    if (!dismissOnCollapsedSelection) return;
+    const handleSelectionChange = () => {
+      if (pinnedRef.current) return;
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || selection.rangeCount === 0) dismiss();
+    };
+    window.document.addEventListener("selectionchange", handleSelectionChange);
+    return () => window.document.removeEventListener("selectionchange", handleSelectionChange);
+  }, [dismissOnCollapsedSelection, dismiss, pinnedRef]);
+
+  return { positioned, readSelection, dismiss, clearSelection, slotApi: api };
 }

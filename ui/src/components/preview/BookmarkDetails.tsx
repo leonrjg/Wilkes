@@ -1,11 +1,11 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Trash2, X } from "react-feather";
 import type { Bookmark } from "../../lib/types";
-import type { BookmarkAnchor } from "./bookmarkPosition";
+import type { ElementAnchor } from "./decorations";
 
 interface BookmarkDetailsProps {
   bookmark: Bookmark;
-  anchor: BookmarkAnchor;
+  anchor: ElementAnchor;
   deleting?: boolean;
   onClose: () => void;
   onDelete: () => void;

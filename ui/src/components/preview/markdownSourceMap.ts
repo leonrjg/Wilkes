@@ -1,9 +1,14 @@
 import type { ByteRange } from "../../lib/types";
 
+/** A byte range the rendered markdown should mark up.
+ *
+ *  `className` rather than a fixed `kind`: what a mark *means* is the host's
+ *  business, and this plugin only needs to know which runs share a class so it
+ *  can cut spans at the boundaries between them. */
 export interface TextAnnotation {
   id: string;
-  kind: "search" | "bookmark";
   range: ByteRange;
+  className?: string;
 }
 
 interface HastNode {
@@ -70,15 +75,18 @@ export function renderedBoundaries(source: string, rendered: string, start: numb
   return boundaries;
 }
 
+/** Identity of the annotation set covering a run, used only to decide where to
+ *  cut spans. Two runs with the same key are rendered as one span. */
 function annotationKey(start: number, end: number, annotations: TextAnnotation[]): string {
-  const matches = annotations.filter((annotation) => annotation.range.start < end && annotation.range.end > start);
-  const search = matches.some((annotation) => annotation.kind === "search");
-  const bookmarks = matches.filter((annotation) => annotation.kind === "bookmark").map((annotation) => annotation.id);
-  return `${search ? "search" : ""}|${bookmarks.join(",")}`;
+  return annotations
+    .filter((annotation) => annotation.range.start < end && annotation.range.end > start)
+    .map((annotation) => annotation.id)
+    .join(",");
 }
 
 /** Rehype plugin that makes every rendered text run addressable in source bytes. */
 export function sourceMappedMarkdown(content: string, annotations: TextAnnotation[]) {
+  const annotationsById = new Map(annotations.map((annotation) => [annotation.id, annotation]));
   const sourceByteBoundaries = new Array<number>(content.length + 1).fill(0);
   let utf16Offset = 0;
   let byteOffset = 0;
@@ -130,19 +138,22 @@ export function sourceMappedMarkdown(content: string, annotations: TextAnnotatio
             ? annotationKey(byteBoundaries[index], byteBoundaries[nextBoundary], annotations)
             : null;
           if (nextKey === key) continue;
-          const [search, bookmarkIds] = key.split("|");
+          const ids = key ? key.split(",") : [];
           const classes = [
             "markdown-source-run",
-            search ? "markdown-search-highlight" : "",
-            bookmarkIds ? "markdown-bookmark-highlight" : "",
-          ].filter(Boolean);
+            ...new Set(
+              ids
+                .map((id) => annotationsById.get(id)?.className)
+                .filter((className): className is string => Boolean(className)),
+            ),
+          ];
           const span = (from: number, to: number): HastNode => ({
             type: "element",
             tagName: "span",
             properties: {
               className: classes,
               dataSourceBoundaries: byteBoundaries.slice(from, to + 1).join(","),
-              ...(bookmarkIds ? { dataBookmarkIds: bookmarkIds } : {}),
+              ...(key ? { dataDecorationIds: key } : {}),
             },
             children: [{ type: "text", value: value.slice(from, to) }],
           });

@@ -1,8 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  type Ref,
+} from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ByteRange } from "../../lib/types";
-import SelectionActions, { type DocumentSelection } from "./SelectionActions";
+import type { DocumentSelection } from "./SelectionActions";
+import SelectionLayer from "./SelectionLayer";
 import FindBar from "./FindBar";
 import ZoomControls, { ZOOM_STEP } from "./ZoomControls";
 import { useDocumentFind } from "./useDocumentFind";
@@ -18,19 +27,26 @@ import {
 } from "./textScrollMemory";
 import { utf8ByteOffsetToUtf16Offset } from "./textOffsets";
 import { useDomDocumentSelection } from "./useDomDocumentSelection";
-import { bookmarkAnchorFor, type BookmarkOpenHandler } from "./bookmarkPosition";
+import { elementAnchor, rangeDecorations, type Decoration } from "./decorations";
+import type { ReaderSlots } from "./slots";
+import type { FindableReaderHandle, ZoomableReaderHandle } from "./readerHandle";
+
+/** The reader's own emphasis for the navigation target. Kept distinct from the
+ *  host's decorations: where a document opens is the reader's business. */
+const SEARCH_DECORATION_ID = "reader:search";
+
+export interface MarkdownReaderHandle extends FindableReaderHandle, ZoomableReaderHandle {}
 
 interface MarkdownViewerProps {
   content: string;
   documentPath: string;
   restoreScrollPosition?: boolean;
   highlightRange: ByteRange;
-  bookmarkHighlights?: Array<{ id: string; range: ByteRange }>;
-  onBookmarkOpen?: BookmarkOpenHandler;
-  onAddBookmark?: (selection: DocumentSelection) => void;
-  showChatSelectionActions?: boolean;
-  onExplainSelection?: (selection: DocumentSelection) => void;
-  onAskSelection?: (selection: DocumentSelection, question: string) => void;
+  /** Host-owned marks. Only `range`-anchored decorations are placeable here;
+   *  `rects` anchors belong to the PDF reader and are ignored. */
+  decorations?: Decoration[];
+  slots?: ReaderSlots;
+  ref?: Ref<MarkdownReaderHandle>;
 }
 
 export default function MarkdownViewer({
@@ -38,19 +54,18 @@ export default function MarkdownViewer({
   documentPath,
   restoreScrollPosition = true,
   highlightRange,
-  bookmarkHighlights = [],
-  onBookmarkOpen,
-  onAddBookmark,
-  showChatSelectionActions = false,
-  onExplainSelection,
-  onAskSelection,
+  decorations = [],
+  slots,
+  ref,
 }: MarkdownViewerProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const annotations = useMemo<TextAnnotation[]>(() => [
-    ...(highlightRange.end > highlightRange.start ? [{ id: "search", kind: "search" as const, range: highlightRange }] : []),
-    ...bookmarkHighlights.map(({ id, range }) => ({ id, kind: "bookmark" as const, range })),
-  ], [bookmarkHighlights, highlightRange]);
+    ...(highlightRange.end > highlightRange.start
+      ? [{ id: SEARCH_DECORATION_ID, className: "markdown-search-highlight", range: highlightRange }]
+      : []),
+    ...rangeDecorations(decorations),
+  ], [decorations, highlightRange]);
   const rehypePlugins = useMemo(() => [sourceMappedMarkdown(content, annotations)], [content, annotations]);
 
   const mapSelection = useCallback((range: Range, selection: Selection): DocumentSelection | null => {
@@ -71,7 +86,11 @@ export default function MarkdownViewer({
       rects: [],
     };
   }, [content]);
-  const domSelection = useDomDocumentSelection({ rootRef, mapSelection });
+  const domSelection = useDomDocumentSelection({
+    rootRef,
+    mapSelection,
+    dismissOnCollapsedSelection: true,
+  });
 
   const [zoom, setZoom] = useState(() => readMarkdownZoom(documentPath));
   const changeZoom = useCallback((next: (zoom: number) => number) => {
@@ -143,6 +162,26 @@ export default function MarkdownViewer({
     };
   }, [content, documentPath, restoreScrollPosition]);
 
+  useImperativeHandle(
+    ref,
+    (): MarkdownReaderHandle => ({
+      scrollToDecoration: (id) => {
+        const element = rootRef.current?.querySelector<HTMLElement>(
+          `[data-decoration-ids~="${id}"], [data-decoration-ids^="${id},"], [data-decoration-ids*=",${id},"], [data-decoration-ids$=",${id}"]`,
+        );
+        element?.scrollIntoView?.({ block: "center" });
+      },
+      openFind: (query) => {
+        if (query !== undefined) find.setQuery(query);
+        find.open();
+      },
+      closeFind: find.close,
+      getZoom: () => zoom,
+      setZoom: (next) => changeZoom(() => next),
+    }),
+    [ref, find, zoom, changeZoom],
+  );
+
   useEffect(() => {
     if (restoreScrollPosition || highlightRange.end <= highlightRange.start) return;
     const highlighted = rootRef.current?.querySelector<HTMLElement>(".markdown-search-highlight");
@@ -153,11 +192,20 @@ export default function MarkdownViewer({
     <div
       ref={rootRef}
       onClick={(event) => {
-        if (!onBookmarkOpen || !(event.target instanceof Element)) return;
-        const highlight = event.target.closest<HTMLElement>("[data-bookmark-ids]");
-        const ids = highlight?.dataset.bookmarkIds;
-        const bookmarkId = ids?.split(",")[0];
-        if (bookmarkId && highlight) onBookmarkOpen(bookmarkId, bookmarkAnchorFor(highlight));
+        if (!(event.target instanceof Element)) return;
+        const marked = event.target.closest<HTMLElement>("[data-decoration-ids]");
+        const ids = marked?.dataset.decorationIds?.split(",") ?? [];
+        if (!marked) return;
+        // Overlapping decorations produce one span carrying every id. Activate
+        // the first that actually wants activation rather than the first id,
+        // which may belong to a purely visual mark.
+        for (const id of ids) {
+          const decoration = decorations.find((candidate) => candidate.id === id);
+          if (decoration?.onActivate) {
+            decoration.onActivate(id, elementAnchor(marked));
+            return;
+          }
+        }
       }}
       onMouseUp={domSelection.readSelection}
       className="relative h-full overflow-hidden"
@@ -179,15 +227,10 @@ export default function MarkdownViewer({
           </ReactMarkdown>
         </article>
       </div>
-      <SelectionActions
+      <SelectionLayer
         positioned={domSelection.positioned}
-        onAddBookmark={onAddBookmark}
-        showChatActions={showChatSelectionActions}
-        onExplain={onExplainSelection}
-        onAsk={onAskSelection}
-        onDismiss={domSelection.dismiss}
-        onClearSelection={domSelection.clearSelection}
-        dismissOnCollapsedDomSelection
+        api={domSelection.slotApi}
+        slot={slots?.selectionActions}
       />
       {find.isOpen && (
         <div className="absolute top-4 right-4 z-20">
@@ -196,6 +239,7 @@ export default function MarkdownViewer({
       )}
       <div className="absolute bottom-4 right-4 z-20 flex flex-col gap-2 items-end">
         <div className="flex items-center gap-1.5 bg-[var(--bg-app)] border border-[var(--border-main)] rounded-lg shadow-lg px-2.5 py-1.5 text-sm text-[var(--text-main)]">
+          {slots?.toolbar}
           <ZoomControls
             zoom={zoom}
             onZoomIn={() => changeZoom((z) => z + ZOOM_STEP)}

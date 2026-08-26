@@ -1,7 +1,16 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type Ref,
+} from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Search as SearchIcon, List } from "react-feather";
 import { Page, pdfjs } from "react-pdf";
+import type { PDFDocumentProxy } from "pdfjs-dist";
 import type { BoundingBox } from "../../lib/types";
 import { usePdfInnerSearch, type InnerMatch } from "./usePdfInnerSearch";
 import { usePdfSearchResult } from "./usePdfSearchResult";
@@ -22,12 +31,19 @@ import {
   type PdfScrollPosition,
 } from "./pdfScrollMemory";
 import { usePdfDocument } from "./pdfDocumentCache";
-import { api } from "../../services";
 import { Tooltip } from "../Tooltip";
-import SelectionActions, { type DocumentSelection } from "./SelectionActions";
+import type { DocumentSelection } from "./SelectionActions";
+import SelectionLayer from "./SelectionLayer";
 import { useDomDocumentSelection } from "./useDomDocumentSelection";
-import { useSettingsStore } from "../../stores/useSettingsStore";
-import { bookmarkAnchorFor, type BookmarkOpenHandler } from "./bookmarkPosition";
+import { useReaderHost } from "./ReaderHost";
+import {
+  elementAnchor,
+  rectDecorationsForPage,
+  unionBox,
+  type Decoration,
+} from "./decorations";
+import type { PdfReaderSlots } from "./slots";
+import type { FindableReaderHandle, ZoomableReaderHandle } from "./readerHandle";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -46,8 +62,13 @@ export interface PdfViewerProps {
   /** Raw search evidence used to correct a chunk-level indexed origin against
    *  nearby PDF.js pages. It is transient viewer state, never index data. */
   search_locator?: PdfSearchLocator | null;
-  bookmarkHighlights?: Array<{ id: string; page: number; rects: BoundingBox[] }>;
-  onBookmarkOpen?: BookmarkOpenHandler;
+  /** Host-owned marks on the document. Only `rects`-anchored decorations are
+   *  placeable here; `range` anchors belong to the text readers and are
+   *  ignored, so one list can be handed to whichever reader is mounted. */
+  decorations?: Decoration[];
+  slots?: PdfReaderSlots;
+  /** Imperative control — navigation, zoom and find as commands. */
+  ref?: Ref<PdfReaderHandle>;
   onRenderSuccess?: () => void;
   onLoadError?: (error: unknown) => void;
   /** Fires (debounced) whenever the page nearest the viewport center changes
@@ -56,15 +77,26 @@ export interface PdfViewerProps {
    *  "open document" page badge live as the user reads, not just on the
    *  initial landing page. */
   onPageChange?: (page: number) => void;
-  onAddBookmark?: (selection: PdfSelection) => void;
-  showChatSelectionActions?: boolean;
-  onExplainSelection?: (selection: PdfSelection) => void;
-  onAskSelection?: (selection: PdfSelection, question: string) => void;
 }
 
 export type PdfSelection = DocumentSelection;
 
+export interface PdfReaderHandle extends FindableReaderHandle, ZoomableReaderHandle {
+  /** Scroll a page to the top of the viewport, optionally revealing a
+   *  rectangle on it once the page is mounted. */
+  goToPage: (page: number, opts?: { reveal?: BoundingBox }) => void;
+  /** Follow an in-document destination (outline entry, cross-reference). */
+  goToDestination: (destination: PdfDestination) => void;
+  getCurrentPage: () => number;
+  getPageCount: () => number | null;
+  /** The parsed document, for hosts that need to read it directly. Null until
+   *  it has loaded. */
+  getDocument: () => PDFDocumentProxy | null;
+}
+
 const PAGE_GAP_PX = 12;
+const PDF_MIN_ZOOM = 0.25;
+const PDF_MAX_ZOOM = 3.0;
 // Keep active find matches away from the very edge of the reader. Besides
 // making the result easier to spot, the top inset prevents a match from sitting
 // underneath the floating find bar. The inset is reduced automatically when a
@@ -158,15 +190,6 @@ function captureScrollPosition(container: HTMLDivElement): PdfScrollAnchor | nul
   return null;
 }
 
-/** Bounding envelope of a set of rectangles (used as the navigation anchor). */
-function unionBox(rects: BoundingBox[]): BoundingBox {
-  const x1 = Math.min(...rects.map((r) => r.x));
-  const y1 = Math.min(...rects.map((r) => r.y));
-  const x2 = Math.max(...rects.map((r) => r.x + r.width));
-  const y2 = Math.max(...rects.map((r) => r.y + r.height));
-  return { x: x1, y: y1, width: x2 - x1, height: y2 - y1 };
-}
-
 /** Reveal a PDF-space rectangle inside the scroll container. Page
  * virtualization is handled by the caller; once the page is mounted, its live
  * DOM rectangle gives us a reliable coordinate bridge from PDF units to the
@@ -224,19 +247,14 @@ export default function PdfViewer({
   highlight_bbox,
   highlight_rects = null,
   search_locator = null,
-  bookmarkHighlights = [],
-  onBookmarkOpen,
+  decorations = [],
+  slots,
+  ref,
   onRenderSuccess,
   onLoadError,
-  onAddBookmark,
-  showChatSelectionActions = false,
-  onExplainSelection,
-  onAskSelection,
   onPageChange,
 }: PdfViewerProps) {
-  const autoZoomTargetPx = useSettingsStore(
-    (state) => state.settings?.pdf_auto_zoom_target_px,
-  );
+  const { openExternal, pdfAutoZoomTargetPx: autoZoomTargetPx } = useReaderHost();
   const rootRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState(600);
@@ -491,9 +509,7 @@ export default function PdfViewer({
     [pdf, virtualizer, pageMetrics, renderedWidth],
   );
 
-  const openExternalLink = useCallback((url: string) => {
-    api.openPath(url).catch((e) => console.error("Open PDF link failed:", e));
-  }, []);
+  const openExternalLink = openExternal;
 
   const syncCurrentPageFromScroll = useCallback(() => {
     const container = containerRef.current;
@@ -579,7 +595,11 @@ export default function PdfViewer({
       quote,
     };
   }, [pageMetrics, renderedWidth]);
-  const domSelection = useDomDocumentSelection({ rootRef, mapSelection: mapPdfSelection });
+  const domSelection = useDomDocumentSelection({
+    rootRef,
+    mapSelection: mapPdfSelection,
+    dismissOnCollapsedSelection: true,
+  });
 
   // A mirror of the matcher's output breaks the declaration cycle: the shared
   // controller needs the match count, while the matcher needs the controller's
@@ -740,6 +760,78 @@ export default function PdfViewer({
     return () => clearTimeout(id);
   }, [currentPage, onPageChange]);
 
+  // Reveal a rectangle on a page: mount the page first, then use its live DOM
+  // geometry on the next frame. Same two-stage dance the find navigation does,
+  // for the same reason -- a virtualized page has no measurable box until it
+  // has been committed.
+  const revealOnPage = useCallback(
+    (targetPageNumber: number, bbox: BoundingBox) => {
+      scrollToPage(targetPageNumber);
+      requestAnimationFrame(() => {
+        const container = containerRef.current;
+        const pageMetric = pageMetrics[targetPageNumber - 1];
+        const pageElement = container?.querySelector<HTMLElement>(
+          `[data-page-number="${targetPageNumber}"]`,
+        );
+        if (!container || !pageMetric || !pageElement) return;
+        revealPdfMatch(container, pageElement, bbox, renderedWidth / pageMetric.width);
+      });
+    },
+    [scrollToPage, pageMetrics, renderedWidth],
+  );
+
+  useImperativeHandle(
+    ref,
+    (): PdfReaderHandle => ({
+      goToPage: (targetPageNumber, opts) => {
+        if (opts?.reveal) {
+          revealOnPage(targetPageNumber, opts.reveal);
+        } else {
+          scrollToPage(targetPageNumber);
+        }
+        setCurrentPage(targetPageNumber);
+      },
+      goToDestination: navigateToDestination,
+      scrollToDecoration: (id) => {
+        const decoration = decorations.find((candidate) => candidate.id === id);
+        if (!decoration || decoration.anchor.kind !== "rects") return;
+        const { page: decorationPage, rects } = decoration.anchor;
+        if (rects.length === 0) {
+          scrollToPage(decorationPage);
+        } else {
+          revealOnPage(decorationPage, unionBox(rects));
+        }
+        setCurrentPage(decorationPage);
+      },
+      getCurrentPage: () => currentPage,
+      getPageCount: () => numPages,
+      getDocument: () => pdf ?? null,
+      getZoom: () => zoom,
+      setZoom: (next) =>
+        setZoomKeepingHorizontalCenter(() =>
+          Math.min(PDF_MAX_ZOOM, Math.max(PDF_MIN_ZOOM, +next.toFixed(2))),
+        ),
+      openFind: (query) => {
+        if (query !== undefined) find.setQuery(query);
+        find.open();
+      },
+      closeFind: find.close,
+    }),
+    [
+      ref,
+      revealOnPage,
+      scrollToPage,
+      navigateToDestination,
+      decorations,
+      currentPage,
+      numPages,
+      pdf,
+      zoom,
+      setZoomKeepingHorizontalCenter,
+      find,
+    ],
+  );
+
   return (
     <div ref={rootRef} className="h-full min-h-0 relative flex flex-col overflow-hidden">
       {isSearchOpen && (
@@ -773,12 +865,13 @@ export default function PdfViewer({
               </button>
             </Tooltip>
           )}
+          {slots?.toolbar}
           {numPages && <span className="w-20 text-center font-mono">{currentPage}/{numPages}</span>}
           {numPages && <span className="text-[var(--text-dim)]">|</span>}
           <ZoomControls
             zoom={zoom}
-            onZoomIn={() => setZoomKeepingHorizontalCenter((z) => Math.min(3.0, +(z + ZOOM_STEP).toFixed(2)))}
-            onZoomOut={() => setZoomKeepingHorizontalCenter((z) => Math.max(0.25, +(z - ZOOM_STEP).toFixed(2)))}
+            onZoomIn={() => setZoomKeepingHorizontalCenter((z) => Math.min(PDF_MAX_ZOOM, +(z + ZOOM_STEP).toFixed(2)))}
+            onZoomOut={() => setZoomKeepingHorizontalCenter((z) => Math.max(PDF_MIN_ZOOM, +(z - ZOOM_STEP).toFixed(2)))}
           />
         </div>
       </div>
@@ -836,9 +929,7 @@ export default function PdfViewer({
                 : pageTargetRects && pageTargetRects.length > 0
                   ? null
                   : pageTargetBbox;
-              const pageBookmarkHighlights = bookmarkHighlights.filter(
-                (highlight) => highlight.page === pageNum,
-              );
+              const pageDecorations = rectDecorationsForPage(decorations, pageNum);
 
               const overlayStyle = activeBbox
                 ? highlightRectStyle(activeBbox, pageScale)
@@ -875,36 +966,57 @@ export default function PdfViewer({
                         onOpenExternal={openExternalLink}
                       />
                     )}
-                    {pageBookmarkHighlights.flatMap((highlight) =>
-                      highlight.rects.map((rect, rectIndex) => (
-                        <div
-                          key={`${highlight.id}-${rectIndex}`}
-                          data-testid="bookmark-highlight"
-                          data-bookmark-id={highlight.id}
-                          className={
-                            onBookmarkOpen
-                              ? "pdf-highlight pdf-highlight--bookmark pdf-highlight--clickable"
-                              : "pdf-highlight pdf-highlight--bookmark"
-                          }
-                          style={highlightRectStyle(rect, pageScale)}
-                          role={onBookmarkOpen ? "button" : undefined}
-                          tabIndex={onBookmarkOpen ? 0 : undefined}
-                          aria-label={onBookmarkOpen ? "Open bookmark" : undefined}
-                          onClick={(event) =>
-                            onBookmarkOpen?.(highlight.id, bookmarkAnchorFor(event.currentTarget))
-                          }
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter" || event.key === " ") {
-                              event.preventDefault();
-                              onBookmarkOpen?.(
-                                highlight.id,
-                                bookmarkAnchorFor(event.currentTarget),
-                              );
-                            }
-                          }}
-                        />
-                      )),
-                    )}
+                    {pageDecorations.map((decoration) => {
+                      const { rects } = decoration.anchor;
+                      if (rects.length === 0) return null;
+                      const { onActivate } = decoration;
+                      const activate = (element: Element) =>
+                        onActivate?.(decoration.id, elementAnchor(element));
+                      return (
+                        <div key={decoration.id}>
+                          {rects.map((rect, rectIndex) => (
+                            <div
+                              key={rectIndex}
+                              data-testid="decoration"
+                              data-decoration-id={decoration.id}
+                              className={[
+                                "pdf-highlight",
+                                decoration.className,
+                                onActivate ? "pdf-highlight--clickable" : "",
+                              ]
+                                .filter(Boolean)
+                                .join(" ")}
+                              style={highlightRectStyle(rect, pageScale)}
+                              role={onActivate ? "button" : undefined}
+                              tabIndex={onActivate ? 0 : undefined}
+                              aria-label={decoration.ariaLabel}
+                              onClick={(event) => activate(event.currentTarget)}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter" || event.key === " ") {
+                                  event.preventDefault();
+                                  activate(event.currentTarget);
+                                }
+                              }}
+                            />
+                          ))}
+                          {decoration.render && (
+                            <div
+                              data-decoration-content={decoration.id}
+                              style={{
+                                position: "absolute",
+                                ...highlightRectStyle(unionBox(rects), pageScale),
+                              }}
+                            >
+                              {decoration.render({
+                                scale: pageScale,
+                                box: unionBox(rects),
+                                page: pageNum,
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
                     {overlayStyle && <div className="pdf-highlight" style={overlayStyle} />}
                     {pageTargetRects?.map((rect, rectIndex) => (
                       <div
@@ -935,6 +1047,18 @@ export default function PdfViewer({
                           />
                         );
                       })()}
+                    {slots?.pageGutter && (
+                      <div
+                        data-page-gutter={pageNum}
+                        style={{ position: "absolute", left: "100%", top: 0, height: pageHeight }}
+                      >
+                        {slots.pageGutter(pageNum, {
+                          scale: pageScale,
+                          width: renderedWidth,
+                          height: pageHeight,
+                        })}
+                      </div>
+                    )}
                   </div>
                 </div>
               );
@@ -942,15 +1066,10 @@ export default function PdfViewer({
           </div>
         </div>
       </div>
-      <SelectionActions
+      <SelectionLayer
         positioned={domSelection.positioned}
-        onAddBookmark={onAddBookmark}
-        showChatActions={showChatSelectionActions}
-        onExplain={onExplainSelection}
-        onAsk={onAskSelection}
-        onDismiss={domSelection.dismiss}
-        onClearSelection={domSelection.clearSelection}
-        dismissOnCollapsedDomSelection
+        api={domSelection.slotApi}
+        slot={slots?.selectionActions}
       />
     </div>
   );

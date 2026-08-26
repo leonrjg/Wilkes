@@ -1,6 +1,8 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { createRef } from "react";
+import { selectionSlot } from "../../test/readerHost";
 import { describe, expect, it, vi } from "vitest";
-import MarkdownViewer from "./MarkdownViewer";
+import MarkdownViewer, { type MarkdownReaderHandle } from "./MarkdownViewer";
 
 describe("MarkdownViewer", () => {
   it("renders headings and GFM tables", () => {
@@ -35,6 +37,46 @@ describe("MarkdownViewer", () => {
     expect(input.closest(".absolute")).not.toHaveClass("bottom-4");
   });
 
+  it("opens find and reports zoom through the imperative handle", () => {
+    const handle = createRef<MarkdownReaderHandle>();
+    render(
+      <MarkdownViewer
+        ref={handle}
+        documentPath="/handle.md"
+        content="Searchable text"
+        highlightRange={{ start: 0, end: 0 }}
+      />,
+    );
+
+    act(() => handle.current!.openFind("café"));
+    expect(screen.getByPlaceholderText("Find in document...")).toHaveValue("café");
+
+    act(() => handle.current!.setZoom(1.4));
+    expect(handle.current!.getZoom()).toBe(1.4);
+
+    act(() => handle.current!.closeFind());
+    expect(screen.queryByPlaceholderText("Find in document...")).not.toBeInTheDocument();
+  });
+
+  it("ignores decorations anchored in a coordinate system it cannot place", () => {
+    render(
+      <MarkdownViewer
+        documentPath="/notes.md"
+        content="Read this note"
+        highlightRange={{ start: 0, end: 0 }}
+        decorations={[
+          {
+            id: "pdf-anchored",
+            anchor: { kind: "rects", page: 1, rects: [{ x: 1, y: 2, width: 3, height: 4 }] },
+            className: "markdown-bookmark-highlight",
+          },
+        ]}
+      />,
+    );
+
+    expect(document.querySelector(".markdown-bookmark-highlight")).toBeNull();
+  });
+
   it("segments overlapping search and bookmark annotations from source byte ranges", () => {
     const content = "Start **café🙂** end";
     const encoder = new TextEncoder();
@@ -47,31 +89,43 @@ describe("MarkdownViewer", () => {
         content={content}
         restoreScrollPosition={false}
         highlightRange={{ start, end: wordEnd }}
-        bookmarkHighlights={[{ id: "cafe", range: { start, end: cafeEnd } }]}
+        decorations={[
+          {
+            id: "cafe",
+            anchor: { kind: "range", range: { start, end: cafeEnd } },
+            className: "markdown-bookmark-highlight",
+          },
+        ]}
       />,
     );
 
     const overlap = document.querySelector<HTMLElement>(".markdown-search-highlight.markdown-bookmark-highlight");
     expect(overlap).toHaveTextContent("café");
-    expect(overlap).toHaveAttribute("data-bookmark-ids", "cafe");
+    expect(overlap).toHaveAttribute("data-decoration-ids", "reader:search,cafe");
     expect(document.querySelector<HTMLElement>(".markdown-search-highlight:not(.markdown-bookmark-highlight)"))
       .toHaveTextContent("🙂");
   });
 
   it("opens a bookmark when its rendered highlight is clicked", () => {
-    const onBookmarkOpen = vi.fn();
+    const onActivate = vi.fn();
     render(
       <MarkdownViewer
         documentPath="/notes.md"
         content="Read this note"
         highlightRange={{ start: 0, end: 0 }}
-        bookmarkHighlights={[{ id: "note-1", range: { start: 5, end: 9 } }]}
-        onBookmarkOpen={onBookmarkOpen}
+        decorations={[
+          {
+            id: "note-1",
+            anchor: { kind: "range", range: { start: 5, end: 9 } },
+            className: "markdown-bookmark-highlight",
+            onActivate,
+          },
+        ]}
       />,
     );
 
     fireEvent.click(document.querySelector(".markdown-bookmark-highlight")!);
-    expect(onBookmarkOpen).toHaveBeenCalledWith("note-1", {
+    expect(onActivate).toHaveBeenCalledWith("note-1", {
       left: 0,
       top: 0,
       right: 0,
@@ -116,7 +170,7 @@ describe("MarkdownViewer", () => {
         documentPath="/notes.md"
         content={"# Title\n\nPick **this** text"}
         highlightRange={{ start: 0, end: 0 }}
-        onAddBookmark={onAddBookmark}
+        slots={{ selectionActions: selectionSlot({ onAddBookmark }) }}
       />,
     );
     const run = Array.from(document.querySelectorAll<HTMLElement>(".markdown-source-run"))

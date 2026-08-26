@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud, Share2, Edit3 } from "react-feather";
 import CodeViewer from "./preview/CodeViewer";
 import DocumentEditor from "./DocumentEditor";
@@ -19,7 +19,10 @@ import { Tooltip } from "./Tooltip";
 import { CopyButton } from "./CopyButton";
 import RelatedDocumentsPane from "./RelatedDocumentsPane";
 import BookmarkDetails from "./preview/BookmarkDetails";
-import type { BookmarkAnchor } from "./preview/bookmarkPosition";
+import type { Decoration, ElementAnchor } from "./preview/decorations";
+import SelectionActions from "./preview/SelectionActions";
+import { ReaderHostProvider, type ReaderHostServices } from "./preview/ReaderHost";
+import type { SelectionActionsSlot } from "./preview/slots";
 import ViewerTabs from "./ViewerTabs";
 import DocumentSummaryPane from "./DocumentSummaryPane";
 import { useGenerationStore } from "../stores/useGenerationStore";
@@ -134,12 +137,26 @@ export default function PreviewPane() {
       : null,
   );
   const { addToast } = useToasts();
+  const pdfAutoZoomTargetPx = useSettingsStore(
+    (state) => state.settings?.pdf_auto_zoom_target_px,
+  );
+  // Everything the readers need from this application. They take it from here
+  // rather than importing the Tauri bridge and the settings store directly, so
+  // the same components can be mounted by a host that has neither.
+  const readerHost = useMemo<ReaderHostServices>(
+    () => ({
+      openExternal: (url) =>
+        api.openPath(url).catch((e) => console.error("Open link failed:", e)),
+      pdfAutoZoomTargetPx,
+    }),
+    [pdfAutoZoomTargetPx],
+  );
   const [sidePanel, setSidePanel] = useState<ViewerSidePanel>(null);
   const [markdownView, setMarkdownView] = useState<"source" | "rendered">("rendered");
   const [editing, setEditing] = useState(false);
   const [openBookmarkTarget, setOpenBookmarkTarget] = useState<{
     id: string;
-    anchor: BookmarkAnchor;
+    anchor: ElementAnchor;
   } | null>(null);
   const [deletingBookmark, setDeletingBookmark] = useState(false);
   const openBookmark = bookmarks.find(
@@ -170,7 +187,7 @@ export default function PreviewPane() {
     if (openBookmarkTarget && !openBookmark) setOpenBookmarkTarget(null);
   }, [openBookmark, openBookmarkTarget]);
 
-  const handleOpenBookmark = (id: string, anchor: BookmarkAnchor) => {
+  const handleOpenBookmark = (id: string, anchor: ElementAnchor) => {
     setOpenBookmarkTarget({ id, anchor });
   };
 
@@ -279,21 +296,54 @@ export default function PreviewPane() {
           context_after: selectedSearchMatch.context_after,
         }
       : null;
-  const bookmarkHighlights = bookmarks.flatMap((bookmark) => {
-    if (bookmark.path !== selectedMatch.path || !("PdfPage" in bookmark.origin)) {
-      return [];
+  // One list for every reader. A bookmark is anchored by whichever coordinate
+  // system its origin already carries -- page rects for a PDF, a byte range for
+  // a text file -- and each reader keeps the anchors it can place. `pdf-`/`cm-`/
+  // `markdown-` prefixed classes are this application's palette, not the
+  // reader's: the readers no longer have a notion of a bookmark to style.
+  const bookmarkDecorations: Decoration[] = bookmarks.flatMap((bookmark): Decoration[] => {
+    if (bookmark.path !== selectedMatch.path) return [];
+    const shared = {
+      id: bookmark.id,
+      onActivate: handleOpenBookmark,
+      ariaLabel: "Open bookmark",
+    };
+    if ("PdfPage" in bookmark.origin) {
+      return bookmark.rects.length > 0
+        ? [{
+            ...shared,
+            anchor: {
+              kind: "rects" as const,
+              page: bookmark.origin.PdfPage.page,
+              rects: bookmark.rects,
+            },
+            className: "pdf-highlight--bookmark",
+          }]
+        : [];
     }
-    const { page } = bookmark.origin.PdfPage;
-    return bookmark.rects.length > 0
-      ? [{ id: bookmark.id, page, rects: bookmark.rects }]
-      : [];
+    if ("TextFile" in bookmark.origin && bookmark.text_range) {
+      return [{
+        ...shared,
+        anchor: { kind: "range" as const, range: bookmark.text_range },
+        className: isMarkdownFile && markdownView === "rendered"
+          ? "markdown-bookmark-highlight"
+          : "cm-bookmark-highlight",
+      }];
+    }
+    return [];
   });
-  const textBookmarkHighlights = bookmarks.flatMap((bookmark) =>
-    bookmark.path === selectedMatch.path &&
-    "TextFile" in bookmark.origin &&
-    bookmark.text_range
-      ? [{ id: bookmark.id, range: bookmark.text_range }]
-      : [],
+
+  // Wilkes' selection chrome, handed to whichever reader is mounted. The reader
+  // decides where it appears; this decides what it offers.
+  const selectionActionsSlot: SelectionActionsSlot = (selection, api) => (
+    <SelectionActions
+      selection={selection}
+      api={api}
+      onAddBookmark={handleAddBookmark}
+      showChatActions={chatSelectionActionsAvailable}
+      onExplain={handleExplainSelection}
+      onAsk={handleAskSelection}
+    />
   );
   // Text locations stay in persisted UTF-8 document coordinates. Each renderer
   // translates only at its boundary (CodeMirror uses UTF-16; Markdown does not).
@@ -595,6 +645,7 @@ export default function PreviewPane() {
         className="flex-1 min-h-0 overflow-hidden bg-[var(--bg-app)]"
       >
         <div className="flex h-full min-h-0">
+          <ReaderHostProvider value={readerHost}>
           <div className="relative min-w-0 flex-1 overflow-hidden">
             {openBookmark && openBookmarkTarget && (
               <BookmarkDetails
@@ -644,14 +695,10 @@ export default function PreviewPane() {
                 highlight_bbox={pdfBbox}
                 highlight_rects={targetBookmarkRects}
                 search_locator={pdfSearchLocator}
-                bookmarkHighlights={bookmarkHighlights}
-                onBookmarkOpen={handleOpenBookmark}
+                decorations={bookmarkDecorations}
+                slots={{ selectionActions: selectionActionsSlot }}
                 onRenderSuccess={() => setIsPdfRendering(false)}
                 onLoadError={(error) => reportTabLoadError(activeTab.id, error)}
-                onAddBookmark={handleAddBookmark}
-                showChatSelectionActions={chatSelectionActionsAvailable}
-                onExplainSelection={handleExplainSelection}
-                onAskSelection={handleAskSelection}
                 onPageChange={handleChatPageChange}
               />
             ) : isMarkdownFile && markdownView === "rendered" ? (
@@ -660,12 +707,8 @@ export default function PreviewPane() {
                 documentPath={selectedMatch.path}
                 restoreScrollPosition={shouldRestoreSourceScroll}
                 highlightRange={renderedHighlightRange}
-                bookmarkHighlights={textBookmarkHighlights}
-                onBookmarkOpen={handleOpenBookmark}
-                onAddBookmark={handleAddBookmark}
-                showChatSelectionActions={chatSelectionActionsAvailable}
-                onExplainSelection={handleExplainSelection}
-                onAskSelection={handleAskSelection}
+                decorations={bookmarkDecorations}
+                slots={{ selectionActions: selectionActionsSlot }}
               />
             ) : displayData && "Text" in displayData && editing ? (
               <DocumentEditor
@@ -686,15 +729,12 @@ export default function PreviewPane() {
                   displayData.Text.content,
                   displayData.Text.highlight_range,
                 )}
-                bookmarkHighlights={textBookmarkHighlights}
-                onBookmarkOpen={handleOpenBookmark}
-                onAddBookmark={handleAddBookmark}
-                showChatSelectionActions={chatSelectionActionsAvailable}
-                onExplainSelection={handleExplainSelection}
-                onAskSelection={handleAskSelection}
+                decorations={bookmarkDecorations}
+                slots={{ selectionActions: selectionActionsSlot }}
               />
             ) : null}
           </div>
+          </ReaderHostProvider>
           {sidePanel === "summary" && generationReady && (
             <DocumentSummaryPane
               path={selectedMatch.path}

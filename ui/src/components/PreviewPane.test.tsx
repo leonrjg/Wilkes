@@ -11,6 +11,20 @@ import { useSearchStore } from "../stores/useSearchStore";
 import { api } from "../services";
 import { saveMarkdownViewMode } from "./preview/textScrollMemory";
 
+/** Invoke a reader's `selectionActions` slot and read back the chrome it
+ *  produced, so tests can drive Wilkes' handlers without a real reader. */
+const selectionChrome = (props: any) => {
+  const api = { dismiss: vi.fn(), clear: vi.fn(), setPinned: vi.fn() };
+  return props.slots.selectionActions(
+    { quote: "", origin: { TextFile: { line: 1, col: 0 } }, rects: [] },
+    api,
+  ).props;
+};
+
+/** The decoration a reader would have rendered for one bookmark. */
+const decorationFor = (props: any, id: string) =>
+  props.decorations.find((decoration: any) => decoration.id === id);
+
 const mockCodeViewer = vi.fn(() => <div data-testid="code-viewer">CodeViewer</div>);
 vi.mock("./preview/CodeViewer", () => ({ default: (props: any) => mockCodeViewer(props) }));
 vi.mock("./DocumentEditor", () => ({ default: () => <div data-testid="document-editor">DocumentEditor</div> }));
@@ -226,10 +240,15 @@ describe("PreviewPane", () => {
       expect.objectContaining({
         content: expect.stringContaining("# Notes"),
         highlightRange: { start: 0, end: 0 },
-        bookmarkHighlights: [{ id: "rendered-bookmark", range: { start: 2, end: 7 } }],
-        onAddBookmark: expect.any(Function),
-        onExplainSelection: expect.any(Function),
-        onAskSelection: expect.any(Function),
+        decorations: [
+          expect.objectContaining({
+            id: "rendered-bookmark",
+            anchor: { kind: "range", range: { start: 2, end: 7 } },
+            className: "markdown-bookmark-highlight",
+            onActivate: expect.any(Function),
+          }),
+        ],
+        slots: expect.objectContaining({ selectionActions: expect.any(Function) }),
       }),
     );
 
@@ -316,11 +335,15 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
     const props = mockCodeViewer.mock.calls.at(-1)![0];
-    expect(props.bookmarkHighlights).toEqual([
-      { id: "text-one", range: { start: 6, end: 11 } },
+    expect(props.decorations).toEqual([
+      expect.objectContaining({
+        id: "text-one",
+        anchor: { kind: "range", range: { start: 6, end: 11 } },
+        className: "cm-bookmark-highlight",
+      }),
     ]);
 
-    props.onAddBookmark({
+    selectionChrome(props).onAddBookmark({
       quote: "hello",
       origin: { TextFile: { line: 1, col: 0 } },
       text_range: { start: 0, end: 5 },
@@ -367,7 +390,7 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
     act(() => {
-      mockCodeViewer.mock.calls.at(-1)![0].onBookmarkOpen("noted-bookmark", {
+      decorationFor(mockCodeViewer.mock.calls.at(-1)![0], "noted-bookmark").onActivate("noted-bookmark", {
         left: 100,
         top: 100,
         right: 140,
@@ -415,7 +438,7 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
     act(() => {
-      mockCodeViewer.mock.calls.at(-1)![0].onBookmarkOpen("outside-dismiss", {
+      decorationFor(mockCodeViewer.mock.calls.at(-1)![0], "outside-dismiss").onActivate("outside-dismiss", {
         left: 100,
         top: 100,
         right: 140,
@@ -809,8 +832,12 @@ describe("PreviewPane", () => {
     render(<PreviewPane />);
 
     const call = mockPdfViewer.mock.calls[mockPdfViewer.mock.calls.length - 1][0];
-    expect(call.bookmarkHighlights).toEqual([
-      { id: "current", page: 4, rects: [{ x: 1, y: 2, width: 3, height: 4 }] },
+    expect(call.decorations).toEqual([
+      expect.objectContaining({
+        id: "current",
+        anchor: { kind: "rects", page: 4, rects: [{ x: 1, y: 2, width: 3, height: 4 }] },
+        className: "pdf-highlight--bookmark",
+      }),
     ]);
     // The text-file bookmark carries no rects and must not produce a highlight.
   });

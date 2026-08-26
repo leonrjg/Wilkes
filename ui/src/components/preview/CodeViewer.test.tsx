@@ -95,17 +95,27 @@ describe("CodeViewer", () => {
   });
 
   it("opens a bookmark when its source highlight is clicked", () => {
-    const onBookmarkOpen = vi.fn();
+    const onActivate = vi.fn();
     const { container } = render(
-      <CodeViewer {...defaultProps} onBookmarkOpen={onBookmarkOpen} />,
+      <CodeViewer
+        {...defaultProps}
+        decorations={[
+          {
+            id: "source-bookmark",
+            anchor: { kind: "range", range: { start: 0, end: 4 } },
+            className: "cm-bookmark-highlight",
+            onActivate,
+          },
+        ]}
+      />,
     );
     const editorContainer = container.firstElementChild?.firstElementChild;
     const highlight = document.createElement("span");
-    highlight.dataset.bookmarkId = "source-bookmark";
+    highlight.dataset.decorationId = "source-bookmark";
     editorContainer?.appendChild(highlight);
 
     fireEvent.click(highlight);
-    expect(onBookmarkOpen).toHaveBeenCalledWith("source-bookmark", {
+    expect(onActivate).toHaveBeenCalledWith("source-bookmark", {
       left: 0,
       top: 0,
       right: 0,

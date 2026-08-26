@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { BoundingBox, ByteRange, SourceOrigin } from "../../lib/types";
+import type { SelectionSlotApi } from "./slots";
 
 export interface DocumentSelection {
   quote: string;
@@ -15,25 +16,30 @@ export interface PositionedSelection {
 }
 
 interface SelectionActionsProps {
-  positioned: PositionedSelection | null;
+  selection: DocumentSelection;
+  api: SelectionSlotApi;
   onAddBookmark?: (selection: DocumentSelection) => void;
   showChatActions?: boolean;
   onExplain?: (selection: DocumentSelection) => void;
   onAsk?: (selection: DocumentSelection, question: string) => void;
-  onDismiss: () => void;
-  onClearSelection: () => void;
-  dismissOnCollapsedDomSelection?: boolean;
 }
 
+/**
+ * Wilkes' own selection chrome, passed to a reader through the
+ * `slots.selectionActions` slot.
+ *
+ * It is no longer positioned here. Where a selection popover belongs is a fact
+ * about the reader's geometry, which only the reader knows; what it offers is a
+ * fact about the application, which only the host knows. The reader hands over
+ * a positioned box and this fills it.
+ */
 export default function SelectionActions({
-  positioned,
+  selection,
+  api,
   onAddBookmark,
   showChatActions = false,
   onExplain,
   onAsk,
-  onDismiss,
-  onClearSelection,
-  dismissOnCollapsedDomSelection = false,
 }: SelectionActionsProps) {
   const [askDraft, setAskDraft] = useState("");
   const [isAskOpen, setIsAskOpen] = useState(false);
@@ -42,38 +48,33 @@ export default function SelectionActions({
   useEffect(() => {
     setAskDraft("");
     setIsAskOpen(false);
-  }, [positioned?.selection]);
+  }, [selection]);
 
   useEffect(() => {
     if (isAskOpen) askInputRef.current?.focus();
   }, [isAskOpen]);
 
+  // Focusing the question input collapses the document selection. Tell the
+  // reader to hold the popover open across that, or typing a question destroys
+  // the thing being typed into.
   useEffect(() => {
-    if (!dismissOnCollapsedDomSelection) return;
-    const handleSelectionChange = () => {
-      if (isAskOpen) return;
-      const selection = window.getSelection();
-      if (!selection || selection.isCollapsed || selection.rangeCount === 0) onDismiss();
-    };
-    window.document.addEventListener("selectionchange", handleSelectionChange);
-    return () => window.document.removeEventListener("selectionchange", handleSelectionChange);
-  }, [dismissOnCollapsedDomSelection, isAskOpen, onDismiss]);
+    api.setPinned(isAskOpen);
+    return () => api.setPinned(false);
+  }, [api, isAskOpen]);
 
-  if (!positioned) return null;
   if (!onAddBookmark && !(showChatActions && (onExplain || onAsk))) return null;
 
   const finish = () => {
-    onDismiss();
-    onClearSelection();
     setIsAskOpen(false);
     setAskDraft("");
+    api.clear();
+    api.dismiss();
   };
 
   return (
     <div
       onMouseDown={(event) => event.preventDefault()}
-      className="absolute z-40 rounded border border-[var(--border-main)] bg-[var(--bg-app)] text-xs text-[var(--text-main)] shadow-lg"
-      style={{ left: positioned.left, top: positioned.top }}
+      className="rounded border border-[var(--border-main)] bg-[var(--bg-app)] text-xs text-[var(--text-main)] shadow-lg"
     >
       {isAskOpen ? (
         <form
@@ -82,7 +83,7 @@ export default function SelectionActions({
             event.preventDefault();
             const question = askDraft.trim();
             if (!question || !onAsk) return;
-            onAsk(positioned.selection, question);
+            onAsk(selection, question);
             finish();
           }}
         >
@@ -110,12 +111,12 @@ export default function SelectionActions({
       ) : (
         <div className="flex items-center">
           {onAddBookmark && (
-            <button type="button" onClick={() => { onAddBookmark(positioned.selection); finish(); }} className="px-2 py-1 hover:bg-[var(--bg-active)]">
+            <button type="button" onClick={() => { onAddBookmark(selection); finish(); }} className="px-2 py-1 hover:bg-[var(--bg-active)]">
               Bookmark
             </button>
           )}
           {showChatActions && onExplain && (
-            <button type="button" onClick={() => { onExplain(positioned.selection); finish(); }} className="px-2 py-1 border-l border-[var(--border-main)] hover:bg-[var(--bg-active)]">
+            <button type="button" onClick={() => { onExplain(selection); finish(); }} className="px-2 py-1 border-l border-[var(--border-main)] hover:bg-[var(--bg-active)]">
               Explain
             </button>
           )}

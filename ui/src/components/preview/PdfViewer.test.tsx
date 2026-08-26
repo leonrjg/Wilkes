@@ -1,7 +1,8 @@
-import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
+import { screen, fireEvent, act, waitFor } from "@testing-library/react";
+import { renderWithReaderHost as render, selectionSlot } from "../../test/readerHost";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { StrictMode } from "react";
-import PdfViewer from "./PdfViewer";
+import { createRef, StrictMode } from "react";
+import PdfViewer, { type PdfReaderHandle } from "./PdfViewer";
 import { savePdfScrollPosition } from "./pdfScrollMemory";
 import { useSettingsStore } from "../../stores/useSettingsStore";
 
@@ -596,13 +597,129 @@ describe("PdfViewer", () => {
     expect(targets[0]).toHaveStyle({ left: "100px", top: "25px", width: "30px" });
   });
 
+  it("renders host content over a decoration's union box", async () => {
+    render(
+      <PdfViewer
+        {...defaultProps}
+        decorations={[
+          {
+            id: "coverage-1",
+            anchor: {
+              kind: "rects",
+              page: 1,
+              rects: [
+                { x: 10, y: 20, width: 30, height: 10 },
+                { x: 10, y: 40, width: 50, height: 10 },
+              ],
+            },
+            render: ({ page, box }) => <span>{`p${page} w${box.width}`}</span>,
+          },
+        ]}
+      />,
+    );
+
+    const content = document.querySelector<HTMLElement>("[data-decoration-content='coverage-1']")!;
+    // Union of the two rects, not either one of them.
+    expect(content).toHaveStyle({ left: "10px", top: "20px", width: "50px", height: "30px" });
+    expect(content).toHaveTextContent("p1 w50");
+  });
+
+  it("renders the page gutter slot beside every mounted page", async () => {
+    render(
+      <PdfViewer
+        {...defaultProps}
+        slots={{ pageGutter: (page, { scale }) => <span>{`note ${page} @${scale}`}</span> }}
+      />,
+    );
+
+    const gutters = document.querySelectorAll("[data-page-gutter]");
+    expect(gutters).toHaveLength(3);
+    expect(gutters[0]).toHaveTextContent("note 1 @1");
+    // Positioned at the page's right edge, reserving no width of its own.
+    expect(gutters[0]).toHaveStyle({ position: "absolute", left: "100%", top: "0px" });
+  });
+
+  it("renders the toolbar slot inside the reader's control cluster", () => {
+    render(
+      <PdfViewer {...defaultProps} slots={{ toolbar: <button>Review</button> }} />,
+    );
+
+    const toolbarButton = screen.getByRole("button", { name: "Review" });
+    expect(toolbarButton.closest(".shadow-lg")).toContainElement(
+      screen.getByRole("button", { name: "Zoom in" }),
+    );
+  });
+
+  it("navigates, zooms and finds through the imperative handle", async () => {
+    const handle = createRef<PdfReaderHandle>();
+    render(
+      <PdfViewer
+        {...defaultProps}
+        ref={handle}
+        decorations={[
+          {
+            id: "finding-3",
+            anchor: { kind: "rects", page: 3, rects: [{ x: 5, y: 6, width: 7, height: 8 }] },
+          },
+        ]}
+      />,
+    );
+
+    expect(handle.current!.getPageCount()).toBe(10);
+
+    act(() => handle.current!.goToPage(2));
+    expect(mockVirtualizer.scrollToIndex).toHaveBeenCalledWith(1, { align: "start" });
+    expect(handle.current!.getCurrentPage()).toBe(2);
+
+    // The same destination twice must navigate twice -- the reason this is a
+    // command rather than a prop.
+    mockVirtualizer.scrollToIndex.mockClear();
+    act(() => handle.current!.goToPage(2));
+    expect(mockVirtualizer.scrollToIndex).toHaveBeenCalledWith(1, { align: "start" });
+
+    act(() => handle.current!.scrollToDecoration("finding-3"));
+    expect(mockVirtualizer.scrollToIndex).toHaveBeenCalledWith(2, { align: "start" });
+    expect(handle.current!.getCurrentPage()).toBe(3);
+
+    act(() => handle.current!.setZoom(1.5));
+    expect(handle.current!.getZoom()).toBe(1.5);
+    // Clamped to the reader's own limits, not the caller's.
+    act(() => handle.current!.setZoom(99));
+    expect(handle.current!.getZoom()).toBe(3);
+
+    act(() => handle.current!.openFind("invariant"));
+    expect(mockUseDocumentFind.value.setQuery).toHaveBeenCalledWith("invariant");
+    expect(mockUseDocumentFind.value.open).toHaveBeenCalled();
+  });
+
+  it("ignores decorations anchored in a coordinate system it cannot place", () => {
+    render(
+      <PdfViewer
+        {...defaultProps}
+        decorations={[
+          { id: "text-anchored", anchor: { kind: "range", range: { start: 0, end: 5 } } },
+        ]}
+      />,
+    );
+
+    expect(screen.queryByTestId("decoration")).not.toBeInTheDocument();
+  });
+
   it("renders persisted bookmark highlights with scaled PDF coordinates", async () => {
     render(
       <PdfViewer
         {...defaultProps}
-        bookmarkHighlights={[
-          { id: "bookmark-1", page: 1, rects: [{ x: 20, y: 30, width: 40, height: 10 }] },
-          { id: "bookmark-2", page: 3, rects: [{ x: 1, y: 2, width: 3, height: 4 }] },
+        decorations={[
+          {
+            id: "bookmark-1",
+            anchor: { kind: "rects", page: 1, rects: [{ x: 20, y: 30, width: 40, height: 10 }] },
+            className: "pdf-highlight--bookmark",
+          },
+          {
+            id: "bookmark-2",
+            anchor: { kind: "rects", page: 3, rects: [{ x: 1, y: 2, width: 3, height: 4 }] },
+            className: "pdf-highlight--bookmark",
+          },
         ]}
       />,
     );
@@ -611,7 +728,7 @@ describe("PdfViewer", () => {
       await new Promise(resolve => setTimeout(resolve, 10));
     });
 
-    const highlights = screen.getAllByTestId("bookmark-highlight");
+    const highlights = screen.getAllByTestId("decoration");
     expect(highlights).toHaveLength(2);
     expect(highlights[0]).toHaveStyle({
       left: "20px",
@@ -624,20 +741,24 @@ describe("PdfViewer", () => {
   });
 
   it("opens a persisted bookmark highlight", async () => {
-    const onBookmarkOpen = vi.fn();
+    const onActivate = vi.fn();
     render(
       <PdfViewer
         {...defaultProps}
-        bookmarkHighlights={[
-          { id: "bookmark-1", page: 1, rects: [{ x: 20, y: 30, width: 40, height: 10 }] },
+        decorations={[
+          {
+            id: "bookmark-1",
+            anchor: { kind: "rects", page: 1, rects: [{ x: 20, y: 30, width: 40, height: 10 }] },
+            className: "pdf-highlight--bookmark",
+            onActivate,
+          },
         ]}
-        onBookmarkOpen={onBookmarkOpen}
       />,
     );
 
-    const highlight = await screen.findByTestId("bookmark-highlight");
+    const highlight = await screen.findByTestId("decoration");
     fireEvent.click(highlight);
-    expect(onBookmarkOpen).toHaveBeenCalledWith("bookmark-1", {
+    expect(onActivate).toHaveBeenCalledWith("bookmark-1", {
       left: 0,
       top: 0,
       right: 0,
@@ -646,7 +767,12 @@ describe("PdfViewer", () => {
   });
 
   it("shows the selection action below and to the right of the selected text", async () => {
-    render(<PdfViewer {...defaultProps} onAddBookmark={vi.fn()} />);
+    render(
+      <PdfViewer
+        {...defaultProps}
+        slots={{ selectionActions: selectionSlot({ onAddBookmark: vi.fn() }) }}
+      />,
+    );
 
     await act(async () => {
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -693,7 +819,12 @@ describe("PdfViewer", () => {
   });
 
   it("anchors the selection action to the final line rather than the range bounding box", async () => {
-    render(<PdfViewer {...defaultProps} onAddBookmark={vi.fn()} />);
+    render(
+      <PdfViewer
+        {...defaultProps}
+        slots={{ selectionActions: selectionSlot({ onAddBookmark: vi.fn() }) }}
+      />,
+    );
 
     await act(async () => {
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -738,10 +869,14 @@ describe("PdfViewer", () => {
     render(
       <PdfViewer
         {...defaultProps}
-        onAddBookmark={vi.fn()}
-        showChatSelectionActions
-        onExplainSelection={onExplainSelection}
-        onAskSelection={onAskSelection}
+        slots={{
+          selectionActions: selectionSlot({
+            onAddBookmark: vi.fn(),
+            showChatActions: true,
+            onExplain: onExplainSelection,
+            onAsk: onAskSelection,
+          }),
+        }}
       />,
     );
 
