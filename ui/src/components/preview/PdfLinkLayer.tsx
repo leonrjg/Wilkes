@@ -6,7 +6,6 @@ import {
   type PdfLinkPreview,
 } from "./pdfLinkPreview";
 import { Tooltip } from "./Tooltip";
-import "./pdfLinkLayer.css";
 
 interface LinkRect {
   key: string;

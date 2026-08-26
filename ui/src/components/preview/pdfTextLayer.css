@@ -1,15 +1,27 @@
-/* Text-layer styles copied verbatim from pdfjs-dist@5.4.296 (web/pdf_viewer.css).
- * react-pdf's bundled TextLayer.css lags pdf.js; we render the text layer with
- * pdf.js' own TextLayerBuilder (PdfTextLayer.tsx) and need the matching CSS.
- * 5.x positions spans via --total-scale-factor (set in PdfTextLayer).
- * Re-sync this block (Apache-2.0) when bumping pdfjs-dist. */
+/* Text-layer styles copied verbatim from pdfjs-dist@6.2.108
+ * (web/pdf_viewer.css). We render the text layer with pdf.js' own
+ * TextLayerBuilder (PdfTextLayer.tsx), so it needs the matching CSS.
+ *
+ * This is not decoration. From 6.x the span geometry lives here: the builder
+ * emits `--font-height`, `--scale-x` and `--rotate` on each span and this
+ * stylesheet turns them into `font-size` and `transform` against
+ * `--total-scale-factor`. Pair 6.x JavaScript with the 5.x stylesheet and every
+ * span renders at the default size with no transform, so the invisible text
+ * stops lining up with the painted glyphs and selection grabs the wrong words.
+ *
+ * Re-sync this block (Apache-2.0) when bumping pdfjs-dist, and check the span
+ * geometry rules specifically rather than diffing for visual changes. */
 .textLayer{
+  color-scheme:only light;
+
   position:absolute;
   text-align:initial;
   inset:0;
   overflow:clip;
   opacity:1;
   line-height:1;
+  letter-spacing:normal;
+  word-spacing:normal;
   -webkit-text-size-adjust:none;
      -moz-text-size-adjust:none;
           text-size-adjust:none;
@@ -17,106 +29,122 @@
   transform-origin:0 0;
   caret-color:CanvasText;
   z-index:0;
-}
 
-.textLayer.highlighting{
+  &.highlighting{
     touch-action:none;
   }
 
-.textLayer :is(span,br){
+  :is(span, br){
     color:transparent;
     position:absolute;
     white-space:pre;
     cursor:text;
     transform-origin:0% 0%;
+    -webkit-user-select:text;
+       -moz-user-select:text;
+            user-select:text;
   }
+  --min-font-size:1;
+  --text-scale-factor:calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv:calc(1 / var(--min-font-size));
 
-.textLayer  > :not(.markedContent),.textLayer .markedContent span:not(.markedContent){
+  > :not(.markedContent),
+  .markedContent span:not(.markedContent){
     z-index:1;
+
+    --font-height:0;
+    font-size:calc(var(--text-scale-factor) * var(--font-height));
+
+    --scale-x:1;
+    --rotate:0deg;
+    transform:rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
   }
 
-.textLayer span.markedContent{
-    top:0;
-    height:0;
+  .markedContent{
+    display:contents;
   }
 
-.textLayer span[role="img"]{
+  span[role="img"]{
     -webkit-user-select:none;
        -moz-user-select:none;
             user-select:none;
     cursor:default;
   }
 
-.textLayer .highlight{
+  .highlight{
     --highlight-bg-color:rgb(180 0 170 / 0.25);
     --highlight-selected-bg-color:rgb(0 100 0 / 0.25);
     --highlight-backdrop-filter:none;
     --highlight-selected-backdrop-filter:none;
-  }
 
-@media screen and (forced-colors: active){
-
-.textLayer .highlight{
+    @media screen and (forced-colors: active){
       --highlight-bg-color:transparent;
       --highlight-selected-bg-color:transparent;
       --highlight-backdrop-filter:var(--hcm-highlight-filter);
       --highlight-selected-backdrop-filter:var(
         --hcm-highlight-selected-filter
       );
-  }
     }
-
-.textLayer .highlight{
 
     margin:-1px;
     padding:1px;
     background-color:var(--highlight-bg-color);
-    -webkit-backdrop-filter:var(--highlight-backdrop-filter);
-            backdrop-filter:var(--highlight-backdrop-filter);
+    backdrop-filter:var(--highlight-backdrop-filter);
     border-radius:4px;
-  }
 
-.appended:is(.textLayer .highlight){
+    &.appended{
       position:initial;
     }
 
-.begin:is(.textLayer .highlight){
+    &.begin{
       border-radius:4px 0 0 4px;
     }
 
-.end:is(.textLayer .highlight){
+    &.end{
       border-radius:0 4px 4px 0;
     }
 
-.middle:is(.textLayer .highlight){
+    &.middle{
       border-radius:0;
     }
 
-.selected:is(.textLayer .highlight){
+    &.selected{
       background-color:var(--highlight-selected-bg-color);
-      -webkit-backdrop-filter:var(--highlight-selected-backdrop-filter);
-              backdrop-filter:var(--highlight-selected-backdrop-filter);
+      backdrop-filter:var(--highlight-selected-backdrop-filter);
+      scroll-margin-top:50px;
     }
-
-.textLayer ::-moz-selection{
-    background:rgba(0 0 255 / 0.25);
-    background:color-mix(in srgb, AccentColor, transparent 75%);
   }
 
-.textLayer ::selection{
+  ::-moz-selection{
     background:rgba(0 0 255 / 0.25);
-    background:color-mix(in srgb, AccentColor, transparent 75%);
+    background:color-mix(in srgb, AccentColor, transparent 50%);
+    color:transparent;
   }
 
-.textLayer br::-moz-selection{
+  ::selection{
+    background:rgba(0 0 255 / 0.25);
+    background:color-mix(in srgb, AccentColor, transparent 50%);
+    color:transparent;
+  }
+
+  &.selectionRendering{
+    ::-moz-selection{
+      background:transparent;
+      color:transparent;
+    }
+    ::selection{
+      background:transparent;
+      color:transparent;
+    }
+  }
+  br::-moz-selection{
+    background:transparent;
+  }
+  br::selection{
     background:transparent;
   }
 
-.textLayer br::selection{
-    background:transparent;
-  }
-
-.textLayer .endOfContent{
+  .endOfContent{
     display:block;
     position:absolute;
     inset:100% 0 0;
@@ -127,7 +155,7 @@
             user-select:none;
   }
 
-.textLayer.selecting .endOfContent{
+  &.selecting .endOfContent{
     top:0;
   }
-
+}
