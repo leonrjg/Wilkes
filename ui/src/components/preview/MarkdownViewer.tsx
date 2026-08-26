@@ -211,7 +211,7 @@ export default function MarkdownViewer({
       className="relative h-full overflow-hidden"
     >
       <div ref={scrollRef} className="h-full overflow-auto px-6 py-5 text-sm text-[var(--text-main)]">
-        <article className="prose-document" style={{ fontSize: `${zoom}rem` }}>
+        <article className="prose prose-document" style={{ fontSize: `${zoom}rem` }}>
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
             rehypePlugins={rehypePlugins}

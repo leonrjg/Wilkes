@@ -231,12 +231,6 @@ body,
   animation: shimmer 1.5s infinite;
 }
 
-.prose-chat,
-.prose-document {
-  max-width: min(100%, 420px);
-  overflow-wrap: anywhere;
-}
-
 /* Inline highlights (Markdown). Text in flow can wrap, so these carry an
    underline where the absolutely positioned PDF boxes carry a full border;
    the colours come from the same role tokens. */
@@ -268,114 +262,96 @@ body,
 /* In-document find (rendered Markdown), painted via the CSS Custom Highlight
    API, which only accepts colour properties — no border, so the passive and
    active hits are separated by alpha alone. */
-::highlight(wilkes-find) {
+::highlight(reader-find) {
   background-color: var(--hl-match-bg);
 }
 
-::highlight(wilkes-find-active) {
+::highlight(reader-find-active) {
   background-color: var(--hl-active-bg);
 }
 
-.prose-document {
-  max-width: 90rem;
-  margin: 0 auto;
-  font-size: 1rem;
-  line-height: 1.65;
+/* Rendered Markdown typography.
+ *
+ * `.prose` is the whole of it; `.prose-chat` and `.prose-document` are the
+ * three places the two surfaces genuinely disagree -- how wide they run, and
+ * whether a table scrolls sideways in a narrow column or lays itself out
+ * across a page. Written as one selector list per rule, the two were
+ * indistinguishable, and the reader could not take its typography anywhere
+ * without taking the chat pane's with it. Apply as `class="prose prose-document"`.
+ */
+.prose {
+  overflow-wrap: anywhere;
 }
 
-.prose-chat > :first-child,
-.prose-document > :first-child {
+.prose > :first-child {
   margin-top: 0;
 }
 
-.prose-chat > :last-child,
-.prose-document > :last-child {
+.prose > :last-child {
   margin-bottom: 0;
 }
 
-.prose-chat p,
-.prose-chat ul,
-.prose-chat ol,
-.prose-chat blockquote,
-.prose-chat pre,
-.prose-chat table,
-.prose-document p,
-.prose-document ul,
-.prose-document ol,
-.prose-document blockquote,
-.prose-document pre,
-.prose-document table {
+.prose p,
+.prose ul,
+.prose ol,
+.prose blockquote,
+.prose pre,
+.prose table {
   margin: 0.55rem 0;
 }
 
-.prose-chat h1,
-.prose-chat h2,
-.prose-chat h3,
-.prose-chat h4,
-.prose-document h1,
-.prose-document h2,
-.prose-document h3,
-.prose-document h4 {
+.prose h1,
+.prose h2,
+.prose h3,
+.prose h4 {
   margin: 0.7rem 0 0.35rem;
   font-weight: 650;
   line-height: 1.25;
 }
 
-.prose-chat h1,
-.prose-document h1 {
+.prose h1 {
   font-size: 1.15em;
 }
 
-.prose-chat h2,
-.prose-document h2 {
+.prose h2 {
   font-size: 1.08em;
 }
 
-.prose-chat h3,
-.prose-chat h4,
-.prose-document h3,
-.prose-document h4 {
+.prose h3,
+.prose h4 {
   font-size: 1em;
 }
 
-.prose-chat ul,
-.prose-chat ol,
-.prose-document ul,
-.prose-document ol {
+.prose ul,
+.prose ol {
   padding-left: 1.25rem;
 }
 
-.prose-chat ul,
-.prose-document ul {
+.prose ul {
   list-style: disc;
 }
 
-.prose-chat ol,
-.prose-document ol {
+.prose ol {
   list-style: decimal;
 }
 
-.prose-chat li + li,
-.prose-document li + li {
+.prose li + li {
   margin-top: 0.2rem;
 }
 
-.prose-chat blockquote,
-.prose-document blockquote {
+.prose blockquote {
   border-left: 3px solid var(--border-strong);
   color: var(--text-muted);
   padding-left: 0.75rem;
 }
 
-.prose-chat a,
-.prose-document a {
+.prose a {
   color: var(--accent-blue);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
 
-.prose-chat code,
-.prose-document code {
+.prose code {
   background: var(--bg-active);
   border: 1px solid var(--border-main);
   border-radius: 4px;
@@ -384,8 +360,7 @@ body,
   padding: 0.05rem 0.25rem;
 }
 
-.prose-chat pre,
-.prose-document pre {
+.prose pre {
   background: var(--bg-active);
   border: 1px solid var(--border-main);
   border-radius: 6px;
@@ -394,8 +369,7 @@ body,
   padding: 0.6rem 0.7rem;
 }
 
-.prose-chat pre code,
-.prose-document pre code {
+.prose pre code {
   background: transparent;
   border: 0;
   border-radius: 0;
@@ -404,30 +378,48 @@ body,
   white-space: pre;
 }
 
-.prose-chat table {
+.prose table {
   border-collapse: collapse;
-  display: block;
   max-width: 100%;
+}
+
+.prose th,
+.prose td {
+  border: 1px solid var(--border-main);
+  padding: 0.25rem 0.45rem;
+}
+
+.prose th {
+  background: var(--bg-active);
+  font-weight: 650;
+}
+
+/* Chat: a narrow column, so a wide table scrolls sideways rather than
+   forcing the column open. */
+.prose-chat {
+  max-width: min(100%, 420px);
+}
+
+.prose-chat table {
+  display: block;
   overflow-x: auto;
   white-space: nowrap;
 }
 
+/* Document: a page to read, so a table lays itself out across it. */
+.prose-document {
+  max-width: 90rem;
+  margin: 0 auto;
+  font-size: 1rem;
+  line-height: 1.65;
+}
+
 .prose-document table {
-  border-collapse: collapse;
   display: table;
-  max-width: 100%;
   overflow: visible;
   table-layout: auto;
   white-space: normal;
   width: 100%;
-}
-
-.prose-chat th,
-.prose-chat td,
-.prose-document th,
-.prose-document td {
-  border: 1px solid var(--border-main);
-  padding: 0.25rem 0.45rem;
 }
 
 .prose-document th,
@@ -437,10 +429,4 @@ body,
   text-align: center;
   vertical-align: middle;
   word-break: normal;
-}
-
-.prose-chat th,
-.prose-document th {
-  background: var(--bg-active);
-  font-weight: 650;
 }

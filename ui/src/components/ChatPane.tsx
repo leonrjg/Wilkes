@@ -818,7 +818,7 @@ export function MessageBubble({
             {message.content.map((block, index) => {
               if (block.kind === "text") {
                 return (
-                  <div className="prose-chat" key={`text-${index}`}>
+                  <div className="prose prose-chat" key={`text-${index}`}>
                     <ReactMarkdown
                       remarkPlugins={[remarkGfm]}
                       components={{

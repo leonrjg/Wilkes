@@ -1,7 +1,11 @@
 import { useEffect } from "react";
 
-const ALL_HIGHLIGHT = "wilkes-find";
-const ACTIVE_HIGHLIGHT = "wilkes-find-active";
+// `CSS.highlights` is a document-global registry, so these names are shared
+// with every other script on the page. They are the reader's, not any one
+// application's -- an app name here would travel into every host that mounts
+// the reader and collide with whatever else that host registers.
+const ALL_HIGHLIGHT = "reader-find";
+const ACTIVE_HIGHLIGHT = "reader-find-active";
 // Block containers whose boundaries should break a match: "end.Start" across two
 // paragraphs must not read as the contiguous word "end.Start".
 const BLOCK_SELECTOR = "p,li,h1,h2,h3,h4,h5,h6,pre,blockquote,td,th,figcaption,dt,dd,div";
