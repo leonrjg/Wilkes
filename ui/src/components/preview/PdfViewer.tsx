@@ -9,8 +9,9 @@ import {
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Search as SearchIcon, List } from "react-feather";
-import { Page, pdfjs } from "react-pdf";
+import { GlobalWorkerOptions } from "pdfjs-dist";
 import type { PDFDocumentProxy } from "pdfjs-dist";
+import PdfPageCanvas from "./PdfPageCanvas";
 import type { BoundingBox } from "../../lib/types";
 import { usePdfInnerSearch, type InnerMatch } from "./usePdfInnerSearch";
 import { usePdfSearchResult } from "./usePdfSearchResult";
@@ -45,7 +46,7 @@ import {
 import type { PdfReaderSlots } from "./slots";
 import type { FindableReaderHandle, ZoomableReaderHandle } from "./readerHandle";
 
-pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
   import.meta.url,
 ).toString();
@@ -902,7 +903,7 @@ export default function PdfViewer({
           }}
         >
           {/* Explicit width (not fit-content) so the scrollable extent grows in
-              the same commit as a zoom change, instead of trailing react-pdf's
+              the same commit as a zoom change, instead of trailing the
               async canvas render. This lets the zoom-recentre effect set
               scrollLeft synchronously without the browser clamping it to a
               stale, not-yet-widened maximum. */}
@@ -942,18 +943,18 @@ export default function PdfViewer({
                   style={{ width: "100%", height: pageHeight + PAGE_GAP_PX }}
                 >
                   <div style={{ position: "relative", display: "inline-block", height: pageHeight }}>
-                    <Page
-                      pdf={pdf ?? false}
-                      pageNumber={pageNum}
-                      width={renderedWidth}
-                      renderAnnotationLayer={false}
-                      renderTextLayer={false}
-                      canvasBackground="white"
-                      onRenderSuccess={() => {
-                        const landing = landingPageRef.current ?? (page || 1);
-                        if (pageNum === landing) signalInitialRender();
-                      }}
-                    />
+                    {pdf && (
+                      <PdfPageCanvas
+                        pdf={pdf}
+                        pageNumber={pageNum}
+                        width={renderedWidth}
+                        canvasBackground="white"
+                        onRenderSuccess={() => {
+                          const landing = landingPageRef.current ?? (page || 1);
+                          if (pageNum === landing) signalInitialRender();
+                        }}
+                      />
+                    )}
                     {pdf && (
                       <PdfTextLayer pdf={pdf} pageNumber={pageNum} scale={pageScale} />
                     )}

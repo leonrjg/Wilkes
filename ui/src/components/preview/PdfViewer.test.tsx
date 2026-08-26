@@ -101,17 +101,17 @@ const mockPage = vi.fn(({ pageNumber, onLoadSuccess, onRenderSuccess }: any) => 
   return <div data-testid={`pdf-page-${pageNumber}`} />;
 });
 
-// Mock react-pdf
-vi.mock("react-pdf", () => ({
-  Document: ({ children, onLoadSuccess }: any) => {
-    // Simulate loading success
-    if (onLoadSuccess) {
-      setTimeout(() => onLoadSuccess(mockPdfDoc.value), 0);
-    }
-    return <div data-testid="pdf-document">{children}</div>;
-  },
-  Page: (props: any) => mockPage(props),
-  pdfjs: { GlobalWorkerOptions: { workerSrc: "" } },
+// Mock the page canvas: it drives a real pdf.js render, which jsdom has no
+// canvas for. These are rendering/navigation tests -- what the canvas paints is
+// out of scope, only that the reader asks for the right page at the right size.
+vi.mock("./PdfPageCanvas", () => ({
+  default: (props: any) => mockPage(props),
+}));
+
+// The worker URL and AnnotationMode are all PdfViewer itself needs from pdf.js.
+vi.mock("pdfjs-dist", async () => ({
+  ...(await vi.importActual<Record<string, unknown>>("pdfjs-dist")),
+  GlobalWorkerOptions: { workerSrc: "" },
 }));
 
 // The document proxy now comes from the shared LRU cache hook rather than

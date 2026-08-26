@@ -1,12 +1,10 @@
 import { renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { pdfjs } from "react-pdf";
+import { getDocument } from "pdfjs-dist";
 import { usePdfDocument } from "./pdfDocumentCache";
 
-vi.mock("react-pdf", () => ({
-  pdfjs: {
-    getDocument: vi.fn(),
-  },
+vi.mock("pdfjs-dist", () => ({
+  getDocument: vi.fn(),
 }));
 
 describe("pdfDocumentCache", () => {
@@ -16,7 +14,7 @@ describe("pdfDocumentCache", () => {
 
   it("reports a failed load and retries when the attempt changes", async () => {
     const proxy = { numPages: 1, destroy: vi.fn() } as any;
-    vi.mocked(pdfjs.getDocument)
+    vi.mocked(getDocument)
       .mockReturnValueOnce({ promise: Promise.reject(new Error("PDF file not found")) } as any)
       .mockReturnValueOnce({ promise: Promise.resolve(proxy) } as any);
     const onLoadError = vi.fn();
@@ -33,6 +31,6 @@ describe("pdfDocumentCache", () => {
     rerender({ attempt: 1 });
 
     await waitFor(() => expect(result.current).toBe(proxy));
-    expect(pdfjs.getDocument).toHaveBeenCalledTimes(2);
+    expect(getDocument).toHaveBeenCalledTimes(2);
   });
 });

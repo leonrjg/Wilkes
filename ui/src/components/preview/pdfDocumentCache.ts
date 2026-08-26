@@ -1,14 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { pdfjs } from "react-pdf";
+import { getDocument } from "pdfjs-dist";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 
 // The parsed PDF documents (`PDFDocumentProxy`) for the N most-recently opened
 // files are kept alive here so switching back to a recent document is instant.
 // This module is the single owner of the document lifecycle: proxies are
-// destroyed only on eviction, never on component unmount. That deliberately
-// takes the lifecycle away from react-pdf's `<Document>`, which destroys its
-// loading task (and the proxy) on unmount and would otherwise force a full
-// re-fetch + re-parse every time the reader navigates back and forth.
+// destroyed only on eviction, never on component unmount. A per-component
+// lifecycle (destroying the loading task when the viewer unmounts) would force
+// a full re-fetch and re-parse every time the reader navigates back and forth.
 const MAX_CACHED_DOCUMENTS = 3;
 
 interface CacheEntry {
@@ -57,7 +56,7 @@ export function loadPdfDocument(url: string): Promise<PDFDocumentProxy> {
     return existing.promise;
   }
 
-  const loadingTask = pdfjs.getDocument(url);
+  const loadingTask = getDocument(url);
   const entry: CacheEntry = { proxy: null, promise: loadingTask.promise };
   entry.promise = loadingTask.promise.then(
     (proxy) => {

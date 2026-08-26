@@ -30,13 +30,11 @@ interface Props {
  * Renders the selectable text overlay for a single page using pdf.js' own
  * `TextLayerBuilder` — the exact component the pdf.js viewer (and Zotero) use.
  *
- * We deliberately do NOT use react-pdf's `renderTextLayer`: react-pdf only
- * reimplements a stub of the viewer's text-layer glue and omits the
- * `selectionchange`-driven `endOfContent` management that keeps selection from
- * ballooning to the whole paragraph/page. `TextLayerBuilder` owns that logic
- * (its static global selection listener spans all mounted pages, including
- * virtualized ones) and is maintained upstream, so there is nothing for us to
- * hand-port. The canvas is still rendered by react-pdf's `<Page>`.
+ * Hand-rolling this layer is a trap: the `selectionchange`-driven
+ * `endOfContent` management is what keeps a selection from ballooning to the
+ * whole paragraph or page, and `TextLayerBuilder` owns it (its static global
+ * selection listener spans every mounted page, virtualized ones included) and
+ * is maintained upstream. The canvas beside it is drawn by `PdfPageCanvas`.
  */
 export default function PdfTextLayer({ pdf, pageNumber, scale }: Props) {
   const wrapperRef = useRef<HTMLDivElement>(null);
