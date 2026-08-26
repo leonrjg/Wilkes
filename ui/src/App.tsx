@@ -13,7 +13,7 @@ import UploadZone from "./components/UploadZone";
 import SettingsModal from "./components/SettingsModal";
 import { useToasts } from "./components/Toast";
 import { useContextMenu, ContextMenu } from "./components/ContextMenu";
-import { Tooltip } from "./components/Tooltip";
+import { Tooltip } from "./components/preview";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useBookmarksStore } from "./stores/useBookmarksStore";
 import { useChatStore } from "./stores/useChatStore";

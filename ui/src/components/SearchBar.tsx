@@ -4,7 +4,7 @@ import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import type { SearchQuery } from "../lib/types";
-import { Tooltip } from "./Tooltip";
+import { Tooltip } from "./preview";
 import { api } from "../services";
 import { useResearchStore } from "../stores/useResearchStore";
 

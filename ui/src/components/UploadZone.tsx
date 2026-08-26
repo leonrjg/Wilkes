@@ -2,7 +2,7 @@ import { useCallback, useRef, useState } from "react";
 import { File, Folder } from "react-feather";
 import type { WebSourceApi } from "../services/api";
 import { useSettingsStore } from "../stores/useSettingsStore";
-import { Tooltip } from "./Tooltip";
+import { Tooltip } from "./preview";
 
 interface Props {
   source: WebSourceApi;

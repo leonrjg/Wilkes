@@ -1,4 +1,4 @@
-import type { ByteRange } from "../../lib/types";
+import type { ByteRange } from "./documentCoordinates";
 import type { DocumentSelection } from "./selection";
 
 const encoder = new TextEncoder();

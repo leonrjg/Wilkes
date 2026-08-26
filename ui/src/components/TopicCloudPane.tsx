@@ -10,7 +10,7 @@ import {
   TopicCloudTags,
   topicSearchResults,
 } from "./TopicCloudShared";
-import { Tooltip } from "./Tooltip";
+import { Tooltip } from "./preview";
 import { useToasts } from "./Toast";
 
 export default function TopicCloudPane() {

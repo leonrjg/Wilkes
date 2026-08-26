@@ -25,7 +25,7 @@ import type { BoundingBox, DocumentMetadata, Match, MatchRef } from "../lib/type
 import { buildExternalLinks } from "../lib/externalLinks";
 import { formatDocumentMonthYear } from "../lib/dateFormatting";
 import { useToasts } from "./Toast";
-import { Tooltip } from "./Tooltip";
+import { Tooltip } from "./preview";
 import { CopyButton } from "./CopyButton";
 import RelatedDocumentsPane from "./RelatedDocumentsPane";
 import BookmarkDetails from "./BookmarkDetails";
@@ -147,6 +147,7 @@ export default function PreviewPane() {
   const pdfAutoZoomTargetPx = useSettingsStore(
     (state) => state.settings?.pdf_auto_zoom_target_px,
   );
+  const colorScheme = useSettingsStore((state) => state.colorScheme);
   // Everything the readers need from this application. They take it from here
   // rather than importing the Tauri bridge and the settings store directly, so
   // the same components can be mounted by a host that has neither.
@@ -154,9 +155,10 @@ export default function PreviewPane() {
     () => ({
       openExternal: (url) =>
         api.openPath(url).catch((e) => console.error("Open link failed:", e)),
+      colorScheme,
       pdfAutoZoomTargetPx,
     }),
-    [pdfAutoZoomTargetPx],
+    [colorScheme, pdfAutoZoomTargetPx],
   );
   const [sidePanel, setSidePanel] = useState<ViewerSidePanel>(null);
   const [markdownView, setMarkdownView] = useState<"source" | "rendered">("rendered");

@@ -4,7 +4,7 @@ import type { CitationLinks, CitationReference, FileEntry } from "../lib/types";
 import { api } from "../services";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { DocumentEntryRow, fileName } from "./DocumentEntryRow";
-import { Tooltip } from "./Tooltip";
+import { Tooltip } from "./preview";
 
 type CitationStatus = "loading" | "ready" | "empty" | "error";
 

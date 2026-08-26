@@ -3,7 +3,7 @@ import { Check, Edit2, Plus, Sliders, X } from "react-feather";
 import { api } from "../services";
 import { useResearchStore } from "../stores/useResearchStore";
 import { ResearchManager } from "./ResearchManager";
-import { Tooltip } from "./Tooltip";
+import { Tooltip } from "./preview";
 
 export function FileScopeControls({ matchCount }: { matchCount: number }) {
   const tags = useResearchStore((state) => state.tags);

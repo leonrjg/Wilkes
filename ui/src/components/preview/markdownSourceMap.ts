@@ -1,4 +1,4 @@
-import type { ByteRange } from "../../lib/types";
+import type { ByteRange } from "./documentCoordinates";
 
 /** A byte range the rendered markdown should mark up.
  *

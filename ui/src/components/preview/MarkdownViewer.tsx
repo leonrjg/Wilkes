@@ -9,7 +9,7 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { ByteRange } from "../../lib/types";
+import type { ByteRange } from "./documentCoordinates";
 import type { DocumentSelection } from "./selection";
 import SelectionLayer from "./SelectionLayer";
 import FindBar from "./FindBar";

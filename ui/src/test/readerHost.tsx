@@ -19,9 +19,10 @@ function ReaderTestHost({ children }: { children: ReactNode }) {
   const pdfAutoZoomTargetPx = useSettingsStore(
     (state) => state.settings?.pdf_auto_zoom_target_px,
   );
+  const colorScheme = useSettingsStore((state) => state.colorScheme);
   const value = useMemo(
-    () => ({ openExternal: openExternalSpy, pdfAutoZoomTargetPx }),
-    [pdfAutoZoomTargetPx],
+    () => ({ openExternal: openExternalSpy, colorScheme, pdfAutoZoomTargetPx }),
+    [colorScheme, pdfAutoZoomTargetPx],
   );
   return <ReaderHostProvider value={value}>{children}</ReaderHostProvider>;
 }

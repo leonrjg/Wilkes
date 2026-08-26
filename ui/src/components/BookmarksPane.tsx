@@ -21,7 +21,7 @@ import { useGenerationStore } from "../stores/useGenerationStore";
 import { toMarkdown } from "../lib/utils/bookmarkMarkdown";
 import { api } from "../services";
 import { useToasts } from "./Toast";
-import { Tooltip } from "./Tooltip";
+import { Tooltip } from "./preview";
 import { CopyButton } from "./CopyButton";
 import type {
   Bookmark,

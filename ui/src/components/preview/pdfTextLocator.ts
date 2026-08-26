@@ -1,5 +1,5 @@
 import type { PDFDocumentProxy } from "pdfjs-dist";
-import type { BoundingBox } from "../../lib/types";
+import type { BoundingBox } from "./documentCoordinates";
 import { loadPdfPageText, type PositionedPdfText } from "./pdfTextContent";
 
 const WRAP_HYPHEN = "\ue000";

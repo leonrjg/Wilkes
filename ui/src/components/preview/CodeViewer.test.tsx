@@ -1,11 +1,19 @@
-import { render, screen, act, fireEvent } from "@testing-library/react";
+import { screen, act, fireEvent } from "@testing-library/react";
+import { renderWithReaderHost as render } from "../../test/readerHost";
+import { useSettingsStore } from "../../stores/useSettingsStore";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import CodeViewer from "./CodeViewer";
 import { EditorView } from "@codemirror/view";
 
+const { viewBuilds } = vi.hoisted(() => ({ viewBuilds: { count: 0, lastExtensions: [] as unknown[] } }));
+
 vi.mock("@codemirror/view", async () => {
   const actual = await vi.importActual("@codemirror/view");
   class MockView {
+    constructor(config: any) {
+      viewBuilds.count += 1;
+      viewBuilds.lastExtensions = config?.state?.extensions ?? [];
+    }
     destroy = vi.fn();
     dispatch = vi.fn();
     scrollDOM = {
@@ -63,6 +71,8 @@ describe("CodeViewer", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    viewBuilds.count = 0;
+    useSettingsStore.setState({ colorScheme: "light" });
   });
 
   it("renders correctly", () => {
@@ -77,15 +87,25 @@ describe("CodeViewer", () => {
     });
   });
 
-  it("responds to theme changes", () => {
+  it("takes its appearance from the host, not from the document", () => {
+    useSettingsStore.setState({ colorScheme: "light" });
+    // A contradictory class on the document proves the reader is no longer
+    // reading it: the host's answer has to win.
+    document.documentElement.classList.add("dark");
     render(<CodeViewer {...defaultProps} />);
-    
+    const buildsWhileLight = viewBuilds.count;
+    expect(buildsWhileLight).toBeGreaterThan(0);
+
     act(() => {
-      document.documentElement.classList.add("dark");
-      if (observerInstance) {
-        observerInstance.trigger([{ type: "attributes", attributeName: "class" }]);
-      }
+      useSettingsStore.setState({ colorScheme: "dark" });
     });
+
+    // Switching appearance swaps the syntax theme, which rebuilds the editor.
+    // Had the reader still been reading the document class, the contradictory
+    // `dark` set above would have made it dark from the start and nothing
+    // would rebuild here.
+    expect(viewBuilds.count).toBeGreaterThan(buildsWhileLight);
+    document.documentElement.classList.remove("dark");
   });
 
   it("dispatches highlight and scroll effects", () => {

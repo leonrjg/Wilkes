@@ -1,4 +1,4 @@
-import type { BoundingBox, ByteRange, SourceOrigin } from "../../lib/types";
+import type { BoundingBox, ByteRange, SourceOrigin } from "./documentCoordinates";
 
 /** A run of text the reader resolved back to document coordinates.
  *

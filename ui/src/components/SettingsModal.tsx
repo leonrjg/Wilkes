@@ -19,6 +19,7 @@ import { indentWithTab } from "@codemirror/commands";
 import {Tool} from "react-feather";
 import { isTauri } from "../services";
 import type { AgentBackend, MetadataSourcePreference } from "../lib/types";
+import { useSettingsStore } from "../stores/useSettingsStore";
 
 const CHAT_BACKENDS: { value: AgentBackend; label: string }[] = [
   { value: "ClaudeCode", label: "Claude Code" },
@@ -47,15 +48,7 @@ function TechnicalSettings({ api, onUpdate }: { api: SearchApi; onUpdate: (s: Se
   const viewRef = useRef<EditorView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
-
-  useEffect(() => {
-    const observer = new MutationObserver(() => {
-      setIsDark(window.document.documentElement.classList.contains("dark"));
-    });
-    observer.observe(window.document.documentElement, { attributes: true, attributeFilter: ["class"] });
-    return () => observer.disconnect();
-  }, []);
+  const isDark = useSettingsStore((state) => state.colorScheme) === "dark";
 
   useEffect(() => {
     let mounted = true;

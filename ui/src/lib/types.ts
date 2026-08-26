@@ -1,3 +1,18 @@
+// Document coordinates are owned by the readers -- they are that package's
+// vocabulary, and it must be usable by a host that has none of the types
+// below. Re-exported here so the rest of Wilkes still has one import site.
+import type {
+  BoundingBox,
+  ByteRange,
+  SourceOrigin,
+} from "../components/preview/documentCoordinates";
+
+export type { BoundingBox, ByteRange, SourceOrigin };
+
+/** What a `Theme` resolves to once "System" has been asked of the OS. Defined
+ *  by the readers, since it is what their host contract asks for. */
+export type { ColorScheme } from "../components/preview/ReaderHost";
+
 // Auto-generated from Rust types (manually maintained until tauri-specta is wired up).
 // Keep in sync with crates/core/src/types.rs.
 
@@ -43,11 +58,6 @@ export interface StartupStatus {
   blockers: StartupBlocker[];
 }
 
-export interface ByteRange {
-  start: number;
-  end: number;
-}
-
 export type SearchMode = "Grep" | "Semantic";
 export type SearchScope =
   | { type: "corpus" }
@@ -74,10 +84,6 @@ export interface SearchQuery {
 }
 
 export type FileType = "PlainText" | "Pdf";
-
-export type SourceOrigin =
-  | { TextFile: { line: number; col: number } }
-  | { PdfPage: { page: number; bbox: BoundingBox | null } };
 
 export interface Match {
   /** null for PDF chunks — highlight position is carried by origin.bbox. */
@@ -272,13 +278,6 @@ export interface NewBookmark {
   quote: string;
   note?: string | null;
   rects: BoundingBox[];
-}
-
-export interface BoundingBox {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
 }
 
 export type PreviewData =

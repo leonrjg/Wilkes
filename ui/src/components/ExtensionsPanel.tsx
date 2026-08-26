@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { Settings } from "../lib/types";
-import { Tooltip } from "./Tooltip";
+import { Tooltip } from "./preview";
 
 interface ExtensionsPanelProps {
   settings: Settings;

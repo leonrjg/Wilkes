@@ -3,7 +3,7 @@ import { X } from "react-feather";
 import { useViewerStore } from "../stores/useViewerStore";
 import { fileName } from "./DocumentEntryRow";
 import { useFileContextMenu } from "./FileContextMenu";
-import { Tooltip } from "./Tooltip";
+import { Tooltip } from "./preview";
 
 export default function ViewerTabs() {
   const tabs = useViewerStore((state) => state.tabs);

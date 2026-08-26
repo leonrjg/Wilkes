@@ -25,6 +25,7 @@ import { readTextScrollPosition, saveTextScrollPosition } from "./textScrollMemo
 import { elementAnchor, rangeDecorations, type Decoration as ReaderDecoration } from "./decorations";
 import type { ReaderSlots } from "./slots";
 import type { ReaderHandle } from "./readerHandle";
+import { useReaderHost } from "./ReaderHost";
 
 // ── Highlight effect / field ──────────────────────────────────────────────────
 
@@ -161,6 +162,7 @@ export default function CodeViewer({
   slots,
   ref,
 }: CodeViewerProps) {
+  const isDark = useReaderHost().colorScheme === "dark";
   const rootRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
@@ -173,15 +175,6 @@ export default function CodeViewer({
       view.dispatch({ selection: { anchor: view.state.selection.main.head } });
     },
   });
-  const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
-
-  useEffect(() => {
-    const observer = new MutationObserver(() => {
-      setIsDark(window.document.documentElement.classList.contains("dark"));
-    });
-    observer.observe(window.document.documentElement, { attributes: true, attributeFilter: ["class"] });
-    return () => observer.disconnect();
-  }, []);
 
   useEffect(() => {
     if (!containerRef.current) return;

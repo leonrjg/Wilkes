@@ -5,6 +5,7 @@ import { useResearchStore } from "./useResearchStore";
 import type {
   AgentBackend,
   BookmarkDock,
+  ColorScheme,
   FileDisplayField,
   FileEntry,
   FileMetadataUpdate,
@@ -16,16 +17,19 @@ import type {
   Theme,
 } from "../lib/types";
 
-function applyTheme(theme: Theme) {
-  const root = window.document.documentElement;
-  root.classList.remove("light", "dark");
-  if (theme === "Light") root.classList.add("light");
-  else if (theme === "Dark") root.classList.add("dark");
-  else {
-    const systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-    root.classList.add(systemDark ? "dark" : "light");
-  }
+/** What "System" currently resolves to, or the explicit choice. */
+function resolveColorScheme(theme: Theme): ColorScheme {
+  if (theme === "Light") return "light";
+  if (theme === "Dark") return "dark";
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
+
+// The one registration that follows the OS while the theme is "System". Held
+// module-side so switching away from System removes it, and switching back
+// installs exactly one -- the previous code added a listener only if System was
+// the theme at startup, and never removed it, so picking System later did not
+// follow the OS and picking it twice stacked listeners.
+let systemThemeListener: (() => void) | null = null;
 
 function listFilesForActiveFilters(directory: string) {
   const { selectedCollectionId, selectedTagId, draftCollectionExpression } = useResearchStore.getState();
@@ -53,6 +57,8 @@ interface SettingsStore {
   preferSemantic: boolean;
   indexing: boolean;
   theme: Theme;
+  /** The resolved appearance, the single source of truth for it. */
+  colorScheme: ColorScheme;
   maxResults: number;
   bookmarksDock: BookmarkDock;
   fileSortKey: FileSortKey;
@@ -83,7 +89,30 @@ interface SettingsStore {
 }
 
 export const useSettingsStore = create<SettingsStore>()(
-  subscribeWithSelector((set, get) => ({
+  subscribeWithSelector((set, get) => {
+    /** Resolve the theme, publish it, mirror it onto the document, and keep the
+     *  OS listener in step. The store is the only thing that decides what the
+     *  appearance is; the class on <html> is a projection of that decision for
+     *  CSS to select on, not a second place it is stored. */
+    const applyTheme = (theme: Theme) => {
+      const media = window.matchMedia("(prefers-color-scheme: dark)");
+      if (systemThemeListener) {
+        media.removeEventListener("change", systemThemeListener);
+        systemThemeListener = null;
+      }
+      if (theme === "System") {
+        systemThemeListener = () => applyTheme("System");
+        media.addEventListener("change", systemThemeListener);
+      }
+
+      const colorScheme = resolveColorScheme(theme);
+      const root = window.document.documentElement;
+      root.classList.remove("light", "dark");
+      root.classList.add(colorScheme);
+      set({ colorScheme });
+    };
+
+    return {
     favorites: [],
     settings: null,
     recentDirs: [],
@@ -98,6 +127,7 @@ export const useSettingsStore = create<SettingsStore>()(
     preferSemantic: false,
     indexing: false,
     theme: "System",
+    colorScheme: resolveColorScheme("System"),
     maxResults: 50,
     bookmarksDock: "Right",
     fileSortKey: "filename",
@@ -119,13 +149,6 @@ export const useSettingsStore = create<SettingsStore>()(
     load: async () => {
       const s = await api.getSettings();
       applyTheme(s.theme);
-
-      // Set up system theme listener if needed
-      if (s.theme === "System") {
-        const media = window.matchMedia("(prefers-color-scheme: dark)");
-        const listener = () => applyTheme("System");
-        media.addEventListener("change", listener);
-      }
 
       set({
         settings: s,
@@ -401,7 +424,8 @@ export const useSettingsStore = create<SettingsStore>()(
       get().replaceSettings(settings);
       return settings;
     },
-  }))
+    };
+  })
 );
 
 // fileList is derived from directory: whenever directory changes, reload (or clear) the file list.

@@ -8,7 +8,7 @@ import type {
 import { api } from "../services";
 import { useViewerStore } from "../stores/useViewerStore";
 import { CopyButton } from "./CopyButton";
-import { Tooltip } from "./Tooltip";
+import { Tooltip } from "./preview";
 
 interface Props {
   input: SearchResultsSummaryInput;

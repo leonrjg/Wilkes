@@ -12,7 +12,7 @@ import { Search as SearchIcon, List } from "react-feather";
 import { GlobalWorkerOptions } from "pdfjs-dist";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import PdfPageCanvas from "./PdfPageCanvas";
-import type { BoundingBox } from "../../lib/types";
+import type { BoundingBox } from "./documentCoordinates";
 import { usePdfInnerSearch, type InnerMatch } from "./usePdfInnerSearch";
 import { usePdfSearchResult } from "./usePdfSearchResult";
 import type { PdfSearchLocator } from "./pdfTextLocator";
@@ -32,7 +32,7 @@ import {
   type PdfScrollPosition,
 } from "./pdfScrollMemory";
 import { usePdfDocument } from "./pdfDocumentCache";
-import { Tooltip } from "../Tooltip";
+import { Tooltip } from "./Tooltip";
 import type { DocumentSelection } from "./selection";
 import SelectionLayer from "./SelectionLayer";
 import { useDomDocumentSelection } from "./useDomDocumentSelection";
@@ -255,7 +255,8 @@ export default function PdfViewer({
   onLoadError,
   onPageChange,
 }: PdfViewerProps) {
-  const { openExternal, pdfAutoZoomTargetPx: autoZoomTargetPx } = useReaderHost();
+  const { openExternal, colorScheme, pdfAutoZoomTargetPx: autoZoomTargetPx } = useReaderHost();
+  const isDark = colorScheme === "dark";
   const rootRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState(600);
@@ -289,15 +290,6 @@ export default function PdfViewer({
   const targetRects =
     locatedSearchResult?.rects ?? (search_locator ? null : highlight_rects);
   const [isOutlineOpen, setIsOutlineOpen] = useState(false);
-  const [isDark, setIsDark] = useState(() => window.document.documentElement.classList.contains("dark"));
-
-  useEffect(() => {
-    const observer = new MutationObserver(() => {
-      setIsDark(window.document.documentElement.classList.contains("dark"));
-    });
-    observer.observe(window.document.documentElement, { attributes: true, attributeFilter: ["class"] });
-    return () => observer.disconnect();
-  }, []);
 
   const renderedWidth = containerWidth * zoom;
   const { pageMetrics, hasPageMetrics } = usePdfPageMetrics(pdf, url);

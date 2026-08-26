@@ -22,7 +22,7 @@ import {
 import { buildRows, COLLAPSED_LIMIT, type Row } from "../lib/utils/flattenResults";
 import { useToasts } from "./Toast";
 import { useFileContextMenu } from "./FileContextMenu";
-import { Tooltip } from "./Tooltip";
+import { Tooltip } from "./preview";
 import { useSearchStore } from "../stores/useSearchStore";
 import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useChatStore } from "../stores/useChatStore";

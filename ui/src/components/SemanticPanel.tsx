@@ -16,7 +16,7 @@ import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import LogsPanel from "./LogsPanel";
 import {CornerLeftDown, CornerRightUp} from "react-feather";
-import { Tooltip } from "./Tooltip";
+import { Tooltip } from "./preview";
 import ModelCatalog from "./ModelCatalog";
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
-import type { BoundingBox } from "../../lib/types";
+import type { BoundingBox } from "./documentCoordinates";
 import { findAllPdfTextMatches } from "./pdfTextLocator";
 
 export interface InnerMatch {

@@ -16,6 +16,7 @@ import { useEditorStore } from "../stores/useEditorStore";
 import { useViewerStore } from "../stores/useViewerStore";
 import { fileName } from "./DocumentEntryRow";
 import { getLanguageExtension } from "./preview/CodeViewer";
+import { useSettingsStore } from "../stores/useSettingsStore";
 
 const setGhost = StateEffect.define<{ position: number; text: string } | null>();
 
@@ -105,7 +106,7 @@ export default function DocumentEditor({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [steering, setSteering] = useState<SessionSteering | null>(null);
-  const [isDark, setIsDark] = useState(() => document.documentElement.classList.contains("dark"));
+  const isDark = useSettingsStore((state) => state.colorScheme) === "dark";
   const buffer = useEditorStore((state) => state.buffers[documentPath]);
   const tabs = useViewerStore((state) => state.tabs);
   const openMatch = useViewerStore((state) => state.openMatch);
@@ -121,14 +122,6 @@ export default function DocumentEditor({
       }
     };
   }, [documentPath]);
-
-  useEffect(() => {
-    const observer = new MutationObserver(() => {
-      setIsDark(document.documentElement.classList.contains("dark"));
-    });
-    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
-    return () => observer.disconnect();
-  }, []);
 
   const disposeListener = () => {
     unlistenRef.current?.();

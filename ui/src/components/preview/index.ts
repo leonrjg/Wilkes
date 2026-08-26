@@ -55,8 +55,16 @@ export type { ReaderHandle, FindableReaderHandle, ZoomableReaderHandle } from ".
 
 export type { DocumentSelection, PositionedSelection } from "./selection";
 
+export type { BoundingBox, ByteRange, SourceOrigin } from "./documentCoordinates";
+
+/** A leaf primitive the readers need and both applications use. It lives here
+ *  because the PDF link preview depends on its `interactive` and `size`
+ *  behaviour, so it is reader functionality rather than host chrome; shipping
+ *  it from one place is what stops the two copies drifting. */
+export { Tooltip } from "./Tooltip";
+
 export { ReaderHostProvider, useReaderHost } from "./ReaderHost";
-export type { ReaderHostServices } from "./ReaderHost";
+export type { ReaderHostServices, ColorScheme } from "./ReaderHost";
 
 // ── Tier 2: headless ────────────────────────────────────────────────────────
 

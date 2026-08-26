@@ -229,6 +229,7 @@ describe("PdfViewer", () => {
     vi.clearAllMocks();
     useSettingsStore.setState({
       settings: { pdf_auto_zoom_target_px: 15.5 } as never,
+      colorScheme: "light",
     });
     mockPdfDoc.value = {
       numPages: 10,
@@ -595,6 +596,26 @@ describe("PdfViewer", () => {
     const targets = screen.getAllByTestId("target-highlight");
     expect(targets).toHaveLength(2);
     expect(targets[0]).toHaveStyle({ left: "100px", top: "25px", width: "30px" });
+  });
+
+  it("applies the dark treatment from the host, not from the document", async () => {
+    useSettingsStore.setState({ colorScheme: "dark" });
+    // Contradictory state on the document: if the reader were still reading the
+    // class it would come out light here.
+    document.documentElement.classList.remove("dark");
+    document.documentElement.classList.add("light");
+
+    const { rerender } = render(<PdfViewer {...defaultProps} />);
+    // `.pdf-dark-mode .pdf-page canvas` is what inverts the page.
+    expect(document.querySelector(".pdf-dark-mode")).not.toBeNull();
+
+    await act(async () => {
+      useSettingsStore.setState({ colorScheme: "light" });
+    });
+    rerender(<PdfViewer {...defaultProps} />);
+    expect(document.querySelector(".pdf-dark-mode")).toBeNull();
+
+    document.documentElement.classList.remove("light");
   });
 
   it("renders host content over a decoration's union box", async () => {
