@@ -47,6 +47,30 @@ function clearWorkspaceUi() {
   useChatStore.getState().resetForWorkspace();
 }
 
+/**
+ * The active workspace, or null before the registry has been read.
+ */
+function activeWorkspace(state: WorkspaceStore): WorkspaceSummary | null {
+  return state.workspaces.find((workspace) => workspace.id === state.activeWorkspaceId) ?? null;
+}
+
+/**
+ * Whether the active workspace may only be read.
+ *
+ * One predicate, so no component decides for itself what read-only means: the
+ * backend refuses the write either way, and a component that guessed
+ * differently would offer a control that always fails or withhold one that
+ * would have worked. `useActiveWorkspaceReadOnly` is the same answer for
+ * components that must re-render when it changes.
+ */
+export function activeWorkspaceIsReadOnly(): boolean {
+  return activeWorkspace(useWorkspaceStore.getState())?.read_only ?? false;
+}
+
+export function useActiveWorkspaceReadOnly(): boolean {
+  return useWorkspaceStore((state) => activeWorkspace(state)?.read_only ?? false);
+}
+
 export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   workspaces: [],
   activeWorkspaceId: null,

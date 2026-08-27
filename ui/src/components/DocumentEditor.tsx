@@ -17,6 +17,7 @@ import { useViewerStore } from "../stores/useViewerStore";
 import { fileName } from "./DocumentEntryRow";
 import { getLanguageExtension } from "@leonrjg/wilkes-reader";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
 
 const setGhost = StateEffect.define<{ position: number; text: string } | null>();
 
@@ -107,6 +108,7 @@ export default function DocumentEditor({
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [steering, setSteering] = useState<SessionSteering | null>(null);
   const isDark = useSettingsStore((state) => state.colorScheme) === "dark";
+  const readOnly = useActiveWorkspaceReadOnly();
   const buffer = useEditorStore((state) => state.buffers[documentPath]);
   const tabs = useViewerStore((state) => state.tabs);
   const openMatch = useViewerStore((state) => state.openMatch);
@@ -269,6 +271,10 @@ export default function DocumentEditor({
         }
       }),
     ];
+    // A workspace another application owns refuses the save, so the buffer is
+    // made uneditable rather than allowed to collect changes that can never
+    // land.
+    if (readOnly) extensions.push(EditorState.readOnly.of(true), EditorView.editable.of(false));
     if (isDark) extensions.push(oneDark);
     if (languageExtension) extensions.push(languageExtension);
     const state = EditorState.create({ doc: buffer.text, extensions });
@@ -284,7 +290,7 @@ export default function DocumentEditor({
     };
     // The editor owns subsequent buffer changes; remount only for a new path/theme/language.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [documentPath, language, isDark, semanticReady, generationReady, Boolean(buffer)]);
+  }, [documentPath, language, isDark, readOnly, semanticReady, generationReady, Boolean(buffer)]);
 
   const shown = buffer?.completion?.text ? buffer.completion : null;
   const inspect = buffer?.completion ?? buffer?.lastCompletion ?? null;
@@ -369,7 +375,8 @@ export default function DocumentEditor({
         </button>
         <button
           type="button"
-          disabled={!buffer?.dirty || saving}
+          disabled={!buffer?.dirty || saving || readOnly}
+          title={readOnly ? "This workspace is read-only" : undefined}
           onClick={() => void save()}
           className="inline-flex items-center gap-1 rounded border border-[var(--border-main)] px-1.5 py-0.5 text-[var(--text-muted)] disabled:opacity-40"
         >

@@ -19,7 +19,7 @@ import { useBookmarksStore } from "./stores/useBookmarksStore";
 import { useChatStore } from "./stores/useChatStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useTopicsStore } from "./stores/useTopicsStore";
-import { useWorkspaceStore } from "./stores/useWorkspaceStore";
+import { useActiveWorkspaceReadOnly, useWorkspaceStore } from "./stores/useWorkspaceStore";
 import { activeViewerTab, useViewerStore } from "./stores/useViewerStore";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
 import { api, source, isTauri } from "./services";
@@ -33,6 +33,7 @@ export default function App() {
   const loadSettings = useSettingsStore((s) => s.load);
   const loadWorkspaces = useWorkspaceStore((s) => s.load);
   const workspaceSwitching = useWorkspaceStore((s) => s.switching);
+  const readOnly = useActiveWorkspaceReadOnly();
   const loadBookmarks = useBookmarksStore((s) => s.load);
   const openBookmarksPane = useBookmarksStore((s) => s.openPane);
   const closeBookmarksPane = useBookmarksStore((s) => s.closePane);
@@ -111,6 +112,10 @@ export default function App() {
         addToast("Choose a directory before dropping files", { type: "error" });
         return;
       }
+      if (readOnly) {
+        addToast("This workspace is read-only", { type: "error" });
+        return;
+      }
 
       try {
         const imported = await (source as DesktopSourceApi).importFiles(paths, directory, "move");
@@ -133,7 +138,7 @@ export default function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [addToast, directory, refreshFileList]);
+  }, [addToast, directory, readOnly, refreshFileList]);
 
   useEffect(() => {
     if (!isTauri) return;
@@ -145,6 +150,10 @@ export default function App() {
         if (paths.length === 0) return;
         if (!directory) {
           addToast("Choose a directory before pasting files", { type: "error" });
+          return;
+        }
+        if (readOnly) {
+          addToast("This workspace is read-only", { type: "error" });
           return;
         }
 
@@ -161,7 +170,7 @@ export default function App() {
 
     window.addEventListener("paste", handlePaste);
     return () => window.removeEventListener("paste", handlePaste);
-  }, [addToast, directory, refreshFileList]);
+  }, [addToast, directory, readOnly, refreshFileList]);
 
   useEffect(() => {
     let mounted = true;

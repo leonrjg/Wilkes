@@ -33,6 +33,17 @@ export interface WorkspaceSummary {
   name: string;
   roots: string[];
   active_root: string | null;
+  /**
+   * True when another application owns the workspace and Wilkes may only read
+   * it. Such a workspace is listed and searchable like any other; every write
+   * to its documents, roots or index is refused by the backend.
+   */
+  read_only: boolean;
+  /**
+   * The owning application's name, so the user knows whose corpus they are
+   * looking at. Null for an ordinary workspace.
+   */
+  managed_by: string | null;
 }
 
 export interface WorkspaceState {

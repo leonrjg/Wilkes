@@ -2,6 +2,7 @@ import { useCallback, useRef, useState } from "react";
 import { File, Folder } from "react-feather";
 import type { WebSourceApi } from "../services/api";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 
 interface Props {
@@ -72,6 +73,7 @@ function formatBytes(bytes: number): string {
 
 export default function UploadZone({ source, onRootChange }: Props) {
   const fileList = useSettingsStore((s) => s.fileList);
+  const readOnly = useActiveWorkspaceReadOnly();
   const refreshFileList = useSettingsStore((s) => s.refreshFileList);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState<UploadProgress | null>(null);
@@ -126,6 +128,11 @@ export default function UploadZone({ source, onRootChange }: Props) {
   const pct = progress && progress.total > 0
     ? Math.round((progress.loaded / progress.total) * 100)
     : null;
+
+  // Every control here writes. A read-only workspace keeps its documents
+  // readable and searchable, so the zone simply has nothing to offer; the
+  // workspace picker is where the lock is explained.
+  if (readOnly) return null;
 
   return (
     <div className="flex items-center gap-2 min-w-0">

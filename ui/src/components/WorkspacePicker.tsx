@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Edit2, Plus } from "react-feather";
+import { Edit2, Lock, Plus } from "react-feather";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 import { TextInputDialog } from "./TextInputDialog";
 import { Tooltip } from "@leonrjg/wilkes-reader";
@@ -20,6 +20,9 @@ export default function WorkspacePicker() {
   const createAndSwitch = useWorkspaceStore((state) => state.createAndSwitch);
   const rename = useWorkspaceStore((state) => state.rename);
   const active = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
+  // A read-only workspace is listed and can be opened; only the controls that
+  // would write to it are withheld.
+  const activeIsReadOnly = active?.read_only ?? false;
 
   const submitDialog = async (name: string) => {
     if (!dialog) return;
@@ -55,14 +58,30 @@ export default function WorkspacePicker() {
           className="h-full max-w-36 bg-transparent px-2 text-xs font-medium text-[var(--text-main)] outline-none disabled:opacity-50"
         >
           {workspaces.map((workspace) => (
-            <option key={workspace.id} value={workspace.id}>{workspace.name}</option>
+            <option key={workspace.id} value={workspace.id}>
+              {workspace.read_only ? `${workspace.name} (read-only)` : workspace.name}
+            </option>
           ))}
         </select>
-        <Tooltip content="Rename workspace">
+        {activeIsReadOnly && (
+          <Tooltip
+            content={active?.managed_by
+              ? `Read-only: this workspace is managed by ${active.managed_by}`
+              : "Read-only workspace"}
+          >
+            <span
+              aria-label="Read-only workspace"
+              className="flex h-full w-4 items-center justify-center text-[var(--text-dim)]"
+            >
+              <Lock size={10} />
+            </span>
+          </Tooltip>
+        )}
+        <Tooltip content={activeIsReadOnly ? "Read-only workspaces cannot be renamed" : "Rename workspace"}>
           <button
             type="button"
             aria-label="Rename workspace"
-            disabled={!active || switching || submitting}
+            disabled={!active || activeIsReadOnly || switching || submitting}
             onClick={() => active && setDialog({
               mode: "rename",
               workspaceId: active.id,

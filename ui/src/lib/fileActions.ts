@@ -9,6 +9,7 @@ import { useSettingsStore } from "../stores/useSettingsStore";
 import { Copy, Edit2, ExternalLink, Folder, FolderPlus, MessageSquare, Paperclip, RefreshCw, Tag, Trash2 } from "react-feather";
 import { useResearchStore } from "../stores/useResearchStore";
 import { useEditorStore } from "../stores/useEditorStore";
+import { activeWorkspaceIsReadOnly } from "../stores/useWorkspaceStore";
 
 export type ContextMenuTarget =
   | { kind: "file" | "match"; path: string; open: () => void }
@@ -46,6 +47,10 @@ export function buildFileContextMenuItems({
   deletionKind,
   onDeleteRequest,
 }: BuildFileContextMenuItemsArgs): ContextMenuItem[] {
+  // A read-only workspace still opens, reveals, is asked about and is tagged;
+  // what it withholds are the entries that would change the documents
+  // themselves, which the backend refuses anyway.
+  const readOnly = activeWorkspaceIsReadOnly();
   const primaryItems: ContextMenuItem[] = [
     {
       id: "open",
@@ -112,7 +117,7 @@ export function buildFileContextMenuItems({
   }
 
   if (target.kind === "directory") {
-    if (isTauri && onRenameRequest) {
+    if (isTauri && onRenameRequest && !readOnly) {
       primaryItems.push({
         id: "rename",
         label: "Rename",
@@ -124,14 +129,16 @@ export function buildFileContextMenuItems({
     return primaryItems;
   }
 
-  const managementItems: ContextMenuItem[] = [
-    {
-      id: "rename",
-      label: "Rename",
-      icon: Edit2,
-      run: () => onRenameRequest?.(target.path),
-    },
-  ];
+  const managementItems: ContextMenuItem[] = readOnly
+    ? []
+    : [
+      {
+        id: "rename",
+        label: "Rename",
+        icon: Edit2,
+        run: () => onRenameRequest?.(target.path),
+      },
+    ];
 
   const research = useResearchStore.getState();
   const currentEntry = useSettingsStore.getState().fileList.find((entry) => entry.path === target.path);
@@ -182,7 +189,7 @@ export function buildFileContextMenuItems({
     });
   }
 
-  if (isTauri && availableRoots.length > 0) {
+  if (isTauri && availableRoots.length > 0 && !readOnly) {
     managementItems.push({
         id: "move-to",
         label: "Move to...",
@@ -222,7 +229,7 @@ export function buildFileContextMenuItems({
     },
   );
 
-  if (onDeleteRequest) {
+  if (onDeleteRequest && !readOnly) {
     managementItems.push({
       id: "delete",
       label: deletionKind === "trash" ? "Move to Trash" : "Delete permanently",
@@ -232,6 +239,8 @@ export function buildFileContextMenuItems({
     });
   }
 
-  managementItems[0].dividerBefore = primaryItems.length > 0;
+  if (managementItems.length > 0) {
+    managementItems[0].dividerBefore = primaryItems.length > 0;
+  }
   return [...primaryItems, ...managementItems];
 }

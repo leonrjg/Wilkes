@@ -51,6 +51,16 @@
 
 ### Changed
 
+- An application-managed workspace — Underdog's semantic corpus — is now listed,
+  activatable and searchable by the user instead of being hidden from the
+  workspace listing. Hiding it protected the corpus by making it unreachable,
+  which cost the reads as well as the writes: its documents sit on the user's
+  own disk and there was no way to look at them. The listing reports
+  `read_only` and `managed_by` (also on the MCP `list_context` workspaces), and
+  the protection is stated on the writes instead — rename, import, save,
+  directory create/move/trash, index build and index delete, `/api/upload` and
+  the `download` MCP tool are all refused. The managed import API keeps its own
+  path and remains the corpus's only writer.
 - The downloader behind the `download` MCP tool moved to `wilkes-core` so the
   catalogue acquisition route shares it. One set of answers to may-this-be-
   fetched, where-may-it-land and is-this-already-here.

@@ -7,6 +7,17 @@ separate from generic workspace routes: a corpus token selects an
 application-managed workspace, but cannot activate, rename, re-root,
 reconfigure, or delete it.
 
+The workspace itself is *not* hidden from the person using Wilkes. It is
+listed with `read_only: true` and `managed_by: "underdog"`, can be activated,
+and its documents can be opened and searched like any other workspace's — they
+are the user's own files. What is refused is every write: renaming the
+workspace, changing its roots or semantic configuration, adding, renaming,
+moving or deleting documents, and building or deleting its index. The
+protection lives on those calls (`AppContext::ensure_writable`,
+`update_scoped_settings`, and the refusal to watch or reindex a managed root),
+not on the workspace's visibility. This adapter remains the corpus's only
+writer.
+
 ## Identity and admission
 
 `embedding_space_id`, `snapshot_id`, `rendition_id`, and `chunk_ref` are

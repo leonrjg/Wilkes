@@ -764,6 +764,12 @@ struct CatalogueAcquireBody {
 /// The download itself — URL scheme check, traversal guard, size cap and
 /// content dedup — is [`wilkes_core::acquire::download_to_root`], the same
 /// function behind the `download` MCP tool. There is one downloader.
+///
+/// Not gated by `ensure_writable`, unlike `/api/upload` into the same
+/// directory. The gate turns away the *user* adding documents to a library
+/// another application owns; this is that application fetching into Wilkes's
+/// own staging area on its way to the managed import API, which is the
+/// corpus's writer by contract.
 async fn underdog_catalogue_acquire_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogueAcquireBody>,
@@ -1844,7 +1850,8 @@ async fn upload_handler(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let (_, uploads_dir) = state.workspace_snapshot();
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    ctx.ensure_writable().map_err(err)?;
     let current_size = TokioServerFs.dir_size(&uploads_dir).await.unwrap_or(0);
     if current_size >= MAX_UPLOAD_BYTES {
         return Err(err(format!(
@@ -1895,7 +1902,8 @@ async fn delete_upload_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<DeleteUploadQuery>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    let (_, uploads_dir) = state.workspace_snapshot();
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    ctx.ensure_writable().map_err(err)?;
     let requested = PathBuf::from(&params.path);
     if requested.as_os_str().is_empty() {
         return Err(err(
@@ -1945,7 +1953,8 @@ async fn delete_upload_handler(
 async fn delete_all_upload_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    let (_, uploads_dir) = state.workspace_snapshot();
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    ctx.ensure_writable().map_err(err)?;
     TokioServerFs
         .remove_dir_all(&uploads_dir)
         .await

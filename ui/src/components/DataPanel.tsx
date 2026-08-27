@@ -3,6 +3,7 @@ import type { SearchApi, DataPaths } from "../services/api";
 import { isTauri } from "../services";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 
 interface Props {
@@ -18,6 +19,7 @@ export default function DataPanel({ api, isActive }: Props) {
   const refreshCurrentRootStatus = useSemanticStore((s) => s.refreshCurrentRootStatus);
   const handleCurrentRootIndexRemoved = useSemanticStore((s) => s.handleCurrentRootIndexRemoved);
   const directory = useSettingsStore((s) => s.directory);
+  const readOnly = useActiveWorkspaceReadOnly();
 
   const fetchPaths = async () => {
     try {
@@ -150,7 +152,10 @@ export default function DataPanel({ api, isActive }: Props) {
                 )}
                 <button
                   onClick={onDeleteIndex}
-                  disabled={isDeleting}
+                  disabled={isDeleting || readOnly}
+                  title={readOnly
+                    ? "This workspace's index is managed by another application"
+                    : undefined}
                   className="px-3 py-1.5 bg-red-900/20 hover:bg-red-900/40 text-red-400 text-[10px] font-bold uppercase tracking-wider rounded border border-red-900/50 transition-colors disabled:opacity-50"
                 >
                   {isDeleting ? "Deleting..." : "Delete current index"}

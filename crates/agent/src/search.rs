@@ -28,6 +28,14 @@ pub trait SearchService: Send + Sync {
 
     async fn library_roots(self: Arc<Self>) -> Vec<PathBuf>;
 
+    /// Whether this workspace refuses writes. Every other method on this trait
+    /// reads, so only the `download` tool has to ask — it is the one place an
+    /// MCP client can put a file into a library, and a workspace another
+    /// application owns is not one it may put files into.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
     /// Current maximum file size for search. Agent-facing callers use this
     /// rather than maintaining a second copy of the application setting.
     /// A value of zero means unlimited.

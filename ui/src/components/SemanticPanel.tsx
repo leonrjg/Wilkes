@@ -14,6 +14,7 @@ import {
 import type { SearchApi } from "../services/api";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
+import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 import LogsPanel from "./LogsPanel";
 import {CornerLeftDown, CornerRightUp} from "react-feather";
 import { Tooltip } from "@leonrjg/wilkes-reader";
@@ -222,6 +223,11 @@ interface Props {
 
 export default function SemanticPanel({ api, directory, refreshSemanticReady }: Props) {
   const handleCurrentRootIndexRemoved = useSemanticStore((s) => s.handleCurrentRootIndexRemoved);
+  const activeWorkspace = useWorkspaceStore((s) =>
+    s.workspaces.find((workspace) => workspace.id === s.activeWorkspaceId) ?? null,
+  );
+  const readOnly = activeWorkspace?.read_only ?? false;
+  const managedBy = activeWorkspace?.managed_by ?? null;
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
   const [modelFilter, setModelFilter] = useState("");
   const [draftSelected, setDraftSelected] = useState<SelectedEmbedder | null>(null);
@@ -589,6 +595,33 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   // ---------------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------------
+
+  // The corpus of a read-only workspace is built and owned by another
+  // application, so the panel reports the index rather than offering to
+  // rebuild or delete it. The backend refuses those calls either way.
+  if (readOnly) {
+    return (
+      <div className="flex flex-col gap-2 p-1">
+        <p className="text-xs text-[var(--text-muted)]">
+          {managedBy
+            ? `This workspace's semantic index is managed by ${managedBy}.`
+            : "This workspace's semantic index is managed by another application."}
+        </p>
+        <p className="text-xs text-[var(--text-dim)]">
+          Its documents are searchable here, but the index cannot be rebuilt or
+          deleted from Wilkes.
+        </p>
+        {indexStatus && (
+          <p className="text-xs text-[var(--text-dim)]">
+            {indexStatus.indexed_files} indexed file
+            {indexStatus.indexed_files === 1 ? "" : "s"}
+            {" · "}
+            {indexStatus.total_chunks} chunk{indexStatus.total_chunks === 1 ? "" : "s"}
+          </p>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-4 p-1">

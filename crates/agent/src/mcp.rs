@@ -473,6 +473,16 @@ impl WorkspaceScope {
     fn require_search(&self, unavailable: &str) -> Result<Arc<dyn SearchService>, String> {
         self.search.clone().ok_or_else(|| unavailable.to_string())
     }
+
+    /// Whether the resolved workspace refuses writes. A scope with no service
+    /// reads as writable; the tool that asks fails on the missing service
+    /// first, and answering "read-only" for an absent workspace would report
+    /// the wrong reason.
+    fn is_read_only(&self) -> bool {
+        self.search
+            .as_ref()
+            .is_some_and(|search| search.is_read_only())
+    }
 }
 
 impl WilkesMcp {
@@ -1219,13 +1229,18 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Download a direct HTTP(S) file URL into the current Wilkes root of the active workspace, or of the workspace named by workspace. Use only when the user asks to import or download a file. Pass filename to choose the saved name; existing files are never overwritten. Literature search results may provide pdf_url values suitable for this tool."
+        description = "Download a direct HTTP(S) file URL into the current Wilkes root of the active workspace, or of the workspace named by workspace. Use only when the user asks to import or download a file. Pass filename to choose the saved name; existing files are never overwritten. Refused for a workspace list_context reports as read_only, which another application owns. Literature search results may provide pdf_url values suitable for this tool."
     )]
     async fn download(&self, Parameters(params): Parameters<DownloadParams>) -> CallToolResult {
         let scope = match self.scope(params.workspace.as_deref()).await {
             Ok(scope) => scope,
             Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
         };
+        if scope.is_read_only() {
+            return CallToolResult::error(vec![ContentBlock::text(
+                "MANAGED_WORKSPACE_PROTECTED: this workspace is owned by another application and                  can only be read",
+            )]);
+        }
         let root = match self.current_root(&scope).await {
             Ok(root) => root,
             Err(message) => {

@@ -7,6 +7,7 @@ import { api, isTauri, source } from "../services";
 import type { DesktopSourceApi } from "../services/api";
 import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileActions";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { DirectoryTree, isStrictAncestor, parentPath } from "./DirectoryTree";
 import { configuredLibraryRoots } from "../lib/configuredRoots";
@@ -140,6 +141,7 @@ export default function DirectoryPicker({
   const { addToast } = useToasts();
   const { menu, openMenu, closeMenu } = useContextMenu<ContextMenuTarget>();
   const settings = useSettingsStore((s) => s.settings);
+  const readOnly = useActiveWorkspaceReadOnly();
   const isFavorite = (dir: string) => favorites.includes(dir);
   const onToast = (message: string, type: "success" | "error") => addToast(message, { type });
 
@@ -194,6 +196,9 @@ export default function DirectoryPicker({
     return (source as DesktopSourceApi).listDirectories(path);
   };
 
+  // Roots and the active directory live in the workspace manifest, which the
+  // backend refuses to rewrite for a workspace another application owns. The
+  // controls that would attempt it are withheld rather than left to fail.
   const openCreateDialog = () => {
     setCreateTarget({ destination: createRoots[0] ?? "", name: "" });
   };
@@ -248,10 +253,14 @@ export default function DirectoryPicker({
   return (
     <div className="flex items-center gap-1 min-w-0 w-full">
       <div className="flex h-6 items-center gap-0.5 bg-[var(--bg-active)] rounded overflow-hidden">
-        <Tooltip content={directory || "Choose directory"}>
+        <Tooltip content={readOnly
+          ? "This workspace's directories are managed by another application"
+          : directory || "Choose directory"}
+        >
           <button
             onClick={onPickDirectory}
-            className="h-full text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] px-3 flex-shrink-0 flex items-center gap-1.5"
+            disabled={readOnly}
+            className="h-full text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] px-3 flex-shrink-0 flex items-center gap-1.5 disabled:opacity-40"
           >
             <Folder size={12} />
             <span>Open</span>
@@ -281,13 +290,13 @@ export default function DirectoryPicker({
                       capabilities: { canOpenInFileManager: isTauri },
                       settings,
                       onToast,
-                      onRenameRequest: onRenameDirectory
+                      onRenameRequest: onRenameDirectory && !readOnly
                         ? (path) => setRenameTarget({ path, name: baseName(path) })
                         : undefined,
                     }),
                   })}
               >
-                {onForgetDirectory && (
+                {onForgetDirectory && !readOnly && (
                   <Tooltip content="Remove from history">
                     <button
                       onClick={async (e) => {
@@ -313,7 +322,7 @@ export default function DirectoryPicker({
                     {shortPath(b).split("/").pop() || shortPath(b)}
                   </button>
                 </Tooltip>
-                {onFavoriteAdd && onFavoriteRemove && (
+                {onFavoriteAdd && onFavoriteRemove && !readOnly && (
                   <Tooltip content={favorite ? "Remove favorite" : "Favorite this directory"}>
                     <button
                       onClick={(e) => {
@@ -335,15 +344,17 @@ export default function DirectoryPicker({
           })}
 
           {/* Create a new folder as a sibling of, or within, the roots */}
-          <Tooltip content="New folder">
-            <button
-              onClick={openCreateDialog}
-              aria-label="New folder"
-              className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
-            >
-              <FolderPlus size={12} />
-            </button>
-          </Tooltip>
+          {!readOnly && (
+            <Tooltip content="New folder">
+              <button
+                onClick={openCreateDialog}
+                aria-label="New folder"
+                className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
+              >
+                <FolderPlus size={12} />
+              </button>
+            </Tooltip>
+          )}
         </RootCarousel>
       )}
 

@@ -39,6 +39,27 @@ describe("WorkspacePicker", () => {
     expect(screen.getByRole("option", { name: "Research" })).toBeInTheDocument();
   });
 
+  it("lists a read-only workspace, marks it, and withholds rename", () => {
+    useWorkspaceStore.setState({
+      workspaces: [
+        { id: "workspace-a", name: "Default" },
+        { id: "corpus", name: "Underdog semantic corpus", read_only: true, managed_by: "underdog" },
+      ],
+      activeWorkspaceId: "corpus",
+    });
+
+    render(<ToastProvider><WorkspacePicker /></ToastProvider>);
+
+    expect(
+      screen.getByRole("option", { name: "Underdog semantic corpus (read-only)" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Read-only workspace")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rename workspace" })).toBeDisabled();
+    // Creating a workspace of one's own is unaffected by the active one being
+    // read-only.
+    expect(screen.getByRole("button", { name: "New workspace" })).toBeEnabled();
+  });
+
   it("does not send a request when the name is unchanged", () => {
     render(<ToastProvider><WorkspacePicker /></ToastProvider>);
     fireEvent.click(screen.getByRole("button", { name: "Rename workspace" }));

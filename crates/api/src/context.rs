@@ -105,6 +105,10 @@ impl wilkes_agent::search::SearchService for AppContext {
         self.get_settings().await.max_file_size
     }
 
+    fn is_read_only(&self) -> bool {
+        AppContext::is_read_only(self)
+    }
+
     async fn list_smart_collections(self: Arc<Self>) -> Result<Vec<SmartCollection>, String> {
         self.list_collections().map_err(|e| e.to_string())
     }
