@@ -18,7 +18,7 @@
     "@codemirror/state": "^6",
     "@codemirror/theme-one-dark": "^6",
     "@codemirror/view": "^6",
-    "@leonrjg/wilkes-reader": "github:leonrjg/wilkes-reader#v0.1.1",
+    "@leonrjg/wilkes-reader": "github:leonrjg/wilkes-reader#v0.2.0",
     "@lezer/highlight": "^1",
     "@tanstack/react-virtual": "^3",
     "@tauri-apps/api": "^2",
