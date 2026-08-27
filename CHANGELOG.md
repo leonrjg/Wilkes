@@ -11,10 +11,13 @@
   once, and every space shares the same rendition ids and chunk refs. The
   projection is an internal workspace — it is not listed beside the user's own
   and is never a corpus id callers address. Corpus status now reports a
-  `corpus_generation` and one entry per space; an import fans out to every
-  space before it returns, and a space that has not indexed the current
+  `corpus_generation` and one entry per space; an import brings every space to
+  the document it admitted, and a space that has not indexed the current
   generation is refused with `EMBEDDING_SPACE_STALE` rather than answering from
-  membership it lacks.
+  membership it lacks. A model that is unavailable does not decide whether a
+  document is in the corpus: its own projection is left behind and unservable,
+  the other spaces still follow, and catching up is idempotent from the
+  canonical renditions, so the work is owed rather than lost.
 
 - A local mirror of the open teaching catalogues — LibreTexts, OpenStax, MIT
   OpenCourseWare and DevDocs — with BM25 search over it, at

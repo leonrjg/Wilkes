@@ -39,9 +39,16 @@ The canonical import is returned only after Wilkes has:
 If the corpus has additional embedding spaces, admission then projects the
 canonical extracted text and exact chunk descriptors into each model. A
 projection never copies the source or repeats extraction/chunking; it computes
-only its own vectors and index rows. Fan-out is synchronous. A partial write is
-idempotently repairable, but no projection whose membership digest differs from
-the canonical corpus can serve.
+only its own vectors and index rows.
+
+Fan-out is attempted on admission and reported per space, but it does not
+decide admission: the canonical corpus is the membership authority, so a model
+that is unavailable or slow leaves its own projection behind rather than
+refusing the document. Catching a projection up is idempotent — every admitted
+snapshot is offered under a content-derived key, so a projection is only ever
+missing work, never holding half of it — and `PUT /spaces` performs it for one
+space, as does the next import for all of them. A projection whose membership
+digest differs from the canonical corpus cannot serve until it has.
 
 Identical source bytes reuse the retained snapshot. Managed snapshots and
 ready index rows are not automatically collected.

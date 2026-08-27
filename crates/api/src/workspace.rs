@@ -928,55 +928,7 @@ impl WorkspaceManager {
             &request.embedding,
         )?;
 
-        let child = self.context_for(&id).await?;
-        child
-            .ensure_managed_runtime()
-            .await
-            .map_err(anyhow::Error::msg)?;
-        let canonical_context = self.context_for(&request.corpus_id).await?;
-        canonical_context
-            .ensure_managed_runtime()
-            .await
-            .map_err(anyhow::Error::msg)?;
-
-        // Backfill from the canonical corpus's retained immutable sources and
-        // admitted chunk structure. The projection computes vectors only: it
-        // neither copies sources nor repeats extraction/chunking. The
-        // idempotency key is content-derived, so a crash or retry repairs only
-        // the documents the projection still lacks.
-        let mut pending =
-            vec![workspace_root(&self.app_data_dir, &request.corpus_id).join("managed_sources")];
-        let mut sources = Vec::new();
-        while let Some(directory) = pending.pop() {
-            for entry in std::fs::read_dir(&directory)? {
-                let entry = entry?;
-                let metadata = entry.metadata()?;
-                if metadata.is_dir() {
-                    if entry.file_name() != ".imports" {
-                        pending.push(entry.path());
-                    }
-                } else if metadata.is_file() {
-                    sources.push(entry.path());
-                }
-            }
-        }
-        sources.sort();
-        for source in sources {
-            let digest = wilkes_core::embed::identity::sha256_file(&source)?;
-            child
-                .import_managed_projection(
-                    request.corpus_id.clone(),
-                    format!("space-backfill-{digest}"),
-                    &canonical_context,
-                    source.clone(),
-                    serde_json::json!({
-                        "kind": "managed_corpus_projection",
-                        "canonical_corpus_id": request.corpus_id,
-                    }),
-                )
-                .await
-                .map_err(anyhow::Error::msg)?;
-        }
+        self.catch_up_projection(&request.corpus_id, &id).await?;
 
         let canonical = self.underdog_workspace_status(&request.corpus_id).await?;
         canonical
@@ -986,9 +938,90 @@ impl WorkspaceManager {
             .ok_or_else(|| anyhow::anyhow!("new embedding projection did not become visible"))
     }
 
+    /// Brings one projection level with its corpus, and is the only thing that
+    /// ever does.
+    ///
+    /// Every canonical source is offered to the projection under a
+    /// content-derived idempotency key, so a document the projection already
+    /// holds costs a hash and a lookup, and one that it lacks — because the
+    /// space was created after the document, or because a fan-out died
+    /// half way — is embedded now. That makes catching up idempotent and
+    /// therefore safe to drive from anywhere: a crash leaves no half-state to
+    /// reconcile, only work not yet done.
+    pub async fn catch_up_projection(
+        &self,
+        corpus_id: &str,
+        projection_workspace_id: &str,
+    ) -> anyhow::Result<()> {
+        let child = self.context_for(projection_workspace_id).await?;
+        child
+            .ensure_managed_runtime()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let canonical_context = self.context_for(corpus_id).await?;
+        canonical_context
+            .ensure_managed_runtime()
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        // The projection computes vectors only: it neither copies sources nor
+        // repeats extraction or chunking. Its passages are the canonical
+        // admitted rendition's passages, which is what keeps every space's
+        // chunk refs identical.
+        let sources = canonical_context
+            .managed_admitted_sources()
+            .map_err(anyhow::Error::msg)?;
+        for source in sources {
+            let digest = wilkes_core::embed::identity::sha256_file(&source)?;
+            child
+                .import_managed_projection(
+                    corpus_id.to_string(),
+                    format!("space-backfill-{digest}"),
+                    &canonical_context,
+                    source.clone(),
+                    serde_json::json!({
+                        "kind": "managed_corpus_projection",
+                        "canonical_corpus_id": corpus_id,
+                    }),
+                )
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    }
+
+    /// Brings every projection of one corpus level with it, reporting per
+    /// space rather than stopping at the first failure.
+    ///
+    /// One model being unavailable is not a reason to leave the others behind:
+    /// the spaces are independent derivations of the same membership, and a
+    /// space that cannot catch up simply goes on failing closed until it can.
+    pub async fn catch_up_corpus(&self, corpus_id: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let status = self.underdog_workspace_status(corpus_id).await?;
+        let mut failures = Vec::new();
+        for space in status.spaces.iter().filter(|space| !space.primary) {
+            if space.ready && space.indexed_generation == status.corpus_generation {
+                continue;
+            }
+            if let Err(error) = self
+                .catch_up_projection(corpus_id, &space.workspace_id)
+                .await
+            {
+                failures.push((space.embedding_space_id.clone(), format!("{error:#}")));
+            }
+        }
+        Ok(failures)
+    }
+
     /// Resolves a logical corpus/space pair to the internal projection
     /// workspace that owns those vectors, refusing a projection whose
     /// rendition/chunk membership is behind the canonical corpus.
+    ///
+    /// Refusing names catching up as the remedy, because that is a thing the
+    /// caller can cause: `catch_up_corpus` is idempotent and the ensure-space
+    /// endpoint performs it. Serving the stale space instead would be the one
+    /// unacceptable outcome — coordinates for a corpus this space does not
+    /// hold.
     pub async fn underdog_space_context(
         &self,
         corpus_id: &str,
@@ -1002,7 +1035,8 @@ impl WorkspaceManager {
             .ok_or_else(|| anyhow::anyhow!("EMBEDDING_SPACE_MISMATCH"))?;
         anyhow::ensure!(
             space.ready && space.indexed_generation == status.corpus_generation,
-            "EMBEDDING_SPACE_STALE: projection generation {}, corpus generation {}",
+            "EMBEDDING_SPACE_STALE: projection generation {}, corpus generation {}; \
+             the projection has not been caught up to the corpus",
             space.indexed_generation,
             status.corpus_generation
         );
@@ -1734,6 +1768,67 @@ mod tests {
                 .is_err(),
             "membership that only the corpus has is membership no projection may answer for"
         );
+
+        // A projection that is behind is work owed, and the pass that owes it
+        // reports per space: this environment has no embedder to load, so the
+        // lagging space comes back as a named failure rather than as an error
+        // that would have stopped every other space from catching up too.
+        let failures = manager.catch_up_corpus(&corpus_id).await.unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].0, lagging.embedding_space_id);
+    }
+
+    /// The cheap path has to stay cheap, because it is the one that runs after
+    /// every import: a corpus whose projections are all level must decide that
+    /// from the membership digests alone, without loading a single model.
+    #[tokio::test]
+    async fn catching_up_a_level_corpus_loads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) = WorkspaceManager::new(
+            dir.path().to_path_buf(),
+            dir.path().join("global-settings.json"),
+            Arc::clone(&events),
+        )
+        .unwrap();
+        let embedding = SelectedEmbedder {
+            engine: EmbeddingEngine::Candle,
+            model: EmbedderModel("primary-model".to_string()),
+            dimension: 2,
+        };
+        let corpus = manager
+            .ensure_underdog_workspace(EnsureManagedWorkspace {
+                corpus_key: "store-level".to_string(),
+                embedding: embedding.clone(),
+                chunk_size: 600,
+                chunk_overlap: 128,
+            })
+            .await
+            .unwrap();
+        let root = workspace_root(dir.path(), &corpus.corpus_id);
+        let recipe = wilkes_core::embed::ExtractionRecipe::new(600, 128);
+        let mut canonical = SemanticIndex::create(
+            &root,
+            embedding.model.model_id(),
+            embedding.dimension,
+            embedding.engine,
+            Some(&root.join("managed_sources")),
+        )
+        .unwrap();
+        admit(
+            &mut canonical,
+            &root.join("managed_sources").join("document.txt"),
+            "canonical passage",
+            vec![1.0, 0.0],
+            &recipe,
+        );
+        // No projection exists, so nothing is behind — and a corpus with one
+        // that is level takes the same path.
+        assert!(manager
+            .catch_up_corpus(&corpus.corpus_id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

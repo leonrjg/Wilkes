@@ -2355,27 +2355,18 @@ impl AppContext {
         )
     }
 
-    pub fn managed_snapshot_path(&self, source_sha256: &str) -> Result<PathBuf, String> {
+    /// The retained snapshots this managed corpus has admitted — what a
+    /// projection must hold to be level with it.
+    pub fn managed_admitted_sources(&self) -> Result<Vec<PathBuf>, String> {
         let index_arc = self.index.lock().clone();
         let guard = index_arc
             .lock()
             .map_err(|_| "Semantic index lock was poisoned")?;
-        let path = guard
+        guard
             .as_ref()
             .ok_or_else(|| "Managed index unavailable".to_string())?
-            .managed_path_for_source_sha256(source_sha256)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| {
-                "DOCUMENT_INDEX_INCOMPLETE: admitted canonical snapshot path is absent".to_string()
-            })?;
-        let actual = wilkes_core::embed::identity::sha256_file(&path)
-            .map_err(|error| format!("Could not verify canonical managed snapshot: {error:#}"))?;
-        if actual != source_sha256 {
-            return Err(
-                "DOCUMENT_INDEX_INCOMPLETE: canonical snapshot digest mismatch".to_string(),
-            );
-        }
-        Ok(path)
+            .managed_admitted_source_paths()
+            .map_err(|error| error.to_string())
     }
 
     pub fn managed_pending_operations(&self) -> (u64, u64) {

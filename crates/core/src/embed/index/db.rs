@@ -5926,21 +5926,25 @@ impl SemanticIndex {
             .map(Option::flatten)
     }
 
-    pub fn managed_path_for_source_sha256(
-        &self,
-        source_sha256: &str,
-    ) -> anyhow::Result<Option<PathBuf>> {
-        let path: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT file_path FROM files
-                 WHERE source_sha256 = ?1 AND admission_state = 'ready'
-                 ORDER BY id LIMIT 1",
-                params![source_sha256],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(path.map(PathBuf::from))
+    /// Every retained snapshot this corpus has admitted, in a stable order.
+    ///
+    /// The membership authority for a catch-up, deliberately, rather than the
+    /// contents of `managed_sources/`: the directory can hold bytes the corpus
+    /// never admitted — an interrupted import, a file someone dropped in — and
+    /// projecting those would either fail the whole pass or invent membership
+    /// the canonical corpus does not have.
+    pub fn managed_admitted_source_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_path FROM files
+              WHERE admission_state = 'ready'
+              ORDER BY source_sha256, id",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut paths = Vec::new();
+        for row in rows {
+            paths.push(PathBuf::from(row?));
+        }
+        Ok(paths)
     }
 
     /// Read and verify the canonical, vector-free structure of one managed

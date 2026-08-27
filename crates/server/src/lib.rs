@@ -423,42 +423,21 @@ async fn import_underdog_document_handler(
         )
         .await
         .map_err(managed_err)?;
-    let canonical_snapshot = managed
-        .managed_snapshot_path(&exported.source_sha256)
-        .map_err(managed_err)?;
-
-    // Projection fan-out is synchronous on admission. A failed secondary can
-    // leave only an idempotently repairable partial write; no space can serve
-    // it because managed_context compares its membership digest with the
-    // canonical corpus before every operation.
-    for space in status.spaces.iter().filter(|space| !space.primary) {
-        let projection = manager
-            .context_for(&space.workspace_id)
-            .await
-            .map_err(|error| managed_err(format!("{error:#}")))?;
-        projection
-            .ensure_managed_runtime()
-            .await
-            .map_err(managed_err)?;
-        projection
-            .import_managed_projection(
-                body.corpus_id.clone(),
-                body.idempotency_key.clone(),
-                &managed,
-                canonical_snapshot.clone(),
-                provenance.clone(),
-            )
-            .await
-            .map_err(managed_err)?;
-    }
-    let synchronized = manager
-        .underdog_workspace_status(&body.corpus_id)
+    // The document is admitted to the canonical corpus above; the spaces are
+    // brought to it here. A secondary model that is slow, unavailable, or
+    // broken must not decide whether a document is in the corpus — the corpus
+    // is the membership authority, and a projection that cannot follow it just
+    // goes on failing closed until it can. So the fan-out reports rather than
+    // refuses, and whatever it could not do is left owed and retried.
+    let failures = manager
+        .catch_up_corpus(&body.corpus_id)
         .await
         .map_err(|error| managed_err(format!("{error:#}")))?;
-    if synchronized.spaces.iter().any(|space| !space.ready) {
-        return Err(managed_err(
-            "EMBEDDING_SPACE_STALE: one or more corpus projections did not reach the canonical generation",
-        ));
+    for (space, error) in &failures {
+        // Left owed rather than raised: the space is already unservable while
+        // it is behind, and the next catch-up — the next import, or the
+        // caller's own maintenance pass — is what clears it.
+        tracing::warn!("embedding projection {space} did not follow the import: {error}");
     }
     Ok(Json(exported))
 }
