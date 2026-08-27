@@ -32,6 +32,21 @@ pub struct WorkspaceSummary {
     /// draw from if the listing says so — otherwise it finds out by exporting
     /// a document and failing.
     pub embedding: SelectedEmbedder,
+    /// Whether the user may only read this workspace.
+    ///
+    /// Reported rather than expressed by leaving the row out. An
+    /// application-managed corpus is protected from being *written* — the
+    /// import API is its only writer — and dropping it from the listing was a
+    /// second, cruder statement of the same protection, one that also cost the
+    /// user any way to look inside a corpus whose documents sit on their own
+    /// disk. The protections live where the writes do
+    /// (`AppContext::ensure_writable`, `update_scoped_settings`, and the
+    /// refusal to watch or reindex a managed root), so the listing is free to
+    /// name the workspace and say what it is.
+    pub read_only: bool,
+    /// The application that owns a read-only workspace, so the user can see
+    /// whose corpus they are looking at. `None` for an ordinary workspace.
+    pub managed_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -139,12 +154,18 @@ impl WorkspaceManifest {
                 roots.push(root.clone());
             }
         }
+        let managed_by = match &self.kind {
+            WorkspaceKind::User => None,
+            WorkspaceKind::ApplicationManaged { owner, .. } => Some(owner.clone()),
+        };
         WorkspaceSummary {
             id: self.id.clone(),
             name: self.name.clone(),
             roots,
             active_root: self.active_root.clone(),
             embedding,
+            read_only: managed_by.is_some(),
+            managed_by,
         }
     }
 }
@@ -362,9 +383,7 @@ pub async fn read_workspace_state(
             "workspace manifest id mismatch for {id}"
         );
         let settings = get_scoped_settings(settings_path, &manifest_path).await?;
-        if !manifest.is_application_managed() {
-            workspaces.push(manifest.summary(settings.semantic.selected));
-        }
+        workspaces.push(manifest.summary(settings.semantic.selected));
     }
     Ok(WorkspaceState {
         active_workspace_id: registry.active_workspace_id,
@@ -434,6 +453,7 @@ impl wilkes_agent::search::WorkspaceCatalog for WorkspaceManager {
                 name: workspace.name,
                 roots: workspace.roots,
                 active_root: workspace.active_root,
+                read_only: workspace.read_only,
             })
             .collect())
     }
@@ -643,12 +663,6 @@ impl WorkspaceManager {
                 registry.workspace_ids.iter().any(|item| item == id),
                 "Unknown workspace"
             );
-            let manifest = read_manifest(&workspace_manifest_path(&self.app_data_dir, id))?;
-            anyhow::ensure!(
-                !manifest.is_application_managed(),
-                "MANAGED_WORKSPACE_PROTECTED: managed workspaces cannot be activated"
-            );
-
             if registry.active_workspace_id == id {
                 already_active = true;
             }
@@ -1278,7 +1292,18 @@ mod tests {
         assert_eq!(restored.corpus_id, source_status.corpus_id);
         assert_eq!(restored.embedding_space_id, Some(space.clone()));
         assert!(restored.ready);
-        assert_eq!(target_manager.state().await.unwrap().workspaces.len(), 1);
+        // Restore replaces the pre-created corpus rather than adding a second
+        // one: the listing shows the user's own workspace and exactly one
+        // managed corpus.
+        let listed = target_manager.state().await.unwrap().workspaces;
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|workspace| workspace.read_only)
+                .count(),
+            1
+        );
         let retried = target_manager
             .restore_underdog_workspace("inbox", &source_status.corpus_id, &space, "store-restore")
             .await
@@ -1335,8 +1360,10 @@ mod tests {
         );
     }
 
+    /// A managed corpus is listed, says it is read-only, and can be activated
+    /// so the user can search it. Only the writes stay refused.
     #[tokio::test]
-    async fn managed_workspace_is_idempotent_hidden_and_protected() {
+    async fn managed_workspace_is_idempotent_listed_and_protected() {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("global-settings.json");
         let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
@@ -1354,18 +1381,36 @@ mod tests {
             .unwrap();
         let second = manager.ensure_underdog_workspace(request).await.unwrap();
         assert_eq!(first.corpus_id, second.corpus_id);
-        assert_eq!(manager.state().await.unwrap().workspaces.len(), 1);
+        let state = manager.state().await.unwrap();
+        assert_eq!(state.workspaces.len(), 2, "the corpus is listed beside the user's own workspace");
+        let corpus = state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == first.corpus_id)
+            .expect("the managed corpus is listed");
+        assert!(corpus.read_only);
+        assert_eq!(corpus.managed_by.as_deref(), Some("underdog"));
+        assert!(state
+            .workspaces
+            .iter()
+            .any(|workspace| !workspace.read_only && workspace.managed_by.is_none()));
+
         assert!(manager
             .rename(&first.corpus_id, "Visible".to_string())
             .await
             .unwrap_err()
             .to_string()
             .contains("MANAGED_WORKSPACE_PROTECTED"));
+
+        // Activation is what makes it searchable: every read path the UI has
+        // answers for the active workspace.
+        let switched = manager.switch(&first.corpus_id).await.unwrap();
+        assert_eq!(switched.active_workspace_id, first.corpus_id);
+        assert!(manager.active().is_read_only());
         assert!(manager
-            .switch(&first.corpus_id)
-            .await
+            .active()
+            .ensure_writable()
             .unwrap_err()
-            .to_string()
             .contains("MANAGED_WORKSPACE_PROTECTED"));
 
         let mut mismatch = SelectedEmbedder::default();

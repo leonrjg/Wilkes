@@ -3857,6 +3857,7 @@ impl AppContext {
     }
 
     pub async fn rename_file(&self, path: PathBuf, new_name: String) -> anyhow::Result<PathBuf> {
+        self.ensure_writable().map_err(anyhow::Error::msg)?;
         let old = path.clone();
         let new = crate::commands::files::rename_file(path, new_name).await?;
         self.rekey_research_path(&old, &new)?;
@@ -3888,6 +3889,7 @@ impl AppContext {
         root: PathBuf,
         mode: crate::commands::files::FileImportMode,
     ) -> anyhow::Result<Vec<PathBuf>> {
+        self.ensure_writable().map_err(anyhow::Error::msg)?;
         let s = self.get_settings().await;
         let Some(current_root) = s.last_directory.clone() else {
             anyhow::bail!("Choose a directory before importing files");
@@ -4079,6 +4081,38 @@ impl AppContext {
         crate::workspace::read_manifest(&self.workspace_path)
             .map(|manifest| manifest.is_application_managed())
             .unwrap_or(false)
+    }
+
+    /// Whether the user may only read this workspace. The same condition as
+    /// [`Self::is_application_managed`], named for the caller that asks it:
+    /// a workspace whose sole writer is an application's import API is
+    /// read-only to everybody else.
+    pub fn is_read_only(&self) -> bool {
+        self.is_application_managed()
+    }
+
+    /// The one gate every user-initiated write to this workspace's documents
+    /// or index passes through.
+    ///
+    /// An application-managed corpus is now listed and searchable like any
+    /// other workspace, so a person can activate it and reach every read path
+    /// the UI offers. What used to stop them — the workspace being absent from
+    /// the listing and refused by `switch` — protected the corpus only by
+    /// making it unreachable, which cost the reads as well as the writes. This
+    /// is the protection stated where it belongs: on the write.
+    ///
+    /// Deliberately not applied to [`Self::import_managed_document`] and the
+    /// rest of the managed corpus API. That caller *is* the workspace's owner;
+    /// it is every other caller that must be turned away.
+    pub fn ensure_writable(&self) -> Result<(), String> {
+        if self.is_application_managed() {
+            return Err(
+                "MANAGED_WORKSPACE_PROTECTED: this workspace is owned by another application and \
+                 can only be read"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     fn start_directory_watcher(self: &Arc<Self>, root: PathBuf) {
@@ -4756,6 +4790,7 @@ impl AppContext {
     /// inside the configured library; saving never becomes a path-creation or
     /// arbitrary-filesystem API.
     pub async fn save_document(&self, path: PathBuf, text: String) -> Result<(), String> {
+        self.ensure_writable()?;
         let settings = self.get_settings().await;
         let (roots, _) = library_roots(&settings);
         let path = std::fs::canonicalize(&path)
@@ -5742,6 +5777,7 @@ impl AppContext {
         root: String,
         selected: SelectedEmbedder,
     ) -> Result<(), String> {
+        self.ensure_writable()?;
         info!(
             "AppContext::start_build_index: root={}, engine={}, model={}",
             root,
@@ -6239,6 +6275,7 @@ impl AppContext {
     }
 
     pub async fn delete_index(&self, root: Option<PathBuf>) -> anyhow::Result<()> {
+        self.ensure_writable().map_err(anyhow::Error::msg)?;
         self.cancel_all_completions();
         self.invalidate_topic_tree_cache();
         if let Some(root) = root {
@@ -8783,6 +8820,42 @@ mod tests {
             user.directory_watcher.lock().is_some(),
             "an ordinary workspace is still watched"
         );
+    }
+
+    /// The corpus is reachable now — listed, activatable, searchable — so the
+    /// protection that used to come from being unreachable has to be stated on
+    /// the write itself.
+    #[tokio::test]
+    async fn test_application_managed_workspace_refuses_writes() {
+        let dir = tempdir().unwrap();
+        let managed = scoped_ctx(
+            dir.path(),
+            serde_json::json!({
+                "kind": "application_managed",
+                "owner": "underdog",
+                "purpose": "semantic-corpus",
+                "corpus_key": "store-id",
+            }),
+        );
+        assert!(managed.is_read_only());
+        let error = managed.ensure_writable().unwrap_err();
+        assert!(error.contains("MANAGED_WORKSPACE_PROTECTED"), "{error}");
+        assert!(managed
+            .save_document(dir.path().join("note.md"), "text".to_string())
+            .await
+            .unwrap_err()
+            .contains("MANAGED_WORKSPACE_PROTECTED"));
+        assert!(managed
+            .delete_index(None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("MANAGED_WORKSPACE_PROTECTED"));
+
+        let personal = tempdir().unwrap();
+        let user = scoped_ctx(personal.path(), serde_json::json!({ "kind": "user" }));
+        assert!(!user.is_read_only());
+        assert!(user.ensure_writable().is_ok());
     }
 
     fn running_embed_task() -> EmbedTaskHandle {

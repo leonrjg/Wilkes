@@ -83,6 +83,10 @@ pub struct WorkspaceDescriptor {
     pub active_root: Option<PathBuf>,
     /// Whether this is the workspace a tool call reaches when it names none.
     pub active: bool,
+    /// Whether the workspace can only be read. An application-managed corpus
+    /// is listed like any other so its documents can be searched, but every
+    /// write to it is refused.
+    pub read_only: bool,
 }
 
 /// Resolves which workspace's library a single tool call reads.

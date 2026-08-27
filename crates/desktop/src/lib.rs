@@ -177,6 +177,7 @@ async fn move_file_to_root_for_ctx(
     path: String,
     target_root: String,
 ) -> Result<String, String> {
+    ctx.ensure_writable()?;
     let supported_extensions = ctx.get_settings().await.supported_extensions;
     let old = PathBuf::from(path);
     let mut moved = wilkes_api::commands::files::move_files_into_root(
@@ -1330,7 +1331,11 @@ async fn reveal_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn trash_file(path: String) -> Result<(), String> {
+async fn trash_file(path: String, app: AppHandle) -> Result<(), String> {
+    // Path-based rather than routed through the context, so the read-only gate
+    // has to be asked for here: the workspace it would delete from is the
+    // active one either way.
+    app_context(&app).ensure_writable()?;
     trash_file_for_path(path).await
 }
 
@@ -2032,7 +2037,8 @@ async fn move_file(path: String, target_root: String, app: AppHandle) -> Result<
 }
 
 #[tauri::command]
-async fn create_directory(parent: String, name: String) -> Result<String, String> {
+async fn create_directory(parent: String, name: String, app: AppHandle) -> Result<String, String> {
+    app_context(&app).ensure_writable()?;
     wilkes_api::commands::files::create_directory(parent.into(), name)
         .await
         .map(|path| path.display().to_string())

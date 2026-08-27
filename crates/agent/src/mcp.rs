@@ -2294,6 +2294,7 @@ mod tests {
                     roots: search.library_roots.clone(),
                     active_root: search.default_root.clone(),
                     active: *id == self.active,
+                    read_only: false,
                 })
                 .collect())
         }
