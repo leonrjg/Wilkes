@@ -360,8 +360,6 @@ export default function PreviewPane() {
     !isPdfFile && displayData && "Text" in displayData
       ? selectedMatch.text_range ?? displayData.Text.highlight_range
       : { start: 0, end: 0 };
-  // When the navigation target is one of this file's bookmarks, emphasise its
-  // exact persisted per-line rects instead of its union bbox.
   const bboxesEqual = (a: BoundingBox | null, b: BoundingBox | null) =>
     a != null &&
     b != null &&
@@ -369,15 +367,28 @@ export default function PreviewPane() {
     a.y === b.y &&
     a.width === b.width &&
     a.height === b.height;
-  const targetBookmarkRects =
-    bookmarks.find(
-      (bookmark) =>
-        bookmark.path === selectedMatch.path &&
-        bookmark.rects.length > 0 &&
-        "PdfPage" in bookmark.origin &&
-        bookmark.origin.PdfPage.page === pdfPage &&
-        bboxesEqual(bookmark.origin.PdfPage.bbox, pdfBbox),
-    )?.rects ?? null;
+  // The reader locates the navigation target but only draws geometry it worked
+  // out itself, so a target the host has coordinates for is marked from here.
+  // A bookmark at the same origin is already drawing that spot: marking it
+  // again is what stacked a second highlight under the bookmark's own.
+  const targetIsBookmarked = bookmarks.some(
+    (bookmark) =>
+      bookmark.path === selectedMatch.path &&
+      bookmark.rects.length > 0 &&
+      "PdfPage" in bookmark.origin &&
+      bookmark.origin.PdfPage.page === pdfPage &&
+      bboxesEqual(bookmark.origin.PdfPage.bbox, pdfBbox),
+  );
+  const readerDecorations: Decoration[] =
+    isPdfFile && pdfBbox && !pdfSearchLocator && !targetIsBookmarked
+      ? [
+          ...bookmarkDecorations,
+          {
+            id: "navigation-target",
+            anchor: { kind: "rects", page: pdfPage, rects: [pdfBbox] },
+          },
+        ]
+      : bookmarkDecorations;
   const title = headerTitle(viewerMetadata);
   const author = headerAuthor(viewerMetadata);
   const createdAt = formatDocumentMonthYear(viewerMetadata?.created_at);
@@ -702,9 +713,8 @@ export default function PreviewPane() {
                 loadAttempt={pdfLoadAttempt}
                 page={pdfPage}
                 highlight_bbox={pdfBbox}
-                highlight_rects={targetBookmarkRects}
                 search_locator={pdfSearchLocator}
-                decorations={bookmarkDecorations}
+                decorations={readerDecorations}
                 slots={{ selectionActions: selectionActionsSlot }}
                 onRenderSuccess={() => setIsPdfRendering(false)}
                 onLoadError={(error) => reportTabLoadError(activeTab.id, error)}
@@ -716,7 +726,7 @@ export default function PreviewPane() {
                 documentPath={selectedMatch.path}
                 restoreScrollPosition={shouldRestoreSourceScroll}
                 highlightRange={renderedHighlightRange}
-                decorations={bookmarkDecorations}
+                decorations={readerDecorations}
                 slots={{ selectionActions: selectionActionsSlot }}
               />
             ) : displayData && "Text" in displayData && editing ? (
@@ -738,7 +748,7 @@ export default function PreviewPane() {
                   displayData.Text.content,
                   displayData.Text.highlight_range,
                 )}
-                decorations={bookmarkDecorations}
+                decorations={readerDecorations}
                 slots={{ selectionActions: selectionActionsSlot }}
               />
             ) : null}

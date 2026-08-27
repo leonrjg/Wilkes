@@ -842,6 +842,59 @@ describe("PreviewPane", () => {
     // The text-file bookmark carries no rects and must not produce a highlight.
   });
 
+  it("marks a navigation target the reader cannot locate itself", () => {
+    setViewerState({
+      selectedMatch: {
+        path: "current.pdf",
+        origin: { PdfPage: { page: 3, bbox: { x: 1, y: 2, width: 3, height: 4 } } },
+      } as any,
+      previewData: { Pdf: { page: 3, highlight_bbox: null } },
+      previewLoading: false,
+    });
+    useBookmarksStore.setState({ bookmarks: [] });
+
+    render(<PreviewPane />);
+
+    const call = mockPdfViewer.mock.calls.at(-1)![0];
+    expect(call.decorations).toEqual([
+      expect.objectContaining({
+        id: "navigation-target",
+        anchor: { kind: "rects", page: 3, rects: [{ x: 1, y: 2, width: 3, height: 4 }] },
+      }),
+    ]);
+  });
+
+  it("leaves a bookmarked target to its bookmark, so it is marked once", () => {
+    const bbox = { x: 1, y: 2, width: 3, height: 4 };
+    setViewerState({
+      selectedMatch: {
+        path: "current.pdf",
+        origin: { PdfPage: { page: 3, bbox } },
+      } as any,
+      previewData: { Pdf: { page: 3, highlight_bbox: null } },
+      previewLoading: false,
+    });
+    useBookmarksStore.setState({
+      bookmarks: [
+        {
+          id: "bookmarked-target",
+          path: "current.pdf",
+          origin: { PdfPage: { page: 3, bbox } },
+          quote: "quote",
+          created_at: "2026-01-01T00:00:00Z",
+          note: null,
+          rects: [bbox],
+        },
+      ],
+    });
+
+    render(<PreviewPane />);
+
+    // A second mark under the bookmark is what showed as two stacked colours.
+    const call = mockPdfViewer.mock.calls.at(-1)![0];
+    expect(call.decorations.map((d: any) => d.id)).toEqual(["bookmarked-target"]);
+  });
+
   it("renders PdfViewer when selectedMatch is PDF but previewData is stale Text data", () => {
     // Regression: viewer type was determined by displayData ("Text" in displayData),
     // not by selectedMatch.origin. When coming from a text file, the stale

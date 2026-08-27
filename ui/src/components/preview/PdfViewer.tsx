@@ -57,10 +57,10 @@ export interface PdfViewerProps {
   /** Incremented to retry a failed parse without changing the document URL. */
   loadAttempt?: number;
   page: number;
+  /** Where to navigate: the scroll destination and what the ping points at.
+   *  It locates the target, it does not draw it -- a host that wants a mark
+   *  left on the page supplies a decoration, so nothing is drawn twice. */
   highlight_bbox: BoundingBox | null;
-  /** Precise per-line rects for the navigation target (bookmarks). When set,
-   *  the emphasis is drawn per line instead of over `highlight_bbox`'s union. */
-  highlight_rects?: BoundingBox[] | null;
   /** Raw search evidence used to correct a chunk-level indexed origin against
    *  nearby PDF.js pages. It is transient viewer state, never index data. */
   search_locator?: PdfSearchLocator | null;
@@ -247,7 +247,6 @@ export default function PdfViewer({
   loadAttempt = 0,
   page,
   highlight_bbox,
-  highlight_rects = null,
   search_locator = null,
   decorations = [],
   slots,
@@ -288,8 +287,10 @@ export default function PdfViewer({
   const targetPage = locatedSearchResult?.page ?? page;
   const targetBbox =
     locatedSearchResult?.bbox ?? (search_locator ? null : highlight_bbox);
-  const targetRects =
-    locatedSearchResult?.rects ?? (search_locator ? null : highlight_rects);
+  // The reader draws emphasis only for geometry it worked out itself: a search
+  // hit relocated against the real pages, which the host cannot know. Anything
+  // the host already has coordinates for it draws as a decoration instead.
+  const drawnTarget = locatedSearchResult;
   const [isOutlineOpen, setIsOutlineOpen] = useState(false);
 
   const renderedWidth = containerWidth * zoom;
@@ -910,11 +911,10 @@ export default function PdfViewer({
               const pageHeight = getScaledPageHeight(pageMetric, renderedWidth);
 
               const isTargetPage = pageNum === targetPage;
-              const pageTargetBbox = isTargetPage ? targetBbox : null;
-              // Precise emphasis for a bookmark target; when present it replaces
-              // the coarse single-box emphasis below.
+              // Per-line emphasis when the relocation produced lines; it
+              // replaces the coarse single-box emphasis below.
               const pageTargetRects =
-                isTargetPage && !isSearchOpen ? targetRects : null;
+                isTargetPage && !isSearchOpen ? drawnTarget?.rects ?? null : null;
 
               const innerMatch = innerMatches[currentMatchIdx];
               const innerBbox = innerMatch && innerMatch.page === pageNum ? innerMatch.bbox : null;
@@ -923,7 +923,9 @@ export default function PdfViewer({
                 ? innerBbox
                 : pageTargetRects && pageTargetRects.length > 0
                   ? null
-                  : pageTargetBbox;
+                  : isTargetPage
+                    ? drawnTarget?.bbox ?? null
+                    : null;
               const pageDecorations = rectDecorationsForPage(decorations, pageNum);
 
               const overlayStyle = activeBbox

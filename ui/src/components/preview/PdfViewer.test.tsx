@@ -400,17 +400,20 @@ describe("PdfViewer", () => {
     expect(mockPage.mock.calls[0][0].canvasBackground).toBe("white");
   });
 
-  it("renders highlight bounding box", async () => {
+  it("locates the navigation target without drawing it", async () => {
     render(<PdfViewer {...defaultProps} />, { host: defaultHost });
-    
+
     // Wait for async load success to set scale
     await act(async () => {
       await new Promise(resolve => setTimeout(resolve, 10));
     });
-    
-    // Appearance lives in styles.css; the overlay is identified by its class.
-    const highlight = document.querySelector("div.pdf-highlight");
-    expect(highlight).toBeInTheDocument();
+
+    // A host that knows where the target is draws it as a decoration. If the
+    // reader drew `highlight_bbox` as well, a bookmarked target would carry
+    // two stacked marks. The ping still points at it.
+    expect(document.querySelector("div.pdf-highlight")).not.toBeInTheDocument();
+    expect(document.querySelector("div.pdf-highlight-ping")).toBeInTheDocument();
+    expect(mockVirtualizer.scrollToIndex).toHaveBeenCalled();
   });
 
   it("reveals the active inner-search match within its page", () => {
@@ -539,27 +542,36 @@ describe("PdfViewer", () => {
     expect(global.cancelAnimationFrame).toHaveBeenCalled();
   });
 
-  it("emphasises the navigation target per-line when highlight_rects is provided", async () => {
+  it("draws a decorated target once, not once per mechanism", async () => {
+    const rects = [
+      { x: 5, y: 5, width: 30, height: 8 },
+      { x: 5, y: 15, width: 12, height: 8 },
+    ];
     render(
       <PdfViewer
         {...defaultProps}
-        highlight_rects={[
-          { x: 5, y: 5, width: 30, height: 8 },
-          { x: 5, y: 15, width: 12, height: 8 },
+        decorations={[
+          {
+            id: "bookmark-1",
+            anchor: { kind: "rects", page: defaultProps.page, rects },
+            className: "pdf-highlight--bookmark",
+          },
         ]}
       />,
+      { host: defaultHost },
     );
 
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     });
 
-    // Precise per-line emphasis is drawn instead of the single union box.
-    const targets = screen.getAllByTestId("target-highlight");
-    expect(targets).toHaveLength(2);
-    expect(targets[0]).toHaveStyle({ left: "5px", top: "5px", width: "30px", height: "8px" });
-    // The coarse union overlay must not also be present.
+    // Two rects, two marks. The reader adding its own emphasis for the same
+    // navigation target is what stacked a second colour underneath.
     expect(document.querySelectorAll("div.pdf-highlight")).toHaveLength(2);
+    expect(
+      document.querySelectorAll("div.pdf-highlight--bookmark"),
+    ).toHaveLength(2);
+    expect(screen.queryAllByTestId("target-highlight")).toHaveLength(0);
   });
 
   it("uses a PDF.js-localized search page and rectangles instead of the coarse origin", async () => {
