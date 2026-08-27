@@ -489,13 +489,29 @@ pub(crate) fn backup_managed_directory(
     expected_embedding_space_id: &str,
     destination: &Path,
 ) -> anyhow::Result<ManagedCorpusBackup> {
+    backup_managed_directory_parts(
+        data_dir,
+        data_dir,
+        corpus_id,
+        expected_embedding_space_id,
+        destination,
+    )
+}
+
+fn backup_managed_directory_parts(
+    canonical_data_dir: &Path,
+    projection_data_dir: &Path,
+    corpus_id: &str,
+    expected_embedding_space_id: &str,
+    destination: &Path,
+) -> anyhow::Result<ManagedCorpusBackup> {
     anyhow::ensure!(!destination.exists(), "backup destination already exists");
     let parent = destination
         .parent()
         .ok_or_else(|| anyhow::anyhow!("backup destination has no parent"))?;
     std::fs::create_dir_all(parent)?;
 
-    let index = SemanticIndex::open_for_maintenance(data_dir)?;
+    let index = SemanticIndex::open_for_maintenance(projection_data_dir)?;
     let actual_space = index.embedding_space_identity()?.id().0;
     anyhow::ensure!(
         actual_space == expected_embedding_space_id,
@@ -511,15 +527,23 @@ pub(crate) fn backup_managed_directory(
     std::fs::create_dir(&staging)?;
     let result = (|| -> anyhow::Result<ManagedCorpusBackup> {
         copy_managed_tree(
-            &data_dir.join("managed_sources"),
+            &canonical_data_dir.join("managed_sources"),
             &staging.join("managed_sources"),
         )?;
-        std::fs::copy(
-            data_dir.join("workspace.json"),
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(canonical_data_dir.join("workspace.json"))?)?;
+        if projection_data_dir != canonical_data_dir {
+            let projection: serde_json::Value = serde_json::from_slice(&std::fs::read(
+                projection_data_dir.join("workspace.json"),
+            )?)?;
+            manifest["semantic"] = projection["semantic"].clone();
+        }
+        std::fs::write(
             staging.join("workspace.json"),
+            serde_json::to_vec_pretty(&manifest)?,
         )?;
 
-        let live_db = data_dir.join("semantic_index.db");
+        let live_db = projection_data_dir.join("semantic_index.db");
         anyhow::ensure!(live_db.is_file(), "managed semantic index is absent");
         let snapshot_db = staging.join("semantic_index.db");
         let connection = rusqlite::Connection::open(&live_db)?;
@@ -2195,6 +2219,165 @@ impl AppContext {
         )
     }
 
+    /// Materialize one embedding projection from the canonical admitted
+    /// rendition. The immutable source, extracted text, chunk boundaries, and
+    /// stable refs remain owned by `canonical`; this context computes only its
+    /// model-specific vectors and projection rows.
+    pub async fn import_managed_projection(
+        self: &Arc<Self>,
+        corpus_id: String,
+        idempotency_key: String,
+        canonical: &Arc<Self>,
+        canonical_snapshot_path: PathBuf,
+        original_source_provenance: serde_json::Value,
+    ) -> Result<ManagedDocumentExport, String> {
+        let _pending = PendingManagedOperation::new(&self.managed_pending_imports);
+        let _import_guard = self.managed_import_lock.lock().await;
+        if idempotency_key.trim().is_empty() || idempotency_key.len() > 256 {
+            return Err(
+                "IDEMPOTENCY_KEY_CONFLICT: idempotency key must contain 1 to 256 bytes".to_string(),
+            );
+        }
+        let source_sha256 = wilkes_core::embed::identity::sha256_file(&canonical_snapshot_path)
+            .map_err(|error| format!("Could not verify canonical managed snapshot: {error:#}"))?;
+        let settings = self.settings().await;
+        let recipe = ExtractionRecipe::for_path(
+            &canonical_snapshot_path,
+            settings.semantic.chunk_size,
+            settings.semantic.chunk_overlap,
+        );
+        let expected_identity = {
+            let index_arc = self.index.lock().clone();
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned")?;
+            guard
+                .as_ref()
+                .ok_or_else(|| "MANAGED_WORKSPACE_NOT_FOUND: runtime is not ready".to_string())?
+                .embedding_space_identity()
+                .map_err(|error| error.to_string())?
+        };
+
+        if let Some(existing) = {
+            let index_arc = self.index.lock().clone();
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned")?;
+            guard
+                .as_ref()
+                .ok_or_else(|| "Managed index unavailable".to_string())?
+                .managed_document_for_import_key(&idempotency_key, &source_sha256, &recipe.id())
+                .map_err(|error| error.to_string())?
+        } {
+            return Self::managed_export(
+                corpus_id,
+                existing,
+                &expected_identity,
+                canonical_snapshot_path,
+                true,
+            );
+        }
+
+        let mut prepared = {
+            let index_arc = canonical.index.lock().clone();
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Canonical semantic index lock was poisoned")?;
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    "MANAGED_WORKSPACE_NOT_FOUND: canonical index is unavailable".to_string()
+                })?
+                .managed_file_structure_for_reembedding(
+                    &canonical_snapshot_path,
+                    &canonical_snapshot_path,
+                    &recipe,
+                )
+                .map_err(|error| format!("Could not read canonical rendition: {error:#}"))?
+                .ok_or_else(|| {
+                    "DOCUMENT_INDEX_INCOMPLETE: canonical snapshot is not admitted".to_string()
+                })?
+        };
+        if prepared.chunks.is_empty() {
+            return Err("DOCUMENT_INDEX_INCOMPLETE: document produced no chunks".to_string());
+        }
+        let embedder = self.embedder.lock().clone().ok_or_else(|| {
+            "MANAGED_WORKSPACE_NOT_FOUND: managed embedder is unavailable".to_string()
+        })?;
+        let texts: Vec<&str> = prepared
+            .chunks
+            .iter()
+            .map(|(chunk, _)| chunk.text.as_str())
+            .collect();
+        let embeddings = embedder
+            .embed_passages(&texts)
+            .map_err(|error| format!("Could not embed canonical rendition: {error:#}"))?;
+        if embeddings.len() != prepared.chunks.len() {
+            return Err(format!(
+                "DOCUMENT_INDEX_INCOMPLETE: embedder returned {} vectors for {} canonical chunks",
+                embeddings.len(),
+                prepared.chunks.len()
+            ));
+        }
+        for ((_, vector), embedding) in prepared.chunks.iter_mut().zip(embeddings) {
+            *vector = embedding;
+        }
+        let expected_chunks = prepared.chunks.len();
+        let managed = {
+            let index_arc = self.index.lock().clone();
+            let mut guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned")?;
+            let index = guard
+                .as_mut()
+                .ok_or_else(|| "Managed index unavailable".to_string())?;
+            index
+                .write_file_with_recipe(
+                    prepared,
+                    &recipe,
+                    None,
+                    Some(&original_source_provenance),
+                    true,
+                    false,
+                    Some(&idempotency_key),
+                )
+                .map_err(|error| format!("Could not publish embedding projection: {error:#}"))?
+        };
+        if managed.source_sha256 != source_sha256 || managed.chunks.len() != expected_chunks {
+            return Err("DOCUMENT_INDEX_INCOMPLETE: projection verification failed".to_string());
+        }
+        Self::managed_export(
+            corpus_id,
+            managed,
+            &expected_identity,
+            canonical_snapshot_path,
+            false,
+        )
+    }
+
+    pub fn managed_snapshot_path(&self, source_sha256: &str) -> Result<PathBuf, String> {
+        let index_arc = self.index.lock().clone();
+        let guard = index_arc
+            .lock()
+            .map_err(|_| "Semantic index lock was poisoned")?;
+        let path = guard
+            .as_ref()
+            .ok_or_else(|| "Managed index unavailable".to_string())?
+            .managed_path_for_source_sha256(source_sha256)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "DOCUMENT_INDEX_INCOMPLETE: admitted canonical snapshot path is absent".to_string()
+            })?;
+        let actual = wilkes_core::embed::identity::sha256_file(&path)
+            .map_err(|error| format!("Could not verify canonical managed snapshot: {error:#}"))?;
+        if actual != source_sha256 {
+            return Err(
+                "DOCUMENT_INDEX_INCOMPLETE: canonical snapshot digest mismatch".to_string(),
+            );
+        }
+        Ok(path)
+    }
+
     pub fn managed_pending_operations(&self) -> (u64, u64) {
         (
             self.managed_pending_imports.load(Ordering::Acquire),
@@ -2223,6 +2406,41 @@ impl AppContext {
         tokio::task::spawn_blocking(move || {
             backup_managed_directory(
                 &data_dir,
+                &corpus_id,
+                &expected_embedding_space_id,
+                &destination,
+            )
+        })
+        .await
+        .map_err(|error| format!("Managed backup task panicked: {error}"))?
+        .map_err(|error| format!("Could not back up managed corpus: {error:#}"))
+    }
+
+    /// Back up canonical membership with whichever embedding projection is
+    /// currently selected by Underdog. Secondary projection workspaces do not
+    /// own sources, so snapshotting one alone would create an unrestorable
+    /// half-corpus.
+    pub async fn backup_managed_corpus_projection(
+        &self,
+        projection: &Arc<Self>,
+        corpus_id: String,
+        expected_embedding_space_id: String,
+    ) -> Result<ManagedCorpusBackup, String> {
+        let _canonical_import_guard = self.managed_import_lock.lock().await;
+        let _canonical_runtime_guard = self.managed_runtime_lock.lock().await;
+        let _projection_import_guard = projection.managed_import_lock.lock().await;
+        let _projection_runtime_guard = projection.managed_runtime_lock.lock().await;
+        let canonical_data_dir = self.data_dir.clone();
+        let projection_data_dir = projection.data_dir.clone();
+        let destination = self.shared_data_dir.join("managed_backups").join(format!(
+            "{}-{}",
+            corpus_id,
+            uuid::Uuid::new_v4()
+        ));
+        tokio::task::spawn_blocking(move || {
+            backup_managed_directory_parts(
+                &canonical_data_dir,
+                &projection_data_dir,
                 &corpus_id,
                 &expected_embedding_space_id,
                 &destination,

@@ -39,7 +39,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 use wilkes_api::context::AppContext;
 use wilkes_api::workspace::{
-    EnsureManagedWorkspace, ManagedWorkspaceStatus, WorkspaceState, WorkspaceSummary,
+    EnsureManagedEmbeddingSpace, EnsureManagedWorkspace, ManagedEmbeddingSpaceStatus,
+    ManagedWorkspaceStatus, WorkspaceState, WorkspaceSummary,
 };
 use wilkes_core::completion::{CompletionFeedback, CompletionRequest};
 use wilkes_core::embed::ChunkRef;
@@ -319,6 +320,20 @@ async fn underdog_workspace_status_handler(
     Ok(Json(managed_status_with_pending(status, &context)))
 }
 
+async fn ensure_underdog_space_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<EnsureManagedEmbeddingSpace>,
+) -> Result<Json<ManagedEmbeddingSpaceStatus>, (StatusCode, Json<ErrorBody>)> {
+    let manager = state.workspaces.as_ref().ok_or_else(|| {
+        managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
+    })?;
+    manager
+        .ensure_underdog_space(request)
+        .await
+        .map(Json)
+        .map_err(|error| managed_err(format!("{error:#}")))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ManagedImportSource {
@@ -356,7 +371,14 @@ async fn import_underdog_document_handler(
         .underdog_workspace_status(&body.corpus_id)
         .await
         .map_err(|error| managed_err(format!("{error:#}")))?;
-    if status.embedding_space_id != body.expected_embedding_space_id {
+    let expected_exists = match body.expected_embedding_space_id.as_deref() {
+        Some(expected) => status
+            .spaces
+            .iter()
+            .any(|space| space.embedding_space_id == expected),
+        None => status.spaces.is_empty(),
+    };
+    if !expected_exists {
         return Err(managed_err(format!(
             "EMBEDDING_SPACE_MISMATCH: corpus={}, request={}",
             describe_space(status.embedding_space_id.as_deref()),
@@ -391,17 +413,54 @@ async fn import_underdog_document_handler(
     };
     let provenance = serde_json::to_value(&body.source)
         .map_err(|error| managed_err(format!("Could not encode import provenance: {error}")))?;
-    managed
+    let exported = managed
         .import_managed_document(
-            body.corpus_id,
-            body.idempotency_key,
-            path,
-            source_workspace,
-            provenance,
+            body.corpus_id.clone(),
+            body.idempotency_key.clone(),
+            path.clone(),
+            source_workspace.clone(),
+            provenance.clone(),
         )
         .await
-        .map(Json)
-        .map_err(managed_err)
+        .map_err(managed_err)?;
+    let canonical_snapshot = managed
+        .managed_snapshot_path(&exported.source_sha256)
+        .map_err(managed_err)?;
+
+    // Projection fan-out is synchronous on admission. A failed secondary can
+    // leave only an idempotently repairable partial write; no space can serve
+    // it because managed_context compares its membership digest with the
+    // canonical corpus before every operation.
+    for space in status.spaces.iter().filter(|space| !space.primary) {
+        let projection = manager
+            .context_for(&space.workspace_id)
+            .await
+            .map_err(|error| managed_err(format!("{error:#}")))?;
+        projection
+            .ensure_managed_runtime()
+            .await
+            .map_err(managed_err)?;
+        projection
+            .import_managed_projection(
+                body.corpus_id.clone(),
+                body.idempotency_key.clone(),
+                &managed,
+                canonical_snapshot.clone(),
+                provenance.clone(),
+            )
+            .await
+            .map_err(managed_err)?;
+    }
+    let synchronized = manager
+        .underdog_workspace_status(&body.corpus_id)
+        .await
+        .map_err(|error| managed_err(format!("{error:#}")))?;
+    if synchronized.spaces.iter().any(|space| !space.ready) {
+        return Err(managed_err(
+            "EMBEDDING_SPACE_STALE: one or more corpus projections did not reach the canonical generation",
+        ));
+    }
+    Ok(Json(exported))
 }
 
 #[derive(Deserialize)]
@@ -857,13 +916,14 @@ async fn underdog_backup_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedBackupBody>,
 ) -> Result<Json<wilkes_api::context::ManagedCorpusBackup>, (StatusCode, Json<ErrorBody>)> {
-    let context =
-        managed_context(&state, &body.corpus_id, &body.expected_embedding_space_id).await?;
-    context
-        .backup_managed_corpus(body.corpus_id, body.expected_embedding_space_id)
+    let manager = state.workspaces.as_ref().ok_or_else(|| {
+        managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
+    })?;
+    manager
+        .backup_underdog_corpus(&body.corpus_id, &body.expected_embedding_space_id)
         .await
         .map(Json)
-        .map_err(managed_err)
+        .map_err(|error| managed_err(format!("{error:#}")))
 }
 
 async fn underdog_restore_handler(
@@ -931,23 +991,8 @@ async fn managed_context(
     let manager = state.workspaces.as_ref().ok_or_else(|| {
         managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
     })?;
-    let status = manager
-        .underdog_workspace_status(corpus_id)
-        .await
-        .map_err(|error| managed_err(format!("{error:#}")))?;
-    if status.embedding_space_id.as_deref() != Some(expected_embedding_space_id) {
-        return Err(managed_err(format!(
-            "EMBEDDING_SPACE_MISMATCH: corpus={}, request={expected_embedding_space_id}",
-            describe_space(status.embedding_space_id.as_deref())
-        )));
-    }
-    if !status.ready {
-        return Err(managed_err(
-            "MANAGED_WORKSPACE_NOT_FOUND: managed index is not ready",
-        ));
-    }
     let context = manager
-        .context_for(corpus_id)
+        .underdog_space_context(corpus_id, expected_embedding_space_id)
         .await
         .map_err(|error| managed_err(format!("{error:#}")))?;
     let actual = context
@@ -2223,6 +2268,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/integrations/underdog/workspace",
             put(ensure_underdog_workspace_handler),
+        )
+        .route(
+            "/api/integrations/underdog/spaces",
+            put(ensure_underdog_space_handler),
         )
         .route(
             "/api/integrations/underdog/status",

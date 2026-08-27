@@ -64,6 +64,11 @@ pub enum WorkspaceKind {
         owner: String,
         purpose: String,
         corpus_key: String,
+        /// `None` is the canonical corpus workspace. A value names the
+        /// canonical corpus whose membership this internal workspace projects
+        /// into one additional embedding space.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_corpus_id: Option<String>,
     },
 }
 
@@ -100,6 +105,29 @@ pub struct ManagedWorkspaceStatus {
     pub integrity_checked_at_ms: i64,
     pub pending_imports: u64,
     pub pending_builds: u64,
+    /// Stable digest of ready rendition/chunk membership. All routable spaces
+    /// beneath one corpus must report the canonical workspace's digest.
+    pub corpus_generation: String,
+    /// Every embedding projection owned by this logical corpus. Child
+    /// projection workspaces are implementation details and never become
+    /// independent corpus ids on this API.
+    pub spaces: Vec<ManagedEmbeddingSpaceStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ManagedEmbeddingSpaceStatus {
+    pub embedding_space_id: String,
+    pub embedding_space_identity: EmbeddingSpaceIdentity,
+    pub ready: bool,
+    pub indexed_generation: String,
+    pub workspace_id: String,
+    pub primary: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureManagedEmbeddingSpace {
+    pub corpus_id: String,
+    pub embedding: SelectedEmbedder,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -383,6 +411,15 @@ pub async fn read_workspace_state(
             "workspace manifest id mismatch for {id}"
         );
         let settings = get_scoped_settings(settings_path, &manifest_path).await?;
+        if matches!(
+            manifest.kind,
+            WorkspaceKind::ApplicationManaged {
+                parent_corpus_id: Some(_),
+                ..
+            }
+        ) {
+            continue;
+        }
         workspaces.push(manifest.summary(settings.semantic.selected));
     }
     Ok(WorkspaceState {
@@ -747,7 +784,12 @@ impl WorkspaceManager {
                 let manifest = read_manifest(&workspace_manifest_path(&self.app_data_dir, id))?;
                 if matches!(
                     &manifest.kind,
-                    WorkspaceKind::ApplicationManaged { owner, purpose, corpus_key: key }
+                    WorkspaceKind::ApplicationManaged {
+                        owner,
+                        purpose,
+                        corpus_key: key,
+                        parent_corpus_id: None,
+                    }
                         if owner == "underdog" && purpose == "semantic-corpus" && key == corpus_key
                 ) {
                     existing = Some(manifest);
@@ -780,6 +822,7 @@ impl WorkspaceManager {
                         owner: "underdog".to_string(),
                         purpose: "semantic-corpus".to_string(),
                         corpus_key: corpus_key.to_string(),
+                        parent_corpus_id: None,
                     },
                     favorites: vec![managed_sources.clone()],
                     recent_roots: Vec::new(),
@@ -795,19 +838,216 @@ impl WorkspaceManager {
         self.underdog_workspace_status(&id).await
     }
 
+    /// The registry half of [`Self::ensure_underdog_space`]: the projection's
+    /// manifest, keyed by its parent corpus and its embedder, and idempotent
+    /// on both. Separated because it is the part that decides what a
+    /// projection *is* — a hidden child of one canonical corpus, sharing that
+    /// corpus's key and extraction settings — while everything after it is the
+    /// vector work that gives the projection its contents.
+    fn ensure_projection_workspace(
+        &self,
+        corpus_id: &str,
+        corpus_key: &str,
+        parent_semantic: &SemanticSettings,
+        embedding: &SelectedEmbedder,
+    ) -> anyhow::Result<String> {
+        let _guard = self.registry_lock.lock();
+        let mut registry = load_registry(&self.app_data_dir)?;
+        for id in &registry.workspace_ids {
+            let candidate = read_manifest(&workspace_manifest_path(&self.app_data_dir, id))?;
+            if matches!(
+                candidate.kind,
+                WorkspaceKind::ApplicationManaged {
+                    parent_corpus_id: Some(ref parent),
+                    ..
+                } if parent == corpus_id
+            ) && candidate
+                .semantic
+                .as_ref()
+                .is_some_and(|semantic| &semantic.selected == embedding)
+            {
+                return Ok(id.clone());
+            }
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let root = workspace_root(&self.app_data_dir, &id);
+        let managed_sources = root.join("managed_sources");
+        std::fs::create_dir_all(&managed_sources)?;
+        let mut semantic = parent_semantic.clone();
+        semantic.selected = embedding.clone();
+        semantic.index_path = Some(root.join("semantic_index.db"));
+        let manifest = WorkspaceManifest {
+            version: MANIFEST_VERSION,
+            id: id.clone(),
+            name: "Underdog embedding projection".to_string(),
+            kind: WorkspaceKind::ApplicationManaged {
+                owner: "underdog".to_string(),
+                purpose: "semantic-corpus".to_string(),
+                corpus_key: corpus_key.to_string(),
+                parent_corpus_id: Some(corpus_id.to_string()),
+            },
+            favorites: vec![managed_sources.clone()],
+            recent_roots: Vec::new(),
+            active_root: Some(managed_sources),
+            semantic: Some(semantic),
+        };
+        write_manifest(&workspace_manifest_path(&self.app_data_dir, &id), &manifest)?;
+        registry.workspace_ids.push(id.clone());
+        atomic_write_json(&registry_path(&self.app_data_dir), &registry)?;
+        Ok(id)
+    }
+
+    /// Adds one derived embedding projection to an existing managed corpus.
+    /// The child workspace is an implementation detail: callers continue to
+    /// address the canonical `corpus_id` plus the returned opaque space id.
+    pub async fn ensure_underdog_space(
+        &self,
+        request: EnsureManagedEmbeddingSpace,
+    ) -> anyhow::Result<ManagedEmbeddingSpaceStatus> {
+        let parent_path = workspace_manifest_path(&self.app_data_dir, &request.corpus_id);
+        let parent = read_manifest(&parent_path)?;
+        let (corpus_key, parent_semantic) = match (&parent.kind, &parent.semantic) {
+            (
+                WorkspaceKind::ApplicationManaged {
+                    owner,
+                    purpose,
+                    corpus_key,
+                    parent_corpus_id: None,
+                },
+                Some(semantic),
+            ) if owner == "underdog" && purpose == "semantic-corpus" => {
+                (corpus_key.clone(), semantic.clone())
+            }
+            _ => anyhow::bail!("MANAGED_WORKSPACE_NOT_FOUND"),
+        };
+
+        let id = self.ensure_projection_workspace(
+            &request.corpus_id,
+            &corpus_key,
+            &parent_semantic,
+            &request.embedding,
+        )?;
+
+        let child = self.context_for(&id).await?;
+        child
+            .ensure_managed_runtime()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let canonical_context = self.context_for(&request.corpus_id).await?;
+        canonical_context
+            .ensure_managed_runtime()
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        // Backfill from the canonical corpus's retained immutable sources and
+        // admitted chunk structure. The projection computes vectors only: it
+        // neither copies sources nor repeats extraction/chunking. The
+        // idempotency key is content-derived, so a crash or retry repairs only
+        // the documents the projection still lacks.
+        let mut pending =
+            vec![workspace_root(&self.app_data_dir, &request.corpus_id).join("managed_sources")];
+        let mut sources = Vec::new();
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory)? {
+                let entry = entry?;
+                let metadata = entry.metadata()?;
+                if metadata.is_dir() {
+                    if entry.file_name() != ".imports" {
+                        pending.push(entry.path());
+                    }
+                } else if metadata.is_file() {
+                    sources.push(entry.path());
+                }
+            }
+        }
+        sources.sort();
+        for source in sources {
+            let digest = wilkes_core::embed::identity::sha256_file(&source)?;
+            child
+                .import_managed_projection(
+                    request.corpus_id.clone(),
+                    format!("space-backfill-{digest}"),
+                    &canonical_context,
+                    source.clone(),
+                    serde_json::json!({
+                        "kind": "managed_corpus_projection",
+                        "canonical_corpus_id": request.corpus_id,
+                    }),
+                )
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+
+        let canonical = self.underdog_workspace_status(&request.corpus_id).await?;
+        canonical
+            .spaces
+            .into_iter()
+            .find(|space| space.workspace_id == id)
+            .ok_or_else(|| anyhow::anyhow!("new embedding projection did not become visible"))
+    }
+
+    /// Resolves a logical corpus/space pair to the internal projection
+    /// workspace that owns those vectors, refusing a projection whose
+    /// rendition/chunk membership is behind the canonical corpus.
+    pub async fn underdog_space_context(
+        &self,
+        corpus_id: &str,
+        embedding_space_id: &str,
+    ) -> anyhow::Result<Arc<AppContext>> {
+        let status = self.underdog_workspace_status(corpus_id).await?;
+        let space = status
+            .spaces
+            .iter()
+            .find(|space| space.embedding_space_id == embedding_space_id)
+            .ok_or_else(|| anyhow::anyhow!("EMBEDDING_SPACE_MISMATCH"))?;
+        anyhow::ensure!(
+            space.ready && space.indexed_generation == status.corpus_generation,
+            "EMBEDDING_SPACE_STALE: projection generation {}, corpus generation {}",
+            space.indexed_generation,
+            status.corpus_generation
+        );
+        self.context_for(&space.workspace_id).await
+    }
+
+    pub async fn backup_underdog_corpus(
+        self: &Arc<Self>,
+        corpus_id: &str,
+        embedding_space_id: &str,
+    ) -> anyhow::Result<crate::context::ManagedCorpusBackup> {
+        let projection = self
+            .underdog_space_context(corpus_id, embedding_space_id)
+            .await?;
+        let canonical = self.context_for(corpus_id).await?;
+        if Arc::ptr_eq(&canonical, &projection) {
+            return canonical
+                .backup_managed_corpus(corpus_id.to_string(), embedding_space_id.to_string())
+                .await
+                .map_err(anyhow::Error::msg);
+        }
+        canonical
+            .backup_managed_corpus_projection(
+                &projection,
+                corpus_id.to_string(),
+                embedding_space_id.to_string(),
+            )
+            .await
+            .map_err(anyhow::Error::msg)
+    }
+
     pub async fn underdog_workspace_status(
         &self,
         corpus_id: &str,
     ) -> anyhow::Result<ManagedWorkspaceStatus> {
         let manifest = read_manifest(&workspace_manifest_path(&self.app_data_dir, corpus_id))?;
-        anyhow::ensure!(
-            matches!(
-                manifest.kind,
-                WorkspaceKind::ApplicationManaged { ref owner, ref purpose, .. }
-                    if owner == "underdog" && purpose == "semantic-corpus"
-            ),
-            "MANAGED_WORKSPACE_NOT_FOUND"
-        );
+        let parent_corpus_id = match &manifest.kind {
+            WorkspaceKind::ApplicationManaged {
+                owner,
+                purpose,
+                parent_corpus_id,
+                ..
+            } if owner == "underdog" && purpose == "semantic-corpus" => parent_corpus_id.clone(),
+            _ => anyhow::bail!("MANAGED_WORKSPACE_NOT_FOUND"),
+        };
         let semantic = manifest.semantic.ok_or_else(|| {
             anyhow::anyhow!(
                 "MANAGED_WORKSPACE_CONFIGURATION_MISMATCH: semantic configuration is absent"
@@ -821,6 +1061,7 @@ impl WorkspaceManager {
                         index.embedding_space_identity()?,
                         index.managed_completeness()?,
                         index.managed_embedding_work_totals()?,
+                        index.managed_snapshot_sha256()?,
                     ))
                 }) {
                 Ok(opened) => Some(opened),
@@ -836,15 +1077,19 @@ impl WorkspaceManager {
                     None
                 }
             };
-        let stored_identity = opened.as_ref().map(|(identity, _, _)| identity.clone());
+        let stored_identity = opened.as_ref().map(|(identity, _, _, _)| identity.clone());
         let completeness = opened
             .as_ref()
-            .map(|(_, counts, _)| *counts)
+            .map(|(_, counts, _, _)| *counts)
             .unwrap_or((0, 0, 0));
         let embedding_work = opened
             .as_ref()
-            .map(|(_, _, totals)| *totals)
+            .map(|(_, _, totals, _)| *totals)
             .unwrap_or((0, 0));
+        let corpus_generation = opened
+            .as_ref()
+            .map(|(_, _, _, generation)| generation.clone())
+            .unwrap_or_else(|| wilkes_core::embed::identity::sha256_bytes(&[]));
         let ready = stored_identity.as_ref().is_some_and(|identity| {
             identity.engine == semantic.selected.engine
                 && identity.model_id == semantic.selected.model.model_id()
@@ -887,7 +1132,17 @@ impl WorkspaceManager {
                 .unwrap_or(0)
         })
         .sum();
-        Ok(ManagedWorkspaceStatus {
+        let primary_space = identity
+            .as_ref()
+            .map(|identity| ManagedEmbeddingSpaceStatus {
+                embedding_space_id: identity.id().0,
+                embedding_space_identity: identity.clone(),
+                ready,
+                indexed_generation: corpus_generation.clone(),
+                workspace_id: corpus_id.to_string(),
+                primary: parent_corpus_id.is_none(),
+            });
+        let mut status = ManagedWorkspaceStatus {
             corpus_id: corpus_id.to_string(),
             embedding_space_id: identity.as_ref().map(|identity| identity.id().0),
             embedding_space_identity: identity,
@@ -910,7 +1165,55 @@ impl WorkspaceManager {
             integrity_checked_at_ms: chrono::Utc::now().timestamp_millis(),
             pending_imports: 0,
             pending_builds: 0,
-        })
+            corpus_generation,
+            spaces: primary_space.into_iter().collect(),
+        };
+
+        if parent_corpus_id.is_none() {
+            let registry = {
+                let _guard = self.registry_lock.lock();
+                load_registry(&self.app_data_dir)?
+            };
+            for workspace_id in registry.workspace_ids {
+                if workspace_id == corpus_id {
+                    continue;
+                }
+                let child =
+                    read_manifest(&workspace_manifest_path(&self.app_data_dir, &workspace_id))?;
+                let belongs = matches!(
+                    child.kind,
+                    WorkspaceKind::ApplicationManaged {
+                        parent_corpus_id: Some(ref parent),
+                        ..
+                    } if parent == corpus_id
+                );
+                if !belongs {
+                    continue;
+                }
+                let child_root = workspace_root(&self.app_data_dir, &workspace_id);
+                let Ok(index) = SemanticIndex::open_for_maintenance(&child_root) else {
+                    continue;
+                };
+                let child_identity = index.embedding_space_identity()?;
+                let indexed_generation = index.managed_snapshot_sha256()?;
+                let counts = index.managed_completeness()?;
+                status.spaces.push(ManagedEmbeddingSpaceStatus {
+                    embedding_space_id: child_identity.id().0,
+                    embedding_space_identity: child_identity,
+                    ready: counts.1 == counts.2 && indexed_generation == status.corpus_generation,
+                    indexed_generation,
+                    workspace_id,
+                    primary: false,
+                });
+            }
+            status.spaces.sort_by(|left, right| {
+                right
+                    .primary
+                    .cmp(&left.primary)
+                    .then_with(|| left.embedding_space_id.cmp(&right.embedding_space_id))
+            });
+        }
+        Ok(status)
     }
 
     /// Restores a self-verifying backup from Wilkes's own managed-backup
@@ -956,7 +1259,7 @@ impl WorkspaceManager {
         anyhow::ensure!(
             matches!(
                 &manifest.kind,
-                WorkspaceKind::ApplicationManaged { owner, purpose, corpus_key }
+                WorkspaceKind::ApplicationManaged { owner, purpose, corpus_key, .. }
                     if owner == "underdog"
                         && purpose == "semantic-corpus"
                         && corpus_key == expected_corpus_key
@@ -972,7 +1275,7 @@ impl WorkspaceManager {
                 let found = read_manifest(&workspace_manifest_path(&self.app_data_dir, id)).ok()?;
                 matches!(
                     &found.kind,
-                    WorkspaceKind::ApplicationManaged { owner, purpose, corpus_key }
+                    WorkspaceKind::ApplicationManaged { owner, purpose, corpus_key, .. }
                         if owner == "underdog"
                             && purpose == "semantic-corpus"
                             && corpus_key == expected_corpus_key
@@ -1132,6 +1435,7 @@ fn copy_workspace_tree(source: &Path, destination: &Path) -> anyhow::Result<()> 
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+    use wilkes_core::types::{EmbedderModel, EmbeddingEngine};
 
     struct NoopEmitter;
 
@@ -1196,6 +1500,240 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status.embedding_space_id, Some(space));
+    }
+
+    /// Writes one managed document into a corpus index the way an admission
+    /// does, so a test can move a corpus's membership generation without a
+    /// downloadable embedding model.
+    fn admit(
+        index: &mut wilkes_core::embed::index::SemanticIndex,
+        path: &Path,
+        text: &str,
+        vector: Vec<f32>,
+        recipe: &wilkes_core::embed::ExtractionRecipe,
+    ) {
+        std::fs::write(path, text).unwrap();
+        index
+            .write_file_with_recipe(
+                wilkes_core::embed::index::db::PreparedFile {
+                    path: path.to_path_buf(),
+                    full_text: text.to_string(),
+                    chunks: vec![(
+                        wilkes_core::embed::index::chunk::Chunk {
+                            file_path: path.to_path_buf(),
+                            text: text.to_string(),
+                            byte_range: wilkes_core::types::ByteRange {
+                                start: 0,
+                                end: text.len(),
+                            },
+                            origin: wilkes_core::types::SourceOrigin::TextFile { line: 1, col: 1 },
+                        },
+                        vector,
+                    )],
+                },
+                recipe,
+                None,
+                None,
+                true,
+                false,
+                Some(&format!("admission-{}", path.display())),
+            )
+            .unwrap();
+    }
+
+    /// The invariant the whole multi-space design exists to hold: one corpus
+    /// owns membership, its projections are internal, and a projection that
+    /// has not indexed the corpus's current membership cannot be routed to.
+    #[tokio::test]
+    async fn a_projection_is_internal_and_may_not_serve_membership_it_lacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) = WorkspaceManager::new(
+            dir.path().to_path_buf(),
+            dir.path().join("global-settings.json"),
+            Arc::clone(&events),
+        )
+        .unwrap();
+        let embedding = SelectedEmbedder {
+            engine: EmbeddingEngine::Candle,
+            model: EmbedderModel("primary-model".to_string()),
+            dimension: 2,
+        };
+        let corpus = manager
+            .ensure_underdog_workspace(EnsureManagedWorkspace {
+                corpus_key: "store-spaces".to_string(),
+                embedding: embedding.clone(),
+                chunk_size: 600,
+                chunk_overlap: 128,
+            })
+            .await
+            .unwrap();
+        let corpus_id = corpus.corpus_id.clone();
+        let canonical_root = workspace_root(dir.path(), &corpus_id);
+        let canonical_sources = canonical_root.join("managed_sources");
+        let recipe = wilkes_core::embed::ExtractionRecipe::new(600, 128);
+        let document = canonical_sources.join("document.txt");
+        let mut canonical = SemanticIndex::create(
+            &canonical_root,
+            embedding.model.model_id(),
+            embedding.dimension,
+            embedding.engine,
+            Some(&canonical_sources),
+        )
+        .unwrap();
+        admit(
+            &mut canonical,
+            &document,
+            "canonical passage",
+            vec![1.0, 0.0],
+            &recipe,
+        );
+
+        // The projection's manifest is created by the same code the ensure
+        // endpoint uses; only its vectors are supplied here, because computing
+        // them for real needs a model this test cannot download.
+        let secondary = SelectedEmbedder {
+            engine: EmbeddingEngine::Candle,
+            model: EmbedderModel("secondary-model".to_string()),
+            dimension: 2,
+        };
+        let manifest = read_manifest(&workspace_manifest_path(dir.path(), &corpus_id)).unwrap();
+        let projection_id = manager
+            .ensure_projection_workspace(
+                &corpus_id,
+                "store-spaces",
+                manifest.semantic.as_ref().unwrap(),
+                &secondary,
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .ensure_projection_workspace(
+                    &corpus_id,
+                    "store-spaces",
+                    manifest.semantic.as_ref().unwrap(),
+                    &secondary,
+                )
+                .unwrap(),
+            projection_id,
+            "one embedder under one corpus is one projection, however often it is ensured"
+        );
+        let projection_root = workspace_root(dir.path(), &projection_id);
+        let projection_sources = projection_root.join("managed_sources");
+        let mut projection = SemanticIndex::create(
+            &projection_root,
+            secondary.model.model_id(),
+            secondary.dimension,
+            secondary.engine,
+            Some(&projection_sources),
+        )
+        .unwrap();
+
+        // A projection is an implementation detail: it never appears beside
+        // the user's own workspaces, and it is not a corpus of its own.
+        let state = manager.state().await.unwrap();
+        assert!(
+            !state
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == projection_id),
+            "an embedding projection is not a workspace the user has"
+        );
+
+        let status = manager.underdog_workspace_status(&corpus_id).await.unwrap();
+        let projection_space = status
+            .spaces
+            .iter()
+            .find(|space| space.workspace_id == projection_id)
+            .expect("the projection is listed as a space of its corpus")
+            .clone();
+        assert!(
+            status.spaces[0].primary,
+            "the primary space is listed first"
+        );
+        assert_eq!(status.spaces[0].workspace_id, corpus_id);
+        assert!(!projection_space.primary);
+        assert_ne!(
+            projection_space.indexed_generation, status.corpus_generation,
+            "an empty projection has not indexed the document the corpus admitted"
+        );
+        assert!(!projection_space.ready);
+
+        // Refused by generation, not by absence: the space exists, is named
+        // correctly, and still may not answer a query.
+        let error = manager
+            .underdog_space_context(&corpus_id, &projection_space.embedding_space_id)
+            .await
+            .err()
+            .expect("a projection behind the corpus must not serve");
+        assert!(
+            format!("{error:#}").contains("EMBEDDING_SPACE_STALE"),
+            "{error:#}"
+        );
+
+        // Catching up is the canonical rendition re-embedded, not re-extracted:
+        // the chunk structure comes from the corpus, only the coordinates are
+        // the projection's own.
+        let mut prepared = canonical
+            .managed_file_structure_for_reembedding(&document, &document, &recipe)
+            .unwrap()
+            .expect("the canonical rendition is admitted");
+        prepared.chunks[0].1 = vec![0.0, 1.0];
+        projection
+            .write_file_with_recipe(
+                prepared,
+                &recipe,
+                None,
+                None,
+                true,
+                false,
+                Some("projected"),
+            )
+            .unwrap();
+
+        let status = manager.underdog_workspace_status(&corpus_id).await.unwrap();
+        let caught_up = status
+            .spaces
+            .iter()
+            .find(|space| space.workspace_id == projection_id)
+            .unwrap();
+        assert_eq!(caught_up.indexed_generation, status.corpus_generation);
+        assert!(caught_up.ready);
+        assert_ne!(
+            caught_up.embedding_space_id, status.spaces[0].embedding_space_id,
+            "two models are two coordinate systems under one corpus"
+        );
+        assert!(
+            manager
+                .underdog_space_context(&corpus_id, &caught_up.embedding_space_id)
+                .await
+                .is_ok(),
+            "a projection at the corpus generation serves"
+        );
+
+        // Admitting one more document puts the corpus ahead again, and the
+        // projection stops serving until it follows.
+        admit(
+            &mut canonical,
+            &canonical_sources.join("second.txt"),
+            "a second canonical passage",
+            vec![0.5, 0.5],
+            &recipe,
+        );
+        let status = manager.underdog_workspace_status(&corpus_id).await.unwrap();
+        let lagging = status
+            .spaces
+            .iter()
+            .find(|space| space.workspace_id == projection_id)
+            .unwrap();
+        assert!(!lagging.ready);
+        assert!(
+            manager
+                .underdog_space_context(&corpus_id, &lagging.embedding_space_id)
+                .await
+                .is_err(),
+            "membership that only the corpus has is membership no projection may answer for"
+        );
     }
 
     #[tokio::test]
@@ -1382,7 +1920,11 @@ mod tests {
         let second = manager.ensure_underdog_workspace(request).await.unwrap();
         assert_eq!(first.corpus_id, second.corpus_id);
         let state = manager.state().await.unwrap();
-        assert_eq!(state.workspaces.len(), 2, "the corpus is listed beside the user's own workspace");
+        assert_eq!(
+            state.workspaces.len(),
+            2,
+            "the corpus is listed beside the user's own workspace"
+        );
         let corpus = state
             .workspaces
             .iter()

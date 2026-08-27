@@ -1,6 +1,7 @@
 # Managed semantic corpus API
 
-Status: implemented for the Phase 1 protected-workspace contract.
+Status: implemented for the protected canonical-corpus and multi-space
+projection contract.
 
 Wilkes exposes a narrow adapter for Underdog. The adapter is deliberately
 separate from generic workspace routes: a corpus token selects an
@@ -24,7 +25,7 @@ writer.
 opaque SHA-256-derived strings owned by Wilkes. Callers must persist and echo
 them, never reconstruct them. Index rowids are not present on this API.
 
-An import is returned only after Wilkes has:
+The canonical import is returned only after Wilkes has:
 
 1. copied the source into `managed_sources/<source_sha256>/`;
 2. verified that the source did not change during the copy;
@@ -34,6 +35,13 @@ An import is returned only after Wilkes has:
    embedded the retained snapshot; and
 5. committed every stable chunk reference and vector in one transaction with
    the document's `admission_state = ready`.
+
+If the corpus has additional embedding spaces, admission then projects the
+canonical extracted text and exact chunk descriptors into each model. A
+projection never copies the source or repeats extraction/chunking; it computes
+only its own vectors and index rows. Fan-out is synchronous. A partial write is
+idempotently repairable, but no projection whose membership digest differs from
+the canonical corpus can serve.
 
 Identical source bytes reuse the retained snapshot. Managed snapshots and
 ready index rows are not automatically collected.
@@ -53,6 +61,7 @@ reuse the key for different bytes or a different recipe is refused.
 ## Routes
 
 - `PUT /api/integrations/underdog/workspace`
+- `PUT /api/integrations/underdog/spaces`
 - `GET /api/integrations/underdog/status?corpus_id=...`
 - `POST /api/integrations/underdog/documents/import`
 - `POST /api/integrations/underdog/chunks/resolve`
@@ -118,11 +127,20 @@ Two absences are answers rather than failures:
 implement a truncation contract, and a Matryoshka width copied off a model card
 would be a claim it could not honour.
 
-Every operation after ensure names `corpus_id` and the
-`expected_embedding_space_id` returned by ensure/status. A mismatch is a hard
-`409`, never a fallback to the active workspace.
+`PUT /spaces` accepts `{ corpus_id, embedding }`, creates or reuses an internal
+projection workspace, and backfills it from canonical admitted renditions. It
+returns `{ embedding_space_id, embedding_space_identity, ready,
+indexed_generation, workspace_id, primary }`. Internal projection workspaces
+are registry members for lifecycle purposes but are omitted from the ordinary
+workspace list.
 
-`embedding_space_id` is `null` until the corpus holds an index. A corpus has no
+Every operation after ensure names `corpus_id` and an
+`expected_embedding_space_id` returned by ensure/status. Wilkes resolves that
+pair to the primary or an internal projection. Unknown spaces and spaces whose
+`indexed_generation` differs from the canonical `corpus_generation` are hard
+`409` failures, never fallbacks to another space.
+
+The primary `embedding_space_id` is `null` until the corpus holds an index. A corpus has no
 coordinate system before its first vectors exist, and the id a build will
 produce cannot be derived from the configured engine, model, and dimension — so
 Wilkes reports nothing rather than an id no index will carry. Import is the only
@@ -179,11 +197,20 @@ L2-normalized member vectors and the computed member count. This lets callers
 partition a large group across requests, add the sums and counts, and normalize
 exactly once.
 
-Status reports the exact stored space identity, ready/required/embedded counts,
-whole-document reused/computed chunk totals, source/temporary/index/total bytes,
-the time of the integrity query, and currently pending managed imports/runtime
-builds. A document contributes to these counts only after `admission_state =
-ready`.
+Status reports the exact primary stored space identity,
+ready/required/embedded counts, whole-document reused/computed chunk totals,
+source/temporary/index/total bytes, the time of the integrity query, and
+currently pending managed imports/runtime builds. It additionally reports the
+canonical `corpus_generation` and every registered `spaces[]` projection with
+its independently computed `indexed_generation` and readiness. A document
+contributes to these counts only after `admission_state = ready`.
+
+Backup always represents one restorable logical corpus. If Underdog's selected
+space is an internal projection, Wilkes combines the canonical retained sources
+and manifest identity with a transactionally snapshotted database for that
+projection. Restore installs that selected space as the corpus's initial
+projection; other spaces are derived caches and are re-established from the
+canonical renditions when requested.
 
 ## Stable errors
 
@@ -194,6 +221,7 @@ machine-readable `code` values:
 - `MANAGED_WORKSPACE_CONFIGURATION_MISMATCH`
 - `MANAGED_WORKSPACE_PROTECTED`
 - `EMBEDDING_SPACE_MISMATCH`
+- `EMBEDDING_SPACE_STALE`
 - `EXTRACTION_RECIPE_MISMATCH`
 - `SOURCE_CHANGED_DURING_IMPORT`
 - `DOCUMENT_INDEX_INCOMPLETE`

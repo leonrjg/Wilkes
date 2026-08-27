@@ -1482,6 +1482,81 @@ mod tests {
     }
 
     #[test]
+    fn managed_projection_reuses_structure_and_generation_but_not_vectors() {
+        let canonical_dir = tempdir().unwrap();
+        let canonical_root = canonical_dir.path().join("managed_sources");
+        fs::create_dir_all(&canonical_root).unwrap();
+        let document = canonical_root.join("document.txt");
+        fs::write(&document, "canonical passage").unwrap();
+        let recipe = ExtractionRecipe::new(100, 0);
+        let mut canonical = SemanticIndex::create(
+            canonical_dir.path(),
+            "primary",
+            2,
+            EmbeddingEngine::Candle,
+            Some(&canonical_root),
+        )
+        .unwrap();
+        canonical
+            .write_file_with_recipe(
+                PreparedFile {
+                    path: document.clone(),
+                    chunks: vec![(test_chunk(&document, "canonical passage"), vec![1.0, 0.0])],
+                    full_text: "canonical passage".to_string(),
+                },
+                &recipe,
+                Some(Path::new("managed_sources/document.txt")),
+                None,
+                true,
+                false,
+                Some("canonical-import"),
+            )
+            .unwrap();
+
+        let projection_dir = tempdir().unwrap();
+        let projection_root = projection_dir.path().join("managed_sources");
+        fs::create_dir_all(&projection_root).unwrap();
+        let mut projection = SemanticIndex::create(
+            projection_dir.path(),
+            "secondary",
+            2,
+            EmbeddingEngine::Candle,
+            Some(&projection_root),
+        )
+        .unwrap();
+        let mut prepared = canonical
+            .managed_file_structure_for_reembedding(&document, &document, &recipe)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.full_text, "canonical passage");
+        assert_eq!(prepared.chunks.len(), 1);
+        assert!(prepared.chunks[0].1.is_empty());
+        prepared.chunks[0].1 = vec![0.0, 1.0];
+        projection
+            .write_file_with_recipe(
+                prepared,
+                &recipe,
+                None,
+                Some(&serde_json::json!({"kind": "managed_corpus_projection"})),
+                true,
+                false,
+                Some("projection-import"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            canonical.managed_snapshot_sha256().unwrap(),
+            projection.managed_snapshot_sha256().unwrap(),
+            "membership generation excludes model-specific coordinates"
+        );
+        assert_eq!(
+            projection.query(&[0.0, 1.0], 1).unwrap()[0].chunk_text,
+            "canonical passage",
+            "the projection stores its own vectors over canonical chunks"
+        );
+    }
+
+    #[test]
     fn exact_whole_document_adoption_survives_source_index_deletion_and_rebuild() {
         let recipe = ExtractionRecipe::new(100, 0);
         let target_dir = tempdir().unwrap();
@@ -2850,6 +2925,45 @@ impl SemanticIndex {
             |row| row.get::<_, i64>(0),
         )? as usize;
         Ok((ready_documents, required_chunks, embedded_chunks))
+    }
+
+    /// Stable identity of the managed corpus membership represented by this
+    /// projection. Embeddings and rowids are deliberately excluded: two
+    /// embedding spaces are synchronized when they contain the same ready
+    /// renditions and stable chunks, not when their coordinates match.
+    pub fn managed_snapshot_sha256(&self) -> anyhow::Result<String> {
+        fn field(target: &mut Vec<u8>, value: &str) {
+            target.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            target.extend_from_slice(value.as_bytes());
+        }
+
+        let mut bytes = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT f.source_sha256, f.rendition_id, c.chunk_idx,
+                    c.chunk_ref, c.text_sha256
+               FROM files f
+               JOIN chunks c ON c.file_id = f.id
+              WHERE f.admission_state = 'ready'
+              ORDER BY f.source_sha256, f.rendition_id, c.chunk_idx",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (source, rendition, ordinal, chunk_ref, text_sha256) = row?;
+            field(&mut bytes, &source);
+            field(&mut bytes, &rendition);
+            field(&mut bytes, &ordinal.to_string());
+            field(&mut bytes, &chunk_ref);
+            field(&mut bytes, &text_sha256);
+        }
+        Ok(sha256_bytes(&bytes))
     }
 
     pub fn managed_embedding_work_totals(&self) -> anyhow::Result<(usize, usize)> {
@@ -5810,6 +5924,84 @@ impl SemanticIndex {
             .map(|rendition| self.managed_document_by_rendition(&rendition))
             .transpose()
             .map(Option::flatten)
+    }
+
+    pub fn managed_path_for_source_sha256(
+        &self,
+        source_sha256: &str,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        let path: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT file_path FROM files
+                 WHERE source_sha256 = ?1 AND admission_state = 'ready'
+                 ORDER BY id LIMIT 1",
+                params![source_sha256],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(path.map(PathBuf::from))
+    }
+
+    /// Read and verify the canonical, vector-free structure of one managed
+    /// document for projection into another embedding space.
+    ///
+    /// The returned [`PreparedFile`] deliberately carries empty vectors. Its
+    /// chunks and full text come from the admitted canonical rendition, so a
+    /// projection can embed those exact passages without reading, extracting,
+    /// or chunking the source again. The caller supplies `target_path` because
+    /// projection indexes may share the canonical immutable snapshot while
+    /// retaining their own file-row identity.
+    pub fn managed_file_structure_for_reembedding(
+        &self,
+        path: &Path,
+        target_path: &Path,
+        expected_recipe: &ExtractionRecipe,
+    ) -> anyhow::Result<Option<PreparedFile>> {
+        let Some(document) = self.managed_document_for_path(path)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            document.extraction_recipe_id == expected_recipe.id(),
+            "DOCUMENT_INDEX_INCOMPLETE: canonical rendition uses a different extraction recipe"
+        );
+        let key = self.path_key_for_known_path(path);
+        let full_text: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT full_text FROM files
+                 WHERE file_path = ?1 AND admission_state = 'ready'",
+                params![key.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let full_text = full_text
+            .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: retained text is absent"))?;
+        anyhow::ensure!(
+            sha256_bytes(full_text.as_bytes()) == document.extracted_content_sha256,
+            "DOCUMENT_INDEX_INCOMPLETE: extracted-content hash does not match retained text"
+        );
+        let chunks = document
+            .chunks
+            .into_iter()
+            .map(|chunk| {
+                (
+                    Chunk {
+                        file_path: target_path.to_path_buf(),
+                        text: chunk.text,
+                        byte_range: chunk.extraction_byte_range,
+                        origin: chunk.origin,
+                    },
+                    Vec::new(),
+                )
+            })
+            .collect();
+        Ok(Some(PreparedFile {
+            path: target_path.to_path_buf(),
+            chunks,
+            full_text,
+        }))
     }
 
     pub fn managed_document_for_import_key(

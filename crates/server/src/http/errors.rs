@@ -36,6 +36,7 @@ pub fn managed_err(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
         "MANAGED_WORKSPACE_CONFIGURATION_MISMATCH",
         "MANAGED_WORKSPACE_PROTECTED",
         "EMBEDDING_SPACE_MISMATCH",
+        "EMBEDDING_SPACE_STALE",
         "EXTRACTION_RECIPE_MISMATCH",
         "SOURCE_CHANGED_DURING_IMPORT",
         "DOCUMENT_INDEX_INCOMPLETE",
@@ -51,6 +52,7 @@ pub fn managed_err(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
         Some(
             "MANAGED_WORKSPACE_CONFIGURATION_MISMATCH"
             | "EMBEDDING_SPACE_MISMATCH"
+            | "EMBEDDING_SPACE_STALE"
             | "EXTRACTION_RECIPE_MISMATCH"
             | "IDEMPOTENCY_KEY_CONFLICT",
         ) => StatusCode::CONFLICT,

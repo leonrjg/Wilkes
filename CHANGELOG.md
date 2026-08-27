@@ -4,6 +4,18 @@
 
 ### Added
 
+- A managed corpus can carry more than one embedding space.
+  `PUT /api/integrations/underdog/spaces` adds a projection of an existing
+  corpus under a second model: it reads that corpus's admitted renditions and
+  computes only its own vectors, so the source is retained once, extracted
+  once, and every space shares the same rendition ids and chunk refs. The
+  projection is an internal workspace — it is not listed beside the user's own
+  and is never a corpus id callers address. Corpus status now reports a
+  `corpus_generation` and one entry per space; an import fans out to every
+  space before it returns, and a space that has not indexed the current
+  generation is refused with `EMBEDDING_SPACE_STALE` rather than answering from
+  membership it lacks.
+
 - A local mirror of the open teaching catalogues — LibreTexts, OpenStax, MIT
   OpenCourseWare and DevDocs — with BM25 search over it, at
   `POST /api/integrations/underdog/catalogue/{search,sync}` and
