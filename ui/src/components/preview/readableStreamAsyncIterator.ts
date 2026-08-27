@@ -13,9 +13,11 @@
 // alternative path. Iteration stays pdf.js' single mechanism for draining the
 // text stream — the engine simply gains the operator the spec says it has.
 //
-// Modules that call getTextContent() import this for the side effect, so the
-// dependency travels with the code that needs it rather than with whichever
-// entry point a host happens to import.
+// Callers install it explicitly, immediately before the pdf.js call that needs
+// it, rather than relying on an import for its side effect: a bundler told the
+// package is side-effect-free would tree-shake such an import away and silently
+// drop the fix on the two of three platforms that need it. Installing is a
+// typeof check once the operator is there, so calling it per use costs nothing.
 
 interface AsyncIteratorOptions {
   preventCancel?: boolean;
@@ -71,5 +73,3 @@ export function installReadableStreamAsyncIterator(): boolean {
   );
   return true;
 }
-
-installReadableStreamAsyncIterator();

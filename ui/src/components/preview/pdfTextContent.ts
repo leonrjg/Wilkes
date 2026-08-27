@@ -1,4 +1,4 @@
-import "./readableStreamAsyncIterator";
+import { installReadableStreamAsyncIterator } from "./readableStreamAsyncIterator";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 
 export interface PositionedPdfText {
@@ -91,6 +91,7 @@ export async function loadPdfPageText(
   if (cached) return cached;
 
   const promise = (async () => {
+    installReadableStreamAsyncIterator();
     const page = await pdf.getPage(pageNumber);
     const viewport = page.getViewport({ scale: 1 });
     const content = await page.getTextContent({ disableNormalization: true });

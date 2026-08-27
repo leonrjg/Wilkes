@@ -11,7 +11,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { Search as SearchIcon, List } from "react-feather";
 import { GlobalWorkerOptions } from "pdfjs-dist";
 import type { PDFDocumentProxy } from "pdfjs-dist";
-import "./readableStreamAsyncIterator";
+import { installReadableStreamAsyncIterator } from "./readableStreamAsyncIterator";
 import PdfPageCanvas from "./PdfPageCanvas";
 import type { BoundingBox } from "./documentCoordinates";
 import { usePdfInnerSearch, type InnerMatch } from "./usePdfInnerSearch";
@@ -359,6 +359,7 @@ export default function PdfViewer({
       // Skip the title page when the document is long enough to have one.
       const start = total > AUTO_ZOOM_SAMPLE_PAGES + 1 ? 2 : 1;
       const end = Math.min(start + AUTO_ZOOM_SAMPLE_PAGES - 1, total);
+      installReadableStreamAsyncIterator();
       for (let p = start; p <= end; p++) {
         const pdfPage = await pdf.getPage(p);
         if (cancelled) return;
