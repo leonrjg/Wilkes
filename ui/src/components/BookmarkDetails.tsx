@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Trash2, X } from "react-feather";
 import type { Bookmark } from "../lib/types";
-import type { ElementAnchor } from "./preview";
+import type { ElementAnchor } from "@leonrjg/wilkes-reader";
 
 interface BookmarkDetailsProps {
   bookmark: Bookmark;

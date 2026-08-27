@@ -1,7 +1,10 @@
 @import "tailwindcss";
+/* Tailwind scans no dependency unless told to, and the readers are built
+   from its utilities. Without this their layout silently collapses. */
+@source "../node_modules/@leonrjg/wilkes-reader/dist";
 /* The readers' stylesheet, ahead of this file's own `:root` so the tokens
    below override its defaults. */
-@import "./components/preview/reader.css";
+@import "@leonrjg/wilkes-reader/reader.css";
 
 html,
 body,

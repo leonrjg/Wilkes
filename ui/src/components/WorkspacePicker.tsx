@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Edit2, Plus } from "react-feather";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 import { TextInputDialog } from "./TextInputDialog";
-import { Tooltip } from "./preview";
+import { Tooltip } from "@leonrjg/wilkes-reader";
 import { useToasts } from "./Toast";
 
 type WorkspaceDialog =

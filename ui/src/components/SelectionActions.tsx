@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import type { DocumentSelection } from "./preview/selection";
-import type { SelectionSlotApi } from "./preview/slots";
+import type { DocumentSelection } from "@leonrjg/wilkes-reader";
+import type { SelectionSlotApi } from "@leonrjg/wilkes-reader";
 
 interface SelectionActionsProps {
   selection: DocumentSelection;

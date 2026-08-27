@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup } from "@testing-library/react";
 import { afterEach, vi } from "vitest";
 // Environment gaps the readers need under jsdom; owned by the package.
-import "../components/preview/testing/setup";
+import "@leonrjg/wilkes-reader/testing/setup";
 
 const localStorageValues = new Map<string, string>();
 Object.defineProperty(window, "localStorage", {

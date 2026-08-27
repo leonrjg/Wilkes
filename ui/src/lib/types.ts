@@ -5,13 +5,13 @@ import type {
   BoundingBox,
   ByteRange,
   SourceOrigin,
-} from "../components/preview/documentCoordinates";
+} from "@leonrjg/wilkes-reader";
 
 export type { BoundingBox, ByteRange, SourceOrigin };
 
 /** What a `Theme` resolves to once "System" has been asked of the OS. Defined
  *  by the readers, since it is what their host contract asks for. */
-export type { ColorScheme } from "../components/preview/ReaderHost";
+export type { ColorScheme } from "@leonrjg/wilkes-reader";
 
 // Auto-generated from Rust types (manually maintained until tauri-specta is wired up).
 // Keep in sync with crates/core/src/types.rs.

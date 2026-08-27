@@ -25,7 +25,7 @@ import { useViewerStore } from "../stores/useViewerStore";
 import { useContextMenu, ContextMenu } from "./ContextMenu";
 import { confirmDialog } from "../lib/utils/dialog";
 import type { AgentBackend, MatchRef } from "../lib/types";
-import { Tooltip } from "./preview";
+import { Tooltip } from "@leonrjg/wilkes-reader";
 import { CopyButton } from "./CopyButton";
 
 function fileName(path: string) {

@@ -13,7 +13,7 @@ import { useSemanticStore } from "../stores/useSemanticStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { fileName, type DocumentDetail } from "./DocumentEntryRow";
 import ResultList from "./ResultList";
-import { Tooltip } from "./preview";
+import { Tooltip } from "@leonrjg/wilkes-reader";
 import {
   useGenerationStream,
   type GenerationStreamPhase,

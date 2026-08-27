@@ -15,7 +15,7 @@ import {
   type ElementAnchor,
   type ReaderHostServices,
   type SelectionActionsSlot,
-} from "./preview";
+} from "@leonrjg/wilkes-reader";
 import { readMarkdownViewMode, saveMarkdownViewMode } from "./markdownViewMode";
 import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
@@ -25,7 +25,7 @@ import type { BoundingBox, DocumentMetadata, Match, MatchRef } from "../lib/type
 import { buildExternalLinks } from "../lib/externalLinks";
 import { formatDocumentMonthYear } from "../lib/dateFormatting";
 import { useToasts } from "./Toast";
-import { Tooltip } from "./preview";
+import { Tooltip } from "@leonrjg/wilkes-reader";
 import { CopyButton } from "./CopyButton";
 import RelatedDocumentsPane from "./RelatedDocumentsPane";
 import BookmarkDetails from "./BookmarkDetails";

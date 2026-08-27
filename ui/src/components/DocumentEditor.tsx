@@ -15,7 +15,7 @@ import { randomId, type CompletionEvent, type SessionSteering } from "../lib/typ
 import { useEditorStore } from "../stores/useEditorStore";
 import { useViewerStore } from "../stores/useViewerStore";
 import { fileName } from "./DocumentEntryRow";
-import { getLanguageExtension } from "./preview/CodeViewer";
+import { getLanguageExtension } from "@leonrjg/wilkes-reader";
 import { useSettingsStore } from "../stores/useSettingsStore";
 
 const setGhost = StateEffect.define<{ position: number; text: string } | null>();

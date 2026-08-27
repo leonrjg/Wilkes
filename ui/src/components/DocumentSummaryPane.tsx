@@ -3,7 +3,7 @@ import { Check, Copy, RefreshCw, X } from "react-feather";
 import { useGenerationStream } from "../hooks/useGenerationStream";
 import { api } from "../services";
 import { CopyButton } from "./CopyButton";
-import { Tooltip } from "./preview";
+import { Tooltip } from "@leonrjg/wilkes-reader";
 
 interface Props {
   path: string;

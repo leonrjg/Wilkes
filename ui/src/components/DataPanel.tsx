@@ -3,7 +3,7 @@ import type { SearchApi, DataPaths } from "../services/api";
 import { isTauri } from "../services";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
-import { Tooltip } from "./preview";
+import { Tooltip } from "@leonrjg/wilkes-reader";
 
 interface Props {
   api: SearchApi;

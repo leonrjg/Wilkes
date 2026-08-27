@@ -7,7 +7,7 @@ import { api, isTauri, source } from "../services";
 import type { DesktopSourceApi } from "../services/api";
 import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileActions";
 import { useSettingsStore } from "../stores/useSettingsStore";
-import { Tooltip } from "./preview";
+import { Tooltip } from "@leonrjg/wilkes-reader";
 import { DirectoryTree, isStrictAncestor, parentPath } from "./DirectoryTree";
 import { configuredLibraryRoots } from "../lib/configuredRoots";
 

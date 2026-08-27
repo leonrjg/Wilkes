@@ -70,8 +70,11 @@ vi.mock("@tauri-apps/api/webview", () => ({
 }));
 
 vi.mock("./hooks/useTauriEvents", () => ({ useTauriEvents: vi.fn() }));
-vi.mock("./components/preview/CodeViewer", () => ({ default: () => <div data-testid="code-viewer">CodeViewer</div> }));
-vi.mock("./components/preview/PdfViewer", () => ({ default: () => <div data-testid="pdf-viewer">PdfViewer</div> }));
+vi.mock("@leonrjg/wilkes-reader", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  CodeViewer: () => <div data-testid="code-viewer">CodeViewer</div>,
+  PdfViewer: () => <div data-testid="pdf-viewer">PdfViewer</div>,
+}));
 vi.mock("./components/SettingsModal", () => ({ default: ({ isOpen }: any) => isOpen ? <div data-testid="settings-modal">Settings Modal</div> : null }));
 
 const bookmarkPaneActions = {

@@ -1,8 +1,18 @@
 /// <reference types="vitest" />
+import { createRequire } from "node:module";
+import { dirname } from "node:path";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-import { pdfjsAssets } from "./src/components/preview/vite/pdfjsAssets";
+import { pdfjsAssets } from "@leonrjg/wilkes-reader/vite";
+
+// Vite resolves a linked package to its real path, which is outside this root,
+// and the dev server refuses to serve pdf.js' worker from there. Derived rather
+// than hard-coded so it holds wherever the package is linked from, and inert
+// once it is installed from a tag and lives under node_modules.
+const readerRoot = dirname(
+  createRequire(import.meta.url).resolve("@leonrjg/wilkes-reader/package.json"),
+);
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), pdfjsAssets()],
@@ -10,6 +20,7 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    fs: { allow: [".", readerRoot] },
     watch: {
       ignored: ["**/src-tauri/**"],
     },

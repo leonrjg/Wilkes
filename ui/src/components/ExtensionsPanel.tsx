@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { Settings } from "../lib/types";
-import { Tooltip } from "./preview";
+import { Tooltip } from "@leonrjg/wilkes-reader";
 
 interface ExtensionsPanelProps {
   settings: Settings;

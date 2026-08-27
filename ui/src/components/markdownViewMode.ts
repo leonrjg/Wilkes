@@ -1,4 +1,4 @@
-import type { TextViewerMode } from "./preview/textScrollMemory";
+import type { TextViewerMode } from "@leonrjg/wilkes-reader";
 
 /**
  * Which viewer Wilkes last showed a Markdown document in, remembered for the

@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type React from "react";
 import { Folder, Tag as TagIcon } from "react-feather";
-import { Tooltip } from "./preview";
+import { Tooltip } from "@leonrjg/wilkes-reader";
 import type { FileType, Tag } from "../lib/types";
 
 export type DetailIcon = React.ComponentType<React.SVGProps<SVGSVGElement> & { size?: number }>;

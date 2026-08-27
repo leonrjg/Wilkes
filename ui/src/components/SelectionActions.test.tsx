@@ -1,8 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import SelectionActions from "./SelectionActions";
-import type { DocumentSelection } from "./preview/selection";
-import type { SelectionSlotApi } from "./preview/slots";
+import type { DocumentSelection, SelectionSlotApi } from "@leonrjg/wilkes-reader";
 
 /**
  * Wilkes' own selection chrome, tested on its own. It used to be exercised

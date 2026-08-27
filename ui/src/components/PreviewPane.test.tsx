@@ -26,14 +26,17 @@ const decorationFor = (props: any, id: string) =>
   props.decorations.find((decoration: any) => decoration.id === id);
 
 const mockCodeViewer = vi.fn(() => <div data-testid="code-viewer">CodeViewer</div>);
-vi.mock("./preview/CodeViewer", () => ({ default: (props: any) => mockCodeViewer(props) }));
-vi.mock("./DocumentEditor", () => ({ default: () => <div data-testid="document-editor">DocumentEditor</div> }));
-
 const mockMarkdownViewer = vi.fn(() => <div data-testid="markdown-viewer">MarkdownViewer</div>);
-vi.mock("./preview/MarkdownViewer", () => ({ default: (props: any) => mockMarkdownViewer(props) }));
-
 const mockPdfViewer = vi.fn(() => <div data-testid="pdf-viewer">PdfViewer</div>);
-vi.mock("./preview/PdfViewer", () => ({ default: (props: any) => mockPdfViewer(props) }));
+// The readers are stood in for so this pane is tested on what it hands them.
+// Everything else the package exports stays real: the pane is built out of it.
+vi.mock("@leonrjg/wilkes-reader", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  CodeViewer: (props: any) => mockCodeViewer(props),
+  MarkdownViewer: (props: any) => mockMarkdownViewer(props),
+  PdfViewer: (props: any) => mockPdfViewer(props),
+}));
+vi.mock("./DocumentEditor", () => ({ default: () => <div data-testid="document-editor">DocumentEditor</div> }));
 vi.mock("./Toast", () => ({ useToasts: () => ({ addToast: vi.fn() }) }));
 vi.mock("../services", () => ({
   isTauri: false,

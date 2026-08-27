@@ -8,7 +8,7 @@ import type {
 import { api } from "../services";
 import { useViewerStore } from "../stores/useViewerStore";
 import { CopyButton } from "./CopyButton";
-import { Tooltip } from "./preview";
+import { Tooltip } from "@leonrjg/wilkes-reader";
 
 interface Props {
   input: SearchResultsSummaryInput;
