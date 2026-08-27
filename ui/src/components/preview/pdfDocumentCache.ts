@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { getDocument } from "pdfjs-dist";
 import type { PDFDocumentLoadingTask, PDFDocumentProxy } from "pdfjs-dist";
+import { pdfjsAssetUrls } from "./pdfjsAssetUrls";
 
 // The parsed PDF documents (`PDFDocumentProxy`) for the N most-recently opened
 // files are kept alive here so switching back to a recent document is instant.
@@ -58,7 +59,7 @@ export function loadPdfDocument(url: string): Promise<PDFDocumentProxy> {
     return existing.promise;
   }
 
-  const loadingTask = getDocument({ url });
+  const loadingTask = getDocument({ url, ...pdfjsAssetUrls() });
   const entry: CacheEntry = { proxy: null, promise: loadingTask.promise, loadingTask };
   entry.promise = loadingTask.promise.then(
     (proxy) => {

@@ -2,6 +2,7 @@ import { renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getDocument } from "pdfjs-dist";
 import { usePdfDocument } from "./pdfDocumentCache";
+import { pdfjsAssetUrls } from "./pdfjsAssetUrls";
 
 vi.mock("pdfjs-dist", () => ({
   getDocument: vi.fn(),
@@ -32,5 +33,20 @@ describe("pdfDocumentCache", () => {
 
     await waitFor(() => expect(result.current).toBe(proxy));
     expect(getDocument).toHaveBeenCalledTimes(2);
+  });
+
+  it("tells pdf.js where its decoders, fonts and character maps live", async () => {
+    // Without these pdf.js cannot decode a scanned page, and the document
+    // renders blank behind an invisible, still-selectable OCR text layer.
+    const proxy = { numPages: 1 } as any;
+    vi.mocked(getDocument).mockReturnValue({ promise: Promise.resolve(proxy) } as any);
+
+    renderHook(() => usePdfDocument("assets.pdf"));
+
+    await waitFor(() => expect(getDocument).toHaveBeenCalled());
+    expect(vi.mocked(getDocument).mock.calls[0][0]).toMatchObject({
+      url: "assets.pdf",
+      ...pdfjsAssetUrls(),
+    });
   });
 });
