@@ -358,7 +358,7 @@ async fn list_models_for_ctx(
     ctx: Arc<AppContext>,
     engine: EmbeddingEngine,
 ) -> Result<Vec<ModelDescriptor>, String> {
-    Ok(wilkes_api::commands::embed::list_models(engine, &ctx.shared_data_dir).await)
+    Ok(wilkes_api::commands::embed::list_models(engine, &ctx.model_dir).await)
 }
 
 async fn cancel_embed_for_ctx(ctx: Arc<AppContext>) -> Result<(), String> {

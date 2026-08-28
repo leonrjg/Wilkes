@@ -989,8 +989,15 @@ fn resolve_outline<T: OutlineChunk>(
 pub struct AppContext {
     /// Workspace-owned databases and conversation persistence.
     pub data_dir: PathBuf,
-    /// Shared model downloads, Python environment, and other installation data.
+    /// Shared Python environment, managed backups, and other installation data.
     pub shared_data_dir: PathBuf,
+    /// The one model cache for the installation: `shared_data_dir/models`.
+    ///
+    /// Its own directory rather than the installation root, and derived here
+    /// rather than at each call site, because every consumer of it must name
+    /// the same path — the embedding-space identity is derived from the cache
+    /// root's contents, so two roots are two identities for one model.
+    pub model_dir: PathBuf,
     pub settings_path: PathBuf,
     pub workspace_path: PathBuf,
     pub bookmarks_path: PathBuf,
@@ -1088,9 +1095,11 @@ impl AppContext {
         let (worker_manager, event_rx, loop_fut) = WorkerManager::new(paths.clone());
         let (generate_manager, generate_event_rx, generate_loop_fut) = WorkerManager::new(paths);
         let bookmarks_path = data_dir.join("bookmarks.json");
+        let model_dir = shared_data_dir.join("models");
         let ctx = Arc::new(Self {
             data_dir,
             shared_data_dir,
+            model_dir,
             bookmarks_path,
             settings_path,
             workspace_path,
@@ -1860,13 +1869,13 @@ impl AppContext {
         );
         let (progress_tx, _progress_rx) = mpsc::channel(8);
         installer
-            .install(&self.shared_data_dir, progress_tx)
+            .install(&self.model_dir, progress_tx)
             .await
             .map_err(|error| format!("Could not install managed embedding model: {error:#}"))?;
-        let shared_data_dir = self.shared_data_dir.clone();
+        let model_dir = self.model_dir.clone();
         let installer_for_build = Arc::clone(&installer);
         let embedder =
-            tokio::task::spawn_blocking(move || installer_for_build.build(&shared_data_dir))
+            tokio::task::spawn_blocking(move || installer_for_build.build(&model_dir))
                 .await
                 .map_err(|error| format!("Managed embedder task panicked: {error}"))?
                 .map_err(|error| format!("Could not load managed embedder: {error:#}"))?;
@@ -4554,10 +4563,12 @@ impl AppContext {
     pub async fn load_image_analyzer(self: &Arc<Self>) -> anyhow::Result<bool> {
         let _serialized = self.image_analyzer_load_lock.lock().await;
         let settings = self.get_settings().await;
-        let data_dir = self.shared_data_dir.clone();
+        let model_dir = self.model_dir.clone();
+        let cache_dir = self.shared_data_dir.clone();
         let built = tokio::task::spawn_blocking(move || {
             wilkes_core::extract::image::build_analyzer(
-                &data_dir,
+                &model_dir,
+                &cache_dir,
                 &settings.image_analysis,
                 &settings.generation.ollama_url,
             )
@@ -4582,7 +4593,7 @@ impl AppContext {
 
     /// Whether the recognizer the shipped recipe names is on disk and intact.
     pub fn is_image_recognizer_installed(&self) -> bool {
-        wilkes_core::extract::image::recognizer_installed(&self.shared_data_dir)
+        wilkes_core::extract::image::recognizer_installed(&self.model_dir)
     }
 
     /// What the shipped recognizer is, where it came from, and under what
@@ -4608,9 +4619,9 @@ impl AppContext {
                 events.emit("image-analysis-progress", serde_json::json!(progress));
             }
         });
-        let data_dir = self.shared_data_dir.clone();
+        let model_dir = self.model_dir.clone();
         let installed = tokio::task::spawn_blocking(move || {
-            wilkes_core::extract::image::install_recognizer(&data_dir, Some(progress_tx))
+            wilkes_core::extract::image::install_recognizer(&model_dir, Some(progress_tx))
         })
         .await?;
         let _ = forward.await;
@@ -5144,7 +5155,7 @@ impl AppContext {
 
     pub async fn list_generation_models(&self) -> anyhow::Result<Vec<GeneratorDescriptor>> {
         let settings = self.generation_settings().await;
-        generate_dispatch::list_models(settings.engine, &self.shared_data_dir, &settings.ollama_url)
+        generate_dispatch::list_models(settings.engine, &self.model_dir, &settings.ollama_url)
             .await
     }
 
@@ -5202,7 +5213,7 @@ impl AppContext {
             model.clone(),
             self.generate_manager.clone(),
             Self::generation_device(&settings),
-            &self.shared_data_dir,
+            &self.model_dir,
             &settings.ollama_url,
             settings.context_tokens,
             progress_tx,
@@ -6235,7 +6246,8 @@ impl AppContext {
 
     fn build_index_options(
         manager: WorkerManager,
-        data_dir: PathBuf,
+        model_dir: PathBuf,
+        index_dir: PathBuf,
         plan: &BuildIndexPlan,
         progress_tx: tokio::sync::mpsc::Sender<EmbedProgress>,
         cancel_flag: Arc<AtomicBool>,
@@ -6243,7 +6255,8 @@ impl AppContext {
         crate::commands::embed::BuildIndexOptions {
             manager: Some(manager),
             device: Some(plan.device.clone()),
-            data_dir,
+            model_dir,
+            index_dir,
             tx: progress_tx,
             cancel_flag,
             chunk_size: plan.chunk_size,
@@ -6356,7 +6369,12 @@ impl AppContext {
         cancel_flag: Arc<AtomicBool>,
     ) -> JoinHandle<anyhow::Result<()>> {
         let manager = self.worker_manager.clone();
+        // The index is the workspace's; the model artefacts are the
+        // installation's. Passing `data_dir` for both is what made every
+        // workspace download its own copy of the same model — and derive its
+        // own embedding-space identity from that copy.
         let data_dir = self.data_dir.clone();
+        let model_dir = self.model_dir.clone();
         let ctx = Arc::clone(&self);
         let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<EmbedProgress>(128);
         let cancel_for_task = cancel.clone();
@@ -6396,6 +6414,7 @@ impl AppContext {
 
             let options = Self::build_index_options(
                 manager.clone(),
+                model_dir,
                 data_dir.clone(),
                 &plan,
                 progress_tx,
@@ -6468,7 +6487,7 @@ impl AppContext {
         plan: DownloadModelPlan,
         selected: SelectedEmbedder,
     ) -> JoinHandle<anyhow::Result<()>> {
-        let data_dir = self.shared_data_dir.clone();
+        let model_dir = self.model_dir.clone();
         let manager = self.worker_manager.clone();
         let ctx = Arc::clone(&self);
         let (progress_tx, progress_rx) = mpsc::channel::<EmbedProgress>(64);
@@ -6483,7 +6502,7 @@ impl AppContext {
                 selected.clone(),
                 manager.clone(),
                 plan.device.clone(),
-                data_dir.clone(),
+                model_dir.clone(),
                 progress_tx,
             )
             .await;
@@ -6533,11 +6552,11 @@ impl AppContext {
     ) -> Result<(), String> {
         // Probe model dimensions by running install again (no-op if cached).
         let (probe_tx, _) = mpsc::channel(1);
-        if let Err(e) = installer.install(&self.shared_data_dir, probe_tx).await {
+        if let Err(e) = installer.install(&self.model_dir, probe_tx).await {
             return Err(format!("Failed to probe model dimensions: {e:#}"));
         }
 
-        match installer.build(&self.shared_data_dir) {
+        match installer.build(&self.model_dir) {
             Ok(embedder) => {
                 *self.embedder.lock() = Some(embedder);
                 Ok(())
@@ -6845,17 +6864,17 @@ impl AppContext {
         installer: Arc<dyn EmbedderInstaller>,
     ) -> Option<Arc<dyn Embedder>> {
         let (probe_tx, _) = tokio::sync::mpsc::channel(1);
-        if let Err(err) = installer.install(&self.shared_data_dir, probe_tx).await {
+        if let Err(err) = installer.install(&self.model_dir, probe_tx).await {
             error!("restore_state: install probe failed: {err:#}");
             return None;
         }
-        if !installer.is_available(&self.shared_data_dir) {
+        if !installer.is_available(&self.model_dir) {
             info!("restore_state: model files absent, skipping");
             return None;
         }
 
-        let data_dir = self.shared_data_dir.clone();
-        match tokio::task::spawn_blocking(move || installer.build(&data_dir)).await {
+        let model_dir = self.model_dir.clone();
+        match tokio::task::spawn_blocking(move || installer.build(&model_dir)).await {
             Ok(Ok(embedder)) => Some(embedder),
             Ok(Err(err)) => {
                 error!("restore_state: build embedder: {err:#}");
@@ -9349,6 +9368,7 @@ mod tests {
                 data_dir: dir.path().to_path_buf(),
             })
             .0,
+            dir.path().join("models"),
             dir.path().to_path_buf(),
             &plan,
             tx,
@@ -9356,6 +9376,8 @@ mod tests {
         );
 
         assert_eq!(options.device.as_deref(), Some("cpu"));
+        assert_eq!(options.model_dir, dir.path().join("models"));
+        assert_eq!(options.index_dir, dir.path().to_path_buf());
         assert_eq!(options.chunk_size, 123);
         assert_eq!(options.chunk_overlap, 45);
         assert_eq!(options.supported_extensions, vec!["rs", "txt"]);

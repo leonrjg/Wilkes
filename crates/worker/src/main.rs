@@ -19,7 +19,10 @@ use wilkes_core::worker::ipc::{CancelSignal, WorkerEvent, WorkerRequest, WorkerR
 struct LoadedModelKey {
     role: WorkerRole,
     model: String,
-    data_dir: std::path::PathBuf,
+    /// The model cache root, not the index directory: a reload is warranted
+    /// when the artefacts change, and the index a build happens to write to
+    /// says nothing about them.
+    model_dir: std::path::PathBuf,
     device: String,
 }
 
@@ -28,7 +31,7 @@ impl LoadedModelKey {
         Self {
             role: req.role,
             model: req.model.clone(),
-            data_dir: req.data_dir.clone(),
+            model_dir: req.model_dir.clone(),
             device: req.device.clone(),
         }
     }
@@ -119,7 +122,7 @@ impl ModelLoader for RealModelLoader {
                 let prepared = dispatch::prepare_embedder(
                     engine,
                     &model,
-                    &key.data_dir,
+                    &key.model_dir,
                     &key.device,
                     event_tx,
                 )
@@ -136,7 +139,7 @@ impl ModelLoader for RealModelLoader {
                 let generator = generate_dispatch::prepare_generator(
                     engine,
                     &model,
-                    &key.data_dir,
+                    &key.model_dir,
                     &key.device,
                     progress,
                 )
@@ -341,7 +344,10 @@ async fn handle_build_plan(
     let options = wilkes_api::commands::embed::BuildIndexOptions {
         manager: None,
         device: None,
-        data_dir: req.data_dir,
+        model_dir: req.model_dir,
+        index_dir: req
+            .index_dir
+            .ok_or_else(|| anyhow::anyhow!("build request missing index_dir"))?,
         tx,
         cancel_flag: Arc::new(AtomicBool::new(false)),
         chunk_size: req
@@ -499,15 +505,15 @@ async fn get_or_load<'a>(
 
     if let Some(current) = active.as_ref() {
         tracing::info!(
-            "[worker] invalidating cached model (role: {:?} -> {:?}, model: {} -> {}, device: {} -> {}, data_dir: {} -> {})",
+            "[worker] invalidating cached model (role: {:?} -> {:?}, model: {} -> {}, device: {} -> {}, model_dir: {} -> {})",
             current.key.role,
             key.role,
             current.key.model,
             key.model,
             current.key.device,
             key.device,
-            current.key.data_dir.display(),
-            key.data_dir.display()
+            current.key.model_dir.display(),
+            key.model_dir.display()
         );
     }
 
@@ -580,7 +586,8 @@ mod tests {
             root: data_dir.clone(),
             role,
             model: "model-a".to_string(),
-            data_dir,
+            model_dir: data_dir.clone(),
+            index_dir: Some(data_dir),
             chunk_size: Some(32),
             chunk_overlap: Some(8),
             device: "cpu".to_string(),
@@ -708,7 +715,7 @@ mod tests {
             key: LoadedModelKey {
                 role: WorkerRole::Embed(EmbeddingEngine::Candle),
                 model: "old-model".to_string(),
-                data_dir: dir.path().to_path_buf(),
+                model_dir: dir.path().to_path_buf(),
                 device: "cpu".to_string(),
             },
             payload: LoadedPayload::Embedder(Arc::new(MockEmbedder::default())),
@@ -958,7 +965,7 @@ mod tests {
         let k1 = LoadedModelKey {
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
-            data_dir: PathBuf::from("d"),
+            model_dir: PathBuf::from("d"),
             device: "cpu".to_string(),
         };
         let k2 = k1.clone();
@@ -976,7 +983,7 @@ mod tests {
         let key = LoadedModelKey {
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "non-existent".to_string(),
-            data_dir: PathBuf::from("/tmp/non-existent-data-dir"),
+            model_dir: PathBuf::from("/tmp/non-existent-model-dir"),
             device: "cpu".to_string(),
         };
         assert!(loader.load(&key, None).await.is_err());

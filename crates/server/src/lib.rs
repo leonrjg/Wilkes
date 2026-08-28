@@ -950,7 +950,7 @@ async fn underdog_embedding_models_handler(
     let context = state.context();
     let settings = context.get_settings().await;
     Json(wilkes_core::embed::dispatch::model_capabilities(
-        &context.shared_data_dir,
+        &context.model_dir,
         &settings.semantic.custom_models,
     ))
 }
@@ -2102,7 +2102,7 @@ async fn list_models_handler(
     Query(params): Query<ListModelsQuery>,
 ) -> impl IntoResponse {
     let models: Vec<ModelDescriptor> =
-        wilkes_api::commands::embed::list_models(params.engine, &state.context().shared_data_dir)
+        wilkes_api::commands::embed::list_models(params.engine, &state.context().model_dir)
             .await;
     Json(models)
 }

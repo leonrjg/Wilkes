@@ -14,7 +14,13 @@ use wilkes_core::worker::manager::{ManagerCommand, WorkerManager};
 pub struct BuildIndexOptions {
     pub manager: Option<wilkes_core::worker::manager::WorkerManager>,
     pub device: Option<String>,
-    pub data_dir: PathBuf,
+    /// Where model artefacts are cached. One directory for the whole
+    /// installation; never the workspace's own directory, or every workspace
+    /// downloads the same model again and derives its own embedding-space
+    /// identity from its own copy.
+    pub model_dir: PathBuf,
+    /// Where the index is written. One per workspace.
+    pub index_dir: PathBuf,
     pub tx: ProgressTx,
     pub cancel_flag: Arc<AtomicBool>,
     pub chunk_size: usize,
@@ -22,12 +28,13 @@ pub struct BuildIndexOptions {
     pub supported_extensions: Vec<String>,
 }
 
-/// Download and install the model. Reports progress via `tx`.
+/// Download and install the model into the installation-wide model cache.
+/// Reports progress via `tx`.
 pub async fn download_model(
     selected: SelectedEmbedder,
     manager: wilkes_core::worker::manager::WorkerManager,
     device: String,
-    data_dir: PathBuf,
+    model_dir: PathBuf,
     tx: ProgressTx,
 ) -> anyhow::Result<()> {
     let installer = wilkes_core::embed::dispatch::get_installer(
@@ -36,11 +43,11 @@ pub async fn download_model(
         manager,
         device,
     );
-    installer.install(&data_dir, tx).await
+    installer.install(&model_dir, tx).await
 }
 
 /// Walk `root`, embed every file using `embedder`, and write a new `SemanticIndex`
-/// at `data_dir`. The embedder is returned so callers can cache it without reloading.
+/// at `index_dir`. The embedder is returned so callers can cache it without reloading.
 pub async fn build_index_with_embedder(
     root: PathBuf,
     embedder: Arc<dyn Embedder>,
@@ -71,7 +78,7 @@ pub async fn build_index_with_embedder(
         paths.len()
     );
 
-    let data_dir_clone = options.data_dir.clone();
+    let index_dir = options.index_dir.clone();
     let root_clone = root.clone();
     let indexing = wilkes_core::types::IndexingConfig {
         chunk_size: options.chunk_size,
@@ -84,7 +91,7 @@ pub async fn build_index_with_embedder(
         let registry = wilkes_core::extract::production_registry();
 
         SemanticIndex::build(
-            &data_dir_clone,
+            &index_dir,
             &root_clone,
             &paths,
             &registry,
@@ -101,7 +108,7 @@ pub async fn build_index_with_embedder(
     Ok(embedder)
 }
 
-/// Walk `root`, embed every file, and write a new `SemanticIndex` at `data_dir`.
+/// Walk `root`, embed every file, and write a new `SemanticIndex` at `index_dir`.
 /// Returns the `Arc<dyn Embedder>` used during the build so the caller can store
 /// it in state without loading the model a second time.
 ///
@@ -150,7 +157,8 @@ async fn build_index_via_worker(
         root,
         role: WorkerRole::Embed(selected.engine),
         model: selected.model.model_id().to_string(),
-        data_dir: options.data_dir.clone(),
+        model_dir: options.model_dir.clone(),
+        index_dir: Some(options.index_dir.clone()),
         chunk_size: Some(options.chunk_size),
         chunk_overlap: Some(options.chunk_overlap),
         device: device.clone(),
@@ -186,7 +194,7 @@ async fn build_index_via_worker(
                         manager,
                         device,
                     );
-                    return installer.build(&options.data_dir);
+                    return installer.build(&options.model_dir);
                 }
                 WorkerEvent::Error(err) => {
                     anyhow::bail!(err);
@@ -210,10 +218,10 @@ pub async fn build_index_with_installer(
 ) -> anyhow::Result<Arc<dyn Embedder>> {
     // Ensure model is ready (probes dimension for SBERT, no-op for others if already cached)
     installer
-        .install(&options.data_dir, options.tx.clone())
+        .install(&options.model_dir, options.tx.clone())
         .await?;
 
-    let embedder = installer.build(&options.data_dir)?;
+    let embedder = installer.build(&options.model_dir)?;
     build_index_with_embedder(root, embedder, options).await
 }
 
@@ -231,11 +239,11 @@ pub async fn get_model_size(
 /// Return all engine-supported models, annotated with local cache availability.
 pub async fn list_models(
     engine: wilkes_core::types::EmbeddingEngine,
-    data_dir: &Path,
+    model_dir: &Path,
 ) -> Vec<wilkes_core::types::ModelDescriptor> {
-    let data_dir = data_dir.to_path_buf();
+    let model_dir = model_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        wilkes_core::embed::dispatch::list_models(engine, &data_dir)
+        wilkes_core::embed::dispatch::list_models(engine, &model_dir)
     })
     .await
     .unwrap_or_default()
@@ -352,8 +360,10 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("test.txt"), "hello world").unwrap();
 
-        let data_dir = dir.path().join("data");
-        std::fs::create_dir(&data_dir).unwrap();
+        let index_dir = dir.path().join("workspace");
+        std::fs::create_dir(&index_dir).unwrap();
+        let model_dir = dir.path().join("models");
+        std::fs::create_dir(&model_dir).unwrap();
 
         let embedder = Arc::new(TestEmbedder);
         let (tx, _rx) = tokio::sync::mpsc::channel(10);
@@ -362,7 +372,8 @@ mod tests {
         let options = BuildIndexOptions {
             manager: None,
             device: None,
-            data_dir: data_dir.clone(),
+            model_dir: model_dir.clone(),
+            index_dir: index_dir.clone(),
             tx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             chunk_size: 600,
@@ -374,8 +385,10 @@ mod tests {
 
         assert!(result.is_ok());
 
-        let db_path = data_dir.join("semantic_index.db");
-        assert!(db_path.exists());
+        assert!(index_dir.join("semantic_index.db").exists());
+        // The index belongs to the workspace, the artefacts to the shared
+        // cache: neither may be written where the other lives.
+        assert!(!model_dir.join("semantic_index.db").exists());
     }
 
     #[tokio::test]
@@ -385,8 +398,10 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("test.txt"), "hello world").unwrap();
 
-        let data_dir = dir.path().join("data");
-        std::fs::create_dir(&data_dir).unwrap();
+        let index_dir = dir.path().join("workspace");
+        std::fs::create_dir(&index_dir).unwrap();
+        let model_dir = dir.path().join("models");
+        std::fs::create_dir(&model_dir).unwrap();
 
         let install_calls = Arc::new(AtomicUsize::new(0));
         let build_calls = Arc::new(AtomicUsize::new(0));
@@ -400,7 +415,8 @@ mod tests {
         let options = BuildIndexOptions {
             manager: None,
             device: None,
-            data_dir: data_dir.clone(),
+            model_dir: model_dir.clone(),
+            index_dir: index_dir.clone(),
             tx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             chunk_size: 600,
@@ -413,7 +429,8 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(install_calls.load(Ordering::Relaxed), 1);
         assert_eq!(build_calls.load(Ordering::Relaxed), 1);
-        assert!(data_dir.join("semantic_index.db").exists());
+        assert!(index_dir.join("semantic_index.db").exists());
+        assert!(!model_dir.join("semantic_index.db").exists());
     }
 
     #[tokio::test]
@@ -423,7 +440,8 @@ mod tests {
         let options = BuildIndexOptions {
             manager: None,
             device: None,
-            data_dir: dir.path().to_path_buf(),
+            model_dir: dir.path().to_path_buf(),
+            index_dir: dir.path().to_path_buf(),
             tx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             chunk_size: 100,

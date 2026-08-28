@@ -86,7 +86,20 @@ pub struct WorkerRequest {
     #[serde(rename = "engine")]
     pub role: WorkerRole,
     pub model: String, // HuggingFace model ID
-    pub data_dir: PathBuf,
+    /// Where model artefacts are cached. One directory for the whole
+    /// installation, never a workspace's own: the cache root is what the
+    /// embedding-space identity is derived from, so a per-workspace copy would
+    /// mint a second identity for the same model.
+    ///
+    /// Kept under the legacy `data_dir` key so a mixed-version host and worker
+    /// still parse each other's requests.
+    #[serde(rename = "data_dir")]
+    pub model_dir: PathBuf,
+    /// Where the index is written. Only used for "build" mode; absent (None)
+    /// in "embed", "info" and "generate" requests, which is why it is separate
+    /// from `model_dir` rather than derived from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_dir: Option<PathBuf>,
     /// Only used for "build" mode; absent (None) in "embed" and "info" requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_size: Option<usize>,
@@ -173,7 +186,8 @@ mod tests {
             root: PathBuf::from("root"),
             role: WorkerRole::Embed(EmbeddingEngine::Fastembed),
             model: "model".to_string(),
-            data_dir: PathBuf::from("data"),
+            index_dir: None,
+            model_dir: PathBuf::from("data"),
             chunk_size: Some(100),
             chunk_overlap: Some(10),
             device: "cpu".to_string(),

@@ -233,8 +233,15 @@ pub fn configured() -> Option<Arc<dyn ImageAnalyzer>> {
 /// A recognizer that is enabled but not installed is an error, not a silent
 /// disable: the user asked for enrichment, and a reading that quietly omits
 /// it would be indistinguishable from one that found no text.
+///
+/// `model_dir` is the installation's model cache; `cache_dir` is where the
+/// annotation cache lives. Two parameters because they are two directories:
+/// the annotations are keyed by recipe and outlive any one checkpoint, and
+/// filing them under the cache root would put them inside what a model
+/// uninstall removes.
 pub fn build_analyzer(
-    data_dir: &std::path::Path,
+    model_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
     settings: &crate::types::ImageAnalysisSettings,
     ollama_url: &str,
 ) -> anyhow::Result<Option<Arc<dyn ImageAnalyzer>>> {
@@ -242,7 +249,7 @@ pub fn build_analyzer(
         return Ok(None);
     }
     let recognizer = paddleocr_vl::PaddleOcrVl::load(
-        data_dir,
+        model_dir,
         paddleocr_vl::SHIPPED_CHECKPOINT,
         settings.device.as_deref().unwrap_or("auto"),
     )
@@ -254,7 +261,7 @@ pub fn build_analyzer(
     };
 
     let analyzer = NativeImageAnalyzer::new(Box::new(recognizer), describer)
-        .with_cache(cache::AnnotationCache::open(data_dir)?);
+        .with_cache(cache::AnnotationCache::open(cache_dir)?);
     Ok(Some(Arc::new(analyzer)))
 }
 
@@ -647,6 +654,7 @@ mod tests {
     fn settings_that_ask_for_nothing_build_nothing() {
         let built = build_analyzer(
             std::path::Path::new("/nonexistent"),
+            std::path::Path::new("/nonexistent"),
             &crate::types::ImageAnalysisSettings::default(),
             "http://localhost:11434",
         )
@@ -662,6 +670,7 @@ mod tests {
     fn enabled_without_the_recognizer_is_an_error_and_not_a_silent_disable() {
         let dir = tempfile::tempdir().expect("a temporary data directory");
         let Err(error) = build_analyzer(
+            dir.path(),
             dir.path(),
             &crate::types::ImageAnalysisSettings {
                 enabled: true,
