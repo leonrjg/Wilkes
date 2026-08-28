@@ -13,6 +13,8 @@
 //! failure is a visible partial result, never a second engine's turn.
 
 pub mod cache;
+#[cfg(test)]
+mod corpus;
 pub mod describe;
 pub mod ocr;
 /// The external door for description: whatever the user has pulled into
