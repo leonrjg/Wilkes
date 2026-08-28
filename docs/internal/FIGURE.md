@@ -4,22 +4,23 @@
 
 Wilkes will enrich native raster images embedded in PDFs with:
 
-1. literal text transcribed by OAR-OCR; and
+1. literal text transcribed by the production OCR engine; and
 2. a separately generated semantic image description.
 
-The OCR engine is provisionally OAR-OCR's classic detection-and-recognition
-pipeline, initially with a PP-OCRv6 model — but it is no longer settled.
-PaddleOCR-VL's end-to-end text-spotting task is a credible challenger the
-original decision record never evaluated, and the choice is now gated as
-recorded in the OCR decision record; the roadmap toward LaTeX, figures, and
-tables decides the presumption in its favor. Whichever engine wins
-becomes the only production OCR backend. This phase will not use OAR's
-document-layout, table, formula, or VLM pipelines, and will not pair
-PaddleOCR-VL with a layout model.
+Decided 2026-08-27: this feature is phase one of a single-stack roadmap to
+three targets — figures, LaTeX formulas, and tables. One prompt-switched
+recognition model (PaddleOCR-VL) transcribes all three content types; one
+describer (Qwen3-VL through the existing candle generation engine, with
+Ollama as the explicit external door) describes them; from phase three, one
+small ONNX layout detector routes native vector regions to them. See
+"Roadmap: LaTeX, figures, and tables".
 
-The image-description backend is selected: Qwen3-VL through the existing
-candle generation engine, with Ollama as the explicit external door. See
-"Image descriptions".
+PaddleOCR-VL is therefore the presumptive OCR engine. OAR-OCR's classic
+detection-and-recognition pipeline — this document's original selection —
+remains specified only as the fallback should the gate's verification pass
+fail. Whichever engine ships becomes the only production OCR backend. This
+phase will not use OAR's document-layout, table, formula, or VLM pipelines,
+and will not pair PaddleOCR-VL with a layout model.
 
 The first implementation is intentionally limited to image blocks that MuPDF
 already exposes from a digitally generated PDF. It does not attempt to decide
@@ -30,7 +31,7 @@ it does not reconstruct complex layouts.
 
 - Preserve and enumerate MuPDF native image blocks.
 - Retain each image's page, bounding box, transform, dimensions, and pixels.
-- Run OAR-OCR on each eligible image.
+- Run the selected OCR engine on each eligible image.
 - Preserve recognized text, confidence, and geometry.
 - Generate an optional semantic description through a separate image-description
   interface.
@@ -124,8 +125,8 @@ PDF page
    |
    +-- MuPDF native image blocks
             |
-            +-- OAR-OCR classic pipeline
-            |      `-- text + confidence + image-relative polygons
+            +-- OCR engine (presumptively PaddleOCR-VL spotting)
+            |      `-- text + image-relative polygons + admission signal
             |
             `-- FigureDescriber
                    `-- semantic description of visible content/relationships
@@ -180,6 +181,11 @@ classification and repeated-artifact suppression are deferred rather than
 hidden inside undocumented heuristics.
 
 ## OAR-OCR integration
+
+Presumption update 2026-08-27: this section survives as the conditional
+fallback specification — see the gate in the OCR decision record. The
+admission and normalization rules below bind whichever engine is selected;
+only the pipeline and packaging details are OAR-specific.
 
 ### Selected pipeline
 
@@ -431,7 +437,7 @@ source PDF SHA-256
 + page
 + normalized image bbox and transform
 + decoded image pixel SHA-256
-+ OAR crate/pipeline version
++ OCR engine crate/pipeline version
 + detector SHA-256
 + recognizer SHA-256
 + dictionary SHA-256
