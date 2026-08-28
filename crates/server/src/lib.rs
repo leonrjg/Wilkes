@@ -1516,6 +1516,21 @@ async fn load_generation_model_handler(
         .map_err(|e| server_err(format!("{e:#}")))
 }
 
+async fn is_image_recognizer_installed_handler(State(state): State<Arc<AppState>>) -> Json<bool> {
+    Json(state.context().is_image_recognizer_installed())
+}
+
+async fn install_image_recognizer_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<bool>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .install_image_recognizer()
+        .await
+        .map(|()| Json(true))
+        .map_err(|e| server_err(format!("{e:#}")))
+}
+
 #[derive(Deserialize)]
 struct ExplainRelatedBody {
     request_id: String,
@@ -2396,6 +2411,14 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             get(generation_model_size_handler),
         )
         .route("/api/generation/load", post(load_generation_model_handler))
+        .route(
+            "/api/image-analysis/installed",
+            get(is_image_recognizer_installed_handler),
+        )
+        .route(
+            "/api/image-analysis/install",
+            post(install_image_recognizer_handler),
+        )
         .route(
             "/api/generation/explain-related",
             post(explain_related_document_handler),

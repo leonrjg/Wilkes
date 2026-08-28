@@ -757,7 +757,7 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
         let regions = match engine.spot(&case.image) {
             Ok(regions) => regions,
             Err(error) => {
-                warn!("{}: recognition failed: {error:#}", case.name);
+                warn!("{}/{}: recognition failed: {error:#}", engine.checkpoint.name, case.name);
                 missed_regions += case.expected.len();
                 errors += case_chars;
                 per_case.push(CaseResult {
@@ -819,7 +819,7 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
             .filter(|expected| !regions.iter().any(|region| region.text == expected.text))
             .count();
         missed_regions += missed;
-        per_case.push(CaseResult {
+        let outcome = CaseResult {
             name: case.name.clone(),
             character_error_rate: if case_chars == 0 {
                 f64::from(u32::from(!regions.is_empty()))
@@ -831,7 +831,21 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
             missed,
             seconds: case_started.elapsed().as_secs_f64(),
             failure: None,
-        });
+        };
+        // A CPU run over a corpus is minutes per figure. Reported as it goes,
+        // because an evaluation whose only output arrives at the end is one
+        // you cannot tell from a hang.
+        info!(
+            "{}/{}: CER {:.3}, {} of {} expected, {:.1}s — {:?}",
+            engine.checkpoint.name,
+            outcome.name,
+            outcome.character_error_rate,
+            outcome.expected - outcome.missed,
+            outcome.expected,
+            outcome.seconds,
+            regions.iter().map(|region| &region.text).collect::<Vec<_>>(),
+        );
+        per_case.push(outcome);
     }
 
     EvaluationResult {
@@ -917,15 +931,45 @@ mod tests {
     #[test]
     #[ignore = "needs the installed checkpoints"]
     fn the_checkpoints_are_measured() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .without_time()
+            .try_init();
         let dir = evaluation_model_dir().expect("set WILKES_MODEL_DIR");
-        let mut corpus = super::super::corpus::accuracy_corpus();
-        if let Some(sample) = sample_diagram_case() {
-            corpus.push(sample);
-        }
-        println!("corpus of {} figures\n", corpus.len());
+
+        // Both filters exist because a full run is hours: a corpus of eight
+        // figures against two checkpoints, at CPU inference speed. Being able
+        // to re-run one case against one checkpoint is what makes the harness
+        // usable while the recipe is still being settled.
+        let wanted = |name: &str, variable: &str| {
+            std::env::var(variable).map_or(true, |filter| {
+                filter.split(',').any(|want| name.contains(want.trim()))
+            })
+        };
+        let mut corpus: Vec<EvaluationCase> = super::super::corpus::accuracy_corpus()
+            .into_iter()
+            .chain(sample_diagram_case())
+            .filter(|case| wanted(&case.name, "WILKES_EVAL_CASES"))
+            .collect();
+        corpus.sort_by(|a, b| {
+            (a.image.width() * a.image.height()).cmp(&(b.image.width() * b.image.height()))
+        });
+        assert!(!corpus.is_empty(), "WILKES_EVAL_CASES matched no figure");
+        println!(
+            "corpus of {} figures: {}\n",
+            corpus.len(),
+            corpus
+                .iter()
+                .map(|case| format!("{} ({}x{})", case.name, case.image.width(), case.image.height()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
         let mut report = Vec::new();
-        for checkpoint in CHECKPOINTS {
+        for checkpoint in CHECKPOINTS
+            .iter()
+            .filter(|checkpoint| wanted(checkpoint.name, "WILKES_EVAL_CHECKPOINTS"))
+        {
             let engine = PaddleOcrVl::load(&dir, *checkpoint, "cpu")
                 .unwrap_or_else(|error| panic!("{}: {error:#}", checkpoint.name));
             let result = evaluate(&engine, &corpus);

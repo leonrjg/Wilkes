@@ -382,6 +382,14 @@ export class TauriSearchApi implements SearchApi {
     return invoke<boolean>("load_generation_model");
   }
 
+  async isImageRecognizerInstalled(): Promise<boolean> {
+    return invoke<boolean>("is_image_recognizer_installed");
+  }
+
+  async installImageRecognizer(): Promise<void> {
+    return invoke("install_image_recognizer");
+  }
+
   async explainRelatedDocument(
     requestId: string,
     anchorPath: string,
@@ -469,6 +477,20 @@ export class TauriSearchApi implements SearchApi {
 
   async onGenerationError(handler: (err: GenerationError) => void): Promise<() => void> {
     return listen<GenerationError>("generation-error", (e) => handler(e.payload));
+  }
+
+  async onImageAnalysisProgress(
+    handler: (progress: EmbedProgress) => void,
+  ): Promise<() => void> {
+    return listen<EmbedProgress>("image-analysis-progress", (e) => handler(e.payload));
+  }
+
+  async onImageAnalysisDone(handler: () => void): Promise<() => void> {
+    return listen("image-analysis-done", () => handler());
+  }
+
+  async onImageAnalysisError(handler: (err: GenerationError) => void): Promise<() => void> {
+    return listen<GenerationError>("image-analysis-error", (e) => handler(e.payload));
   }
 
   async onEmbedProgress(

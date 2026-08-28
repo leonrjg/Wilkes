@@ -619,6 +619,19 @@ export interface GenerationSettings {
   sampling_overrides: Partial<Record<GenerationTask, GenerationSampling>>;
 }
 
+/** Enrichment of the pictures inside a document: text transcribed out of
+ *  them, and optionally a description of what they show. Off by default —
+ *  turning it on installs a recognizer and re-reads every document that has a
+ *  picture in it. */
+export interface ImageAnalysisSettings {
+  enabled: boolean;
+  /** "auto" | "cpu" | "metal". Null takes the recognizer's default. */
+  device: string | null;
+  /** The Ollama tag figures are described with; empty means transcription
+   *  only. The server is `generation.ollama_url`. */
+  describer_model: string;
+}
+
 /** HyDE: search with the embedding of an LLM-generated hypothetical answer,
  *  which sits in document space rather than terse-question space. Requires
  *  generation to be enabled and ready. */
@@ -782,6 +795,8 @@ export interface Settings {
   external_mcp?: ExternalMcpSettings;
   /** Optional HTTP API, served over the workspace this app already has open. */
   http_api?: HttpApiSettings;
+  /** Transcription and description of the pictures inside documents. */
+  image_analysis?: ImageAnalysisSettings;
 }
 
 export interface ExternalMcpSettings {

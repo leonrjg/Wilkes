@@ -2483,6 +2483,24 @@ async fn load_generation_model(app: AppHandle) -> Result<bool, String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Whether the image recognizer the shipped recipe names is on disk.
+#[tauri::command]
+fn is_image_recognizer_installed(app: AppHandle) -> bool {
+    app_context(&app).is_image_recognizer_installed()
+}
+
+/// Download (if needed) and verify the image recognizer, then attach the
+/// analyzer the settings describe. Progress arrives on the
+/// image-analysis-progress stream, terminated by image-analysis-done or
+/// image-analysis-error.
+#[tauri::command]
+async fn install_image_recognizer(app: AppHandle) -> Result<(), String> {
+    app_context(&app)
+        .install_image_recognizer()
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 #[tauri::command]
 async fn explain_related_document(
     app: AppHandle,
@@ -2741,6 +2759,8 @@ pub fn run() {
             list_generation_models,
             get_generation_model_size,
             load_generation_model,
+            is_image_recognizer_installed,
+            install_image_recognizer,
             explain_related_document,
             summarize_document,
             summarize_search_results,

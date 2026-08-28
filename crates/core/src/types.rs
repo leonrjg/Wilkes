@@ -1192,6 +1192,29 @@ pub struct GenerationSettings {
     pub sampling_overrides: HashMap<GenerationTask, crate::generate::Sampling>,
 }
 
+/// Enrichment of the pictures inside a document.
+///
+/// Off by default, and deliberately not a quiet default-on: turning it on
+/// installs a recognizer, and it changes the extraction recipe, which re-reads
+/// and re-embeds every document that has a picture in it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageAnalysisSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// "auto", "cpu", "metal". Absent takes the recognizer's default.
+    #[serde(default)]
+    pub device: Option<String>,
+    /// The Ollama tag figures are described with, or empty for transcription
+    /// only. The server is [`GenerationSettings::ollama_url`]: there is one
+    /// Ollama endpoint per app, and a second field for the same server would
+    /// be a second answer to where it is.
+    ///
+    /// A description is a separate fact from a transcription, produced by a
+    /// separate model, and it is optional in a way the transcription is not.
+    #[serde(default)]
+    pub describer_model: String,
+}
+
 /// Tasks whose sampling the user may override.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1751,6 +1774,10 @@ pub struct Settings {
     /// feedback). Off by default.
     #[serde(default)]
     pub retrieval: RetrievalSettings,
+    /// Transcription and description of the pictures inside documents. Off by
+    /// default.
+    #[serde(default)]
+    pub image_analysis: ImageAnalysisSettings,
 }
 
 fn default_file_display_fields() -> Vec<FileDisplayField> {
@@ -1799,6 +1826,7 @@ impl Default for Settings {
             http_api: HttpApiSettings::default(),
             generation: GenerationSettings::default(),
             retrieval: RetrievalSettings::default(),
+            image_analysis: ImageAnalysisSettings::default(),
         }
     }
 }

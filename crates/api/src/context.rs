@@ -1016,6 +1016,9 @@ pub struct AppContext {
     /// Serialises `load_generator`, so two settings changes cannot download and
     /// attach concurrently.
     generator_load_lock: tokio::sync::Mutex<()>,
+    /// Serializes analyzer loads against each other: each one reads 1.9 GB
+    /// of weights into memory, and two at once would hold both.
+    image_analyzer_load_lock: tokio::sync::Mutex<()>,
     /// Claimed by each load before it queues behind the lock. Only the newest
     /// claim may assign the generator; an older one that finishes later would
     /// otherwise attach a model the user has already switched away from.
@@ -1105,6 +1108,7 @@ impl AppContext {
             generate_manager,
             generator: PLMutex::new(None),
             generator_load_lock: tokio::sync::Mutex::new(()),
+            image_analyzer_load_lock: tokio::sync::Mutex::new(()),
             generator_epoch: AtomicU64::new(0),
             cluster_label_task: PLMutex::new(None),
             topic_operations: PLMutex::new(HashMap::new()),
@@ -4510,6 +4514,111 @@ impl AppContext {
     /// change. Both the on and off transitions matter: leaving a generator
     /// attached after the feature is switched off would keep a multi-gigabyte
     /// process alive behind a toggle the user turned off.
+    /// Reconcile the process-wide image analyzer after a settings edit.
+    ///
+    /// The Ollama endpoint is in here because the describer speaks to it:
+    /// moving the server moves the describer, even though nothing under
+    /// `image_analysis` changed.
+    fn on_image_analysis_settings_maybe_changed(
+        self: &Arc<Self>,
+        before: &Settings,
+        after: &Settings,
+    ) {
+        if before.image_analysis == after.image_analysis
+            && before.generation.ollama_url == after.generation.ollama_url
+        {
+            return;
+        }
+        if !after.image_analysis.enabled {
+            // Synchronously, with the settings transition: extraction reads the
+            // analyzer on every call, and a disabled feature must not keep
+            // enriching while a detach is queued.
+            info!("image analysis disabled; detaching the analyzer");
+            wilkes_core::extract::image::configure(None);
+            return;
+        }
+        let ctx = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = ctx.load_image_analyzer().await {
+                error!("could not attach the image analyzer: {error:#}");
+            }
+        });
+    }
+
+    /// Build the analyzer the settings describe and install it for the whole
+    /// process.
+    ///
+    /// Loading is 1.9 GB read into memory, so it is serialized against itself
+    /// and run off the async executor. A failure detaches rather than leaving
+    /// the previous analyzer in place: the settings no longer describe it, and
+    /// silently enriching under the old recipe is the one outcome that would
+    /// put two answers into one index.
+    pub async fn load_image_analyzer(self: &Arc<Self>) -> anyhow::Result<bool> {
+        let _serialized = self.image_analyzer_load_lock.lock().await;
+        let settings = self.get_settings().await;
+        let data_dir = self.shared_data_dir.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            wilkes_core::extract::image::build_analyzer(
+                &data_dir,
+                &settings.image_analysis,
+                &settings.generation.ollama_url,
+            )
+        })
+        .await?;
+        match built {
+            Ok(analyzer) => {
+                let attached = analyzer.is_some();
+                wilkes_core::extract::image::configure(analyzer);
+                Ok(attached)
+            }
+            Err(error) => {
+                wilkes_core::extract::image::configure(None);
+                self.events.emit(
+                    "image-analysis-error",
+                    serde_json::json!({ "error": format!("{error:#}") }),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Whether the recognizer the shipped recipe names is on disk and intact.
+    pub fn is_image_recognizer_installed(&self) -> bool {
+        wilkes_core::extract::image::recognizer_installed(&self.shared_data_dir)
+    }
+
+    /// Download and verify the recognizer, then attach the analyzer if the
+    /// settings ask for one.
+    ///
+    /// Progress travels on its own event stream for the reason the generation
+    /// one does: borrowing `embed-*` would put the UI into "indexing" with no
+    /// terminal event to leave it.
+    pub async fn install_image_recognizer(self: &Arc<Self>) -> anyhow::Result<()> {
+        let (progress_tx, mut progress_rx) = mpsc::channel::<EmbedProgress>(64);
+        let events = Arc::clone(&self.events);
+        let forward = tokio::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                events.emit("image-analysis-progress", serde_json::json!(progress));
+            }
+        });
+        let data_dir = self.shared_data_dir.clone();
+        let installed = tokio::task::spawn_blocking(move || {
+            wilkes_core::extract::image::install_recognizer(&data_dir, Some(progress_tx))
+        })
+        .await?;
+        let _ = forward.await;
+        if let Err(error) = installed {
+            self.events.emit(
+                "image-analysis-error",
+                serde_json::json!({ "error": format!("{error:#}") }),
+            );
+            return Err(error);
+        }
+        self.load_image_analyzer().await?;
+        self.events.emit("image-analysis-done", serde_json::json!({}));
+        Ok(())
+    }
+
     fn on_generation_settings_maybe_changed(self: &Arc<Self>, before: &Settings, after: &Settings) {
         let before = &before.generation;
         let after = &after.generation;
@@ -4573,6 +4682,7 @@ impl AppContext {
         self.on_openalex_settings_maybe_changed(&before, &updated);
         self.on_search_runtime_settings_maybe_changed(&before, &updated);
         self.on_generation_settings_maybe_changed(&before, &updated);
+        self.on_image_analysis_settings_maybe_changed(&before, &updated);
         Ok(updated)
     }
 
@@ -6848,6 +6958,16 @@ impl AppContext {
             tokio::spawn(async move {
                 if let Err(e) = ctx.load_generator().await {
                     error!("restore_state: could not attach the generation model: {e:#}");
+                }
+            });
+        }
+        // Likewise independent: image analysis has its own enable flag, and
+        // every extraction path — not only indexing — reads the analyzer.
+        if settings.image_analysis.enabled {
+            let ctx = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Err(e) = ctx.load_image_analyzer().await {
+                    error!("restore_state: could not attach the image analyzer: {e:#}");
                 }
             });
         }
@@ -9628,6 +9748,45 @@ mod tests {
             .await
             .unwrap();
         assert!(ctx.directory_watcher.lock().is_none());
+    }
+
+    /// The feature's reachability, end to end at this layer: a settings edit
+    /// is what turns image enrichment on and off, and what extraction reads is
+    /// the process-wide analyzer the edit moves.
+    ///
+    /// Enabling it here fails, because the test context has no recognizer
+    /// installed — and that failure is the point twice over: it proves the
+    /// edit is acted on rather than ignored, and it proves an enabled feature
+    /// that cannot run says so instead of quietly extracting without it.
+    #[tokio::test]
+    async fn an_image_analysis_settings_edit_attaches_and_detaches_the_analyzer() {
+        let (_dir, ctx) = test_ctx();
+        assert!(
+            wilkes_core::extract::image::configured().is_none(),
+            "nothing is configured before anything asks for it"
+        );
+
+        ctx.update_settings(serde_json::json!({
+            "image_analysis": { "enabled": true }
+        }))
+        .await
+        .unwrap();
+        assert!(
+            ctx.load_image_analyzer().await.is_err(),
+            "an enabled analyzer with no recognizer installed is a failure"
+        );
+        assert!(
+            wilkes_core::extract::image::configured().is_none(),
+            "a failed load detaches rather than leaving a stale analyzer"
+        );
+
+        ctx.update_settings(serde_json::json!({
+            "image_analysis": { "enabled": false }
+        }))
+        .await
+        .unwrap();
+        assert!(wilkes_core::extract::image::configured().is_none());
+        assert!(!ctx.is_image_recognizer_installed());
     }
 
     #[tokio::test]

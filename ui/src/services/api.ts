@@ -174,6 +174,15 @@ export interface SearchApi {
   /** Download if needed, then attach. Progress arrives on
    *  `onGenerationProgress`, terminated by `onGenerationDone`/`onGenerationError`. */
   loadGenerationModel(): Promise<boolean>;
+  /** Whether the image recognizer the shipped recipe names is on disk. The
+   *  gate for image enrichment, for the same reason `isGenerationReady` is
+   *  the gate for generation: enabled but not installed is a state that
+   *  reads as broken. */
+  isImageRecognizerInstalled(): Promise<boolean>;
+  /** Download if needed, verify, then attach the analyzer the settings
+   *  describe. Progress arrives on `onImageAnalysisProgress`, terminated by
+   *  `onImageAnalysisDone`/`onImageAnalysisError`. */
+  installImageRecognizer(): Promise<void>;
   /** Starts a related-document explanation. Its complete lifecycle arrives on
    *  `onGenerationStream`, correlated by `requestId`. */
   explainRelatedDocument(
@@ -206,6 +215,9 @@ export interface SearchApi {
   ): Promise<() => void>;
 
   onGenerationProgress(handler: (progress: EmbedProgress) => void): Promise<() => void>;
+  onImageAnalysisProgress(handler: (progress: EmbedProgress) => void): Promise<() => void>;
+  onImageAnalysisDone(handler: () => void): Promise<() => void>;
+  onImageAnalysisError(handler: (err: GenerationError) => void): Promise<() => void>;
   onGenerationDone(handler: (done: GenerationDone) => void): Promise<() => void>;
   onGenerationError(handler: (err: GenerationError) => void): Promise<() => void>;
 

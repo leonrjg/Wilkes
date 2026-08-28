@@ -627,6 +627,27 @@ export class HttpSearchApi implements SearchApi {
     return () => this.releaseEventSource("generation-error", listener);
   }
 
+  async onImageAnalysisProgress(handler: (p: EmbedProgress) => void): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("image-analysis-progress", listener);
+    return () => this.releaseEventSource("image-analysis-progress", listener);
+  }
+
+  async onImageAnalysisDone(handler: () => void): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = () => handler();
+    es.addEventListener("image-analysis-done", listener);
+    return () => this.releaseEventSource("image-analysis-done", listener);
+  }
+
+  async onImageAnalysisError(handler: (e: GenerationError) => void): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("image-analysis-error", listener);
+    return () => this.releaseEventSource("image-analysis-error", listener);
+  }
+
   async onEmbedProgress(handler: (p: EmbedProgress) => void): Promise<() => void> {
     const es = this.acquireEventSource();
     const listener = (e: any) => handler(JSON.parse(e.data));
@@ -699,6 +720,17 @@ export class HttpSearchApi implements SearchApi {
     const res = await fetch("/api/generation/load", { method: "POST" });
     if (!res.ok) throw await responseError(res, "loadGenerationModel");
     return res.json() as Promise<boolean>;
+  }
+
+  async isImageRecognizerInstalled(): Promise<boolean> {
+    const res = await fetch("/api/image-analysis/installed");
+    if (!res.ok) throw await responseError(res, "isImageRecognizerInstalled");
+    return res.json() as Promise<boolean>;
+  }
+
+  async installImageRecognizer(): Promise<void> {
+    const res = await fetch("/api/image-analysis/install", { method: "POST" });
+    if (!res.ok) throw await responseError(res, "installImageRecognizer");
   }
 
   async explainRelatedDocument(

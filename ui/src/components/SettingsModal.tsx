@@ -3,6 +3,7 @@ import type { SearchApi } from "../services/api";
 import type { ExternalMcpStatus, HttpApiStatus, Settings } from "../lib/types";
 import SemanticPanel from "./SemanticPanel";
 import GenerationPanel from "./GenerationPanel";
+import ImageAnalysisPanel from "./ImageAnalysisPanel";
 import { useGenerationStore } from "../stores/useGenerationStore";
 import ChunkingPanel from "./ChunkingPanel";
 import DataPanel from "./DataPanel";
@@ -168,6 +169,7 @@ export default function SettingsModal({
     | "semantic-chunking"
     | "generation-chat"
     | "generation-models"
+    | "extraction-images"
     | "data"
     | "workers"
     | "logs"
@@ -432,6 +434,16 @@ export default function SettingsModal({
                 id="generation-models"
                 label="Models"
                 accessibleLabel="Generation Models"
+                indent
+              />
+            </div>
+
+            <div className="flex flex-col gap-0.5">
+              <span className="px-3 py-1 text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Extraction</span>
+              <TabButton
+                id="extraction-images"
+                label="Images"
+                accessibleLabel="Image Analysis"
                 indent
               />
             </div>
@@ -1087,6 +1099,16 @@ export default function SettingsModal({
             <div className={activeTab === "generation-models" ? "block h-full" : "hidden"}>
               {settings && (
                 <GenerationPanel
+                  api={api}
+                  settings={settings}
+                  onUpdateSettings={handleUpdateSettings}
+                />
+              )}
+            </div>
+
+            <div className={activeTab === "extraction-images" ? "block h-full" : "hidden"}>
+              {settings && (
+                <ImageAnalysisPanel
                   api={api}
                   settings={settings}
                   onUpdateSettings={handleUpdateSettings}

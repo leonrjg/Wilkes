@@ -18,7 +18,7 @@ mod corpus;
 pub mod describe;
 pub mod ocr;
 /// The external door for description: whatever the user has pulled into
-/// Ollama, asked with the same prompt and schema as the first-class path.
+/// Ollama, asked with the same prompt as the first-class path.
 pub mod ollama;
 /// The production recognizer. Behind the `candle` feature because that is the
 /// runtime it uses — the one already pinned, with no second inference
@@ -28,10 +28,11 @@ pub mod paddleocr_vl;
 pub mod serialize;
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 
 use sha2::{Digest, Sha256};
-use tracing::{debug, warn};
+use anyhow::Context as _;
+use tracing::{debug, info, warn};
 
 use crate::types::{
     BoundingBox, ExtractedImage, ExtractionDiagnostics, ImageAnalysisStatus, ImageTransform,
@@ -183,35 +184,93 @@ impl AnalysisContext {
 
 /// The one image analyzer this process reads documents with.
 ///
-/// A single owner, set once at startup, because the invariant is exactly
-/// that: every consumer of a rendition — indexing, watcher updates,
-/// exact-search fallback, MCP reads, summaries, export — must see the same
-/// enrichment. Passing an analyzer per call site is what lets one consumer
-/// enrich a document and another not, and then write both answers into one
-/// index under recipes that disagree.
+/// A single owner, because the invariant is exactly that: every consumer of a
+/// rendition — indexing, watcher updates, exact-search fallback, MCP reads,
+/// summaries, export — must see the same enrichment. Passing an analyzer per
+/// call site is what lets one consumer enrich a document and another not, and
+/// then write both answers into one index under recipes that disagree.
+///
+/// One at a time, not one forever: the setting that decides it is editable
+/// while the app runs, and a lock that could only be written once would make
+/// turning the feature on a restart. Replacing it is safe because a reading
+/// records the recipe that produced it — extraction identity is what keeps
+/// the two answers apart, and it is already the mechanism that re-reads
+/// documents when the recipe moves.
 ///
 /// Unset means no enrichment, which is a configuration and not a failure:
 /// images are still found, digested and counted, and the diagnostics say the
 /// analysis did not run.
-static CONFIGURED_ANALYZER: OnceLock<Option<Arc<dyn ImageAnalyzer>>> = OnceLock::new();
+static CONFIGURED_ANALYZER: RwLock<Option<Arc<dyn ImageAnalyzer>>> = RwLock::new(None);
 
-/// Install this process's analyzer. Callable once; a second call is a
-/// configuration bug and says so rather than quietly winning or losing.
-pub fn configure(analyzer: Option<Arc<dyn ImageAnalyzer>>) -> anyhow::Result<()> {
+/// Install this process's analyzer, replacing whatever it was.
+pub fn configure(analyzer: Option<Arc<dyn ImageAnalyzer>>) {
     let named = analyzer.as_ref().map(|analyzer| analyzer.identity());
-    CONFIGURED_ANALYZER
-        .set(analyzer)
-        .map_err(|_| anyhow::anyhow!("the image analyzer was already configured"))?;
+    *CONFIGURED_ANALYZER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = analyzer;
     match named {
-        Some(identity) => debug!("image analyzer configured: {identity}"),
-        None => debug!("no image analyzer configured"),
+        Some(identity) => info!("image analyzer configured: {identity}"),
+        None => info!("no image analyzer configured"),
     }
-    Ok(())
 }
 
 /// This process's analyzer, or none.
 pub fn configured() -> Option<Arc<dyn ImageAnalyzer>> {
-    CONFIGURED_ANALYZER.get().cloned().flatten()
+    CONFIGURED_ANALYZER
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+#[cfg(feature = "candle")]
+/// Build the analyzer the settings describe, or `None` when they describe
+/// none.
+///
+/// Loading the recognizer is the expensive part — 1.9 GB read into memory —
+/// so this is not something to call on a settings read. It is called when the
+/// configuration changes, and its result is what [`configure`] installs.
+///
+/// A recognizer that is enabled but not installed is an error, not a silent
+/// disable: the user asked for enrichment, and a reading that quietly omits
+/// it would be indistinguishable from one that found no text.
+pub fn build_analyzer(
+    data_dir: &std::path::Path,
+    settings: &crate::types::ImageAnalysisSettings,
+    ollama_url: &str,
+) -> anyhow::Result<Option<Arc<dyn ImageAnalyzer>>> {
+    if !settings.enabled {
+        return Ok(None);
+    }
+    let recognizer = paddleocr_vl::PaddleOcrVl::load(
+        data_dir,
+        paddleocr_vl::SHIPPED_CHECKPOINT,
+        settings.device.as_deref().unwrap_or("auto"),
+    )
+    .context("could not load the image recognizer")?;
+
+    let describer: Option<Box<dyn FigureDescriber>> = match settings.describer_model.trim() {
+        "" => None,
+        model => Some(Box::new(ollama::OllamaDescriber::new(ollama_url, model)?)),
+    };
+
+    let analyzer = NativeImageAnalyzer::new(Box::new(recognizer), describer)
+        .with_cache(cache::AnnotationCache::open(data_dir)?);
+    Ok(Some(Arc::new(analyzer)))
+}
+
+#[cfg(feature = "candle")]
+/// Whether the recognizer the shipped recipe names is installed and intact.
+pub fn recognizer_installed(data_dir: &std::path::Path) -> bool {
+    paddleocr_vl::is_installed(data_dir, &paddleocr_vl::SHIPPED_CHECKPOINT)
+}
+
+#[cfg(feature = "candle")]
+/// Download and verify the recognizer the shipped recipe names.
+pub fn install_recognizer(
+    data_dir: &std::path::Path,
+    progress: Option<crate::models::progress::ProgressTx>,
+) -> anyhow::Result<()> {
+    paddleocr_vl::install(data_dir, &paddleocr_vl::SHIPPED_CHECKPOINT, progress)
 }
 
 /// One configured way to enrich native images.
@@ -538,6 +597,75 @@ pub fn decode(
 
 #[cfg(test)]
 mod tests {
+
+    /// The analyzer is process-wide state that a settings edit moves, so what
+    /// matters is that it moves: a feature the user turns off must stop
+    /// enriching, not stop enriching after a restart.
+    #[test]
+    fn the_configured_analyzer_can_be_replaced_and_detached() {
+        struct Nothing(&'static str);
+        impl ImageAnalyzer for Nothing {
+            fn identity(&self) -> String {
+                self.0.to_string()
+            }
+            fn analyze(
+                &self,
+                _images: &mut [ExtractedImage],
+                _discovered: &[DiscoveredImage],
+                _context: &AnalysisContext,
+                _diagnostics: &mut ExtractionDiagnostics,
+            ) {
+            }
+        }
+
+        let restore = configured();
+        configure(Some(Arc::new(Nothing("first"))));
+        assert_eq!(configured().map(|a| a.identity()).as_deref(), Some("first"));
+        configure(Some(Arc::new(Nothing("second"))));
+        assert_eq!(configured().map(|a| a.identity()).as_deref(), Some("second"));
+        configure(None);
+        assert!(configured().is_none());
+        configure(restore);
+    }
+
+    /// Disabled is answered without touching the disk: the settings say no
+    /// enrichment, and loading a recognizer to discover that would make
+    /// turning the feature off cost what turning it on costs.
+    #[test]
+    #[cfg(feature = "candle")]
+    fn settings_that_ask_for_nothing_build_nothing() {
+        let built = build_analyzer(
+            std::path::Path::new("/nonexistent"),
+            &crate::types::ImageAnalysisSettings::default(),
+            "http://localhost:11434",
+        )
+        .expect("disabled is not a failure");
+        assert!(built.is_none());
+    }
+
+    /// Enabled without the weights is an error, never a quiet disable: a
+    /// reading that silently omitted the enrichment would be
+    /// indistinguishable from one that found no text in the picture.
+    #[test]
+    #[cfg(feature = "candle")]
+    fn enabled_without_the_recognizer_is_an_error_and_not_a_silent_disable() {
+        let dir = tempfile::tempdir().expect("a temporary data directory");
+        let Err(error) = build_analyzer(
+            dir.path(),
+            &crate::types::ImageAnalysisSettings {
+                enabled: true,
+                ..Default::default()
+            },
+            "http://localhost:11434",
+        ) else {
+            panic!("an uninstalled recognizer is a failure");
+        };
+        assert!(
+            format!("{error:#}").contains("recognizer"),
+            "the failure should name what is missing: {error:#}"
+        );
+        assert!(!recognizer_installed(dir.path()));
+    }
 
     /// FIGURE.md's acceptance criterion on identity, in one place: *model,
     /// prompt, threshold, mapping, or serialization changes alter extraction

@@ -254,6 +254,43 @@ Wilkes retains ownership of model installation and extraction identity:
 PaddleOCR-VL is Apache-2.0 licensed. The redistributed checkpoint must still
 receive a model-specific license/provenance inventory before it is packaged.
 
+### How it is turned on (added 2026-08-28)
+
+Enrichment is off by default and is one process-wide analyzer, built from
+`settings.image_analysis` and installed for every consumer at once. That is
+the same invariant the registry consolidation exists for, one level up: a
+per-call-site analyzer is what would let indexing enrich a document and an
+MCP read not, and then write both answers into one index under recipes that
+disagree.
+
+- `enabled` installs the recognizer and turns transcription on.
+- `device` is the recognizer's, defaulting to the engine's own choice.
+- `describer_model` names an Ollama tag, or is empty for transcription only.
+  The server is `generation.ollama_url`: there is one Ollama endpoint per
+  app, and a second field for the same server would be a second answer to
+  where it is.
+
+Three consequences are deliberate and are what the settings surface says out
+loud:
+
+- Enabled but not installed is an **error**, not a quiet disable. A reading
+  that silently omitted the enrichment would be indistinguishable from one
+  that found no text in the picture.
+- A failed load **detaches** rather than leaving the previous analyzer
+  attached. The settings no longer describe it, and continuing to enrich
+  under the old recipe is the one outcome that puts two answers into one
+  index.
+- The analyzer is replaceable while the app runs, where this document first
+  said "set once at startup". The invariant that matters is one analyzer at a
+  time, not one forever, and a write-once cell would have made turning the
+  feature on a restart. Replacement is safe because a reading records the
+  recipe that produced it — extraction identity is what keeps the two answers
+  apart, and it is already the mechanism that re-reads documents when the
+  recipe moves.
+
+Recognition costs roughly a minute a picture on a CPU, which is a fact the
+user is told before enabling rather than after.
+
 ## Image descriptions
 
 The description backend is selected: Qwen3-VL Instruct through the existing
