@@ -73,6 +73,14 @@ impl OcrEngine for Arc<ImageCapture> {
 ///
 /// This is the corpus for [`super::paddleocr_vl::evaluate`]. It is not run by
 /// the suite: it needs 1.9 GB of weights.
+///
+/// The rendering scales are chosen against what dominates the recognizer's
+/// cost, which is the spotting task's pixel envelope and not the figure. Any
+/// figure large enough to fill it costs the same, and on a CPU that is tens of
+/// minutes each — so the built cases are rendered small enough that a sweep
+/// over eight conditions and two checkpoints finishes, and what a real
+/// full-size figure costs is measured on the real one instead. These cases
+/// exist to vary the *condition*; the sample supplies the cost.
 #[allow(dead_code)] // Reached only from the ignored evaluation test.
 pub(super) fn accuracy_corpus() -> Vec<super::paddleocr_vl::EvaluationCase> {
     use super::paddleocr_vl::{EvaluationCase, ExpectedRegion};
@@ -111,14 +119,14 @@ pub(super) fn accuracy_corpus() -> Vec<super::paddleocr_vl::EvaluationCase> {
 
     vec![
         // The baseline: what the recognizer does when nothing is against it.
-        case("clean-diagram", diagram_page(), 3.0, DIAGRAM),
+        case("clean-diagram", diagram_page(), CASE_SCALE, DIAGRAM),
         // A figure exported at screen resolution, which is most of them.
-        case("low-resolution", diagram_page(), 0.9, DIAGRAM),
+        case("low-resolution", diagram_page(), LOW_SCALE, DIAGRAM),
         // Slide-deck artwork is rarely drawn on white.
         case(
             "coloured-background",
             diagram_page().with_background((0.82, 0.89, 0.97)),
-            3.0,
+            CASE_SCALE,
             DIAGRAM,
         ),
         // Inverted contrast, which a binarizing recognizer fails outright and
@@ -132,7 +140,7 @@ pub(super) fn accuracy_corpus() -> Vec<super::paddleocr_vl::EvaluationCase> {
                         .with_text_colour((0.97, 0.97, 0.97))
                 })
                 .with_background((0.09, 0.09, 0.12)),
-            3.0,
+            CASE_SCALE,
             DIAGRAM,
         ),
         // Axis captions and side labels are turned; the quads come back
@@ -146,7 +154,7 @@ pub(super) fn accuracy_corpus() -> Vec<super::paddleocr_vl::EvaluationCase> {
                     |page, (x, y, text)| page.with_rotated_text(*x + 20.0, *y - 40.0, 90.0, text),
                 )]),
                 0,
-                3.0,
+                CASE_SCALE,
             ),
             expected: DIAGRAM
                 .iter()
@@ -164,7 +172,7 @@ pub(super) fn accuracy_corpus() -> Vec<super::paddleocr_vl::EvaluationCase> {
                 &build_pdf(vec![PageSpec::default()
                     .with_image(ImageSpec::gradient(64, 64).at(20.0, 100.0, 160.0, 120.0))]),
                 0,
-                3.0,
+                CASE_SCALE,
             ),
             expected: Vec::new(),
         },
@@ -177,11 +185,20 @@ pub(super) fn accuracy_corpus() -> Vec<super::paddleocr_vl::EvaluationCase> {
                 .fold(PageSpec::default(), |page, (x, y, text)| {
                     page.with_text(*x, *y, text)
                 }),
-            3.0,
+            CASE_SCALE,
             UNICODE_DIAGRAM,
         ),
     ]
 }
+
+/// 240x360, which the spotting task doubles to 480x720 — a real figure at a
+/// resolution a document plausibly carries, and roughly a fifth of what a
+/// full-envelope figure costs to recognize.
+const CASE_SCALE: f32 = 1.2;
+
+/// The degraded end: 120x180, where 12-point labels are around seven pixels
+/// tall.
+const LOW_SCALE: f32 = 0.6;
 
 const UNICODE_DIAGRAM: &[(f32, f32, &str)] = &[
     (12.0, 240.0, "Système expert"),

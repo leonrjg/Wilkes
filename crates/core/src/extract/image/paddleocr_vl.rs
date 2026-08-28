@@ -140,6 +140,10 @@ const MAX_PIXELS: u64 = 2048 * 28 * 28;
 /// crops are the spotting task's weak end and the model card upsamples them;
 /// doing anything else here would be a different recipe from the one the
 /// checkpoint was measured under.
+///
+/// The doubling is Lanczos and the fit to the envelope is bicubic, in that
+/// order, as two resamples — which is what the card does and is not the same
+/// pixels as one resample straight to the final size.
 const UPSCALE_THRESHOLD: u32 = 1500;
 
 /// Normalization: the checkpoint's preprocessor centres on 0.5 with a 0.5
@@ -162,8 +166,9 @@ const MAX_NEW_TOKENS: usize = 1024;
 /// rule.
 pub const ADMISSION_THRESHOLD: f32 = 0.60;
 
-/// Bumped when anything above changes for the same weights.
-const EXTRACTION_SETTINGS_VERSION: &str = "spotting-v1";
+/// Bumped when anything above changes for the same weights. `v2` corrected
+/// the resample pipeline to the card's two stages.
+const EXTRACTION_SETTINGS_VERSION: &str = "spotting-v2";
 
 // ── Preprocessing ────────────────────────────────────────────────────────────
 
@@ -174,13 +179,16 @@ const EXTRACTION_SETTINGS_VERSION: &str = "spotting-v1";
 /// Coordinates come back normalized, so this rescaling never has to be undone:
 /// a fraction of the resized image is the same fraction of the original.
 pub fn spotting_dimensions(width: u32, height: u32) -> (u32, u32) {
-    let doubled = width < UPSCALE_THRESHOLD && height < UPSCALE_THRESHOLD;
-    let (width, height) = if doubled {
-        (width.saturating_mul(2), height.saturating_mul(2))
-    } else {
-        (width, height)
+    let (width, height) = match upscales(width, height) {
+        true => (width.saturating_mul(2), height.saturating_mul(2)),
+        false => (width, height),
     };
     smart_resize(width, height)
+}
+
+/// Whether the spotting task doubles this image before gridding it.
+fn upscales(width: u32, height: u32) -> bool {
+    width < UPSCALE_THRESHOLD && height < UPSCALE_THRESHOLD
 }
 
 fn smart_resize(width: u32, height: u32) -> (u32, u32) {
@@ -223,12 +231,28 @@ fn pixel_tensor(
     dtype: DType,
 ) -> anyhow::Result<(Tensor, u32, u32)> {
     let (width, height) = spotting_dimensions(image.width(), image.height());
+    // Two resamples where the recipe has two, not one straight to the final
+    // size. A Lanczos double followed by a bicubic fit does not produce the
+    // pixels a single bicubic would, and the pixels are what the model reads;
+    // the spec's own rule is that a different filter is a different recipe.
+    let doubled;
+    let source = if upscales(image.width(), image.height()) {
+        doubled = image::imageops::resize(
+            image,
+            image.width().saturating_mul(2),
+            image.height().saturating_mul(2),
+            image::imageops::FilterType::Lanczos3,
+        );
+        &doubled
+    } else {
+        image
+    };
     let resized = image::imageops::resize(
-        image,
+        source,
         width,
         height,
-        // The checkpoint's preprocessor resamples bicubically. A different
-        // filter is a different recipe: it changes the pixels the model reads.
+        // Bicubic, as the checkpoint's image processor asks for (`resample: 3`).
+        // Catmull-Rom is the cubic PIL's BICUBIC uses.
         image::imageops::FilterType::CatmullRom,
     );
 
