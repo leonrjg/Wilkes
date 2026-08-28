@@ -252,36 +252,71 @@ task's preprocessing — the 1500-pixel upscale, the 2048-patch envelope, the
 Lanczos-then-bicubic resample — matches the model card. The engine decision
 does not reopen.
 
-**Accuracy.** On five of eight figures, both checkpoints transcribed every
-region exactly, character error 0.000: a clean diagram, the same one at
-120x180 where a 12-point label is seven pixels tall, a coloured background,
-an inverted dark background, and non-ASCII labels. The figure with no text in
-it produced no regions at all — no false positives to admit. Coordinate
-accuracy is 0.011 of the image on average and 0.025 at worst, comfortably
-inside a label's own footprint.
+**Accuracy.** On the shipped checkpoint, over eight figures and forty emitted
+regions: character error 0.111, four regions missed, two wrong. Five figures
+were transcribed exactly, character error 0.000 — a clean diagram, the same
+one at 120x180 where a 12-point label is seven pixels tall, a coloured
+background, an inverted dark background, and non-ASCII labels. The figure with
+no text in it produced no regions at all. The sample document's own diagram
+came back with all twelve of its drawn lines exact. Coordinate accuracy is
+0.012 of the image on average and 0.025 at worst, comfortably inside a label's
+own footprint.
 
-**1.6 is the shipped checkpoint**, on measurement rather than on being later:
-character error 0.182 against 0.196 overall, 0.543 against 0.571 on turned
-labels, 0.602 against 0.663 on the sample document's figure, with coordinate
-accuracy indistinguishable. The two are *not* distinguished on speed; the
-wall-clock numbers differ but the runs were not made on an equally idle
-machine, and same architecture at same parameter count gives no reason for
-them to.
+Every missed and every wrong region came from one figure.
 
 **Turned labels are a real weakness.** Both checkpoints garble text rotated a
 quarter turn — `User interface` came back as `User intiaac expert` — reading
-one of five. Recorded, not worked around: this is a property of the weights.
+one of five. Recorded, not worked around: this is a property of the weights,
+and it is the whole of this corpus's error.
 
-**CPU latency is the finding that costs.** 51 seconds for a 120x180 figure,
-around 130 for 240x360, 237 for the sample document's 1559x499 diagram, and
-roughly four times that again for a figure large enough to fill the spotting
+**The checkpoint choice is not load-bearing**, which is the honest result of
+comparing them. On seven of eight figures 1.5 and 1.6 are indistinguishable:
+the same five perfect transcriptions, the same empty answer on the textless
+figure, the same twelve exact lines on the sample, and coordinate accuracy
+equal to a thousandth. On the eighth both fail, and their character error
+differs by 0.03 — a difference between two garbled strings, not a basis for a
+recipe. 1.6 ships as the later post-training of the same weights with nothing
+measured against it. They are not distinguished on speed either; wall-clock
+differed between runs, but the runs were not made on an equally idle machine
+and the checkpoints are the same architecture at the same parameter count.
+
+**The admission threshold is 0.70**, measured rather than chosen. Across the
+forty regions it is the point where both errors are zero:
+
+```text
+threshold   correct in   wrong in   correct lost
+     0.60           38          1              0
+     0.70           38          0              0
+     0.80           37          0              1
+     0.90           34          0              4
+```
+
+0.60, where this sat before it was measured, admitted a garbled region. Above
+0.70 the rule starts discarding transcriptions that were right. Forty
+observations from one corpus is a small basis and the wrong regions all came
+from the turned-label figure, so this is a real operating point and not a
+calibration.
+
+**CPU latency is the finding that costs.** 33 seconds for a 120x180 figure,
+around 95 for 240x360, 239 for the sample document's 1559x499 diagram, and
+several times that again for a figure large enough to fill the spotting
 envelope. The shipped build enables neither `candle-metal` nor
 `candle-accelerate`, so this is plain f32 CPU matmul and is what a user gets.
 A library of a few hundred figures is an overnight job. Nothing about the
-extraction design depends on this — the annotation cache means it is paid
-once per image per recipe — but it is what the settings surface has to say
-out loud, and it is the strongest argument for the Metal path this repository
-does not yet build.
+extraction design depends on this — the annotation cache means it is paid once
+per image per recipe — but it is what the settings surface has to say out
+loud, and it is the strongest argument for the Metal path this repository does
+not yet build.
+
+**One caution about the measurement itself.** Two of this evaluation's early
+results were defects in the corpus, not in the model, and both looked exactly
+like character error until they were traced: a label laid out past the right
+edge of the page, and a ground-truth list written from this document's prose
+summary of the sample figure rather than from the twelve lines the figure
+draws. The corpus now asserts that its labels fit. The remaining character
+error on the sample is reading-order disagreement between two defensible
+orders for a figure whose elements sit side by side, not misread characters —
+which is why region exactness is reported beside it.
 
 ### The acceptance criterion that fails (found 2026-08-28)
 

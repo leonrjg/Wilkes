@@ -107,20 +107,26 @@ pub const CHECKPOINTS: &[Checkpoint] = &[CHECKPOINT_1_5, CHECKPOINT_1_6];
 /// The checkpoint Wilkes ships.
 ///
 /// **Measured, 2026-08-28**, by [`evaluate`] over the eight-figure corpus in
-/// [`crate::extract::image::corpus`]. 1.6 is not merely later; it read every
-/// figure at least as well as 1.5 and better where either made an error:
-/// character error 0.182 against 0.196 overall, 0.543 against 0.571 on turned
-/// labels, 0.602 against 0.663 on the sample document's diagram. Both
-/// transcribed the clean, low-resolution, coloured, inverted and non-ASCII
-/// figures perfectly, both emitted nothing on the figure with no text in it,
-/// and their coordinate accuracy is indistinguishable — 0.012 against 0.011
-/// of the image, 0.025 worst for each.
+/// [`crate::extract::image::corpus`]. The result is that the corpus does not
+/// distinguish the two, and that is the finding — not a tie-break dressed up
+/// as a decision.
 ///
-/// 1.6's confidence also separates its own errors better, which is what the
-/// admission rule has to work with: see [`ADMISSION_THRESHOLD`].
+/// On seven of eight figures they are indistinguishable: both transcribed the
+/// clean, low-resolution, coloured, inverted and non-ASCII figures perfectly,
+/// both emitted nothing on the figure with no text in it, and both read all
+/// twelve drawn lines of the sample document's diagram exactly. Coordinate
+/// accuracy is the same to a thousandth — 0.012 against 0.011 of the image,
+/// 0.025 worst for each. On the eighth, turned labels, both fail badly and
+/// their character error differs by 0.03, which is a difference between two
+/// garbled strings and not something to stake a recipe on.
 ///
-/// The two are not distinguished on speed. The wall-clock figures differ
-/// (103s against 143s a figure) but the runs were not made on an equally idle
+/// 1.6 is therefore shipped as the later post-training of the same weights
+/// with nothing measured against it. The checkpoint choice is not
+/// load-bearing, which is worth knowing: effort spent choosing between these
+/// two buys nothing, and the weaknesses the corpus did find are shared.
+///
+/// The two are not distinguished on speed either. The wall-clock figures
+/// differ between runs, but the runs were not made on an equally idle
 /// machine, and the checkpoints are the same architecture at the same
 /// parameter count, so there is no reason for them to differ and this
 /// measurement is not evidence that they do.
@@ -170,12 +176,28 @@ const MAX_NEW_TOKENS: usize = 1024;
 
 /// The admission threshold: mean token probability of a region's text.
 ///
-/// **Provisional**, for the same reason as the checkpoint. One explicit,
-/// tested rule is in place — the value it compares against is what the
-/// unrun evaluation is for. It is part of the engine identity, so changing it
+/// **Measured, 2026-08-28**, by [`evaluate`]'s sweep over 40 emitted regions
+/// from the shipped checkpoint. It is the operating point where both errors
+/// are zero: every correct region admitted, every incorrect one rejected.
+///
+/// ```text
+/// threshold   correct in   wrong in   correct lost
+///      0.60           38          1              0
+///      0.70           38          0              0
+///      0.80           37          0              1
+///      0.90           34          0              4
+/// ```
+///
+/// 0.60, where this sat before it was measured, admitted a garbled region.
+/// Above 0.70 the rule starts throwing away transcriptions that were right.
+///
+/// Forty observations from one corpus is a small basis, and the wrong regions
+/// it separates all came from one figure — turned labels, which the weights
+/// read badly. It is a real operating point rather than a guess, and it is
+/// not a calibration. It is part of the engine identity, so moving it
 /// re-extracts rather than quietly re-reading old annotations under a new
 /// rule.
-pub const ADMISSION_THRESHOLD: f32 = 0.60;
+pub const ADMISSION_THRESHOLD: f32 = 0.70;
 
 /// Bumped when anything above changes for the same weights. `v2` corrected
 /// the resample pipeline to the card's two stages.
