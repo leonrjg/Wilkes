@@ -1,0 +1,842 @@
+//! The production recognizer: PaddleOCR-VL's text-spotting task.
+//!
+//! Wilkes owns everything outside the weights — the task prompt, the image
+//! preprocessing, the decode loop, and the parsing of `<|LOC_n|>` tokens into
+//! quadrilaterals. `candle-transformers` owns the model, which is why no new
+//! inference dependency, toolchain change or `ort` bump was needed to get here.
+//!
+//! The decode loop is Wilkes' own rather than the module's `generate`, and for
+//! a reason the admission rule depends on: `generate` returns the chosen
+//! tokens and discards the logits, so the log-probabilities the admission
+//! signal is derived from would not exist. Running `forward` per step keeps
+//! them.
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use anyhow::Context;
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::paddleocr_vl::{Config, PaddleOCRVLModel};
+use hf_hub::api::sync::ApiBuilder;
+use sha2::{Digest, Sha256};
+use tokenizers::Tokenizer;
+use tracing::{debug, info, warn};
+
+use crate::embed::engines::candle::{realize_device, select_device_plan};
+use crate::models::hf_hub::HfProgressReporter;
+use crate::models::progress::ProgressTx;
+
+use super::ocr::{
+    parse_spotting, OcrEngine, SpottedRegion, SpottingDecoder, SpottingToken, LOC_MAX,
+};
+
+// ── The pinned recipe ────────────────────────────────────────────────────────
+
+/// One shippable recognizer: weights, tokenizer, and the revision they were
+/// evaluated at together.
+///
+/// A checkpoint, not a runtime choice. Wilkes packages and identifies exactly
+/// one, chosen by measurement; two checkpoints reachable at runtime would be
+/// two answers to "what does this document say".
+#[derive(Debug, Clone, Copy)]
+pub struct Checkpoint {
+    pub name: &'static str,
+    pub repo: &'static str,
+    /// An immutable commit sha, never a branch. A branch re-resolves to
+    /// whatever was last pushed, which is exactly what a pin exists to stop.
+    pub revision: &'static str,
+    pub weights: Artifact,
+    pub tokenizer: Artifact,
+    pub config: Artifact,
+}
+
+/// One downloaded file and what it must be.
+///
+/// Size and digest both, and checked after download rather than trusted: a
+/// truncated or substituted artifact that loads at all would change every
+/// reading it touched, silently.
+#[derive(Debug, Clone, Copy)]
+pub struct Artifact {
+    pub filename: &'static str,
+    pub size_bytes: u64,
+    pub sha256: &'static str,
+}
+
+/// PaddleOCR-VL 1.5, the first checkpoint with the spotting task.
+pub const CHECKPOINT_1_5: Checkpoint = Checkpoint {
+    name: "paddleocr-vl-1.5",
+    repo: "PaddlePaddle/PaddleOCR-VL-1.5",
+    revision: "2a4195faa5e7914c12f2fc601d72c81caf8d2da5",
+    weights: Artifact {
+        filename: "model.safetensors",
+        size_bytes: 1_917_255_968,
+        sha256: "d557c9d8997ae57ed3b1b33bdf347be878cc335687f32ca105341c16973f8958",
+    },
+    tokenizer: Artifact {
+        filename: "tokenizer.json",
+        size_bytes: 11_189_060,
+        sha256: "c8a215a59183d0d0781adc33bacd3ce6162716f7fd568fb30234a74d69803a7d",
+    },
+    config: Artifact {
+        filename: "config.json",
+        size_bytes: 2_059,
+        sha256: "ce7f4565f8b1db78532ad5d1b9ebe55c2139d49bd4cb04778b580a08a598f171",
+    },
+};
+
+/// PaddleOCR-VL 1.6. Same architecture and the same tokenizer; different
+/// weights, and therefore a different recipe.
+pub const CHECKPOINT_1_6: Checkpoint = Checkpoint {
+    name: "paddleocr-vl-1.6",
+    repo: "PaddlePaddle/PaddleOCR-VL-1.6",
+    revision: "c5630abae1d940eafe0697512a0325494b02ab42",
+    weights: Artifact {
+        filename: "model.safetensors",
+        size_bytes: 1_917_255_968,
+        sha256: "85a479d506a11e724e7285d395c551be69f41dbc16b6342d3cacfb189aed71db",
+    },
+    tokenizer: CHECKPOINT_1_5.tokenizer,
+    config: CHECKPOINT_1_5.config,
+};
+
+/// The two checkpoints the evaluation compares. It selects one; it does not
+/// leave a choice behind.
+pub const CHECKPOINTS: &[Checkpoint] = &[CHECKPOINT_1_5, CHECKPOINT_1_6];
+
+/// The checkpoint Wilkes ships.
+///
+/// **Provisional.** FIGURE.md's implementation plan step 1 requires character
+/// error, coordinate accuracy, admission-rule viability and CPU latency to be
+/// measured on the image corpus before a checkpoint is pinned, and that
+/// measurement has not been run. 1.6 is named here because it is the later
+/// post-training of the same weights and the same spotting task, not because
+/// it measured better. [`crate::extract::image::paddleocr_vl::evaluate`] is
+/// the harness that settles it.
+pub const SHIPPED_CHECKPOINT: Checkpoint = CHECKPOINT_1_6;
+
+// ── The pinned extraction settings ───────────────────────────────────────────
+
+/// The task prompt. The model was post-trained on this exact string; it is not
+/// a phrasing choice, and changing it changes the recipe.
+const SPOTTING_PROMPT: &str = "Spotting:";
+
+/// The chat framing the checkpoint's own template produces, with the image
+/// placeholder where the vision tokens go.
+const PROMPT_PREFIX: &str = "<|begin_of_sentence|>User: <|IMAGE_START|>";
+const PROMPT_SUFFIX: &str = "<|IMAGE_END|>";
+
+/// Patch size times the spatial merge: the recognizer's grid steps in 28-pixel
+/// units, so both dimensions of a preprocessed image are multiples of it.
+const RESIZE_FACTOR: u32 = 28;
+
+/// The spotting task's own resolution envelope, from the checkpoint's model
+/// card. Larger than the default recognition envelope because localization
+/// needs the pixels.
+const MIN_PIXELS: u64 = 112_896;
+const MAX_PIXELS: u64 = 2048 * 28 * 28;
+
+/// Below this on both sides the image is doubled before preprocessing. Small
+/// crops are the spotting task's weak end and the model card upsamples them;
+/// doing anything else here would be a different recipe from the one the
+/// checkpoint was measured under.
+const UPSCALE_THRESHOLD: u32 = 1500;
+
+/// Normalization: the checkpoint's preprocessor centres on 0.5 with a 0.5
+/// spread, per channel.
+const IMAGE_MEAN: f32 = 0.5;
+const IMAGE_STD: f32 = 0.5;
+
+/// The longest spotting response Wilkes will decode. A figure's labels are
+/// tens of tokens; a decode still running at this point has stopped
+/// transcribing and started repeating, and the partial result is the honest
+/// outcome.
+const MAX_NEW_TOKENS: usize = 1024;
+
+/// The admission threshold: mean token probability of a region's text.
+///
+/// **Provisional**, for the same reason as the checkpoint. One explicit,
+/// tested rule is in place — the value it compares against is what the
+/// unrun evaluation is for. It is part of the engine identity, so changing it
+/// re-extracts rather than quietly re-reading old annotations under a new
+/// rule.
+pub const ADMISSION_THRESHOLD: f32 = 0.60;
+
+/// Bumped when anything above changes for the same weights.
+const EXTRACTION_SETTINGS_VERSION: &str = "spotting-v1";
+
+// ── Preprocessing ────────────────────────────────────────────────────────────
+
+/// The dimensions the recognizer is given for an image of `width` x `height`.
+///
+/// Both are multiples of [`RESIZE_FACTOR`], the aspect ratio is held as close
+/// as the grid allows, and the total lands inside the task's pixel envelope.
+/// Coordinates come back normalized, so this rescaling never has to be undone:
+/// a fraction of the resized image is the same fraction of the original.
+pub fn spotting_dimensions(width: u32, height: u32) -> (u32, u32) {
+    let doubled = width < UPSCALE_THRESHOLD && height < UPSCALE_THRESHOLD;
+    let (width, height) = if doubled {
+        (width.saturating_mul(2), height.saturating_mul(2))
+    } else {
+        (width, height)
+    };
+    smart_resize(width, height)
+}
+
+fn smart_resize(width: u32, height: u32) -> (u32, u32) {
+    let factor = RESIZE_FACTOR as f64;
+    let (mut width, mut height) = (width.max(1) as f64, height.max(1) as f64);
+
+    // A side thinner than one grid step cannot be gridded at all; it is scaled
+    // up to one step and the other side follows, which is what the
+    // checkpoint's own preprocessor does.
+    if height < factor {
+        width = (width * factor) / height;
+        height = factor;
+    }
+    if width < factor {
+        height = (height * factor) / width;
+        width = factor;
+    }
+
+    let round_to_grid = |value: f64| ((value / factor).round() * factor).max(factor);
+    let (mut resized_width, mut resized_height) = (round_to_grid(width), round_to_grid(height));
+
+    let area = resized_width * resized_height;
+    if area > MAX_PIXELS as f64 {
+        let beta = ((width * height) / MAX_PIXELS as f64).sqrt();
+        resized_width = ((width / beta / factor).floor() * factor).max(factor);
+        resized_height = ((height / beta / factor).floor() * factor).max(factor);
+    } else if area < MIN_PIXELS as f64 {
+        let beta = (MIN_PIXELS as f64 / (width * height)).sqrt();
+        resized_width = (width * beta / factor).ceil() * factor;
+        resized_height = (height * beta / factor).ceil() * factor;
+    }
+    (resized_width as u32, resized_height as u32)
+}
+
+/// The image as the recognizer's vision encoder takes it: `(1, 3, h, w)`,
+/// normalized, with `h` and `w` multiples of the grid step.
+fn pixel_tensor(
+    image: &image::RgbImage,
+    device: &Device,
+    dtype: DType,
+) -> anyhow::Result<(Tensor, u32, u32)> {
+    let (width, height) = spotting_dimensions(image.width(), image.height());
+    let resized = image::imageops::resize(
+        image,
+        width,
+        height,
+        // The checkpoint's preprocessor resamples bicubically. A different
+        // filter is a different recipe: it changes the pixels the model reads.
+        image::imageops::FilterType::CatmullRom,
+    );
+
+    let count = (width as usize) * (height as usize);
+    let mut planes = vec![0f32; 3 * count];
+    for (index, pixel) in resized.pixels().enumerate() {
+        for channel in 0..3 {
+            let value = f32::from(pixel.0[channel]) / 255.0;
+            planes[channel * count + index] = (value - IMAGE_MEAN) / IMAGE_STD;
+        }
+    }
+    let tensor = Tensor::from_vec(planes, (1, 3, height as usize, width as usize), device)?
+        .to_dtype(dtype)?;
+    Ok((tensor, width, height))
+}
+
+// ── Artifacts ────────────────────────────────────────────────────────────────
+
+fn cached_path(data_dir: &Path, checkpoint: &Checkpoint, artifact: &Artifact) -> Option<PathBuf> {
+    hf_hub::Cache::new(data_dir.to_path_buf())
+        .repo(hf_hub::Repo::with_revision(
+            checkpoint.repo.to_string(),
+            hf_hub::RepoType::Model,
+            checkpoint.revision.to_string(),
+        ))
+        .get(artifact.filename)
+}
+
+/// Whether the shipped recognizer is installed and intact on this machine.
+pub fn is_installed(data_dir: &Path, checkpoint: &Checkpoint) -> bool {
+    resolve(data_dir, checkpoint).is_ok()
+}
+
+struct ResolvedArtifacts {
+    weights: PathBuf,
+    tokenizer: PathBuf,
+    config: PathBuf,
+}
+
+fn resolve(data_dir: &Path, checkpoint: &Checkpoint) -> anyhow::Result<ResolvedArtifacts> {
+    let locate = |artifact: &Artifact| -> anyhow::Result<PathBuf> {
+        let path = cached_path(data_dir, checkpoint, artifact).ok_or_else(|| {
+            anyhow::anyhow!(
+                "'{}' is not installed for '{}' at {}",
+                artifact.filename,
+                checkpoint.repo,
+                checkpoint.revision
+            )
+        })?;
+        let size = std::fs::metadata(&path)?.len();
+        anyhow::ensure!(
+            size == artifact.size_bytes,
+            "'{}' is {size} bytes, {} expected",
+            artifact.filename,
+            artifact.size_bytes
+        );
+        Ok(path)
+    };
+    Ok(ResolvedArtifacts {
+        weights: locate(&checkpoint.weights)?,
+        tokenizer: locate(&checkpoint.tokenizer)?,
+        config: locate(&checkpoint.config)?,
+    })
+}
+
+/// The digest of a file on disk, streamed.
+pub fn file_sha256(path: &Path) -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+/// Download and verify one checkpoint.
+///
+/// Explicit: nothing here runs on a timer or on first use, so offline
+/// operation after installation is the ordinary case and an unversioned
+/// runtime download can never change what a document extracts to.
+pub fn install(
+    data_dir: &Path,
+    checkpoint: &Checkpoint,
+    progress: Option<ProgressTx>,
+) -> anyhow::Result<()> {
+    let reporter = progress.map(HfProgressReporter::new);
+    for artifact in [
+        &checkpoint.weights,
+        &checkpoint.tokenizer,
+        &checkpoint.config,
+    ] {
+        let path = match cached_path(data_dir, checkpoint, artifact) {
+            Some(path) => path,
+            None => {
+                let api = ApiBuilder::new()
+                    .with_cache_dir(data_dir.to_path_buf())
+                    .build()
+                    .context("could not initialise the HF hub API")?;
+                let repo = api.repo(hf_hub::Repo::with_revision(
+                    checkpoint.repo.to_string(),
+                    hf_hub::RepoType::Model,
+                    checkpoint.revision.to_string(),
+                ));
+                match reporter.clone() {
+                    Some(reporter) => repo.download_with_progress(artifact.filename, reporter),
+                    None => repo.download(artifact.filename),
+                }
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "could not download '{}' from '{}': {error:#}",
+                        artifact.filename,
+                        checkpoint.repo
+                    )
+                })?
+            }
+        };
+
+        let size = std::fs::metadata(&path)?.len();
+        let digest = file_sha256(&path)?;
+        if size != artifact.size_bytes || digest != artifact.sha256 {
+            // A wrong artifact that loads at all would change every reading
+            // it touched, so it does not stay on disk to be found next time.
+            let _ = std::fs::remove_file(&path);
+            anyhow::bail!(
+                "'{}' does not match the pinned artifact: {size} bytes / {digest}, \
+                 {} bytes / {} expected",
+                artifact.filename,
+                artifact.size_bytes,
+                artifact.sha256
+            );
+        }
+        debug!("verified {} ({size} bytes)", artifact.filename);
+    }
+    info!(
+        "installed recognizer {} from {} at {}",
+        checkpoint.name, checkpoint.repo, checkpoint.revision
+    );
+    Ok(())
+}
+
+// ── The engine ───────────────────────────────────────────────────────────────
+
+/// Which vocabulary ids are `<|LOC_n|>`, resolved from the tokenizer that
+/// shipped with the weights rather than hardcoded.
+///
+/// The ids are contiguous in the checkpoints Wilkes pins, but reading them
+/// from the tokenizer is what keeps the parser correct if a later checkpoint
+/// renumbers its vocabulary — and what makes a checkpoint whose vocabulary has
+/// no location tokens a load error instead of a run of nonsense coordinates.
+struct LocationVocabulary {
+    first: u32,
+    last: u32,
+}
+
+impl LocationVocabulary {
+    fn resolve(tokenizer: &Tokenizer) -> anyhow::Result<Self> {
+        let id_of = |value: u16| {
+            tokenizer
+                .token_to_id(&format!("<|LOC_{value}|>"))
+                .ok_or_else(|| anyhow::anyhow!("the tokenizer has no <|LOC_{value}|> token"))
+        };
+        let first = id_of(0)?;
+        let last = id_of(LOC_MAX)?;
+        anyhow::ensure!(
+            last.checked_sub(first) == Some(u32::from(LOC_MAX)),
+            "the tokenizer's location tokens are not contiguous: \
+             <|LOC_0|> is {first} and <|LOC_{LOC_MAX}|> is {last}"
+        );
+        Ok(Self { first, last })
+    }
+
+    fn value(&self, id: u32) -> Option<u16> {
+        (id >= self.first && id <= self.last).then(|| (id - self.first) as u16)
+    }
+}
+
+struct TokenizerDecoder<'a>(&'a Tokenizer);
+
+impl SpottingDecoder for TokenizerDecoder<'_> {
+    fn decode(&self, ids: &[u32]) -> anyhow::Result<String> {
+        self.0
+            .decode(ids, /* skip_special_tokens */ true)
+            .map_err(|error| anyhow::anyhow!("could not decode spotting output: {error}"))
+    }
+}
+
+/// The loaded recognizer.
+///
+/// The model is behind a mutex because decoding mutates its KV cache, and one
+/// document's images are transcribed one after another. Extraction of a
+/// library is already parallel per file; making one image's decode parallel
+/// with another's would contend for the same weights.
+pub struct PaddleOcrVl {
+    checkpoint: Checkpoint,
+    model: Mutex<PaddleOCRVLModel>,
+    tokenizer: Tokenizer,
+    locations: LocationVocabulary,
+    image_token_id: u32,
+    eos_token_id: u32,
+    device: Device,
+    dtype: DType,
+    spatial_merge: usize,
+    patch_size: usize,
+}
+
+impl PaddleOcrVl {
+    /// Load the installed checkpoint.
+    pub fn load(data_dir: &Path, checkpoint: Checkpoint, device: &str) -> anyhow::Result<Self> {
+        let artifacts = resolve(data_dir, &checkpoint)?;
+        let realized = realize_device(select_device_plan(device))?;
+        if let Some(reason) = &realized.fallback_reason {
+            warn!("recognizer falling back to {}: {reason}", realized.name);
+        }
+        let device = realized.device;
+        // F32 everywhere: the CPU path is the one every supported platform
+        // has, and candle's accelerate backend does not carry f16 matmul.
+        let dtype = DType::F32;
+
+        let config: Config = serde_json::from_slice(&std::fs::read(&artifacts.config)?)
+            .context("could not read the recognizer's config")?;
+        let tokenizer = Tokenizer::from_file(&artifacts.tokenizer)
+            .map_err(|error| anyhow::anyhow!("could not read the recognizer's tokenizer: {error}"))?;
+        let locations = LocationVocabulary::resolve(&tokenizer)?;
+        let eos_token_id = tokenizer
+            .token_to_id("</s>")
+            .ok_or_else(|| anyhow::anyhow!("the tokenizer has no end-of-sequence token"))?;
+
+        let weights = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[artifacts.weights.clone()], dtype, &device)?
+        };
+        let model = PaddleOCRVLModel::new(&config, weights)
+            .context("could not build the recognizer from its weights")?;
+
+        info!(
+            "recognizer {} loaded on {} ({} vision layers, {} decoder layers)",
+            checkpoint.name,
+            realized.name,
+            config.vision_config.num_hidden_layers,
+            config.num_hidden_layers,
+        );
+
+        Ok(Self {
+            checkpoint,
+            model: Mutex::new(model),
+            tokenizer,
+            locations,
+            image_token_id: config.image_token_id,
+            eos_token_id,
+            device,
+            dtype,
+            spatial_merge: config.vision_config.spatial_merge_size,
+            patch_size: config.vision_config.patch_size,
+        })
+    }
+
+    /// The prompt token ids for one image, with the placeholder run expanded
+    /// to exactly the number of vision tokens the encoder will produce.
+    fn prompt_ids(&self, grid_height: usize, grid_width: usize) -> anyhow::Result<Vec<u32>> {
+        let encode = |text: &str| -> anyhow::Result<Vec<u32>> {
+            Ok(self
+                .tokenizer
+                .encode(text, /* add_special_tokens */ false)
+                .map_err(|error| anyhow::anyhow!("could not encode the task prompt: {error}"))?
+                .get_ids()
+                .to_vec())
+        };
+        let merge = self.spatial_merge * self.spatial_merge;
+        let vision_tokens = grid_height * grid_width / merge;
+
+        let mut ids = encode(PROMPT_PREFIX)?;
+        ids.extend(std::iter::repeat(self.image_token_id).take(vision_tokens));
+        ids.extend(encode(&format!(
+            "{PROMPT_SUFFIX}{SPOTTING_PROMPT}\nAssistant:\n"
+        ))?);
+        Ok(ids)
+    }
+
+    /// Decode one spotting response, keeping the log-probability of every
+    /// token chosen.
+    ///
+    /// Greedy: the transcription of a fixed image is a fact about the image,
+    /// and a sampled one would make the reading — and therefore the rendition
+    /// hash — depend on a random seed.
+    fn decode_spotting(
+        &self,
+        prompt: &[u32],
+        pixels: &Tensor,
+        grid: &Tensor,
+    ) -> anyhow::Result<Vec<SpottingToken>> {
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the recognizer's lock was poisoned"))?;
+        model.clear_kv_cache();
+
+        let mut tokens = Vec::new();
+        let input = Tensor::new(prompt, &self.device)?.unsqueeze(0)?;
+        let mut logits = model.forward(&input, Some(pixels), Some(grid), 0)?;
+        let mut offset = prompt.len();
+
+        for _ in 0..MAX_NEW_TOKENS {
+            let (id, logprob) = greedy(&logits)?;
+            if id == self.eos_token_id {
+                break;
+            }
+            tokens.push(SpottingToken {
+                id,
+                logprob,
+                loc: self.locations.value(id),
+            });
+            let next = Tensor::new(&[id], &self.device)?.unsqueeze(0)?;
+            logits = model.forward(&next, None, None, offset)?;
+            offset += 1;
+        }
+        Ok(tokens)
+    }
+}
+
+/// The most likely next token and the log-probability the decode gave it.
+///
+/// The softmax is taken in f32 and after subtracting the maximum, so the
+/// signal does not depend on the logits' scale or overflow on a confident
+/// step.
+fn greedy(logits: &Tensor) -> anyhow::Result<(u32, f32)> {
+    let values = logits
+        .flatten_all()?
+        .to_dtype(DType::F32)?
+        .to_vec1::<f32>()?;
+    let (index, max) = values.iter().enumerate().fold(
+        (0usize, f32::NEG_INFINITY),
+        |(best, best_value), (index, value)| {
+            if *value > best_value {
+                (index, *value)
+            } else {
+                (best, best_value)
+            }
+        },
+    );
+    let total: f32 = values.iter().map(|value| (value - max).exp()).sum();
+    Ok((index as u32, -total.ln()))
+}
+
+impl OcrEngine for PaddleOcrVl {
+    fn identity(&self) -> String {
+        format!(
+            "candle-transformers-0.11+{}+{}+{}+admit-{ADMISSION_THRESHOLD}",
+            self.checkpoint.name, self.checkpoint.weights.sha256, EXTRACTION_SETTINGS_VERSION,
+        )
+    }
+
+    fn admission_threshold(&self) -> f32 {
+        ADMISSION_THRESHOLD
+    }
+
+    fn spot(&self, image: &image::RgbImage) -> anyhow::Result<Vec<SpottedRegion>> {
+        let (pixels, width, height) = pixel_tensor(image, &self.device, self.dtype)?;
+        let (grid_height, grid_width) = (
+            height as usize / self.patch_size,
+            width as usize / self.patch_size,
+        );
+        let grid = Tensor::new(
+            &[[1u32, grid_height as u32, grid_width as u32]],
+            &self.device,
+        )?;
+        let prompt = self.prompt_ids(grid_height, grid_width)?;
+        let tokens = self.decode_spotting(&prompt, &pixels, &grid)?;
+        parse_spotting(&tokens, &TokenizerDecoder(&self.tokenizer))
+    }
+}
+
+// ── The unrun evaluation ─────────────────────────────────────────────────────
+
+/// One image of the evaluation corpus and what it should transcribe to.
+pub struct EvaluationCase {
+    pub name: String,
+    pub image: image::RgbImage,
+    /// The text a correct transcription contains, in reading order.
+    pub expected: Vec<String>,
+}
+
+/// What one checkpoint measured on one corpus.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EvaluationResult {
+    pub checkpoint: String,
+    pub cases: usize,
+    /// Character error rate against the expected text, joined in emission
+    /// order: substitutions, insertions and deletions over expected length.
+    pub character_error_rate: f64,
+    /// Regions the model emitted that no expected string accounts for.
+    pub false_regions: usize,
+    /// Expected strings no emitted region accounts for.
+    pub missed_regions: usize,
+    /// How many accepted regions the threshold admits, and how many correct
+    /// ones it rejects — the two numbers the admission rule is judged on.
+    pub admitted: usize,
+    pub correct_rejected: usize,
+    pub seconds_per_image: f64,
+}
+
+/// Measure one checkpoint on a corpus.
+///
+/// This is FIGURE.md's implementation-plan step 1, made runnable. It has not
+/// been run: it needs the checkpoints installed — 1.9 GB each — and a corpus
+/// with expected transcriptions, neither of which is in the repository. Until
+/// it is, [`SHIPPED_CHECKPOINT`] and [`ADMISSION_THRESHOLD`] are provisional
+/// and say so.
+pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationResult {
+    let started = std::time::Instant::now();
+    let (mut errors, mut expected_chars) = (0usize, 0usize);
+    let (mut false_regions, mut missed_regions) = (0usize, 0usize);
+    let (mut admitted, mut correct_rejected) = (0usize, 0usize);
+
+    for case in corpus {
+        let regions = match engine.spot(&case.image) {
+            Ok(regions) => regions,
+            Err(error) => {
+                warn!("{}: recognition failed: {error:#}", case.name);
+                missed_regions += case.expected.len();
+                expected_chars += case.expected.iter().map(|text| text.chars().count()).sum::<usize>();
+                continue;
+            }
+        };
+
+        let emitted: Vec<String> = regions.iter().map(|region| region.text.clone()).collect();
+        expected_chars += case.expected.iter().map(|text| text.chars().count()).sum::<usize>();
+        errors += edit_distance(
+            &case.expected.join(" ").chars().collect::<Vec<_>>(),
+            &emitted.join(" ").chars().collect::<Vec<_>>(),
+        );
+
+        for region in &regions {
+            let correct = case.expected.iter().any(|text| text == &region.text);
+            if !correct {
+                false_regions += 1;
+            }
+            if region.confidence >= engine.admission_threshold() {
+                admitted += 1;
+            } else if correct {
+                correct_rejected += 1;
+            }
+        }
+        missed_regions += case
+            .expected
+            .iter()
+            .filter(|text| !emitted.contains(text))
+            .count();
+    }
+
+    EvaluationResult {
+        checkpoint: engine.checkpoint.name.to_string(),
+        cases: corpus.len(),
+        character_error_rate: if expected_chars == 0 {
+            0.0
+        } else {
+            errors as f64 / expected_chars as f64
+        },
+        false_regions,
+        missed_regions,
+        admitted,
+        correct_rejected,
+        seconds_per_image: if corpus.is_empty() {
+            0.0
+        } else {
+            started.elapsed().as_secs_f64() / corpus.len() as f64
+        },
+    }
+}
+
+/// Levenshtein distance over characters. Character-aware by construction: the
+/// inputs are already character slices, because a transcription is arbitrary
+/// Unicode and has no byte offsets that are safe to index.
+fn edit_distance(expected: &[char], actual: &[char]) -> usize {
+    let mut previous: Vec<usize> = (0..=actual.len()).collect();
+    let mut current = vec![0usize; actual.len() + 1];
+    for (row, want) in expected.iter().enumerate() {
+        current[0] = row + 1;
+        for (column, got) in actual.iter().enumerate() {
+            let substitution = previous[column] + usize::from(want != got);
+            current[column + 1] = substitution
+                .min(previous[column + 1] + 1)
+                .min(current[column] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[actual.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both dimensions land on the grid, the aspect ratio survives, and the
+    /// area stays inside the task's envelope. The recognizer cannot be given
+    /// an image that is not a whole number of merged patches.
+    #[test]
+    fn preprocessing_grids_the_image_and_respects_the_envelope() {
+        for (width, height) in [(1559, 499), (16, 16), (4000, 120), (800, 1200), (3, 900)] {
+            let (resized_width, resized_height) = spotting_dimensions(width, height);
+            assert_eq!(
+                (resized_width % RESIZE_FACTOR, resized_height % RESIZE_FACTOR),
+                (0, 0),
+                "{width}x{height} is not on the grid"
+            );
+            let pixels = u64::from(resized_width) * u64::from(resized_height);
+            assert!(
+                pixels <= MAX_PIXELS,
+                "{width}x{height} became {resized_width}x{resized_height}, over the envelope"
+            );
+            assert!(resized_width > 0 && resized_height > 0);
+        }
+    }
+
+    /// The sample document's diagram, at the size FIGURE.md records. It is
+    /// over the upscale threshold on its long side, so it is not doubled, and
+    /// its aspect ratio is held.
+    #[test]
+    fn the_sample_diagram_keeps_its_shape() {
+        let (width, height) = spotting_dimensions(1559, 499);
+        let ratio = f64::from(width) / f64::from(height);
+        assert!(
+            (ratio - 1559.0 / 499.0).abs() < 0.05,
+            "{width}x{height} distorts the diagram"
+        );
+    }
+
+    /// A small crop is doubled first: the spotting task's own recipe, and the
+    /// difference between reading a 200-pixel label and not.
+    #[test]
+    fn a_small_image_is_upscaled_before_gridding() {
+        let (small_width, small_height) = spotting_dimensions(200, 100);
+        let (large_width, large_height) = spotting_dimensions(1600, 800);
+        assert!(
+            small_width * small_height >= MIN_PIXELS as u32,
+            "{small_width}x{small_height} is under the floor"
+        );
+        assert!(large_width >= small_width && large_height >= small_height);
+    }
+
+    /// A greedy step's log-probability is the log of the chosen token's
+    /// softmax share, and it does not depend on the logits' offset.
+    #[test]
+    fn the_admission_signal_is_the_chosen_tokens_log_probability() {
+        let confident = Tensor::new(&[[0.0f32, 10.0, 0.0]], &Device::Cpu).unwrap();
+        let (id, logprob) = greedy(&confident).unwrap();
+        assert_eq!(id, 1);
+        assert!(logprob.exp() > 0.99, "{}", logprob.exp());
+
+        let undecided = Tensor::new(&[[1.0f32, 1.0, 1.0]], &Device::Cpu).unwrap();
+        let (_, logprob) = greedy(&undecided).unwrap();
+        assert!((logprob.exp() - 1.0 / 3.0).abs() < 1e-5, "{}", logprob.exp());
+
+        // Shifting every logit by a constant is the same distribution.
+        let shifted = Tensor::new(&[[100.0f32, 110.0, 100.0]], &Device::Cpu).unwrap();
+        let (shifted_id, shifted_logprob) = greedy(&shifted).unwrap();
+        assert_eq!(shifted_id, 1);
+        let (_, original) = greedy(&confident).unwrap();
+        assert!((shifted_logprob - original).abs() < 1e-4);
+    }
+
+    /// Every shipped artifact is pinned to an immutable commit and named by
+    /// size and digest. A branch would re-resolve to whatever was last pushed.
+    #[test]
+    fn every_checkpoint_is_pinned_by_revision_size_and_digest() {
+        for checkpoint in CHECKPOINTS {
+            assert_eq!(checkpoint.revision.len(), 40, "{}", checkpoint.name);
+            assert!(
+                checkpoint
+                    .revision
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+                "{} is not a commit sha",
+                checkpoint.name
+            );
+            for artifact in [
+                &checkpoint.weights,
+                &checkpoint.tokenizer,
+                &checkpoint.config,
+            ] {
+                assert_eq!(artifact.sha256.len(), 64, "{}", artifact.filename);
+                assert!(artifact.size_bytes > 0, "{}", artifact.filename);
+            }
+        }
+    }
+
+    /// The two checkpoints must be distinguishable, or the evaluation that
+    /// chooses between them would be comparing one thing with itself.
+    #[test]
+    fn the_two_checkpoints_are_different_weights() {
+        assert_ne!(CHECKPOINT_1_5.weights.sha256, CHECKPOINT_1_6.weights.sha256);
+        assert_ne!(CHECKPOINT_1_5.revision, CHECKPOINT_1_6.revision);
+        // Same tokenizer, so a location token means the same thing in both.
+        assert_eq!(
+            CHECKPOINT_1_5.tokenizer.sha256,
+            CHECKPOINT_1_6.tokenizer.sha256
+        );
+    }
+
+    #[test]
+    fn the_edit_distance_counts_all_three_edits() {
+        let chars = |text: &str| text.chars().collect::<Vec<_>>();
+        assert_eq!(edit_distance(&chars("kitten"), &chars("sitting")), 3);
+        assert_eq!(edit_distance(&chars("Größe"), &chars("Größe")), 0);
+        assert_eq!(edit_distance(&chars(""), &chars("abc")), 3);
+    }
+}

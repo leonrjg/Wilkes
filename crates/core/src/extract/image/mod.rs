@@ -15,6 +15,14 @@
 pub mod cache;
 pub mod describe;
 pub mod ocr;
+/// The external door for description: whatever the user has pulled into
+/// Ollama, asked with the same prompt and schema as the first-class path.
+pub mod ollama;
+/// The production recognizer. Behind the `candle` feature because that is the
+/// runtime it uses — the one already pinned, with no second inference
+/// dependency added to reach it.
+#[cfg(feature = "candle")]
+pub mod paddleocr_vl;
 pub mod serialize;
 
 use std::collections::HashMap;

@@ -25,7 +25,7 @@ infer = "0.16"
 mupdf = "0.6"
 # Pixel buffers and resampling for native image enrichment. Not an inference
 # dependency: no runtime, no models, and already in the tree transitively.
-image = { version = "0.25", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
 regex = "1"
 rayon = "1"
 dirs = "5"
@@ -49,6 +49,8 @@ strip-ansi-escapes = "0.2.1"
 which = "6"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 urlencoding = "2"
+url = "2"
+base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 
 [dependencies.ort]
