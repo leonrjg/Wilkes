@@ -49,6 +49,35 @@ pub struct Checkpoint {
     pub weights: Artifact,
     pub tokenizer: Artifact,
     pub config: Artifact,
+    /// The SPDX identifier the upstream repository publishes these artifacts
+    /// under.
+    pub license: &'static str,
+    pub license_url: &'static str,
+    /// What the weights are made of, upstream of this repository. A checkpoint
+    /// is not one work: this one is an encoder and a decoder trained together,
+    /// and an inventory that named only the repository it was fetched from
+    /// would be an inventory of the download rather than of the model.
+    pub derived_from: &'static [&'static str],
+}
+
+impl Checkpoint {
+    /// Every file this checkpoint is, in the order they are installed.
+    ///
+    /// One list, so the download, the verification and the inventory cannot
+    /// disagree about what the checkpoint consists of — a fourth artifact
+    /// added here is downloaded, verified and inventoried by that fact alone.
+    pub fn artifacts(&self) -> [&Artifact; 3] {
+        [&self.weights, &self.tokenizer, &self.config]
+    }
+
+    /// What the checkpoint costs on disk: the pinned sizes, summed. Exact
+    /// rather than observed, because the pins are what an install produces.
+    pub fn footprint_bytes(&self) -> u64 {
+        self.artifacts()
+            .iter()
+            .map(|artifact| artifact.size_bytes)
+            .sum()
+    }
 }
 
 /// One downloaded file and what it must be.
@@ -83,7 +112,18 @@ pub const CHECKPOINT_1_5: Checkpoint = Checkpoint {
         size_bytes: 2_059,
         sha256: "ce7f4565f8b1db78532ad5d1b9ebe55c2139d49bd4cb04778b580a08a598f171",
     },
+    license: "Apache-2.0",
+    license_url: "https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5",
+    derived_from: PADDLEOCR_VL_COMPONENTS,
 };
+
+/// What every PaddleOCR-VL checkpoint is built from. Shared because 1.5 and
+/// 1.6 are the same architecture: two post-trainings of one design, not two
+/// models with two provenances.
+const PADDLEOCR_VL_COMPONENTS: &[&str] = &[
+    "NaViT-style dynamic-resolution vision encoder (Apache-2.0, PaddlePaddle)",
+    "ERNIE-4.5-0.3B language decoder (Apache-2.0, Baidu)",
+];
 
 /// PaddleOCR-VL 1.6. Same architecture and the same tokenizer; different
 /// weights, and therefore a different recipe.
@@ -98,6 +138,9 @@ pub const CHECKPOINT_1_6: Checkpoint = Checkpoint {
     },
     tokenizer: CHECKPOINT_1_5.tokenizer,
     config: CHECKPOINT_1_5.config,
+    license: "Apache-2.0",
+    license_url: "https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6",
+    derived_from: PADDLEOCR_VL_COMPONENTS,
 };
 
 /// The two checkpoints the evaluation compares. It selects one; it does not
@@ -131,6 +174,67 @@ pub const CHECKPOINTS: &[Checkpoint] = &[CHECKPOINT_1_5, CHECKPOINT_1_6];
 /// parameter count, so there is no reason for them to differ and this
 /// measurement is not evidence that they do.
 pub const SHIPPED_CHECKPOINT: Checkpoint = CHECKPOINT_1_6;
+
+// ── The license and provenance inventory ─────────────────────────────────────
+
+/// One file of a checkpoint, as an inventory names it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InventoriedArtifact {
+    pub filename: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+/// What the recognizer is, where it came from, and under what terms.
+///
+/// FIGURE.md requires this of the redistributed checkpoint before it is
+/// packaged, and it is data rather than prose for the reason the pins
+/// themselves are: an inventory kept in a comment is one nobody can check.
+/// Every file the install writes appears here with the digest it is verified
+/// against, so the inventory describes the bytes on disk and not a
+/// recollection of them.
+///
+/// Wilkes fetches these artifacts at the user's request rather than shipping
+/// them inside the application, which is why the inventory is shown where the
+/// download is offered: the terms are disclosed before the bytes arrive, not
+/// after.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecognizerInventory {
+    pub name: String,
+    pub repo: String,
+    pub revision: String,
+    pub license: String,
+    pub license_url: String,
+    pub derived_from: Vec<String>,
+    pub artifacts: Vec<InventoriedArtifact>,
+    pub footprint_bytes: u64,
+}
+
+/// The inventory of one checkpoint.
+pub fn inventory(checkpoint: &Checkpoint) -> RecognizerInventory {
+    RecognizerInventory {
+        name: checkpoint.name.to_string(),
+        repo: checkpoint.repo.to_string(),
+        revision: checkpoint.revision.to_string(),
+        license: checkpoint.license.to_string(),
+        license_url: checkpoint.license_url.to_string(),
+        derived_from: checkpoint
+            .derived_from
+            .iter()
+            .map(|component| (*component).to_string())
+            .collect(),
+        artifacts: checkpoint
+            .artifacts()
+            .iter()
+            .map(|artifact| InventoriedArtifact {
+                filename: artifact.filename.to_string(),
+                size_bytes: artifact.size_bytes,
+                sha256: artifact.sha256.to_string(),
+            })
+            .collect(),
+        footprint_bytes: checkpoint.footprint_bytes(),
+    }
+}
 
 // ── The pinned extraction settings ───────────────────────────────────────────
 
@@ -378,11 +482,7 @@ pub fn install(
     progress: Option<ProgressTx>,
 ) -> anyhow::Result<()> {
     let reporter = progress.map(HfProgressReporter::new);
-    for artifact in [
-        &checkpoint.weights,
-        &checkpoint.tokenizer,
-        &checkpoint.config,
-    ] {
+    for artifact in checkpoint.artifacts() {
         let path = match cached_path(data_dir, checkpoint, artifact) {
             Some(path) => path,
             None => {
@@ -492,6 +592,9 @@ pub struct PaddleOcrVl {
     image_token_id: u32,
     eos_token_id: u32,
     device: Device,
+    /// The device the recognizer actually realized, as the evaluation reports
+    /// it. A latency figure that does not say what it ran on is not one.
+    device_name: String,
     dtype: DType,
     spatial_merge: usize,
     patch_size: usize,
@@ -505,6 +608,7 @@ impl PaddleOcrVl {
         if let Some(reason) = &realized.fallback_reason {
             warn!("recognizer falling back to {}: {reason}", realized.name);
         }
+        let device_name = realized.name.clone();
         let device = realized.device;
         // F32 everywhere: the CPU path is the one every supported platform
         // has, and candle's accelerate backend does not carry f16 matmul.
@@ -541,6 +645,7 @@ impl PaddleOcrVl {
             image_token_id: config.image_token_id,
             eos_token_id,
             device,
+            device_name,
             dtype,
             spatial_merge: config.vision_config.spatial_merge_size,
             patch_size: config.vision_config.patch_size,
@@ -721,6 +826,12 @@ pub struct EvaluationResult {
     /// Character error rate against the expected text, joined in emission
     /// order: substitutions, insertions and deletions over expected length.
     pub character_error_rate: f64,
+    /// The same edit distance over whitespace-separated words rather than
+    /// characters. Reported beside the character rate because they fail
+    /// differently: one misread letter costs a character and a whole word, so
+    /// a transcription that is nearly right reads badly here and a
+    /// transcription that drops a label reads badly in both.
+    pub word_error_rate: f64,
     /// Per case, so one unreadable figure is visible as one unreadable figure
     /// rather than as a slightly worse average.
     pub per_case: Vec<CaseResult>,
@@ -737,8 +848,88 @@ pub struct EvaluationResult {
     /// opposite side of the figure, and that is the failure that would put a
     /// search hit on the wrong part of the page.
     pub worst_centre_error: f64,
+    /// How much of the model's emission order agrees with the order the figure
+    /// draws its text in: one minus the fraction of region pairs the model
+    /// emitted the wrong way round.
+    ///
+    /// 1.0 is complete agreement and 0.5 is what shuffling would give. The
+    /// measurement exists because reading order is a way to be wrong that
+    /// character error cannot see: a figure whose every label is transcribed
+    /// perfectly still reads incorrectly if the labels arrive in an order the
+    /// drawing does not support, and on a figure whose elements sit side by
+    /// side there is more than one defensible order.
+    ///
+    /// Only regions that transcribed correctly are ordered — a misread has no
+    /// place in the expected sequence, and it is already counted as a misread.
+    /// Two expected regions that read the same string count as one position,
+    /// so a repeated label contributes no disagreement either way.
+    pub reading_order_agreement: f64,
+    /// The pairs behind the fraction above, so an agreement of 1.0 over three
+    /// comparisons is not read as an agreement of 1.0 over three hundred.
+    pub reading_order_pairs: usize,
     pub observations: Vec<RegionObservation>,
     pub seconds_per_image: f64,
+    /// What the checkpoint costs on disk, from its pinned artifact sizes.
+    pub model_footprint_bytes: u64,
+    /// The process's peak resident set after the run — the whole process, not
+    /// the model alone, because that is the number that decides whether a
+    /// machine can run this at all. `None` where the platform does not report
+    /// it rather than a zero that would read as "measured, and small".
+    pub peak_memory_bytes: Option<u64>,
+    /// The build and machine the numbers above were produced on.
+    ///
+    /// FIGURE.md's evaluation list asks for supported-platform packaging, and
+    /// this is the part of it a run can establish: a latency figure without
+    /// the target, the device and the compiled backends beside it is not
+    /// attributable to anything.
+    pub platform: String,
+}
+
+/// The target, device and compiled inference backends of this run.
+fn platform_description(device: &str) -> String {
+    let backends = [
+        ("candle-metal", cfg!(feature = "candle-metal")),
+        ("candle-accelerate", cfg!(feature = "candle-accelerate")),
+    ]
+    .into_iter()
+    .filter(|(_, enabled)| *enabled)
+    .map(|(name, _)| name)
+    .collect::<Vec<_>>();
+    format!(
+        "{}-{} / {device} / f32 / {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        match backends.is_empty() {
+            true => "no accelerated backend compiled in".to_string(),
+            false => backends.join(" + "),
+        }
+    )
+}
+
+/// The process's peak resident set size, where the platform reports one.
+#[cfg(unix)]
+fn peak_memory_bytes() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage` fills the whole `rusage` it is given for
+    // `RUSAGE_SELF`, and it is only read after a success return.
+    let read = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if read != 0 {
+        warn!("could not read peak memory: {}", std::io::Error::last_os_error());
+        return None;
+    }
+    let maxrss = u64::try_from(unsafe { usage.assume_init() }.ru_maxrss).ok()?;
+    // macOS reports bytes here and Linux reports kilobytes. The same field
+    // with two units is the kind of thing that silently reports a gigabyte as
+    // a megabyte, so it is converted by target rather than guessed at.
+    Some(match cfg!(target_os = "macos") {
+        true => maxrss,
+        false => maxrss * 1024,
+    })
+}
+
+#[cfg(not(unix))]
+fn peak_memory_bytes() -> Option<u64> {
+    None
 }
 
 /// One figure's outcome, kept separately from the aggregate.
@@ -746,6 +937,13 @@ pub struct EvaluationResult {
 pub struct CaseResult {
     pub name: String,
     pub character_error_rate: f64,
+    pub word_error_rate: f64,
+    /// The order agreement of this figure alone, and the pairs it rests on.
+    /// Per case because reading order is a property of a layout: one figure
+    /// whose elements sit side by side can disagree while every other figure
+    /// in the corpus is read top to bottom exactly.
+    pub reading_order_agreement: f64,
+    pub reading_order_pairs: usize,
     pub expected: usize,
     pub emitted: usize,
     pub missed: usize,
@@ -791,15 +989,18 @@ impl EvaluationResult {
 
 /// Measure one checkpoint on a corpus.
 ///
-/// This is FIGURE.md's implementation-plan step 1, made runnable: character
-/// error, coordinate accuracy, admission-rule viability and CPU latency, which
-/// are the four things that step names. It needs the checkpoint installed —
+/// This is FIGURE.md's implementation-plan step 1 and step 9's metric list,
+/// made runnable: character and word error, missed and false regions, reading
+/// order, coordinate accuracy, latency, model footprint, peak memory, and the
+/// platform they were all produced on. It needs the checkpoint installed —
 /// 1.9 GB — so its caller is an ignored test rather than the suite.
 pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationResult {
     let started = std::time::Instant::now();
     let (mut errors, mut expected_chars) = (0usize, 0usize);
+    let (mut word_errors, mut expected_words) = (0usize, 0usize);
     let (mut false_regions, mut missed_regions) = (0usize, 0usize);
     let (mut centre_errors, mut worst_centre_error) = (Vec::new(), 0f64);
+    let (mut order_agreements, mut order_pairs) = (0usize, 0usize);
     let (mut observations, mut per_case) = (Vec::new(), Vec::new());
 
     for case in corpus {
@@ -810,6 +1011,12 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
             .map(|region| region.text.chars().count())
             .sum();
         expected_chars += case_chars;
+        let case_words: usize = case
+            .expected
+            .iter()
+            .map(|region| region.text.split_whitespace().count())
+            .sum();
+        expected_words += case_words;
 
         let regions = match engine.spot(&case.image) {
             Ok(regions) => regions,
@@ -817,9 +1024,16 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
                 warn!("{}/{}: recognition failed: {error:#}", engine.checkpoint.name, case.name);
                 missed_regions += case.expected.len();
                 errors += case_chars;
+                word_errors += case_words;
                 per_case.push(CaseResult {
                     name: case.name.clone(),
                     character_error_rate: 1.0,
+                    word_error_rate: 1.0,
+                    // A run that emitted nothing put no regions in an order.
+                    // Zero pairs is what says so; an agreement of 1.0 over
+                    // zero pairs would read as a figure read perfectly.
+                    reading_order_agreement: 1.0,
+                    reading_order_pairs: 0,
                     expected: case.expected.len(),
                     emitted: 0,
                     missed: case.expected.len(),
@@ -848,19 +1062,49 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
         let case_errors = edit_distance(&expected_text, &emitted_text);
         errors += case_errors;
 
+        let expected_words_of = |regions: &[&str]| -> Vec<String> {
+            regions
+                .iter()
+                .flat_map(|text| text.split_whitespace())
+                .map(str::to_string)
+                .collect()
+        };
+        let case_word_errors = edit_distance(
+            &expected_words_of(
+                &case
+                    .expected
+                    .iter()
+                    .map(|region| region.text.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+            &expected_words_of(
+                &regions
+                    .iter()
+                    .map(|region| region.text.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        word_errors += case_word_errors;
+
+        // Where each correctly transcribed region sits in the order the figure
+        // draws its text. The position of the *first* expected region with
+        // that text, so two regions reading the same string share a position
+        // and neither can disagree with the other.
+        let mut emitted_positions: Vec<usize> = Vec::new();
         for region in &regions {
             let matched = case
                 .expected
                 .iter()
-                .find(|expected| expected.text == region.text);
+                .position(|expected| expected.text == region.text);
             observations.push(RegionObservation {
                 confidence: region.confidence,
                 correct: matched.is_some(),
             });
             match matched {
                 None => false_regions += 1,
-                Some(expected) => {
-                    if let Some(want) = expected.centre {
+                Some(position) => {
+                    emitted_positions.push(position);
+                    if let Some(want) = case.expected[position].centre {
                         let centre = quad_centre(&region.quad);
                         let error =
                             f64::from((centre.x - want.x).hypot(centre.y - want.y));
@@ -870,6 +1114,9 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
                 }
             }
         }
+        let (case_order_agreements, case_order_pairs) = order_agreement(&emitted_positions);
+        order_agreements += case_order_agreements;
+        order_pairs += case_order_pairs;
         let missed = case
             .expected
             .iter()
@@ -883,6 +1130,13 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
             } else {
                 case_errors as f64 / case_chars as f64
             },
+            word_error_rate: if case_words == 0 {
+                f64::from(u32::from(!regions.is_empty()))
+            } else {
+                case_word_errors as f64 / case_words as f64
+            },
+            reading_order_agreement: fraction(case_order_agreements, case_order_pairs),
+            reading_order_pairs: case_order_pairs,
             expected: case.expected.len(),
             emitted: regions.len(),
             missed,
@@ -893,10 +1147,14 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
         // because an evaluation whose only output arrives at the end is one
         // you cannot tell from a hang.
         info!(
-            "{}/{}: CER {:.3}, {} of {} expected, {:.1}s — {:?}",
+            "{}/{}: CER {:.3}, WER {:.3}, order {:.2} over {} pairs, \
+             {} of {} expected, {:.1}s — {:?}",
             engine.checkpoint.name,
             outcome.name,
             outcome.character_error_rate,
+            outcome.word_error_rate,
+            outcome.reading_order_agreement,
+            outcome.reading_order_pairs,
             outcome.expected - outcome.missed,
             outcome.expected,
             outcome.seconds,
@@ -913,6 +1171,11 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
         } else {
             errors as f64 / expected_chars as f64
         },
+        word_error_rate: if expected_words == 0 {
+            0.0
+        } else {
+            word_errors as f64 / expected_words as f64
+        },
         per_case,
         false_regions,
         missed_regions,
@@ -922,13 +1185,54 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
             centre_errors.iter().sum::<f64>() / centre_errors.len() as f64
         },
         worst_centre_error,
+        reading_order_agreement: fraction(order_agreements, order_pairs),
+        reading_order_pairs: order_pairs,
         observations,
         seconds_per_image: if corpus.is_empty() {
             0.0
         } else {
             started.elapsed().as_secs_f64() / corpus.len() as f64
         },
+        model_footprint_bytes: engine.checkpoint.footprint_bytes(),
+        peak_memory_bytes: peak_memory_bytes(),
+        platform: platform_description(&engine.device_name),
     }
+}
+
+/// `agreements / pairs`, with no pairs reported as complete agreement.
+///
+/// A corpus that put nothing in an order has nothing to disagree with, and the
+/// count of pairs is reported beside every one of these so the distinction
+/// between "agreed everywhere" and "nowhere to disagree" is never carried by
+/// the fraction alone.
+fn fraction(agreements: usize, pairs: usize) -> f64 {
+    match pairs {
+        0 => 1.0,
+        pairs => agreements as f64 / pairs as f64,
+    }
+}
+
+/// How many pairs of emitted regions are in the order the figure draws them,
+/// and how many pairs were comparable at all.
+///
+/// Every pair of positions is compared, not just adjacent ones, so one label
+/// emitted at the far end of the sequence costs as much as it should rather
+/// than costing one swap. Pairs at the same position — two regions reading the
+/// same string — are not comparable and are counted in neither.
+fn order_agreement(positions: &[usize]) -> (usize, usize) {
+    let (mut agreements, mut pairs) = (0usize, 0usize);
+    for (index, earlier) in positions.iter().enumerate() {
+        for later in &positions[index + 1..] {
+            if earlier == later {
+                continue;
+            }
+            pairs += 1;
+            if earlier < later {
+                agreements += 1;
+            }
+        }
+    }
+    (agreements, pairs)
 }
 
 /// The centre of a quadrilateral, as the mean of its corners.
@@ -939,10 +1243,14 @@ fn quad_centre(quad: &[crate::types::Point; 4]) -> crate::types::Point {
     }
 }
 
-/// Levenshtein distance over characters. Character-aware by construction: the
-/// inputs are already character slices, because a transcription is arbitrary
-/// Unicode and has no byte offsets that are safe to index.
-fn edit_distance(expected: &[char], actual: &[char]) -> usize {
+/// Levenshtein distance over whatever the units are — characters for the
+/// character error rate, words for the word error rate. One implementation,
+/// because the two rates differ in what they count and in nothing else.
+///
+/// Character-aware by construction: the caller has already split the text into
+/// units, because a transcription is arbitrary Unicode and has no byte offsets
+/// that are safe to index.
+fn edit_distance<T: PartialEq>(expected: &[T], actual: &[T]) -> usize {
     let mut previous: Vec<usize> = (0..=actual.len()).collect();
     let mut current = vec![0usize; actual.len() + 1];
     for (row, want) in expected.iter().enumerate() {
@@ -968,6 +1276,18 @@ mod tests {
     /// twice.
     fn evaluation_model_dir() -> Option<std::path::PathBuf> {
         std::env::var_os("WILKES_MODEL_DIR").map(std::path::PathBuf::from)
+    }
+
+    /// Byte counts as a person reads them, for the evaluation's own printout.
+    fn format_bytes(bytes: u64) -> String {
+        const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+        let mut value = bytes as f64;
+        let mut unit = 0;
+        while value >= 1024.0 && unit + 1 < UNITS.len() {
+            value /= 1024.0;
+            unit += 1;
+        }
+        format!("{value:.2} {}", UNITS[unit])
     }
 
     /// The thresholds the sweep reports on. Wide, because the point is to see
@@ -1031,20 +1351,36 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{}: {error:#}", checkpoint.name));
             let result = evaluate(&engine, &corpus);
             println!(
-                "{}: CER {:.3}  missed {}  false {}  centre err {:.3} (worst {:.3})  {:.1}s/image",
+                "{}: CER {:.3}  WER {:.3}  missed {}  false {}  centre err {:.3} \
+                 (worst {:.3})  order {:.2} over {} pairs  {:.1}s/image",
                 result.checkpoint,
                 result.character_error_rate,
+                result.word_error_rate,
                 result.missed_regions,
                 result.false_regions,
                 result.centre_error,
                 result.worst_centre_error,
+                result.reading_order_agreement,
+                result.reading_order_pairs,
                 result.seconds_per_image,
+            );
+            println!(
+                "    {} on disk, peak RSS {}, on {}",
+                format_bytes(result.model_footprint_bytes),
+                result
+                    .peak_memory_bytes
+                    .map_or("not reported by this platform".to_string(), format_bytes),
+                result.platform,
             );
             for case in &result.per_case {
                 println!(
-                    "    {:<22} CER {:.3}  expected {:<2} emitted {:<2} missed {:<2} {:.1}s{}",
+                    "    {:<22} CER {:.3}  WER {:.3}  order {:.2}/{:<3} \
+                     expected {:<2} emitted {:<2} missed {:<2} {:.1}s{}",
                     case.name,
                     case.character_error_rate,
+                    case.word_error_rate,
+                    case.reading_order_agreement,
+                    case.reading_order_pairs,
                     case.expected,
                     case.emitted,
                     case.missed,
@@ -1259,14 +1595,55 @@ mod tests {
                 "{} is not a commit sha",
                 checkpoint.name
             );
-            for artifact in [
-                &checkpoint.weights,
-                &checkpoint.tokenizer,
-                &checkpoint.config,
-            ] {
+            for artifact in checkpoint.artifacts() {
                 assert_eq!(artifact.sha256.len(), 64, "{}", artifact.filename);
                 assert!(artifact.size_bytes > 0, "{}", artifact.filename);
             }
+        }
+    }
+
+    /// FIGURE.md: *the redistributed checkpoint must still receive a
+    /// model-specific license/provenance inventory before it is packaged.*
+    ///
+    /// The inventory is checked rather than asserted in prose, and it is
+    /// checked against the artifact list the install actually walks — so a
+    /// fourth file added to a checkpoint cannot be downloaded onto a user's
+    /// disk without appearing in what the user is told they are downloading.
+    #[test]
+    fn every_shipped_artifact_is_covered_by_a_license_and_provenance_inventory() {
+        for checkpoint in CHECKPOINTS {
+            let inventory = inventory(checkpoint);
+            assert_eq!(inventory.license, "Apache-2.0", "{}", checkpoint.name);
+            assert!(
+                inventory.license_url.starts_with("https://"),
+                "{} has no reachable license statement",
+                checkpoint.name
+            );
+            assert!(
+                !inventory.derived_from.is_empty(),
+                "{} names nothing it is derived from",
+                checkpoint.name
+            );
+            assert_eq!(
+                inventory.artifacts.len(),
+                checkpoint.artifacts().len(),
+                "{} installs files the inventory does not name",
+                checkpoint.name
+            );
+            for (inventoried, artifact) in inventory.artifacts.iter().zip(checkpoint.artifacts()) {
+                assert_eq!(inventoried.filename, artifact.filename);
+                assert_eq!(inventoried.sha256, artifact.sha256);
+                assert_eq!(inventoried.size_bytes, artifact.size_bytes);
+            }
+            assert_eq!(
+                inventory.footprint_bytes,
+                inventory
+                    .artifacts
+                    .iter()
+                    .map(|artifact| artifact.size_bytes)
+                    .sum::<u64>(),
+            );
+            assert_eq!(inventory.revision, checkpoint.revision);
         }
     }
 
@@ -1289,5 +1666,95 @@ mod tests {
         assert_eq!(edit_distance(&chars("kitten"), &chars("sitting")), 3);
         assert_eq!(edit_distance(&chars("Größe"), &chars("Größe")), 0);
         assert_eq!(edit_distance(&chars(""), &chars("abc")), 3);
+    }
+
+    /// The same distance over words, which is the whole difference between the
+    /// two rates. One misread letter is one character and one whole word.
+    #[test]
+    fn the_edit_distance_counts_words_when_it_is_given_words() {
+        let words = |text: &str| {
+            text.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            edit_distance(&words("Knowledge base"), &words("Knowledge bose")),
+            1
+        );
+        assert_eq!(
+            edit_distance(&words("User interface"), &words("User interface")),
+            0
+        );
+        assert_eq!(edit_distance(&words("a b c"), &words("a c")), 1);
+    }
+
+    /// Reading order is a way to be wrong that character error cannot see, so
+    /// it is measured on its own: perfect agreement, complete reversal, and
+    /// one label emitted out of turn.
+    #[test]
+    fn reading_order_scores_the_sequence_and_not_the_characters() {
+        assert_eq!(order_agreement(&[0, 1, 2, 3]), (6, 6));
+        assert_eq!(order_agreement(&[3, 2, 1, 0]), (0, 6));
+
+        // One label emitted last that the figure draws first: it disagrees
+        // with each of the three it should have preceded, and nothing else.
+        let (agreements, pairs) = order_agreement(&[1, 2, 3, 0]);
+        assert_eq!((agreements, pairs), (3, 6));
+        assert!((fraction(agreements, pairs) - 0.5).abs() < 1e-9);
+    }
+
+    /// Two regions that read the same string are one position, so a repeated
+    /// label — `Expert` twice in the sample's diagram — cannot disagree with
+    /// itself in either direction.
+    #[test]
+    fn a_repeated_label_is_one_position_and_disagrees_with_nothing() {
+        assert_eq!(order_agreement(&[2, 2, 2]), (0, 0));
+        assert_eq!(order_agreement(&[0, 2, 2, 3]), (5, 5));
+    }
+
+    /// Nothing emitted is nothing in an order. The pair count is what says so,
+    /// which is why every agreement is reported beside one.
+    #[test]
+    fn an_empty_sequence_has_no_pairs_to_agree_about() {
+        assert_eq!(order_agreement(&[]), (0, 0));
+        assert_eq!(order_agreement(&[4]), (0, 0));
+        assert_eq!(fraction(0, 0), 1.0);
+    }
+
+    /// The footprint is the pinned sizes and nothing else — the number a user
+    /// is told before a 1.9 GB download starts.
+    #[test]
+    fn the_footprint_is_the_sum_of_the_pinned_artifacts() {
+        for checkpoint in CHECKPOINTS {
+            assert_eq!(
+                checkpoint.footprint_bytes(),
+                checkpoint.weights.size_bytes
+                    + checkpoint.tokenizer.size_bytes
+                    + checkpoint.config.size_bytes,
+            );
+        }
+        assert!(SHIPPED_CHECKPOINT.footprint_bytes() > 1_900_000_000);
+    }
+
+    /// A latency figure with no target, device or compiled backend beside it
+    /// is not attributable to anything, so the run records all three.
+    #[test]
+    fn the_platform_names_the_target_the_device_and_the_backends() {
+        let platform = platform_description("cpu");
+        assert!(platform.contains(std::env::consts::OS), "{platform}");
+        assert!(platform.contains(std::env::consts::ARCH), "{platform}");
+        assert!(platform.contains("cpu"), "{platform}");
+        assert!(platform.contains("f32"), "{platform}");
+    }
+
+    /// Peak memory is the number that decides whether a machine can run this
+    /// at all. Where the platform reports one it is a real quantity; where it
+    /// does not, it is absent rather than a zero that would read as measured.
+    #[test]
+    fn peak_memory_is_a_real_quantity_or_is_absent() {
+        match peak_memory_bytes() {
+            Some(bytes) => assert!(bytes > 1_000_000, "{bytes} bytes is not this process"),
+            None => assert!(!cfg!(unix), "unix reports a resident set size"),
+        }
     }
 }
