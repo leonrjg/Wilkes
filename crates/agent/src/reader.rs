@@ -22,8 +22,7 @@ fn is_pdf(path: &Path) -> bool {
 }
 
 fn registry() -> ExtractorRegistry {
-    let mut registry = ExtractorRegistry::new();
-    registry.register(Box::new(PdfExtractor::new()));
+    let registry = wilkes_core::extract::production_registry();
     registry
 }
 

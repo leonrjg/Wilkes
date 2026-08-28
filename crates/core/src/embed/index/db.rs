@@ -3329,7 +3329,7 @@ impl SemanticIndex {
         // to a single file's chunks + embeddings on top of the model weights.
         for (i, path) in paths.iter().enumerate() {
             let extraction_recipe =
-                ExtractionRecipe::for_path(path, indexing.chunk_size, indexing.chunk_overlap);
+                ExtractionRecipe::for_path(path, extractors, indexing.chunk_size, indexing.chunk_overlap);
             anyhow::ensure!(
                 !cancel_flag.load(Ordering::Relaxed),
                 "Index build cancelled"
@@ -5302,7 +5302,7 @@ impl SemanticIndex {
         let prepared = Self::prepare_file(path, extractors, embedder, chunk_size, chunk_overlap)?;
         self.write_file_with_recipe(
             prepared,
-            &ExtractionRecipe::for_path(path, chunk_size, chunk_overlap),
+            &ExtractionRecipe::for_path(path, extractors, chunk_size, chunk_overlap),
             None,
             None,
             false,

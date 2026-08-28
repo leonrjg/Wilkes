@@ -340,7 +340,16 @@ fn relocate_marginalia(
             continue;
         }
 
-        let last_body = in_body.iter().rposition(|body| *body);
+        // The last block of *text* in the body column. Read from the extents
+        // rather than from `in_body`, because a block with no extent is in
+        // the body only in the sense that it cannot be placed — a native
+        // image at the foot of a page is one, and letting it stand as the
+        // last body block would relocate an aside that sits above it and was
+        // previously left alone.
+        let last_body = in_body
+            .iter()
+            .zip(&extents)
+            .rposition(|(body, extent)| *body && extent.is_some());
         let mut reordered = Vec::with_capacity(page.blocks.len());
         let mut page_flows = Vec::with_capacity(page.blocks.len());
         let mut asides = Vec::new();

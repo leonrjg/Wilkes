@@ -12,11 +12,13 @@
 //! The stages have one owner each and no fallbacks between them: a recognizer
 //! failure is a visible partial result, never a second engine's turn.
 
+pub mod cache;
 pub mod describe;
 pub mod ocr;
 pub mod serialize;
 
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
@@ -169,6 +171,39 @@ impl AnalysisContext {
     }
 }
 
+/// The one image analyzer this process reads documents with.
+///
+/// A single owner, set once at startup, because the invariant is exactly
+/// that: every consumer of a rendition — indexing, watcher updates,
+/// exact-search fallback, MCP reads, summaries, export — must see the same
+/// enrichment. Passing an analyzer per call site is what lets one consumer
+/// enrich a document and another not, and then write both answers into one
+/// index under recipes that disagree.
+///
+/// Unset means no enrichment, which is a configuration and not a failure:
+/// images are still found, digested and counted, and the diagnostics say the
+/// analysis did not run.
+static CONFIGURED_ANALYZER: OnceLock<Option<Arc<dyn ImageAnalyzer>>> = OnceLock::new();
+
+/// Install this process's analyzer. Callable once; a second call is a
+/// configuration bug and says so rather than quietly winning or losing.
+pub fn configure(analyzer: Option<Arc<dyn ImageAnalyzer>>) -> anyhow::Result<()> {
+    let named = analyzer.as_ref().map(|analyzer| analyzer.identity());
+    CONFIGURED_ANALYZER
+        .set(analyzer)
+        .map_err(|_| anyhow::anyhow!("the image analyzer was already configured"))?;
+    match named {
+        Some(identity) => debug!("image analyzer configured: {identity}"),
+        None => debug!("no image analyzer configured"),
+    }
+    Ok(())
+}
+
+/// This process's analyzer, or none.
+pub fn configured() -> Option<Arc<dyn ImageAnalyzer>> {
+    CONFIGURED_ANALYZER.get().cloned().flatten()
+}
+
 /// One configured way to enrich native images.
 ///
 /// Sync on purpose. Extraction is a synchronous contract with many callers —
@@ -193,16 +228,40 @@ pub trait ImageAnalyzer: Send + Sync {
     );
 }
 
-/// The analyzer Wilkes runs when one is configured: one recognizer, and a
-/// describer if there is one.
+/// The analyzer Wilkes runs when one is configured: one recognizer, a
+/// describer if there is one, and a cache if there is somewhere to keep it.
 pub struct NativeImageAnalyzer {
     ocr: Box<dyn OcrEngine>,
     describer: Option<Box<dyn FigureDescriber>>,
+    cache: Option<cache::AnnotationCache>,
 }
 
 impl NativeImageAnalyzer {
     pub fn new(ocr: Box<dyn OcrEngine>, describer: Option<Box<dyn FigureDescriber>>) -> Self {
-        Self { ocr, describer }
+        Self {
+            ocr,
+            describer,
+            cache: None,
+        }
+    }
+
+    /// Keep annotations under `data_dir`, so a second reading of the same
+    /// document does not run the models again.
+    pub fn with_cache(mut self, cache: cache::AnnotationCache) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    fn cache_key(&self, image: &ExtractedImage) -> cache::AnnotationKey {
+        cache::AnnotationKey {
+            analyzer_identity: self.identity(),
+            page: image.page,
+            image_sha256: image.image_sha256.clone(),
+            pixel_width: image.pixel_width,
+            pixel_height: image.pixel_height,
+            bbox: image.bbox.clone(),
+            transform: image.transform,
+        }
     }
 }
 
@@ -240,6 +299,26 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                 continue;
             };
 
+            // A cached annotation is the same analysis, already done. It is
+            // still counted as analyzed: what the reading contains is what a
+            // full analysis established, and a consumer reading the counts is
+            // asking about the document, not about this machine's disk.
+            let key = self.cache_key(image);
+            if let Some(cached) = self.cache.as_ref().and_then(|cache| cache.get(&key)) {
+                diagnostics.native_images_analyzed += 1;
+                diagnostics.images_ocr_succeeded += 1;
+                image.ocr_regions = cached.ocr_regions;
+                image.description = cached.description;
+                image.status = cached.status;
+                count_regions(image, diagnostics);
+                if image.description.is_some() {
+                    diagnostics.images_description_succeeded += 1;
+                } else if self.describer.is_none() {
+                    diagnostics.images_description_not_configured += 1;
+                }
+                continue;
+            }
+
             diagnostics.native_images_analyzed += 1;
             let mut failures = Vec::new();
 
@@ -267,17 +346,7 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                 }
             }
 
-            for region in &image.ocr_regions {
-                match region.admission {
-                    OcrAdmission::Accepted => diagnostics.ocr_regions_accepted += 1,
-                    OcrAdmission::RejectedLowConfidence => {
-                        diagnostics.ocr_regions_rejected_low_confidence += 1
-                    }
-                    OcrAdmission::DeduplicatedAgainstNativeText => {
-                        diagnostics.ocr_regions_deduplicated_against_native_text += 1
-                    }
-                }
-            }
+            count_regions(image, diagnostics);
 
             match &self.describer {
                 None => diagnostics.images_description_not_configured += 1,
@@ -302,6 +371,31 @@ impl ImageAnalyzer for NativeImageAnalyzer {
             } else {
                 ImageAnalysisStatus::Partial { failures }
             };
+
+            if let Some(cache) = &self.cache {
+                cache.put(
+                    &key,
+                    &cache::Annotation {
+                        ocr_regions: image.ocr_regions.clone(),
+                        description: image.description.clone(),
+                        status: image.status.clone(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn count_regions(image: &ExtractedImage, diagnostics: &mut ExtractionDiagnostics) {
+    for region in &image.ocr_regions {
+        match region.admission {
+            OcrAdmission::Accepted => diagnostics.ocr_regions_accepted += 1,
+            OcrAdmission::RejectedLowConfidence => {
+                diagnostics.ocr_regions_rejected_low_confidence += 1
+            }
+            OcrAdmission::DeduplicatedAgainstNativeText => {
+                diagnostics.ocr_regions_deduplicated_against_native_text += 1
+            }
         }
     }
 }

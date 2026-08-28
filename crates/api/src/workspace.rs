@@ -1180,7 +1180,11 @@ impl WorkspaceManager {
             corpus_id: corpus_id.to_string(),
             embedding_space_id: identity.as_ref().map(|identity| identity.id().0),
             embedding_space_identity: identity,
-            extraction_recipe_id: ExtractionRecipe::new(
+            // The recipe this runtime would produce under, analyzer included:
+            // a corpus reported without it would claim compatibility with
+            // readings it cannot reproduce.
+            extraction_recipe_id: ExtractionRecipe::for_runtime(
+                &wilkes_core::extract::production_registry(),
                 semantic.chunk_size,
                 semantic.chunk_overlap,
             )

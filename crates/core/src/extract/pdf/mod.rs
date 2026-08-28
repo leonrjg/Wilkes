@@ -42,10 +42,6 @@ impl PdfExtractor {
         }
     }
 
-    /// The analyzer recipe this extractor produces readings under.
-    pub fn analyzer_identity(&self) -> &str {
-        &self.analyzer_identity
-    }
 }
 
 impl Default for PdfExtractor {
@@ -55,6 +51,10 @@ impl Default for PdfExtractor {
 }
 
 impl ContentExtractor for PdfExtractor {
+    fn image_analyzer_identity(&self) -> &str {
+        &self.analyzer_identity
+    }
+
     fn can_handle(&self, path: &Path, _mime: Option<&str>) -> bool {
         path.extension()
             .and_then(|e| e.to_str())

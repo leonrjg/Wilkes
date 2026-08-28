@@ -1360,8 +1360,7 @@ async fn get_document_outline_for_mcp(
     let path = resolve_document_path(mcp, params.path, &scope).await?;
     let outline_path = path.clone();
     let declared_outline = tokio::task::spawn_blocking(move || {
-        let mut registry = ExtractorRegistry::new();
-        registry.register(Box::new(PdfExtractor::new()));
+        let registry = wilkes_core::extract::production_registry();
         wilkes_core::extract::document_outline(&outline_path, &registry)
     })
     .await

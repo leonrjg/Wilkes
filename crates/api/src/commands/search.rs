@@ -169,8 +169,7 @@ pub fn start_search(
     let (tx, rx) = mpsc::channel::<FileMatches>(64);
 
     let worker = tokio::task::spawn_blocking(move || {
-        let mut registry = ExtractorRegistry::new();
-        registry.register(Box::new(PdfExtractor::new()));
+        let registry = wilkes_core::extract::production_registry();
 
         let provider: Box<dyn SearchProvider> = match query.mode {
             SearchMode::Semantic => match (embedder, index) {

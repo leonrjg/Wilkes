@@ -238,6 +238,16 @@ pub struct ExtractionRecipe {
     pub chunk_size: usize,
     pub chunk_overlap: usize,
     pub locator_schema_version: String,
+    /// The image analyzer the reading was produced under: models, revisions,
+    /// prompts, admission thresholds, technical limits and the serialization
+    /// of the enrichment block, as the analyzer names itself.
+    ///
+    /// Absent from the hash when it is empty, which is what a runtime with no
+    /// analyzer configured has to declare — so installing a recognizer changes
+    /// the recipe and forces re-extraction, while a runtime that never had one
+    /// keeps the identity it already had.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image_analyzer_recipe: String,
 }
 
 impl ExtractionRecipe {
@@ -250,14 +260,28 @@ impl ExtractionRecipe {
             chunk_size,
             chunk_overlap,
             locator_schema_version: "source-origin-v1".to_string(),
+            image_analyzer_recipe: String::new(),
         }
     }
 
-    /// Exact per-document extractor selection. Source bytes alone do not
-    /// encode the media type in every supported format, so the selected
-    /// extractor is part of rendition compatibility rather than inferred from
-    /// a matching digest.
-    pub fn for_path(path: &std::path::Path, chunk_size: usize, chunk_overlap: usize) -> Self {
+    /// Exact per-document extractor selection, from the registry that will do
+    /// the extracting.
+    ///
+    /// The registry is a parameter rather than the path alone because the
+    /// analyzer is part of what produces the bytes, and the registry is what
+    /// holds it. A recipe derived without it would describe a reading nobody
+    /// produced — which is precisely how two consumers come to disagree about
+    /// what a document says.
+    ///
+    /// Source bytes alone do not encode the media type in every supported
+    /// format, so the selected extractor is part of rendition compatibility
+    /// rather than inferred from a matching digest.
+    pub fn for_path(
+        path: &std::path::Path,
+        extractors: &crate::extract::ExtractorRegistry,
+        chunk_size: usize,
+        chunk_overlap: usize,
+    ) -> Self {
         let mut recipe = Self::new(chunk_size, chunk_overlap);
         recipe.selected_extractor = match path
             .extension()
@@ -270,6 +294,20 @@ impl ExtractionRecipe {
             _ => "plain-text-v1",
         }
         .to_string();
+        recipe.image_analyzer_recipe = extractors.image_analyzer_identity().to_string();
+        recipe
+    }
+
+    /// The recipe a corpus is described by, with the analyzer the runtime is
+    /// configured with. Path-independent: it answers "what would this runtime
+    /// produce", not "what did this file produce".
+    pub fn for_runtime(
+        extractors: &crate::extract::ExtractorRegistry,
+        chunk_size: usize,
+        chunk_overlap: usize,
+    ) -> Self {
+        let mut recipe = Self::new(chunk_size, chunk_overlap);
+        recipe.image_analyzer_recipe = extractors.image_analyzer_identity().to_string();
         recipe
     }
 

@@ -83,8 +83,7 @@ pub async fn build_index_with_embedder(
 
     tokio::task::spawn_blocking(move || {
         tracing::info!("build_index_with_embedder: spawn_blocking SemanticIndex::build start");
-        let mut registry = ExtractorRegistry::new();
-        registry.register(Box::new(PdfExtractor::new()));
+        let registry = wilkes_core::extract::production_registry();
 
         SemanticIndex::build(
             &data_dir_clone,

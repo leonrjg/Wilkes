@@ -2084,6 +2084,7 @@ impl AppContext {
         let expected_space = expected_identity.id();
         let recipe = ExtractionRecipe::for_path(
             &snapshot_path,
+            &wilkes_core::extract::production_registry(),
             settings.semantic.chunk_size,
             settings.semantic.chunk_overlap,
         );
@@ -2168,8 +2169,7 @@ impl AppContext {
             let chunk_size = settings.semantic.chunk_size;
             let chunk_overlap = settings.semantic.chunk_overlap;
             tokio::task::spawn_blocking(move || {
-                let mut extractors = ExtractorRegistry::new();
-                extractors.register(Box::new(PdfExtractor::new()));
+                let extractors = wilkes_core::extract::production_registry();
                 SemanticIndex::prepare_file(
                     &snapshot_for_task,
                     &extractors,
@@ -2243,6 +2243,7 @@ impl AppContext {
         let settings = self.settings().await;
         let recipe = ExtractionRecipe::for_path(
             &canonical_snapshot_path,
+            &wilkes_core::extract::production_registry(),
             settings.semantic.chunk_size,
             settings.semantic.chunk_overlap,
         );
@@ -2465,8 +2466,7 @@ impl AppContext {
             _ => "application/octet-stream",
         }
         .to_string();
-        let mut registry = ExtractorRegistry::new();
-        registry.register(Box::new(PdfExtractor::new()));
+        let registry = wilkes_core::extract::production_registry();
         let declared_outline = wilkes_core::extract::document_outline(&snapshot_path, &registry)
             .map_err(|error| format!("Could not read retained document outline: {error:#}"))?;
         let outline = resolve_outline(&declared_outline.entries, &document.chunks);
@@ -3036,8 +3036,7 @@ impl AppContext {
         let (_, path) = self.export_file_path(root, path, "Outline export").await?;
         let outline_path = path.clone();
         let declared_outline = tokio::task::spawn_blocking(move || {
-            let mut registry = ExtractorRegistry::new();
-            registry.register(Box::new(PdfExtractor::new()));
+            let registry = wilkes_core::extract::production_registry();
             wilkes_core::extract::document_outline(&outline_path, &registry)
                 .map_err(|error| format!("Could not read the document outline: {error:#}"))
         })
@@ -3080,8 +3079,7 @@ impl AppContext {
         // document declares no sections" is a claim consumers act on.
         let outline_path = path.clone();
         let outline = tokio::task::spawn_blocking(move || {
-            let mut registry = ExtractorRegistry::new();
-            registry.register(Box::new(PdfExtractor::new()));
+            let registry = wilkes_core::extract::production_registry();
             wilkes_core::extract::document_outline(&outline_path, &registry)
                 .map_err(|error| format!("Could not read the document outline: {error:#}"))
         })
@@ -4406,8 +4404,7 @@ impl AppContext {
             }
         }
 
-        let mut registry = ExtractorRegistry::new();
-        registry.register(Box::new(PdfExtractor::new()));
+        let registry = wilkes_core::extract::production_registry();
         let registry = Arc::new(registry);
         let cache = self.metadata_cache();
         let config = Self::restore_state_indexing_config(&settings);
@@ -6804,8 +6801,7 @@ impl AppContext {
     fn spawn_full_text_backfill(&self) {
         let index_arc = Arc::clone(&*self.index.lock());
         tokio::task::spawn_blocking(move || {
-            let mut registry = ExtractorRegistry::new();
-            registry.register(Box::new(PdfExtractor::new()));
+            let registry = wilkes_core::extract::production_registry();
             let filled = SemanticIndex::backfill_missing_full_text(&index_arc, &registry);
             if filled > 0 {
                 info!("full_text backfill: filled {filled} legacy row(s)");
