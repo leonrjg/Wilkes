@@ -133,7 +133,7 @@ PDF page
             |      `-- text + image-relative polygons + admission signal
             |
             `-- FigureDescriber
-                   `-- semantic description of visible content/relationships
+                   `-- prose description of what the figure shows
                               |
                               v
                     versioned ImageAnnotation
@@ -270,9 +270,9 @@ so switching forces re-extraction. The selection rests on verified facts:
 - All Qwen3-VL sizes are Apache-2.0, which keeps the license/provenance
   inventory clean.
 - The same family scales through the existing Ollama engine (2B–235B) with
-  identical prompting, so one describer prompt and schema serve both the
-  first-class and the external path. External models remain whatever the
-  user pulls into Ollama; Wilkes does not manage those.
+  identical prompting, so one describer prompt serves both the first-class
+  and the external path. External models remain whatever the user pulls into
+  Ollama; Wilkes does not manage those.
 
 Rejected for first-class support: Gemma 4 (license-inventory friction, dead
 audio modality; a reasonable second family later), Moondream (weak
@@ -283,24 +283,39 @@ PaddleOCR-VL (a narrow parsing model that cannot produce free-form
 relationship descriptions; its candidacy is as the OCR engine, not the
 describer).
 
-Verification item before pinning the recipe: whether candle's `qwen3_vl` has
-a quantized-GGUF path or is dense-safetensors only. The engine supports both
-loading styles, but the answer decides the 2B recipe's footprint (~2 GB vs
-~4 GB on disk).
+Verification item before pinning the recipe, **resolved 2026-08-27**:
+candle 0.11's `qwen3_vl` is dense-safetensors only — there is no
+`quantized_qwen3_vl` module beside it, as there is for several text
+families. The 2B recipe is therefore ~4.4 GB on disk, the upper end of the
+range this item was opened to decide, and there is no quantized path to fall
+back to without writing one.
+
+Two further facts about the module, from the same reading, because they are
+what the integration costs: it exposes `forward` and no generation helper,
+and its `forward` takes the 3D M-RoPE position sections, the deepstack
+visual indexes, and the per-image placeholder spans (`continuous_img_pad`)
+as caller-supplied arguments. Wilkes owns all of that geometry, alongside
+the dynamic-resolution patch flattening the vision tower expects. That is a
+larger Wilkes-owned surface than the recognizer's, and none of it is
+checkable without the weights.
 
 A describer receives:
 
 - the native image pixels;
 - accepted OCR regions and their coordinates;
-- a fixed instruction to report only visible content and relationships;
-- a fixed, versioned response schema.
+- a fixed, versioned instruction to describe, in detail, only what is
+  visibly present — the elements drawn and the relationships the drawing
+  expresses between them.
 
 It does not receive a caption in this phase because caption association is
 deferred.
 
+It returns prose. There is no response schema (**amended 2026-08-27**; see
+"Why the description is prose and not a schema").
+
 ```rust
 trait FigureDescriber {
-    async fn describe(
+    fn describe(
         &self,
         image: &RgbImage,
         ocr: &[ImageOcrRegion],
@@ -308,29 +323,78 @@ trait FigureDescriber {
 }
 ```
 
-Example structured output for the sample:
+Synchronous, where this document first sketched it `async`. Extraction is a
+synchronous contract with many callers — indexing, watcher updates,
+exact-search fallback, MCP reads, summaries and export all reach it — and
+making it async to suit one analyzer would push a runtime requirement onto
+every one of them. A describer that needs a server uses a blocking client,
+which is what a batch extraction pass wants anyway.
 
-```json
-{
-  "description": "A non-expert communicates through a user interface with an inference engine, which consults a knowledge base populated by expert knowledge.",
-  "relationships": [
-    {
-      "source": "Expert knowledge",
-      "relation": "feeds",
-      "target": "Knowledge base"
-    },
-    {
-      "source": "User interface",
-      "relation": "communicates bidirectionally with",
-      "target": "Inference engine"
-    }
-  ]
-}
+Example output for the sample:
+
+```text
+A block diagram of an expert system. A non-expert on the left communicates
+through a user interface, which exchanges arrows in both directions with an
+inference engine at the centre. The inference engine draws on a knowledge
+base below it, and the knowledge base is filled from expert knowledge on the
+right. A dashed box encloses the inference engine and the knowledge base and
+is labelled as the expert system.
 ```
 
-The relationships support validation and future features. Canonical text only
-needs a compact natural-language description plus the independently obtained
-OCR transcription.
+### Why the description is prose and not a schema
+
+**Amended 2026-08-27.** The original design returned a `description` string
+alongside a list of `{source, relation, target}` triples under a fixed,
+validated schema. That is withdrawn. The description is prose, detailed, and
+nothing else.
+
+The triples were justified as supporting "validation and future features",
+and neither survives contact with what this phase actually does:
+
+- Nothing consumes them. Canonical text takes the prose; the embedder sees
+  the canonical text; exact search hits the OCR transcription, not the
+  description. A structure no consumer reads is a second representation of
+  the same fact, maintained and versioned for nobody.
+- They do not validate anything. A triple is as invented as the sentence it
+  was extracted from — a describer confident enough to hallucinate an arrow
+  will emit a triple for it. Schema conformance proves the reply was shaped
+  by something that understood the *format*, which is not the claim that
+  matters here.
+- They narrowed the field of usable models for no return. Requiring
+  schema-conformant JSON demands an instruction-tuned model; asking for a
+  paragraph does not. The describer is optional and local-first, so the
+  models it can run on are the constraint, and a requirement that costs
+  candidates has to earn it.
+
+What replaces the schema as the gate on bytes entering the canonical
+reading:
+
+- the reply is normalized and must be non-empty after normalization;
+- it is bounded in length, and a describer that runs past the bound is a
+  truncated claim rather than a paragraph of invention;
+- an empty, refused or unreachable reply is a *failed* description — a
+  partial analysis — never an absent one.
+
+Detail is now asked for explicitly, where the schema previously implied a
+compact summary. The arrows on a figure are what the description exists to
+add: the OCR transcription already carries every label, so a description
+that only restates the labels adds nothing the reading did not have.
+
+Relationship extraction as structured data is not abandoned, only unbuilt:
+it becomes an explicit feature when something consumes it, and it will want
+its own evaluation rather than riding along unmeasured.
+
+### Consequences for the describer selection
+
+The rejection of Moondream above reads "weak relationship extraction on
+dense labeled diagrams", and the rejection of PaddleOCR-VL reads "cannot
+produce free-form relationship descriptions". Both rationales were written
+against the schema. Dropping it widens the field to any model that can
+write a paragraph about a picture, which is a materially larger set than the
+one that can emit conformant JSON — so the describer selection is reopened
+to that extent, and Qwen3-VL remains the selection until something measured
+displaces it. PaddleOCR-VL's rejection stands on its own ground regardless:
+its task prompts are fixed, and none of them produces prose.
 
 Local analysis remains the default requirement. Any remote describer must be
 explicitly configured and visibly disclose that document imagery leaves the
@@ -423,7 +487,7 @@ source PDF SHA-256
 + dictionary SHA-256
 + OCR preprocessing and admission settings
 + description model revision
-+ description prompt/schema version
++ description prompt version
 + canonical serialization version
 ```
 
@@ -690,7 +754,7 @@ narrow.
    - Wire the Qwen3-VL describer through the candle engine, with Ollama as
      the configured external door.
    - Pass image pixels and accepted OCR to the describer.
-   - Validate a fixed response schema.
+   - Normalize the reply, bound its length, and reject an empty one.
    - Report unconfigured and failed descriptions as partial analysis.
 
 6. **Merge annotations into canonical text**
