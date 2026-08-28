@@ -10,8 +10,9 @@ Wilkes will enrich native raster images embedded in PDFs with:
 The OCR engine is provisionally OAR-OCR's classic detection-and-recognition
 pipeline, initially with a PP-OCRv6 model — but it is no longer settled.
 PaddleOCR-VL's end-to-end text-spotting task is a credible challenger the
-original decision record never evaluated, and the choice is now gated on a
-head-to-head comparison; see the OCR decision record. Whichever engine wins
+original decision record never evaluated, and the choice is now gated as
+recorded in the OCR decision record; the roadmap toward LaTeX, figures, and
+tables decides the presumption in its favor. Whichever engine wins
 becomes the only production OCR backend. This phase will not use OAR's
 document-layout, table, formula, or VLM pipelines, and will not pair
 PaddleOCR-VL with a layout model.
@@ -544,17 +545,22 @@ and task prompts is an open verification item.
 [1.6 paper](https://arxiv.org/pdf/2606.03264), and
 [candle paddleocr_vl module](https://docs.rs/candle-transformers/0.11.0/candle_transformers/models/paddleocr_vl/index.html).
 
-**Gate.** The engine is decided by a head-to-head evaluation on the planned
-corpus — character error, coordinate accuracy, logprob-threshold viability,
-CPU latency — and implementation plan step 1 must not execute before the
-gate, because its migration is only needed if OAR wins. No evaluation is
-scheduled yet; the gate records order, not timing.
+**Gate.** The roadmap below commits to LaTeX and tables as goals, which
+decides the presumption on paper: OAR's route to the same goals adds
+PP-FormulaNet, table models, and the dependency migration to reach what one
+prompt-switched model provides. The gate therefore reduces from a bake-off
+to a verification pass — the candle module drives the 1.5/1.6 checkpoints
+and task prompts, `<|LOC|>` output parses to usable quads, and character
+error, coordinate accuracy, admission-rule viability, and CPU latency hold
+on the planned corpus. It still precedes implementation plan step 1 (whose
+migration is only needed if the verification fails and OAR returns), and it
+is still not scheduled; the gate records order, not timing.
 
 ### If LaTeX becomes mandatory
 
 Formulas sit in the deferred list, so LaTeX support is a scope change, not a
-parameter. The analysis is recorded here in case that scope change is ever
-exercised:
+parameter. The roadmap below exercises this scope change in its second and
+third phases; the analysis that led there:
 
 - The presumption flips to PaddleOCR-VL. Its formula recognition is the same
   pinned 0.9B weights behind a `Formula Recognition:` task prompt — no new
@@ -578,6 +584,77 @@ exercised:
 - LaTeX chiefly serves exact search, export, and reading fidelity. Text
   embedders handle raw LaTeX poorly, so semantic retrieval of formula
   content still rides on the describer's natural-language rendering.
+
+## Roadmap: LaTeX, figures, and tables
+
+Decided 2026-08-27: the path to all three targets is one stack, sequenced so
+each phase reuses the previous one's machinery. Two models Wilkes can
+already run — PaddleOCR-VL for recognition of every content type,
+prompt-switched, and Qwen3-VL for description — plus one small ONNX layout
+detector for routing. No OAR, no toolchain migration, no fastembed upgrade.
+The phases are subsequent explicit features; they do not retroactively
+expand this document's deferred list.
+
+### Phase 1 — Raster figures
+
+This document, with PaddleOCR-VL as the engine: MuPDF native image blocks,
+the spotting task for text and page polygons, the Qwen3-VL describer, and
+canonical labeled blocks.
+
+### Phase 2 — Formulas and tables inside figures
+
+Same crops, same weights, different task prompts: `Formula Recognition:`
+yields LaTeX, `Table Recognition:` yields a structured table. The new design
+work is the routing rule for what a crop contains — options recorded under
+"If LaTeX becomes mandatory" — plus that section's serialization,
+provenance, and chunking amendments. This picks up equations embedded as
+images nearly for free.
+
+### Phase 3 — Native vector tables and formulas
+
+Born-digital PDFs draw most tables and math as vector content, invisible to
+the image-block scope. The blocker is region detection, and the routing
+problem that recurs through this document has one answer Wilkes can hold
+without the OAR migration: PP-DocLayoutV2-class layout detectors
+(RT-DETR/PicoDet) are plain ONNX detection graphs — OAR's registry hosts
+ONNX conversions — and Wilkes already carries `ort = "=2.0.0-rc.11"` for
+FastEmbed. Wilkes uses the model artifacts, not the OAR crate, and owns the
+pre- and post-processing. Then: detected region, MuPDF renders the crop (the
+binding has pixmap support), the same PaddleOCR-VL task prompts, and a
+labeled block at the region's reading anchor.
+
+### Decisions taken now
+
+- **Tables serialize as Markdown.** One canonical table format, chosen once
+  and versioned in the extraction recipe. OTSL is compact but hostile to
+  embedders and human readers; a Markdown table serves exact search, LLM
+  consumers, and embeddings from the same bytes.
+- **Recognized regions suppress the native glyphs they displace.** Phase 3
+  is the first time recognized content replaces native text — the garbled
+  glyph runs inside a table or formula region — rather than standing beside
+  it. This is a deliberate extension of the geometric dedup rule already
+  specified for native-text-over-image, not a new invariant, with one
+  addition: every suppressed byte has a recorded reason in diagnostics, the
+  counterpart of every inserted byte carrying truthful provenance.
+
+### Not on the path
+
+- The OAR route to the same goals: classic OCR plus PP-FormulaNet plus table
+  models plus a layout pipeline plus the dependency migration — three
+  additional model families for what one prompt-switched model provides.
+- Whole-page VLM parsing: it replaces ground-truth glyphs with model
+  transcription at seconds per page across a library, and Baidu's own papers
+  argue against end-to-end layout.
+
+### Verification items
+
+- Phase 1: the candle `paddleocr_vl` module drives the 1.5/1.6 checkpoints
+  and task prompts, and `<|LOC|>` output parses to usable quads.
+- Phase 3: the chosen layout detector's ONNX opset runs on the pinned
+  `ort = "=2.0.0-rc.11"`.
+
+Nothing here is scheduled; the roadmap records order and decisions, not
+timing.
 
 ## Proposed implementation plan
 
