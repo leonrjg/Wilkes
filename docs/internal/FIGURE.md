@@ -8,7 +8,9 @@ Wilkes will enrich native raster images embedded in PDFs with:
 2. a separately generated semantic image description.
 
 Decided 2026-08-27: this feature is phase one of a single-stack roadmap to
-three targets — figures, LaTeX formulas, and tables. One prompt-switched
+three targets — figures, LaTeX formulas, and tables — the remaining
+extraction-fidelity gaps for the LLM integrations that read the library, and
+for every other consumer of the canonical reading. One prompt-switched
 recognition model (PaddleOCR-VL) transcribes all three content types; one
 describer (Qwen3-VL through the existing candle generation engine, with
 Ollama as the explicit external door) describes them; from phase three, one
@@ -48,7 +50,8 @@ it does not reconstruct complex layouts.
 - Grouping several PDF objects into one figure.
 - Scanned-page or whole-page layout detection.
 - Learned layout models such as PP-Structure.
-- Tables, formulas, seals, or chart-specific parsing.
+- Tables, formulas, seals, or chart-specific parsing (tables and formulas
+  are roadmap phases 2–3, deferred here — not abandoned).
 - Whole-page VLM document-understanding pipelines.
 - A second OCR engine or runtime fallback.
 
@@ -548,11 +551,12 @@ verification fails, the decision reopens with this record as context; no
 OAR specification is kept warm. Nothing is scheduled; this records order,
 not timing.
 
-### If LaTeX becomes mandatory
+### LaTeX decision analysis
 
-Formulas sit in the deferred list, so LaTeX support is a scope change, not a
-parameter. The roadmap below exercises this scope change in its second and
-third phases; the analysis that led there:
+LaTeX fidelity is a committed goal: the roadmap below exercises it in its
+second and third phases. It is still a scope change relative to this phase —
+formulas sit in the deferred list above — and this is the analysis that
+settled how it will be met:
 
 - The presumption flips to PaddleOCR-VL. Its formula recognition is the same
   pinned 0.9B weights behind a `Formula Recognition:` task prompt — no new
@@ -598,7 +602,7 @@ canonical labeled blocks.
 Same crops, same weights, different task prompts: `Formula Recognition:`
 yields LaTeX, `Table Recognition:` yields a structured table. The new design
 work is the routing rule for what a crop contains — options recorded under
-"If LaTeX becomes mandatory" — plus that section's serialization,
+"LaTeX decision analysis" — plus that section's serialization,
 provenance, and chunking amendments. This picks up equations embedded as
 images nearly for free.
 
@@ -716,8 +720,8 @@ narrow.
 
 The evaluation must measure OCR character/word error, missed and false regions,
 reading order, coordinate accuracy, CPU latency, peak memory, model footprint,
-and supported-platform packaging. It selects one PP-OCRv6 model pair for the
-shipped recipe; it does not create a runtime choice between engines.
+and supported-platform packaging. It selects one PaddleOCR-VL checkpoint for
+the shipped recipe; it does not create a runtime choice between engines.
 
 ## Acceptance criteria
 
