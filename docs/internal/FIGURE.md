@@ -683,8 +683,8 @@ narrow.
    - Apply only explicit technical safety limits.
    - Do not add caption, vector grouping, or layout inference.
 
-4. **Integrate the selected OCR engine** (provisionally OAR classic;
-   PaddleOCR-VL spotting if the gate selects it)
+4. **Integrate the selected OCR engine** (presumptively PaddleOCR-VL
+   spotting; OAR classic only if the verification pass fails)
    - Add one Wilkes-owned adapter; OAR types or `<|LOC|>` parsing stay
      behind the extraction boundary either way.
    - Batch native images from a PDF.
