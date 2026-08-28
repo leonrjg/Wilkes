@@ -1041,11 +1041,36 @@ mod tests {
         }
     }
 
+    /// Write the sample document's diagram to a PNG, so ground truth can be
+    /// written from the figure rather than from a summary of it.
+    ///
+    /// `WILKES_SAMPLE_PDF=<path> WILKES_EVAL_OUT=<file.png> cargo test -p wilkes-core \
+    ///     the_sample_diagram_can_be_looked_at -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a local corpus document"]
+    fn the_sample_diagram_can_be_looked_at() {
+        let Some(case) = sample_diagram_case() else {
+            return;
+        };
+        let out = std::env::var("WILKES_EVAL_OUT").expect("set WILKES_EVAL_OUT to a .png path");
+        case.image.save(&out).expect("the figure is written");
+        println!("{} ({}x{})", out, case.image.width(), case.image.height());
+    }
+
     /// The figure this feature was specified against, taken out of the real
     /// document by the real extraction path.
     ///
-    /// Text only: the spec records what the diagram says, not where on it
-    /// each label sits, so this case measures transcription and contributes
+    /// The ground truth is the twelve lines the figure *draws*, in the row
+    /// order it draws them — not the six labels the spec's prose summarises
+    /// it as. Every label in this diagram is set on two lines inside its own
+    /// shape, and the three circles sit side by side, so the drawn reading
+    /// order runs across the row before it runs down. Expecting the six
+    /// concepts instead scored a completely correct transcription at CER
+    /// 0.663 and zero of six regions, which was a fact about this list and
+    /// not about the recognizer.
+    ///
+    /// Text only: the document records what its diagram says, not where on it
+    /// each line sits, so this case measures transcription and contributes
     /// nothing to the coordinate figure rather than contributing a guess.
     fn sample_diagram_case() -> Option<EvaluationCase> {
         use crate::extract::ContentExtractor;
@@ -1067,12 +1092,23 @@ mod tests {
             name: "sample-expert-system".to_string(),
             image,
             expected: [
-                "Non-expert",
-                "User interface",
-                "Inference engine",
-                "Knowledge base",
-                "Expert system",
-                "Expert knowledge",
+                // Row 1: the tops of the three circles.
+                "User",
+                "Inference",
+                "Knowledge",
+                // Row 2: their second lines.
+                "interface",
+                "engine",
+                "base",
+                // Row 3: the figure on the left, and the brain on the right.
+                "Non-",
+                "Expert",
+                // Row 4.
+                "expert",
+                "knowledge",
+                // Row 5 and 6: the label on the enclosing box.
+                "Expert",
+                "system",
             ]
             .into_iter()
             .map(|text| ExpectedRegion {

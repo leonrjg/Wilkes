@@ -954,6 +954,62 @@ fn exact_search_finds_a_transcribed_label_at_its_own_polygon() {
     assert!(confidence.is_some(), "a transcribed region carries its signal");
 }
 
+/// A label the figure sets on two lines is transcribed as two regions, and the
+/// reading separates them with `; ` — so an exact search for the label as a
+/// person reads it does not find it.
+///
+/// **This is a limitation, not a design.** It is pinned here because the
+/// evaluation found it on the real sample document: PaddleOCR-VL's spotting
+/// task emits one region per drawn line, every label in that diagram is set on
+/// two lines inside its own shape, and the transcription — which is
+/// character-perfect — reaches the reading as `User; interface`. A semicolon
+/// is punctuation the figure does not contain, and FIGURE.md's acceptance
+/// criterion "exact search for `Expert knowledge` finds the sample image"
+/// therefore fails on the very figure it names.
+///
+/// Joining the two would take a geometric rule over the whole region set
+/// rather than over neighbours: the recognizer reads this figure in row order,
+/// so `User` and `interface` are not adjacent in emission — `Inference` and
+/// `Knowledge` come between them. That is layout analysis, which this phase
+/// does not do, so the behaviour is recorded rather than quietly patched.
+#[test]
+fn a_label_split_across_two_drawn_lines_is_two_regions_in_the_reading() {
+    use grep_matcher::Matcher;
+
+    let (content, _) = extract(
+        vec![PageSpec::default().with_image(ImageSpec::gradient(64, 32))],
+        // Stacked, as the sample's circles set their labels, and in the row
+        // order the recognizer actually reads such a figure in.
+        vec![Script::Spots(vec![
+            ("User", 0.95, [0.1, 0.1, 0.4, 0.1, 0.4, 0.3, 0.1, 0.3]),
+            ("Inference", 0.95, [0.6, 0.1, 0.9, 0.1, 0.9, 0.3, 0.6, 0.3]),
+            ("interface", 0.95, [0.1, 0.4, 0.4, 0.4, 0.4, 0.6, 0.1, 0.6]),
+            ("engine", 0.95, [0.6, 0.4, 0.9, 0.4, 0.9, 0.6, 0.6, 0.6]),
+        ])],
+        None,
+    );
+
+    assert!(
+        content.text.contains("Image embedded text: User; Inference; interface; engine."),
+        "each drawn line is its own region: {:?}",
+        content.text
+    );
+
+    let projection = crate::search::pdf_projection::PdfSearchProjection::new(&content.text);
+    let finds = |needle: &str| {
+        crate::search::pdf_projection::literal_matcher(needle, false)
+            .expect("the matcher builds")
+            .find(projection.as_bytes())
+            .expect("the search runs")
+            .is_some()
+    };
+    assert!(finds("User"), "the line itself is findable");
+    assert!(
+        !finds("User interface"),
+        "the label as a person reads it is not findable, and this is the gap"
+    );
+}
+
 /// The acceptance criterion `get_document_text` rests on: a page-scoped read
 /// of the document includes the enrichment, exactly once, and only on the page
 /// that drew the picture.
