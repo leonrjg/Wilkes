@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { SearchApi } from "../services/api";
-import type { EmbedProgress, Settings } from "../lib/types";
+import type { EmbedProgress, RecognizerInventory, Settings } from "../lib/types";
 import { formatModelBytes } from "./ModelCatalog";
 
 interface Props {
@@ -29,6 +29,7 @@ const DEFAULTS = { enabled: false, device: null, describer_model: "" } as const;
 export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: Props) {
   const analysis = settings.image_analysis ?? DEFAULTS;
   const [installed, setInstalled] = useState<boolean | null>(null);
+  const [inventory, setInventory] = useState<RecognizerInventory | null>(null);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -46,6 +47,23 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
   };
 
   useEffect(refreshInstalled, [api]);
+
+  // The inventory describes the shipped recipe rather than this machine, so it
+  // is read once and whether or not anything is installed: it is what the
+  // download is disclosed by, and disclosing it afterwards would be no
+  // disclosure at all.
+  useEffect(() => {
+    let mounted = true;
+    api
+      .imageRecognizerInventory()
+      .then((next) => {
+        if (mounted) setInventory(next);
+      })
+      .catch((cause) => console.error("imageRecognizerInventory failed:", cause));
+    return () => {
+      mounted = false;
+    };
+  }, [api]);
 
   // The install has its own event stream, and a settings change can start one
   // too, so the panel listens for backend truth rather than assuming the
@@ -161,17 +179,58 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
             This is part of how a document is read, not a display option:
             changing it re-reads and re-embeds every document that has a
             picture in it. Recognition runs on this machine and is slow on a
-            CPU — measured at around five minutes for a full-width figure, and
-            longer for a large one. A library of a few hundred figures is an
-            overnight job.
+            CPU — measured at about half a minute for a small diagram, four
+            minutes for a full-width one, and several times that for a large
+            one. A library of a few hundred figures is an overnight job.
           </p>
+
+          {inventory && (
+            <div className="space-y-1.5 border-t border-[var(--border-main)] pt-3">
+              <p className="text-[10px] text-[var(--text-dim)]">
+                {installed === false
+                  ? "Not installed yet. Downloading it fetches "
+                  : "Running "}
+                <span className="text-[var(--text-muted)]">{inventory.name}</span>,{" "}
+                {formatModelBytes(inventory.footprint_bytes)} from{" "}
+                <span className="text-[var(--text-muted)]">{inventory.repo}</span> at{" "}
+                <span className="font-mono">{inventory.revision.slice(0, 12)}</span>,
+                under{" "}
+                <a
+                  href={inventory.license_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[var(--accent-blue)] underline"
+                >
+                  {inventory.license}
+                </a>
+                .
+              </p>
+              <details className="text-[10px] text-[var(--text-dim)]">
+                <summary className="cursor-pointer">What it is made of</summary>
+                <ul className="mt-1 list-disc pl-4">
+                  {inventory.derived_from.map((component) => (
+                    <li key={component}>{component}</li>
+                  ))}
+                </ul>
+                <ul className="mt-1.5 space-y-0.5">
+                  {inventory.artifacts.map((artifact) => (
+                    <li key={artifact.filename} className="font-mono">
+                      {artifact.filename} · {formatModelBytes(artifact.size_bytes)} ·
+                      sha256 {artifact.sha256.slice(0, 12)}…
+                    </li>
+                  ))}
+                </ul>
+                <p className="mt-1.5">
+                  Each file is checked against the size and digest above after
+                  it downloads; one that does not match is deleted rather than
+                  used.
+                </p>
+              </details>
+            </div>
+          )}
 
           {installed === false && (
             <div className="border-t border-[var(--border-main)] pt-3">
-              <p className="mb-2 text-[10px] text-[var(--text-dim)]">
-                The recognizer is not installed yet (about 1.9 GB, downloaded
-                once).
-              </p>
               <button
                 type="button"
                 disabled={busy}

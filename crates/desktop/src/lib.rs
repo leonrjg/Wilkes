@@ -2489,6 +2489,16 @@ fn is_image_recognizer_installed(app: AppHandle) -> bool {
     app_context(&app).is_image_recognizer_installed()
 }
 
+/// What the image recognizer is, where it came from, and under what licence.
+/// Answers whether or not it is installed: it describes the recipe, and the
+/// point of it is to be readable before the download rather than after.
+#[tauri::command]
+fn image_recognizer_inventory(
+    app: AppHandle,
+) -> wilkes_core::extract::image::paddleocr_vl::RecognizerInventory {
+    app_context(&app).image_recognizer_inventory()
+}
+
 /// Download (if needed) and verify the image recognizer, then attach the
 /// analyzer the settings describe. Progress arrives on the
 /// image-analysis-progress stream, terminated by image-analysis-done or
@@ -2760,6 +2770,7 @@ pub fn run() {
             get_generation_model_size,
             load_generation_model,
             is_image_recognizer_installed,
+            image_recognizer_inventory,
             install_image_recognizer,
             explain_related_document,
             summarize_document,

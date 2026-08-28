@@ -265,6 +265,17 @@ pub fn recognizer_installed(data_dir: &std::path::Path) -> bool {
 }
 
 #[cfg(feature = "candle")]
+/// What the shipped recognizer is, where it came from, and under what terms.
+///
+/// Static: this describes the recipe, not the machine, so it answers before
+/// anything is installed. That is the point of it — the terms and the size are
+/// disclosed where the download is offered, rather than after 1.9 GB has
+/// arrived.
+pub fn recognizer_inventory() -> paddleocr_vl::RecognizerInventory {
+    paddleocr_vl::inventory(&paddleocr_vl::SHIPPED_CHECKPOINT)
+}
+
+#[cfg(feature = "candle")]
 /// Download and verify the recognizer the shipped recipe names.
 pub fn install_recognizer(
     data_dir: &std::path::Path,

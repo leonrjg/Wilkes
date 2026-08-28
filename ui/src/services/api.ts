@@ -54,6 +54,7 @@ import type {
   WorkspaceState,
   WorkspaceSummary,
   StartupStatus,
+  RecognizerInventory,
 } from "../lib/types";
 
 export interface DataPaths {
@@ -179,6 +180,10 @@ export interface SearchApi {
    *  the gate for generation: enabled but not installed is a state that
    *  reads as broken. */
   isImageRecognizerInstalled(): Promise<boolean>;
+  /** What the recognizer is, where it came from and under what licence.
+   *  Static — it describes the shipped recipe, not this machine — so it
+   *  answers before the download it discloses. */
+  imageRecognizerInventory(): Promise<RecognizerInventory>;
   /** Download if needed, verify, then attach the analyzer the settings
    *  describe. Progress arrives on `onImageAnalysisProgress`, terminated by
    *  `onImageAnalysisDone`/`onImageAnalysisError`. */

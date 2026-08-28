@@ -49,6 +49,7 @@ import type {
   CompletionFeedback,
   CompletionRequest,
   SessionSteering,
+  RecognizerInventory,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type { SearchApi, WebSourceApi } from "./api";
@@ -726,6 +727,12 @@ export class HttpSearchApi implements SearchApi {
     const res = await fetch("/api/image-analysis/installed");
     if (!res.ok) throw await responseError(res, "isImageRecognizerInstalled");
     return res.json() as Promise<boolean>;
+  }
+
+  async imageRecognizerInventory(): Promise<RecognizerInventory> {
+    const res = await fetch("/api/image-analysis/inventory");
+    if (!res.ok) throw await responseError(res, "imageRecognizerInventory");
+    return res.json() as Promise<RecognizerInventory>;
   }
 
   async installImageRecognizer(): Promise<void> {

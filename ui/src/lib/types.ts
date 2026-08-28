@@ -632,6 +632,32 @@ export interface ImageAnalysisSettings {
   describer_model: string;
 }
 
+/** One file of the recognizer, as the inventory names it. */
+export interface InventoriedArtifact {
+  filename: string;
+  size_bytes: number;
+  sha256: string;
+}
+
+/** What the recognizer is, where it came from, and under what terms.
+ *
+ *  Wilkes fetches these files at the user's request rather than shipping them
+ *  inside the application, so this is what the download is disclosed by: the
+ *  licence, the pinned revision, and every file that will be written, each
+ *  with the digest it is verified against. */
+export interface RecognizerInventory {
+  name: string;
+  repo: string;
+  revision: string;
+  license: string;
+  license_url: string;
+  /** The works the weights are made of, upstream of the repository they are
+   *  fetched from. */
+  derived_from: string[];
+  artifacts: InventoriedArtifact[];
+  footprint_bytes: number;
+}
+
 /** HyDE: search with the embedding of an LLM-generated hypothetical answer,
  *  which sits in document space rather than terse-question space. Requires
  *  generation to be enabled and ready. */

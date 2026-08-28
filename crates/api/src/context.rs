@@ -4585,6 +4585,15 @@ impl AppContext {
         wilkes_core::extract::image::recognizer_installed(&self.shared_data_dir)
     }
 
+    /// What the shipped recognizer is, where it came from, and under what
+    /// terms. Answers before the download, which is the only time it is of
+    /// any use to whoever has to decide about it.
+    pub fn image_recognizer_inventory(
+        &self,
+    ) -> wilkes_core::extract::image::paddleocr_vl::RecognizerInventory {
+        wilkes_core::extract::image::recognizer_inventory()
+    }
+
     /// Download and verify the recognizer, then attach the analyzer if the
     /// settings ask for one.
     ///

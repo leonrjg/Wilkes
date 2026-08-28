@@ -1520,6 +1520,15 @@ async fn is_image_recognizer_installed_handler(State(state): State<Arc<AppState>
     Json(state.context().is_image_recognizer_installed())
 }
 
+/// What the recognizer is, where it came from, and under what licence. Static,
+/// and answers whether or not it is installed: it is what the download is
+/// disclosed by, so it has to be readable before the download.
+async fn image_recognizer_inventory_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<wilkes_core::extract::image::paddleocr_vl::RecognizerInventory> {
+    Json(state.context().image_recognizer_inventory())
+}
+
 async fn install_image_recognizer_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<bool>, (StatusCode, Json<ErrorBody>)> {
@@ -2414,6 +2423,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/image-analysis/installed",
             get(is_image_recognizer_installed_handler),
+        )
+        .route(
+            "/api/image-analysis/inventory",
+            get(image_recognizer_inventory_handler),
         )
         .route(
             "/api/image-analysis/install",

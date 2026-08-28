@@ -58,6 +58,7 @@ import type {
   WorkspaceState,
   WorkspaceSummary,
   StartupStatus,
+  RecognizerInventory,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type { SearchApi, DesktopSourceApi, DataPaths } from "./api";
@@ -384,6 +385,10 @@ export class TauriSearchApi implements SearchApi {
 
   async isImageRecognizerInstalled(): Promise<boolean> {
     return invoke<boolean>("is_image_recognizer_installed");
+  }
+
+  async imageRecognizerInventory(): Promise<RecognizerInventory> {
+    return invoke<RecognizerInventory>("image_recognizer_inventory");
   }
 
   async installImageRecognizer(): Promise<void> {
