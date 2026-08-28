@@ -30,6 +30,18 @@ describe("SettingsModal", () => {
     onGenerationDone: vi.fn(() => Promise.resolve(() => {})),
     onGenerationError: vi.fn(() => Promise.resolve(() => {})),
     isImageRecognizerInstalled: vi.fn(() => Promise.resolve(false)),
+    imageRecognizerInventory: vi.fn(() =>
+      Promise.resolve({
+        name: "paddleocr-vl-1.6",
+        repo: "PaddlePaddle/PaddleOCR-VL-1.6",
+        revision: "c5630abae1d940eafe0697512a0325494b02ab42",
+        license: "Apache-2.0",
+        license_url: "https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6",
+        derived_from: [],
+        artifacts: [],
+        footprint_bytes: 1_928_447_087,
+      }),
+    ),
     installImageRecognizer: vi.fn(() => Promise.resolve()),
     onImageAnalysisProgress: vi.fn(() => Promise.resolve(() => {})),
     onImageAnalysisDone: vi.fn(() => Promise.resolve(() => {})),

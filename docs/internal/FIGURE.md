@@ -364,8 +364,26 @@ Wilkes retains ownership of model installation and extraction identity:
 - Include the candle-transformers version, checkpoint digests, task prompts,
   preprocessing settings, and admission thresholds in the extraction recipe.
 
-PaddleOCR-VL is Apache-2.0 licensed. The redistributed checkpoint must still
-receive a model-specific license/provenance inventory before it is packaged.
+PaddleOCR-VL is Apache-2.0 licensed.
+
+**The inventory exists, 2026-08-28.** The checkpoint carries its SPDX
+identifier, the statement it is published under, and the works it is derived
+from — a NaViT-style vision encoder and an ERNIE-4.5-0.3B decoder, both
+Apache-2.0. Naming only the repository the files are fetched from would have
+been an inventory of the download rather than of the model.
+
+Two things make it an inventory rather than a claim. It is built from the same
+artifact list the install walks, so a fourth file cannot reach a user's disk
+without appearing in what they are told they are downloading, and a test holds
+that. And it is rendered where the download is offered — the licence, the
+size, the pinned revision, the components, and every file with the digest it
+is verified against — so it is readable before the 1.9 GB arrives, which is
+the only time it is of use to whoever has to decide.
+
+Wilkes fetches these files at the user's request rather than shipping them
+inside the application. That is what the disclosure point follows from: there
+is no bundle to put a NOTICE in, and the moment of redistribution is the
+moment the user asks for one.
 
 ### How it is turned on (added 2026-08-28)
 
@@ -401,8 +419,12 @@ loud:
   apart, and it is already the mechanism that re-reads documents when the
   recipe moves.
 
-Recognition costs roughly a minute a picture on a CPU, which is a fact the
-user is told before enabling rather than after.
+Recognition is slow on a CPU, which is a fact the user is told before enabling
+rather than after — and the figure they are told is the measured one. This
+section first said "roughly a minute a picture", which was written before the
+measurement and was wrong by a factor of four at the size that matters: about
+half a minute for a small diagram, four minutes for a full-width one, and
+several times that for a figure large enough to fill the spotting envelope.
 
 ## Image descriptions
 
@@ -966,6 +988,38 @@ reading order, coordinate accuracy, CPU latency, peak memory, model footprint,
 and supported-platform packaging. It selects one PaddleOCR-VL checkpoint for
 the shipped recipe; it does not create a runtime choice between engines.
 
+**All of that list is measured, 2026-08-28.** The first run reported five of
+the nine and the section above was written from it, which is why its caution
+about the measurement is the shape it is. The harness now reports the rest:
+
+- **Word error** beside the character rate, from the same edit distance over a
+  different unit. They fail differently — one misread letter costs one
+  character and a whole word — so a transcription that is nearly right and one
+  that dropped a label are told apart rather than averaged together.
+- **Reading order**, as the fraction of region pairs emitted in the order the
+  figure draws them. This is the one that was genuinely missing rather than
+  merely unreported: a figure whose every label is transcribed perfectly still
+  reads wrongly if the labels arrive in an order the drawing does not support,
+  and character error cannot see that. It is also what the sample's residual
+  error actually is, which the section above could only say in prose. Two
+  regions reading the same string count as one position, so a repeated label —
+  `Expert`, twice, on the sample — disagrees with nothing.
+- **Model footprint**, from the pinned artifact sizes rather than from
+  whatever is on the machine that ran it.
+- **Peak resident set** of the process, where the platform reports one, and
+  absent where it does not rather than a zero that would read as measured.
+- **Supported-platform packaging**, to the extent a run can establish it: the
+  target, the realized device, the dtype and the compiled inference backends,
+  recorded on every result. A latency figure without those beside it is not
+  attributable to anything, and the shipped build compiles neither
+  `candle-metal` nor `candle-accelerate` — which is what makes the CPU numbers
+  the numbers a user gets.
+
+The correctness and missed-region rules are unchanged, deliberately: the
+numbers recorded above were measured under them, and moving the definition
+without re-running the corpus would have quietly restated an old measurement
+as a new one.
+
 ## Acceptance criteria
 
 The scoped feature is complete only when:
@@ -993,6 +1047,36 @@ The scoped feature is complete only when:
   runtime fallback is retained.
 - No caption association, vector reconstruction, scanned-page layout inference,
   or whole-page VLM parsing has entered this phase implicitly.
+
+### Where the list stands, 2026-08-28
+
+Every criterion above except one is met and pinned by a test, so that the
+answer to "is this still true" is a suite run rather than a reading. The
+describer's own criteria are excluded here: that work is separate and this
+audit did not touch it.
+
+| Criterion | Held by |
+| --- | --- |
+| Discovery without a caption heuristic | `a_native_image_block_is_found_with_its_placement_and_pixels`, `enrichment_lands_at_the_image_block_rather_than_near_a_caption` |
+| Enrichment once, at the reading anchor | `a_diagram_with_labels_is_transcribed_into_the_reading`, `a_page_scoped_read_carries_that_pages_enrichment_and_no_others` |
+| Exact search resolves to the OCR polygon | `exact_search_finds_a_transcribed_label_at_its_own_polygon` — **the mechanism, not the sample**; see below |
+| Semantic search reaches the enrichment | `semantic_search_retrieves_the_enrichment_for_a_question_only_the_picture_answers` |
+| One embedding path | `the_enrichment_reaches_the_embedder_as_one_passage` |
+| A self-contained enrichment chunk | `an_image_block_is_a_chunk_of_its_own` |
+| Byte-for-byte reconstruction | `chunks_around_an_image_block_still_reconstruct_the_reading` |
+| A locator and provenance on every inserted byte | `every_inserted_byte_has_a_locator_and_truthful_provenance`, `every_piece_carries_provenance_and_a_region` |
+| Recipe changes force re-extraction | `every_input_that_changes_the_bytes_changes_the_recipe`, `a_different_recipe_never_reads_the_previous_recipes_answer` |
+| Failures visible as partial results | `a_recognition_failure_is_partial_rather_than_empty`, `without_an_analyzer_the_reading_is_unchanged_and_the_image_is_counted` |
+| No new inference dependency or `ort` bump | The whole feature added `image`, `url` and `base64` and nothing else; `ort` is still `=2.0.0-rc.11` and there is no toolchain file to bump |
+| One OCR owner | No `ocrs`, Tesseract or OAR crate is in any manifest, and a recognition failure has no second engine to fall to |
+
+The exception is the third row, and it is the one recorded under "The
+acceptance criterion that fails". The polygon mechanism works and is pinned;
+what does not hold is the criterion as written against the sample, whose
+labels are each set on two drawn lines. That is a scope decision about layout
+analysis, not an implementation gap, and it stays open with
+`a_label_split_across_two_drawn_lines_is_two_regions_in_the_reading` holding
+the behaviour so it cannot regress into being forgotten.
 
 The selected first implementation is therefore **MuPDF native image blocks +
 PaddleOCR-VL spotting + a Qwen3-VL describer through the candle engine +
