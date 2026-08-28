@@ -478,9 +478,10 @@ ExtractedImage {
 
 enum TextProvenance {
     Native,
+    Unrecorded,
     ImageOcr {
         image_id: String,
-        confidence: f32,
+        confidence: Option<f32>,
     },
     ImageDescription {
         image_id: String,
@@ -492,6 +493,18 @@ enum TextProvenance {
 `ExtractedContent` owns `images: Vec<ExtractedImage>`. OCR source segments map
 to precise page polygons; descriptions map to the complete native image bounds.
 Every inserted byte therefore has both a page locator and truthful provenance.
+
+Two departures from the sketch above, both as built:
+
+- The confidence is optional. Every byte of the enrichment carries
+  provenance, and some of those bytes are the label `Image embedded text:`
+  and the separators between regions. Those are Wilkes' own structure, not
+  anything a recognizer was confident about, and giving them a number would
+  be inventing one.
+- `Unrecorded` exists for the coarser per-chunk map the index rebuilds, where
+  a chunk's provenance is not resolvable to a single segment. Naming that
+  state is the alternative to defaulting it to `Native`, which would claim
+  the document said something it did not.
 
 ## Chunking
 
@@ -514,19 +527,35 @@ Image analysis is versioned extraction, not live search-time generation. Cache
 annotation JSON by:
 
 ```text
-source PDF SHA-256
-+ page
+page
 + normalized image bbox and transform
 + decoded image pixel SHA-256
 + OCR engine crate/pipeline version
-+ detector SHA-256
 + recognizer SHA-256
-+ dictionary SHA-256
 + OCR preprocessing and admission settings
 + description model revision
 + description prompt version
++ coordinate mapping version
++ technical limits version
 + canonical serialization version
 ```
+
+Three differences from the first sketch of this key, all as built:
+
+- **The source document's digest is deliberately absent.** The digest of the
+  *decoded pixels* names what was analyzed. Two documents that draw the same
+  pixels at the same place on the page have the same answer, and keying on
+  the file as well would only stop them sharing it — while costing a full
+  read of every PDF to compute the key.
+- **No detector or dictionary digest.** The selected engine has neither; a
+  single checkpoint does detection and recognition in one pass, which is the
+  reason it was selected. Keying on artifacts that do not exist would be
+  pretending the pipeline is the one that was rejected.
+- **The coordinate mapping and the technical limits are in the key.** Both
+  are Wilkes' own and neither is inside the engine's settings, so neither
+  would otherwise move the recipe. A region that moves is a different
+  reading even when the bytes are identical: the same text would resolve to a
+  different part of the page.
 
 Do not cache a second copy of image pixels unless the source format requires it.
 Changing any OCR model, description model, prompt, threshold, coordinate
