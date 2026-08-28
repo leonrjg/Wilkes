@@ -37,7 +37,7 @@ describe("ImageAnalysisPanel", () => {
   it("says what enabling costs before it is enabled", async () => {
     panel(SETTINGS);
     await screen.findByText(/re-reads and re-embeds/i);
-    expect(screen.getByText(/minute per picture/i)).toBeTruthy();
+    expect(screen.getByText(/five minutes for a full-width figure/i)).toBeTruthy();
   });
 
   it("offers the download when the recognizer is missing, and no toggle to enable without it", async () => {

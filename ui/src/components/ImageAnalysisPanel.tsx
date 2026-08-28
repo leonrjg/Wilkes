@@ -160,8 +160,10 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
           <p className="text-[10px] italic text-[var(--text-dim)]">
             This is part of how a document is read, not a display option:
             changing it re-reads and re-embeds every document that has a
-            picture in it. Recognition runs on this machine and takes on the
-            order of a minute per picture on a CPU.
+            picture in it. Recognition runs on this machine and is slow on a
+            CPU — measured at around five minutes for a full-width figure, and
+            longer for a large one. A library of a few hundred figures is an
+            overnight job.
           </p>
 
           {installed === false && (

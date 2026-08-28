@@ -106,13 +106,24 @@ pub const CHECKPOINTS: &[Checkpoint] = &[CHECKPOINT_1_5, CHECKPOINT_1_6];
 
 /// The checkpoint Wilkes ships.
 ///
-/// **Provisional.** FIGURE.md's implementation plan step 1 requires character
-/// error, coordinate accuracy, admission-rule viability and CPU latency to be
-/// measured on the image corpus before a checkpoint is pinned, and that
-/// measurement has not been run. 1.6 is named here because it is the later
-/// post-training of the same weights and the same spotting task, not because
-/// it measured better. [`crate::extract::image::paddleocr_vl::evaluate`] is
-/// the harness that settles it.
+/// **Measured, 2026-08-28**, by [`evaluate`] over the eight-figure corpus in
+/// [`crate::extract::image::corpus`]. 1.6 is not merely later; it read every
+/// figure at least as well as 1.5 and better where either made an error:
+/// character error 0.182 against 0.196 overall, 0.543 against 0.571 on turned
+/// labels, 0.602 against 0.663 on the sample document's diagram. Both
+/// transcribed the clean, low-resolution, coloured, inverted and non-ASCII
+/// figures perfectly, both emitted nothing on the figure with no text in it,
+/// and their coordinate accuracy is indistinguishable — 0.012 against 0.011
+/// of the image, 0.025 worst for each.
+///
+/// 1.6's confidence also separates its own errors better, which is what the
+/// admission rule has to work with: see [`ADMISSION_THRESHOLD`].
+///
+/// The two are not distinguished on speed. The wall-clock figures differ
+/// (103s against 143s a figure) but the runs were not made on an equally idle
+/// machine, and the checkpoints are the same architecture at the same
+/// parameter count, so there is no reason for them to differ and this
+/// measurement is not evidence that they do.
 pub const SHIPPED_CHECKPOINT: Checkpoint = CHECKPOINT_1_6;
 
 // ── The pinned extraction settings ───────────────────────────────────────────

@@ -235,6 +235,84 @@ or image.
   failure is a visible partial result, not a trigger for a duplicated
   mechanism.
 
+### Measured, 2026-08-28
+
+Implementation-plan step 1, run. The harness is
+`extract::image::paddleocr_vl::evaluate`, the corpus is
+`extract::image::corpus::accuracy_corpus`, and both are in the tree; the run
+is an ignored test because it needs 1.9 GB of weights per checkpoint.
+
+**The engine works.** Both pinned checkpoints download, verify against their
+pinned size and SHA-256, and build in `candle-transformers` 0.11 (about 2.7
+seconds to load). `<|LOC|>` output parses to usable quads. The location
+vocabulary is contiguous and nothing else shares its id range, which the
+parser assumed and which is now checked rather than assumed. The chat framing
+matches the checkpoint's own template token for token, and the spotting
+task's preprocessing — the 1500-pixel upscale, the 2048-patch envelope, the
+Lanczos-then-bicubic resample — matches the model card. The engine decision
+does not reopen.
+
+**Accuracy.** On five of eight figures, both checkpoints transcribed every
+region exactly, character error 0.000: a clean diagram, the same one at
+120x180 where a 12-point label is seven pixels tall, a coloured background,
+an inverted dark background, and non-ASCII labels. The figure with no text in
+it produced no regions at all — no false positives to admit. Coordinate
+accuracy is 0.011 of the image on average and 0.025 at worst, comfortably
+inside a label's own footprint.
+
+**1.6 is the shipped checkpoint**, on measurement rather than on being later:
+character error 0.182 against 0.196 overall, 0.543 against 0.571 on turned
+labels, 0.602 against 0.663 on the sample document's figure, with coordinate
+accuracy indistinguishable. The two are *not* distinguished on speed; the
+wall-clock numbers differ but the runs were not made on an equally idle
+machine, and same architecture at same parameter count gives no reason for
+them to.
+
+**Turned labels are a real weakness.** Both checkpoints garble text rotated a
+quarter turn — `User interface` came back as `User intiaac expert` — reading
+one of five. Recorded, not worked around: this is a property of the weights.
+
+**CPU latency is the finding that costs.** 51 seconds for a 120x180 figure,
+around 130 for 240x360, 237 for the sample document's 1559x499 diagram, and
+roughly four times that again for a figure large enough to fill the spotting
+envelope. The shipped build enables neither `candle-metal` nor
+`candle-accelerate`, so this is plain f32 CPU matmul and is what a user gets.
+A library of a few hundred figures is an overnight job. Nothing about the
+extraction design depends on this — the annotation cache means it is paid
+once per image per recipe — but it is what the settings surface has to say
+out loud, and it is the strongest argument for the Metal path this repository
+does not yet build.
+
+### The acceptance criterion that fails (found 2026-08-28)
+
+> Exact search for `Expert knowledge` finds the sample image and resolves to
+> its OCR polygon.
+
+It does not, on the sample. The reason is not recognition — the
+transcription of that figure is character-perfect — and it is worth stating
+precisely because the numbers above hide it.
+
+Every label in the sample diagram is *set on two lines* inside its own shape:
+`User` above `interface`, `Non-` above `expert`, `Expert` above `knowledge`.
+The spotting task emits one region per drawn line, correctly. The serializer
+joins regions with `; `, so the reading contains `User; interface` — a
+semicolon the figure does not draw — and an exact search for the label as a
+person reads it finds nothing.
+
+Joining them is not a neighbour rule. The recognizer reads this figure in row
+order, across the three circles before down them, so `User` and `interface`
+are not adjacent in emission: `Inference` and `Knowledge` come between. It
+would take a geometric rule over the whole region set — vertical adjacency
+and horizontal overlap, plus the wrap-hyphen join the native-text sanitizer
+already does for `Non-` / `expert`. That is layout analysis over the image,
+which this phase deliberately does not do.
+
+So this is left open rather than patched, and pinned by
+`a_label_split_across_two_drawn_lines_is_two_regions_in_the_reading` so it
+cannot regress into being forgotten. It is the one acceptance criterion this
+work does not meet, and deciding it is a scope decision, not an
+implementation detail.
+
 ### Runtime and packaging requirements
 
 No dependency migration is required: `candle-transformers` 0.11 and the
