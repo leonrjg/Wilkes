@@ -15,12 +15,13 @@ Ollama as the explicit external door) describes them; from phase three, one
 small ONNX layout detector routes native vector regions to them. See
 "Roadmap: LaTeX, figures, and tables".
 
-PaddleOCR-VL is therefore the presumptive OCR engine. OAR-OCR's classic
-detection-and-recognition pipeline — this document's original selection —
-remains specified only as the fallback should the gate's verification pass
-fail. Whichever engine ships becomes the only production OCR backend. This
-phase will not use OAR's document-layout, table, formula, or VLM pipelines,
-and will not pair PaddleOCR-VL with a layout model.
+PaddleOCR-VL is the selected OCR engine and the only production OCR backend.
+OAR-OCR — this document's original selection — is discarded: the OCR
+decision record retains why it was chosen and why it was superseded, and
+nothing of it remains specified for implementation. If the verification
+items in the implementation plan fail, the decision reopens with that
+record as context; no fallback engine waits in the wings. This phase uses
+only the spotting task and pairs no layout model with it.
 
 The first implementation is intentionally limited to image blocks that MuPDF
 already exposes from a digitally generated PDF. It does not attempt to decide
@@ -48,7 +49,7 @@ it does not reconstruct complex layouts.
 - Scanned-page or whole-page layout detection.
 - Learned layout models such as PP-Structure.
 - Tables, formulas, seals, or chart-specific parsing.
-- OAR's `oar-ocr-vl` document-understanding pipeline.
+- Whole-page VLM document-understanding pipelines.
 - A second OCR engine or runtime fallback.
 
 This document treats the referenced PDF entirely as source material, never as
@@ -125,7 +126,7 @@ PDF page
    |
    +-- MuPDF native image blocks
             |
-            +-- OCR engine (presumptively PaddleOCR-VL spotting)
+            +-- PaddleOCR-VL spotting task
             |      `-- text + image-relative polygons + admission signal
             |
             `-- FigureDescriber
@@ -143,8 +144,8 @@ PDF page
                      existing passage embedder
 ```
 
-OCR and description remain separate facts. OAR transcribes visible text; it
-does not provide the semantic description in this design.
+OCR and description remain separate facts. The spotting task transcribes
+visible text; it does not provide the semantic description in this design.
 
 ## Native image discovery
 
@@ -175,105 +176,80 @@ minimum-size rule must be versioned, covered by tests, and reported in
 diagnostics; it must not quietly act as a semantic figure classifier.
 
 Repeated logos, decorative images, and other non-figures may therefore enter
-analysis in this phase. OAR should normally return no accepted text for them,
+analysis in this phase. The recognizer should normally return no accepted
+text for them,
 and the description policy can decline to serialize unhelpful results. Semantic
 classification and repeated-artifact suppression are deferred rather than
 hidden inside undocumented heuristics.
 
-## OAR-OCR integration
-
-Presumption update 2026-08-27: this section survives as the conditional
-fallback specification — see the gate in the OCR decision record. The
-admission and normalization rules below bind whichever engine is selected;
-only the pipeline and packaging details are OAR-specific.
+## OCR integration (PaddleOCR-VL)
 
 ### Selected pipeline
 
-Use `OAROCRBuilder` with OAR's classic ONNX text detector and recognizer. Do not
-instantiate `OARStructureBuilder`, a page-layout pipeline, or `oar-ocr-vl`.
+Use the `paddleocr_vl` module in the already-pinned `candle-transformers`
+0.11: the 0.9B recognizer (NaViT encoder + ERNIE-4.5-0.3B decoder) driving
+the end-to-end text-spotting task. No layout model, no OAR crate, no second
+ONNX runtime. Wilkes owns the task prompt and the parsing of `<|LOC_nnn|>`
+tokens into per-region 4-point quadrilaterals on the normalized 0–999 grid.
 
-The initial quality baseline should be PP-OCRv6 small on CPU. Before pinning the
-final extraction recipe, compare PP-OCRv6 tiny and small on the image evaluation
-corpus. The shipped model is the better measured model, not a runtime fallback:
-Wilkes must package and identify one selected detector/recognizer pair per
-recipe.
+Before pinning the final extraction recipe, compare the 1.5 and 1.6
+checkpoints on the image evaluation corpus. The shipped checkpoint is the
+better measured one, not a runtime choice: Wilkes packages and identifies
+one recognizer checkpoint per recipe.
 
-OAR supports model paths and in-memory model bytes, batch prediction, and
-structured text regions. Its current result preserves recognized text,
-confidence, detection/recognition polygons, optional word boxes, and orientation.
-Coordinates are mapped back to the original input image when orientation
-correction is used. [OAR usage guide](https://github.com/GreatV/oar-ocr/blob/main/docs/usage.md)
-and [OAR result type](https://github.com/GreatV/oar-ocr/blob/main/src/oarocr/result.rs).
-
-Normalize OAR output into Wilkes-owned types so OAR types do not leak across
-the extraction boundary:
+Normalize model output into Wilkes-owned types so engine types and token
+formats do not leak across the extraction boundary:
 
 ```rust
 ImageOcrRegion {
     text: String,
+    /// Admission signal derived from token log-probabilities. Explicitly
+    /// uncalibrated; thresholded by one tested rule.
     confidence: f32,
     polygon_within_image: Vec<Point>,
     page_polygon: Vec<Point>,
-    word_boxes_within_image: Option<Vec<Polygon>>,
 }
 ```
 
-The image transform maps each OAR polygon from input pixels into MuPDF page
-coordinates. Precise page polygons allow exact search to highlight
-`Knowledge base` rather than the entire page or image.
+The image transform maps each spotted polygon — denormalized from the 0–999
+grid to input pixels — into MuPDF page coordinates. Precise page polygons
+allow exact search to highlight `Knowledge base` rather than the entire page
+or image.
 
 ### Admission and normalization
 
-- Preserve OAR's reading order and region grouping.
+- Preserve the model's emission order and region grouping.
 - Normalize whitespace without losing punctuation, percentages, units, or
   Unicode characters.
-- Keep raw confidence in structured metadata.
-- Apply one explicit, tested confidence threshold before OCR text enters the
+- Keep the raw admission signal in structured metadata.
+- Apply one explicit, tested admission threshold before OCR text enters the
   canonical reading.
 - Record rejected regions in diagnostics rather than silently discarding them.
 - Deduplicate OCR against native text geometrically located inside the same
   image bounds. Some PDFs draw native labels over an image.
 - Run OCR whether or not an image-description model is configured.
-- Never substitute a second OCR engine after an OAR error. An OAR failure is a
-  visible partial result, not a trigger for a duplicated mechanism.
+- Never substitute a second OCR engine after an engine error. A recognition
+  failure is a visible partial result, not a trigger for a duplicated
+  mechanism.
 
 ### Runtime and packaging requirements
 
-The OAR selection requires a coordinated dependency migration, not merely a
-new Cargo dependency:
+No dependency migration is required: `candle-transformers` 0.11 and the
+existing hf-hub model lifecycle are already in the tree, and the Rust
+toolchain, fastembed, and `ort` pins are untouched. (The migration OAR would
+have demanded is recorded in the OCR decision record.)
 
-- Current OAR upstream requires Rust 1.95, while Wilkes's Docker build uses
-  Rust 1.88 in [Dockerfile](Dockerfile:16).
-- Wilkes currently pins `ort = 2.0.0-rc.11` in
-  [crates/core/Cargo.toml](crates/core/Cargo.toml:51).
-- OAR uses a newer `ort`/`ort-sys`. All FastEmbed and OAR dependencies in one
-  binary must converge on a single compatible `ort-sys` version.
-- Linux, Windows, macOS, Core ML, and the existing MuPDF/Windows CRT build
-  constraint must be verified after that convergence.
+Wilkes retains ownership of model installation and extraction identity:
 
-Verified 2026-08-27: the conflict is exact, not merely awkward. fastembed
-5.13.0 pins `ort = "=2.0.0-rc.11"` and oar-ocr-core 0.9.2 pins
-`ort = "=2.0.0-rc.13"` — two `=` pins on one crate, so a joint build cannot
-resolve today. The convergence path is fastembed 6.0.x (which pins
-`=2.0.0-rc.13`) plus the Rust 1.88 → 1.95 toolchain bump: a major fastembed
-upgrade whose embedding behavior must be re-verified. This entire migration
-exists only on the OAR path; selecting PaddleOCR-VL deletes it.
-
-OAR's default feature can download ONNX Runtime binaries during the build, and
-its optional `auto-download` feature can fetch OCR models at runtime. Wilkes
-should retain ownership of model installation and extraction identity instead:
-
-- Pin exact detector, recognizer, and dictionary artifacts.
+- Pin the exact recognizer checkpoint by revision.
 - Verify every artifact by size and SHA-256.
 - Make offline operation possible after explicit installation.
 - Do not let an unversioned or implicit runtime download change extraction.
-- Include OAR crate version, model digests, preprocessing settings, and
-  thresholds in the extraction recipe.
+- Include the candle-transformers version, checkpoint digests, task prompts,
+  preprocessing settings, and admission thresholds in the extraction recipe.
 
-OAR is Apache-2.0 licensed. The redistributed model artifacts and dictionaries
-must also receive a model-specific license/provenance inventory before they are
-packaged. [OAR repository](https://github.com/GreatV/oar-ocr) and [OAR model
-registry](https://github.com/GreatV/oar-ocr/blob/main/docs/models.md).
+PaddleOCR-VL is Apache-2.0 licensed. The redistributed checkpoint must still
+receive a model-specific license/provenance inventory before it is packaged.
 
 ## Image descriptions
 
@@ -355,7 +331,8 @@ OCR transcription.
 
 Local analysis remains the default requirement. Any remote describer must be
 explicitly configured and visibly disclose that document imagery leaves the
-machine. OAR's separate VLM crate is not an implicit description fallback.
+machine. No OCR-adjacent pipeline doubles as an implicit description
+fallback.
 
 ## Canonical representation and provenance
 
@@ -485,8 +462,9 @@ not configured" is actionable; silently missing an image is not.
 
 ## OCR decision record
 
-OAR-OCR was selected over `ocrs` and Tesseract because it provides the stronger
-production result contract and model ecosystem:
+OAR-OCR was originally selected over `ocrs` and Tesseract — a selection
+since superseded; see the resolution below — because it provided the
+stronger production result contract and model ecosystem:
 
 - per-region recognition confidence;
 - detection and recognition polygons in original-image coordinates;
@@ -503,9 +481,10 @@ confidence. Tesseract would introduce a native system/package dependency and a
 second OCR mechanism. Neither remains as a production fallback. This preserves
 one owner for OCR behavior and one extraction recipe.
 
-The model checkpoint is not yet selected merely because the engine is. The
-PP-OCRv6 tiny-versus-small evaluation and artifact-license inventory remain
-required before implementation can claim a pinned, shippable OCR recipe.
+One principle from that record outlives the engine swap: an engine selection
+is not a checkpoint selection. The 1.5-versus-1.6 evaluation and
+artifact-license inventory remain required before implementation can claim a
+pinned, shippable OCR recipe.
 
 ### PaddleOCR-VL candidacy (added 2026-08-27)
 
@@ -542,6 +521,12 @@ What OAR still holds:
   ~1 GB and seconds per image, on every native image block including logos.
   Cached and offline, so bounded — but real at indexing scale.
 
+And what discarding OAR saved, verified 2026-08-27: fastembed 5.13.0 pins
+`ort = "=2.0.0-rc.11"` while oar-ocr-core 0.9.2 pins `ort = "=2.0.0-rc.13"`
+— two `=` pins on one crate, so a joint build could not resolve at all. The
+OAR path required fastembed 6.0.x, the Rust 1.88 → 1.95 toolchain bump, and
+re-verification of embedding behavior and every supported platform build.
+
 Candle's module is the recognizer only; PP-DocLayoutV2 is not in candle and
 is not needed for this scope. Wilkes would own the spotting-task prompt and
 `<|LOC|>` parsing. Whether the candle module drives the 1.5/1.6 checkpoints
@@ -551,16 +536,17 @@ and task prompts is an open verification item.
 [1.6 paper](https://arxiv.org/pdf/2606.03264), and
 [candle paddleocr_vl module](https://docs.rs/candle-transformers/0.11.0/candle_transformers/models/paddleocr_vl/index.html).
 
-**Gate.** The roadmap below commits to LaTeX and tables as goals, which
-decides the presumption on paper: OAR's route to the same goals adds
-PP-FormulaNet, table models, and the dependency migration to reach what one
-prompt-switched model provides. The gate therefore reduces from a bake-off
-to a verification pass — the candle module drives the 1.5/1.6 checkpoints
-and task prompts, `<|LOC|>` output parses to usable quads, and character
-error, coordinate accuracy, admission-rule viability, and CPU latency hold
-on the planned corpus. It still precedes implementation plan step 1 (whose
-migration is only needed if the verification fails and OAR returns), and it
-is still not scheduled; the gate records order, not timing.
+**Resolution (2026-08-27).** PaddleOCR-VL is selected and OAR is discarded —
+as a dependency, an implementation path, and a fallback alike. The roadmap
+below decided it: OAR's route to LaTeX and tables adds PP-FormulaNet, table
+models, and the dependency migration to reach what one prompt-switched model
+provides. What remains is verification, as implementation plan step 1: the
+candle module drives the 1.5/1.6 checkpoints and task prompts, `<|LOC|>`
+output parses to usable quads, and character error, coordinate accuracy,
+admission-rule viability, and CPU latency hold on the planned corpus. If
+verification fails, the decision reopens with this record as context; no
+OAR specification is kept warm. Nothing is scheduled; this records order,
+not timing.
 
 ### If LaTeX becomes mandatory
 
@@ -667,16 +653,14 @@ timing.
 This is a full extraction feature even though image discovery is deliberately
 narrow.
 
-0. **Decide the OCR engine**
-   - Run the gate recorded in the OCR decision record. Every OAR-specific
-     step below is conditional on its outcome.
-
-1. **Converge the build runtime** *(OAR path only — deleted if PaddleOCR-VL
-   is selected)*
-   - Upgrade the Rust toolchain to 1.95.
-   - Upgrade fastembed to 6.0.x so FastEmbed and OAR converge on
-     `ort = "=2.0.0-rc.13"`; re-verify embedding behavior.
-   - Verify all supported platform builds.
+1. **Verify the engine on the pinned runtime**
+   - Confirm the candle `paddleocr_vl` module drives the 1.5/1.6
+     checkpoints and task prompts, and `<|LOC|>` output parses to usable
+     quads.
+   - Measure character error, coordinate accuracy, admission-rule
+     viability, and CPU latency on the sample corpus; pick the shipped
+     checkpoint.
+   - If this fails, reopen the engine decision before any later step.
 
 2. **Add structured image types and provenance**
    - Add `ExtractedImage`, `ImageOcrRegion`, image ranges, and analyzer identity.
@@ -689,16 +673,14 @@ narrow.
    - Apply only explicit technical safety limits.
    - Do not add caption, vector grouping, or layout inference.
 
-4. **Integrate the selected OCR engine** (presumptively PaddleOCR-VL
-   spotting; OAR classic only if the verification pass fails)
-   - Add one Wilkes-owned adapter; OAR types or `<|LOC|>` parsing stay
-     behind the extraction boundary either way.
+4. **Integrate PaddleOCR-VL spotting**
+   - Add one Wilkes-owned adapter; task prompts and `<|LOC|>` parsing stay
+     behind the extraction boundary.
    - Batch native images from a PDF.
    - Map image-relative polygons to page coordinates.
-   - Apply the admission rule (confidence threshold for OAR; an explicit
-     tested logprob or validity rule for the VLM) and native-text
-     deduplication.
-   - Install models through the Wilkes model lifecycle.
+   - Apply the admission rule (one explicit, tested log-probability
+     threshold) and native-text deduplication.
+   - Install the checkpoint through the Wilkes model lifecycle.
 
 5. **Add the independent description interface**
    - Wire the Qwen3-VL describer through the candle engine, with Ollama as
@@ -758,15 +740,14 @@ The scoped feature is complete only when:
   identity and force reindexing.
 - Analyzer failures and unconfigured descriptions are visible as partial
   results.
-- If OAR is selected, FastEmbed and OAR use one compatible ONNX Runtime
-  dependency (fastembed 6.0.x, `ort = "=2.0.0-rc.13"`).
-- Exactly one engine — the gate's winner — owns OCR behavior; no `ocrs`,
-  Tesseract, second engine, or runtime fallback is retained.
+- The recognizer and describer run on the already-pinned candle runtime; no
+  new inference dependency, toolchain change, or `ort` bump entered.
+- PaddleOCR-VL alone owns OCR behavior; no `ocrs`, Tesseract, OAR, or
+  runtime fallback is retained.
 - No caption association, vector reconstruction, scanned-page layout inference,
-  or OAR VLM pipeline has entered this phase implicitly.
+  or whole-page VLM parsing has entered this phase implicitly.
 
 The selected first implementation is therefore **MuPDF native image blocks +
-one gated OCR engine (OAR classic or PaddleOCR-VL spotting) + a Qwen3-VL
-describer through the candle engine + canonical-text integration**. More
-ambitious figure detection remains a later, explicit feature rather than an
-accidental expansion of this one.
+PaddleOCR-VL spotting + a Qwen3-VL describer through the candle engine +
+canonical-text integration**. More ambitious figure detection remains a
+later, explicit feature rather than an accidental expansion of this one.
