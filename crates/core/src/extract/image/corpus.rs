@@ -93,7 +93,7 @@ pub(super) fn accuracy_corpus() -> Vec<super::paddleocr_vl::EvaluationCase> {
         (12.0, 200.0, "User interface"),
         (75.0, 160.0, "Inference engine"),
         (75.0, 110.0, "Knowledge base"),
-        (140.0, 60.0, "Expert knowledge"),
+        (85.0, 60.0, "Expert knowledge"),
     ];
 
     let diagram_page = || {
@@ -151,7 +151,17 @@ pub(super) fn accuracy_corpus() -> Vec<super::paddleocr_vl::EvaluationCase> {
             image: render_page(
                 &build_pdf(vec![DIAGRAM.iter().fold(
                     PageSpec::default(),
-                    |page, (x, y, text)| page.with_rotated_text(*x + 20.0, *y - 40.0, 90.0, text),
+                    |page, (x, y, text)| {
+                        let (x, y) = (*x + 20.0, *y - 40.0);
+                        // Turned a quarter turn, a label runs up the page, so
+                        // it is the height it has to fit inside.
+                        assert!(
+                            y + text.chars().count() as f32 * LABEL_POINTS * AVERAGE_ADVANCE_EM
+                                <= PAGE_HEIGHT_POINTS,
+                            "rotated {text:?} at y={y} runs off the page"
+                        );
+                        page.with_rotated_text(x, y, 90.0, text)
+                    },
                 )]),
                 0,
                 CASE_SCALE,
@@ -208,6 +218,13 @@ const UNICODE_DIAGRAM: &[(f32, f32, &str)] = &[
     (12.0, 60.0, "Fähigkeit"),
 ];
 
+/// Half the em width Helvetica averages over mixed-case text, close enough to
+/// place a label and to catch one that would not fit on the page.
+const AVERAGE_ADVANCE_EM: f32 = 0.5;
+const LABEL_POINTS: f32 = 12.0;
+const PAGE_WIDTH_POINTS: f32 = 200.0;
+const PAGE_HEIGHT_POINTS: f32 = 300.0;
+
 /// Where a drawn label sits, as a fraction of the rendered image.
 ///
 /// Estimated from the layout rather than measured off the raster: Helvetica's
@@ -217,15 +234,20 @@ const UNICODE_DIAGRAM: &[(f32, f32, &str)] = &[
 /// what it is asked — whether a region landed on its own label or on another
 /// part of the figure.
 fn label_centre(x: f32, y: f32, text: &str) -> Point {
-    const PAGE_WIDTH: f32 = 200.0;
-    const PAGE_HEIGHT: f32 = 300.0;
-    const FONT_SIZE: f32 = 12.0;
-    let width = text.chars().count() as f32 * FONT_SIZE * 0.5;
+    let width = text.chars().count() as f32 * LABEL_POINTS * AVERAGE_ADVANCE_EM;
+    // A label the page clips is ground truth the figure does not contain, and
+    // the recognizer would be scored down for reading what is actually there.
+    // This cost a whole evaluation run once: `Expert knowledge` was laid out
+    // past the right edge and every checkpoint "truncated" it to `Expert kno`.
+    assert!(
+        x + width <= PAGE_WIDTH_POINTS,
+        "{text:?} at x={x} runs off a {PAGE_WIDTH_POINTS}pt page"
+    );
     Point {
-        x: (x + width / 2.0) / PAGE_WIDTH,
+        x: (x + width / 2.0) / PAGE_WIDTH_POINTS,
         // PDF user space counts up from the bottom; an image counts down from
         // the top.
-        y: (PAGE_HEIGHT - (y + FONT_SIZE * 0.717 / 2.0)) / PAGE_HEIGHT,
+        y: (PAGE_HEIGHT_POINTS - (y + LABEL_POINTS * 0.717 / 2.0)) / PAGE_HEIGHT_POINTS,
     }
 }
 
@@ -374,8 +396,8 @@ pub(super) fn render_page(pdf: &[u8], page: usize, scale: f32) -> image::RgbImag
 /// Assemble a PDF. Uncompressed image streams and a base-14 font, because the
 /// point is to control exactly which blocks MuPDF will report.
 pub(super) fn build_pdf(pages: Vec<PageSpec>) -> Vec<u8> {
-    const PAGE_WIDTH: f32 = 200.0;
-    const PAGE_HEIGHT: f32 = 300.0;
+    const PAGE_WIDTH: f32 = PAGE_WIDTH_POINTS;
+    const PAGE_HEIGHT: f32 = PAGE_HEIGHT_POINTS;
 
     let mut objects: Vec<Vec<u8>> = Vec::new();
     // 1: catalog, 2: page tree, 3: font. Page and content objects follow.
