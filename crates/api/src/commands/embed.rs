@@ -6,8 +6,6 @@ use ignore::WalkBuilder;
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::installer::EmbedderInstaller;
 use wilkes_core::embed::Embedder;
-use wilkes_core::extract::pdf::PdfExtractor;
-use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::models::progress::ProgressTx;
 use wilkes_core::types::{EmbeddingEngine, IndexStatus, SelectedEmbedder};
 use wilkes_core::worker::ipc::{WorkerEvent, WorkerRequest, WorkerRole};

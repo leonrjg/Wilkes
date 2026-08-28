@@ -24,8 +24,6 @@ use wilkes_core::embed::index::semantic_updater::process_directory_change;
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::installer::EmbedderInstaller;
 use wilkes_core::embed::{dispatch, ChunkRef, Embedder, ExtractionRecipe};
-use wilkes_core::extract::pdf::PdfExtractor;
-use wilkes_core::extract::{ContentExtractor, ExtractorRegistry};
 use wilkes_core::generate::engines::dispatch as generate_dispatch;
 use wilkes_core::generate::tasks::cluster_label::{
     cluster_label, cluster_label_stream, validate_cluster_label,
@@ -6022,7 +6020,12 @@ impl AppContext {
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
         {
-            PdfExtractor::new()
+            // The configured registry, not a bare extractor: a summary read
+            // under a different recipe from the index's is a second answer to
+            // what this document says.
+            wilkes_core::extract::production_registry()
+                .find(path, None)
+                .ok_or_else(|| format!("No extractor for {}", path.display()))?
                 .extract(path)
                 .map_err(|e| format!("Could not extract {}: {e:#}", path.display()))?
                 .text

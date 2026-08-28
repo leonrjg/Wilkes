@@ -5,7 +5,6 @@
 use std::path::Path;
 use std::time::Instant;
 
-use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::types::{ExtractedContent, SourceOrigin};
 

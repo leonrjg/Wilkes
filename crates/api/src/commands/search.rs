@@ -6,8 +6,6 @@ use tokio::task::JoinHandle;
 use tracing::error;
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::Embedder;
-use wilkes_core::extract::pdf::PdfExtractor;
-use wilkes_core::extract::ExtractorRegistry;
 use wilkes_core::generate::Generator;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::search::grep::GrepSearchProvider;

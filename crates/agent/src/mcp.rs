@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use wilkes_core::acquire::download_to_root;
-use wilkes_core::extract::{pdf::PdfExtractor, ExtractorRegistry};
 use wilkes_core::integrations::{
     openalex::OpenAlexClient, semantic_scholar::SemanticScholarClient,
 };
