@@ -169,6 +169,18 @@ pub fn normalize_recognized_text(text: &str) -> String {
     out
 }
 
+/// Bumped when the geometry below changes: how a normalized quad becomes
+/// pixels, how pixels become page coordinates, or what the deduplication
+/// against native glyphs counts as the same claim.
+///
+/// This is Wilkes' own mapping, not the engine's, which is why it is versioned
+/// here and not inside the engine's settings. It is in the analyzer identity
+/// because a region that moves is a different reading: the bytes may be
+/// identical and still resolve to a different part of the page, and a search
+/// hit that lands somewhere else is exactly the failure this feature exists to
+/// avoid.
+pub const MAPPING_VERSION: &str = "image-mapping-v1";
+
 /// Place each spotted region on the page, and decide whether it enters the
 /// reading.
 ///

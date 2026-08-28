@@ -278,8 +278,9 @@ impl NativeImageAnalyzer {
 impl ImageAnalyzer for NativeImageAnalyzer {
     fn identity(&self) -> String {
         format!(
-            "{}+{}+{}+{}",
+            "{}+{}+{}+{}+{}",
             LIMITS_VERSION,
+            ocr::MAPPING_VERSION,
             serialize::SERIALIZATION_VERSION,
             self.ocr.identity(),
             self.describer
@@ -537,6 +538,72 @@ pub fn decode(
 
 #[cfg(test)]
 mod tests {
+
+    /// FIGURE.md's acceptance criterion on identity, in one place: *model,
+    /// prompt, threshold, mapping, or serialization changes alter extraction
+    /// identity and force reindexing.* Each of the five, named and checked.
+    #[test]
+    fn every_input_that_changes_the_bytes_changes_the_recipe() {
+        use crate::extract::image::describe::FigureDescriber;
+        use crate::extract::image::ocr::{OcrEngine, SpottedRegion};
+
+        struct Recognizer(&'static str, f32);
+        impl OcrEngine for Recognizer {
+            fn identity(&self) -> String {
+                format!("{}+admit-{}", self.0, self.1)
+            }
+            fn admission_threshold(&self) -> f32 {
+                self.1
+            }
+            fn spot(&self, _image: &image::RgbImage) -> anyhow::Result<Vec<SpottedRegion>> {
+                Ok(Vec::new())
+            }
+        }
+
+        struct Describer(&'static str);
+        impl FigureDescriber for Describer {
+            fn identity(&self) -> String {
+                self.0.to_string()
+            }
+            fn describe(
+                &self,
+                _image: &image::RgbImage,
+                _ocr: &[crate::types::ImageOcrRegion],
+            ) -> anyhow::Result<crate::types::ImageDescription> {
+                unreachable!("identity only")
+            }
+        }
+
+        let analyzer = |model: &'static str, threshold: f32, prompt: &'static str| {
+            NativeImageAnalyzer::new(
+                Box::new(Recognizer(model, threshold)),
+                Some(Box::new(Describer(prompt))),
+            )
+            .identity()
+        };
+        let baseline = analyzer("weights-a", 0.6, "prompt-v1");
+
+        assert_ne!(baseline, analyzer("weights-b", 0.6, "prompt-v1"), "model");
+        assert_ne!(baseline, analyzer("weights-a", 0.7, "prompt-v1"), "threshold");
+        assert_ne!(baseline, analyzer("weights-a", 0.6, "prompt-v2"), "prompt");
+
+        // The mapping and the serialization are constants rather than
+        // configuration, so what a test can hold is that the identity carries
+        // them: changing either then changes it by construction, and cannot
+        // be changed without this failing to be true.
+        assert!(baseline.contains(ocr::MAPPING_VERSION), "mapping: {baseline}");
+        assert!(
+            baseline.contains(serialize::SERIALIZATION_VERSION),
+            "serialization: {baseline}"
+        );
+        assert!(baseline.contains(LIMITS_VERSION), "limits: {baseline}");
+
+        // And configuring a describer at all is a different reading from not.
+        assert_ne!(
+            baseline,
+            NativeImageAnalyzer::new(Box::new(Recognizer("weights-a", 0.6)), None).identity(),
+        );
+    }
     use super::*;
 
     #[test]

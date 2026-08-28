@@ -605,14 +605,55 @@ impl OcrEngine for PaddleOcrVl {
     }
 }
 
-// ── The unrun evaluation ─────────────────────────────────────────────────────
+// ── The evaluation ───────────────────────────────────────────────────────────
+
+/// One expected transcription and where it sits.
+///
+/// The centre is in fractions of the image, the same space the recognizer
+/// emits its quads in, so coordinate accuracy is a comparison and not a
+/// conversion.
+#[derive(Clone, Debug)]
+pub struct ExpectedRegion {
+    pub text: String,
+    /// `None` where the corpus knows the words but not the geometry — a case
+    /// collected from a real document rather than laid out. Coordinate
+    /// accuracy is then simply not measured on it, which is honest; scoring
+    /// it against a guessed centre would not be.
+    pub centre: Option<crate::types::Point>,
+}
 
 /// One image of the evaluation corpus and what it should transcribe to.
 pub struct EvaluationCase {
     pub name: String,
     pub image: image::RgbImage,
     /// The text a correct transcription contains, in reading order.
-    pub expected: Vec<String>,
+    pub expected: Vec<ExpectedRegion>,
+}
+
+/// One emitted region, judged.
+///
+/// The pair the admission rule is chosen from: how sure the decoder was, and
+/// whether it was right. A threshold is only meaningful against the shape of
+/// this, which is why the individual observations survive into the result
+/// rather than being collapsed to a count at one candidate value.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct RegionObservation {
+    pub confidence: f32,
+    pub correct: bool,
+}
+
+/// What one candidate threshold would do to a corpus.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct AdmissionPoint {
+    pub threshold: f32,
+    /// Correct regions it lets into the reading.
+    pub admitted_correct: usize,
+    /// Wrong regions it lets into the reading — text the document does not
+    /// contain, arriving with a page locator on it. The cost this rule exists
+    /// to control.
+    pub admitted_incorrect: usize,
+    /// Correct regions it throws away.
+    pub rejected_correct: usize,
 }
 
 /// What one checkpoint measured on one corpus.
@@ -623,64 +664,174 @@ pub struct EvaluationResult {
     /// Character error rate against the expected text, joined in emission
     /// order: substitutions, insertions and deletions over expected length.
     pub character_error_rate: f64,
+    /// Per case, so one unreadable figure is visible as one unreadable figure
+    /// rather than as a slightly worse average.
+    pub per_case: Vec<CaseResult>,
     /// Regions the model emitted that no expected string accounts for.
     pub false_regions: usize,
     /// Expected strings no emitted region accounts for.
     pub missed_regions: usize,
-    /// How many accepted regions the threshold admits, and how many correct
-    /// ones it rejects — the two numbers the admission rule is judged on.
-    pub admitted: usize,
-    pub correct_rejected: usize,
+    /// Mean distance between an emitted region's centre and the centre of the
+    /// text it transcribed, in fractions of the image. Only over regions that
+    /// transcribed correctly: the location of a misread is not a coordinate
+    /// error, it is a different failure already counted above.
+    pub centre_error: f64,
+    /// The worst such distance. A mean hides the one label placed on the
+    /// opposite side of the figure, and that is the failure that would put a
+    /// search hit on the wrong part of the page.
+    pub worst_centre_error: f64,
+    pub observations: Vec<RegionObservation>,
     pub seconds_per_image: f64,
+}
+
+/// One figure's outcome, kept separately from the aggregate.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CaseResult {
+    pub name: String,
+    pub character_error_rate: f64,
+    pub expected: usize,
+    pub emitted: usize,
+    pub missed: usize,
+    pub seconds: f64,
+    pub failure: Option<String>,
+}
+
+impl EvaluationResult {
+    /// What each candidate threshold would admit and reject.
+    ///
+    /// The rule is chosen from this, not from a single number measured at a
+    /// value someone already picked.
+    pub fn admission_sweep(&self, candidates: &[f32]) -> Vec<AdmissionPoint> {
+        candidates
+            .iter()
+            .map(|&threshold| {
+                let admits = |observation: &&RegionObservation| observation.confidence >= threshold;
+                AdmissionPoint {
+                    threshold,
+                    admitted_correct: self
+                        .observations
+                        .iter()
+                        .filter(admits)
+                        .filter(|observation| observation.correct)
+                        .count(),
+                    admitted_incorrect: self
+                        .observations
+                        .iter()
+                        .filter(admits)
+                        .filter(|observation| !observation.correct)
+                        .count(),
+                    rejected_correct: self
+                        .observations
+                        .iter()
+                        .filter(|observation| observation.confidence < threshold)
+                        .filter(|observation| observation.correct)
+                        .count(),
+                }
+            })
+            .collect()
+    }
 }
 
 /// Measure one checkpoint on a corpus.
 ///
-/// This is FIGURE.md's implementation-plan step 1, made runnable. It has not
-/// been run: it needs the checkpoints installed — 1.9 GB each — and a corpus
-/// with expected transcriptions, neither of which is in the repository. Until
-/// it is, [`SHIPPED_CHECKPOINT`] and [`ADMISSION_THRESHOLD`] are provisional
-/// and say so.
+/// This is FIGURE.md's implementation-plan step 1, made runnable: character
+/// error, coordinate accuracy, admission-rule viability and CPU latency, which
+/// are the four things that step names. It needs the checkpoint installed —
+/// 1.9 GB — so its caller is an ignored test rather than the suite.
 pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationResult {
     let started = std::time::Instant::now();
     let (mut errors, mut expected_chars) = (0usize, 0usize);
     let (mut false_regions, mut missed_regions) = (0usize, 0usize);
-    let (mut admitted, mut correct_rejected) = (0usize, 0usize);
+    let (mut centre_errors, mut worst_centre_error) = (Vec::new(), 0f64);
+    let (mut observations, mut per_case) = (Vec::new(), Vec::new());
 
     for case in corpus {
+        let case_started = std::time::Instant::now();
+        let case_chars: usize = case
+            .expected
+            .iter()
+            .map(|region| region.text.chars().count())
+            .sum();
+        expected_chars += case_chars;
+
         let regions = match engine.spot(&case.image) {
             Ok(regions) => regions,
             Err(error) => {
                 warn!("{}: recognition failed: {error:#}", case.name);
                 missed_regions += case.expected.len();
-                expected_chars += case.expected.iter().map(|text| text.chars().count()).sum::<usize>();
+                errors += case_chars;
+                per_case.push(CaseResult {
+                    name: case.name.clone(),
+                    character_error_rate: 1.0,
+                    expected: case.expected.len(),
+                    emitted: 0,
+                    missed: case.expected.len(),
+                    seconds: case_started.elapsed().as_secs_f64(),
+                    failure: Some(format!("{error:#}")),
+                });
                 continue;
             }
         };
 
-        let emitted: Vec<String> = regions.iter().map(|region| region.text.clone()).collect();
-        expected_chars += case.expected.iter().map(|text| text.chars().count()).sum::<usize>();
-        errors += edit_distance(
-            &case.expected.join(" ").chars().collect::<Vec<_>>(),
-            &emitted.join(" ").chars().collect::<Vec<_>>(),
-        );
-
-        for region in &regions {
-            let correct = case.expected.iter().any(|text| text == &region.text);
-            if !correct {
-                false_regions += 1;
-            }
-            if region.confidence >= engine.admission_threshold() {
-                admitted += 1;
-            } else if correct {
-                correct_rejected += 1;
-            }
-        }
-        missed_regions += case
+        let expected_text: Vec<char> = case
             .expected
             .iter()
-            .filter(|text| !emitted.contains(text))
+            .map(|region| region.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .collect();
+        let emitted_text: Vec<char> = regions
+            .iter()
+            .map(|region| region.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .collect();
+        let case_errors = edit_distance(&expected_text, &emitted_text);
+        errors += case_errors;
+
+        for region in &regions {
+            let matched = case
+                .expected
+                .iter()
+                .find(|expected| expected.text == region.text);
+            observations.push(RegionObservation {
+                confidence: region.confidence,
+                correct: matched.is_some(),
+            });
+            match matched {
+                None => false_regions += 1,
+                Some(expected) => {
+                    if let Some(want) = expected.centre {
+                        let centre = quad_centre(&region.quad);
+                        let error =
+                            f64::from((centre.x - want.x).hypot(centre.y - want.y));
+                        worst_centre_error = worst_centre_error.max(error);
+                        centre_errors.push(error);
+                    }
+                }
+            }
+        }
+        let missed = case
+            .expected
+            .iter()
+            .filter(|expected| !regions.iter().any(|region| region.text == expected.text))
             .count();
+        missed_regions += missed;
+        per_case.push(CaseResult {
+            name: case.name.clone(),
+            character_error_rate: if case_chars == 0 {
+                f64::from(u32::from(!regions.is_empty()))
+            } else {
+                case_errors as f64 / case_chars as f64
+            },
+            expected: case.expected.len(),
+            emitted: regions.len(),
+            missed,
+            seconds: case_started.elapsed().as_secs_f64(),
+            failure: None,
+        });
     }
 
     EvaluationResult {
@@ -691,15 +842,29 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
         } else {
             errors as f64 / expected_chars as f64
         },
+        per_case,
         false_regions,
         missed_regions,
-        admitted,
-        correct_rejected,
+        centre_error: if centre_errors.is_empty() {
+            0.0
+        } else {
+            centre_errors.iter().sum::<f64>() / centre_errors.len() as f64
+        },
+        worst_centre_error,
+        observations,
         seconds_per_image: if corpus.is_empty() {
             0.0
         } else {
             started.elapsed().as_secs_f64() / corpus.len() as f64
         },
+    }
+}
+
+/// The centre of a quadrilateral, as the mean of its corners.
+fn quad_centre(quad: &[crate::types::Point; 4]) -> crate::types::Point {
+    crate::types::Point {
+        x: quad.iter().map(|point| point.x).sum::<f32>() / 4.0,
+        y: quad.iter().map(|point| point.y).sum::<f32>() / 4.0,
     }
 }
 
@@ -725,6 +890,155 @@ fn edit_distance(expected: &[char], actual: &[char]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where an evaluation run keeps its 1.9 GB per checkpoint. Named by the
+    /// environment rather than defaulted, because a test that silently fills
+    /// a home directory with model weights is not a test anyone can run
+    /// twice.
+    fn evaluation_model_dir() -> Option<std::path::PathBuf> {
+        std::env::var_os("WILKES_MODEL_DIR").map(std::path::PathBuf::from)
+    }
+
+    /// The thresholds the sweep reports on. Wide, because the point is to see
+    /// the shape of the decoder's confidence and not to confirm a value
+    /// somebody already liked.
+    const CANDIDATE_THRESHOLDS: &[f32] =
+        &[0.0, 0.30, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.99];
+
+    /// FIGURE.md implementation-plan step 1, second half: the measurement that
+    /// chooses the shipped checkpoint and the admission threshold.
+    ///
+    /// `WILKES_MODEL_DIR=<dir> [WILKES_SAMPLE_PDF=<path>] cargo test -p wilkes-core \
+    ///     the_checkpoints_are_measured -- --ignored --nocapture`
+    ///
+    /// The sample document is optional and additive: without it the corpus is
+    /// the built one, which is reproducible anywhere. With it, the figure this
+    /// whole feature was specified against is measured too.
+    #[test]
+    #[ignore = "needs the installed checkpoints"]
+    fn the_checkpoints_are_measured() {
+        let dir = evaluation_model_dir().expect("set WILKES_MODEL_DIR");
+        let mut corpus = super::super::corpus::accuracy_corpus();
+        if let Some(sample) = sample_diagram_case() {
+            corpus.push(sample);
+        }
+        println!("corpus of {} figures\n", corpus.len());
+
+        let mut report = Vec::new();
+        for checkpoint in CHECKPOINTS {
+            let engine = PaddleOcrVl::load(&dir, *checkpoint, "cpu")
+                .unwrap_or_else(|error| panic!("{}: {error:#}", checkpoint.name));
+            let result = evaluate(&engine, &corpus);
+            println!(
+                "{}: CER {:.3}  missed {}  false {}  centre err {:.3} (worst {:.3})  {:.1}s/image",
+                result.checkpoint,
+                result.character_error_rate,
+                result.missed_regions,
+                result.false_regions,
+                result.centre_error,
+                result.worst_centre_error,
+                result.seconds_per_image,
+            );
+            for case in &result.per_case {
+                println!(
+                    "    {:<22} CER {:.3}  expected {:<2} emitted {:<2} missed {:<2} {:.1}s{}",
+                    case.name,
+                    case.character_error_rate,
+                    case.expected,
+                    case.emitted,
+                    case.missed,
+                    case.seconds,
+                    case.failure
+                        .as_deref()
+                        .map_or(String::new(), |failure| format!("  FAILED: {failure}")),
+                );
+            }
+            println!("    admission sweep (threshold: correct in / wrong in / correct lost)");
+            for point in result.admission_sweep(CANDIDATE_THRESHOLDS) {
+                println!(
+                    "      {:.2}: {} / {} / {}",
+                    point.threshold,
+                    point.admitted_correct,
+                    point.admitted_incorrect,
+                    point.rejected_correct,
+                );
+            }
+            report.push(result);
+        }
+
+        if let Some(path) = std::env::var_os("WILKES_EVAL_OUT") {
+            std::fs::write(&path, serde_json::to_vec_pretty(&report).expect("serializes"))
+                .expect("writes the evaluation record");
+            println!("\nwrote {}", std::path::Path::new(&path).display());
+        }
+    }
+
+    /// The figure this feature was specified against, taken out of the real
+    /// document by the real extraction path.
+    ///
+    /// Text only: the spec records what the diagram says, not where on it
+    /// each label sits, so this case measures transcription and contributes
+    /// nothing to the coordinate figure rather than contributing a guess.
+    fn sample_diagram_case() -> Option<EvaluationCase> {
+        use crate::extract::ContentExtractor;
+
+        let path = std::env::var("WILKES_SAMPLE_PDF").ok()?;
+        let capture = std::sync::Arc::new(super::super::corpus::ImageCapture::default());
+        crate::extract::pdf::PdfExtractor::with_image_analyzer(std::sync::Arc::new(
+            super::super::NativeImageAnalyzer::new(Box::new(capture.clone()), None),
+        ))
+        .extract(std::path::Path::new(&path))
+        .expect("the sample document extracts");
+        let images = capture.images.lock().expect("capture lock");
+        let image = images
+            .iter()
+            .find(|image| (image.width(), image.height()) == (1559, 499))
+            .expect("the sample document draws the 1559x499 expert-system diagram")
+            .clone();
+        Some(EvaluationCase {
+            name: "sample-expert-system".to_string(),
+            image,
+            expected: [
+                "Non-expert",
+                "User interface",
+                "Inference engine",
+                "Knowledge base",
+                "Expert system",
+                "Expert knowledge",
+            ]
+            .into_iter()
+            .map(|text| ExpectedRegion {
+                text: text.to_string(),
+                centre: None,
+            })
+            .collect(),
+        })
+    }
+
+    /// FIGURE.md implementation-plan step 1, first half: the pinned artifacts
+    /// are what the pins say they are, and the candle module builds a model
+    /// out of them.
+    ///
+    /// `WILKES_MODEL_DIR=<dir> cargo test -p wilkes-core \
+    ///     the_pinned_checkpoints_install_and_load -- --ignored --nocapture`
+    #[test]
+    #[ignore = "downloads 1.9 GB per checkpoint"]
+    fn the_pinned_checkpoints_install_and_load() {
+        let dir = evaluation_model_dir().expect("set WILKES_MODEL_DIR");
+        for checkpoint in CHECKPOINTS {
+            install(&dir, checkpoint, None)
+                .unwrap_or_else(|error| panic!("{}: {error:#}", checkpoint.name));
+            let started = std::time::Instant::now();
+            let engine = PaddleOcrVl::load(&dir, *checkpoint, "cpu")
+                .unwrap_or_else(|error| panic!("{}: {error:#}", checkpoint.name));
+            println!(
+                "{}: loaded in {:.1}s as {}",
+                checkpoint.name,
+                started.elapsed().as_secs_f64(),
+                engine.identity()
+            );
+        }
+    }
 
     /// Both dimensions land on the grid, the aspect ratio survives, and the
     /// area stays inside the task's envelope. The recognizer cannot be given

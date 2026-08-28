@@ -28,6 +28,190 @@ use super::describe::FigureDescriber;
 use super::ocr::{OcrEngine, SpottedRegion};
 use super::NativeImageAnalyzer;
 
+// ── A capture of what a real document actually draws ─────────────────────────
+
+/// An [`OcrEngine`] that transcribes nothing and keeps the pixels it was
+/// given.
+///
+/// The way to get a real document's native images out of extraction without
+/// adding an accessor that only a test would use: extraction already hands
+/// every decoded image to the analyzer, and this is an analyzer.
+#[derive(Default)]
+pub(super) struct ImageCapture {
+    pub images: std::sync::Mutex<Vec<image::RgbImage>>,
+}
+
+impl OcrEngine for Arc<ImageCapture> {
+    fn identity(&self) -> String {
+        "capture".to_string()
+    }
+
+    fn admission_threshold(&self) -> f32 {
+        1.0
+    }
+
+    fn spot(&self, image: &image::RgbImage) -> anyhow::Result<Vec<SpottedRegion>> {
+        self.images
+            .lock()
+            .expect("capture lock")
+            .push(image.clone());
+        Ok(Vec::new())
+    }
+}
+
+// ── The accuracy corpus ──────────────────────────────────────────────────────
+
+/// The conditions FIGURE.md's step 9 lists, as figures a recognizer can be
+/// measured on.
+///
+/// Built, not collected, for the same reason as the contract cases above:
+/// each one states in its own source what it is a case *of*, and the ground
+/// truth is what was drawn rather than what someone later read off a scan.
+/// The figures are real rasterizations — MuPDF draws the page and the pixels
+/// are what it drew — so the recognizer meets real glyphs and real
+/// anti-aliasing, at a resolution each case chooses.
+///
+/// This is the corpus for [`super::paddleocr_vl::evaluate`]. It is not run by
+/// the suite: it needs 1.9 GB of weights.
+#[allow(dead_code)] // Reached only from the ignored evaluation test.
+pub(super) fn accuracy_corpus() -> Vec<super::paddleocr_vl::EvaluationCase> {
+    use super::paddleocr_vl::{EvaluationCase, ExpectedRegion};
+
+    /// The labels of the sample figure, at the positions the diagram puts
+    /// them: a source on the left, a hub in the middle, a store below it, and
+    /// the expert's knowledge entering from the right.
+    const DIAGRAM: &[(f32, f32, &str)] = &[
+        (12.0, 240.0, "Non-expert"),
+        (12.0, 200.0, "User interface"),
+        (75.0, 160.0, "Inference engine"),
+        (75.0, 110.0, "Knowledge base"),
+        (140.0, 60.0, "Expert knowledge"),
+    ];
+
+    let diagram_page = || {
+        DIAGRAM.iter().fold(PageSpec::default(), |page, (x, y, text)| {
+            page.with_text(*x, *y, text)
+        })
+    };
+
+    let case = |name: &str, page: PageSpec, scale: f32, labels: &[(f32, f32, &str)]| {
+        let pdf = build_pdf(vec![page]);
+        EvaluationCase {
+            name: name.to_string(),
+            image: render_page(&pdf, 0, scale),
+            expected: labels
+                .iter()
+                .map(|(x, y, text)| ExpectedRegion {
+                    text: (*text).to_string(),
+                    centre: Some(label_centre(*x, *y, text)),
+                })
+                .collect(),
+        }
+    };
+
+    vec![
+        // The baseline: what the recognizer does when nothing is against it.
+        case("clean-diagram", diagram_page(), 3.0, DIAGRAM),
+        // A figure exported at screen resolution, which is most of them.
+        case("low-resolution", diagram_page(), 0.9, DIAGRAM),
+        // Slide-deck artwork is rarely drawn on white.
+        case(
+            "coloured-background",
+            diagram_page().with_background((0.82, 0.89, 0.97)),
+            3.0,
+            DIAGRAM,
+        ),
+        // Inverted contrast, which a binarizing recognizer fails outright and
+        // a VLM should not notice at all.
+        case(
+            "dark-background",
+            DIAGRAM
+                .iter()
+                .fold(PageSpec::default(), |page, (x, y, text)| {
+                    page.with_text(*x, *y, text)
+                        .with_text_colour((0.97, 0.97, 0.97))
+                })
+                .with_background((0.09, 0.09, 0.12)),
+            3.0,
+            DIAGRAM,
+        ),
+        // Axis captions and side labels are turned; the quads come back
+        // turned with them, which is why the geometry is a quadrilateral and
+        // not a rectangle.
+        EvaluationCase {
+            name: "rotated-labels".to_string(),
+            image: render_page(
+                &build_pdf(vec![DIAGRAM.iter().fold(
+                    PageSpec::default(),
+                    |page, (x, y, text)| page.with_rotated_text(*x + 20.0, *y - 40.0, 90.0, text),
+                )]),
+                0,
+                3.0,
+            ),
+            expected: DIAGRAM
+                .iter()
+                .map(|(_, _, text)| ExpectedRegion {
+                    text: (*text).to_string(),
+                    centre: None,
+                })
+                .collect(),
+        },
+        // Nothing to transcribe. Every region emitted here is a false one,
+        // and this is the case that says so.
+        EvaluationCase {
+            name: "no-text".to_string(),
+            image: render_page(
+                &build_pdf(vec![PageSpec::default()
+                    .with_image(ImageSpec::gradient(64, 64).at(20.0, 100.0, 160.0, 120.0))]),
+                0,
+                3.0,
+            ),
+            expected: Vec::new(),
+        },
+        // Characters outside ASCII, which is where a byte-indexing
+        // transcription pipeline breaks.
+        case(
+            "unicode-labels",
+            UNICODE_DIAGRAM
+                .iter()
+                .fold(PageSpec::default(), |page, (x, y, text)| {
+                    page.with_text(*x, *y, text)
+                }),
+            3.0,
+            UNICODE_DIAGRAM,
+        ),
+    ]
+}
+
+const UNICODE_DIAGRAM: &[(f32, f32, &str)] = &[
+    (12.0, 240.0, "Système expert"),
+    (12.0, 200.0, "Größe"),
+    (75.0, 160.0, "Conocimiento"),
+    (75.0, 110.0, "Naïve Bayes"),
+    (12.0, 60.0, "Fähigkeit"),
+];
+
+/// Where a drawn label sits, as a fraction of the rendered image.
+///
+/// Estimated from the layout rather than measured off the raster: Helvetica's
+/// advance widths average close to 0.5 em over mixed-case text and its cap
+/// height is 0.717 em, which places the centre within a few percent of the
+/// image. That is the precision this measurement has, and it is enough for
+/// what it is asked — whether a region landed on its own label or on another
+/// part of the figure.
+fn label_centre(x: f32, y: f32, text: &str) -> Point {
+    const PAGE_WIDTH: f32 = 200.0;
+    const PAGE_HEIGHT: f32 = 300.0;
+    const FONT_SIZE: f32 = 12.0;
+    let width = text.chars().count() as f32 * FONT_SIZE * 0.5;
+    Point {
+        x: (x + width / 2.0) / PAGE_WIDTH,
+        // PDF user space counts up from the bottom; an image counts down from
+        // the top.
+        y: (PAGE_HEIGHT - (y + FONT_SIZE * 0.717 / 2.0)) / PAGE_HEIGHT,
+    }
+}
+
 // ── A PDF with pictures in it ────────────────────────────────────────────────
 
 /// One image drawn on a page: its pixels, and the rectangle it occupies in PDF
@@ -85,16 +269,60 @@ impl ImageSpec {
     }
 }
 
+/// One line of drawn text: where it sits, what it says, how it is turned, and
+/// what colour it is drawn in.
+pub(super) struct TextSpec {
+    pub x: f32,
+    pub y: f32,
+    pub text: String,
+    /// Anticlockwise, in degrees, about the line's own origin.
+    pub rotation: f32,
+    pub rgb: (f32, f32, f32),
+}
+
 /// One page: lines of text at user-space positions, and images.
 #[derive(Default)]
 pub(super) struct PageSpec {
-    pub text: Vec<(f32, f32, String)>,
+    pub text: Vec<TextSpec>,
     pub images: Vec<ImageSpec>,
+    /// Painted over the whole page before anything else. `None` leaves the
+    /// page as the viewer's own white.
+    pub background: Option<(f32, f32, f32)>,
 }
 
 impl PageSpec {
     pub(super) fn with_text(mut self, x: f32, y: f32, text: &str) -> Self {
-        self.text.push((x, y, text.to_string()));
+        self.text.push(TextSpec {
+            x,
+            y,
+            text: text.to_string(),
+            rotation: 0.0,
+            rgb: (0.0, 0.0, 0.0),
+        });
+        self
+    }
+
+    /// A label turned on the page, as a diagram turns its axis captions.
+    pub(super) fn with_rotated_text(mut self, x: f32, y: f32, degrees: f32, text: &str) -> Self {
+        self.text.push(TextSpec {
+            x,
+            y,
+            text: text.to_string(),
+            rotation: degrees,
+            rgb: (0.0, 0.0, 0.0),
+        });
+        self
+    }
+
+    pub(super) fn with_text_colour(mut self, rgb: (f32, f32, f32)) -> Self {
+        if let Some(last) = self.text.last_mut() {
+            last.rgb = rgb;
+        }
+        self
+    }
+
+    pub(super) fn with_background(mut self, rgb: (f32, f32, f32)) -> Self {
+        self.background = Some(rgb);
         self
     }
 
@@ -102,6 +330,28 @@ impl PageSpec {
         self.images.push(image);
         self
     }
+}
+
+/// Rasterize one page of a built PDF, as a scanner or a figure export would.
+///
+/// This is how the accuracy corpus gets typeset text without a font
+/// rasterizer of its own: MuPDF already draws pages, and drawing one is the
+/// most faithful way to produce the thing a recognizer meets — real glyphs,
+/// real anti-aliasing, at a resolution the case chooses.
+pub(super) fn render_page(pdf: &[u8], page: usize, scale: f32) -> image::RgbImage {
+    let document = mupdf::Document::from_bytes(pdf, "pdf").expect("the built PDF opens");
+    let page = document.load_page(page as i32).expect("the page loads");
+    let pixmap = page
+        .to_pixmap(
+            &mupdf::Matrix::new_scale(scale, scale),
+            &mupdf::Colorspace::device_rgb(),
+            false,
+            true,
+        )
+        .expect("the page rasterizes");
+    let (width, height) = (pixmap.width(), pixmap.height());
+    image::RgbImage::from_raw(width, height, pixmap.samples().to_vec())
+        .expect("a device-RGB pixmap is three bytes a pixel")
 }
 
 /// Assemble a PDF. Uncompressed image streams and a base-14 font, because the
@@ -114,16 +364,44 @@ pub(super) fn build_pdf(pages: Vec<PageSpec>) -> Vec<u8> {
     // 1: catalog, 2: page tree, 3: font. Page and content objects follow.
     objects.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
     objects.push(Vec::new()); // page tree, patched below
-    objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec());
+    // WinAnsi, so a label's accented characters are the bytes written for them
+    // rather than whatever StandardEncoding happens to put at that code.
+    objects.push(
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+    );
 
     let mut page_ids = Vec::new();
     for page in &pages {
         let mut content = Vec::new();
-        for (x, y, text) in &page.text {
-            let escaped = text.replace('\\', r"\\").replace('(', r"\(").replace(')', r"\)");
+        if let Some((red, green, blue)) = page.background {
             content.extend_from_slice(
-                format!("BT /F1 12 Tf {x} {y} Td ({escaped}) Tj ET\n").as_bytes(),
+                format!("{red} {green} {blue} rg 0 0 {PAGE_WIDTH} {PAGE_HEIGHT} re f\n")
+                    .as_bytes(),
             );
+        }
+        for line in &page.text {
+            // WinAnsi is the base-14 default, so a label may carry any Latin-1
+            // character as its own byte; the escapes are the three the string
+            // syntax reserves.
+            let escaped = line
+                .text
+                .replace('\\', r"\\")
+                .replace('(', r"\(")
+                .replace(')', r"\)");
+            let bytes: Vec<u8> = escaped
+                .chars()
+                .map(|c| if (c as u32) < 256 { c as u8 } else { b'?' })
+                .collect();
+            let (radians, (red, green, blue)) = (line.rotation.to_radians(), line.rgb);
+            let (cos, sin) = (radians.cos(), radians.sin());
+            content.extend_from_slice(
+                format!("BT /F1 12 Tf {red} {green} {blue} rg {cos} {sin} {} {cos} {} {} Tm (",
+                    -sin, line.x, line.y)
+                    .as_bytes(),
+            );
+            content.extend_from_slice(&bytes);
+            content.extend_from_slice(b") Tj ET\n");
         }
         let mut xobjects = String::new();
         for (index, image) in page.images.iter().enumerate() {
@@ -637,6 +915,61 @@ fn exact_search_finds_a_transcribed_label_at_its_own_polygon() {
     assert!(confidence.is_some(), "a transcribed region carries its signal");
 }
 
+/// The acceptance criterion `get_document_text` rests on: a page-scoped read
+/// of the document includes the enrichment, exactly once, and only on the page
+/// that drew the picture.
+///
+/// A page-scoped read is the span between the first and last byte the source
+/// map attributes to that page (`wilkes_agent::reader`), so what decides the
+/// answer is where the enrichment's own segments say they are. That is what is
+/// checked here: the tool itself is one registry lookup and this slice, and
+/// the registry is checked in `extract::tests`.
+#[test]
+fn a_page_scoped_read_carries_that_pages_enrichment_and_no_others() {
+    let (content, _) = extract(
+        vec![
+            PageSpec::default()
+                .with_text(20.0, 250.0, "First page prose")
+                .with_image(ImageSpec::gradient(64, 32)),
+            PageSpec::default().with_text(20.0, 250.0, "Second page prose"),
+        ],
+        vec![
+            Script::Spots(vec![("Inference engine", 0.95, MIDDLE)]),
+            Script::Spots(Vec::new()),
+        ],
+        None,
+    );
+
+    let span = |page: u32| -> String {
+        let ranges: Vec<_> = content
+            .source_map
+            .segments
+            .iter()
+            .filter(|segment| {
+                matches!(segment.origin, crate::types::SourceOrigin::PdfPage { page: p, .. } if p == page)
+            })
+            .map(|segment| segment.text_range.clone())
+            .collect();
+        assert!(!ranges.is_empty(), "page {page} has no segments at all");
+        let start = ranges.iter().map(|range| range.start).min().expect("a start");
+        let end = ranges.iter().map(|range| range.end).max().expect("an end");
+        content.text[start..end].to_string()
+    };
+
+    let first = span(1);
+    assert_eq!(
+        first.matches("Image embedded text: Inference engine").count(),
+        1,
+        "the enrichment is in the reading of its own page, once: {first:?}"
+    );
+    assert!(first.contains("First page prose"), "{first:?}");
+    assert!(
+        !span(2).contains("Image embedded text:"),
+        "a page that drew no picture reads none: {:?}",
+        span(2)
+    );
+}
+
 /// The acceptance criterion the embedder rests on: the enrichment reaches the
 /// passages the existing embedder is given, in one piece, with no second
 /// embedding path — and the chunks still rebuild the reading byte for byte.
@@ -703,6 +1036,113 @@ fn the_enrichment_reaches_the_embedder_as_one_passage() {
             .map(|chunk| (&chunk.byte_range, chunk.text.as_str())),
     )
     .expect("the chunks rebuild the reading");
+}
+
+/// FIGURE.md's semantic acceptance criterion: *semantic search for "Where does
+/// expert knowledge enter the system?" retrieves the image-enrichment passage
+/// when a description is configured.*
+///
+/// Retrieval for real — the chunks are written to a `SemanticIndex` and the
+/// question is asked of it — with a transparent embedder in place of a model:
+/// a term-overlap vector, so a passage's rank is a fact about its words rather
+/// than about weights this test would otherwise be silently measuring.
+///
+/// What that proves is the half Wilkes owns: the enrichment is chunked,
+/// embedded through the one existing path, stored, and comes back first for a
+/// question only the picture answers. What it does not prove is that a
+/// particular real model ranks it first; no test can, and the shipped
+/// embedder's quality is not this feature's claim.
+#[test]
+fn semantic_search_retrieves_the_enrichment_for_a_question_only_the_picture_answers() {
+    use crate::embed::index::db::{PreparedFile, SemanticIndex};
+
+    /// One dimension per term of interest. Cosine similarity then ranks by
+    /// how much of the question a passage actually contains.
+    const TERMS: &[&str] = &[
+        "expert", "knowledge", "enter", "system", "inference", "engine", "base", "component",
+        "figure", "chapter", "reasoning",
+    ];
+    fn embed(text: &str) -> Vec<f32> {
+        let lowered = text.to_lowercase();
+        let mut vector: Vec<f32> = TERMS
+            .iter()
+            .map(|term| lowered.matches(term).count() as f32)
+            .collect();
+        let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for value in &mut vector {
+                *value /= norm;
+            }
+        }
+        vector.resize(TERMS.len(), 0.0);
+        vector
+    }
+
+    struct Fixed;
+    impl FigureDescriber for Fixed {
+        fn identity(&self) -> String {
+            "fixed-describer-v1".to_string()
+        }
+        fn describe(
+            &self,
+            _image: &image::RgbImage,
+            _ocr: &[ImageOcrRegion],
+        ) -> anyhow::Result<crate::types::ImageDescription> {
+            Ok(crate::types::ImageDescription {
+                description: "Expert knowledge enters from the right and fills the \
+                              knowledge base, which the inference engine consults."
+                    .to_string(),
+            })
+        }
+    }
+
+    let (content, _) = extract(
+        vec![PageSpec::default()
+            .with_text(20.0, 260.0, "This chapter introduces reasoning under uncertainty.")
+            .with_image(ImageSpec::gradient(64, 32))
+            .with_text(20.0, 60.0, "Figure 3: Components of an Expert System")],
+        vec![Script::Spots(vec![
+            ("Inference engine", 0.95, MIDDLE),
+            ("Knowledge base", 0.95, MIDDLE),
+            ("Expert knowledge", 0.95, MIDDLE),
+        ])],
+        Some(|| Box::new(Fixed)),
+    );
+
+    let dir = tempfile::tempdir().expect("a temporary index");
+    let path = dir.path().join("case.pdf");
+    std::fs::write(&path, b"%PDF-1.4\n").expect("a file to hang the chunks on");
+    let mut index = SemanticIndex::create(
+        dir.path(),
+        "term-overlap",
+        TERMS.len(),
+        crate::types::EmbeddingEngine::SBERT,
+        Some(dir.path()),
+    )
+    .expect("the index is created");
+
+    let chunks = crate::embed::index::chunk::chunk_content(&content, path.clone(), 220, 0);
+    assert!(chunks.len() > 1, "the document is more than one passage");
+    index
+        .write_file(PreparedFile {
+            full_text: content.text.clone(),
+            path: path.clone(),
+            chunks: chunks
+                .iter()
+                .map(|chunk| (chunk.clone(), embed(&chunk.text)))
+                .collect(),
+        })
+        .expect("the passages are indexed");
+
+    let found = index
+        .query(&embed("Where does expert knowledge enter the system?"), 3)
+        .expect("the index answers");
+    let best = found.first().expect("the question retrieves something");
+    assert!(
+        best.chunk_text.contains("Image description: Expert knowledge enters"),
+        "the enrichment should answer a question only the picture answers, got {:?}",
+        found.iter().map(|chunk| &chunk.chunk_text).collect::<Vec<_>>()
+    );
 }
 
 /// Several figures in one document each land at their own picture, and the
