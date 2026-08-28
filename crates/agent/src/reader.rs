@@ -256,6 +256,7 @@ mod tests {
                             page: 1,
                             bbox: None,
                         },
+                        provenance: Default::default(),
                     },
                     SourceSegment {
                         text_range: ByteRange { start: 5, end: 8 },
@@ -263,6 +264,7 @@ mod tests {
                             page: 1,
                             bbox: None,
                         },
+                        provenance: Default::default(),
                     },
                     SourceSegment {
                         text_range: ByteRange { start: 9, end: 13 },
@@ -270,6 +272,7 @@ mod tests {
                             page: 2,
                             bbox: None,
                         },
+                        provenance: Default::default(),
                     },
                     SourceSegment {
                         text_range: ByteRange { start: 14, end: 17 },
@@ -277,6 +280,7 @@ mod tests {
                             page: 2,
                             bbox: None,
                         },
+                        provenance: Default::default(),
                     },
                 ],
             },
@@ -287,6 +291,7 @@ mod tests {
                 title: None,
                 page_count: Some(2),
             },
+            images: Vec::new(),
         };
 
         assert_eq!(page_text_strict(&content, 1).unwrap(), "page one");

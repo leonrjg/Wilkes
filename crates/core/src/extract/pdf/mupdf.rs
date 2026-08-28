@@ -1,21 +1,39 @@
 use std::path::Path;
+use std::sync::Arc;
 
+use mupdf::text_page::TextBlockType;
 use mupdf::{DestinationKind, Document, MetadataName, TextPageFlags};
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
+use crate::extract::image::{
+    self, AnalysisContext, DiscoveredImage, ImageAnalyzer, NativeTextOnPage,
+};
 use crate::types::{
-    BoundingBox, DeclaredOutline, ExtractedContent, ExtractionDiagnostics, FileMetadata,
-    OutlineAnchor, OutlineEntry, SourceMap, SourceOrigin,
+    BoundingBox, DeclaredOutline, ExtractedContent, ExtractedImage, ExtractionDiagnostics,
+    FileMetadata, ImageTransform, OutlineAnchor, OutlineEntry, SourceMap, SourceOrigin,
 };
 
 use super::backend::PdfBackend;
 use super::sanitize::{self, Block, Line, Page, Reading, Word};
 
-pub(super) struct MuPdfBackend;
+#[derive(Default)]
+pub(super) struct MuPdfBackend {
+    /// The configured image analyzer, or none. One analyzer per extractor,
+    /// and one extractor per registry, so every consumer of a rendition sees
+    /// the same enrichment — an analyzer configured per call site is how two
+    /// consumers end up disagreeing about what a document says.
+    analyzer: Option<Arc<dyn ImageAnalyzer>>,
+}
+
+impl MuPdfBackend {
+    pub(super) fn new(analyzer: Option<Arc<dyn ImageAnalyzer>>) -> Self {
+        Self { analyzer }
+    }
+}
 
 impl PdfBackend for MuPdfBackend {
     fn extract(&self, path: &Path) -> anyhow::Result<ExtractedContent> {
-        let document = read_document(path)?;
+        let document = read_document(path, self.analyzer.as_deref())?;
         let size_bytes = std::fs::metadata(path)?.len();
 
         Ok(ExtractedContent {
@@ -30,11 +48,12 @@ impl PdfBackend for MuPdfBackend {
                 title: document.title,
                 page_count: Some(document.page_count),
             },
+            images: document.images,
         })
     }
 
     fn outline(&self, path: &Path) -> anyhow::Result<DeclaredOutline> {
-        let document = read_document(path)?;
+        let document = read_document(path, self.analyzer.as_deref())?;
         let anchors = PageAnchors::new(&document.reading);
         let mut entries = Vec::new();
         flatten_outline(
@@ -74,6 +93,7 @@ struct PdfDocument {
     page_count: u32,
     title: Option<String>,
     diagnostics: ExtractionDiagnostics,
+    images: Vec<ExtractedImage>,
 }
 
 /// Read a PDF into the one reading Wilkes has of it.
@@ -83,7 +103,10 @@ struct PdfDocument {
 /// and there is exactly one of those. Asking for the outline therefore costs
 /// what extraction costs — the price of the offsets being real rather than a
 /// page number wearing an offset's clothes.
-fn read_document(path: &Path) -> anyhow::Result<PdfDocument> {
+fn read_document(
+    path: &Path,
+    analyzer: Option<&dyn ImageAnalyzer>,
+) -> anyhow::Result<PdfDocument> {
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?;
@@ -99,16 +122,34 @@ fn read_document(path: &Path) -> anyhow::Result<PdfDocument> {
         .filter(|s| !s.is_empty());
 
     let mut pages = Vec::with_capacity(page_count as usize);
+    let mut discovered: Vec<DiscoveredImage> = Vec::new();
     for i in 0..page_count as i32 {
         let page = doc.load_page(i)?;
         let height = page.bounds().map(|bounds| bounds.y1 - bounds.y0)?;
         // ACCURATE_BBOXES produces tighter per-character quads.
-        let text_page = page.to_text_page(TextPageFlags::ACCURATE_BBOXES)?;
-        pages.push(extract_page_words(&text_page, (i + 1) as u32, height));
+        // PRESERVE_IMAGES adds the page's image blocks to the same block list,
+        // in the order the page draws them — which is the only discovery
+        // signal this phase needs, and the only thing that establishes where
+        // an image sits relative to the text around it.
+        let text_page = page.to_text_page(
+            TextPageFlags::ACCURATE_BBOXES | TextPageFlags::PRESERVE_IMAGES,
+        )?;
+        pages.push(extract_page_words(
+            &text_page,
+            (i + 1) as u32,
+            height,
+            &mut discovered,
+        ));
     }
 
     let mut diagnostics = ExtractionDiagnostics::default();
-    let reading = sanitize::sanitize(pages, &mut diagnostics);
+    let context = AnalysisContext::new(native_words(&pages));
+    let mut images = image::analyze(&discovered, &context, analyzer, &mut diagnostics);
+    // The pixels have done their work. Dropping them here rather than at the
+    // end of extraction keeps a document's worth of decoded artwork out of
+    // memory while the reading is being built.
+    drop(discovered);
+    let reading = sanitize::sanitize(pages, &mut images, &mut diagnostics);
     if diagnostics.ambiguous_column_pages > 0
         || diagnostics.relocated_marginalia_blocks > 0
         || diagnostics.removed_furniture_runs > 0
@@ -128,13 +169,60 @@ fn read_document(path: &Path) -> anyhow::Result<PdfDocument> {
         );
     }
 
+    if diagnostics.native_images_found > 0 {
+        info!(
+            "images in {:?}: {} found, {} analyzed, {} skipped by a technical limit, \
+             {} transcribed, {} recognition failures, {} regions accepted, \
+             {} below the threshold, {} already native text, \
+             {} described, {} description failures, {} with no describer configured",
+            path,
+            diagnostics.native_images_found,
+            diagnostics.native_images_analyzed,
+            diagnostics.native_images_skipped_technical_limit,
+            diagnostics.images_ocr_succeeded,
+            diagnostics.images_ocr_failed,
+            diagnostics.ocr_regions_accepted,
+            diagnostics.ocr_regions_rejected_low_confidence,
+            diagnostics.ocr_regions_deduplicated_against_native_text,
+            diagnostics.images_description_succeeded,
+            diagnostics.images_description_failed,
+            diagnostics.images_description_not_configured,
+        );
+    }
+
     Ok(PdfDocument {
         doc,
         reading,
         page_count,
         title,
         diagnostics,
+        images,
     })
+}
+
+/// Every word the pages draw as their own glyphs, for the deduplication rule.
+///
+/// Read from the pages as MuPDF gave them, before sanitation moves anything:
+/// the question is where the document *drew* a word, and relocation changes
+/// where a word is read, never where it was drawn.
+fn native_words(pages: &[Page]) -> Vec<NativeTextOnPage> {
+    let mut words = Vec::new();
+    for page in pages {
+        for block in &page.blocks {
+            for line in &block.lines {
+                for word in &line.words {
+                    if let Some(bbox) = &word.bbox {
+                        words.push(NativeTextOnPage {
+                            page: page.number,
+                            text: word.text.clone(),
+                            bbox: bbox.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    words
 }
 
 /// Where each page's segments sit in the reading. Marginalia are relocated
@@ -314,10 +402,25 @@ fn flatten_outline(
 ///
 /// This produces the page as the page is; [`sanitize`](super::sanitize) turns
 /// it into the document's reading.
-fn extract_page_words(text_page: &mupdf::TextPage, page_num: u32, height: f32) -> Page {
+fn extract_page_words(
+    text_page: &mupdf::TextPage,
+    page_num: u32,
+    height: f32,
+    discovered: &mut Vec<DiscoveredImage>,
+) -> Page {
     let mut blocks = Vec::new();
 
     for block in text_page.blocks() {
+        if block.r#type() == TextBlockType::Image {
+            if let Some(found) = discover_image(&block, page_num, discovered.len()) {
+                blocks.push(Block {
+                    lines: Vec::new(),
+                    image: Some(discovered.len()),
+                });
+                discovered.push(found);
+            }
+            continue;
+        }
         let mut lines = Vec::new();
         for line in block.lines() {
             let mut out = Line::default();
@@ -365,7 +468,7 @@ fn extract_page_words(text_page: &mupdf::TextPage, page_num: u32, height: f32) -
             lines.push(out);
         }
         if !lines.is_empty() {
-            blocks.push(Block { lines });
+            blocks.push(Block { lines, image: None });
         }
     }
 
@@ -374,6 +477,78 @@ fn extract_page_words(text_page: &mupdf::TextPage, page_num: u32, height: f32) -
         height,
         blocks,
     }
+}
+
+/// Read one native image block: where the page put it, and its pixels.
+///
+/// Everything mechanical. No caption is looked for, no neighbouring text is
+/// consulted, and nothing decides whether this is a figure — a repeated logo
+/// arrives here exactly as a diagram does, and it is the recognizer finding no
+/// text in it that keeps it out of the reading.
+fn discover_image(
+    block: &mupdf::TextBlock<'_>,
+    page: u32,
+    ordinal: usize,
+) -> Option<DiscoveredImage> {
+    let bounds = block.bounds();
+    let bbox = BoundingBox {
+        x: bounds.x0,
+        y: bounds.y0,
+        width: (bounds.x1 - bounds.x0).max(0.0),
+        height: (bounds.y1 - bounds.y0).max(0.0),
+    };
+    let ctm = block.ctm()?;
+    let transform = ImageTransform {
+        a: ctm.a,
+        b: ctm.b,
+        c: ctm.c,
+        d: ctm.d,
+        e: ctm.e,
+        f: ctm.f,
+    };
+    let id = format!("p{page}-i{ordinal}");
+
+    let mut found = DiscoveredImage {
+        id: id.clone(),
+        page,
+        bbox,
+        transform,
+        decoded: None,
+        rejected: None,
+    };
+
+    let Some(image) = block.image() else {
+        found.rejected = Some("image block carries no image".to_string());
+        return Some(found);
+    };
+    // Ask the technical limits before decoding: the point of a decode limit is
+    // not to decode the thing.
+    if let Some(reason) = image::technical_limit(image.width(), image.height()) {
+        found.rejected = Some(reason);
+        return Some(found);
+    }
+    let pixmap = match image.to_pixmap() {
+        Ok(pixmap) => pixmap,
+        Err(error) => {
+            warn!("image {id}: decode failed: {error}");
+            found.rejected = Some(format!("decode failed: {error}"));
+            return Some(found);
+        }
+    };
+    match image::decode(
+        pixmap.width(),
+        pixmap.height(),
+        pixmap.n() as usize,
+        pixmap.stride() as usize,
+        pixmap.samples(),
+    ) {
+        Ok(decoded) => found.decoded = Some(decoded),
+        Err(reason) => {
+            warn!("image {id}: {reason}");
+            found.rejected = Some(reason);
+        }
+    }
+    Some(found)
 }
 
 fn flush(line: &mut Line, word_chars: &mut String, bbox: &mut Option<BoundingBox>) {
@@ -396,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_mupdf_backend_invalid_file() {
-        let backend = MuPdfBackend;
+        let backend = MuPdfBackend::default();
         let dir = tempdir().unwrap();
         let path = dir.path().join("invalid.pdf");
         fs::write(&path, "not a pdf").unwrap();
@@ -407,7 +582,7 @@ mod tests {
 
     #[test]
     fn test_mupdf_backend_non_existent_file() {
-        let backend = MuPdfBackend;
+        let backend = MuPdfBackend::default();
         let path = Path::new("non_existent.pdf");
         let result = backend.extract(path);
         assert!(result.is_err());
@@ -415,7 +590,7 @@ mod tests {
 
     #[test]
     fn test_mupdf_backend_extract_valid_pdf() {
-        let backend = MuPdfBackend;
+        let backend = MuPdfBackend::default();
         let dir = tempdir().unwrap();
         let path = dir.path().join("valid.pdf");
 
@@ -445,6 +620,11 @@ mod tests {
     /// coordinate at all.
     const COORDINATE_OUTLINED_PDF_BASE64: &str = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgL091dGxpbmVzIDUgMCBSIC9QYWdlTW9kZSAvVXNlT3V0bGluZXMgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAyMDAgNjAwXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNiAwIFIgPj4gPj4gPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCAxMjkgPj4Kc3RyZWFtCkJUIC9GMSAxMiBUZiAyMCA1NTAgVGQgKEFscGhhIGhlYWRpbmcpIFRqIEVUCkJUIC9GMSAxMiBUZiAyMCA0MDAgVGQgKEJldGEgbWlkZGxlKSBUaiBFVApCVCAvRjEgMTIgVGYgMjAgMjAwIFRkIChHYW1tYSB0YWlsKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmoKPDwgL1R5cGUgL091dGxpbmVzIC9GaXJzdCA3IDAgUiAvTGFzdCA4IDAgUiAvQ291bnQgMiA+PgplbmRvYmoKNiAwIG9iago8PCAvVHlwZSAvRm9udCAvU3VidHlwZSAvVHlwZTEgL0Jhc2VGb250IC9IZWx2ZXRpY2EgPj4KZW5kb2JqCjcgMCBvYmoKPDwgL1RpdGxlIChNaWRkbGUpIC9QYXJlbnQgNSAwIFIgL0Rlc3QgWzMgMCBSIC9YWVogMjAgNDIwIDBdIC9OZXh0IDggMCBSID4+CmVuZG9iago4IDAgb2JqCjw8IC9UaXRsZSAoR2FtbWEgdGFpbCkgL1BhcmVudCA1IDAgUiAvRGVzdCBbMyAwIFIgL0ZpdF0gL1ByZXYgNyAwIFIgPj4KZW5kb2JqCnhyZWYKMCA5CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMDk3IDAwMDAwIG4gCjAwMDAwMDAxNTQgMDAwMDAgbiAKMDAwMDAwMDI4MCAwMDAwMCBuIAowMDAwMDAwNDYwIDAwMDAwIG4gCjAwMDAwMDA1MzEgMDAwMDAgbiAKMDAwMDAwMDYwMSAwMDAwMCBuIAowMDAwMDAwNjkyIDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgOSAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNzc4CiUlRU9GCg==";
 
+    /// One page, a line of text, a 4x2 RGB image placed at a known matrix,
+    /// and a caption below it. Hand-built so the thing under test — where the
+    /// image is and how big — is visible in the source that asserts about it.
+    const IMAGE_PDF_BASE64: &str = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAyMDAgMzAwXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNiAwIFIgPj4gL1hPYmplY3QgPDwgL0ltMCA1IDAgUiA+PiA+PiA+PgplbmRvYmoKNCAwIG9iago8PCAvTGVuZ3RoIDEzMiA+PgpzdHJlYW0KQlQgL0YxIDEyIFRmIDIwIDI1MCBUZCAoQWJvdmUgdGhlIHBpY3R1cmUpIFRqIEVUCnEgMTYwIDAgMCA4MCAyMCAxMDAgY20gL0ltMCBEbyBRCkJUIC9GMSAxMiBUZiAyMCA2MCBUZCAoRmlndXJlIDE6IGEgY2FwdGlvbikgVGogRVQKZW5kc3RyZWFtCmVuZG9iago1IDAgb2JqCjw8IC9UeXBlIC9YT2JqZWN0IC9TdWJ0eXBlIC9JbWFnZSAvV2lkdGggNCAvSGVpZ2h0IDIgL0NvbG9yU3BhY2UgL0RldmljZVJHQiAvQml0c1BlckNvbXBvbmVudCA4IC9MZW5ndGggMjQgPj4Kc3RyZWFtCv8AAAD/AAAA////AAAAAEBAQICAgP///wplbmRzdHJlYW0KZW5kb2JqCjYgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iagp4cmVmCjAgNwowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1OCAwMDAwMCBuIAowMDAwMDAwMTE1IDAwMDAwIG4gCjAwMDAwMDAyNjcgMDAwMDAgbiAKMDAwMDAwMDQ0OSAwMDAwMCBuIAowMDAwMDAwNjE2IDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNyAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNjg2CiUlRU9GCg==";
+
     fn write_pdf(dir: &std::path::Path, name: &str, base64: &str) -> std::path::PathBuf {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         let path = dir.join(name);
@@ -457,7 +637,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_pdf(dir.path(), "outlined.pdf", OUTLINED_PDF_BASE64);
 
-        let outline = MuPdfBackend.outline(&path).expect("outline reads").entries;
+        let outline = MuPdfBackend::default().outline(&path).expect("outline reads").entries;
         let seen: Vec<(&str, u32, Option<u32>)> = outline
             .iter()
             .map(|e| (e.title.as_str(), e.level, e.page))
@@ -482,8 +662,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_pdf(dir.path(), "outlined.pdf", OUTLINED_PDF_BASE64);
 
-        let content = MuPdfBackend.extract(&path).expect("extracts");
-        let outline = MuPdfBackend.outline(&path).expect("outline reads").entries;
+        let content = MuPdfBackend::default().extract(&path).expect("extracts");
+        let outline = MuPdfBackend::default().outline(&path).expect("outline reads").entries;
 
         let chapter_two = outline
             .iter()
@@ -520,8 +700,8 @@ mod tests {
             COORDINATE_OUTLINED_PDF_BASE64,
         );
 
-        let content = MuPdfBackend.extract(&path).expect("extracts");
-        let outline = MuPdfBackend.outline(&path).expect("outline reads").entries;
+        let content = MuPdfBackend::default().extract(&path).expect("extracts");
+        let outline = MuPdfBackend::default().outline(&path).expect("outline reads").entries;
 
         let middle = outline.iter().find(|e| e.title == "Middle").expect("entry");
         assert_eq!(middle.anchor, OutlineAnchor::DestinationCoordinate);
@@ -544,8 +724,8 @@ mod tests {
             COORDINATE_OUTLINED_PDF_BASE64,
         );
 
-        let content = MuPdfBackend.extract(&path).expect("extracts");
-        let outline = MuPdfBackend.outline(&path).expect("outline reads").entries;
+        let content = MuPdfBackend::default().extract(&path).expect("extracts");
+        let outline = MuPdfBackend::default().outline(&path).expect("outline reads").entries;
 
         let tail = outline
             .iter()
@@ -567,7 +747,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_pdf(dir.path(), "outlined.pdf", OUTLINED_PDF_BASE64);
 
-        let outline = MuPdfBackend.outline(&path).expect("outline reads").entries;
+        let outline = MuPdfBackend::default().outline(&path).expect("outline reads").entries;
         let chapter_one = outline
             .iter()
             .find(|e| e.title == "Chapter One")
@@ -583,7 +763,7 @@ mod tests {
         // The plain single-page PDF the extraction test uses.
         let path = write_pdf(dir.path(), "plain.pdf", "JVBERi0xLjQKMSAwIG9iago8PAovVHlwZSAvQ2F0YWxvZwovUGFnZXMgMiAwIFIKPj4KZW5kb2JqCjIgMCBvYmoKPDwKL1R5cGUgL1BhZ2VzCi9LaWRzIFszIDAgUl0KL0NvdW50IDEKPj4KZW5kb2JqCjMgMCBvYmoKPDwKL1R5cGUgL1BhZ2UKL1BhcmVudCAyIDAgUgovTWVkaWFCb3ggWzAgMCAzMDAgMTQ0XQovQ29udGVudHMgNCAwIFIKL1Jlc291cmNlcyA8PAovRm9udCA8PAovRjEgPDwKL1R5cGUgL0ZvbnQKL1N1YnR5cGUgL1R5cGUxCi9CYXNlRm9udCAvSGVsdmV0aWNhCj4+Cj4+Cj4+Cj4+CjBlbmRvYmoKNCAwIG9iago8PAovTGVuZ3RoIDQxCj4+CnN0cmVhbQpCVAovRjEgMTggVGYKMCBldAo1MCA1MCBUZAooSGVsbG8gV29ybGQpIFRqCkVUCmVuZHN0cmVhbQplbmRvYmoKeHJlZgowIDUKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTYgMDAwMDAgbiAKMDAwMDAwMDExMSAwMDAwMCBuIAowMDAwMDAwMjgyIDAwMDAwIG4gCnRyYWlsZXIKPDwKL1NpemUgNQovUm9vdCAxIDAgUgo+PgpzdGFydHhyZWYKMzcyCiUlRU9GCg==");
 
-        assert!(MuPdfBackend
+        assert!(MuPdfBackend::default()
             .outline(&path)
             .expect("outline reads")
             .entries
@@ -595,7 +775,286 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("invalid.pdf");
         fs::write(&path, "not a pdf").unwrap();
-        assert!(MuPdfBackend.outline(&path).is_err());
+        assert!(MuPdfBackend::default().outline(&path).is_err());
+    }
+
+    // ── Native images ───────────────────────────────────────────────────
+
+    /// Discovery is mechanical: the block MuPDF exposes, its placement and
+    /// its pixels. No caption is matched, and the caption in this fixture is
+    /// there to prove it is not consulted.
+    #[test]
+    fn a_native_image_block_is_found_with_its_placement_and_pixels() {
+        let dir = tempdir().unwrap();
+        let path = write_pdf(dir.path(), "image.pdf", IMAGE_PDF_BASE64);
+
+        let content = MuPdfBackend::default().extract(&path).expect("extracts");
+        assert_eq!(content.images.len(), 1, "one image block on the page");
+        let image = &content.images[0];
+
+        assert_eq!(image.id, "p1-i0");
+        assert_eq!(image.page, 1);
+        assert_eq!((image.pixel_width, image.pixel_height), (4, 2));
+        assert!(!image.image_sha256.is_empty(), "the pixels were digested");
+
+        // Placed by `160 0 0 80 20 100 cm` on a 300-point-tall page, so the
+        // box is 160 x 80 with its top 300 - 180 = 120 from the top edge.
+        assert!((image.bbox.width - 160.0).abs() < 1.0, "{:?}", image.bbox);
+        assert!((image.bbox.height - 80.0).abs() < 1.0, "{:?}", image.bbox);
+        assert!((image.bbox.x - 20.0).abs() < 1.0, "{:?}", image.bbox);
+        assert!((image.bbox.y - 120.0).abs() < 1.0, "{:?}", image.bbox);
+    }
+
+    /// The transform is what turns a position inside the image into a
+    /// position on the page. Checked at the corners, because a flip that put
+    /// the first pixel row at the bottom would still produce a plausible
+    /// bounding box and an upside-down highlight.
+    #[test]
+    fn the_transform_maps_image_pixels_onto_the_page() {
+        let dir = tempdir().unwrap();
+        let path = write_pdf(dir.path(), "image.pdf", IMAGE_PDF_BASE64);
+
+        let content = MuPdfBackend::default().extract(&path).expect("extracts");
+        let image = &content.images[0];
+        let (width, height) = (image.pixel_width, image.pixel_height);
+
+        let top_left = image.transform.pixel_to_page(0.0, 0.0, width, height);
+        let bottom_right = image
+            .transform
+            .pixel_to_page(width as f32, height as f32, width, height);
+
+        assert!(
+            (top_left.x - image.bbox.x).abs() < 1.0 && (top_left.y - image.bbox.y).abs() < 1.0,
+            "the first pixel is at the box's top-left, got {top_left:?} for {:?}",
+            image.bbox
+        );
+        assert!(
+            (bottom_right.x - (image.bbox.x + image.bbox.width)).abs() < 1.0
+                && (bottom_right.y - (image.bbox.y + image.bbox.height)).abs() < 1.0,
+            "the last pixel is at the box's bottom-right, got {bottom_right:?} for {:?}",
+            image.bbox
+        );
+    }
+
+    /// With no analyzer the reading is the document's own text, unchanged,
+    /// and the image is counted rather than described. "No recognizer here"
+    /// and "no text in the picture" are different facts and read differently.
+    #[test]
+    fn without_an_analyzer_the_reading_is_unchanged_and_the_image_is_counted() {
+        let dir = tempdir().unwrap();
+        let path = write_pdf(dir.path(), "image.pdf", IMAGE_PDF_BASE64);
+
+        let content = MuPdfBackend::default().extract(&path).expect("extracts");
+        assert!(content.text.contains("Above the picture"));
+        assert!(content.text.contains("Figure 1: a caption"));
+        assert!(!content.text.contains("Image embedded text:"));
+        assert!(content.images[0].reading_range.is_none());
+        assert!(matches!(
+            content.images[0].status,
+            crate::types::ImageAnalysisStatus::Partial { .. }
+        ));
+
+        let diagnostics = MuPdfBackend::default()
+            .outline(&path)
+            .expect("outline reads")
+            .diagnostics;
+        assert_eq!(diagnostics.native_images_found, 1);
+        assert_eq!(diagnostics.native_images_analyzed, 0);
+    }
+
+    /// Enrichment is written where the page drew the picture — between the
+    /// line above it and the caption below — and not after the text that
+    /// looks like a caption, because no caption was looked for.
+    #[test]
+    fn enrichment_lands_at_the_image_block_rather_than_near_a_caption() {
+        use crate::extract::image::{AnalysisContext, DiscoveredImage, ImageAnalyzer};
+        use crate::types::{ImageDescription, ImageOcrRegion, OcrAdmission, Point};
+
+        struct Fixed;
+        impl ImageAnalyzer for Fixed {
+            fn identity(&self) -> String {
+                "fixed-analyzer-v1".to_string()
+            }
+            fn analyze(
+                &self,
+                images: &mut [ExtractedImage],
+                _discovered: &[DiscoveredImage],
+                _context: &AnalysisContext,
+                diagnostics: &mut ExtractionDiagnostics,
+            ) {
+                for image in images {
+                    diagnostics.native_images_analyzed += 1;
+                    diagnostics.ocr_regions_accepted += 1;
+                    image.analyzer_identity = self.identity();
+                    image.ocr_regions = vec![ImageOcrRegion {
+                        text: "Knowledge base".to_string(),
+                        confidence: 0.9,
+                        polygon_within_image: vec![Point { x: 0.0, y: 0.0 }],
+                        page_polygon: vec![
+                            Point { x: 30.0, y: 130.0 },
+                            Point { x: 90.0, y: 130.0 },
+                            Point { x: 90.0, y: 150.0 },
+                            Point { x: 30.0, y: 150.0 },
+                        ],
+                        admission: OcrAdmission::Accepted,
+                    }];
+                    image.description = Some(ImageDescription {
+                        description: "Four coloured squares over four grey ones.".to_string(),
+                        relationships: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let path = write_pdf(dir.path(), "image.pdf", IMAGE_PDF_BASE64);
+        let backend = MuPdfBackend::new(Some(Arc::new(Fixed)));
+        let content = backend.extract(&path).expect("extracts");
+
+        let above = content.text.find("Above the picture").expect("text above");
+        let block = content
+            .text
+            .find("Image embedded text: Knowledge base.")
+            .expect("the transcription is in the reading");
+        let caption = content.text.find("Figure 1:").expect("the caption");
+        assert!(above < block && block < caption, "{:?}", content.text);
+        assert!(content
+            .text
+            .contains("Image description: Four coloured squares over four grey ones."));
+
+        // The author's own lines are neither moved nor duplicated.
+        assert_eq!(content.text.matches("Figure 1: a caption").count(), 1);
+        assert_eq!(content.text.matches("Above the picture").count(), 1);
+
+        // The image knows where its block landed, and the bytes there are it.
+        let range = content.images[0]
+            .reading_range
+            .clone()
+            .expect("the block has a range");
+        assert!(content.text[range.start..range.end].starts_with("Image embedded text:"));
+    }
+
+    /// Every byte the enrichment inserted resolves to a page and says what it
+    /// is. The transcription resolves to its own polygon, not to the whole
+    /// image, which is what lets exact search highlight the label.
+    #[test]
+    fn every_inserted_byte_has_a_locator_and_truthful_provenance() {
+        use crate::extract::image::{AnalysisContext, DiscoveredImage, ImageAnalyzer};
+        use crate::types::{ImageOcrRegion, OcrAdmission, Point, TextProvenance};
+
+        struct Spotter;
+        impl ImageAnalyzer for Spotter {
+            fn identity(&self) -> String {
+                "spotter-v1".to_string()
+            }
+            fn analyze(
+                &self,
+                images: &mut [ExtractedImage],
+                _discovered: &[DiscoveredImage],
+                _context: &AnalysisContext,
+                _diagnostics: &mut ExtractionDiagnostics,
+            ) {
+                for image in images {
+                    image.analyzer_identity = self.identity();
+                    image.ocr_regions = vec![ImageOcrRegion {
+                        text: "Expert knowledge".to_string(),
+                        confidence: 0.87,
+                        polygon_within_image: vec![Point { x: 0.0, y: 0.0 }],
+                        page_polygon: vec![
+                            Point { x: 40.0, y: 130.0 },
+                            Point { x: 100.0, y: 130.0 },
+                            Point { x: 100.0, y: 150.0 },
+                            Point { x: 40.0, y: 150.0 },
+                        ],
+                        admission: OcrAdmission::Accepted,
+                    }];
+                }
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let path = write_pdf(dir.path(), "image.pdf", IMAGE_PDF_BASE64);
+        let content = MuPdfBackend::new(Some(Arc::new(Spotter)))
+            .extract(&path)
+            .expect("extracts");
+
+        let range = content.images[0].reading_range.clone().expect("a range");
+        let inserted: Vec<&crate::types::SourceSegment> = content
+            .source_map
+            .segments
+            .iter()
+            .filter(|segment| {
+                segment.text_range.start >= range.start && segment.text_range.end <= range.end
+            })
+            .collect();
+
+        // The segments tile the block: nothing inserted is left unattributed.
+        let mut cursor = range.start;
+        for segment in &inserted {
+            assert_eq!(segment.text_range.start, cursor, "a gap in the block");
+            cursor = segment.text_range.end;
+            assert!(matches!(
+                segment.provenance,
+                TextProvenance::ImageOcr { .. } | TextProvenance::ImageDescription { .. }
+            ));
+            assert!(matches!(
+                segment.origin,
+                SourceOrigin::PdfPage { page: 1, bbox: Some(_) }
+            ));
+        }
+        assert_eq!(cursor, range.end, "the block ends where the segments do");
+
+        let label = content
+            .source_map
+            .resolve(
+                content
+                    .text
+                    .find("Expert knowledge")
+                    .expect("the label is in the reading"),
+            )
+            .expect("it resolves");
+        let SourceOrigin::PdfPage { bbox: Some(bbox), .. } = label else {
+            panic!("expected a page locator, got {label:?}");
+        };
+        // The region's polygon, not the image's box.
+        assert!((bbox.x - 40.0).abs() < 0.01 && (bbox.width - 60.0).abs() < 0.01, "{bbox:?}");
+    }
+
+    /// The document this feature was specified against, when it is present.
+    ///
+    /// Gated on an environment variable rather than checked in: the corpus is
+    /// a user's library, not a fixture. Run it with
+    /// `WILKES_SAMPLE_PDF=<path> cargo test -- --ignored`.
+    #[test]
+    #[ignore = "needs a local corpus document"]
+    fn the_sample_documents_diagram_is_found_as_a_native_image() {
+        let Ok(path) = std::env::var("WILKES_SAMPLE_PDF") else {
+            return;
+        };
+        let content = MuPdfBackend::default()
+            .extract(std::path::Path::new(&path))
+            .expect("extracts");
+        eprintln!("{} images found", content.images.len());
+        for image in content.images.iter().take(40) {
+            eprintln!(
+                "  {} page {} {}x{}px box {:.0},{:.0} {:.0}x{:.0} {:?}",
+                image.id,
+                image.page,
+                image.pixel_width,
+                image.pixel_height,
+                image.bbox.x,
+                image.bbox.y,
+                image.bbox.width,
+                image.bbox.height,
+                image.status,
+            );
+        }
+        let expected = content
+            .images
+            .iter()
+            .find(|image| image.page == 18)
+            .expect("page 18 draws the expert-system diagram");
+        assert_eq!((expected.pixel_width, expected.pixel_height), (1559, 499));
     }
 
     /// Source-map totality on a real extraction: the segments tile the
@@ -609,7 +1068,7 @@ mod tests {
             COORDINATE_OUTLINED_PDF_BASE64,
         );
 
-        let content = MuPdfBackend.extract(&path).expect("extracts");
+        let content = MuPdfBackend::default().extract(&path).expect("extracts");
         let mut previous = ByteRange { start: 0, end: 0 };
         for segment in &content.source_map.segments {
             assert!(segment.text_range.start >= previous.end, "segments overlap");

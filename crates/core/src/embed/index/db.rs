@@ -3992,6 +3992,7 @@ impl SemanticIndex {
                         title: None,
                         page_count: None,
                     },
+                    images: Vec::new(),
                 }
             }
         };
@@ -4444,6 +4445,10 @@ impl SemanticIndex {
                 origin.map(|origin| SourceSegment {
                     text_range: ByteRange { start, end },
                     origin,
+                    // One segment per chunk, and a chunk can hold native text
+                    // and image enrichment together, so no single answer here
+                    // would be true. Consumers needing provenance re-extract.
+                    provenance: crate::types::TextProvenance::Unrecorded,
                 })
             })
             .collect();

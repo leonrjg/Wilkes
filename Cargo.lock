@@ -8656,6 +8656,7 @@ dependencies = [
  "grep-searcher",
  "hf-hub",
  "ignore",
+ "image",
  "infer 0.16.0",
  "libc",
  "mockall",

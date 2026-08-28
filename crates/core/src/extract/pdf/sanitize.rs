@@ -18,7 +18,12 @@
 //! dictionary or a language assumption, and each failing towards today's
 //! behaviour rather than towards a guess.
 
-use crate::types::{BoundingBox, ByteRange, ExtractionDiagnostics, SourceOrigin, SourceSegment};
+use crate::types::{
+    BoundingBox, ByteRange, ExtractedImage, ExtractionDiagnostics, SourceOrigin, SourceSegment,
+    TextProvenance,
+};
+
+use crate::extract::image::serialize;
 
 /// The flow a line belongs to. Body text is one flow for the whole document —
 /// it continues across block and page boundaries, which is what lets a word
@@ -63,11 +68,24 @@ impl Line {
     }
 }
 
-/// One text block, as the page grouped it — typically a paragraph, a heading,
-/// a running head, or a margin box.
+/// One block, as the page grouped it — typically a paragraph, a heading, a
+/// running head, or a margin box, or else a native image.
+///
+/// An image is a block here rather than a list beside the blocks so that it
+/// keeps its place among them through every transform in this module. That
+/// place *is* the reading anchor: no caption is matched, nothing is inferred
+/// from the words nearby, and the enrichment is written where the page drew
+/// the picture.
+///
+/// An image block has no lines, and every judgement in this module is made
+/// from words — so it has no extent, is never a furniture candidate, and is
+/// never relocated as marginalia. Those are consequences of it having no
+/// text, not special cases written for it.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Block {
     pub lines: Vec<Line>,
+    /// Index into the document's images when this block is one.
+    pub image: Option<usize>,
 }
 
 impl Block {
@@ -182,13 +200,23 @@ const BODY_COLUMN_SHARE: f32 = 0.6;
 
 /// Remove page furniture, move marginalia out of the reading order, join
 /// line-wrapped words, and render the result to text plus source map.
-pub(super) fn sanitize(mut pages: Vec<Page>, diagnostics: &mut ExtractionDiagnostics) -> Reading {
+/// Turn the pages into the document's one reading.
+///
+/// `images` arrives already analyzed, and leaves carrying the byte range each
+/// image's enrichment occupies in the reading — filled here because here is
+/// where the text is written, and a range computed anywhere else would be a
+/// claim about bytes rather than the bytes themselves.
+pub(super) fn sanitize(
+    mut pages: Vec<Page>,
+    images: &mut [ExtractedImage],
+    diagnostics: &mut ExtractionDiagnostics,
+) -> Reading {
     diagnostics.pages = pages.len() as u32;
     remove_page_furniture(&mut pages, diagnostics);
     let flows = relocate_marginalia(&mut pages, diagnostics);
     let mut items = flatten(&pages, &flows);
     join_wrapped_words(&mut items, diagnostics);
-    render(&items)
+    render(&items, images)
 }
 
 // ── Class 2: page furniture ─────────────────────────────────────────────────
@@ -389,12 +417,19 @@ enum Item {
     LineEnd,
     /// End of a page: renders as a newline unless one was just written.
     PageEnd,
+    /// A native image, at the position the page drew it. Renders as its
+    /// enrichment block, or as nothing when analysis established nothing.
+    Image(usize),
 }
 
 fn flatten(pages: &[Page], flows: &[Vec<Flow>]) -> Vec<Item> {
     let mut items = Vec::new();
     for (page, page_flows) in pages.iter().zip(flows) {
         for (block, flow) in page.blocks.iter().zip(page_flows) {
+            if let Some(image) = block.image {
+                items.push(Item::Image(image));
+                continue;
+            }
             for line in &block.lines {
                 for c in line.leading.chars() {
                     items.push(Item::Space(c));
@@ -560,7 +595,7 @@ fn normalize_word(word: &str) -> String {
 /// This is the only place the text is built, which is what keeps the map
 /// exact: a segment's range is the range the word was actually written at, not
 /// a range computed alongside it.
-fn render(items: &[Item]) -> Reading {
+fn render(items: &[Item], images: &mut [ExtractedImage]) -> Reading {
     let mut text = String::new();
     let mut segments = Vec::new();
     for item in items {
@@ -585,6 +620,7 @@ fn render(items: &[Item]) -> Reading {
                         page: *page,
                         bbox: bbox.clone(),
                     },
+                    provenance: TextProvenance::Native,
                 });
             }
             Item::Space(c) => text.push(*c),
@@ -593,6 +629,41 @@ fn render(items: &[Item]) -> Reading {
                 if !text.ends_with('\n') {
                     text.push('\n');
                 }
+            }
+            Item::Image(index) => {
+                let Some(image) = images.get(*index) else {
+                    continue;
+                };
+                let pieces = serialize::enrichment_pieces(image);
+                if pieces.is_empty() {
+                    continue;
+                }
+                // The block starts its own line. Whitespace only, so it falls
+                // in the gap between segments exactly as the space between
+                // two words does.
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                let start = text.len();
+                for piece in pieces {
+                    let piece_start = text.len();
+                    text.push_str(&piece.text);
+                    segments.push(SourceSegment {
+                        text_range: ByteRange {
+                            start: piece_start,
+                            end: text.len(),
+                        },
+                        origin: SourceOrigin::PdfPage {
+                            page: image.page,
+                            bbox: Some(piece.bbox),
+                        },
+                        provenance: piece.provenance,
+                    });
+                }
+                images[*index].reading_range = Some(ByteRange {
+                    start,
+                    end: text.len(),
+                });
             }
         }
     }
@@ -632,13 +703,13 @@ mod tests {
         Page {
             number,
             height: 800.0,
-            blocks: vec![Block { lines }],
+            blocks: vec![Block { lines , image: None }],
         }
     }
 
     fn read(pages: Vec<Page>) -> (String, ExtractionDiagnostics) {
         let mut diagnostics = ExtractionDiagnostics::default();
-        let reading = sanitize(pages, &mut diagnostics);
+        let reading = sanitize(pages, &mut [], &mut diagnostics);
         (reading.text, diagnostics)
     }
 
@@ -743,9 +814,11 @@ mod tests {
                 blocks: vec![
                     Block {
                         lines: vec![line(vec![word("body", 100.0, 300.0)])],
+                        image: None,
                     },
                     Block {
                         lines: vec![line(vec![word(&format!("{}", 127 + number), 100.0, 760.0)])],
+                        image: None,
                     },
                 ],
             })
@@ -765,11 +838,13 @@ mod tests {
                 height: 800.0,
                 blocks: vec![Block {
                     lines: vec![line(vec![word("body", 100.0, 300.0)])],
+                    image: None,
                 }],
             })
             .collect();
         pages[2].blocks.push(Block {
             lines: vec![line(vec![word("once", 100.0, 760.0)])],
+            image: None,
         });
         let (text, diagnostics) = read(pages);
 
@@ -785,6 +860,7 @@ mod tests {
                 height: 800.0,
                 blocks: vec![Block {
                     lines: vec![line(vec![word("7", 100.0, 760.0)])],
+                    image: None,
                 }],
             })
             .collect();
@@ -805,6 +881,7 @@ mod tests {
                         word("Serialization", 20.0, 100.0),
                         word("is", 20.0, 120.0),
                     ])],
+                    image: None,
                 },
                 Block {
                     lines: vec![
@@ -818,6 +895,7 @@ mod tests {
                         ]),
                         line(vec![word("continues", 200.0, 140.0)]),
                     ],
+                    image: None,
                 },
             ],
         };
@@ -844,6 +922,7 @@ mod tests {
             blocks: vec![
                 Block {
                     lines: vec![line(vec![word("Serialization", 20.0, 100.0)])],
+                    image: None,
                 },
                 Block {
                     lines: vec![
@@ -853,11 +932,12 @@ mod tests {
                         ]),
                         line(vec![word("continues", 200.0, 120.0)]),
                     ],
+                    image: None,
                 },
             ],
         };
         let mut diagnostics = ExtractionDiagnostics::default();
-        let reading = sanitize(vec![page], &mut diagnostics);
+        let reading = sanitize(vec![page], &mut [], &mut diagnostics);
 
         let aside = bbox_at(&reading, "Serialization");
         assert_eq!((aside.x, aside.y), (20.0, 100.0));
@@ -876,12 +956,14 @@ mod tests {
                         word("left", 50.0, 100.0),
                         word("column", 90.0, 100.0),
                     ])],
+                    image: None,
                 },
                 Block {
                     lines: vec![line(vec![
                         word("right", 400.0, 100.0),
                         word("column", 450.0, 100.0),
                     ])],
+                    image: None,
                 },
             ],
         };
@@ -902,6 +984,7 @@ mod tests {
             blocks: vec![
                 Block {
                     lines: vec![line(vec![word("aside", 20.0, 100.0)])],
+                    image: None,
                 },
                 Block {
                     lines: vec![
@@ -912,6 +995,7 @@ mod tests {
                         ]),
                         line(vec![word("bro-", 200.0, 120.0)]),
                     ],
+                    image: None,
                 },
             ],
         };
@@ -943,7 +1027,7 @@ mod tests {
             body_page(2, vec![line(vec![word("delta", 100.0, 100.0)])]),
         ];
         let mut diagnostics = ExtractionDiagnostics::default();
-        let reading = sanitize(pages, &mut diagnostics);
+        let reading = sanitize(pages, &mut [], &mut diagnostics);
 
         let mut covered = vec![false; reading.text.len()];
         let mut previous_end = 0;

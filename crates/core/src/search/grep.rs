@@ -712,6 +712,7 @@ mod tests {
                 title: None,
                 page_count: Some(1),
             },
+            images: Vec::new(),
         };
         let query = SearchQuery {
             pattern: "fox".to_string(),
@@ -774,6 +775,7 @@ mod tests {
                             height: 10.0,
                         }),
                     },
+                    provenance: Default::default(),
                 },
                 SourceSegment {
                     text_range: ByteRange {
@@ -789,6 +791,7 @@ mod tests {
                             height: 10.0,
                         }),
                     },
+                    provenance: Default::default(),
                 },
             ],
         };
@@ -1395,6 +1398,7 @@ mod tests {
                         title: None,
                         page_count: None,
                     },
+                    images: Vec::new(),
                 })
             }
             fn outline(&self, _: &Path) -> anyhow::Result<crate::types::DeclaredOutline> {

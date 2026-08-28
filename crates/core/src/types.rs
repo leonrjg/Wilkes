@@ -339,6 +339,53 @@ pub struct SourceMap {
 pub struct SourceSegment {
     pub text_range: ByteRange,
     pub origin: SourceOrigin,
+    /// Where these bytes came from: the document's own glyphs, an image's
+    /// transcription, or a description derived from one. `origin` says *where
+    /// on the page* the bytes belong; this says *what they are*, and the two
+    /// answer different questions — a transcribed label and the caption beside
+    /// it can share a page region while differing in whether a reader may
+    /// quote them as the author's words.
+    ///
+    /// Defaulted on read so a source map written before image enrichment
+    /// existed loads as what it was: entirely native text.
+    #[serde(default)]
+    pub provenance: TextProvenance,
+}
+
+/// What produced a run of the canonical reading.
+///
+/// Every inserted byte carries one. `Native` is the document's own glyphs;
+/// the other two are Wilkes' additions, and each names the image it came from
+/// so a consumer can reach the region, the confidence, and the analyzer that
+/// produced it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub enum TextProvenance {
+    /// The document's own glyphs. Also what a source map written before image
+    /// enrichment existed deserializes to, which is what those maps were.
+    #[default]
+    Native,
+    /// A map rebuilt at a coarser granularity than extraction produced —
+    /// notably the per-chunk map the index reconstructs for cached text,
+    /// where one segment can span both native and inserted bytes. Saying so
+    /// beats claiming either.
+    Unrecorded,
+    ImageOcr {
+        image_id: String,
+        /// The region's admission signal, carried through so a consumer can
+        /// see how strong the evidence for these bytes was. Uncalibrated —
+        /// see [`ImageOcrRegion::confidence`].
+        ///
+        /// `None` for the bytes Wilkes wrote to frame the transcription — the
+        /// `Image embedded text:` label and the separators between regions.
+        /// Those belong to the transcription block and to no single region,
+        /// and inventing a confidence for them would be the one kind of lie
+        /// this enum exists to prevent.
+        confidence: Option<f32>,
+    },
+    ImageDescription {
+        image_id: String,
+        analyzer_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -446,6 +493,46 @@ pub struct ExtractionDiagnostics {
     /// them sits on the far side of a relocated margin box. The only way a
     /// reading still contains a hyphen-broken word.
     pub unjoinable_wrap_breaks: u32,
+
+    // ── Native image analysis ────────────────────────────────────────────
+    //
+    // Defaulted on read, each of them: these counters joined a published wire
+    // contract, and an export written before they existed reports no images
+    // rather than failing to parse — which is what it found.
+    //
+    // Counted for the same reason as the rest: an image that produced no
+    // enrichment and an image that was never looked at read identically in
+    // the text, and only one of them is a fact about the document. "Twenty
+    // found, nineteen read, one decoder failure, descriptions not
+    // configured" is actionable; a silently missing figure is not.
+    /// Native image blocks MuPDF exposed.
+    #[serde(default)]
+    pub native_images_found: u32,
+    /// Images at least one analysis stage ran on.
+    #[serde(default)]
+    pub native_images_analyzed: u32,
+    /// Images a fixed technical limit rejected before any stage.
+    #[serde(default)]
+    pub native_images_skipped_technical_limit: u32,
+    #[serde(default)]
+    pub images_ocr_succeeded: u32,
+    #[serde(default)]
+    pub images_ocr_failed: u32,
+    #[serde(default)]
+    pub ocr_regions_accepted: u32,
+    #[serde(default)]
+    pub ocr_regions_rejected_low_confidence: u32,
+    #[serde(default)]
+    pub ocr_regions_deduplicated_against_native_text: u32,
+    #[serde(default)]
+    pub images_description_succeeded: u32,
+    #[serde(default)]
+    pub images_description_failed: u32,
+    /// Images that reached the description stage with no describer
+    /// configured. Not a failure — a configuration this reading was produced
+    /// under, and one that changes what the reading contains.
+    #[serde(default)]
+    pub images_description_not_configured: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -531,12 +618,174 @@ impl SourceMap {
     }
 }
 
+// ── Native image enrichment ──────────────────────────────────────────────────
+
+/// One point in MuPDF page space, or in an image's own pixel space —
+/// whichever the field holding it names. Origin top-left, y increasing
+/// downward in both.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Point {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// The affine placement of a native image on its page, as MuPDF reports it.
+///
+/// Maps the unit square onto the page region the image occupies. This is the
+/// only thing that turns a coordinate inside the image into a coordinate on
+/// the page, so it is retained rather than reduced to the bounding box it
+/// implies: a rotated or mirrored placement has a bounding box that is not
+/// its outline.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ImageTransform {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
+}
+
+impl ImageTransform {
+    /// Map a point of the unit square through the placement.
+    pub fn apply(&self, x: f32, y: f32) -> Point {
+        Point {
+            x: self.a * x + self.c * y + self.e,
+            y: self.b * x + self.d * y + self.f,
+        }
+    }
+
+    /// Map a pixel position inside the decoded image onto the page.
+    ///
+    /// MuPDF places an image by mapping the unit square onto the page, with
+    /// the image's *first* row of pixels along the square's top edge — which
+    /// is the edge at `y = 0` before the transform, because the transform
+    /// carries whatever flip the page applied. So a pixel's normalized
+    /// position is used as-is, without a vertical inversion of our own: the
+    /// page already said which way up the image goes.
+    pub fn pixel_to_page(&self, x: f32, y: f32, pixel_width: u32, pixel_height: u32) -> Point {
+        let width = pixel_width.max(1) as f32;
+        let height = pixel_height.max(1) as f32;
+        self.apply(x / width, y / height)
+    }
+}
+
+/// One region of text the recognizer spotted inside a native image.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImageOcrRegion {
+    pub text: String,
+    /// Admission signal derived from token log-probabilities. Explicitly
+    /// uncalibrated: it orders regions of one image by how confidently the
+    /// model emitted them, and nothing more. One tested threshold decides
+    /// admission; no consumer should read it as a probability.
+    pub confidence: f32,
+    /// The spotted quadrilateral in the decoded image's own pixel space,
+    /// top-left origin.
+    pub polygon_within_image: Vec<Point>,
+    /// The same quadrilateral mapped onto the page through the image
+    /// transform. What exact search highlights.
+    pub page_polygon: Vec<Point>,
+    /// Why this region is or is not in the canonical reading.
+    pub admission: OcrAdmission,
+}
+
+/// What became of one spotted region.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OcrAdmission {
+    /// In the canonical reading.
+    Accepted,
+    /// Below the admission threshold. Kept here, not in the reading, so a
+    /// missing label is visible rather than silently absent.
+    RejectedLowConfidence,
+    /// The page draws this text natively over the image; the document's own
+    /// glyphs already carry it and are the better evidence.
+    DeduplicatedAgainstNativeText,
+}
+
+/// A semantic description of what an image shows, generated rather than read.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImageDescription {
+    /// Compact natural language. This is what reaches the canonical reading.
+    pub description: String,
+    /// Relationships the describer reported, retained for validation and for
+    /// features that want structure rather than prose. Not serialized into
+    /// the reading.
+    #[serde(default)]
+    pub relationships: Vec<ImageRelationship>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageRelationship {
+    pub source: String,
+    pub relation: String,
+    pub target: String,
+}
+
+/// How far analysis of one image got.
+///
+/// A failure leaves the native text and the stages that did succeed in place,
+/// and says so here. It is never recorded as a successful analysis that found
+/// nothing — those are different facts, and only one of them means the image
+/// has no text.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ImageAnalysisStatus {
+    /// Every configured stage ran.
+    Complete,
+    /// Not analyzed at all: a technical limit rejected it before any stage.
+    SkippedTechnicalLimit { reason: String },
+    /// At least one stage failed. The message is the failure, not a summary.
+    Partial { failures: Vec<String> },
+}
+
+/// One native image block of a PDF, and whatever analysis established about it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExtractedImage {
+    /// Stable within one extraction: `p{page}-i{ordinal}`, where the ordinal
+    /// counts images across the document in the order the pages draw them.
+    /// Referenced by [`TextProvenance`], so it is fixed at discovery and
+    /// never depends on what analysis found.
+    pub id: String,
+    /// 1-based, numbered as extraction numbers pages.
+    pub page: u32,
+    /// The page region the image occupies, axis-aligned.
+    pub bbox: BoundingBox,
+    pub transform: ImageTransform,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    /// Digest of the decoded RGB pixels — not of the PDF's compressed stream,
+    /// which two renditions of the same picture need not share. This is what
+    /// makes the annotation cache addressable by the thing that was analyzed.
+    pub image_sha256: String,
+    /// Where the enrichment block landed in the canonical reading. `None`
+    /// when nothing was serialized for this image, which is the ordinary case
+    /// for a logo the recognizer read no text in.
+    pub reading_range: Option<ByteRange>,
+    pub ocr_regions: Vec<ImageOcrRegion>,
+    pub description: Option<ImageDescription>,
+    /// The analyzer recipe that produced the above — the same string that
+    /// enters the extraction recipe. Empty when no analyzer ran.
+    pub analyzer_identity: String,
+    pub status: ImageAnalysisStatus,
+}
+
+impl ExtractedImage {
+    pub fn accepted_ocr(&self) -> impl Iterator<Item = &ImageOcrRegion> {
+        self.ocr_regions
+            .iter()
+            .filter(|region| region.admission == OcrAdmission::Accepted)
+    }
+}
+
 // ── Extraction ───────────────────────────────────────────────────────────────
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExtractedContent {
     pub text: String,
     pub source_map: SourceMap,
     pub metadata: FileMetadata,
+    /// The native images this rendition found, in reading order. Empty for
+    /// formats that have none and for a PDF whose pages draw no images.
+    #[serde(default)]
+    pub images: Vec<ExtractedImage>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2120,10 +2369,12 @@ mod tests {
                 SourceSegment {
                     text_range: ByteRange { start: 0, end: 10 },
                     origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                    provenance: Default::default(),
                 },
                 SourceSegment {
                     text_range: ByteRange { start: 10, end: 20 },
                     origin: SourceOrigin::TextFile { line: 2, col: 1 },
+                    provenance: Default::default(),
                 },
             ],
         };
@@ -2154,6 +2405,7 @@ mod tests {
                             height: 10.0,
                         }),
                     },
+                    provenance: Default::default(),
                 },
                 SourceSegment {
                     text_range: ByteRange { start: 10, end: 20 },
@@ -2166,6 +2418,7 @@ mod tests {
                             height: 10.0,
                         }),
                     },
+                    provenance: Default::default(),
                 },
             ],
         };
@@ -2285,6 +2538,7 @@ mod tests {
             segments: vec![SourceSegment {
                 text_range: ByteRange { start: 0, end: 10 },
                 origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                provenance: Default::default(),
             }],
         };
 
@@ -2305,6 +2559,7 @@ mod tests {
                         page: 1,
                         bbox: None,
                     },
+                    provenance: Default::default(),
                 },
                 SourceSegment {
                     text_range: ByteRange { start: 10, end: 20 },
@@ -2312,6 +2567,7 @@ mod tests {
                         page: 2,
                         bbox: None,
                     },
+                    provenance: Default::default(),
                 },
             ],
         };
@@ -2330,6 +2586,7 @@ mod tests {
             segments: vec![SourceSegment {
                 text_range: ByteRange { start: 10, end: 20 },
                 origin: SourceOrigin::TextFile { line: 2, col: 1 },
+                provenance: Default::default(),
             }],
         };
 

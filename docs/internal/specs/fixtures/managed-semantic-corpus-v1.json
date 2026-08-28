@@ -110,7 +110,18 @@
       "removed_furniture_runs": 0,
       "joined_wrap_hyphens": 0,
       "kept_wrap_hyphens": 0,
-      "unjoinable_wrap_breaks": 0
+      "unjoinable_wrap_breaks": 0,
+      "native_images_found": 1,
+      "native_images_analyzed": 1,
+      "native_images_skipped_technical_limit": 0,
+      "images_ocr_succeeded": 1,
+      "images_ocr_failed": 0,
+      "ocr_regions_accepted": 2,
+      "ocr_regions_rejected_low_confidence": 1,
+      "ocr_regions_deduplicated_against_native_text": 0,
+      "images_description_succeeded": 0,
+      "images_description_failed": 0,
+      "images_description_not_configured": 1
     },
     "chunks": [
       {

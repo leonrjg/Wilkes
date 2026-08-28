@@ -173,6 +173,7 @@ mod tests {
                 segments: vec![SourceSegment {
                     text_range: ByteRange { start: 0, end: 70 },
                     origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                    provenance: Default::default(),
                 }],
             },
             metadata: FileMetadata {
@@ -182,6 +183,7 @@ mod tests {
                 title: None,
                 page_count: None,
             },
+            images: Vec::new(),
         };
 
         // window_chars = 20, overlap = 5
@@ -210,6 +212,7 @@ mod tests {
                 title: None,
                 page_count: None,
             },
+            images: Vec::new(),
         };
 
         let chunks = chunk_content(&content, PathBuf::from("test.txt"), 100, 10);
@@ -237,6 +240,7 @@ mod tests {
                         end: byte_len,
                     },
                     origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                    provenance: Default::default(),
                 }],
             },
             metadata: FileMetadata {
@@ -246,6 +250,7 @@ mod tests {
                 title: None,
                 page_count: None,
             },
+            images: Vec::new(),
         };
 
         let chunks = chunk_content(&content, PathBuf::from("doc.txt"), 120, 20);

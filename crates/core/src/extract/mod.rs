@@ -1,3 +1,4 @@
+pub mod image;
 pub mod outline;
 pub mod pdf;
 
