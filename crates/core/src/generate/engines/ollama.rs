@@ -414,7 +414,8 @@ pub fn list_models(base_url: &str) -> anyhow::Result<Vec<GeneratorDescriptor>> {
     Ok(models)
 }
 
-fn ollama_client(timeout: std::time::Duration) -> anyhow::Result<Client> {
+/// The blocking client every Ollama caller uses, extraction included.
+pub(crate) fn ollama_client(timeout: std::time::Duration) -> anyhow::Result<Client> {
     Client::builder()
         .connect_timeout(OLLAMA_CONNECT_TIMEOUT)
         .timeout(timeout)
@@ -422,7 +423,8 @@ fn ollama_client(timeout: std::time::Duration) -> anyhow::Result<Client> {
         .context("could not create Ollama HTTP client")
 }
 
-fn normalize_base_url(input: &str) -> anyhow::Result<Url> {
+/// What a usable Ollama server URL is, decided once for every caller.
+pub(crate) fn normalize_base_url(input: &str) -> anyhow::Result<Url> {
     let mut url = Url::parse(input.trim()).context("Ollama URL is invalid")?;
     anyhow::ensure!(
         matches!(url.scheme(), "http" | "https"),
@@ -445,13 +447,13 @@ fn normalize_base_url(input: &str) -> anyhow::Result<Url> {
     Ok(url)
 }
 
-fn endpoint(base_url: &Url, path: &str) -> anyhow::Result<Url> {
+pub(crate) fn endpoint(base_url: &Url, path: &str) -> anyhow::Result<Url> {
     base_url
         .join(path)
         .with_context(|| format!("could not build Ollama endpoint '{path}'"))
 }
 
-fn checked_response(response: Response, operation: &str) -> anyhow::Result<Response> {
+pub(crate) fn checked_response(response: Response, operation: &str) -> anyhow::Result<Response> {
     if response.status().is_success() {
         return Ok(response);
     }

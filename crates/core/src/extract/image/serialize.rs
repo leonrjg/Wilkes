@@ -181,7 +181,6 @@ mod tests {
             ocr_regions: regions,
             description: description.map(|description| ImageDescription {
                 description: description.to_string(),
-                relationships: Vec::new(),
             }),
             analyzer_identity: "analyzer-v1".into(),
             status: ImageAnalysisStatus::Complete,

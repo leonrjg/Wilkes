@@ -656,7 +656,6 @@ fn the_enrichment_reaches_the_embedder_as_one_passage() {
                 description: "Expert knowledge feeds a knowledge base that an inference \
                               engine consults."
                     .to_string(),
-                relationships: Vec::new(),
             })
         }
     }

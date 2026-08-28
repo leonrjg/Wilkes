@@ -900,7 +900,6 @@ mod tests {
                     }];
                     image.description = Some(ImageDescription {
                         description: "Four coloured squares over four grey ones.".to_string(),
-                        relationships: Vec::new(),
                     });
                 }
             }

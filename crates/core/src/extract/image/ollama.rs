@@ -1,12 +1,17 @@
 //! The external door for image description.
 //!
-//! One describer prompt and one response schema serve both the first-class
-//! local path and whatever the user has pulled into Ollama — the same family
-//! scales from 2B to 235B with identical prompting, so this is a second door
-//! onto one describer, not a second describer. What is behind the door is the
-//! user's business: Wilkes does not manage those models, and names whichever
-//! one it was told to use in the extraction recipe so a reading produced by a
-//! 2B and one produced by a 235B are never mixed.
+//! One describer prompt serves both the first-class local path and whatever
+//! the user has pulled into Ollama — the same family scales from 2B to 235B
+//! with identical prompting, so this is a second door onto one describer, not
+//! a second describer. What is behind the door is the user's business: Wilkes
+//! does not manage those models, and names whichever one it was told to use in
+//! the extraction recipe so a reading produced by a 2B and one produced by a
+//! 235B are never mixed.
+//!
+//! What an Ollama server *is* — a URL that may be trusted, a client, an
+//! endpoint, an error body worth reading — is not decided here. That belongs
+//! to [`crate::generate::engines::ollama`], which spoke this protocol first,
+//! and this module borrows it rather than keeping a second opinion.
 
 use std::time::Duration;
 
@@ -16,17 +21,31 @@ use reqwest::blocking::Client;
 use tracing::warn;
 use url::Url;
 
+use crate::generate::engines::ollama::{
+    checked_response, endpoint, normalize_base_url, ollama_client,
+};
 use crate::types::{ImageDescription, ImageOcrRegion};
 
 use super::describe::{
-    describer_prompt, parse_description, FigureDescriber, DESCRIBER_PROMPT_VERSION,
+    accept_description, describer_prompt, FigureDescriber, DESCRIBER_PROMPT_VERSION,
+    MAX_DESCRIPTION_CHARS,
 };
 
 /// A describer is one model call over one figure. Generous because a large
 /// model on a loaded machine is slow, bounded because an indexing pass that
 /// waits forever on one image has stopped being an indexing pass.
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(180);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The generation stops at the bound rather than being cut back to it.
+/// Truncation is the last resort; not generating the excess is better than
+/// paying for it and throwing it away. Sized in tokens against the character
+/// bound at a deliberately loose ratio, because a description in a script
+/// that tokenizes densely must not be cut short by an English assumption.
+const MAX_DESCRIBE_TOKENS: i32 = MAX_DESCRIPTION_CHARS as i32;
+
+/// Long enough to cover another figure in the same pass. A batch extraction
+/// that lets the model unload between images pays the load cost per figure.
+const KEEP_ALIVE: &str = "5m";
 
 /// Describes figures with a model served by Ollama.
 pub struct OllamaDescriber {
@@ -54,11 +73,7 @@ impl OllamaDescriber {
             );
         }
         Ok(Self {
-            client: Client::builder()
-                .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(DESCRIBE_TIMEOUT)
-                .build()
-                .context("could not create the describer's HTTP client")?,
+            client: ollama_client(DESCRIBE_TIMEOUT)?,
             base_url,
             model: model.trim().to_string(),
             remote,
@@ -74,9 +89,12 @@ struct GenerateRequest<'a> {
     images: Vec<String>,
     /// The whole reply at once: this is a batch extraction, not a chat.
     stream: bool,
-    /// Ollama's JSON mode. The schema is still validated on the way in —
-    /// well-formed JSON is not the same claim as the response schema.
-    format: &'a str,
+    /// No reasoning preamble. The reply asked for is the description itself,
+    /// and a describer that thinks out loud spends the timeout on text that
+    /// would then have to be stripped back off by something downstream
+    /// guessing where the answer began.
+    think: bool,
+    keep_alive: &'a str,
     options: GenerateOptions,
 }
 
@@ -87,6 +105,7 @@ struct GenerateOptions {
     /// sampler's seed.
     temperature: f32,
     seed: u32,
+    num_predict: i32,
 }
 
 #[derive(serde::Deserialize)]
@@ -118,31 +137,24 @@ impl FigureDescriber for OllamaDescriber {
             prompt: &describer_prompt(ocr),
             images: vec![base64::engine::general_purpose::STANDARD.encode(encode_png(image)?)],
             stream: false,
-            format: "json",
+            think: false,
+            keep_alive: KEEP_ALIVE,
             options: GenerateOptions {
                 temperature: 0.0,
                 seed: 0,
+                num_predict: MAX_DESCRIBE_TOKENS,
             },
         };
-        let url = self
-            .base_url
-            .join("api/generate")
-            .context("could not build the describer's endpoint")?;
         let response = self
             .client
-            .post(url)
+            .post(endpoint(&self.base_url, "api/generate")?)
             .json(&request)
             .send()
             .context("could not reach the describer")?;
-        anyhow::ensure!(
-            response.status().is_success(),
-            "the describer returned {}",
-            response.status()
-        );
-        let body: GenerateResponse = response
+        let body: GenerateResponse = checked_response(response, "describe an image")?
             .json()
             .context("the describer's reply was not an Ollama response")?;
-        parse_description(&body.response)
+        accept_description(&body.response)
     }
 }
 
@@ -176,29 +188,6 @@ fn is_loopback(url: &Url) -> bool {
     }
 }
 
-fn normalize_base_url(input: &str) -> anyhow::Result<Url> {
-    let mut url = Url::parse(input.trim()).context("the describer's URL is invalid")?;
-    anyhow::ensure!(
-        matches!(url.scheme(), "http" | "https"),
-        "the describer's URL must use http or https"
-    );
-    anyhow::ensure!(url.host_str().is_some(), "the describer's URL has no host");
-    anyhow::ensure!(
-        url.username().is_empty() && url.password().is_none(),
-        "the describer's URL must not contain credentials"
-    );
-    anyhow::ensure!(
-        url.query().is_none() && url.fragment().is_none(),
-        "the describer's URL must not contain a query or fragment"
-    );
-    anyhow::ensure!(
-        matches!(url.path(), "" | "/"),
-        "the describer's URL must not contain a path"
-    );
-    url.set_path("/");
-    Ok(url)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,13 +208,13 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_reply_becomes_a_description() {
+    fn a_prose_reply_becomes_the_description() {
         let mut server = mockito::Server::new();
         let mock = server
             .mock("POST", "/api/generate")
             .with_status(200)
             .with_body(
-                r#"{"response": "{\"description\": \"A user interface reaches an inference engine.\", \"relationships\": [{\"source\": \"User interface\", \"relation\": \"reaches\", \"target\": \"Inference engine\"}]}"}"#,
+                r#"{"response": "A user interface exchanges arrows in both directions with an inference engine."}"#,
             )
             .create();
 
@@ -235,9 +224,8 @@ mod tests {
             .expect("describes");
         assert_eq!(
             description.description,
-            "A user interface reaches an inference engine."
+            "A user interface exchanges arrows in both directions with an inference engine."
         );
-        assert_eq!(description.relationships[0].target, "Inference engine");
         mock.assert();
     }
 
@@ -255,7 +243,7 @@ mod tests {
                 mockito::Matcher::Regex("\"temperature\":0".into()),
             ]))
             .with_status(200)
-            .with_body(r#"{"response": "{\"description\": \"Two boxes.\"}"}"#)
+            .with_body(r#"{"response": "Two boxes joined by an arrow."}"#)
             .create();
 
         let describer = OllamaDescriber::new(&server.url(), "qwen3-vl:2b").expect("configures");
@@ -265,15 +253,56 @@ mod tests {
         mock.assert();
     }
 
-    /// A reply that is not the schema is a failed description, reported as a
-    /// partial analysis rather than smuggled into the reading as prose.
+    /// Nothing about the reply's *shape* is required any more, so the request
+    /// must not ask for one: JSON mode would constrain the reply to a form the
+    /// gate no longer reads, on models that may not support it at all.
     #[test]
-    fn a_reply_outside_the_schema_is_a_failure() {
+    fn the_request_asks_for_prose_within_a_bound_and_not_for_json() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/api/generate")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("\"think\":false".into()),
+                mockito::Matcher::Regex("\"num_predict\":1500".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"response": "Two boxes."}"#)
+            .create();
+
+        let describer = OllamaDescriber::new(&server.url(), "qwen3-vl:2b").expect("configures");
+        describer.describe(&figure(), &[]).expect("describes");
+        mock.assert();
+
+        let sent = OllamaDescriber::new("http://localhost:11434", "m").expect("configures");
+        assert!(
+            !serde_json::to_string(&GenerateRequest {
+                model: &sent.model,
+                prompt: "p",
+                images: Vec::new(),
+                stream: false,
+                think: false,
+                keep_alive: KEEP_ALIVE,
+                options: GenerateOptions {
+                    temperature: 0.0,
+                    seed: 0,
+                    num_predict: MAX_DESCRIBE_TOKENS,
+                },
+            })
+            .unwrap()
+            .contains("format"),
+            "the request must not carry a response format"
+        );
+    }
+
+    /// A model that answers with nothing has failed to describe the image; it
+    /// has not described the image as empty.
+    #[test]
+    fn an_empty_reply_is_a_failure() {
         let mut server = mockito::Server::new();
         let _mock = server
             .mock("POST", "/api/generate")
             .with_status(200)
-            .with_body(r#"{"response": "I think it shows an expert system."}"#)
+            .with_body(r#"{"response": "   "}"#)
             .create();
 
         let describer = OllamaDescriber::new(&server.url(), "qwen3-vl:2b").expect("configures");
@@ -286,14 +315,19 @@ mod tests {
         let _mock = server
             .mock("POST", "/api/generate")
             .with_status(500)
-            .with_body("model not found")
+            .with_body(r#"{"error": "model 'qwen3-vl:2b' not found"}"#)
             .create();
 
         let describer = OllamaDescriber::new(&server.url(), "qwen3-vl:2b").expect("configures");
         let error = describer
             .describe(&figure(), &[])
             .expect_err("a 500 is a failure");
-        assert!(error.to_string().contains("500"), "{error}");
+        let reported = error.to_string();
+        assert!(reported.contains("500"), "{reported}");
+        assert!(
+            reported.contains("not found"),
+            "the server's own reason survives: {reported}"
+        );
     }
 
     /// Local analysis is the default requirement, so a describer that sends

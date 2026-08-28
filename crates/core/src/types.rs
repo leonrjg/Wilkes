@@ -705,20 +705,14 @@ pub enum OcrAdmission {
 /// A semantic description of what an image shows, generated rather than read.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImageDescription {
-    /// Compact natural language. This is what reaches the canonical reading.
+    /// Prose, and only prose. This is what reaches the canonical reading.
+    ///
+    /// A structured relationship list lived here until 2026-08-27 and was
+    /// withdrawn: nothing consumed it, it validated nothing a hallucinated
+    /// sentence would not also pass, and requiring conformant JSON narrowed
+    /// the models a local-first describer could run on. Structure returns as
+    /// its own measured feature when something reads it.
     pub description: String,
-    /// Relationships the describer reported, retained for validation and for
-    /// features that want structure rather than prose. Not serialized into
-    /// the reading.
-    #[serde(default)]
-    pub relationships: Vec<ImageRelationship>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ImageRelationship {
-    pub source: String,
-    pub relation: String,
-    pub target: String,
 }
 
 /// How far analysis of one image got.
