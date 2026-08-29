@@ -3584,12 +3584,30 @@ mod tests {
     #[test]
     fn managed_contract_fixture_matches_the_server_wire_schema() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../docs/internal/specs/fixtures/managed-semantic-corpus-v1.json"
+            "../../../docs/internal/specs/fixtures/consumer-api-v2.json"
         ))
         .unwrap();
+        assert_eq!(fixture["schema_version"], 2);
+
         let ensure: EnsureManagedWorkspace =
             serde_json::from_value(fixture["ensure_request"].clone()).unwrap();
         assert_eq!(ensure.corpus_key, "store-018f");
+        // The corpus names the application that owns it, which is what the
+        // route path used to do.
+        assert_eq!(ensure.owner, "underdog");
+
+        // The one addressing object, in both forms. A pin is required on a
+        // managed corpus, where it routes as well as verifies, and optional on
+        // a user workspace, where it only verifies.
+        let pinned: ConsumerScope =
+            serde_json::from_value(fixture["scope_pinned"].clone()).unwrap();
+        assert_eq!(
+            pinned.expected_embedding_space_id.as_deref(),
+            Some("space-example")
+        );
+        let unpinned: ConsumerScope =
+            serde_json::from_value(fixture["scope_unpinned"].clone()).unwrap();
+        assert_eq!(unpinned.expected_embedding_space_id, None);
 
         let import: ManagedImportBody =
             serde_json::from_value(fixture["import_request"].clone()).unwrap();
@@ -3677,6 +3695,52 @@ mod tests {
         let extraction: wilkes_core::types::ExtractionDiagnostics =
             serde_json::from_value(response["extraction"].clone()).unwrap();
         assert_eq!(extraction.pages, 1);
+
+        // Passages, named the one way they can be named. `resolve` needs no
+        // root or path: a ref already names its document.
+        let resolve: ChunksResolveBody =
+            serde_json::from_value(fixture["chunks_resolve_request"].clone()).unwrap();
+        assert_eq!(resolve.chunk_refs.len(), 1);
+        assert_eq!(
+            resolve.scope.expected_embedding_space_id.as_deref(),
+            Some("space-example")
+        );
+        let resolved = &fixture["chunks_resolve_response"]["chunks"][0];
+        for required in [
+            "chunk_ref",
+            "ordinal",
+            "text",
+            "text_sha256",
+            "byte_range",
+            "origin",
+        ] {
+            assert!(
+                resolved.get(required).is_some(),
+                "missing resolved chunk field {required}"
+            );
+        }
+        assert!(
+            resolved.get("chunk_id").is_none(),
+            "a rowid is not part of this contract"
+        );
+
+        let accumulate: ChunksGroupsBody =
+            serde_json::from_value(fixture["chunks_accumulate_request"].clone()).unwrap();
+        assert_eq!(accumulate.groups.len(), 1);
+        // The sum and the count, not the mean: a caller partitioning a large
+        // group across requests adds these and normalizes once.
+        let group = &fixture["chunks_accumulate_response"]["groups"][0];
+        assert!(group.get("sum").is_some());
+        assert!(group.get("member_count").is_some());
+
+        // The untagged probe is the shape most likely to drift silently, so
+        // the fixture carries one of each and this reads them back through the
+        // enum the server deserializes.
+        let search: ChunksSearchBody =
+            serde_json::from_value(fixture["chunks_search_request"].clone()).unwrap();
+        assert_eq!(search.probes.len(), 2);
+        assert!(matches!(search.probes[0], SearchProbe::Vector(_)));
+        assert!(matches!(search.probes[1], SearchProbe::Text(_)));
 
         let backup: ManagedBackupBody =
             serde_json::from_value(fixture["backup_request"].clone()).unwrap();

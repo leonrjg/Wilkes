@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "ensure_request": {
     "owner": "underdog",
     "corpus_key": "store-018f",
@@ -10,6 +10,13 @@
     },
     "chunk_size": 1000,
     "chunk_overlap": 100
+  },
+  "scope_pinned": {
+    "workspace_id": "managed-corpus-018f",
+    "expected_embedding_space_id": "space-example"
+  },
+  "scope_unpinned": {
+    "workspace_id": "workspace-example"
   },
   "embedder_manifest_response": {
     "engines": [
@@ -152,16 +159,48 @@
       "computed": 0
     }
   },
-  "accumulate_request": {
-    "corpus_id": "managed-corpus-018f",
-    "expected_embedding_space_id": "space-example",
+  "chunks_resolve_request": {
+    "scope": {
+      "workspace_id": "managed-corpus-018f",
+      "expected_embedding_space_id": "space-example"
+    },
+    "chunk_refs": [
+      "chunk-example"
+    ]
+  },
+  "chunks_resolve_response": {
+    "embedding_space_id": "space-example",
+    "chunks": [
+      {
+        "chunk_ref": "chunk-example",
+        "ordinal": 0,
+        "text": "The passage as the reading holds it.",
+        "text_sha256": "text-sha256-example",
+        "byte_range": {
+          "start": 0,
+          "end": 36
+        },
+        "origin": {
+          "PdfPage": {
+            "page": 1,
+            "bbox": null
+          }
+        }
+      }
+    ]
+  },
+  "chunks_accumulate_request": {
+    "scope": {
+      "workspace_id": "managed-corpus-018f",
+      "expected_embedding_space_id": "space-example"
+    },
     "groups": [
       [
         "chunk-example"
       ]
     ]
   },
-  "accumulate_response": {
+  "chunks_accumulate_response": {
     "embedding_space_id": "space-example",
     "dimension": 384,
     "groups": [
@@ -173,6 +212,25 @@
         "member_count": 1
       }
     ]
+  },
+  "chunks_search_request": {
+    "scope": {
+      "workspace_id": "managed-corpus-018f",
+      "expected_embedding_space_id": "space-example"
+    },
+    "probes": [
+      {
+        "vector": [
+          0.25,
+          -0.5
+        ]
+      },
+      {
+        "text": "what the caller is looking for"
+      }
+    ],
+    "top_k": 8,
+    "min_similarity": 0.35
   },
   "backup_request": {
     "corpus_id": "managed-corpus-018f",

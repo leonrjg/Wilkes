@@ -286,7 +286,7 @@ Legacy (non-managed) indexed files re-index on their normal path.
 
 The managed corpus contract does not change shape. `OutlineEntry.byte_offset`
 already exists in
-[`docs/internal/specs/fixtures/managed-semantic-corpus-v1.json`](fixtures/managed-semantic-corpus-v1.json)
+[`docs/internal/specs/fixtures/consumer-api-v2.json`](fixtures/consumer-api-v2.json)
 and is exported as `null` today; it starts carrying values. Add the per-entry
 resolution rung (§6b) as a new field, and the per-document marginalia-clustering
 outcome (§6a class 3) to the import response diagnostics.
