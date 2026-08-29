@@ -56,7 +56,7 @@ use crate::types::{BoundingBox, ImageTransform, Point, RegionOrigin};
 /// rendered. Part of the enrichment recipe an extractor declares, so a reading
 /// produced under different routing is never mistaken for one produced under
 /// this.
-pub(super) const ROUTING_VERSION: &str = "typeset-routing-v2";
+pub(super) const ROUTING_VERSION: &str = "typeset-routing-v3";
 
 /// The share of a line's glyphs that must come from a math font for the line
 /// to be part of a formula.
@@ -91,6 +91,16 @@ const MIN_FORMULA_GLYPHS: usize = 3;
 /// because two glyphs a hundredth of a point apart are on the same baseline
 /// however they round.
 const STRUCTURE_SPREAD_POINTS: f32 = 0.5;
+
+/// How close a math fragment must sit to a formula region, along the same
+/// baseline, to be another piece of the same expression. In line heights.
+///
+/// One line height is about one em — a wide word space. Beyond that the runs
+/// are separate expressions; within it the page drew one formula in several
+/// text objects, which is ordinary and which MuPDF reports as several lines.
+/// Measured on the reported page: `yB = wxB` and `mod q` are 3.9 points apart
+/// on an 11.6-point line, and `KA, B` and `ZB` are 8.3 apart on 10.8.
+const SAME_LINE_GAP: f32 = 1.0;
 
 /// Two formula lines join into one region when the gap between them is under
 /// this many line heights. An aligned multi-line equation is one formula, and
@@ -223,9 +233,43 @@ impl SurveyedLine {
     /// right, and it does so by asking what the feature is for rather than by
     /// counting characters.
     fn is_formula(&self) -> bool {
-        self.glyphs >= MIN_FORMULA_GLYPHS
-            && (self.math_glyphs as f32) >= (self.glyphs as f32) * MATH_GLYPH_SHARE
-            && self.structure_flattened
+        self.glyphs >= MIN_FORMULA_GLYPHS && self.is_mathematics() && self.structure_flattened
+    }
+
+    /// Whether the typography says this line is mathematics, without asking
+    /// whether it is worth reading on its own.
+    ///
+    /// The weaker test, and the one a region *grows* by. `mod q` is
+    /// mathematics and is not worth a recognizer call by itself — flattening
+    /// loses nothing in it — but when it sits at the end of an expression that
+    /// is, it belongs inside the same crop.
+    fn is_mathematics(&self) -> bool {
+        self.glyphs > 0 && (self.math_glyphs as f32) >= (self.glyphs as f32) * MATH_GLYPH_SHARE
+    }
+
+    fn right(&self) -> f32 {
+        self.bbox.x + self.bbox.width
+    }
+
+    fn bottom(&self) -> f32 {
+        self.bbox.y + self.bbox.height
+    }
+
+    /// Whether `other` sits on one of this line's baselines, close enough
+    /// along it to be the same expression.
+    fn continues_into(&self, other: &SurveyedLine) -> bool {
+        let shares_a_baseline = other.bbox.y < self.bottom() && self.bbox.y < other.bottom();
+        if !shares_a_baseline {
+            return false;
+        }
+        let gap = if other.bbox.x >= self.right() {
+            other.bbox.x - self.right()
+        } else if self.bbox.x >= other.right() {
+            self.bbox.x - other.right()
+        } else {
+            0.0
+        };
+        gap <= self.bbox.height.max(other.bbox.height) * SAME_LINE_GAP
     }
 }
 
@@ -594,7 +638,7 @@ pub(super) fn regions(page: u32, survey: &Survey, lines: &[SurveyedLine]) -> Vec
         }
         found.push(TypesetRegion {
             page,
-            bbox: with_margin(&hull),
+            bbox: with_margin_clear_of(&hull, lines, &covered),
             lines: covered
                 .iter()
                 .map(|index| (lines[*index].block, lines[*index].line))
@@ -602,7 +646,12 @@ pub(super) fn regions(page: u32, survey: &Survey, lines: &[SurveyedLine]) -> Vec
         });
     }
 
-    for group in formula_lines(lines, &taken) {
+    for mut group in formula_lines(lines, &taken) {
+        for index in &group {
+            taken[*index] = true;
+        }
+        grow_to_fragments(&mut group, lines, &mut taken);
+        group.sort_unstable();
         let hull = group
             .iter()
             .skip(1)
@@ -611,7 +660,7 @@ pub(super) fn regions(page: u32, survey: &Survey, lines: &[SurveyedLine]) -> Vec
             });
         found.push(TypesetRegion {
             page,
-            bbox: with_margin(&hull),
+            bbox: with_margin_clear_of(&hull, lines, &group),
             lines: group
                 .iter()
                 .map(|index| (lines[*index].block, lines[*index].line))
@@ -625,12 +674,86 @@ pub(super) fn regions(page: u32, survey: &Survey, lines: &[SurveyedLine]) -> Vec
     found
 }
 
-fn with_margin(bbox: &BoundingBox) -> BoundingBox {
+/// Take in every math fragment the region's own baselines run into.
+///
+/// A display formula is one expression and the page may draw it as several
+/// text objects: on the reported page `yB = wxB` and `mod q` are two runs 3.9
+/// points apart on one baseline, which MuPDF reports as two lines. Only the
+/// first carries the subscripts that make it a seed, and the seeding rule is
+/// right not to start a region for `mod q` alone.
+///
+/// But a region that stops at its seed is a region whose crop *cuts the
+/// expression in half*. The recognizer was then shown `y_B = w^{x_B}` followed
+/// by an opening parenthesis and four points of the next glyph, and it
+/// completed what it was given — `( n_{0} )` where the page says `(mod q)`.
+/// That is not the model being unreliable; it is the crop lying about where
+/// the formula ends.
+///
+/// Repeated until nothing more is taken, so an expression drawn in three runs
+/// is reached in three passes.
+fn grow_to_fragments(group: &mut Vec<usize>, lines: &[SurveyedLine], taken: &mut [bool]) {
+    while let Some(next) = lines.iter().enumerate().position(|(index, candidate)| {
+        !taken[index]
+            && candidate.is_mathematics()
+            && group
+                .iter()
+                .any(|member| lines[*member].continues_into(candidate))
+    }) {
+        taken[next] = true;
+        group.push(next);
+    }
+}
+
+/// The region's margin, cut back on any side where it would reach into a line
+/// the region does not own.
+///
+/// A recognizer meets a page with margins, so a crop shaved to the ink is not
+/// what it was trained on — but a crop carrying a *sliver of the next
+/// expression* is worse than either, because half a glyph is an invitation to
+/// invent the rest of one. So the margin is as much as can be had without
+/// showing anything the region does not speak for.
+///
+/// Second line of defence rather than the fix: [`grow_to_fragments`] is what
+/// keeps an expression whole. This bounds the damage when the geometry is
+/// something neither rule anticipated.
+fn with_margin_clear_of(
+    hull: &BoundingBox,
+    lines: &[SurveyedLine],
+    owned: &[usize],
+) -> BoundingBox {
+    let (mut left, mut right) = (MARGIN_POINTS, MARGIN_POINTS);
+    let (mut top, mut bottom) = (MARGIN_POINTS, MARGIN_POINTS);
+    let (hull_right, hull_bottom) = (hull.x + hull.width, hull.y + hull.height);
+
+    for (index, line) in lines.iter().enumerate() {
+        if owned.contains(&index) {
+            continue;
+        }
+        if line.bbox.y < hull_bottom && hull.y < line.bottom() {
+            if line.right() <= hull.x {
+                left = left.min(hull.x - line.right());
+            }
+            if line.bbox.x >= hull_right {
+                right = right.min(line.bbox.x - hull_right);
+            }
+        }
+        if line.bbox.x < hull_right && hull.x < line.right() {
+            if line.bottom() <= hull.y {
+                top = top.min(hull.y - line.bottom());
+            }
+            if line.bbox.y >= hull_bottom {
+                bottom = bottom.min(line.bbox.y - hull_bottom);
+            }
+        }
+    }
+
+    let (left, right) = (left.max(0.0), right.max(0.0));
+    let (top, bottom) = (top.max(0.0), bottom.max(0.0));
     BoundingBox {
-        x: bbox.x - MARGIN_POINTS,
-        y: bbox.y - MARGIN_POINTS,
-        width: bbox.width + MARGIN_POINTS * 2.0,
-        height: bbox.height + MARGIN_POINTS * 2.0,
+        x: hull.x - left,
+        y: hull.y - top,
+        width: hull.width + left + right,
+        height: hull.height + top + bottom,
     }
 }
 
@@ -998,6 +1121,137 @@ mod tests {
         assert!(subscripted.structure_flattened);
     }
 
+    /// A fragment at a chosen place along its baseline. Each gets its own
+    /// block, which is how a page that draws an expression as several text
+    /// objects reaches this module.
+    fn fragment(
+        index: usize,
+        x: f32,
+        width: f32,
+        glyphs: usize,
+        math: usize,
+        structure: bool,
+    ) -> SurveyedLine {
+        SurveyedLine {
+            block: index,
+            line: 0,
+            bbox: BoundingBox {
+                x,
+                y: 673.7,
+                width,
+                height: 11.6,
+            },
+            glyphs,
+            math_glyphs: math,
+            structure_flattened: structure,
+        }
+    }
+
+    fn only_region(lines: &[SurveyedLine]) -> Vec<(usize, usize)> {
+        let survey = Survey::default();
+        let found = regions(1, &survey, lines);
+        assert_eq!(found.len(), 1, "one region: {:?}", found.iter().map(|r| &r.lines).collect::<Vec<_>>());
+        found[0].lines.clone()
+    }
+
+    // ── Fragments of one expression ──────────────────────────────────────
+
+    /// The reported failure. `yB = wxB` and `mod q` are one expression the
+    /// page drew as two runs 3.9 points apart; only the first carries the
+    /// subscripts that seed a region. A region that stops at the seed crops
+    /// through `(mod q)` and hands the recognizer half a glyph to finish.
+    #[test]
+    fn a_fragment_of_the_same_expression_joins_the_region() {
+        let lines = vec![
+            fragment(0, 287.8, 41.4, 6, 6, true),  // yB = wxB
+            fragment(1, 333.1, 26.6, 4, 4, false), // (mod q)
+        ];
+        assert!(!lines[1].is_formula(), "the fragment is not a seed on its own");
+        assert_eq!(only_region(&lines), vec![(0, 0), (1, 0)]);
+    }
+
+    /// And the crop then covers all of it, margin and all.
+    #[test]
+    fn the_region_reaches_past_the_last_fragment() {
+        let lines = vec![
+            fragment(0, 287.8, 41.4, 6, 6, true),
+            fragment(1, 333.1, 26.6, 4, 4, false),
+        ];
+        let found = regions(1, &Survey::default(), &lines);
+        assert!(
+            found[0].bbox.x + found[0].bbox.width >= 359.7,
+            "the crop ends past the fragment at 359.7: {:?}",
+            found[0].bbox
+        );
+    }
+
+    /// An expression drawn in three runs is reached in three passes.
+    #[test]
+    fn fragments_chain_along_the_baseline() {
+        let lines = vec![
+            fragment(0, 327.6, 24.1, 4, 4, true),  // KA, B
+            fragment(1, 356.7, 4.9, 1, 1, false),  // the separator
+            fragment(2, 366.1, 12.9, 2, 2, true),  // ZB
+        ];
+        assert_eq!(only_region(&lines), vec![(0, 0), (1, 0), (2, 0)]);
+    }
+
+    /// The gap does real work. On the reported page a step number sits 15.8
+    /// points before the expression on the same baseline, and it is not part
+    /// of it.
+    #[test]
+    fn a_fragment_too_far_along_the_baseline_is_a_different_expression() {
+        let lines = vec![
+            fragment(0, 225.1, 22.7, 3, 3, false), // "2 AS", a step number
+            fragment(1, 263.6, 36.7, 4, 4, true),  // the expression
+        ];
+        let found = regions(1, &Survey::default(), &lines);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].lines, vec![(1, 0)], "the step number stays out");
+    }
+
+    /// Prose beside a formula is never absorbed, however close it sits. On
+    /// the reported page a sentence ends 5.0 points before an expression.
+    #[test]
+    fn prose_beside_a_formula_is_not_absorbed() {
+        let lines = vec![
+            fragment(0, 138.3, 191.3, 36, 2, true), // prose, two stray symbols
+            fragment(1, 334.6, 36.0, 6, 6, true),   // the expression
+        ];
+        let found = regions(1, &Survey::default(), &lines);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].lines, vec![(1, 0)], "the sentence stays out");
+    }
+
+    // ── The margin ───────────────────────────────────────────────────────
+
+    /// Half a glyph is an invitation to invent the rest of one, so the margin
+    /// gives way rather than reach into a line the region does not own.
+    #[test]
+    fn the_margin_is_cut_back_rather_than_reaching_into_a_line_it_does_not_own() {
+        let lines = vec![
+            fragment(0, 263.6, 36.7, 4, 4, true), // the expression
+            // Prose four points to the right: too close for a full margin,
+            // and not math, so growing will not take it either.
+            fragment(1, 304.3, 80.0, 30, 0, false),
+        ];
+        let found = regions(1, &Survey::default(), &lines);
+        assert_eq!(found[0].lines, vec![(0, 0)]);
+        assert!(
+            found[0].bbox.x + found[0].bbox.width <= 304.3,
+            "the crop stops short of the line beside it: {:?}",
+            found[0].bbox
+        );
+    }
+
+    /// Where there is nothing beside it, the margin is the full one.
+    #[test]
+    fn a_region_with_room_keeps_its_whole_margin() {
+        let lines = vec![fragment(0, 263.6, 36.7, 4, 4, true)];
+        let found = regions(1, &Survey::default(), &lines);
+        assert!((found[0].bbox.x - (263.6 - MARGIN_POINTS)).abs() < 0.01, "{:?}", found[0].bbox);
+    }
+
     #[test]
     fn a_line_too_short_to_be_an_equation_is_not_one() {
         let lines = vec![line(0, 0, 100.0, 2, 2)];
@@ -1247,4 +1501,5 @@ mod tests {
         assert_eq!(diagnostics.typeset_regions_over_budget, 0);
     }
 }
+
 

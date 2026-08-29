@@ -1115,6 +1115,29 @@ planned for this purpose. It remains the answer for what the typography cannot
 declare: an unruled table, and a document that sets its mathematics in a text
 font. Both are out of scope and stated as such in the module.
 
+**A region covers the whole expression, not the fragment that seeded it.**
+Found from the first reading this produced. The page draws `y_B = w^{x_B}(mod
+q)` as two text objects 3.9 points apart on one baseline, and MuPDF reports
+them as two lines; only the first carries the subscripts that seed a region.
+The region stopped there, and its 8-point margin reached 4.1 points into the
+second — so the recognizer was shown `y_B = w^{x_B}` followed by an opening
+parenthesis and half a glyph, and completed what it was given as
+`( n_{0} )`. The reading then carried the mangled half *and* an orphaned
+`mod q` that nothing had superseded, which is the tell.
+
+The model was not at fault: `y _ { B } = w ^ { x _ { B } }` is exactly right,
+and that is the part no consumer could recover from `yB = wxB`. The crop was
+at fault, for lying about where the formula ended. Two rules now:
+
+- A region grows along its own baselines, taking in every math-dominant line
+  within one line height, seed or not, repeatedly. Prose is excluded by the
+  dominance test — on that page a sentence ends 5.0 points before an
+  expression — and so is a step number 15.8 points away, by the gap.
+- The margin gives way rather than reach into a line the region does not own.
+  Second line of defence, not the fix: showing a recognizer half a glyph is
+  what invites it to invent the other half, so where the geometry is something
+  neither rule anticipated the crop stops at a clean edge instead.
+
 **A document that yields nothing says why.** The faces a document draws with,
 and which of them were read as mathematics, are reported once per document —
 at info when *none* was, because that is the case a reader needs to see. Before
