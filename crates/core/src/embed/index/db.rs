@@ -1770,7 +1770,6 @@ mod tests {
         assert!(format!("{error:#}").contains("dimension"), "{error:#}");
     }
 
-    #[test]
     /// Renamed from `…_preserves_probe_scale`, which pinned the opposite rule:
     /// a probe of magnitude 0.5 scored 0.5 against a chunk pointing the same
     /// way, so the field called `similarity` was cosine × ‖probe‖ and the
