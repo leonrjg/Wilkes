@@ -1,6 +1,6 @@
 # Recognition Engine — Design
 
-Status: proposed
+Status: implemented (2026-08-29)
 Branch: `develop`
 Depends on: `OcrEngine`, the recognition worker protocol, `ExtractionRecipe`
 identity, the annotation cache, `EmbedderCapabilityManifest` (as precedent)
@@ -35,8 +35,9 @@ side and is answered the same way here.
   `EmbeddingEngine` × `EmbedderModel`.
 - A per-engine catalogue with a default, so recognition has a picker rather
   than a constant.
-- `granite-docling-258M` under ONNX as the shipped default: ~318 MB against
-  PaddleOCR-VL's 1.9 GB, with formulas, tables and figures in one pass.
+- `granite-docling-258M` under ONNX as the shipped default, with formulas,
+  tables and figures in one pass. (Sized at ~318 MB when this was written;
+  measurement forced fp32 and 1.26 GB — see §5.7.)
 - PaddleOCR-VL kept, catalogued, and selectable — not deprecated.
 - Model-specific types (`RecognizerInventory`) stop appearing in API
   signatures, the way `EmbedderCapabilityManifest` already does not.
@@ -62,11 +63,12 @@ side and is answered the same way here.
 > its weights are here — is answered by the recognition boundary, not by a
 > table the consumer keeps.
 
-The second sentence is the part that is not yet true. `ADMISSION_THRESHOLD` is
-a module constant inside `paddleocr_vl`; `recognizer_inventory()` returns a
-`paddleocr_vl::RecognizerInventory` to three API surfaces; `dispatch` routes by
-engine and then asks `paddleocr_vl` what a model id means. Each of those is a
-consumer holding a fact that belongs to the boundary.
+The second sentence was the part that was not true when this was written:
+`ADMISSION_THRESHOLD` was a module constant inside `paddleocr_vl`,
+`recognizer_inventory()` returned a `paddleocr_vl::RecognizerInventory` to
+three API surfaces, and `dispatch` routed by engine and then asked
+`paddleocr_vl` what a model id means. All three are closed; §4 records what
+they were.
 
 `ocr.rs` states the first sentence already and it is preserved without
 amendment: *"There is exactly one production engine. A recognition failure is a
@@ -104,9 +106,9 @@ Three deliberate departures, each with a reason:
    and `RecognizerInventory` cross the API boundary, so they belong beside
    `EmbedderCapabilityManifest`, not inside a model module.
 
-## 4. Current state — the four divergences
+## 4. The four divergences, as they were
 
-Each is a concrete edit, not a direction.
+All four are closed. Kept as the record of what the change was for.
 
 1. **The engine is a constant, not a setting.**
    `extract/image/mod.rs` builds `dispatch::RecognitionEngine::default()` and
@@ -301,19 +303,35 @@ output parser. Everything above is shared.
 
 Weights: `onnx-community/granite-docling-258M-ONNX`.
 
-| set | vision | embed | decoder | total |
-|---|---|---|---|---|
-| int8 | 93.9 | 57.8 | 166.2 | **317.9 MB** |
-| fp16 | 187.0 | 115.6 | 329.1 | 631.7 MB |
-| q4f16 | 54.8 | 115.6 | 93.4 | 263.8 MB |
-| fp32 | 374.0 | 231.2 | 658.1 | 1263.3 MB |
+| set | vision | embed | decoder | total | measured on the fixture page |
+|---|---|---|---|---|---|
+| fp32 | 374.0 | 231.2 | 658.1 | **1263.3 MB** | correct; full table; stops cleanly at 338 tokens |
+| int8 vision only | 93.9 | 57.8 | 658.1 | 809.8 MB | structure right, characters broken |
+| int8 | 93.9 | 57.8 | 166.2 | 317.9 MB | drops words, loops to the cap, never reaches the table |
+| fp16 | 187.0 | 115.6 | 329.1 | 631.7 MB | degenerate `!!!!`, NaN log-probabilities |
+| q4f16 | 54.8 | 115.6 | 93.4 | 263.8 MB | not run; a WebGPU target |
 
-**Ship int8.** q4f16 is smaller on disk but its fp16 tensors are emulated on the
-CPU execution provider and can run slower than fp32; it is a WebGPU target.
-q4f16 may be revisited only behind CoreML, and only with a measurement. Note
-also that `embed_tokens_q4` is 231.2 MB — byte-identical to fp32 — because the
-embedding table is not 4-bit quantized; only the fp16 and int8 variants shrink
-it. Do not assume a `_q4` suffix means smaller.
+**Ship fp32. This reverses what this section said before it was run.** The
+earlier text picked int8 at 318 MB, reasoning that fp16 is emulated on the CPU
+provider. The fp16 reasoning was right — it is worse than emulated, it diverges
+into NaN — and the int8 conclusion was wrong.
+
+The damage is attributable, which is why all four rows are here rather than a
+verdict. The int8 **vision encoder** corrupts characters while keeping the
+layout ("Exper t Sy s t e m s in Pr a c t i c e"); the int8 **decoder** loops
+and omits whole elements. int8 also spent *more* wall-clock than fp32, because
+looping to the token cap costs more than its faster steps save. There is no
+speed argument left to trade quality against.
+
+So this recognizer's size claim is **1.26 GB against PaddleOCR-VL's 1.9 GB** —
+a much weaker argument than this spec was originally written on, and the honest
+one. What 1.26 GB buys is formulas, tables and figure regions in a single pass
+with no layout model in front of it, and that case does not rest on the
+footprint at all.
+
+One trap in the file listing survives the change: `embed_tokens_q4` is 231.2 MB,
+byte-identical to fp32, because the embedding table is not 4-bit quantized. A
+`_q4` suffix does not mean smaller.
 
 Preprocessing, from `preprocessor_config.json` — every value is pinned, none is
 a default to be inferred at runtime:
@@ -408,15 +426,18 @@ the existing, correct behaviour. Two obligations follow:
 
 ## 9. Phases
 
-**Phase 0 — measure before building.** Drive `granite-docling` through the
-existing corpus harness (`extract/image/corpus.rs` and the evaluation section of
-`paddleocr_vl.rs`) over Ollama, where `ibm/granite-docling` is an official
-library model and `/api/generate` returns per-token logprobs. This ships
-nothing: no engine variant, no settings field, no catalogue entry. It exists to
-produce two things the rest of this design cannot be written without — the
-admission threshold of §5.4, and evidence that granite-docling is good enough on
-real documents to be a **default**. If it is not, this design stops here, having
-cost a day rather than a fortnight.
+**Phase 0 — measure before building. Done, but not over Ollama.** The plan was
+to borrow the existing Ollama door as a harness. In the event the ONNX path was
+cheap enough to stand up directly, so the measuring was done against the real
+graphs: a Python reference over `onnxruntime` established the tiling, the prompt
+expansion, the DocTags shape and the golden output, and the Rust port is checked
+against it. That is a better harness than Ollama would have been — it measures
+what ships rather than a proxy for it — and it is what produced both the
+precision decision in §5.7 and the threshold in §5.4.
+
+The one thing Ollama would still be good for is a wider corpus sweep without
+installing weights per machine. The threshold rests on two pages, which is a
+band rather than a sweep; widening it is the outstanding work named in §5.4.
 
 **Phase 1 — the boundary, one engine.** Bump fastembed for ort rc.13. Move
 `RecognizerInventory` to `types.rs` and the threshold onto a per-model
