@@ -423,8 +423,6 @@ mod tests {
         let _ = fetch_model_size(EmbeddingEngine::SBERT, "invalid/model");
     }
 
-    use super::*;
-
     /// The manifest exists so a consumer stops keeping its own table of model
     /// facts. That only works if every catalogue entry states its dimension —
     /// and if a model nobody has loaded says so instead of guessing.
