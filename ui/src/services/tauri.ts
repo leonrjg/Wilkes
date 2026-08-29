@@ -24,7 +24,7 @@ import type {
   IntegrationStatus,
   MatchRef,
   DocumentMetadata,
-  ModelDescriptor,
+  EmbedderCapabilityManifest,
   NewBookmark,
   OpenAlexWork,
   PreviewData,
@@ -293,10 +293,6 @@ export class TauriSearchApi implements SearchApi {
     return invoke<string>("get_python_info");
   }
 
-  async getSupportedEngines(): Promise<EmbeddingEngine[]> {
-    return invoke<EmbeddingEngine[]>("get_supported_engines");
-  }
-
   async getDataPaths(): Promise<DataPaths> {
     return invoke<DataPaths>("get_data_paths");
   }
@@ -333,8 +329,8 @@ export class TauriSearchApi implements SearchApi {
 
   // ── Semantic / embed commands ──────────────────────────────────────────────
 
-  async listModels(engine: EmbeddingEngine): Promise<ModelDescriptor[]> {
-    return invoke<ModelDescriptor[]>("list_models", { engine });
+  async getEmbedderCapabilities(): Promise<EmbedderCapabilityManifest> {
+    return invoke<EmbedderCapabilityManifest>("embedder_capabilities");
   }
 
   async getModelSize(engine: EmbeddingEngine, modelId: string): Promise<number> {

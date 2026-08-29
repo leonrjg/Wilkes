@@ -361,18 +361,6 @@ describe("HttpSearchApi", () => {
     expect(res).toBe("python info");
   });
 
-  it("getSupportedEngines calls fetch and returns EmbeddingEngine[]", async () => {
-    const mockEngines = ["SBERT", "Xenova"];
-    (fetch as any).mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve(mockEngines),
-    });
-
-    const res = await api.getSupportedEngines();
-    expect(fetch).toHaveBeenCalledWith("/api/embed/engines");
-    expect(res).toEqual(mockEngines);
-  });
-
   it("getDataPaths calls fetch and returns data paths", async () => {
     const mockData = { paths: ["/path1"] };
     (fetch as any).mockResolvedValue({
@@ -427,16 +415,20 @@ describe("HttpSearchApi", () => {
     }));
   });
 
-  it("listModels calls fetch and returns ModelDescriptor[]", async () => {
-    const mockModels = [{ id: "model1", name: "model 1", size_bytes: 100 }];
+  it("getEmbedderCapabilities calls fetch and returns the manifest", async () => {
+    const manifest = {
+      engines: ["SBERT"],
+      roles: ["query", "passage"],
+      models: [{ engine: "SBERT", model_id: "model1", size_bytes: 100 }],
+    };
     (fetch as any).mockResolvedValue({
       ok: true,
-      json: () => Promise.resolve(mockModels),
+      json: () => Promise.resolve(manifest),
     });
 
-    const res = await api.listModels("SBERT" as any);
-    expect(fetch).toHaveBeenCalledWith("/api/embed/models?engine=SBERT");
-    expect(res).toEqual(mockModels);
+    const res = await api.getEmbedderCapabilities();
+    expect(fetch).toHaveBeenCalledWith("/api/embed/capabilities");
+    expect(res).toEqual(manifest);
   });
 
   it("getModelSize calls fetch and returns number", async () => {
@@ -582,12 +574,13 @@ describe("HttpSearchApi", () => {
     await expect(api.getLogs()).rejects.toThrow("getLogs failed: 500");
     await expect(api.clearLogs()).rejects.toThrow("clearLogs failed: 500");
     await expect(api.getPythonInfo()).rejects.toThrow("getPythonInfo failed: 500");
-    await expect(api.getSupportedEngines()).rejects.toThrow("getSupportedEngines failed: 500");
     await expect(api.getDataPaths()).rejects.toThrow("getDataPaths failed: 500");
     await expect(api.getWorkerStatus()).rejects.toThrow("getWorkerStatus failed: 500");
     await expect(api.killWorker()).rejects.toThrow("killWorker failed: 500");
     await expect(api.setWorkerTimeout(1)).rejects.toThrow("setWorkerTimeout failed: 500");
-    await expect(api.listModels("SBERT" as any)).rejects.toThrow("listModels failed: 500");
+    await expect(api.getEmbedderCapabilities()).rejects.toThrow(
+      "getEmbedderCapabilities failed: 500",
+    );
     await expect(api.getModelSize("SBERT" as any, "m")).rejects.toThrow("getModelSize failed: 500");
     await expect(api.downloadModel({} as any)).rejects.toThrow("downloadModel failed: 500");
     await expect(api.buildIndex("/", {} as any)).rejects.toThrow("buildIndex failed: 500");

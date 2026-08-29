@@ -20,7 +20,7 @@ import type {
   IntegrationStatus,
   MatchRef,
   DocumentMetadata,
-  ModelDescriptor,
+  EmbedderCapabilityManifest,
   CitationLinks,
   CitationLinksQuery,
   NewBookmark,
@@ -138,7 +138,6 @@ export interface SearchApi {
   getLogs(): Promise<string[]>;
   clearLogs(): Promise<void>;
   getPythonInfo(): Promise<string>;
-  getSupportedEngines(): Promise<EmbeddingEngine[]>;
   getDataPaths(): Promise<DataPaths>;
   openPath(path: string): Promise<void>;
   revealPath(path: string): Promise<void>;
@@ -156,7 +155,11 @@ export interface SearchApi {
   setWorkerTimeout(secs: number): Promise<void>;
 
   // ── Semantic / embed commands ──────────────────────────────────────────────
-  listModels(engine: EmbeddingEngine): Promise<ModelDescriptor[]>;
+  /** What this build can embed with: the engines, and every model under each
+   *  — catalogued and hand-added alike. One call, because deciding what a
+   *  model is by joining two replies is how a picker and a backend come to
+   *  disagree about which models exist. */
+  getEmbedderCapabilities(): Promise<EmbedderCapabilityManifest>;
   getModelSize(engine: EmbeddingEngine, modelId: string): Promise<number>;
   downloadModel(selected: SelectedEmbedder): Promise<void>;
   buildIndex(root: string, selected: SelectedEmbedder): Promise<void>;

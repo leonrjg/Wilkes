@@ -38,7 +38,9 @@
         "locally_available": true,
         "size_bytes": 90000000,
         "preferred_batch_size": 32,
-        "catalogued": true
+        "catalogued": true,
+        "is_default": true,
+        "is_recommended": true
       },
       {
         "engine": "SBERT",
@@ -55,7 +57,9 @@
         "locally_available": false,
         "size_bytes": null,
         "preferred_batch_size": null,
-        "catalogued": false
+        "catalogued": false,
+        "is_default": false,
+        "is_recommended": false
       }
     ]
   },

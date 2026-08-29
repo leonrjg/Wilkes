@@ -5,7 +5,8 @@ import {
   type EmbedProgress,
   type EmbedDone,
   type EmbedError,
-  type ModelDescriptor,
+  type EmbedderCapability,
+  type EmbedderCapabilityManifest,
   type SemanticSettings,
   type SelectedEmbedder,
   type IndexStatus,
@@ -37,12 +38,11 @@ interface PendingBuild {
 }
 
 interface PanelState {
-  /** Models returned by the backend — only valid for the current engine. */
-  backendModels: ModelDescriptor[];
-  /** Engine the backendModels were fetched for. Used to reject stale loads. */
-  modelsEngine: EmbeddingEngine | null;
+  /** Every model this build can embed with, across every engine, as the
+   *  backend reported them — hand-added models included, since the manifest
+   *  already merges the user's own entries. */
+  capabilities: EmbedderCapability[] | null;
   indexStatus: IndexStatus | null;
-  isEngineAvailable: boolean;
   error: string | null;
   activeOp: ActiveOp;
   progress: ProgressState | null;
@@ -55,10 +55,8 @@ interface PanelState {
 }
 
 const INITIAL_STATE: PanelState = {
-  backendModels: [],
-  modelsEngine: null,
+  capabilities: null,
   indexStatus: null,
-  isEngineAvailable: true,
   error: null,
   activeOp: null,
   progress: null,
@@ -71,9 +69,8 @@ const INITIAL_STATE: PanelState = {
 };
 
 type Action =
-  | { type: "init_loaded"; supportedEngines: EmbeddingEngine[] }
-  | { type: "models_loaded"; models: ModelDescriptor[]; engine: EmbeddingEngine }
-  | { type: "models_failed"; engine: EmbeddingEngine; error: string }
+  | { type: "capabilities_loaded"; manifest: EmbedderCapabilityManifest }
+  | { type: "capabilities_failed"; error: string }
   | { type: "index_loaded"; indexStatus: IndexStatus | null }
   | { type: "error"; error: string }
   | { type: "clear_error" }
@@ -93,12 +90,15 @@ type Action =
 
 function reducer(state: PanelState, action: Action): PanelState {
   switch (action.type) {
-    case "init_loaded":
-      return { ...state, supportedEngines: action.supportedEngines };
-    case "models_loaded":
-      return { ...state, backendModels: action.models, modelsEngine: action.engine, isEngineAvailable: true, error: null };
-    case "models_failed":
-      return { ...state, backendModels: [], modelsEngine: action.engine, isEngineAvailable: false, error: action.error };
+    case "capabilities_loaded":
+      return {
+        ...state,
+        supportedEngines: action.manifest.engines,
+        capabilities: action.manifest.models,
+        error: null,
+      };
+    case "capabilities_failed":
+      return { ...state, supportedEngines: [], capabilities: [], error: action.error };
     case "index_loaded":
       return { ...state, indexStatus: action.indexStatus };
     case "error":
@@ -157,7 +157,7 @@ function reducer(state: PanelState, action: Action): PanelState {
     case "model_size_fetched":
       return {
         ...state,
-        backendModels: state.backendModels.map((m) =>
+        capabilities: (state.capabilities ?? []).map((m) =>
           m.model_id === action.modelId ? { ...m, size_bytes: action.sizeBytes } : m,
         ),
       };
@@ -187,7 +187,11 @@ function reducer(state: PanelState, action: Action): PanelState {
 
 type Phase = "not_downloaded" | "downloading" | "ready" | "building" | "indexed" | "engine_mismatch";
 
-function derivePhase(state: PanelState, sem: SemanticSettings | null): Phase {
+function derivePhase(
+  state: PanelState,
+  sem: SemanticSettings | null,
+  engineModels: EmbedderCapability[],
+): Phase {
   if (state.activeOp === "downloading") return "downloading";
   if (state.activeOp === "building") return "building";
 
@@ -206,8 +210,8 @@ function derivePhase(state: PanelState, sem: SemanticSettings | null): Phase {
   if (!sem) return "not_downloaded";
   if (sem.selected.engine === "SBERT") return "ready";
 
-  const selected = state.backendModels.find((m) => m.model_id === sem.selected.model);
-  if (selected?.is_cached) return "ready";
+  const selected = engineModels.find((m) => m.model_id === sem.selected.model);
+  if (selected?.locally_available) return "ready";
   return "not_downloaded";
 }
 
@@ -242,14 +246,22 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   const replaceSettings = useSettingsStore((s) => s.replaceSettings);
   const refreshSettings = useSettingsStore((s) => s.refreshSettings);
 
-  const { indexStatus, isEngineAvailable, backendModels, supportedEngines, pendingBuild, buildRequest } = state;
+  const { indexStatus, capabilities, supportedEngines, pendingBuild, buildRequest } = state;
   const effectiveSelected = draftSelected ?? settings?.selected;
   const effectiveSemantic = settings && effectiveSelected
     ? { ...settings, selected: effectiveSelected }
     : settings;
-  const phase = derivePhase(state, effectiveSemantic);
-  const isActive = phase === "downloading" || phase === "building";
   const currentEngine = effectiveSelected?.engine;
+  // The manifest describes every engine at once, so which models belong to
+  // the chosen one is a filter rather than a fetch — and there is no stale
+  // reply from a previous engine to guard against.
+  const backendModels = (capabilities ?? []).filter((m) => m.engine === currentEngine);
+  // Not "the manifest listed no models for it": an engine this build does not
+  // support is the only thing the picker should refuse.
+  const isEngineAvailable =
+    capabilities === null || !currentEngine || supportedEngines.includes(currentEngine);
+  const phase = derivePhase(state, effectiveSemantic, backendModels);
+  const isActive = phase === "downloading" || phase === "building";
 
   const invalidate = useCallback(() => setFetchEpoch((e) => e + 1), []);
 
@@ -265,13 +277,9 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([
-      api.getSettings(),
-      api.getSupportedEngines().catch(() => ["SBERT"] as EmbeddingEngine[]),
-    ]).then(([s, engines]) => {
+    api.getSettings().then((s) => {
       if (!cancelled) {
         replaceSettings(s);
-        dispatch({ type: "init_loaded", supportedEngines: engines });
         setDraftSelected(null);
       }
     });
@@ -279,20 +287,21 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   }, [api, replaceSettings]);
 
   // ---------------------------------------------------------------------------
-  // Effect: fetch models when engine changes (or after invalidate)
+  // Effect: what this build can embed with. Refetched after an operation that
+  // changes it — a download lands artifacts, adding a custom model adds an
+  // entry — and not when the engine selection changes, since the manifest
+  // already covers every engine.
   // ---------------------------------------------------------------------------
 
   useEffect(() => {
-    if (!settings) return;
     let cancelled = false;
-    const engine = currentEngine ?? settings.selected.engine;
-    api.listModels(engine).then((models) => {
-      if (!cancelled) dispatch({ type: "models_loaded", models, engine });
+    api.getEmbedderCapabilities().then((manifest) => {
+      if (!cancelled) dispatch({ type: "capabilities_loaded", manifest });
     }).catch((e: any) => {
-      if (!cancelled) dispatch({ type: "models_failed", engine, error: e.toString() });
+      if (!cancelled) dispatch({ type: "capabilities_failed", error: e.toString() });
     });
     return () => { cancelled = true; };
-  }, [api, currentEngine, settings?.selected.engine, fetchEpoch]);
+  }, [api, fetchEpoch]);
 
   // ---------------------------------------------------------------------------
   // Effect: fetch index status when engine/model changes (or after invalidate)
@@ -394,28 +403,9 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     });
   }, [api, buildRequest]);
 
-  // Merge custom models for current engine into the backend list.
-  // Computed inline — no memoization, always fresh.
-  const mergedModels: ModelDescriptor[] = (() => {
-    const customs: ModelDescriptor[] = (settings?.custom_models ?? [])
-      .filter((m) => m.engine === currentEngine)
-      .map((m) => ({
-        model_id: m.model_id,
-        display_name: m.model_id.split("/").pop() || m.model_id,
-        description: "User-defined HuggingFace model",
-        dimension: 0,
-        is_cached: false,
-        is_default: false,
-        is_recommended: false,
-        size_bytes: null,
-        preferred_batch_size: 32,
-      }));
-    const merged = [...backendModels];
-    for (const c of customs) {
-      if (!merged.find((m) => m.model_id === c.model_id)) merged.push(c);
-    }
-    return merged;
-  })();
+  // The catalog's own shape. `locally_available` is the manifest's word for
+  // what a picker calls cached; the rest is already the same vocabulary.
+  const catalogModels = backendModels.map((m) => ({ ...m, is_cached: m.locally_available }));
 
   // ---------------------------------------------------------------------------
   // Handlers
@@ -467,7 +457,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       });
 
       const descriptor = backendModels.find((m) => m.model_id === modelId);
-      if (descriptor && !descriptor.is_cached && descriptor.size_bytes === null) {
+      if (descriptor && !descriptor.locally_available && descriptor.size_bytes === null) {
         setSizeFetchingFor(modelId);
         try {
           const size = await api.getModelSize(effectiveSelected.engine, modelId);
@@ -677,7 +667,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
         <ModelCatalog
           title="Embedding Model"
           catalogKey={`embedding:${currentEngine ?? settings.selected.engine}`}
-          models={mergedModels}
+          models={catalogModels}
           filter={modelFilter}
           selectedModelId={effectiveSelected?.model}
           activeModelId={settings.selected.model}

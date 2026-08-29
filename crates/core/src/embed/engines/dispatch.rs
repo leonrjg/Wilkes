@@ -97,6 +97,8 @@ pub fn model_capabilities(
                 size_bytes: descriptor.size_bytes,
                 preferred_batch_size: descriptor.preferred_batch_size,
                 catalogued: true,
+                is_default: descriptor.is_default,
+                is_recommended: descriptor.is_recommended,
             });
         }
     }
@@ -125,6 +127,8 @@ pub fn model_capabilities(
             size_bytes: None,
             preferred_batch_size: None,
             catalogued: false,
+            is_default: false,
+            is_recommended: false,
         });
     }
     EmbedderCapabilityManifest {

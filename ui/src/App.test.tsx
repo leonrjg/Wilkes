@@ -48,7 +48,9 @@ vi.mock("./services", () => ({
       supported_extensions: ["ts"],
     })),
     getLogs: vi.fn(() => Promise.resolve([])),
-    getSupportedEngines: vi.fn(() => Promise.resolve(["SBERT"])),
+    getEmbedderCapabilities: vi.fn(() =>
+      Promise.resolve({ engines: ["SBERT"], roles: ["query", "passage"], models: [] }),
+    ),
     getIndexStatus: vi.fn(() => Promise.resolve(null)),
     isSemanticReady: vi.fn(() => Promise.resolve(true)),
     getDataPaths: vi.fn(() => Promise.resolve({ app_data: "" })),

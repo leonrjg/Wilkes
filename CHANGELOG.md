@@ -4,6 +4,22 @@
 
 ### Added
 
+- One answer about what this build can embed with, at
+  `GET /api/embed/capabilities`. It replaces `/api/embed/engines`,
+  `/api/embed/models`, and the consumer's own model list: the UI's picker used
+  to assemble a model from two replies and then merge the user's hand-added
+  entries itself, which is how a picker and a backend come to disagree about
+  which models exist. `EmbedderCapability` gains `is_default` and
+  `is_recommended` so the picker has everything it displayed before, and its
+  two load-bearing nulls are unchanged — `dimension` is null for a model whose
+  width only a first load reveals, and `prefix_source` says whether anything
+  has established the model's prefixes at all.
+
+- The catalogue mirror is addressed at `/api/catalogue/*` rather than under a
+  consumer's name. Reading the open teaching catalogues has nothing to do with
+  which application asked, and a route path that names one consumer is a claim
+  about ownership that was never true.
+
 - A managed corpus can carry more than one embedding space.
   `PUT /api/integrations/underdog/spaces` adds a projection of an existing
   corpus under a second model: it reads that corpus's admitted renditions and
@@ -21,10 +37,9 @@
 
 - A local mirror of the open teaching catalogues — LibreTexts, OpenStax, MIT
   OpenCourseWare and DevDocs — with BM25 search over it, at
-  `POST /api/integrations/underdog/catalogue/{search,sync}` and
-  `GET .../catalogue/status`. These catalogues are small enough to hold whole,
-  which is what makes searching them locally possible; papers are not, and
-  literature search is unchanged. Search returns *recall*, not a ranking:
+  `POST /api/catalogue/{search,sync}` and `GET /api/catalogue/status`. These
+  catalogues are small enough to hold whole, which is what makes searching them
+  locally possible; papers are not, and literature search is unchanged. Search returns *recall*, not a ranking:
   deciding which of these teaches a particular reader best needs to know what
   that reader already knows, which is not a fact about documents. Sync reports
   what each provider offered against what was stored, because both LibreTexts

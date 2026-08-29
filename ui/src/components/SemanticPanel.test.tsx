@@ -10,8 +10,7 @@ describe("SemanticPanel", () => {
 
   const mockApi = {
     getSettings: vi.fn(),
-    getSupportedEngines: vi.fn(),
-    listModels: vi.fn(),
+    getEmbedderCapabilities: vi.fn(),
     getIndexStatus: vi.fn(),
     getPythonInfo: vi.fn(),
     onEmbedProgress: vi.fn().mockImplementation((h) => {
@@ -40,6 +39,34 @@ describe("SemanticPanel", () => {
     getModelSize: vi.fn(),
     getLogs: vi.fn(),
   } as any;
+
+  /** The wire shape of one model, with only the fields a test names spelled
+   *  out. `engine` defaults to Candle because that is what defaultSettings
+   *  selects. */
+  const capability = (model: any) => ({
+    engine: "Candle",
+    description: "",
+    repository_id: null,
+    dimension: 384,
+    supported_dimensions: [384],
+    query_prefix: null,
+    passage_prefix: null,
+    prefix_source: "undetermined",
+    max_input_tokens: null,
+    size_bytes: null,
+    preferred_batch_size: null,
+    catalogued: true,
+    is_default: false,
+    is_recommended: false,
+    ...model,
+    locally_available: model.locally_available ?? model.is_cached ?? false,
+  });
+
+  const manifest = (models: any[], engines: string[] = ["SBERT", "Candle"]) => ({
+    engines,
+    roles: ["query", "passage"],
+    models: models.map(capability),
+  });
 
   const defaultSettings = {
     favorites: [],
@@ -82,10 +109,11 @@ describe("SemanticPanel", () => {
       maxResults: 50,
     });
     mockApi.getSettings.mockResolvedValue(defaultSettings);
-    mockApi.getSupportedEngines.mockResolvedValue(["SBERT", "Candle"]);
-    mockApi.listModels.mockResolvedValue([
-      { model_id: "initial-id", display_name: "Initial", is_cached: true, description: "", size_bytes: 1024 * 1024 },
-    ]);
+    mockApi.getEmbedderCapabilities.mockResolvedValue(
+      manifest([
+        { model_id: "initial-id", display_name: "Initial", is_cached: true, size_bytes: 1024 * 1024 },
+      ]),
+    );
     mockApi.getIndexStatus.mockResolvedValue(null);
     mockApi.getPythonInfo.mockResolvedValue("/usr/bin/python3");
     mockApi.getLogs.mockResolvedValue([]);
@@ -154,12 +182,12 @@ describe("SemanticPanel", () => {
     mockApi.getSettings.mockResolvedValue({
       semantic: { ...defaultSettings.semantic, selected: { ...defaultSettings.semantic.selected, engine: "SBERT", model: "initial-id" } }
     });
-    mockApi.listModels.mockImplementation(async (engine: string) => {
-      if (engine === "Candle") {
-        return [{ model_id: "candle-default", display_name: "Candle Default", is_cached: true, description: "" }];
-      }
-      return [{ model_id: "initial-id", display_name: "Initial", is_cached: true, description: "" }];
-    });
+    mockApi.getEmbedderCapabilities.mockResolvedValue(
+      manifest([
+        { engine: "Candle", model_id: "candle-default", display_name: "Candle Default", is_cached: true },
+        { engine: "SBERT", model_id: "initial-id", display_name: "Initial", is_cached: true },
+      ]),
+    );
 
     await act(async () => {
       render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
@@ -183,10 +211,12 @@ describe("SemanticPanel", () => {
   });
 
   it("handles model selection", async () => {
-    mockApi.listModels.mockResolvedValue([
-      { model_id: "initial-id", display_name: "Initial", is_cached: true, description: "" },
-      { model_id: "new-id", display_name: "New Model", is_cached: true, description: "" },
-    ]);
+    mockApi.getEmbedderCapabilities.mockResolvedValue(
+      manifest([
+        { model_id: "initial-id", display_name: "Initial", is_cached: true, description: "" },
+        { model_id: "new-id", display_name: "New Model", is_cached: true, description: "" },
+      ]),
+    );
 
     await act(async () => {
       render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
@@ -211,9 +241,11 @@ describe("SemanticPanel", () => {
 
   it("handles model download and triggering progress", async () => {
     // Force not_downloaded phase by providing a non-cached model
-    mockApi.listModels.mockResolvedValue([
-      { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
-    ]);
+    mockApi.getEmbedderCapabilities.mockResolvedValue(
+      manifest([
+        { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
+      ]),
+    );
     mockApi.getSettings.mockResolvedValue({
       semantic: { ...defaultSettings.semantic, selected: { ...defaultSettings.semantic.selected, model: "not-cached" } }
     });
@@ -254,9 +286,11 @@ describe("SemanticPanel", () => {
   });
 
   it("shows download feedback immediately after starting a model download", async () => {
-    mockApi.listModels.mockResolvedValue([
-      { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
-    ]);
+    mockApi.getEmbedderCapabilities.mockResolvedValue(
+      manifest([
+        { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
+      ]),
+    );
     mockApi.getSettings.mockResolvedValue({
       semantic: { ...defaultSettings.semantic, selected: { ...defaultSettings.semantic.selected, model: "not-cached" } }
     });
@@ -276,9 +310,11 @@ describe("SemanticPanel", () => {
   });
 
   it("does not start a queued build after cancelling a download", async () => {
-    mockApi.listModels.mockResolvedValue([
-      { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
-    ]);
+    mockApi.getEmbedderCapabilities.mockResolvedValue(
+      manifest([
+        { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
+      ]),
+    );
     mockApi.getSettings.mockResolvedValue({
       semantic: { ...defaultSettings.semantic, selected: { ...defaultSettings.semantic.selected, model: "not-cached" } }
     });
@@ -310,9 +346,11 @@ describe("SemanticPanel", () => {
   });
 
   it("clears the queued build when download emits an error", async () => {
-    mockApi.listModels.mockResolvedValue([
-      { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
-    ]);
+    mockApi.getEmbedderCapabilities.mockResolvedValue(
+      manifest([
+        { model_id: "not-cached", display_name: "Not Cached", is_cached: false, description: "", size_bytes: 50000000 },
+      ]),
+    );
     mockApi.getSettings.mockResolvedValue({
       semantic: { ...defaultSettings.semantic, selected: { ...defaultSettings.semantic.selected, model: "not-cached" } }
     });
@@ -390,10 +428,12 @@ describe("SemanticPanel", () => {
   });
 
   it("does not persist draft selection on build completion from the panel", async () => {
-    mockApi.listModels.mockResolvedValue([
-      { model_id: "initial-id", display_name: "Initial", is_cached: true, description: "" },
-      { model_id: "new-id", display_name: "New Model", is_cached: true, description: "" },
-    ]);
+    mockApi.getEmbedderCapabilities.mockResolvedValue(
+      manifest([
+        { model_id: "initial-id", display_name: "Initial", is_cached: true, description: "" },
+        { model_id: "new-id", display_name: "New Model", is_cached: true, description: "" },
+      ]),
+    );
 
     await act(async () => {
       render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
@@ -491,10 +531,12 @@ describe("SemanticPanel", () => {
   });
 
   it("filters models by search text", async () => {
-    mockApi.listModels.mockResolvedValue([
-      { model_id: "model-a", display_name: "Apple", is_cached: true, description: "" },
-      { model_id: "model-b", display_name: "Banana", is_cached: true, description: "" },
-    ]);
+    mockApi.getEmbedderCapabilities.mockResolvedValue(
+      manifest([
+        { model_id: "model-a", display_name: "Apple", is_cached: true, description: "" },
+        { model_id: "model-b", display_name: "Banana", is_cached: true, description: "" },
+      ]),
+    );
 
     await act(async () => {
       render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);

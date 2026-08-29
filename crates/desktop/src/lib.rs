@@ -20,9 +20,9 @@ use wilkes_api::workspace::{WorkspaceManager, WorkspaceState, WorkspaceSummary};
 use wilkes_core::types::{
     AddOutcome, AgentBackend, Bookmark, BookmarkClustersQuery, BookmarkClustersResult,
     ChunkTopicsQuery, ChunkTopicsResult, CitationResult, CollectionValidation, DataPaths,
-    DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, ExternalMcpSettings, FileListResponse,
-    HttpApiSettings, IndexStatus, IntegrationStatus, ModelDescriptor, NewBookmark,
-    NewSmartCollection, NewTag, OpenAlexWork, SearchLogEntry, SelectedEmbedder,
+    DocumentMetadata, DocumentTagUpdate, EmbedderCapabilityManifest, EmbeddingEngine,
+    ExternalMcpSettings, FileListResponse, HttpApiSettings, IndexStatus, IntegrationStatus,
+    NewBookmark, NewSmartCollection, NewTag, OpenAlexWork, SearchLogEntry, SelectedEmbedder,
     SemanticScholarPaper, Settings, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::worker::manager::WorkerStatus;
@@ -354,11 +354,20 @@ async fn build_index_for_ctx(
     Arc::clone(&ctx).start_build_index(root, selected).await
 }
 
-async fn list_models_for_ctx(
+/// What this build can embed with, as one answer.
+///
+/// The picker used to assemble this from two calls — the engine list, then a
+/// model list per engine — which meant the UI decided what a model *was* by
+/// joining two replies. The manifest is that join, made once and on the side
+/// that knows.
+async fn embedder_capabilities_for_ctx(
     ctx: Arc<AppContext>,
-    engine: EmbeddingEngine,
-) -> Result<Vec<ModelDescriptor>, String> {
-    Ok(wilkes_api::commands::embed::list_models(engine, &ctx.model_dir).await)
+) -> Result<EmbedderCapabilityManifest, String> {
+    let settings = ctx.get_settings().await;
+    Ok(wilkes_core::embed::dispatch::model_capabilities(
+        &ctx.model_dir,
+        &settings.semantic.custom_models,
+    ))
 }
 
 async fn cancel_embed_for_ctx(ctx: Arc<AppContext>) -> Result<(), String> {
@@ -2390,11 +2399,6 @@ async fn clear_logs() -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn get_supported_engines() -> Vec<EmbeddingEngine> {
-    EmbeddingEngine::supported_engines()
-}
-
 // ── Embed commands (delegating to AppContext) ─────────────────────────────────
 
 #[tauri::command]
@@ -2412,11 +2416,8 @@ async fn build_index(
 }
 
 #[tauri::command]
-async fn list_models(
-    engine: EmbeddingEngine,
-    app: AppHandle,
-) -> Result<Vec<ModelDescriptor>, String> {
-    list_models_for_ctx(app_context(&app), engine).await
+async fn embedder_capabilities(app: AppHandle) -> Result<EmbedderCapabilityManifest, String> {
+    embedder_capabilities_for_ctx(app_context(&app)).await
 }
 
 #[tauri::command]
@@ -2716,7 +2717,6 @@ pub fn run() {
             trash_file,
             get_file_metadata,
             get_python_info,
-            get_supported_engines,
             get_settings,
             update_settings,
             configure_external_mcp,
@@ -2757,7 +2757,7 @@ pub fn run() {
             pick_directory,
             download_model,
             build_index,
-            list_models,
+            embedder_capabilities,
             get_model_size,
             cancel_embed,
             get_index_status,
@@ -2920,13 +2920,6 @@ mod tests {
     async fn test_get_python_info() {
         let result = get_python_info().await;
         assert!(result.is_ok() || result.is_err());
-    }
-
-    #[test]
-    fn test_get_supported_engines() {
-        let engines = get_supported_engines();
-        assert!(!engines.is_empty());
-        assert!(engines.contains(&EmbeddingEngine::SBERT));
     }
 
     #[tokio::test]
@@ -3270,12 +3263,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_models_for_ctx_returns_catalog() {
+    async fn capabilities_cover_every_supported_engine() {
         let (_dir, ctx) = test_ctx();
-        let models = list_models_for_ctx(ctx, EmbeddingEngine::Candle)
-            .await
-            .unwrap();
-        assert!(!models.is_empty());
+        let manifest = embedder_capabilities_for_ctx(ctx).await.unwrap();
+        assert_eq!(manifest.engines, EmbeddingEngine::supported_engines());
+        assert!(!manifest.models.is_empty());
+        // The picker reads its default from here now, so the manifest has to
+        // carry one rather than leaving the UI to guess at a name.
+        assert!(manifest.models.iter().any(|model| model.is_default));
     }
 
     #[tokio::test]

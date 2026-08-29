@@ -173,19 +173,6 @@ pub async fn get_model_size(
     .await?
 }
 
-/// Return all engine-supported models, annotated with local cache availability.
-pub async fn list_models(
-    engine: wilkes_core::types::EmbeddingEngine,
-    model_dir: &Path,
-) -> Vec<wilkes_core::types::ModelDescriptor> {
-    let model_dir = model_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        wilkes_core::embed::dispatch::list_models(engine, &model_dir)
-    })
-    .await
-    .unwrap_or_default()
-}
-
 /// Read index status from disk without opening the full index.
 pub async fn get_index_status(
     data_dir: &Path,
@@ -403,13 +390,6 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("manager is required"));
-    }
-
-    #[tokio::test]
-    async fn test_list_models() {
-        let dir = tempdir().unwrap();
-        let models = list_models(wilkes_core::types::EmbeddingEngine::Fastembed, dir.path()).await;
-        assert!(!models.is_empty());
     }
 
     #[tokio::test]

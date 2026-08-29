@@ -49,9 +49,9 @@ use wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryIn
 use wilkes_core::types::{
     AddOutcome, BookmarkClustersQuery, ChunkTopicsQuery, CitationLinksQuery, CitationResult,
     CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, IntegrationStatus,
-    MatchRef, ModelDescriptor, NewBookmark, NewSmartCollection, NewTag, OpenAlexWork,
-    RelatedDocumentsQuery, SearchLogEntry, SearchQuery, SelectedEmbedder, SemanticScholarPaper,
-    SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
+    MatchRef, NewBookmark, NewSmartCollection, NewTag, OpenAlexWork, RelatedDocumentsQuery,
+    SearchLogEntry, SearchQuery, SelectedEmbedder, SemanticScholarPaper, SmartCollection, Tag,
+    UpdateSmartCollection, UpdateTag,
 };
 #[cfg(test)]
 use wilkes_core::worker::manager::WorkerPaths;
@@ -2133,24 +2133,6 @@ async fn events_handler(
 
 // ── Embed handlers ────────────────────────────────────────────────────────────
 
-async fn get_engines_handler() -> impl IntoResponse {
-    Json(EmbeddingEngine::supported_engines())
-}
-
-#[derive(Deserialize)]
-struct ListModelsQuery {
-    engine: EmbeddingEngine,
-}
-
-async fn list_models_handler(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<ListModelsQuery>,
-) -> impl IntoResponse {
-    let models: Vec<ModelDescriptor> =
-        wilkes_api::commands::embed::list_models(params.engine, &state.context().model_dir).await;
-    Json(models)
-}
-
 #[derive(Deserialize)]
 struct ModelSizeQuery {
     engine: EmbeddingEngine,
@@ -2344,29 +2326,13 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             "/api/integrations/underdog/chunks/search",
             post(chunks_search_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
-        .route(
-            "/api/integrations/underdog/catalogue/search",
-            post(catalogue_search_handler),
-        )
-        .route(
-            "/api/integrations/underdog/catalogue/sync",
-            post(catalogue_sync_handler),
-        )
-        .route(
-            "/api/integrations/underdog/catalogue/status",
-            get(catalogue_status_handler),
-        )
-        .route(
-            "/api/integrations/underdog/catalogue/acquire",
-            post(catalogue_acquire_handler),
-        )
+        .route("/api/catalogue/search", post(catalogue_search_handler))
+        .route("/api/catalogue/sync", post(catalogue_sync_handler))
+        .route("/api/catalogue/status", get(catalogue_status_handler))
+        .route("/api/catalogue/acquire", post(catalogue_acquire_handler))
         .route(
             "/api/integrations/underdog/embed/text",
             post(managed_embed_text_handler),
-        )
-        .route(
-            "/api/integrations/underdog/embed/models",
-            get(embedder_capabilities_handler),
         )
         .route(
             "/api/integrations/underdog/backup",
@@ -2527,8 +2493,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/asset", get(asset_handler))
         // Embed
         .route("/api/events", get(events_handler))
-        .route("/api/embed/engines", get(get_engines_handler))
-        .route("/api/embed/models", get(list_models_handler))
+        .route(
+            "/api/embed/capabilities",
+            get(embedder_capabilities_handler),
+        )
         .route("/api/embed/model-size", get(get_model_size_handler))
         .route("/api/embed/status", get(get_index_status_handler))
         .route("/api/embed/download", post(download_model_handler))
@@ -3139,7 +3107,7 @@ mod tests {
         let _ = get_data_paths_handler(State(state.clone())).await;
         let _ = get_python_info_handler().await;
         let _ = is_semantic_ready_handler(State(state.clone())).await;
-        let _ = get_engines_handler().await;
+        let _ = embedder_capabilities_handler(State(state.clone())).await;
 
         let patch = serde_json::json!({"semantic": {"enabled": true}});
         let res = update_settings_handler(State(state.clone()), axum::Json(patch)).await;
@@ -3480,9 +3448,6 @@ mod tests {
             events_tx,
         });
 
-        // test get_engines_handler
-        let _ = get_engines_handler().await;
-
         // test get_worker_status_handler
         let _ = get_worker_status_handler(State(state.clone())).await;
 
@@ -3507,14 +3472,8 @@ mod tests {
         }))
         .await;
 
-        // test list_models_handler
-        let _ = list_models_handler(
-            State(state.clone()),
-            Query(ListModelsQuery {
-                engine: EmbeddingEngine::Fastembed,
-            }),
-        )
-        .await;
+        // test embedder_capabilities_handler
+        let _ = embedder_capabilities_handler(State(state.clone())).await;
 
         // test get_python_info_handler
         let _ = get_python_info_handler().await;

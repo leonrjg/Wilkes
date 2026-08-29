@@ -1330,15 +1330,15 @@ pub enum PrefixSource {
     Undetermined,
 }
 
-/// Everything a consumer can learn about an embedding model *without* loading
+/// Everything a caller can learn about an embedding model *without* loading
 /// it, so that the choice of model is made where the models are.
 ///
-/// This is deliberately more than [`ModelDescriptor`]. A descriptor answers
-/// "what may I show in a picker"; this answers "what would embedding under
-/// this model actually mean" — the dimension, the input recipe, whether the
-/// artifacts are here — which is what a caller migrating a corpus has to know
-/// before it commits. Every field is either something Wilkes can establish or
-/// an explicit absence; nothing here is inferred from a model's name.
+/// This is the whole of what Wilkes says about a model: the dimension, the
+/// input recipe, whether the artifacts are here, and — since the picker reads
+/// this too — which entry a fresh install would choose. [`ModelDescriptor`]
+/// remains the engines' internal listing shape, from which this is built.
+/// Every field is either something Wilkes can establish or an explicit
+/// absence; nothing here is inferred from a model's name.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EmbedderCapability {
     pub engine: EmbeddingEngine,
@@ -1376,6 +1376,13 @@ pub struct EmbedderCapability {
     /// True for the entries the engine's own catalogue lists, false for a
     /// model the user added by hand.
     pub catalogued: bool,
+    /// The model a fresh install embeds with. Exactly one entry per engine
+    /// carries it, and a hand-added model never does.
+    pub is_default: bool,
+    /// A model this build vouches for, as a picker would mark it. Advice
+    /// about a choice rather than a property of the weights — which is why it
+    /// sits beside `catalogued` rather than beside `dimension`.
+    pub is_recommended: bool,
 }
 
 /// What this Wilkes can embed with, as one answer.

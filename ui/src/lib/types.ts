@@ -469,17 +469,40 @@ export type EmbedderModel = string;
 export type EmbeddingEngine = "SBERT" | "Candle" | "Fastembed";
 export const ALL_ENGINES: EmbeddingEngine[] = ["SBERT", "Candle", "Fastembed"];
 
-export interface ModelDescriptor {
+/** Where a model's retrieval prefixes came from, and whether that is known. */
+export type PrefixSource = "discovered" | "curated" | "not_documented" | "undetermined";
+
+/** Everything Wilkes says about one embedding model without loading it. */
+export interface EmbedderCapability {
+  engine: EmbeddingEngine;
   model_id: string;
   display_name: string;
   description: string;
-  dimension: number;
-  is_cached: boolean;
-  is_default: boolean;
-  is_recommended: boolean;
+  repository_id: string | null;
+  /** Null for a model added by hand, whose width only a first load reveals.
+   *  A picker must never fill this in. */
+  dimension: number | null;
+  supported_dimensions: number[];
+  query_prefix: string | null;
+  passage_prefix: string | null;
+  prefix_source: PrefixSource;
+  max_input_tokens: number | null;
+  /** Whether the artifacts are on this machine already. */
+  locally_available: boolean;
   /** Total bytes of all model files. Null for uncached models until fetched. */
   size_bytes: number | null;
   preferred_batch_size: number | null;
+  /** False for a model the user added by hand. */
+  catalogued: boolean;
+  is_default: boolean;
+  is_recommended: boolean;
+}
+
+/** What this Wilkes can embed with, as one answer. */
+export interface EmbedderCapabilityManifest {
+  engines: EmbeddingEngine[];
+  roles: string[];
+  models: EmbedderCapability[];
 }
 export interface CustomModel {
   engine: EmbeddingEngine;

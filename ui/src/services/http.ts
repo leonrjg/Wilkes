@@ -20,7 +20,7 @@ import type {
   IntegrationStatus,
   MatchRef,
   DocumentMetadata,
-  ModelDescriptor,
+  EmbedderCapabilityManifest,
   CitationLinks,
   CitationLinksQuery,
   NewBookmark,
@@ -471,12 +471,6 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<string>;
   }
 
-  async getSupportedEngines(): Promise<EmbeddingEngine[]> {
-    const res = await fetch("/api/embed/engines");
-    if (!res.ok) throw new Error(`getSupportedEngines failed: ${res.status}`);
-    return res.json() as Promise<EmbeddingEngine[]>;
-  }
-
   async getDataPaths(): Promise<any> {
     const res = await fetch("/api/data/paths");
     if (!res.ok) throw new Error(`getDataPaths failed: ${res.status}`);
@@ -534,10 +528,10 @@ export class HttpSearchApi implements SearchApi {
 
   // ── Semantic / embed commands ──────────────────────────────────────────────
 
-  async listModels(engine: EmbeddingEngine): Promise<ModelDescriptor[]> {
-    const res = await fetch(`/api/embed/models?engine=${encodeURIComponent(engine)}`);
-    if (!res.ok) throw new Error(`listModels failed: ${res.status}`);
-    return res.json() as Promise<ModelDescriptor[]>;
+  async getEmbedderCapabilities(): Promise<EmbedderCapabilityManifest> {
+    const res = await fetch("/api/embed/capabilities");
+    if (!res.ok) throw new Error(`getEmbedderCapabilities failed: ${res.status}`);
+    return res.json() as Promise<EmbedderCapabilityManifest>;
   }
 
   async getModelSize(engine: EmbeddingEngine, modelId: string): Promise<number> {
