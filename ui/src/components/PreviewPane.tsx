@@ -289,6 +289,12 @@ export default function PreviewPane() {
     selectedMatch.text_range == null;
   const pdfPage = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.page : 1;
   const pdfBbox = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.bbox : null;
+  // What this document's reading says its own areas hold, so the reader can
+  // offer that instead of the glyph runs the reading dropped. It arrives with
+  // the preview rather than on a call of its own: opening the document is
+  // already the request that asks what showing it needs.
+  const pdfSuperseded =
+    displayData && "Pdf" in displayData ? displayData.Pdf.superseded : undefined;
   const selectedSearchMatch = isPdfFile
     ? searchResults
         .find((file) => file.path === selectedMatch.path)
@@ -709,12 +715,13 @@ export default function PreviewPane() {
             {isPdfFile ? (
               <PdfViewer
                 key={api.resolvePdfUrl(selectedMatch.path)}
-                url={api.resolvePdfUrl(selectedMatch.path)}
+                source={api.resolvePdfUrl(selectedMatch.path)}
                 loadAttempt={pdfLoadAttempt}
                 page={pdfPage}
                 highlight_bbox={pdfBbox}
                 search_locator={pdfSearchLocator}
                 decorations={readerDecorations}
+                textSubstitutions={pdfSuperseded}
                 slots={{ selectionActions: selectionActionsSlot }}
                 onRenderSuccess={() => setIsPdfRendering(false)}
                 onLoadError={(error) => reportTabLoadError(activeTab.id, error)}

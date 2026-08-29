@@ -170,12 +170,10 @@ fn system_time_ms(time: SystemTime) -> Option<i64> {
 pub async fn open_file(
     path: PathBuf,
     _supported_extensions: Vec<String>,
+    index: Option<crate::commands::preview::IndexHandle>,
 ) -> anyhow::Result<PreviewData> {
     match viewer_file_type(&path) {
-        FileType::Pdf => Ok(PreviewData::Pdf {
-            page: 1,
-            highlight_bbox: None,
-        }),
+        FileType::Pdf => Ok(crate::commands::preview::pdf_preview(&path, 1, None, index)),
         FileType::PlainText => {
             let content =
                 tokio::fs::read_to_string(&path)
@@ -475,7 +473,7 @@ mod tests {
         fs::write(&path, "hello world").unwrap();
 
         let extensions = vec!["txt".to_string()];
-        let preview = open_file(path, extensions).await.unwrap();
+        let preview = open_file(path, extensions, None).await.unwrap();
 
         match preview {
             PreviewData::Text { content, .. } => assert_eq!(content, "hello world"),
@@ -490,7 +488,7 @@ mod tests {
         fs::write(&path, "plain text").unwrap();
 
         let extensions = vec!["txt".to_string()];
-        let preview = open_file(path, extensions).await.unwrap();
+        let preview = open_file(path, extensions, None).await.unwrap();
 
         match preview {
             PreviewData::Text { content, .. } => assert_eq!(content, "plain text"),
@@ -505,7 +503,7 @@ mod tests {
         fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
 
         let extensions = vec!["txt".to_string()];
-        let result = open_file(path, extensions).await;
+        let result = open_file(path, extensions, None).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -520,7 +518,7 @@ mod tests {
         fs::write(&path, "fake pdf").unwrap();
 
         let extensions = vec!["pdf".to_string()];
-        let preview = open_file(path, extensions).await.unwrap();
+        let preview = open_file(path, extensions, None).await.unwrap();
 
         match preview {
             PreviewData::Pdf { page, .. } => assert_eq!(page, 1),

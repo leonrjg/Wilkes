@@ -1974,9 +1974,11 @@ async fn chat_close(session_id: String, app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn preview(
+    app: AppHandle,
     match_ref: wilkes_core::types::MatchRef,
 ) -> Result<wilkes_core::types::PreviewData, String> {
-    wilkes_api::commands::preview::preview(match_ref)
+    app_context(&app)
+        .preview(match_ref)
         .await
         .map_err(|e| e.to_string())
 }

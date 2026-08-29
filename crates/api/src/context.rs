@@ -2400,6 +2400,19 @@ impl AppContext {
         )
     }
 
+    /// What one document's reading surface needs to show a match.
+    ///
+    /// Routed through the context rather than called as a free function so a
+    /// PDF preview can carry the areas whose text this workspace's reading
+    /// owns. Those live in the index, which is the context's to hand out.
+    pub async fn preview(
+        &self,
+        match_ref: wilkes_core::types::MatchRef,
+    ) -> anyhow::Result<wilkes_core::types::PreviewData> {
+        let index = self.index.lock().clone();
+        crate::commands::preview::preview(match_ref, Some(index)).await
+    }
+
     /// The retained snapshots this managed corpus has admitted — what a
     /// projection must hold to be level with it.
     pub fn managed_admitted_sources(&self) -> Result<Vec<PathBuf>, ConsumerError> {
@@ -3871,7 +3884,8 @@ impl AppContext {
     /// because desktop library documents normally live outside `data_dir`.
     pub async fn open_file(&self, path: PathBuf) -> anyhow::Result<PreviewData> {
         let s = self.get_settings().await;
-        crate::commands::files::open_file(path, s.supported_extensions).await
+        let index = self.index.lock().clone();
+        crate::commands::files::open_file(path, s.supported_extensions, Some(index)).await
     }
 
     pub async fn rename_file(&self, path: PathBuf, new_name: String) -> anyhow::Result<PathBuf> {
@@ -7477,6 +7491,7 @@ mod tests {
             std::fs::write(&path, &text).unwrap();
             index
                 .write_file(wilkes_core::embed::index::db::PreparedFile {
+                    regions: Vec::new(),
                     full_text: String::new(),
                     path: path.clone(),
                     chunks: vec![(
@@ -7646,6 +7661,7 @@ mod tests {
         index
             .write_file_with_recipe(
                 wilkes_core::embed::index::db::PreparedFile {
+                    regions: Vec::new(),
                     full_text: String::new(),
                     path: document.clone(),
                     chunks,
@@ -7764,6 +7780,7 @@ mod tests {
         .unwrap();
         index
             .write_file(wilkes_core::embed::index::db::PreparedFile {
+                regions: Vec::new(),
                 full_text: String::new(),
                 path: indexed.clone(),
                 chunks: vec![(
@@ -7842,6 +7859,7 @@ mod tests {
         index
             .write_file_with_recipe(
                 wilkes_core::embed::index::db::PreparedFile {
+                    regions: Vec::new(),
                     full_text: text.to_string(),
                     path: document.clone(),
                     chunks: vec![
@@ -7992,6 +8010,7 @@ mod tests {
             .collect();
         index
             .write_file(wilkes_core::embed::index::db::PreparedFile {
+                regions: Vec::new(),
                 full_text: String::new(),
                 path: document.clone(),
                 chunks,
@@ -7999,6 +8018,7 @@ mod tests {
             .unwrap();
         index
             .write_file(wilkes_core::embed::index::db::PreparedFile {
+                regions: Vec::new(),
                 full_text: String::new(),
                 path: other.clone(),
                 chunks: vec![(
@@ -8115,6 +8135,7 @@ mod tests {
         .collect();
         index
             .write_file(wilkes_core::embed::index::db::PreparedFile {
+                regions: Vec::new(),
                 full_text: String::new(),
                 path: source.clone(),
                 chunks: source_chunks,
@@ -8127,6 +8148,7 @@ mod tests {
         ] {
             index
                 .write_file(wilkes_core::embed::index::db::PreparedFile {
+                    regions: Vec::new(),
                     full_text: String::new(),
                     path: path.clone(),
                     chunks: vec![(
@@ -8144,6 +8166,7 @@ mod tests {
         index.activate_root(&stale_root).unwrap();
         index
             .write_file(wilkes_core::embed::index::db::PreparedFile {
+                regions: Vec::new(),
                 full_text: String::new(),
                 path: stale_match.clone(),
                 chunks: vec![(
@@ -10804,6 +10827,7 @@ exit 0
         .unwrap();
         index
             .write_file(PreparedFile {
+                regions: Vec::new(),
                 path: pdf.clone(),
                 full_text: "alpha beta gamma".to_string(),
                 chunks: vec![(
@@ -11660,12 +11684,14 @@ exit 0
             origin: SourceOrigin::TextFile { line: 1, col: 1 },
         };
         idx.write_file(wilkes_core::embed::index::db::PreparedFile {
+            regions: Vec::new(),
             full_text: String::new(),
             path: source.clone(),
             chunks: vec![(chunk(&source, "source"), vec![1.0, 0.0])],
         })
         .unwrap();
         idx.write_file(wilkes_core::embed::index::db::PreparedFile {
+            regions: Vec::new(),
             full_text: String::new(),
             path: related.clone(),
             chunks: vec![(chunk(&related, "related"), vec![0.9, 0.1])],

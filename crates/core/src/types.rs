@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 // ── Byte range (replaces std::ops::Range<usize> for serde compat) ────────────
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ByteRange {
     pub start: usize,
     pub end: usize,
@@ -645,7 +645,7 @@ pub struct ExtractionDiagnostics {
     pub images_description_not_configured: u32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BoundingBox {
     pub x: f32,
     pub y: f32,
@@ -919,6 +919,51 @@ impl RegionKind {
             RegionKind::Text | RegionKind::Code => false,
         }
     }
+}
+
+/// One stretch of the reading that owns a page area outright, and where on
+/// the page it belongs.
+///
+/// The reading records what each of its bytes *is* through
+/// [`TextProvenance`], and where each of them came from through
+/// [`SourceOrigin`], but only for as long as the extraction is in hand. This
+/// is the part of that worth keeping: the areas where a recognizer's reading
+/// of a region the page typeset *replaced* the glyph run drawn there, which
+/// are the only areas the document's own glyphs no longer account for. Every
+/// other byte of the reading has the page's text behind it and needs no
+/// record.
+///
+/// No text is carried. `full_text` already holds these bytes at
+/// `text_range`, and a second copy of them would be a second answer to the
+/// same question. What is missing from the index — and what this supplies —
+/// is *where on the page* a stretch of the reading lives.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ReadingRegion {
+    /// The [`ExtractedImage`] this was read from. Pieces sharing one are one
+    /// area of the page, and are read back as one.
+    pub area_id: String,
+    /// 1-based, numbered as extraction numbers pages.
+    pub page: u32,
+    /// The area whose glyph run the reading replaced — the region as it was
+    /// marked out and rendered, not the recognizer's polygon around its ink.
+    /// The former is exactly what stopped being in the reading; the latter can
+    /// be tighter, and would leave the flattened glyphs it missed beside the
+    /// transcription that superseded them.
+    pub bbox: BoundingBox,
+    pub text_range: ByteRange,
+}
+
+/// A page area whose text the reading owns, as a reading surface needs it:
+/// resolved, joined, and ready to stand in place of what the page draws there.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SupersededArea {
+    pub page: u32,
+    pub bbox: BoundingBox,
+    /// The reading's account of the area. The pieces of one area joined by
+    /// newlines, as the reading separates them — and never the `Page formula:`
+    /// label standing in front of them, which belongs to the transcription
+    /// block and to no region of the page.
+    pub text: String,
 }
 
 /// One region of text the recognizer spotted inside a native image.
@@ -1240,6 +1285,12 @@ pub enum PreviewData {
     Pdf {
         page: u32,
         highlight_bbox: Option<BoundingBox>,
+        /// The page areas whose text this document's reading owns rather than
+        /// its glyphs. Empty for a document the index has never read, which is
+        /// the same answer as "this document has none": in both cases the
+        /// reader offers what the page draws, which is all there is to offer.
+        #[serde(default)]
+        superseded: Vec<SupersededArea>,
     },
 }
 

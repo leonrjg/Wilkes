@@ -1064,6 +1064,7 @@ mod tests {
         let mut idx =
             SemanticIndex::create(root, "m", 3, EmbeddingEngine::Candle, Some(root)).unwrap();
         idx.write_file(PreparedFile {
+            regions: Vec::new(),
             path: pdf.clone(),
             full_text: "alpha something gamma".to_string(),
             chunks: vec![(

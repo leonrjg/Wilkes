@@ -146,9 +146,12 @@ async fn citation_links_handler(
 // ── Preview ───────────────────────────────────────────────────────────────────
 
 async fn preview_handler(
+    State(state): State<Arc<AppState>>,
     Json(match_ref): Json<MatchRef>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
-    let data = wilkes_api::commands::preview::preview(match_ref)
+    let (ctx, _) = state.workspace_snapshot();
+    let data = ctx
+        .preview(match_ref)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(data))

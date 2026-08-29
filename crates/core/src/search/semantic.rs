@@ -535,6 +535,7 @@ mod tests {
         use crate::types::{ByteRange, SourceOrigin};
 
         idx.write_file(PreparedFile {
+            regions: Vec::new(),
             full_text: String::new(),
             path: path.clone(),
             chunks: vec![(
@@ -905,6 +906,7 @@ mod tests {
             origin: SourceOrigin::TextFile { line: 1, col: 1 },
         };
         let prepared = PreparedFile {
+            regions: Vec::new(),
             full_text: String::new(),
             path: path.clone(),
             chunks: vec![(chunk, vec![1.0; 768])],
@@ -1046,6 +1048,7 @@ mod tests {
         use crate::types::{ByteRange, SourceOrigin};
 
         idx.write_file(PreparedFile {
+            regions: Vec::new(),
             full_text: String::new(),
             path: file_a.clone(),
             chunks: vec![(
@@ -1060,6 +1063,7 @@ mod tests {
         })
         .unwrap();
         idx.write_file(PreparedFile {
+            regions: Vec::new(),
             full_text: String::new(),
             path: file_b.clone(),
             chunks: vec![(
@@ -1074,6 +1078,7 @@ mod tests {
         })
         .unwrap();
         idx.write_file(PreparedFile {
+            regions: Vec::new(),
             full_text: String::new(),
             path: file_c.clone(),
             chunks: vec![(

@@ -758,6 +758,43 @@ describe("PreviewPane", () => {
     expect(mockPdfViewer.mock.lastCall?.[0].search_locator).toEqual(locator);
   });
 
+  it("hands the reader the areas this document's reading owns", () => {
+    const superseded = [
+      {
+        page: 3,
+        bbox: { x: 10, y: 20, width: 300, height: 24 },
+        text: "y_{B} = w^{x_{B}} \\bmod q",
+      },
+    ];
+    setViewerState({
+      selectedMatch: {
+        path: "paper.pdf",
+        origin: { PdfPage: { page: 3, bbox: null } },
+      } as any,
+      previewData: { Pdf: { page: 3, highlight_bbox: null, superseded } },
+    });
+
+    render(<PreviewPane />);
+
+    expect(mockPdfViewer.mock.lastCall?.[0].textSubstitutions).toEqual(superseded);
+  });
+
+  it("tells the reader nothing about areas before the preview arrives", () => {
+    setViewerState({
+      selectedMatch: {
+        path: "paper.pdf",
+        origin: { PdfPage: { page: 1, bbox: null } },
+      } as any,
+      previewData: null,
+    });
+
+    render(<PreviewPane />);
+
+    // Not an empty list: the document's reading has not been read yet, which
+    // is not the same as knowing it owns nothing.
+    expect(mockPdfViewer.mock.lastCall?.[0].textSubstitutions).toBeUndefined();
+  });
+
   it("does not replace semantic chunk geometry with exact-result localization", () => {
     const origin = {
       PdfPage: { page: 30, bbox: { x: 1, y: 2, width: 3, height: 4 } },

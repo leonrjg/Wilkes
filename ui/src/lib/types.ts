@@ -304,8 +304,21 @@ export type PreviewData =
       Pdf: {
         page: number;
         highlight_bbox: BoundingBox | null;
+        /** The page areas whose text this document's reading owns rather than
+         *  its glyphs — what a recognizer read where the page typeset a
+         *  formula or a table, and whose flattened glyph run the reading
+         *  dropped. Empty for a document the index has never read. */
+        superseded: SupersededArea[];
       };
     };
+
+/** A page area whose text the reading owns, ready to stand in place of what
+ *  the page draws there. Mirrors `wilkes_core::types::SupersededArea`. */
+export interface SupersededArea {
+  page: number;
+  bbox: BoundingBox;
+  text: string;
+}
 
 export interface DocumentMetadata {
   title: string | null;

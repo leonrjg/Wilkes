@@ -13,8 +13,13 @@
 //! model reading the export is told which is which in the text itself rather
 //! than being trusted to guess.
 
+use std::collections::HashMap;
+
+use tracing::warn;
+
 use crate::types::{
-    BoundingBox, ExtractedImage, ImageOcrRegion, Point, RegionKind, RegionOrigin, TextProvenance,
+    BoundingBox, ExtractedContent, ExtractedImage, ImageOcrRegion, Point, ReadingRegion,
+    RegionKind, RegionOrigin, SourceOrigin, SupersededArea, TextProvenance,
 };
 
 /// Bumped whenever these bytes change for the same analysis — a new label, a
@@ -219,6 +224,113 @@ pub fn enrichment_pieces(image: &ExtractedImage) -> Vec<Piece> {
     pieces
 }
 
+/// The stretches of a reading that stand in place of a page's own glyph run.
+///
+/// The inverse of [`enrichment_pieces`], read back off the finished reading
+/// rather than recomputed: the source map is where the reading records what
+/// each of its bytes is, and a second traversal of the images would be a
+/// second opinion about bytes that are already written.
+///
+/// Two conditions, and no more:
+///
+/// - The bytes are a *region's*, not the block's framing. A piece with no
+///   confidence is a label or a separator — [`TextProvenance::ImageOcr`] says
+///   so — and `Page formula:` is Wilkes' word about the area, not the
+///   document's own.
+/// - The area was one the page typeset. An embedded picture's transcription
+///   supersedes nothing: the page draws pixels there, the reading adds an
+///   account of them, and both stand.
+///
+/// Nothing here re-tests [`RegionKind::supersedes_native_glyphs`]. Admission
+/// already refuses any typeset region whose kind is not worth displacing a
+/// glyph run for, so a typeset region that reached the reading is one that
+/// displaced one; asking again would be this module's own copy of a rule that
+/// has an owner.
+pub fn reading_regions(content: &ExtractedContent) -> Vec<ReadingRegion> {
+    let typeset: HashMap<&str, &ExtractedImage> = content
+        .images
+        .iter()
+        .filter(|image| image.origin == RegionOrigin::Typeset)
+        .map(|image| (image.id.as_str(), image))
+        .collect();
+
+    content
+        .source_map
+        .segments
+        .iter()
+        .filter_map(|segment| {
+            let TextProvenance::ImageOcr {
+                image_id,
+                confidence: Some(_),
+                ..
+            } = &segment.provenance
+            else {
+                return None;
+            };
+            let image = typeset.get(image_id.as_str())?;
+            let SourceOrigin::PdfPage { page, .. } = &segment.origin else {
+                return None;
+            };
+            Some(ReadingRegion {
+                area_id: image.id.clone(),
+                page: *page,
+                bbox: image.bbox.clone(),
+                text_range: segment.text_range.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Resolve stored regions against the reading they were cut from.
+///
+/// The pieces of one area are one thing to a reader — two formulas the page
+/// set as one displayed block, or a label and its rows — so they are joined,
+/// with the newline the reading itself puts between two blocks of the same
+/// area. Consecutive pieces share an area because they were written in
+/// reading order and are read back in it.
+///
+/// A range that does not resolve is dropped and said so. It means the stored
+/// text and the stored positions have come apart, which is a fact worth a log
+/// line: silently serving the neighbouring bytes would put an arbitrary
+/// fragment of the document on a reader's clipboard.
+pub fn superseded_areas(full_text: &str, regions: &[ReadingRegion]) -> Vec<SupersededArea> {
+    let mut areas: Vec<(&str, SupersededArea)> = Vec::new();
+
+    for (index, region) in regions.iter().enumerate() {
+        let Some(text) = full_text.get(region.text_range.start..region.text_range.end) else {
+            warn!(
+                "reading region {index} of area {} does not resolve against the stored text \
+                 ({}..{} of {} bytes)",
+                region.area_id,
+                region.text_range.start,
+                region.text_range.end,
+                full_text.len()
+            );
+            continue;
+        };
+        match areas.last_mut() {
+            Some((area_id, area)) if *area_id == region.area_id => {
+                area.text.push('\n');
+                area.text.push_str(text);
+            }
+            _ => areas.push((
+                region.area_id.as_str(),
+                SupersededArea {
+                    page: region.page,
+                    bbox: region.bbox.clone(),
+                    text: text.to_string(),
+                },
+            )),
+        }
+    }
+
+    areas
+        .into_iter()
+        .map(|(_, area)| area)
+        .filter(|area| !area.text.trim().is_empty())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +397,132 @@ mod tests {
 
     fn rendered(pieces: &[Piece]) -> String {
         pieces.iter().map(|piece| piece.text.as_str()).collect()
+    }
+
+    /// A reading with one image's enrichment written into it, exactly as
+    /// `sanitize::render` writes it: one segment per piece, in order.
+    fn reading(images: Vec<ExtractedImage>) -> ExtractedContent {
+        let mut text = String::new();
+        let mut segments = Vec::new();
+        for image in &images {
+            for piece in enrichment_pieces(image) {
+                let start = text.len();
+                text.push_str(&piece.text);
+                segments.push(crate::types::SourceSegment {
+                    text_range: crate::types::ByteRange {
+                        start,
+                        end: text.len(),
+                    },
+                    origin: SourceOrigin::PdfPage {
+                        page: image.page,
+                        bbox: Some(piece.bbox.clone()),
+                    },
+                    provenance: piece.provenance.clone(),
+                });
+            }
+        }
+        ExtractedContent {
+            text,
+            source_map: crate::types::SourceMap { segments },
+            metadata: crate::types::FileMetadata {
+                path: "doc.pdf".into(),
+                size_bytes: 0,
+                mime: None,
+                title: None,
+                page_count: None,
+            },
+            images,
+        }
+    }
+
+    fn typeset(kind: RegionKind, text: &str) -> ExtractedImage {
+        let mut image = image(vec![kinded(kind, text, 0.95, OcrAdmission::Accepted)], None);
+        image.origin = RegionOrigin::Typeset;
+        image
+    }
+
+    /// The area the reading speaks for is the one whose glyph run it replaced
+    /// -- the region as it was marked out -- and the bytes are the region's
+    /// own, without the label standing in front of them.
+    #[test]
+    fn a_typeset_region_is_the_area_and_its_own_bytes() {
+        let content = reading(vec![typeset(RegionKind::Formula, "y_{B} = w^{x_{B}} \\bmod q")]);
+        let regions = reading_regions(&content);
+
+        assert_eq!(regions.len(), 1, "{regions:?}");
+        assert_eq!(regions[0].area_id, "p18-i0");
+        assert_eq!(regions[0].page, 18);
+        assert_eq!(regions[0].bbox, content.images[0].bbox);
+
+        let areas = superseded_areas(&content.text, &regions);
+        assert_eq!(areas.len(), 1);
+        assert_eq!(areas[0].text, "y_{B} = w^{x_{B}} \\bmod q");
+        assert!(content.text.contains("Page formula:"), "{}", content.text);
+        assert!(!areas[0].text.contains("Page formula:"));
+    }
+
+    /// A picture's transcription supersedes nothing: the page draws pixels
+    /// there, and the reading adds an account of them beside what the page
+    /// still draws.
+    #[test]
+    fn an_embedded_image_speaks_for_no_area() {
+        let content = reading(vec![image(
+            vec![kinded(
+                RegionKind::Formula,
+                "E = mc^2",
+                0.95,
+                OcrAdmission::Accepted,
+            )],
+            Some("A blackboard."),
+        )]);
+
+        assert!(reading_regions(&content).is_empty());
+    }
+
+    /// The framing Wilkes writes around a transcription -- its label, the
+    /// separators, the terminator -- belongs to the block and to no region of
+    /// the page, and `confidence: None` is how the reading says so.
+    #[test]
+    fn the_blocks_framing_is_not_part_of_any_area() {
+        let content = reading(vec![typeset(RegionKind::Table, "| a | b |\n| - | - |")]);
+        let regions = reading_regions(&content);
+
+        for region in &regions {
+            let bytes = &content.text[region.text_range.start..region.text_range.end];
+            assert!(!bytes.contains("Page table:"), "{bytes:?}");
+            assert!(!bytes.trim().is_empty());
+        }
+        assert_eq!(
+            superseded_areas(&content.text, &regions)[0].text,
+            "| a | b |\n| - | - |"
+        );
+    }
+
+    /// Two regions of one area are one thing to a reader, and are joined the
+    /// way the reading separates the blocks they were written as.
+    #[test]
+    fn the_pieces_of_one_area_are_read_back_as_one() {
+        let mut image = typeset(RegionKind::Formula, "x = 1");
+        image
+            .ocr_regions
+            .push(kinded(RegionKind::Formula, "y = 2", 0.9, OcrAdmission::Accepted));
+        let content = reading(vec![image]);
+
+        let areas = superseded_areas(&content.text, &reading_regions(&content));
+        assert_eq!(areas.len(), 1);
+        assert_eq!(areas[0].text, "x = 1\ny = 2");
+    }
+
+    /// Stored positions and stored text can only come apart through damage,
+    /// and serving the neighbouring bytes would put an arbitrary fragment of
+    /// the document on a reader's clipboard.
+    #[test]
+    fn a_range_that_does_not_resolve_is_dropped() {
+        let content = reading(vec![typeset(RegionKind::Formula, "x = 1")]);
+        let mut regions = reading_regions(&content);
+        regions[0].text_range.end = content.text.len() + 100;
+
+        assert!(superseded_areas(&content.text, &regions).is_empty());
     }
 
     #[test]
