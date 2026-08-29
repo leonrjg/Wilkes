@@ -39,6 +39,7 @@
 //! drew stays exactly where it was.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use mupdf::device::NativeDevice;
@@ -55,7 +56,7 @@ use crate::types::{BoundingBox, ImageTransform, Point, RegionOrigin};
 /// rendered. Part of the enrichment recipe an extractor declares, so a reading
 /// produced under different routing is never mistaken for one produced under
 /// this.
-pub(super) const ROUTING_VERSION: &str = "typeset-routing-v1";
+pub(super) const ROUTING_VERSION: &str = "typeset-routing-v2";
 
 /// The share of a line's glyphs that must come from a math font for the line
 /// to be part of a formula.
@@ -79,6 +80,17 @@ const MATH_GLYPH_SHARE: f32 = 0.5;
 /// more often than it is an equation, and it is never an equation worth a
 /// recognizer call.
 const MIN_FORMULA_GLYPHS: usize = 3;
+
+/// How far a line's glyph sizes, or its baselines, must spread before the line
+/// counts as having carried structure that flattening destroyed. Points.
+///
+/// Half a point is comfortably below a real subscript — typeset at around
+/// seventy percent of the body size, so three points apart on ten-point text —
+/// and comfortably above the jitter of a typesetter placing glyphs on one
+/// baseline. Measured as a spread rather than as a count of distinct values,
+/// because two glyphs a hundredth of a point apart are on the same baseline
+/// however they round.
+const STRUCTURE_SPREAD_POINTS: f32 = 0.5;
 
 /// Two formula lines join into one region when the gap between them is under
 /// this many line heights. An aligned multi-line equation is one formula, and
@@ -164,6 +176,14 @@ pub(super) struct Survey {
     math_origins: Vec<Point>,
     /// Thin wide rectangles the page filled or stroked.
     rules: Vec<BoundingBox>,
+    /// Every face the page drew text with, and how many glyphs each drew.
+    ///
+    /// Collected whether or not the face is mathematics, because the useful
+    /// question when a document yields no formulas is *what it does draw
+    /// with*. Without this, "this document has no mathematics" and "this
+    /// build did not recognize the face its mathematics is set in" are the
+    /// same silence — which is exactly how `DBAMWK+Formula` went unnoticed.
+    pub(super) faces: BTreeMap<String, usize>,
 }
 
 /// A line of the page, as this module needs it: where it sits and how much of
@@ -176,12 +196,36 @@ pub(super) struct SurveyedLine {
     pub bbox: BoundingBox,
     pub glyphs: usize,
     pub math_glyphs: usize,
+    /// Whether the page drew this line's glyphs at more than one size or on
+    /// more than one baseline — a subscript, a superscript, a stacked
+    /// fraction, the limits on a sum.
+    ///
+    /// This is the damage the whole feature exists to repair, measured
+    /// directly. Reading a line out of the page's own drawing flattens it: `c`
+    /// with a subscript `i` becomes `ci`, and the structure that said which
+    /// was which is gone. A line with no such structure flattens to itself and
+    /// has nothing to recover — `mod n` reads `mod n` either way.
+    pub structure_flattened: bool,
 }
 
 impl SurveyedLine {
+    /// Whether this line is a formula worth reading again.
+    ///
+    /// Three conditions, and the third is the one that matters. The
+    /// typography says the line is mathematics; it is long enough not to be a
+    /// stray symbol; and flattening it destroyed something.
+    ///
+    /// That last condition replaced a length floor, which was the wrong
+    /// question asked in the wrong units. On the document that prompted this,
+    /// a floor kept `ETAOINSRHDLUCMFYWGPBVKXQJZ` — a cipher alphabet, twenty-
+    /// six glyphs, nothing to recover and a transcription that could only
+    /// damage it — and dropped `c = me` at four. The structure test gets both
+    /// right, and it does so by asking what the feature is for rather than by
+    /// counting characters.
     fn is_formula(&self) -> bool {
         self.glyphs >= MIN_FORMULA_GLYPHS
             && (self.math_glyphs as f32) >= (self.glyphs as f32) * MATH_GLYPH_SHARE
+            && self.structure_flattened
     }
 }
 
@@ -219,6 +263,9 @@ impl Survey {
             .count()
     }
 
+    /// Whether this page offered anything to mark a region out from. The
+    /// faces are not part of the answer: they are collected for the report
+    /// and a page drawn entirely in body text offers nothing.
     pub(super) fn is_empty(&self) -> bool {
         self.math_origins.is_empty() && self.rules.is_empty()
     }
@@ -250,7 +297,12 @@ fn is_math_font(name: &str) -> bool {
     // Trailing design sizes: cmmi10, cmsy7, lmmathitalic12.
     let stem = family.trim_end_matches(|c: char| c.is_ascii_digit());
 
-    if stem.contains("math") {
+    // A face named for the job it does. Every OpenType math font follows the
+    // first convention, and a publisher rolling its own follows one of the
+    // others — the course book that prompted this ships `DBAMWK+Formula`,
+    // which is as explicit a declaration as `LatinModernMath` and was missed
+    // by a list that only knew TeX's names.
+    if ["math", "formula", "equation"].iter().any(|word| stem.contains(word)) {
         return true;
     }
     const FAMILIES: &[&str] = &[
@@ -272,7 +324,13 @@ fn is_math_font(name: &str) -> bool {
 /// parse — milliseconds against the tens of seconds a single recognizer call
 /// takes — and buys the answer without reaching past the wrapper into raw
 /// MuPDF structures.
-struct FontProbe(Rc<RefCell<Vec<Point>>>);
+#[derive(Default)]
+struct Drawn {
+    math_origins: Vec<Point>,
+    faces: BTreeMap<String, usize>,
+}
+
+struct FontProbe(Rc<RefCell<Drawn>>);
 
 impl FontProbe {
     /// A text-drawing operation, whichever entry point delivered it.
@@ -280,19 +338,33 @@ impl FontProbe {
     /// `ctm` is the accumulated transform, and a glyph's item coordinates are
     /// its origin before it — MuPDF composes exactly this to place the glyph —
     /// so the origin in page space is the item mapped through `ctm`.
+    ///
+    /// Word spaces are skipped. A space is an item like any other and would be
+    /// counted as a math glyph while the line it sits on counts only its
+    /// visible characters, which put the share above one — harmless against a
+    /// threshold, and a number that cannot be read.
     fn collect(&mut self, text: &Text, ctm: Matrix) {
         for span in text.spans() {
-            if !is_math_font(span.font().name()) {
-                continue;
-            }
-            let mut origins = self.0.borrow_mut();
+            let font = span.font();
+            let name = font.name();
+            let math = is_math_font(name);
+            let mut drawn = self.0.borrow_mut();
+            let mut glyphs = 0usize;
             for item in span.items() {
+                if char::from_u32(item.ucs() as u32).is_some_and(char::is_whitespace) {
+                    continue;
+                }
+                glyphs += 1;
+                if !math {
+                    continue;
+                }
                 let (x, y) = (item.x(), item.y());
-                origins.push(Point {
+                drawn.math_origins.push(Point {
                     x: ctm.a * x + ctm.c * y + ctm.e,
                     y: ctm.b * x + ctm.d * y + ctm.f,
                 });
             }
+            *drawn.faces.entry(name.to_string()).or_default() += glyphs;
         }
     }
 }
@@ -336,7 +408,7 @@ impl NativeDevice for FontProbe {
 /// the same object the reading does. The font probe is a second run of the
 /// page, for the reason on [`FontProbe`].
 pub(super) fn survey(page: &mupdf::Page, text_page: &mupdf::TextPage) -> Survey {
-    let collected = Rc::new(RefCell::new(Vec::new()));
+    let collected = Rc::new(RefCell::new(Drawn::default()));
     match Device::from_native(FontProbe(Rc::clone(&collected))) {
         Ok(device) => {
             if let Err(error) = page.run(&device, &Matrix::IDENTITY) {
@@ -371,20 +443,27 @@ pub(super) fn survey(page: &mupdf::Page, text_page: &mupdf::TextPage) -> Survey 
     // finished with its copy of the device is its business, and a failed
     // unwrap here would return an empty survey — which reads exactly like a
     // page with no mathematics on it.
-    let math_origins = collected.borrow().clone();
+    let drawn = collected.borrow();
     Survey {
-        math_origins,
+        math_origins: drawn.math_origins.clone(),
+        faces: drawn.faces.clone(),
         rules,
     }
 }
 
 /// Measure one line against the survey.
+///
+/// `sizes` and `baselines` are the font size and the baseline `y` of every
+/// glyph on the line, in the order they were drawn; their spread is what says
+/// whether the line carried structure the reading flattened.
 pub(super) fn surveyed_line(
     survey: &Survey,
     block: usize,
     line: usize,
     bbox: BoundingBox,
     glyphs: usize,
+    sizes: &[f32],
+    baselines: &[f32],
 ) -> SurveyedLine {
     let math_glyphs = survey.math_glyphs_within(&bbox);
     SurveyedLine {
@@ -393,7 +472,21 @@ pub(super) fn surveyed_line(
         bbox,
         glyphs,
         math_glyphs,
+        structure_flattened: spread(sizes) > STRUCTURE_SPREAD_POINTS
+            || spread(baselines) > STRUCTURE_SPREAD_POINTS,
     }
+}
+
+fn spread(values: &[f32]) -> f32 {
+    let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
+    for value in values {
+        low = low.min(*value);
+        high = high.max(*value);
+    }
+    if low > high {
+        return 0.0;
+    }
+    high - low
 }
 
 // ── Marking out regions ─────────────────────────────────────────────────────
@@ -538,6 +631,44 @@ fn with_margin(bbox: &BoundingBox) -> BoundingBox {
         y: bbox.y - MARGIN_POINTS,
         width: bbox.width + MARGIN_POINTS * 2.0,
         height: bbox.height + MARGIN_POINTS * 2.0,
+    }
+}
+
+/// Say what the document draws with, and which of it was read as mathematics.
+///
+/// At info when nothing was — because that is the case a reader needs to see.
+/// A document whose mathematics is set in a face this build does not know
+/// yields no formulas and looks exactly like a document with no mathematics
+/// in it, and the difference is the whole of whether this feature worked. The
+/// face names are the evidence, and they are only in the file.
+pub(super) fn report_faces(path: &std::path::Path, faces: &BTreeMap<String, usize>) {
+    if faces.is_empty() {
+        return;
+    }
+    let mut ordered: Vec<(&String, &usize)> = faces.iter().collect();
+    ordered.sort_by_key(|(_, glyphs)| std::cmp::Reverse(**glyphs));
+    let named = |mathematics: bool| {
+        ordered
+            .iter()
+            .filter(|(name, _)| is_math_font(name) == mathematics)
+            .map(|(name, glyphs)| format!("{name} ({glyphs})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mathematics = named(true);
+    if mathematics.is_empty() {
+        tracing::info!(
+            "typeset routing in {:?}: no face is known to this build as mathematics, so no \
+             formula was marked out. The document draws with: {}",
+            path,
+            named(false)
+        );
+    } else {
+        tracing::debug!(
+            "typeset routing in {:?}: mathematics is set in {mathematics}; the rest is {}",
+            path,
+            named(false)
+        );
     }
 }
 
@@ -697,7 +828,20 @@ pub(super) fn discover(
 mod tests {
     use super::*;
 
+    /// A surveyed line that carried structure — the ordinary case for a
+    /// display equation, whose subscripts are what flattening destroyed.
     fn line(block: usize, index: usize, y: f32, glyphs: usize, math: usize) -> SurveyedLine {
+        flat_line(block, index, y, glyphs, math, true)
+    }
+
+    fn flat_line(
+        block: usize,
+        index: usize,
+        y: f32,
+        glyphs: usize,
+        math: usize,
+        structure_flattened: bool,
+    ) -> SurveyedLine {
         SurveyedLine {
             block,
             line: index,
@@ -709,6 +853,7 @@ mod tests {
             },
             glyphs,
             math_glyphs: math,
+            structure_flattened,
         }
     }
 
@@ -736,6 +881,12 @@ mod tests {
             "STIXTwoMath-Regular",
             "Cambria Math",
             "TeXGyrePagella-Math",
+            // A publisher rolling its own and naming it for the job. This is
+            // the face the reported document sets its mathematics in, and the
+            // case that the TeX-only list missed.
+            "DBAMWK+Formula",
+            "Formula",
+            "EquationFont",
         ] {
             assert!(is_math_font(name), "{name} should be a math font");
         }
@@ -754,6 +905,13 @@ mod tests {
             "LMRoman10-Regular",
             "SFRM1000",
             "Arial-BoldMT",
+            // The rest of the reported document's faces, which must not be
+            // dragged in by a rule loose enough to catch its `Formula`.
+            "DBAMWK+SourceSans",
+            "DBAMWK+SourceSansBold",
+            "DBAMWK+SourceCode",
+            // A real text typeface whose name starts like "formula".
+            "Formata-Regular",
         ] {
             assert!(!is_math_font(name), "{name} should not be a math font");
         }
@@ -773,6 +931,55 @@ mod tests {
         let regions = formula_lines(&lines, &[false, false]);
         assert_eq!(regions.len(), 1, "one formula on the page");
         assert_eq!(regions[0], vec![1]);
+    }
+
+    /// The rule that decides whether a line is worth reading again is not its
+    /// length but whether flattening it lost anything. `mod n` reads `mod n`
+    /// either way; `ci = ai ⊕bi` lost two subscripts.
+    #[test]
+    fn a_line_that_flattened_to_itself_is_not_read_again() {
+        let flat = flat_line(0, 0, 100.0, 8, 8, false);
+        assert!(!flat.is_formula(), "nothing was destroyed, so nothing to repair");
+        let structured = flat_line(0, 0, 100.0, 8, 8, true);
+        assert!(structured.is_formula());
+    }
+
+    /// A long run in a math face with nothing stacked in it is still not a
+    /// formula. The document that prompted this sets a cipher alphabet —
+    /// twenty-six letters, no structure — in the same face as its equations,
+    /// and a transcription of it could only be worse than the glyphs.
+    #[test]
+    fn a_long_flat_run_in_a_math_face_is_not_a_formula() {
+        assert!(!flat_line(0, 0, 100.0, 26, 26, false).is_formula());
+    }
+
+    /// The spread is measured, not the count of distinct values: two glyphs a
+    /// hundredth of a point apart sit on one baseline however they round.
+    #[test]
+    fn jitter_along_one_baseline_is_not_structure() {
+        let survey = Survey::default();
+        let bbox = BoundingBox { x: 0.0, y: 0.0, width: 100.0, height: 12.0 };
+        let jittered = surveyed_line(
+            &survey,
+            0,
+            0,
+            bbox.clone(),
+            4,
+            &[10.0, 10.0, 10.01, 10.0],
+            &[100.0, 100.02, 100.0, 99.99],
+        );
+        assert!(!jittered.structure_flattened);
+
+        let subscripted = surveyed_line(
+            &survey,
+            0,
+            0,
+            bbox,
+            4,
+            &[10.0, 7.0, 10.0, 7.0],
+            &[100.0, 102.0, 100.0, 102.0],
+        );
+        assert!(subscripted.structure_flattened);
     }
 
     #[test]
@@ -869,6 +1076,7 @@ mod tests {
     fn a_table_claims_its_lines_before_the_formula_rule_sees_them() {
         let survey = Survey {
             math_origins: Vec::new(),
+            faces: BTreeMap::new(),
             rules: vec![
                 rule(100.0, 100.0, 300.0),
                 rule(130.0, 100.0, 300.0),
@@ -886,6 +1094,7 @@ mod tests {
     fn a_region_carries_a_margin_around_what_it_covers() {
         let survey = Survey {
             math_origins: Vec::new(),
+            faces: BTreeMap::new(),
             rules: Vec::new(),
         };
         let lines = vec![line(0, 0, 100.0, 8, 8)];
@@ -982,3 +1191,4 @@ mod tests {
         assert_eq!(diagnostics.typeset_regions_over_budget, 0);
     }
 }
+

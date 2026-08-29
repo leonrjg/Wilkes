@@ -1080,6 +1080,27 @@ document already declares the thing a detector would have to infer:
   0.08 on the sentence above it. Fonts are read with a MuPDF `NativeDevice`,
   since the safe structured-text API exposes a character's box and size but
   not its face.
+
+  *Corrected 2026-08-29, from the reported document.* The first list knew only
+  TeX's and unicode-math's names, and the document that prompted the whole
+  feature sets its mathematics in `DBAMWK+Formula` — a publisher's own face,
+  named for its job, matched by nothing in the list. The reading was unchanged
+  and every count read zero, which is indistinguishable from a document with
+  no mathematics in it. The rule now also matches a family whose name contains
+  `math`, `formula` or `equation`, and the gap it closed is the reason for the
+  face report below.
+- **A line is only read again if flattening destroyed something.** The
+  measurement that settled this: on the reported document, 103 lines pass the
+  font test and only 31 carry a subscript, superscript or stacked term. The
+  other 72 are inline fragments — `mod n`, `p −1`, `12P = 8P + 4P` — that
+  flatten to *themselves*: there is nothing in them to recover, and reading
+  each one costs a recognizer call. A length floor was tried first and is the
+  wrong question in the wrong units; it kept
+  `ETAOINSRHDLUCMFYWGPBVKXQJZ` — a cipher alphabet set in the same face,
+  twenty-six glyphs, nothing to repair and a transcription that could only
+  damage it — and dropped `c = me` at four glyphs. Structure is detected as
+  the spread of the line's glyph sizes and baselines, which is the damage
+  itself rather than a proxy for it.
 - **Tables are found by their rules.** `FZ_STEXT_COLLECT_VECTORS` hands over
   the thin wide rectangles the page filled; three of them sharing a column,
   with text between, is the booktabs shape.
@@ -1093,6 +1114,14 @@ The detector this section specified is therefore not built and is no longer
 planned for this purpose. It remains the answer for what the typography cannot
 declare: an unruled table, and a document that sets its mathematics in a text
 font. Both are out of scope and stated as such in the module.
+
+**A document that yields nothing says why.** The faces a document draws with,
+and which of them were read as mathematics, are reported once per document —
+at info when *none* was, because that is the case a reader needs to see. Before
+this, a document whose mathematics is set in an unrecognized face produced no
+formulas and looked exactly like a document with no mathematics in it; finding
+the difference took a throwaway probe against the file. The face names are the
+evidence and they are only in the PDF, so the log is where they belong.
 
 **Cost is bounded and the bound is reported.** Recognition is tens of seconds
 a region, so inline mathematics is deliberately unreachable — the unit is the
@@ -1158,6 +1187,14 @@ Added 2026-08-29, for typeset routing:
   mode of a threshold set too low is cost — a prose line marked out, read, and
   refused by admission — and of one set too high is a formula left as the
   glyph run it is today. Neither corrupts a reading.
+- **The font list is a list, and a list is not a rule.** `math`, `formula`,
+  `equation` and the TeX families cover what has been seen; a publisher who
+  names its math face for its course code is not covered, and nothing in the
+  file would give it away. The face report is the mitigation and not the fix:
+  it makes the miss visible, and adding a name is then a one-line change made
+  on evidence. What would replace the list is a signal that does not depend on
+  naming at all — the face that is neither the body face nor a weight of it —
+  and that is not built.
 - **The per-document region budget has not been calibrated against a
   mathematics textbook.** The number bounds a wait, and what a reader will
   wait for is the measurement that has not been taken.

@@ -132,6 +132,7 @@ fn read_document(
     let mut discovered: Vec<DiscoveredImage> = Vec::new();
     let mut diagnostics = ExtractionDiagnostics::default();
     let mut pending: Vec<typeset::TypesetRegion> = Vec::new();
+    let mut faces: std::collections::BTreeMap<String, usize> = Default::default();
     for i in 0..page_count as i32 {
         let page = doc.load_page(i)?;
         let height = page.bounds().map(|bounds| bounds.y1 - bounds.y0)?;
@@ -161,9 +162,16 @@ fn read_document(
             &survey,
             &mut lines,
         ));
+        for (name, glyphs) in &survey.faces {
+            *faces.entry(name.clone()).or_default() += glyphs;
+        }
         if route_typeset && !survey.is_empty() {
             pending.extend(typeset::regions((i + 1) as u32, &survey, &lines));
         }
+    }
+
+    if route_typeset {
+        typeset::report_faces(path, &faces);
     }
 
     // Bounded across the document rather than per page: the budget is what a
@@ -534,12 +542,16 @@ fn extract_page_words(
             let mut out = Line::default();
             let mut word_chars = String::new();
             let mut bbox: Option<BoundingBox> = None;
-            // The whole line's extent and glyph count, for the typeset survey.
-            // Taken here rather than from the words because it is the line the
-            // survey measures, and a word box says nothing about the line's
-            // ascender and descender.
+            // The whole line's extent and glyph count, for the typeset survey,
+            // with the size and baseline of each glyph. Taken here rather than
+            // from the words because it is the line the survey measures: a
+            // word box says nothing about the line's ascender and descender,
+            // and a subscript is a property of the run rather than of any word
+            // in it.
             let mut extent: Option<BoundingBox> = None;
             let mut glyphs = 0usize;
+            let mut sizes: Vec<f32> = Vec::new();
+            let mut baselines: Vec<f32> = Vec::new();
 
             for ch in line.chars() {
                 let c = match ch.char() {
@@ -554,6 +566,8 @@ fn extract_page_words(
                 }
 
                 word_chars.push(c);
+                sizes.push(ch.size());
+                baselines.push(ch.origin().y);
 
                 // Derive an axis-aligned rect from the character's bounding quad.
                 let q = ch.quad();
@@ -595,6 +609,8 @@ fn extract_page_words(
                     lines.len(),
                     extent,
                     glyphs,
+                    &sizes,
+                    &baselines,
                 ));
             }
             lines.push(out);
@@ -761,10 +777,22 @@ mod tests {
     /// One page, three lines of text, the middle one set in `CMMI10` — the
     /// Computer Modern math italic a TeX document sets a display equation in.
     /// Hand-built so the signal under test, which font drew which line, is
-    /// visible in the source that asserts about it. The equation is long and
-    /// the page is short, so the region marked out over it is a sliver — which
-    /// is what makes the padding rule reachable from here.
-    const MATH_PDF_BASE64: &str = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA0MDAgMzAwXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNSAwIFIgL0YyIDYgMCBSID4+ID4+ID4+CmVuZG9iago0IDAgb2JqCjw8IC9MZW5ndGggMjIwID4+CnN0cmVhbQpCVCAvRjEgMTEgVGYgMjAgMjUwIFRkICh3aGljaCBpcyBvYnRhaW5lZCBieSBiaXR3aXNlIGFkZGl0aW9uIG9mIGEgYW5kIGIpIFRqIEVUCkJUIC9GMiAxMiBUZiA0MCAyMzAgVGQgKGNpID0gYWkgKyBiaSArIGRpICsgZWkgKyBmaSArIGdpICsgaGkpIFRqIEVUCkJUIC9GMSAxMSBUZiAyMCAyMTAgVGQgKGFuZCB0aGUgZGlzY3Vzc2lvbiBjb250aW51ZXMgYWZ0ZXJ3YXJkcykgVGogRVQKZW5kc3RyZWFtCmVuZG9iago1IDAgb2JqCjw8IC9UeXBlIC9Gb250IC9TdWJ0eXBlIC9UeXBlMSAvQmFzZUZvbnQgL0hlbHZldGljYSA+PgplbmRvYmoKNiAwIG9iago8PCAvVHlwZSAvRm9udCAvU3VidHlwZSAvVHlwZTEgL0Jhc2VGb250IC9DTU1JMTAgPj4KZW5kb2JqCnhyZWYKMCA3CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMDU4IDAwMDAwIG4gCjAwMDAwMDAxMTUgMDAwMDAgbiAKMDAwMDAwMDI1MSAwMDAwMCBuIAowMDAwMDAwNTIxIDAwMDAwIG4gCjAwMDAwMDA1OTEgMDAwMDAgbiAKdHJhaWxlcgo8PCAvU2l6ZSA3IC9Sb290IDEgMCBSID4+CnN0YXJ0eHJlZgo2NTgKJSVFT0YK";
+    /// visible in the source that asserts about it.
+    ///
+    /// The equation is drawn the way a typesetter draws one: base glyphs on
+    /// the baseline at twelve points, subscripts three points lower at eight.
+    /// That structure is what the reading flattens away, and it is what the
+    /// routing rule looks for — a fixture without it would not be a display
+    /// equation and would rightly not be marked out. It is also long against a
+    /// short page, which is what makes the padding rule reachable from here.
+    const MATH_PDF_BASE64: &str = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA0MDAgMzAwXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNSAwIFIgL0YyIDYgMCBSID4+ID4+ID4+CmVuZG9iago0IDAgb2JqCjw8IC9MZW5ndGggMTAwOSA+PgpzdHJlYW0KQlQgL0YxIDExIFRmIDIwIDI1MCBUZCAod2hpY2ggaXMgb2J0YWluZWQgYnkgYml0d2lzZSBhZGRpdGlvbiBvZiBhIGFuZCBiKSBUaiBFVApCVCAvRjIgMTIgVGYgNDAuMCAyMzAuMCBUZCAoYykgVGogRVQKQlQgL0YyIDggVGYgNDcuMCAyMjcuMCBUZCAoaSkgVGogRVQKQlQgL0YyIDEyIFRmIDU0LjAgMjMwLjAgVGQgKD0pIFRqIEVUCkJUIC9GMiAxMiBUZiA2NS4wIDIzMC4wIFRkIChhKSBUaiBFVApCVCAvRjIgOCBUZiA3Mi4wIDIyNy4wIFRkIChpKSBUaiBFVApCVCAvRjIgMTIgVGYgNzkuMCAyMzAuMCBUZCAoKykgVGogRVQKQlQgL0YyIDEyIFRmIDkwLjAgMjMwLjAgVGQgKGIpIFRqIEVUCkJUIC9GMiA4IFRmIDk3LjAgMjI3LjAgVGQgKGkpIFRqIEVUCkJUIC9GMiAxMiBUZiAxMDQuMCAyMzAuMCBUZCAoKykgVGogRVQKQlQgL0YyIDEyIFRmIDExNS4wIDIzMC4wIFRkIChkKSBUaiBFVApCVCAvRjIgOCBUZiAxMjIuMCAyMjcuMCBUZCAoaSkgVGogRVQKQlQgL0YyIDEyIFRmIDEyOS4wIDIzMC4wIFRkICgrKSBUaiBFVApCVCAvRjIgMTIgVGYgMTQwLjAgMjMwLjAgVGQgKGUpIFRqIEVUCkJUIC9GMiA4IFRmIDE0Ny4wIDIyNy4wIFRkIChpKSBUaiBFVApCVCAvRjIgMTIgVGYgMTU0LjAgMjMwLjAgVGQgKCspIFRqIEVUCkJUIC9GMiAxMiBUZiAxNjUuMCAyMzAuMCBUZCAoZikgVGogRVQKQlQgL0YyIDggVGYgMTcyLjAgMjI3LjAgVGQgKGkpIFRqIEVUCkJUIC9GMiAxMiBUZiAxNzkuMCAyMzAuMCBUZCAoKykgVGogRVQKQlQgL0YyIDEyIFRmIDE5MC4wIDIzMC4wIFRkIChnKSBUaiBFVApCVCAvRjIgOCBUZiAxOTcuMCAyMjcuMCBUZCAoaSkgVGogRVQKQlQgL0YyIDEyIFRmIDIwNC4wIDIzMC4wIFRkICgrKSBUaiBFVApCVCAvRjIgMTIgVGYgMjE1LjAgMjMwLjAgVGQgKGgpIFRqIEVUCkJUIC9GMiA4IFRmIDIyMi4wIDIyNy4wIFRkIChpKSBUaiBFVApCVCAvRjEgMTEgVGYgMjAgMjEwIFRkIChhbmQgdGhlIGRpc2N1c3Npb24gY29udGludWVzIGFmdGVyd2FyZHMpIFRqIEVUCmVuZHN0cmVhbQplbmRvYmoKNSAwIG9iago8PCAvVHlwZSAvRm9udCAvU3VidHlwZSAvVHlwZTEgL0Jhc2VGb250IC9IZWx2ZXRpY2EgPj4KZW5kb2JqCjYgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvQ01NSTEwID4+CmVuZG9iagp4cmVmCjAgNwowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1OCAwMDAwMCBuIAowMDAwMDAwMTE1IDAwMDAwIG4gCjAwMDAwMDAyNTEgMDAwMDAgbiAKMDAwMDAwMTMxMSAwMDAwMCBuIAowMDAwMDAxMzgxIDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNyAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKMTQ0OAolJUVPRgo=";
+
+    /// What `MATH_PDF_BASE64`'s equation reads as when nothing routes it: the
+    /// subscripts flattened into the line, their size and offset gone, and
+    /// the word spacing left over from where they sat. Not mathematics, and
+    /// not something a consumer can parse back into any — which is the whole
+    /// reason for the feature these tests cover.
+    const FLATTENED_EQUATION: &str = "c i = a i + bi + di + e i + f i + gi + hi";
 
     fn write_pdf(dir: &std::path::Path, name: &str, base64: &str) -> std::path::PathBuf {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -1302,7 +1330,7 @@ mod tests {
             content.text
         );
         assert!(
-            !content.text.contains("ci = ai"),
+            !content.text.contains(FLATTENED_EQUATION),
             "the glyph run the page drew has left the reading: {:?}",
             content.text
         );
@@ -1403,7 +1431,7 @@ mod tests {
         let content = backend.extract(&path).expect("extracts");
 
         assert!(
-            content.text.contains("ci = ai"),
+            content.text.contains(FLATTENED_EQUATION),
             "the glyph run is still the reading: {:?}",
             content.text
         );
@@ -1418,7 +1446,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_pdf(dir.path(), "math.pdf", MATH_PDF_BASE64);
         let content = MuPdfBackend::default().extract(&path).expect("extracts");
-        assert!(content.text.contains("ci = ai"));
+        assert!(content.text.contains(FLATTENED_EQUATION));
         assert!(content.images.is_empty());
 
         let diagnostics = MuPdfBackend::default()
