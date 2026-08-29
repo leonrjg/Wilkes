@@ -191,6 +191,91 @@ mod tests {
         assert!(decode_request_image(&request).is_err());
     }
 
+    /// The whole chain against the real recognizer: spawn the worker binary,
+    /// load 1.9 GB of weights in it, recognize an image, read the regions
+    /// back. Everything else in this file is mocked on one side or the other,
+    /// so this is the only test that would catch a role that routes to the
+    /// wrong process, a mode the worker does not serve, or a payload it
+    /// cannot decode.
+    ///
+    /// Ignored by default: it needs the weights on disk and takes minutes.
+    ///
+    /// ```text
+    /// cargo build -p wilkes-rust-worker
+    /// WILKES_MODEL_DIR="$HOME/Library/Application Support/app.wilkes/models"     ///   cargo test -p wilkes-core --lib worker_ocr -- --ignored --nocapture
+    /// ```
+    ///
+    /// A blank image is deliberate. This asserts the hop, not the reading:
+    /// "no text in it" is a correct answer and an empty region list is a
+    /// success, while an error means the chain is broken.
+    #[tokio::test]
+    #[ignore = "needs the installed recognizer; minutes"]
+    #[cfg(feature = "candle")]
+    async fn the_real_recognizer_answers_over_the_worker_protocol() {
+        let model_dir = std::path::PathBuf::from(
+            std::env::var("WILKES_MODEL_DIR").expect("WILKES_MODEL_DIR must name the model cache"),
+        );
+        let worker_bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug/wilkes-rust-worker");
+        assert!(
+            worker_bin.exists(),
+            "build it first: cargo build -p wilkes-rust-worker ({})",
+            worker_bin.display()
+        );
+
+        let (manager, _events, loop_fut) =
+            crate::worker::manager::WorkerManager::new(crate::worker::manager::WorkerPaths {
+                python_path: std::path::PathBuf::new(),
+                python_package_dir: std::path::PathBuf::new(),
+                requirements_path: std::path::PathBuf::new(),
+                venv_dir: std::path::PathBuf::new(),
+                worker_bin,
+                data_dir: model_dir.clone(),
+            });
+        tokio::spawn(loop_fut);
+
+        let engine = RecognitionEngine::default();
+        let model_id = dispatch::shipped_model_id(engine);
+        assert!(
+            dispatch::installed(engine, model_id, &model_dir).unwrap(),
+            "the recognizer is not installed under {}",
+            model_dir.display()
+        );
+
+        let recognizer = attach(manager, engine, model_id, model_dir, "auto").unwrap();
+        let identity = recognizer.identity();
+        assert!(identity.contains(model_id), "{identity}");
+
+        // A page with a known label on it, rasterized — so an empty answer is
+        // a failure of the chain rather than an honest reading of a blank
+        // image. The corpus builder is reused rather than a fixture invented
+        // here: it is what the accuracy harness draws with.
+        let page = crate::extract::image::corpus::PageSpec::default()
+            .with_text(20.0, 150.0, "Knowledge base");
+        let pdf = crate::extract::image::corpus::build_pdf(vec![page]);
+        let image = crate::extract::image::corpus::render_page(&pdf, 0, 4.0);
+
+        let started = std::time::Instant::now();
+        let regions = tokio::task::spawn_blocking(move || recognizer.spot(&image))
+            .await
+            .unwrap()
+            .expect("the recognizer should answer");
+        let read = regions
+            .iter()
+            .map(|region| region.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "recognized in {:.1}s: {} region(s): {read}",
+            started.elapsed().as_secs_f32(),
+            regions.len()
+        );
+        assert!(
+            read.to_lowercase().contains("knowledge"),
+            "the label did not survive the hop; read {read:?}"
+        );
+    }
+
     /// Regions are the whole reply, and they cross as ordinary JSON so a
     /// recognizer written in another language can produce them.
     #[test]
