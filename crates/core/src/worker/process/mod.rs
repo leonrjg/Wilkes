@@ -4,6 +4,7 @@ use std::time::Duration;
 use super::ipc::{WorkerEvent, WorkerRequest, WorkerRole};
 use super::manager::WorkerPaths;
 use super::python_env::setup_python_env;
+use crate::extract::image::dispatch::RecognitionEngine;
 use crate::types::EmbeddingEngine;
 
 #[cfg(unix)]
@@ -49,7 +50,11 @@ pub(super) async fn build_command_plan(
     req: &WorkerRequest,
 ) -> Result<ProcessCommandPlan, String> {
     Ok(match req.role {
-        // SBERT is the only role that runs outside the Rust worker binary.
+        // SBERT is the only engine that runs outside the Rust worker binary
+        // today. The recognition arm below is spelled out rather than left to
+        // the fallthrough so that adding a recognition engine — a Python one,
+        // served by the same sidecar — fails to compile here until someone
+        // decides which process it belongs in.
         WorkerRole::Embed(EmbeddingEngine::SBERT) => {
             let python = setup_python_env(paths).await?;
             let cache_root = paths.data_dir.join("huggingface");
@@ -74,6 +79,9 @@ pub(super) async fn build_command_plan(
                 xdg_cache_root,
             }
         }
+        WorkerRole::Recognize(RecognitionEngine::Candle) => ProcessCommandPlan::WorkerBin {
+            worker_bin: paths.worker_bin.clone(),
+        },
         _ => ProcessCommandPlan::WorkerBin {
             worker_bin: paths.worker_bin.clone(),
         },
@@ -229,6 +237,7 @@ exit 0
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -291,6 +300,7 @@ echo '"Done"'
             device: "cpu".to_string(),
             texts: None,
             generate: None,
+            recognize: None,
         };
         let req_json = serde_json::to_string(&req).unwrap();
 
@@ -347,6 +357,7 @@ echo '"Done"'
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -387,6 +398,7 @@ echo '"Done"'
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -434,6 +446,7 @@ exit 0
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -474,6 +487,7 @@ exit 0
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -511,6 +525,7 @@ exit 0
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -581,6 +596,7 @@ exit 0
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
         };
 
         let active_pid = AtomicU32::new(0);

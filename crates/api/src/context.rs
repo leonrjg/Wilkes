@@ -1017,6 +1017,9 @@ pub struct AppContext {
     /// alternation, because the worker caches exactly one model and restarts on
     /// role change.
     pub generate_manager: WorkerManager,
+    /// The worker that recognizes the text drawn inside images. Its own, for
+    /// the reason `new` gives.
+    pub recognize_manager: WorkerManager,
     generator: PLMutex<Option<Arc<dyn Generator>>>,
     /// Serialises `load_generator`, so two settings changes cannot download and
     /// attach concurrently.
@@ -1093,7 +1096,14 @@ impl AppContext {
         impl std::future::Future<Output = ()> + Send,
     ) {
         let (worker_manager, event_rx, loop_fut) = WorkerManager::new(paths.clone());
-        let (generate_manager, generate_event_rx, generate_loop_fut) = WorkerManager::new(paths);
+        let (generate_manager, generate_event_rx, generate_loop_fut) =
+            WorkerManager::new(paths.clone());
+        // A third, because a manager holds one worker and a worker serves one
+        // role: a build alternates recognition and embedding file by file, and
+        // sharing a manager between them would restart and reload a model on
+        // every alternation.
+        let (recognize_manager, recognize_event_rx, recognize_loop_fut) =
+            WorkerManager::new(paths);
         let bookmarks_path = data_dir.join("bookmarks.json");
         let model_dir = shared_data_dir.join("models");
         let ctx = Arc::new(Self {
@@ -1113,6 +1123,7 @@ impl AppContext {
             shutting_down: AtomicBool::new(false),
             worker_manager,
             generate_manager,
+            recognize_manager,
             generator: PLMutex::new(None),
             generator_load_lock: tokio::sync::Mutex::new(()),
             image_analyzer_load_lock: tokio::sync::Mutex::new(()),
@@ -1143,8 +1154,10 @@ impl AppContext {
             tokio::join!(
                 loop_fut,
                 generate_loop_fut,
+                recognize_loop_fut,
                 forward_manager_events(event_rx, merged_tx.clone()),
-                forward_manager_events(generate_event_rx, merged_tx),
+                forward_manager_events(generate_event_rx, merged_tx.clone()),
+                forward_manager_events(recognize_event_rx, merged_tx),
             );
         };
         (ctx, merged_rx, combined)
@@ -4555,25 +4568,23 @@ impl AppContext {
     /// Build the analyzer the settings describe and install it for the whole
     /// process.
     ///
-    /// Loading is 1.9 GB read into memory, so it is serialized against itself
-    /// and run off the async executor. A failure detaches rather than leaving
-    /// the previous analyzer in place: the settings no longer describe it, and
-    /// silently enriching under the old recipe is the one outcome that would
-    /// put two answers into one index.
+    /// No longer expensive and no longer off the executor: the weights live in
+    /// the recognition worker, and what is assembled here is the address of
+    /// one plus the annotation cache. Still serialized against itself, because
+    /// two edits in flight could otherwise install the older one's analyzer.
+    /// A failure detaches rather than leaving the previous analyzer in place:
+    /// the settings no longer describe it, and silently enriching under the
+    /// old recipe is the one outcome that would put two answers into one index.
     pub async fn load_image_analyzer(self: &Arc<Self>) -> anyhow::Result<bool> {
         let _serialized = self.image_analyzer_load_lock.lock().await;
         let settings = self.get_settings().await;
-        let model_dir = self.model_dir.clone();
-        let cache_dir = self.shared_data_dir.clone();
-        let built = tokio::task::spawn_blocking(move || {
-            wilkes_core::extract::image::build_analyzer(
-                &model_dir,
-                &cache_dir,
-                &settings.image_analysis,
-                &settings.generation.ollama_url,
-            )
-        })
-        .await?;
+        let built = wilkes_core::extract::image::build_analyzer(
+            self.recognize_manager.clone(),
+            &self.model_dir,
+            &self.shared_data_dir,
+            &settings.image_analysis,
+            &settings.generation.ollama_url,
+        );
         match built {
             Ok(analyzer) => {
                 let attached = analyzer.is_some();
@@ -6659,7 +6670,11 @@ impl AppContext {
     /// Status of every worker. Two processes can die independently, so a single
     /// status would misreport a dead generation worker as healthy.
     pub fn get_worker_statuses(&self) -> Vec<WorkerStatus> {
-        vec![self.worker_manager.status(), self.generate_manager.status()]
+        vec![
+            self.worker_manager.status(),
+            self.generate_manager.status(),
+            self.recognize_manager.status(),
+        ]
     }
 
     /// The embedding worker's status. Kept for callers that only care about
@@ -6674,6 +6689,7 @@ impl AppContext {
 
     pub fn kill_generation_worker(&self) {
         self.generate_manager.request_shutdown();
+        self.recognize_manager.request_shutdown();
     }
 
     /// Shut down every worker. A missed one leaks a multi-gigabyte process past

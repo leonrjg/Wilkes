@@ -175,6 +175,21 @@ pub const CHECKPOINTS: &[Checkpoint] = &[CHECKPOINT_1_5, CHECKPOINT_1_6];
 /// measurement is not evidence that they do.
 pub const SHIPPED_CHECKPOINT: Checkpoint = CHECKPOINT_1_6;
 
+/// The recipe string a recognizer of this checkpoint reads documents under.
+///
+/// A free function on the checkpoint rather than a method on a loaded model,
+/// because it is derived entirely from constants and the process that needs it
+/// is not always the process holding the weights. Recognition runs in a worker
+/// subprocess; the extraction recipe is decided by the host. Deriving the
+/// identity from the same checkpoint the worker is told to load is what keeps
+/// those two from disagreeing without a round trip to ask.
+pub fn identity_of(checkpoint: &Checkpoint) -> String {
+    format!(
+        "candle-transformers-0.11+{}+{}+{}+admit-{ADMISSION_THRESHOLD}",
+        checkpoint.name, checkpoint.weights.sha256, EXTRACTION_SETTINGS_VERSION,
+    )
+}
+
 // ── The license and provenance inventory ─────────────────────────────────────
 
 /// One file of a checkpoint, as an inventory names it.
@@ -741,10 +756,7 @@ fn greedy(logits: &Tensor) -> anyhow::Result<(u32, f32)> {
 
 impl OcrEngine for PaddleOcrVl {
     fn identity(&self) -> String {
-        format!(
-            "candle-transformers-0.11+{}+{}+{}+admit-{ADMISSION_THRESHOLD}",
-            self.checkpoint.name, self.checkpoint.weights.sha256, EXTRACTION_SETTINGS_VERSION,
-        )
+        identity_of(&self.checkpoint)
     }
 
     fn admission_threshold(&self) -> f32 {

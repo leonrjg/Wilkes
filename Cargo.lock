@@ -8720,6 +8720,8 @@ name = "wilkes-rust-worker"
 version = "0.9.5"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "image",
  "serde_json",
  "tempfile",
  "tokio",

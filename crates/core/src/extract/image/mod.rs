@@ -16,6 +16,8 @@ pub mod cache;
 #[cfg(test)]
 mod corpus;
 pub mod describe;
+/// What recognizers exist and how one is addressed, engine by engine.
+pub mod dispatch;
 pub mod ocr;
 /// The external door for description: whatever the user has pulled into
 /// Ollama, asked with the same prompt as the first-class path.
@@ -26,6 +28,8 @@ pub mod ollama;
 #[cfg(feature = "candle")]
 pub mod paddleocr_vl;
 pub mod serialize;
+/// The recognizer as the host addresses it, over the worker protocol.
+pub mod worker_ocr;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -41,6 +45,21 @@ use crate::types::{
 
 use describe::FigureDescriber;
 use ocr::OcrEngine;
+
+/// One image handed to a recognizer, as it travels between processes.
+///
+/// The pixels go as a base64 PNG rather than as an array of numbers, and the
+/// reply is a list of regions with fractional coordinates. Both halves are
+/// ordinary JSON that any language can produce: recognition is addressed by
+/// this protocol rather than by a Rust trait object precisely so the engine
+/// serving it need not be Rust, and a payload of raw f32s would have made that
+/// a fiction. PNG because it is lossless — a recognizer reading small type off
+/// a diagram is exactly the reader that a lossy re-encode fails.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RecognitionRequest {
+    /// One image, PNG-encoded, then base64.
+    pub image_png_base64: String,
+}
 
 /// The decoded pixels of one native image block, held only for as long as
 /// analysis needs them.
@@ -226,13 +245,16 @@ pub fn configured() -> Option<Arc<dyn ImageAnalyzer>> {
 /// Build the analyzer the settings describe, or `None` when they describe
 /// none.
 ///
-/// Loading the recognizer is the expensive part — 1.9 GB read into memory —
-/// so this is not something to call on a settings read. It is called when the
-/// configuration changes, and its result is what [`configure`] installs.
+/// Cheap, and deliberately so: it resolves names and opens a cache, and loads
+/// nothing. The 1.9 GB is loaded by the worker, on its first image, and stays
+/// resident there — so attaching an analyzer no longer costs the host a model
+/// load, and a fault while recognizing no longer costs it the application.
 ///
-/// A recognizer that is enabled but not installed is an error, not a silent
-/// disable: the user asked for enrichment, and a reading that quietly omits
-/// it would be indistinguishable from one that found no text.
+/// A recognizer that is enabled but that this build does not ship is an error,
+/// not a silent disable: the user asked for enrichment, and a reading that
+/// quietly omits it is indistinguishable from one that found no text. Whether
+/// the weights are actually on disk is a separate question, answered by
+/// [`recognizer_installed`] before the toggle is offered.
 ///
 /// `model_dir` is the installation's model cache; `cache_dir` is where the
 /// annotation cache lives. Two parameters because they are two directories:
@@ -240,6 +262,7 @@ pub fn configured() -> Option<Arc<dyn ImageAnalyzer>> {
 /// filing them under the cache root would put them inside what a model
 /// uninstall removes.
 pub fn build_analyzer(
+    recognizers: crate::worker::manager::WorkerManager,
     model_dir: &std::path::Path,
     cache_dir: &std::path::Path,
     settings: &crate::types::ImageAnalysisSettings,
@@ -248,19 +271,27 @@ pub fn build_analyzer(
     if !settings.enabled {
         return Ok(None);
     }
-    let recognizer = paddleocr_vl::PaddleOcrVl::load(
-        model_dir,
-        paddleocr_vl::SHIPPED_CHECKPOINT,
+    let engine = dispatch::RecognitionEngine::default();
+    let model_id = dispatch::shipped_model_id(engine);
+    anyhow::ensure!(
+        dispatch::installed(engine, model_id, model_dir)?,
+        "the '{model_id}' recognizer is enabled but not installed"
+    );
+    let recognizer = worker_ocr::attach(
+        recognizers,
+        engine,
+        model_id,
+        model_dir.to_path_buf(),
         settings.device.as_deref().unwrap_or("auto"),
     )
-    .context("could not load the image recognizer")?;
+    .context("could not address the image recognizer")?;
 
     let describer: Option<Box<dyn FigureDescriber>> = match settings.describer_model.trim() {
         "" => None,
         model => Some(Box::new(ollama::OllamaDescriber::new(ollama_url, model)?)),
     };
 
-    let analyzer = NativeImageAnalyzer::new(Box::new(recognizer), describer)
+    let analyzer = NativeImageAnalyzer::new(recognizer, describer)
         .with_cache(cache::AnnotationCache::open(cache_dir)?);
     Ok(Some(Arc::new(analyzer)))
 }
@@ -674,6 +705,22 @@ mod tests {
         configure(restore);
     }
 
+    /// A manager for the two tests below, neither of which reaches the
+    /// worker: one returns before addressing a recognizer and the other fails
+    /// the installed check first.
+    #[cfg(feature = "candle")]
+    fn test_manager() -> crate::worker::manager::WorkerManager {
+        crate::worker::manager::WorkerManager::new(crate::worker::manager::WorkerPaths {
+            python_path: std::path::PathBuf::new(),
+            python_package_dir: std::path::PathBuf::new(),
+            requirements_path: std::path::PathBuf::new(),
+            venv_dir: std::path::PathBuf::new(),
+            worker_bin: std::path::PathBuf::new(),
+            data_dir: std::path::PathBuf::new(),
+        })
+        .0
+    }
+
     /// Disabled is answered without touching the disk: the settings say no
     /// enrichment, and loading a recognizer to discover that would make
     /// turning the feature off cost what turning it on costs.
@@ -681,6 +728,7 @@ mod tests {
     #[cfg(feature = "candle")]
     fn settings_that_ask_for_nothing_build_nothing() {
         let built = build_analyzer(
+            test_manager(),
             std::path::Path::new("/nonexistent"),
             std::path::Path::new("/nonexistent"),
             &crate::types::ImageAnalysisSettings::default(),
@@ -698,6 +746,7 @@ mod tests {
     fn enabled_without_the_recognizer_is_an_error_and_not_a_silent_disable() {
         let dir = tempfile::tempdir().expect("a temporary data directory");
         let Err(error) = build_analyzer(
+            test_manager(),
             dir.path(),
             dir.path(),
             &crate::types::ImageAnalysisSettings {

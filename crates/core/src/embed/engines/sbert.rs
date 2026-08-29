@@ -165,6 +165,7 @@ impl EmbedderInstaller for SBERTInstaller {
             device: self.device.clone(),
             texts: None,
             generate: None,
+            recognize: None,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);

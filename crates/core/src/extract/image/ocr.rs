@@ -24,7 +24,7 @@ pub const LOC_MAX: u16 = 1000;
 
 /// One region as the model emitted it: text, an admission signal, and a
 /// quadrilateral in fractions of the image, before any of Wilkes' geometry.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SpottedRegion {
     pub text: String,
     /// Mean probability of the tokens that spell `text`, from the decode's own

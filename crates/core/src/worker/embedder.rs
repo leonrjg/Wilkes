@@ -57,6 +57,7 @@ impl WorkerEmbedder {
             device: self.device.clone(),
             texts: Some(texts.iter().map(|s| s.to_string()).collect()),
             generate: None,
+            recognize: None,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);

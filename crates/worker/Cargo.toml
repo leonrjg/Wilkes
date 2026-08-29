@@ -13,6 +13,8 @@ fastembed-coreml = ["wilkes-core/fastembed-coreml"]
 [dependencies]
 wilkes-core = { path = "../core" }
 anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

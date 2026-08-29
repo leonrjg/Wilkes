@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use wilkes_core::embed::dispatch;
+use wilkes_core::extract::image::dispatch as recognize_dispatch;
+use wilkes_core::extract::image::ocr::OcrEngine;
+use wilkes_core::extract::image::worker_ocr;
 use wilkes_core::generate::engines::dispatch as generate_dispatch;
 use wilkes_core::generate::{Generated, Generator};
 use wilkes_core::models::progress::EmbedProgress;
@@ -40,6 +43,7 @@ impl LoadedModelKey {
 enum LoadedPayload {
     Embedder(Arc<dyn wilkes_core::embed::Embedder>),
     Generator(Arc<dyn Generator>),
+    Recognizer(Arc<dyn OcrEngine>),
 }
 
 struct LoadedModel {
@@ -52,18 +56,31 @@ impl LoadedModel {
     fn embedder(&self) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
         match &self.payload {
             LoadedPayload::Embedder(embedder) => Ok(Arc::clone(embedder)),
-            LoadedPayload::Generator(_) => {
-                anyhow::bail!("worker holds a generator but received an embedding request")
-            }
+            other => anyhow::bail!("worker holds {} but received an embedding request", other.what()),
         }
     }
 
     fn generator(&self) -> anyhow::Result<Arc<dyn Generator>> {
         match &self.payload {
             LoadedPayload::Generator(generator) => Ok(Arc::clone(generator)),
-            LoadedPayload::Embedder(_) => {
-                anyhow::bail!("worker holds an embedder but received a generation request")
-            }
+            other => anyhow::bail!("worker holds {} but received a generation request", other.what()),
+        }
+    }
+
+    fn recognizer(&self) -> anyhow::Result<Arc<dyn OcrEngine>> {
+        match &self.payload {
+            LoadedPayload::Recognizer(recognizer) => Ok(Arc::clone(recognizer)),
+            other => anyhow::bail!("worker holds {} but received a recognition request", other.what()),
+        }
+    }
+}
+
+impl LoadedPayload {
+    fn what(&self) -> &'static str {
+        match self {
+            LoadedPayload::Embedder(_) => "an embedder",
+            LoadedPayload::Generator(_) => "a generator",
+            LoadedPayload::Recognizer(_) => "a recognizer",
         }
     }
 }
@@ -81,6 +98,7 @@ enum WorkerLoopAction {
 #[derive(Debug, PartialEq, Eq)]
 enum WorkerRequestKind {
     Embed,
+    Recognize,
     Info,
     Generate,
     Unknown(String),
@@ -130,6 +148,23 @@ impl ModelLoader for RealModelLoader {
                     key: key.clone(),
                     payload: LoadedPayload::Embedder(prepared.embedder),
                     background_task: prepared.background_task,
+                })
+            }
+            WorkerRole::Recognize(engine) => {
+                // Loaded here and kept in the slot: a document is dozens of
+                // images, and reloading 1.9 GB for each of them would cost
+                // more than recognizing them.
+                let recognizer: Arc<dyn OcrEngine> = recognize_dispatch::load_recognizer_local(
+                    engine,
+                    &key.model,
+                    &key.model_dir,
+                    &key.device,
+                )?
+                .into();
+                Ok(LoadedModel {
+                    key: key.clone(),
+                    payload: LoadedPayload::Recognizer(recognizer),
+                    background_task: None,
                 })
             }
             WorkerRole::Generate(engine) => {
@@ -203,6 +238,7 @@ fn classify_input_line(line: &str) -> WorkerLoopAction {
 fn classify_worker_request(req: &WorkerRequest) -> WorkerRequestKind {
     match req.mode.as_str() {
         "embed" => WorkerRequestKind::Embed,
+        "recognize" => WorkerRequestKind::Recognize,
         "info" => WorkerRequestKind::Info,
         "generate" => WorkerRequestKind::Generate,
         other => WorkerRequestKind::Unknown(other.to_string()),
@@ -296,6 +332,9 @@ async fn handle_worker_request(
         WorkerRequestKind::Embed => {
             handle_embed_plan(req, active_model, event_tx, loader).await?;
         }
+        WorkerRequestKind::Recognize => {
+            handle_recognize_plan(req, active_model, event_tx, loader).await?;
+        }
         WorkerRequestKind::Info => {
             handle_info_plan(req, active_model, event_tx, loader).await?;
         }
@@ -305,6 +344,59 @@ async fn handle_worker_request(
         WorkerRequestKind::Unknown(other) => {
             let _ = event_tx
                 .send(WorkerEvent::Error(format!("Unknown mode: {other}")))
+                .await;
+        }
+    }
+    Ok(())
+}
+
+/// Recognize the text drawn in one image.
+///
+/// One image per request, because that is the unit the host analyzes and the
+/// unit it caches. Batching them would mean holding a document's artwork in
+/// two processes to save a round trip that is already dwarfed by the
+/// recognition it carries.
+async fn handle_recognize_plan(
+    req: WorkerRequest,
+    active_model: &mut Option<LoadedModel>,
+    event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
+    loader: &impl ModelLoader,
+) -> anyhow::Result<()> {
+    let Some(payload) = req.recognize.clone() else {
+        let _ = event_tx
+            .send(WorkerEvent::Error(
+                "recognize request carries no image".to_string(),
+            ))
+            .await;
+        return Ok(());
+    };
+    let image = match worker_ocr::decode_request_image(&payload) {
+        Ok(image) => image,
+        Err(error) => {
+            let _ = event_tx
+                .send(WorkerEvent::Error(format!("{error:#}")))
+                .await;
+            return Ok(());
+        }
+    };
+
+    let recognizer = get_or_load(active_model, &req, loader, Some(&event_tx))
+        .await?
+        .recognizer()?;
+
+    // Off the async executor: this is seconds to minutes of inference, and
+    // leaving it on the runtime would stall the cancel signal with it.
+    let spotted =
+        tokio::task::spawn_blocking(move || recognizer.spot(&image)).await?;
+
+    match spotted {
+        Ok(regions) => {
+            let _ = event_tx.send(WorkerEvent::Regions(regions)).await;
+            let _ = event_tx.send(WorkerEvent::Done).await;
+        }
+        Err(error) => {
+            let _ = event_tx
+                .send(WorkerEvent::Error(format!("recognition failed: {error:#}")))
                 .await;
         }
     }
@@ -493,12 +585,39 @@ mod tests {
                         "Cache invalidation strategy",
                     ])))
                 }
+                WorkerRole::Recognize(_) => {
+                    LoadedPayload::Recognizer(Arc::new(MockRecognizer))
+                }
             };
             Ok(LoadedModel {
                 key: key.clone(),
                 payload,
                 background_task: None,
             })
+        }
+    }
+
+    /// Returns one region whose text names the image it was given, so a test
+    /// can tell a real round trip from a canned reply.
+    struct MockRecognizer;
+
+    impl OcrEngine for MockRecognizer {
+        fn identity(&self) -> String {
+            "mock-recognizer".to_string()
+        }
+        fn admission_threshold(&self) -> f32 {
+            0.5
+        }
+        fn spot(
+            &self,
+            image: &image::RgbImage,
+        ) -> anyhow::Result<Vec<wilkes_core::extract::image::ocr::SpottedRegion>> {
+            let corner = wilkes_core::types::Point { x: 0.0, y: 0.0 };
+            Ok(vec![wilkes_core::extract::image::ocr::SpottedRegion {
+                text: format!("{}x{}", image.width(), image.height()),
+                confidence: 0.9,
+                quad: [corner; 4],
+            }])
         }
     }
 
@@ -523,6 +642,7 @@ mod tests {
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
         }
     }
 
@@ -843,6 +963,68 @@ mod tests {
         );
 
         handle_worker_request(req, &mut active, tx, &FailLoader, &no_cancel())
+            .await
+            .unwrap();
+
+        assert!(matches!(rx.recv().await.unwrap(), WorkerEvent::Error(_)));
+    }
+
+    /// The whole hop, in one test: the host's encoding, the worker's decode,
+    /// the recognizer, and the regions coming back over the event channel.
+    #[tokio::test]
+    async fn a_recognize_request_returns_the_regions_of_the_image_it_carried() {
+        let dir = tempdir().unwrap();
+        let mut active = None;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(11, 5))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mut req = request(
+            "recognize",
+            WorkerRole::Recognize(
+                wilkes_core::extract::image::dispatch::RecognitionEngine::Candle,
+            ),
+            dir.path().to_path_buf(),
+        );
+        req.recognize = Some(wilkes_core::extract::image::RecognitionRequest {
+            image_png_base64: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                png.into_inner(),
+            ),
+        });
+
+        handle_worker_request(req, &mut active, tx, &SuccessLoader, &no_cancel())
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap() {
+            WorkerEvent::Regions(regions) => {
+                assert_eq!(regions.len(), 1);
+                // The recognizer reports the dimensions it was handed, so this
+                // is the host's image and not a canned reply.
+                assert_eq!(regions[0].text, "11x5");
+            }
+            other => panic!("expected Regions, got {other:?}"),
+        }
+        assert!(matches!(rx.recv().await.unwrap(), WorkerEvent::Done));
+    }
+
+    #[tokio::test]
+    async fn a_recognize_request_without_an_image_reports_an_error() {
+        let dir = tempdir().unwrap();
+        let mut active = None;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let req = request(
+            "recognize",
+            WorkerRole::Recognize(
+                wilkes_core::extract::image::dispatch::RecognitionEngine::Candle,
+            ),
+            dir.path().to_path_buf(),
+        );
+
+        handle_worker_request(req, &mut active, tx, &SuccessLoader, &no_cancel())
             .await
             .unwrap();
 

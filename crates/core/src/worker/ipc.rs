@@ -3,6 +3,9 @@ use std::path::PathBuf;
 use crate::generate::{
     GenerationEngine, GenerationRequest, GenerationRuntime, GenerationTimings, StopReason,
 };
+use crate::extract::image::dispatch::RecognitionEngine;
+use crate::extract::image::ocr::SpottedRegion;
+use crate::extract::image::RecognitionRequest;
 use crate::models::progress::EmbedProgress;
 use crate::types::EmbeddingEngine;
 
@@ -13,6 +16,7 @@ use crate::types::EmbeddingEngine;
 pub enum WorkerRole {
     Embed(EmbeddingEngine),
     Generate(GenerationEngine),
+    Recognize(RecognitionEngine),
 }
 
 impl WorkerRole {
@@ -20,6 +24,7 @@ impl WorkerRole {
         match self {
             WorkerRole::Embed(_) => "embed",
             WorkerRole::Generate(_) => "generate",
+            WorkerRole::Recognize(_) => "recognize",
         }
     }
 
@@ -28,13 +33,14 @@ impl WorkerRole {
         match self {
             WorkerRole::Embed(engine) => engine.as_str(),
             WorkerRole::Generate(engine) => engine.as_str(),
+            WorkerRole::Recognize(engine) => engine.as_str(),
         }
     }
 
     pub fn embedding_engine(&self) -> Option<EmbeddingEngine> {
         match self {
             WorkerRole::Embed(engine) => Some(*engine),
-            WorkerRole::Generate(_) => None,
+            WorkerRole::Generate(_) | WorkerRole::Recognize(_) => None,
         }
     }
 }
@@ -43,6 +49,7 @@ impl WorkerRole {
 enum TaggedRole {
     Embed(EmbeddingEngine),
     Generate(GenerationEngine),
+    Recognize(RecognitionEngine),
 }
 
 /// Accepts both the tagged form this version writes and the bare engine string
@@ -60,6 +67,7 @@ impl serde::Serialize for WorkerRole {
         let tagged = match self {
             WorkerRole::Embed(engine) => TaggedRole::Embed(*engine),
             WorkerRole::Generate(engine) => TaggedRole::Generate(*engine),
+            WorkerRole::Recognize(engine) => TaggedRole::Recognize(*engine),
         };
         tagged.serialize(serializer)
     }
@@ -70,6 +78,7 @@ impl<'de> serde::Deserialize<'de> for WorkerRole {
         Ok(match RoleRepr::deserialize(deserializer)? {
             RoleRepr::Tagged(TaggedRole::Embed(engine)) => WorkerRole::Embed(engine),
             RoleRepr::Tagged(TaggedRole::Generate(engine)) => WorkerRole::Generate(engine),
+            RoleRepr::Tagged(TaggedRole::Recognize(engine)) => WorkerRole::Recognize(engine),
             RoleRepr::Legacy(engine) => WorkerRole::Embed(engine),
         })
     }
@@ -108,6 +117,9 @@ pub struct WorkerRequest {
     /// Used by "generate" mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generate: Option<GenerationRequest>,
+    /// Used by "recognize" mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recognize: Option<RecognitionRequest>,
 }
 
 fn default_mode() -> String {
@@ -151,6 +163,14 @@ pub enum WorkerEvent {
     /// Carries no text: the text is the concatenation of the `Token` events,
     /// and a second copy would only invite the two to disagree.
     Completion { tokens: usize, stop: StopReason },
+    /// Every text region one image was found to carry. Emitted for
+    /// "recognize" mode, before its terminal event.
+    ///
+    /// Regions only: where they land on the page, whether they clear the
+    /// admission threshold and whether the document already draws them as
+    /// glyphs are all decided by the host, because they are extraction rather
+    /// than inference and the host is what owns the extraction recipe.
+    Regions(Vec<SpottedRegion>),
     /// Index build completed successfully.
     Done,
     /// Index build failed.
@@ -183,6 +203,7 @@ mod tests {
             device: "cpu".to_string(),
             texts: None,
             generate: None,
+            recognize: None,
         }
     }
 

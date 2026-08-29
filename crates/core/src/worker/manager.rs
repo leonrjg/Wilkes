@@ -385,6 +385,7 @@ mod tests {
             device: "cpu".to_string(),
             texts: None,
             generate: None,
+            recognize: None,
         });
 
         manager
@@ -444,6 +445,7 @@ mod tests {
             device: "cpu".to_string(),
             texts: None,
             generate: None,
+            recognize: None,
         });
 
         manager

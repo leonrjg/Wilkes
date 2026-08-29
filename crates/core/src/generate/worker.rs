@@ -52,6 +52,7 @@ impl WorkerGenerator {
             device: self.device.clone(),
             texts: None,
             generate: Some(req),
+            recognize: None,
         }
     }
 }

@@ -682,6 +682,7 @@ mod tests {
             device: "cpu".to_string(),
             texts: None,
             generate: None,
+            recognize: None,
             mode: "generate".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -800,6 +801,7 @@ mod tests {
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -844,6 +846,7 @@ mod tests {
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -933,6 +936,7 @@ mod tests {
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -956,6 +960,7 @@ mod tests {
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -977,6 +982,7 @@ mod tests {
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1007,6 +1013,7 @@ mod tests {
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1065,6 +1072,7 @@ mod tests {
             device: "cpu".to_string(),
             texts: Some(vec!["hello".to_string()]),
             generate: None,
+            recognize: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
