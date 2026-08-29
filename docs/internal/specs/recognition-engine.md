@@ -475,6 +475,18 @@ exist, which is not.
   kinds without naming the configuration alongside. The `ort` pin is the other
   shared surface — §5.6 moves it to rc.13 and FIGURE.md's routing detector runs
   on whatever it lands at. One version, not two.
+- **Which areas of a page reach a recognizer.** Amended 2026-08-29: a PDF's
+  embedded rasters are no longer the only ones. Formula and ruled-table areas
+  the page *typesets* are marked out from the document's own typography and
+  rendered for the recognizer — see FIGURE.md, "Phase 3 — Native vector tables
+  and formulas". That is a decision of the PDF extractor and not of this
+  document, and it reaches an engine as pixels like anything else. It touches
+  this spec at two points and no others: the routing version joins the analyzer
+  identity in the extraction recipe, so changing what is routed re-reads the
+  library exactly as changing the engine does; and admission gained a second
+  native-glyph rule, because a typeset region's bytes go into the reading in
+  place of glyphs the page drew and only a formula, a table or a chart is worth
+  displacing them for.
 - **The tile budget as a user-facing setting.** §5.7 fixes it at the config's
   2048 longest edge for now. It is the dominant cost and it belongs in the task
   configuration id, so exposing it later is a recipe change, not a preference.

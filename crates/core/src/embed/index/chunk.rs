@@ -330,6 +330,7 @@ mod tests {
                 page_count: Some(1),
             },
             images: vec![ExtractedImage {
+                origin: Default::default(),
                 id: "p1-i0".into(),
                 page: 1,
                 bbox: BoundingBox {

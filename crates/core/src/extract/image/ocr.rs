@@ -11,7 +11,9 @@
 //! would mean two answers to "what does this document say", and the whole
 //! design rests on there being one.
 
-use crate::types::{BoundingBox, ImageOcrRegion, ImageTransform, OcrAdmission, Point};
+use crate::types::{
+    BoundingBox, ImageOcrRegion, ImageTransform, OcrAdmission, Point, RegionOrigin,
+};
 
 use super::AnalysisContext;
 
@@ -234,13 +236,18 @@ pub fn normalize_recognized_text(text: &str) -> String {
 pub const MAPPING_VERSION: &str = "image-mapping-v1";
 
 /// Bumped when a kind's admission rule changes: the threshold comparison, what
-/// counts as parseable LaTeX, or what shape a table has to have.
+/// counts as parseable LaTeX, what shape a table has to have, or which kinds
+/// may displace the glyphs a page drew.
 ///
 /// In the analyzer identity for the same reason the threshold is in the
 /// engine's: the rules decide which recognized bytes reach the reading, so two
 /// readings produced under different rules are different readings even when
 /// the same model read the same picture.
-pub const ADMISSION_RULES_VERSION: &str = "image-admission-v1";
+///
+/// v2: admission gained the region's origin. A typeset region is refused when
+/// what came back is prose or code, because those bytes would go into the
+/// reading in place of the author's own glyphs.
+pub const ADMISSION_RULES_VERSION: &str = "image-admission-v2";
 
 /// Whether a formula's LaTeX parses.
 ///
@@ -420,10 +427,14 @@ pub fn markdown_table_is_rectangular(table: &str) -> bool {
 /// Each kind is admitted by what makes *that* kind wrong. Confidence-
 /// thresholding is a text rule and does not transfer: a formula is admitted on
 /// validity and a table on structure, because a decoder that truncates them
-/// scores its own truncation highly. The native-glyph check comes first for
+/// scores its own truncation highly. The native-glyph checks come first for
 /// every kind — the document's own glyphs are the better evidence whatever the
-/// recognizer called this region.
+/// recognizer called this region — and there are two of them, one for each
+/// origin: an embedded picture is refused when the page already draws the
+/// words over it, and a typeset region is refused when what came back is not a
+/// kind worth displacing a glyph run for.
 fn admit(
+    origin: RegionOrigin,
     kind: RegionKind,
     text: &str,
     confidence: f32,
@@ -431,6 +442,13 @@ fn admit(
     drawn_natively: bool,
 ) -> OcrAdmission {
     if drawn_natively {
+        return OcrAdmission::DeduplicatedAgainstNativeText;
+    }
+    // The same verdict for the same reason, reached by kind instead of by
+    // text: these bytes would go into the reading *in place of* glyphs the
+    // page drew, and for prose those glyphs are the better evidence. See
+    // [`RegionKind::supersedes_native_glyphs`].
+    if origin == RegionOrigin::Typeset && !kind.supersedes_native_glyphs() {
         return OcrAdmission::DeduplicatedAgainstNativeText;
     }
     match kind {
@@ -472,10 +490,20 @@ pub fn place_and_admit(
     pixel_width: u32,
     pixel_height: u32,
     page: u32,
+    origin: RegionOrigin,
     context: &AnalysisContext,
     threshold: f32,
 ) -> Vec<ImageOcrRegion> {
-    let native = context.native_text_within(page, image_bbox);
+    // Only an embedded picture can duplicate the page's glyphs. A typeset
+    // region *is* those glyphs, rendered so they could be read as the
+    // mathematics or the table they were set as, and the recognizer is the
+    // designated owner of the bytes there — the page's own run leaves the
+    // reading when this answer is admitted. Asking the duplicate question of
+    // it would refuse every region for being what it was marked out for.
+    let native = match origin {
+        RegionOrigin::Embedded => context.native_text_within(page, image_bbox),
+        RegionOrigin::Typeset => String::new(),
+    };
     spotted
         .into_iter()
         .map(|region| {
@@ -497,6 +525,7 @@ pub fn place_and_admit(
             let drawn_natively =
                 !comparable.is_empty() && native.contains(comparable.as_str());
             let admission = admit(
+                origin,
                 region.kind,
                 &region.text,
                 region.confidence,
@@ -726,38 +755,66 @@ mod tests {
     fn each_kind_is_admitted_by_its_own_rule() {
         let table = "| a | b |\n| --- | --- |\n| 1 | 2 |";
         assert_eq!(
-            admit(RegionKind::Text, "Knowledge base", 0.9, 0.7, false),
+            admit(
+                RegionOrigin::Embedded,
+                RegionKind::Text,
+                "Knowledge base",
+                0.9,
+                0.7,
+                false
+            ),
             OcrAdmission::Accepted
         );
         assert_eq!(
-            admit(RegionKind::Text, "blurred", 0.4, 0.7, false),
+            admit(RegionOrigin::Embedded, RegionKind::Text, "blurred", 0.4, 0.7, false),
             OcrAdmission::RejectedLowConfidence
         );
         assert_eq!(
-            admit(RegionKind::Formula, "E = mc^{2}", 0.1, 0.7, false),
+            admit(
+                RegionOrigin::Embedded,
+                RegionKind::Formula,
+                "E = mc^{2}",
+                0.1,
+                0.7,
+                false
+            ),
             OcrAdmission::Accepted,
             "a valid formula is not thresholded on confidence"
         );
         assert_eq!(
-            admit(RegionKind::Formula, "\\frac{a}{b", 0.99, 0.7, false),
+            admit(
+                RegionOrigin::Embedded,
+                RegionKind::Formula,
+                "\\frac{a}{b",
+                0.99,
+                0.7,
+                false
+            ),
             OcrAdmission::RejectedInvalidLatex,
             "a confident truncation is still a truncation"
         );
         assert_eq!(
-            admit(RegionKind::Table, table, 0.1, 0.7, false),
+            admit(RegionOrigin::Embedded, RegionKind::Table, table, 0.1, 0.7, false),
             OcrAdmission::Accepted
         );
         assert_eq!(
-            admit(RegionKind::Table, "| a |\n| --- |\n| 1 |", 0.99, 0.7, false),
+            admit(
+                RegionOrigin::Embedded,
+                RegionKind::Table,
+                "| a |\n| --- |\n| 1 |",
+                0.99,
+                0.7,
+                false
+            ),
             OcrAdmission::RejectedMalformedTable
         );
         assert_eq!(
-            admit(RegionKind::Chart, table, 0.99, 0.7, false),
+            admit(RegionOrigin::Embedded, RegionKind::Chart, table, 0.99, 0.7, false),
             OcrAdmission::Accepted,
             "a chart is admitted as a table, by the same rule"
         );
         assert_eq!(
-            admit(RegionKind::Chart, "roughly rising", 0.99, 0.7, false),
+            admit(RegionOrigin::Embedded, RegionKind::Chart, "roughly rising", 0.99, 0.7, false),
             OcrAdmission::RejectedMalformedTable
         );
     }
@@ -769,11 +826,50 @@ mod tests {
     fn native_glyphs_outrank_every_kinds_rule() {
         for kind in RegionKind::ALL {
             assert_eq!(
-                admit(kind, "E = mc^{2}", 0.99, 0.7, true),
+                admit(RegionOrigin::Embedded, kind, "E = mc^{2}", 0.99, 0.7, true),
                 OcrAdmission::DeduplicatedAgainstNativeText,
                 "{kind:?}"
             );
         }
+    }
+
+    /// A typeset region's bytes go into the reading *in place of* the glyphs
+    /// the page drew. A formula or a table is why the region was marked out
+    /// and is worth that; prose is not — the author's own glyphs are better
+    /// evidence for a sentence than a model's reading of a picture of one.
+    #[test]
+    fn only_a_kind_worth_displacing_glyphs_is_admitted_from_a_typeset_region() {
+        let table = "| a | b |\n| --- | --- |\n| 1 | 2 |";
+        let of = |kind, text| admit(RegionOrigin::Typeset, kind, text, 0.99, 0.7, false);
+
+        assert_eq!(of(RegionKind::Formula, "E = mc^{2}"), OcrAdmission::Accepted);
+        assert_eq!(of(RegionKind::Table, table), OcrAdmission::Accepted);
+        assert_eq!(of(RegionKind::Chart, table), OcrAdmission::Accepted);
+        for kind in [RegionKind::Text, RegionKind::Code] {
+            assert_eq!(
+                of(kind, "for all i we have"),
+                OcrAdmission::DeduplicatedAgainstNativeText,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// The same kinds read out of an embedded picture are admitted as they
+    /// always were: there are no glyphs of the document's under a figure, so
+    /// nothing is being displaced.
+    #[test]
+    fn the_typeset_rule_does_not_reach_an_embedded_picture() {
+        assert_eq!(
+            admit(
+                RegionOrigin::Embedded,
+                RegionKind::Text,
+                "Knowledge base",
+                0.99,
+                0.7,
+                false
+            ),
+            OcrAdmission::Accepted
+        );
     }
 
     /// Placement carries the recognizer's answer about what a region is; it
@@ -806,6 +902,7 @@ mod tests {
             100,
             100,
             1,
+            RegionOrigin::Embedded,
             &AnalysisContext::default(),
             0.7,
         );

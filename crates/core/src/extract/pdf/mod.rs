@@ -1,6 +1,8 @@
 mod backend;
 mod mupdf;
 mod sanitize;
+/// Formulas and ruled tables the page draws rather than embeds.
+mod typeset;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -35,7 +37,12 @@ impl PdfExtractor {
 
     /// A PDF extractor that enriches native images with the given analyzer.
     pub fn with_image_analyzer(analyzer: Arc<dyn ImageAnalyzer>) -> Self {
-        let analyzer_identity = analyzer.identity();
+        // The routing joins the analyzer in the recipe. Which areas of a page
+        // are handed to the recognizer is as much a determinant of the bytes
+        // as which recognizer reads them, and a change to it has to re-read
+        // the library the same way a change of model does.
+        let analyzer_identity =
+            format!("{}+{}", typeset::ROUTING_VERSION, analyzer.identity());
         Self {
             backend: Box::new(MuPdfBackend::new(Some(analyzer))),
             analyzer_identity,

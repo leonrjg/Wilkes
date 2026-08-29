@@ -44,7 +44,7 @@ use tracing::{debug, info, warn};
 
 use crate::types::{
     BoundingBox, ExtractedImage, ExtractionDiagnostics, ImageAnalysisStatus, ImageTransform,
-    OcrAdmission, RegionKind,
+    OcrAdmission, RegionKind, RegionOrigin,
 };
 
 use describe::FigureDescriber;
@@ -119,10 +119,16 @@ pub fn technical_limit(width: u32, height: u32) -> Option<String> {
     None
 }
 
-/// A native image block found on a page, before analysis.
+/// An image found on a page, before analysis: a raster the PDF embeds, or an
+/// area the page typesets that Wilkes rendered so a recognizer could read it.
 pub struct DiscoveredImage {
     pub id: String,
     pub page: u32,
+    /// Which of those two this is. It travels with the region rather than
+    /// being inferred from the id, because it decides an admission rule and a
+    /// label, and a rule read off a string is a rule waiting to be broken by a
+    /// rename.
+    pub origin: RegionOrigin,
     pub bbox: BoundingBox,
     pub transform: ImageTransform,
     pub decoded: Option<NativeImage>,
@@ -458,7 +464,9 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                     .rejected
                     .clone()
                     .unwrap_or_else(|| "not decoded".to_string());
-                diagnostics.native_images_skipped_technical_limit += 1;
+                if image.origin == RegionOrigin::Embedded {
+                    diagnostics.native_images_skipped_technical_limit += 1;
+                }
                 debug!("image {} skipped: {reason}", image.id);
                 image.status = ImageAnalysisStatus::SkippedTechnicalLimit { reason };
                 continue;
@@ -470,13 +478,17 @@ impl ImageAnalyzer for NativeImageAnalyzer {
             // asking about the document, not about this machine's disk.
             let key = self.cache_key(image);
             if let Some(cached) = self.cache.as_ref().and_then(|cache| cache.get(&key)) {
-                diagnostics.native_images_analyzed += 1;
+                if image.origin == RegionOrigin::Embedded {
+                    diagnostics.native_images_analyzed += 1;
+                }
                 diagnostics.images_ocr_succeeded += 1;
                 image.ocr_regions = cached.ocr_regions;
                 image.description = cached.description;
                 image.status = cached.status;
                 count_regions(image, diagnostics);
-                if image.description.is_some() {
+                if image.origin == RegionOrigin::Typeset {
+                    // The description stage does not apply, cached or not.
+                } else if image.description.is_some() {
                     diagnostics.images_description_succeeded += 1;
                 } else if self.describer.is_none() {
                     diagnostics.images_description_not_configured += 1;
@@ -544,7 +556,9 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                 .expect("a pending image is a decoded one");
             let image = &mut images[index];
             let key = self.cache_key(image);
-            diagnostics.native_images_analyzed += 1;
+            if image.origin == RegionOrigin::Embedded {
+                diagnostics.native_images_analyzed += 1;
+            }
             let mut failures = Vec::new();
 
             match spotted.as_ref().map(|all| &all[position]) {
@@ -558,6 +572,7 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                         image.pixel_width,
                         image.pixel_height,
                         image.page,
+                        image.origin,
                         context,
                         self.ocr.admission_threshold(),
                     );
@@ -571,6 +586,13 @@ impl ImageAnalyzer for NativeImageAnalyzer {
             count_regions(image, diagnostics);
 
             match &self.describer {
+                // A description is a generated claim about what a *picture*
+                // shows. A typeset region is a rendering Wilkes made of the
+                // document's own typesetting, and there is no picture in it to
+                // describe — the formula it contains is already in the reading
+                // as LaTeX. Not a failure and not a missing configuration:
+                // this stage does not apply to it.
+                _ if image.origin == RegionOrigin::Typeset => {}
                 None => diagnostics.images_description_not_configured += 1,
                 Some(describer) => {
                     let accepted: Vec<_> = image.accepted_ocr().cloned().collect();
@@ -670,7 +692,13 @@ pub fn analyze(
     analyzer: Option<&dyn ImageAnalyzer>,
     diagnostics: &mut ExtractionDiagnostics,
 ) -> Vec<ExtractedImage> {
-    diagnostics.native_images_found = discovered.len() as u32;
+    // The embedded ones only. A typeset region is an area Wilkes rendered, not
+    // a block MuPDF exposed, and counting it here would report figures the
+    // document does not contain.
+    diagnostics.native_images_found = discovered
+        .iter()
+        .filter(|found| found.origin == RegionOrigin::Embedded)
+        .count() as u32;
 
     let mut images: Vec<ExtractedImage> = discovered
         .iter()
@@ -684,6 +712,7 @@ pub fn analyze(
             ExtractedImage {
                 id: found.id.clone(),
                 page: found.page,
+                origin: found.origin,
                 bbox: found.bbox.clone(),
                 transform: found.transform,
                 pixel_width,
@@ -710,7 +739,9 @@ pub fn analyze(
             // were never looked at. Neither is a success.
             for image in &mut images {
                 if matches!(image.status, ImageAnalysisStatus::SkippedTechnicalLimit { .. }) {
-                    diagnostics.native_images_skipped_technical_limit += 1;
+                    if image.origin == RegionOrigin::Embedded {
+                        diagnostics.native_images_skipped_technical_limit += 1;
+                    }
                 } else {
                     image.status = ImageAnalysisStatus::Partial {
                         failures: vec!["no image analyzer configured".to_string()],

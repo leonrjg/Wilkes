@@ -14,7 +14,7 @@
 //! than being trusted to guess.
 
 use crate::types::{
-    BoundingBox, ExtractedImage, ImageOcrRegion, Point, RegionKind, TextProvenance,
+    BoundingBox, ExtractedImage, ImageOcrRegion, Point, RegionKind, RegionOrigin, TextProvenance,
 };
 
 /// Bumped whenever these bytes change for the same analysis — a new label, a
@@ -24,13 +24,17 @@ use crate::types::{
 /// transcribed table `Image embedded text:` — the same bytes under a claim
 /// that is no longer made, which is exactly what a recipe version exists to
 /// keep apart.
-pub const SERIALIZATION_VERSION: &str = "image-enrichment-v2";
+///
+/// v3: one label per kind *and origin*. A formula the page typeset and Wilkes
+/// re-read is not embedded in anything, and the bytes that stand in place of
+/// its glyph run may not say it was.
+pub const SERIALIZATION_VERSION: &str = "image-enrichment-v3";
 
 /// The label prose is transcribed under. The other kinds' labels are on
 /// [`RegionKind::label`], where the exhaustive match keeps every kind from
 /// reaching the reading unlabelled; this name is kept because callers outside
 /// this module ask for the transcription label by it.
-pub const OCR_LABEL: &str = RegionKind::Text.label();
+pub const OCR_LABEL: &str = RegionKind::Text.label(RegionOrigin::Embedded);
 pub const DESCRIPTION_LABEL: &str = "Image description:";
 
 /// Between two spotted regions. A separator rather than a newline: the regions
@@ -159,7 +163,11 @@ pub fn enrichment_pieces(image: &ExtractedImage) -> Vec<Piece> {
         // table — so their label ends its own line. A phrase or an inline
         // formula follows its label.
         pieces.push(whole(
-            &format!("{}{}", kind.label(), if starts_a_line(kind) { "\n" } else { " " }),
+            &format!(
+                "{}{}",
+                kind.label(image.origin),
+                if starts_a_line(kind) { "\n" } else { " " }
+            ),
             structural_ocr(kind),
         ));
         for (index, region) in block.regions.iter().enumerate() {
@@ -222,6 +230,7 @@ mod tests {
         ExtractedImage {
             id: "p18-i0".into(),
             page: 18,
+            origin: RegionOrigin::Embedded,
             bbox: BoundingBox {
                 x: 10.0,
                 y: 20.0,
@@ -366,9 +375,23 @@ mod tests {
     /// learns that. No other kind may claim the same words.
     #[test]
     fn a_chart_is_labelled_a_transcription_and_a_table_is_not() {
-        assert_eq!(RegionKind::Chart.label(), "Image transcribed chart:");
-        assert!(!RegionKind::Chart.label().contains("embedded"));
-        assert!(RegionKind::Table.label().contains("embedded"));
+        let embedded = RegionOrigin::Embedded;
+        assert_eq!(RegionKind::Chart.label(embedded), "Image transcribed chart:");
+        assert!(!RegionKind::Chart.label(embedded).contains("embedded"));
+        assert!(RegionKind::Table.label(embedded).contains("embedded"));
+    }
+
+    /// A formula the page typeset is not embedded in anything: the bytes
+    /// stand in place of the glyph run the page drew, and the label may not
+    /// claim the document carries a picture of it.
+    #[test]
+    fn a_typeset_region_is_never_labelled_embedded() {
+        for kind in RegionKind::ALL {
+            let label = kind.label(RegionOrigin::Typeset);
+            assert!(!label.contains("embedded"), "{label}");
+            assert!(!label.contains("Image"), "{label}");
+            assert_ne!(label, kind.label(RegionOrigin::Embedded));
+        }
     }
 
     /// The mechanism behind "a fifth kind cannot appear without a label": the
@@ -376,8 +399,11 @@ mod tests {
     /// has one, and no two kinds share.
     #[test]
     fn every_kind_has_a_distinct_label() {
-        let labels: Vec<&str> = RegionKind::ALL.iter().map(|kind| kind.label()).collect();
-        assert_eq!(labels.len(), RegionKind::ALL.len());
+        let labels: Vec<&str> = [RegionOrigin::Embedded, RegionOrigin::Typeset]
+            .into_iter()
+            .flat_map(|origin| RegionKind::ALL.iter().map(move |kind| kind.label(origin)))
+            .collect();
+        assert_eq!(labels.len(), RegionKind::ALL.len() * 2);
         for (index, label) in labels.iter().enumerate() {
             assert!(label.ends_with(':'), "{label}");
             assert!(!labels[..index].contains(label), "{label} is used twice");

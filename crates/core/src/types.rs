@@ -369,6 +369,15 @@ pub enum TextProvenance {
     /// where one segment can span both native and inserted bytes. Saying so
     /// beats claiming either.
     Unrecorded,
+    /// Text a recognizer read out of pixels.
+    ///
+    /// Those pixels are one of two things, and `image_id` resolves to an
+    /// [`ExtractedImage`] whose [`RegionOrigin`] says which: a raster the PDF
+    /// embeds, or an area the page typeset that Wilkes rendered so it could
+    /// be read as the formula or table it was set as. The second replaces the
+    /// glyph run the page drew there, so these bytes are the reading's only
+    /// account of that area — which is exactly why the origin is recorded on
+    /// the image rather than left to be inferred from the label.
     ImageOcr {
         image_id: String,
         /// The region's admission signal, carried through so a consumer can
@@ -519,6 +528,13 @@ pub struct ExtractionDiagnostics {
     #[serde(default)]
     pub native_images_found: u32,
     /// Images at least one analysis stage ran on.
+    ///
+    /// This and the two counters around it are about the *document's* images
+    /// and count embedded rasters only. The recognition counters that follow
+    /// — succeeded, failed, and everything by kind and admission — are about
+    /// regions read and cover typeset regions as well, because a formula that
+    /// came back as invalid LaTeX is the same fact whichever pixels it was
+    /// read from.
     #[serde(default)]
     pub native_images_analyzed: u32,
     /// Images a fixed technical limit rejected before any stage.
@@ -579,6 +595,29 @@ pub struct ExtractionDiagnostics {
     pub charts_accepted: u32,
     #[serde(default)]
     pub charts_rejected_malformed: u32,
+
+    // ── Typeset regions ──────────────────────────────────────────────────
+    //
+    // Areas the page draws with fonts and paths rather than embedding as a
+    // raster, routed to the recognizer and rendered for it. Counted apart
+    // from the embedded images they share a pipeline with, because they cost
+    // differently and fail differently: an embedded figure that reads as
+    // nothing leaves the reading as it was, and a typeset region that reads
+    // as nothing leaves the page's own glyph run in place of it.
+    /// Areas the typography marked out as a formula or a ruled table.
+    #[serde(default)]
+    pub typeset_regions_found: u32,
+    /// Regions past the per-document budget, discovered and not rendered.
+    /// Never silently dropped: a bounded run that reports nothing dropped
+    /// reads identically to a document that had no more to find.
+    #[serde(default)]
+    pub typeset_regions_over_budget: u32,
+    /// Regions whose reading was admitted, and which therefore stand in the
+    /// canonical reading in place of the glyphs the page drew there. The
+    /// difference from `typeset_regions_found` is the regions where the page's
+    /// own glyphs were kept because the recognizer's answer was refused.
+    #[serde(default)]
+    pub typeset_regions_superseded_native_text: u32,
 
     #[serde(default)]
     pub images_description_succeeded: u32,
@@ -743,6 +782,34 @@ impl ImageTransform {
 /// both carry it across the API boundary — the same reason
 /// [`RecognizerInventory`] is here rather than inside the model module that
 /// first needed it.
+/// Where the pixels a region was read from came from.
+///
+/// Two answers, and the reading says which. An `Embedded` region was read out
+/// of a raster the PDF carries: the bytes are a transcription of a picture,
+/// and the document's own glyphs are elsewhere. A `Typeset` region was read
+/// out of a rasterization *Wilkes* made of an area the page draws with fonts
+/// and paths — a display formula, a ruled table — and the bytes stand in place
+/// of the glyph run that area drew.
+///
+/// The distinction is load-bearing twice over. It chooses the label, because
+/// "embedded" is a false claim about content the page typeset. And it chooses
+/// whether the native-glyph check applies: a transcription that repeats
+/// glyphs the page already draws is redundant for an embedded picture and is
+/// the entire *point* for a typeset region, where the recognizer is the
+/// designated owner of those bytes.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionOrigin {
+    /// A raster image the PDF embeds.
+    #[default]
+    Embedded,
+    /// An area the page draws with fonts and paths, rasterized by Wilkes so a
+    /// recognizer could read it.
+    Typeset,
+}
+
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
 )]
@@ -784,13 +851,45 @@ impl RegionKind {
     /// other labels name content that is present in the image and was read; a
     /// chart rendered as rows is Wilkes' reconstruction of what the picture
     /// depicts, and the label is the only place a consumer learns that.
-    pub const fn label(&self) -> &'static str {
+    /// `Typeset` labels say *page*, and never *embedded*: the content is the
+    /// document's own typesetting, re-read from a rasterization of it, and the
+    /// glyph run it stands in place of is no longer in the reading beside it.
+    /// Calling that "embedded" would claim the page carries a picture of a
+    /// formula, which is exactly what it does not do.
+    pub const fn label(&self, origin: RegionOrigin) -> &'static str {
+        match (origin, self) {
+            (RegionOrigin::Embedded, RegionKind::Text) => "Image embedded text:",
+            (RegionOrigin::Embedded, RegionKind::Formula) => "Image embedded formula:",
+            (RegionOrigin::Embedded, RegionKind::Table) => "Image embedded table:",
+            (RegionOrigin::Embedded, RegionKind::Chart) => "Image transcribed chart:",
+            (RegionOrigin::Embedded, RegionKind::Code) => "Image embedded code:",
+            (RegionOrigin::Typeset, RegionKind::Text) => "Page text:",
+            (RegionOrigin::Typeset, RegionKind::Formula) => "Page formula:",
+            (RegionOrigin::Typeset, RegionKind::Table) => "Page table:",
+            (RegionOrigin::Typeset, RegionKind::Chart) => "Page transcribed chart:",
+            (RegionOrigin::Typeset, RegionKind::Code) => "Page code:",
+        }
+    }
+
+    /// Whether reading this kind is worth putting in place of the glyphs a
+    /// page drew.
+    ///
+    /// Only asked of a typeset region, where the two accounts of an area are
+    /// the page's own glyph run and the recognizer's reading of a rendering
+    /// of it. A formula and a table are why such a region was marked out: the
+    /// glyph run for those is flattened past use — `ci = ai ⊕bi` is not
+    /// mathematics — and the reading is the only usable account of them.
+    ///
+    /// Prose and code are not. If a recognizer reads a region the page's own
+    /// typography called a formula and answers "this is a sentence", the two
+    /// disagree, and the document's glyphs are the better evidence for a
+    /// sentence — they are what the author wrote, at no risk of transcription
+    /// error. Replacing them on the strength of that disagreement would trade
+    /// certainty for a model's opinion.
+    pub const fn supersedes_native_glyphs(&self) -> bool {
         match self {
-            RegionKind::Text => "Image embedded text:",
-            RegionKind::Formula => "Image embedded formula:",
-            RegionKind::Table => "Image embedded table:",
-            RegionKind::Chart => "Image transcribed chart:",
-            RegionKind::Code => "Image embedded code:",
+            RegionKind::Formula | RegionKind::Table | RegionKind::Chart => true,
+            RegionKind::Text | RegionKind::Code => false,
         }
     }
 
@@ -894,6 +993,12 @@ pub struct ExtractedImage {
     pub id: String,
     /// 1-based, numbered as extraction numbers pages.
     pub page: u32,
+    /// Whether the PDF embedded these pixels or Wilkes rendered them out of
+    /// the page's own drawing. Defaulted on read: every rendition written
+    /// before typeset routing existed contains embedded images only, which is
+    /// what the default says.
+    #[serde(default)]
+    pub origin: RegionOrigin,
     /// The page region the image occupies, axis-aligned.
     pub bbox: BoundingBox,
     pub transform: ImageTransform,

@@ -50,6 +50,15 @@ pub(super) struct Line {
     pub leading: String,
     pub words: Vec<Word>,
     pub trailing: Vec<String>,
+    /// The typeset region marked out over this line, as an index into the
+    /// document's images.
+    ///
+    /// Marked at discovery and acted on in [`supersede_typeset_regions`],
+    /// after the recognizer has answered — because until then it is not known
+    /// whether these words are leaving. A region whose reading is refused
+    /// leaves its lines exactly where the page put them, which is what makes
+    /// a false positive cost time and no bytes.
+    pub typeset: Option<usize>,
 }
 
 impl Line {
@@ -212,11 +221,86 @@ pub(super) fn sanitize(
     diagnostics: &mut ExtractionDiagnostics,
 ) -> Reading {
     diagnostics.pages = pages.len() as u32;
+    supersede_typeset_regions(&mut pages, images, diagnostics);
     remove_page_furniture(&mut pages, diagnostics);
     let flows = relocate_marginalia(&mut pages, diagnostics);
     let mut items = flatten(&pages, &flows);
     join_wrapped_words(&mut items, diagnostics);
     render(&items, images)
+}
+
+// ── Typeset regions ─────────────────────────────────────────────────────────
+
+/// Hand the lines of an admitted typeset region over to that region.
+///
+/// This is the one place the ownership of those bytes is settled, and it
+/// settles it by removing the competing claim rather than by reconciling two.
+/// A display formula reaches this point twice over: as the glyph run MuPDF
+/// read off the page — `ci = ai ⊕bi`, which is not mathematics — and as the
+/// region a recognizer read as LaTeX. Exactly one of them is in the reading
+/// afterwards.
+///
+/// The recognizer wins only where it actually said something admissible. A
+/// region whose formula did not parse, whose table came back ragged, or whose
+/// recognition failed outright leaves its lines untouched, and the reading is
+/// what it was before typeset routing existed. That is deliberate: the
+/// failure mode of a wrongly marked-out region is a wasted recognizer call,
+/// never a paragraph replaced by nothing.
+///
+/// Run before every other pass here so that what follows sees an image block
+/// where the region is — a formula is not a furniture candidate and not a
+/// marginalia candidate, and it stops being either by the ordinary rule that
+/// those are decided from words.
+fn supersede_typeset_regions(
+    pages: &mut [Page],
+    images: &[ExtractedImage],
+    diagnostics: &mut ExtractionDiagnostics,
+) {
+    let admitted = |index: usize| {
+        images
+            .get(index)
+            .is_some_and(|image| image.accepted_ocr().next().is_some())
+    };
+    let mut placed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    for page in pages.iter_mut() {
+        let mut rebuilt: Vec<Block> = Vec::new();
+        for block in std::mem::take(&mut page.blocks) {
+            if block.image.is_some() {
+                rebuilt.push(block);
+                continue;
+            }
+            // Consecutive lines of one region are one run. A region that
+            // spans two of the page's blocks is still one image, so its block
+            // is written where its first line was and the rest simply go.
+            let mut pending: Vec<Line> = Vec::new();
+            let flush = |pending: &mut Vec<Line>, rebuilt: &mut Vec<Block>| {
+                if !pending.is_empty() {
+                    rebuilt.push(Block {
+                        lines: std::mem::take(pending),
+                        image: None,
+                    });
+                }
+            };
+            for line in block.lines {
+                match line.typeset.filter(|index| admitted(*index)) {
+                    Some(index) => {
+                        flush(&mut pending, &mut rebuilt);
+                        if placed.insert(index) {
+                            diagnostics.typeset_regions_superseded_native_text += 1;
+                            rebuilt.push(Block {
+                                lines: Vec::new(),
+                                image: Some(index),
+                            });
+                        }
+                    }
+                    None => pending.push(line),
+                }
+            }
+            flush(&mut pending, &mut rebuilt);
+        }
+        page.blocks = rebuilt;
+    }
 }
 
 // ── Class 2: page furniture ─────────────────────────────────────────────────
@@ -733,6 +817,152 @@ mod tests {
             SourceOrigin::PdfPage { bbox, .. } => bbox.clone().expect("word has a box"),
             other => panic!("expected a page origin, got {other:?}"),
         }
+    }
+
+    // ── Typeset regions ──────────────────────────────────────────────────
+
+    /// One recognized typeset region, admitted or refused.
+    fn recognized(admitted: bool) -> ExtractedImage {
+        use crate::types::{
+            ImageAnalysisStatus, ImageOcrRegion, ImageTransform, OcrAdmission, Point, RegionKind,
+            RegionOrigin,
+        };
+        ExtractedImage {
+            id: "p1-v0".into(),
+            page: 1,
+            origin: RegionOrigin::Typeset,
+            bbox: BoundingBox {
+                x: 90.0,
+                y: 90.0,
+                width: 200.0,
+                height: 30.0,
+            },
+            transform: ImageTransform {
+                a: 200.0,
+                b: 0.0,
+                c: 0.0,
+                d: 30.0,
+                e: 90.0,
+                f: 90.0,
+            },
+            pixel_width: 800,
+            pixel_height: 120,
+            image_sha256: "digest".into(),
+            reading_range: None,
+            ocr_regions: vec![ImageOcrRegion {
+                kind: RegionKind::Formula,
+                text: "c_i = a_i \\oplus b_i".into(),
+                confidence: 0.95,
+                polygon_within_image: vec![Point { x: 0.0, y: 0.0 }],
+                page_polygon: vec![Point { x: 90.0, y: 90.0 }],
+                admission: if admitted {
+                    OcrAdmission::Accepted
+                } else {
+                    OcrAdmission::RejectedInvalidLatex
+                },
+            }],
+            description: None,
+            analyzer_identity: "test".into(),
+            status: ImageAnalysisStatus::Complete,
+        }
+    }
+
+    /// A paragraph with a display formula in the middle of it, marked as one
+    /// region.
+    fn page_with_a_formula_in_the_middle() -> Page {
+        let mut lines = vec![
+            line(vec![word("prose", 100.0, 80.0), word("above", 140.0, 80.0)]),
+            line(vec![word("ci", 100.0, 100.0), word("=", 120.0, 100.0),
+                      word("ai", 140.0, 100.0)]),
+            line(vec![word("prose", 100.0, 120.0), word("below", 140.0, 120.0)]),
+        ];
+        lines[1].typeset = Some(0);
+        Page {
+            number: 1,
+            height: 800.0,
+            blocks: vec![Block { lines, image: None }],
+        }
+    }
+
+    /// The recognizer's reading takes the glyph run's place, and the prose
+    /// around it stays in its own blocks on either side. One owner for those
+    /// bytes: the flattened run is gone, not sitting beside its transcription.
+    #[test]
+    fn an_admitted_region_replaces_the_lines_it_speaks_for() {
+        let mut images = [recognized(true)];
+        let mut diagnostics = ExtractionDiagnostics::default();
+        let reading = sanitize(
+            vec![page_with_a_formula_in_the_middle()],
+            &mut images,
+            &mut diagnostics,
+        );
+
+        assert!(reading.text.contains("prose above"), "{:?}", reading.text);
+        assert!(reading.text.contains("prose below"), "{:?}", reading.text);
+        assert!(
+            reading.text.contains("Page formula: c_i = a_i \\oplus b_i."),
+            "{:?}",
+            reading.text
+        );
+        assert!(!reading.text.contains("ci = ai"), "{:?}", reading.text);
+        assert_eq!(diagnostics.typeset_regions_superseded_native_text, 1);
+        assert!(images[0].reading_range.is_some(), "the block has a range");
+
+        // The order is the page's: the formula is between the two paragraphs
+        // it was drawn between, not appended after them.
+        let above = reading.text.find("prose above").expect("above");
+        let formula = reading.text.find("Page formula:").expect("formula");
+        let below = reading.text.find("prose below").expect("below");
+        assert!(above < formula && formula < below, "{:?}", reading.text);
+    }
+
+    /// A region the recognizer had no admissible answer for changes nothing.
+    /// That is what makes a wrongly marked-out region cost time and no bytes.
+    #[test]
+    fn a_refused_region_leaves_its_lines_exactly_where_they_were() {
+        let mut images = [recognized(false)];
+        let mut diagnostics = ExtractionDiagnostics::default();
+        let reading = sanitize(
+            vec![page_with_a_formula_in_the_middle()],
+            &mut images,
+            &mut diagnostics,
+        );
+
+        assert!(reading.text.contains("ci = ai"), "{:?}", reading.text);
+        assert!(!reading.text.contains("Page formula:"));
+        assert_eq!(diagnostics.typeset_regions_superseded_native_text, 0);
+        assert!(images[0].reading_range.is_none());
+    }
+
+    /// A region whose lines fall in two of the page's blocks is still one
+    /// image: its block is written where its first line was, and the rest of
+    /// its lines simply go.
+    #[test]
+    fn a_region_spanning_two_blocks_is_written_once() {
+        let mut first = line(vec![word("ci", 100.0, 100.0), word("=", 120.0, 100.0)]);
+        first.typeset = Some(0);
+        let mut second = line(vec![word("ai", 100.0, 116.0), word("+", 120.0, 116.0)]);
+        second.typeset = Some(0);
+        let page = Page {
+            number: 1,
+            height: 800.0,
+            blocks: vec![
+                Block { lines: vec![first], image: None },
+                Block { lines: vec![second], image: None },
+            ],
+        };
+
+        let mut images = [recognized(true)];
+        let mut diagnostics = ExtractionDiagnostics::default();
+        let reading = sanitize(vec![page], &mut images, &mut diagnostics);
+
+        assert_eq!(
+            reading.text.matches("Page formula:").count(),
+            1,
+            "{:?}",
+            reading.text
+        );
+        assert_eq!(diagnostics.typeset_regions_superseded_native_text, 1);
     }
 
     #[test]

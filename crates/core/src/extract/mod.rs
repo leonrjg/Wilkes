@@ -214,7 +214,11 @@ mod tests {
         enriched.register(Box::new(pdf::PdfExtractor::with_image_analyzer(
             std::sync::Arc::new(Named),
         )));
-        assert_eq!(enriched.image_analyzer_identity(), "named-analyzer-v1");
+        // The analyzer, and the routing that decides which areas of a page
+        // reach it: both determine the bytes, so both are in the recipe.
+        let identity = enriched.image_analyzer_identity();
+        assert!(identity.contains("named-analyzer-v1"), "{identity}");
+        assert!(identity.contains("typeset-routing"), "{identity}");
     }
 
     /// Installing an analyzer changes the recipe, which is what forces

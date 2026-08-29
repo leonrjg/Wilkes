@@ -63,10 +63,16 @@ it does not reconstruct complex layouts.
 - Vector-only diagrams.
 - Grouping several PDF objects into one figure.
 - Scanned-page or whole-page layout detection. Region detection *inside an
-  image crop* is in scope as of 2026-08-29; detecting regions across a whole
-  rendered page is not, and remains phase 3.
-- Native vector tables and formulas — content MuPDF draws rather than
-  embeds. Phase 3, and the only part of the original roadmap still deferred.
+  image crop* is in scope as of 2026-08-29, and so is marking out formula and
+  ruled-table areas of a page from the page's own typography. Handing a whole
+  rendered page to a recognizer and taking its reading of the prose is not,
+  and is not planned: it would make the recognizer a second PDF extraction
+  mechanism, which the architectural invariant forbids.
+- ~~Native vector tables and formulas — content MuPDF draws rather than
+  embeds.~~ **In scope as of 2026-08-29**; see "Phase 3 — Native vector tables
+  and formulas" for what was built and what within it is still deferred.
+  Unruled tables and inline mathematics remain out of scope, and the reasons
+  are in the module rather than here.
 - Seal recognition. The sixth task prompt exists; nothing in the corpus
   exercises it, and a prompt nobody measured is not scope.
 - Whole-page VLM document-understanding pipelines.
@@ -1053,19 +1059,46 @@ could not be built.
 ### Phase 3 — Native vector tables and formulas
 
 Born-digital PDFs draw most tables and math as vector content, invisible to
-the image-block scope. Amended 2026-08-29: the detector below is no longer
-introduced here — phase 2 brings it forward and phase 3 inherits it. What
-remains phase 3 is running it over a *rendered page* rather than an image
-crop, and the reading-anchor placement that follows. The blocker is region
-detection, and the routing problem that recurs through this document has one
-answer Wilkes can hold without the OAR migration: PP-DocLayoutV2-class layout
-detectors
-(RT-DETR/PicoDet) are plain ONNX detection graphs — OAR's registry hosts
-ONNX conversions — and Wilkes already carries `ort = "=2.0.0-rc.11"` for
-FastEmbed. Wilkes uses the model artifacts, not the OAR crate, and owns the
-pre- and post-processing. Then: detected region, MuPDF renders the crop (the
-binding has pixmap support), the same PaddleOCR-VL task prompts, and a
-labeled block at the region's reading anchor.
+the image-block scope.
+
+**Built 2026-08-29, and not with a layout model.** The trigger was a report
+that granite-docling was "not OCR'ing LaTeX": a reading of a cryptography text
+returned `ci = ai ⊕bi` with and without the recognizer, byte for byte. It was
+not a recognizer failure. The formula is glyphs the page draws, so no image
+block exists there, so nothing was ever dispatched — the head of the path was
+missing while everything downstream of it worked.
+
+What closed it is cheaper than the detector this section planned, because the
+document already declares the thing a detector would have to infer:
+
+- **Formulas are found by font.** A typesetter that sets mathematics switches
+  to a math font — `CMMI`/`CMSY`/`CMEX` under TeX, `LatinModernMath` or
+  `STIXTwoMath` under unicode-math, `Cambria Math` under Word. That switch is
+  a fact in the file. A *line* most of whose glyphs come from one is a display
+  formula; the threshold separates roughly 0.9 on the reported equation from
+  0.08 on the sentence above it. Fonts are read with a MuPDF `NativeDevice`,
+  since the safe structured-text API exposes a character's box and size but
+  not its face.
+- **Tables are found by their rules.** `FZ_STEXT_COLLECT_VECTORS` hands over
+  the thin wide rectangles the page filled; three of them sharing a column,
+  with text between, is the booktabs shape.
+- **The region is rendered and goes through the existing pipeline.** MuPDF
+  draws the area at four to eight times page scale into a white-padded crop,
+  and it enters `analyze` as a `DiscoveredImage` like any embedded figure —
+  same recognizer, same per-kind admission, same serialization, same source
+  map, same chunk rule.
+
+The detector this section specified is therefore not built and is no longer
+planned for this purpose. It remains the answer for what the typography cannot
+declare: an unruled table, and a document that sets its mathematics in a text
+font. Both are out of scope and stated as such in the module.
+
+**Cost is bounded and the bound is reported.** Recognition is tens of seconds
+a region, so inline mathematics is deliberately unreachable — the unit is the
+line, and an inline formula shares its line with prose — and a per-document
+budget caps how many regions one reading may spend. What the budget drops is
+counted and logged, because a bounded run that reports nothing dropped reads
+exactly like a document that had nothing more to find.
 
 ### Decisions taken now
 
@@ -1081,6 +1114,20 @@ labeled block at the region's reading anchor.
   addition: every suppressed byte has a recorded reason in diagnostics, the
   counterpart of every inserted byte carrying truthful provenance.
 
+  **As built, the extension is a replacement rather than an addition, and
+  deliberately so.** The native-glyph dedup asks "does the page already draw
+  this?" and refuses the transcription when it does. For a typeset region the
+  answer is always yes — that is what the region *is* — so the check is not
+  tightened for it, it is removed: `RegionOrigin::Typeset` skips it outright,
+  and the recognizer is the designated owner of those bytes. Two rules
+  competing for the same bytes was the thing to avoid; one rule per origin is
+  what replaced it. Ownership is settled in exactly one place,
+  `sanitize::supersede_typeset_regions`, and only where the recognizer's
+  answer was admitted — a formula whose LaTeX does not close, a ragged table,
+  or a failed recognition leaves the page's own glyphs untouched. The failure
+  mode of a wrongly marked-out region is a wasted recognizer call, never a
+  paragraph replaced by nothing.
+
 ### Not on the path
 
 - The OAR route to the same goals: classic OCR plus PP-FormulaNet plus table
@@ -1094,9 +1141,32 @@ labeled block at the region's reading anchor.
 
 - Phase 1: the candle `paddleocr_vl` module drives the 1.5/1.6 checkpoints
   and task prompts, and `<|LOC|>` output parses to usable quads.
-- Phase 3: the chosen layout detector's ONNX opset runs on the pinned
-  `ort`. Amended 2026-08-29: this is now a phase 2 item, and the pin is no
-  longer `=2.0.0-rc.11` — see the note on `ort` below.
+- ~~Phase 3: the chosen layout detector's ONNX opset runs on the pinned
+  `ort`.~~ Withdrawn 2026-08-29: phase 3 shipped without a detector, so there
+  is no opset to verify. What replaces it as this phase's open measurement is
+  the math-font share threshold, which is set from the reported document's two
+  sides and not from a sweep — see the typeset-routing items below.
+
+Added 2026-08-29, for typeset routing:
+
+- **The math-font share threshold is a band, not a sweep.** It is set from
+  two measurements on one document: a display equation at roughly 0.9 and the
+  sentence above it at 0.08. That the signal separates display mathematics
+  from prose is not in doubt; where exactly the line sits between them is, and
+  widening it to the evaluation corpus is the outstanding work. The failure
+  mode of a threshold set too low is cost — a prose line marked out, read, and
+  refused by admission — and of one set too high is a formula left as the
+  glyph run it is today. Neither corrupts a reading.
+- **The per-document region budget has not been calibrated against a
+  mathematics textbook.** The number bounds a wait, and what a reader will
+  wait for is the measurement that has not been taken.
+- **Table detection by rules has not been run against an unruled table,
+  because it cannot find one.** What is unverified is the false-positive rate
+  on framed figures and boxed asides, which the rule stack can look like.
+- **The recognizer has not been measured on a rendered formula crop.** The
+  path is proven end to end against a stub; what granite-docling actually
+  returns for a white-padded display equation at four to eight times page
+  scale is the gating measurement, and it needs the weights.
 
 Added 2026-08-29, for the prompt work:
 
