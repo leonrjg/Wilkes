@@ -9,6 +9,9 @@ use wilkes_core::embed::{EmbeddingSpaceIdentity, ExtractionRecipe};
 use wilkes_core::types::{SelectedEmbedder, SemanticSettings};
 use wilkes_core::worker::manager::{ManagerEvent, WorkerPaths};
 
+use wilkes_core::consumer::{consumer_error, ConsumerErrorCode};
+use wilkes_core::{consumer_bail, consumer_ensure};
+
 use crate::commands::settings::get_scoped_settings;
 use crate::context::{AppContext, EventEmitter, ManagedCorpusBackup};
 use crate::startup::{StartupAction, StartupBlocker};
@@ -685,9 +688,10 @@ impl WorkspaceManager {
             );
             let path = workspace_manifest_path(&self.app_data_dir, id);
             let manifest = update_manifest(&path, |manifest| {
-                anyhow::ensure!(
+                consumer_ensure!(
                     !manifest.is_application_managed(),
-                    "MANAGED_WORKSPACE_PROTECTED: managed workspaces cannot be renamed"
+                    ConsumerErrorCode::ManagedWorkspaceProtected,
+                    "managed workspaces cannot be renamed",
                 );
                 manifest.name = name.to_string();
                 Ok(())
@@ -811,13 +815,17 @@ impl WorkspaceManager {
             }
             if let Some(manifest) = existing {
                 let configured = manifest.semantic.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("MANAGED_WORKSPACE_CONFIGURATION_MISMATCH: semantic configuration is absent")
+                    consumer_error(
+                        ConsumerErrorCode::ManagedWorkspaceConfigurationMismatch,
+                        "semantic configuration is absent",
+                    )
                 })?;
-                anyhow::ensure!(
+                consumer_ensure!(
                     configured.selected == request.embedding
                         && configured.chunk_size == request.chunk_size
                         && configured.chunk_overlap == request.chunk_overlap,
-                    "MANAGED_WORKSPACE_CONFIGURATION_MISMATCH: existing corpus uses a different embedding or extraction configuration"
+                    ConsumerErrorCode::ManagedWorkspaceConfigurationMismatch,
+                    "existing corpus uses a different embedding or extraction configuration",
                 );
                 manifest.id
             } else {
@@ -932,7 +940,10 @@ impl WorkspaceManager {
             ) if purpose == "semantic-corpus" => {
                 (owner.clone(), corpus_key.clone(), semantic.clone())
             }
-            _ => anyhow::bail!("MANAGED_WORKSPACE_NOT_FOUND"),
+            _ => consumer_bail!(
+                ConsumerErrorCode::ManagedWorkspaceNotFound,
+                "this id names no managed semantic corpus",
+            ),
         };
 
         let id = self.ensure_projection_workspace(
@@ -1047,13 +1058,19 @@ impl WorkspaceManager {
             .spaces
             .iter()
             .find(|space| space.embedding_space_id == embedding_space_id)
-            .ok_or_else(|| anyhow::anyhow!("EMBEDDING_SPACE_MISMATCH"))?;
-        anyhow::ensure!(
+            .ok_or_else(|| {
+                consumer_error(
+                    ConsumerErrorCode::EmbeddingSpaceMismatch,
+                    format!("the corpus holds no embedding space {embedding_space_id}"),
+                )
+            })?;
+        consumer_ensure!(
             space.ready && space.indexed_generation == status.corpus_generation,
-            "EMBEDDING_SPACE_STALE: projection generation {}, corpus generation {}; \
+            ConsumerErrorCode::EmbeddingSpaceStale,
+            "projection generation {}, corpus generation {}; \
              the projection has not been caught up to the corpus",
             space.indexed_generation,
-            status.corpus_generation
+            status.corpus_generation,
         );
         self.context_for(&space.workspace_id).await
     }
@@ -1094,11 +1111,15 @@ impl WorkspaceManager {
                 parent_corpus_id,
                 ..
             } if purpose == "semantic-corpus" => parent_corpus_id.clone(),
-            _ => anyhow::bail!("MANAGED_WORKSPACE_NOT_FOUND"),
+            _ => consumer_bail!(
+                ConsumerErrorCode::ManagedWorkspaceNotFound,
+                "this id names no managed semantic corpus",
+            ),
         };
         let semantic = manifest.semantic.ok_or_else(|| {
-            anyhow::anyhow!(
-                "MANAGED_WORKSPACE_CONFIGURATION_MISMATCH: semantic configuration is absent"
+            consumer_error(
+                ConsumerErrorCode::ManagedWorkspaceConfigurationMismatch,
+                "semantic configuration is absent",
             )
         })?;
         let index_root = workspace_root(&self.app_data_dir, corpus_id);
@@ -2074,11 +2095,10 @@ mod tests {
         let switched = manager.switch(&first.corpus_id).await.unwrap();
         assert_eq!(switched.active_workspace_id, first.corpus_id);
         assert!(manager.active().is_read_only());
-        assert!(manager
-            .active()
-            .ensure_writable()
-            .unwrap_err()
-            .contains("MANAGED_WORKSPACE_PROTECTED"));
+        assert_eq!(
+            manager.active().ensure_writable().unwrap_err().code(),
+            Some(wilkes_core::consumer::ConsumerErrorCode::ManagedWorkspaceProtected)
+        );
 
         let mut mismatch = SelectedEmbedder::default();
         mismatch.dimension += 1;

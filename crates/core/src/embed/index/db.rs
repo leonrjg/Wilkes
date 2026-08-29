@@ -9,12 +9,14 @@ use ignore::WalkBuilder;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql};
 use tracing::error;
 
+use crate::consumer::{consumer_error, ConsumerErrorCode};
 use crate::extract::ExtractorRegistry;
 use crate::metadata::cache::FileIdentity;
 use crate::types::{
     BoundingBox, ByteRange, ChunkTopicMember, EmbeddingEngine, FileType, IndexStatus,
     IndexingConfig, RelatedDocument, SourceMap, SourceOrigin, SourceSegment,
 };
+use crate::{consumer_bail, consumer_ensure};
 
 use super::super::Embedder;
 use super::chunk::{chunk_content, ensure_chunks_reconstruct, Chunk};
@@ -2938,11 +2940,12 @@ impl SemanticIndex {
         expected: &EmbeddingSpaceIdentity,
     ) -> anyhow::Result<()> {
         let actual = self.embedding_space_identity()?;
-        anyhow::ensure!(
+        consumer_ensure!(
             &actual == expected,
-            "EMBEDDING_SPACE_MISMATCH: index={}, runtime={}",
+            ConsumerErrorCode::EmbeddingSpaceMismatch,
+            "index={}, runtime={}",
             actual.id().as_str(),
-            expected.id().as_str()
+            expected.id().as_str(),
         );
         Ok(())
     }
@@ -2956,10 +2959,11 @@ impl SemanticIndex {
         expected: &EmbeddingSpaceIdentity,
     ) -> anyhow::Result<()> {
         let metadata = self.embedding_metadata()?;
-        anyhow::ensure!(
+        consumer_ensure!(
             metadata.is_locally_compatible_with(expected),
-            "EMBEDDING_SPACE_MISMATCH: index metadata is incompatible with runtime {}",
-            expected.id().as_str()
+            ConsumerErrorCode::EmbeddingSpaceMismatch,
+            "index metadata is incompatible with runtime {}",
+            expected.id().as_str(),
         );
         Ok(())
     }
@@ -3378,8 +3382,12 @@ impl SemanticIndex {
         // Extract, embed, and write one file at a time so peak memory is bounded
         // to a single file's chunks + embeddings on top of the model weights.
         for (i, path) in paths.iter().enumerate() {
-            let extraction_recipe =
-                ExtractionRecipe::for_path(path, extractors, indexing.chunk_size, indexing.chunk_overlap);
+            let extraction_recipe = ExtractionRecipe::for_path(
+                path,
+                extractors,
+                indexing.chunk_size,
+                indexing.chunk_overlap,
+            );
             anyhow::ensure!(
                 !cancel_flag.load(Ordering::Relaxed),
                 "Index build cancelled"
@@ -4639,9 +4647,10 @@ impl SemanticIndex {
     }
 
     fn merge_root_from(&mut self, source: &SemanticIndex, root: &Path) -> anyhow::Result<()> {
-        anyhow::ensure!(
+        consumer_ensure!(
             self.embedding_space_id()? == source.embedding_space_id()?,
-            "EMBEDDING_SPACE_MISMATCH: refusing cross-index vector copy"
+            ConsumerErrorCode::EmbeddingSpaceMismatch,
+            "refusing cross-index vector copy",
         );
         let target_root_id = self.activate_root(root)?;
         let source_root_id = source.root_id_for_path(root)?.ok_or_else(|| {
@@ -5119,7 +5128,12 @@ impl SemanticIndex {
             admission_state: admitted.then(|| "ready".to_string()),
         };
         self.write_file_internal(prepared, Some(identity))?
-            .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: identity was not published"))
+            .ok_or_else(|| {
+                consumer_error(
+                    ConsumerErrorCode::DocumentIndexIncomplete,
+                    "identity was not published",
+                )
+            })
     }
 
     fn write_file_internal(
@@ -5141,10 +5155,11 @@ impl SemanticIndex {
                 embedding.len(),
                 abs_path_str
             );
-            anyhow::ensure!(
+            consumer_ensure!(
                 embedding.iter().all(|value| value.is_finite()),
-                "DOCUMENT_INDEX_INCOMPLETE: non-finite embedding for path {}",
-                abs_path_str
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "non-finite embedding for path {}",
+                abs_path_str,
             );
         }
 
@@ -5325,11 +5340,12 @@ impl SemanticIndex {
                     )
                     .optional()?;
                 if let Some((source, recipe, rendition)) = existing {
-                    anyhow::ensure!(
+                    consumer_ensure!(
                         source == identity.source_sha256
                             && recipe == identity.extraction_recipe_id
                             && rendition == identity.rendition_id.as_str(),
-                        "IDEMPOTENCY_KEY_CONFLICT: managed import key is already bound to a different rendition"
+                        ConsumerErrorCode::IdempotencyKeyConflict,
+                        "managed import key is already bound to a different rendition",
                     );
                 } else {
                     tx.execute(
@@ -5352,8 +5368,9 @@ impl SemanticIndex {
             .map(|identity| {
                 self.managed_document_by_rendition(identity.rendition_id.as_str())?
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "DOCUMENT_INDEX_INCOMPLETE: published rendition cannot be read"
+                        consumer_error(
+                            ConsumerErrorCode::DocumentIndexIncomplete,
+                            "published rendition cannot be read",
                         )
                     })
             })
@@ -6041,9 +6058,10 @@ impl SemanticIndex {
         let Some(document) = self.managed_document_for_path(path)? else {
             return Ok(None);
         };
-        anyhow::ensure!(
+        consumer_ensure!(
             document.extraction_recipe_id == expected_recipe.id(),
-            "DOCUMENT_INDEX_INCOMPLETE: canonical rendition uses a different extraction recipe"
+            ConsumerErrorCode::DocumentIndexIncomplete,
+            "canonical rendition uses a different extraction recipe",
         );
         let key = self.path_key_for_known_path(path);
         let full_text: Option<String> = self
@@ -6056,11 +6074,16 @@ impl SemanticIndex {
             )
             .optional()?
             .flatten();
-        let full_text = full_text
-            .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: retained text is absent"))?;
-        anyhow::ensure!(
+        let full_text = full_text.ok_or_else(|| {
+            consumer_error(
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "retained text is absent",
+            )
+        })?;
+        consumer_ensure!(
             sha256_bytes(full_text.as_bytes()) == document.extracted_content_sha256,
-            "DOCUMENT_INDEX_INCOMPLETE: extracted-content hash does not match retained text"
+            ConsumerErrorCode::DocumentIndexIncomplete,
+            "extracted-content hash does not match retained text",
         );
         let chunks = document
             .chunks
@@ -6108,9 +6131,10 @@ impl SemanticIndex {
         let Some((bound_source, bound_recipe, rendition)) = binding else {
             return Ok(None);
         };
-        anyhow::ensure!(
+        consumer_ensure!(
             bound_source == source_sha256 && bound_recipe == extraction_recipe_id,
-            "IDEMPOTENCY_KEY_CONFLICT: managed import key is already bound to different content"
+            ConsumerErrorCode::IdempotencyKeyConflict,
+            "managed import key is already bound to different content",
         );
         self.managed_document_by_rendition(&rendition)
     }
@@ -6120,9 +6144,10 @@ impl SemanticIndex {
         idempotency_key: &str,
         document: &ManagedDocumentData,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(
+        consumer_ensure!(
             !idempotency_key.trim().is_empty(),
-            "IDEMPOTENCY_KEY_CONFLICT: idempotency key is empty"
+            ConsumerErrorCode::IdempotencyKeyConflict,
+            "idempotency key is empty",
         );
         let existing = self
             .conn
@@ -6140,11 +6165,12 @@ impl SemanticIndex {
             )
             .optional()?;
         if let Some((source, recipe, rendition)) = existing {
-            anyhow::ensure!(
+            consumer_ensure!(
                 source == document.source_sha256
                     && recipe == document.extraction_recipe_id
                     && rendition == document.rendition_id.as_str(),
-                "IDEMPOTENCY_KEY_CONFLICT: managed import key is already bound to a different rendition"
+                ConsumerErrorCode::IdempotencyKeyConflict,
+                "managed import key is already bound to a different rendition",
             );
             return Ok(());
         }
@@ -6197,27 +6223,51 @@ impl SemanticIndex {
         else {
             return Ok(None);
         };
-        let source_sha256 = source_sha256
-            .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: source hash is absent"))?;
-        let snapshot = snapshot
-            .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: snapshot id is absent"))?;
+        let source_sha256 = source_sha256.ok_or_else(|| {
+            consumer_error(
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "source hash is absent",
+            )
+        })?;
+        let snapshot = snapshot.ok_or_else(|| {
+            consumer_error(
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "snapshot id is absent",
+            )
+        })?;
         let extraction_recipe_id = extraction_recipe_id.ok_or_else(|| {
-            anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: extraction recipe id is absent")
+            consumer_error(
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "extraction recipe id is absent",
+            )
         })?;
-        let rendition = rendition
-            .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: rendition id is absent"))?;
-        let full_text = full_text
-            .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: retained text is absent"))?;
+        let rendition = rendition.ok_or_else(|| {
+            consumer_error(
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "rendition id is absent",
+            )
+        })?;
+        let full_text = full_text.ok_or_else(|| {
+            consumer_error(
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "retained text is absent",
+            )
+        })?;
         let extracted_content_sha256 = extracted_content_sha256.ok_or_else(|| {
-            anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: extracted-content hash is absent")
+            consumer_error(
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "extracted-content hash is absent",
+            )
         })?;
-        anyhow::ensure!(
+        consumer_ensure!(
             sha256_bytes(full_text.as_bytes()) == extracted_content_sha256,
-            "DOCUMENT_INDEX_INCOMPLETE: extracted-content hash does not match retained text"
+            ConsumerErrorCode::DocumentIndexIncomplete,
+            "extracted-content hash does not match retained text",
         );
-        anyhow::ensure!(
+        consumer_ensure!(
             snapshot_id(&source_sha256).as_str() == snapshot,
-            "DOCUMENT_INDEX_INCOMPLETE: snapshot identity does not match source hash"
+            ConsumerErrorCode::DocumentIndexIncomplete,
+            "snapshot identity does not match source hash",
         );
 
         let mut stmt = self.conn.prepare(
@@ -6261,33 +6311,38 @@ impl SemanticIndex {
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        anyhow::ensure!(
+        consumer_ensure!(
             !rows.is_empty(),
-            "DOCUMENT_INDEX_INCOMPLETE: rendition has no complete chunk/vector mapping"
+            ConsumerErrorCode::DocumentIndexIncomplete,
+            "rendition has no complete chunk/vector mapping",
         );
         let mut chunks = Vec::with_capacity(rows.len());
         let mut descriptors = Vec::with_capacity(rows.len());
         for (expected_ordinal, row) in rows.into_iter().enumerate() {
             let (stored_ref, ordinal, text, stored_text_sha256, byte_start, byte_end, origin, blob) =
                 row;
-            anyhow::ensure!(
+            consumer_ensure!(
                 ordinal >= 0 && ordinal as usize == expected_ordinal,
-                "DOCUMENT_INDEX_INCOMPLETE: chunk ordinals are not contiguous"
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "chunk ordinals are not contiguous",
             );
-            anyhow::ensure!(
+            consumer_ensure!(
                 byte_start >= 0 && byte_end >= byte_start,
-                "DOCUMENT_INDEX_INCOMPLETE: invalid chunk byte range"
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "invalid chunk byte range",
             );
             let text_sha256 = sha256_bytes(text.as_bytes());
-            anyhow::ensure!(
+            consumer_ensure!(
                 text_sha256 == stored_text_sha256,
-                "DOCUMENT_INDEX_INCOMPLETE: chunk text hash mismatch"
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "chunk text hash mismatch",
             );
             let embedding = f32_slice_from_bytes(&blob)?;
-            anyhow::ensure!(
+            consumer_ensure!(
                 embedding.len() == self.dimension
                     && embedding.iter().all(|value| value.is_finite()),
-                "DOCUMENT_INDEX_INCOMPLETE: invalid stored vector"
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "invalid stored vector",
             );
             let byte_range = ByteRange {
                 start: byte_start as usize,
@@ -6313,14 +6368,16 @@ impl SemanticIndex {
             &extraction_recipe_id,
             &descriptors,
         );
-        anyhow::ensure!(
+        consumer_ensure!(
             recomputed_rendition.as_str() == rendition,
-            "DOCUMENT_INDEX_INCOMPLETE: rendition identity mismatch"
+            ConsumerErrorCode::DocumentIndexIncomplete,
+            "rendition identity mismatch",
         );
         for chunk in &chunks {
-            anyhow::ensure!(
+            consumer_ensure!(
                 chunk.chunk_ref == chunk_ref(&recomputed_rendition, chunk.ordinal),
-                "DOCUMENT_INDEX_INCOMPLETE: stable chunk reference mismatch"
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "stable chunk reference mismatch",
             );
         }
         Ok(Some(ManagedDocumentData {
@@ -6511,10 +6568,11 @@ impl SemanticIndex {
                 .map(ChunkRef::as_str)
                 .collect();
             missing.sort_unstable();
-            anyhow::bail!(
-                "CHUNK_REF_NOT_FOUND: {} reference(s) do not belong to this corpus: {}",
+            consumer_bail!(
+                ConsumerErrorCode::ChunkRefNotFound,
+                "{} reference(s) do not belong to this corpus: {}",
                 missing.len(),
-                missing.into_iter().take(10).collect::<Vec<_>>().join(", ")
+                missing.into_iter().take(10).collect::<Vec<_>>().join(", "),
             );
         }
         Ok(found)
@@ -6901,22 +6959,34 @@ impl SemanticIndex {
         let mut answers = vec![Vec::new(); probes.len()];
         for row in rows {
             let (chunk_ref, snapshot_id, rendition_id, ordinal, blob) = row?;
-            let chunk_ref = chunk_ref
-                .ok_or_else(|| anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: chunk ref is absent"))?;
+            let chunk_ref = chunk_ref.ok_or_else(|| {
+                consumer_error(
+                    ConsumerErrorCode::DocumentIndexIncomplete,
+                    "chunk ref is absent",
+                )
+            })?;
             let snapshot_id = snapshot_id.ok_or_else(|| {
-                anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: snapshot id is absent")
+                consumer_error(
+                    ConsumerErrorCode::DocumentIndexIncomplete,
+                    "snapshot id is absent",
+                )
             })?;
             let rendition_id = rendition_id.ok_or_else(|| {
-                anyhow::anyhow!("DOCUMENT_INDEX_INCOMPLETE: rendition id is absent")
+                consumer_error(
+                    ConsumerErrorCode::DocumentIndexIncomplete,
+                    "rendition id is absent",
+                )
             })?;
-            anyhow::ensure!(
+            consumer_ensure!(
                 ordinal >= 0,
-                "DOCUMENT_INDEX_INCOMPLETE: negative chunk ordinal"
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "negative chunk ordinal",
             );
             let vector = f32_slice_from_bytes(&blob)?;
-            anyhow::ensure!(
+            consumer_ensure!(
                 vector.len() == self.dimension && vector.iter().all(|value| value.is_finite()),
-                "DOCUMENT_INDEX_INCOMPLETE: invalid stored vector"
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "invalid stored vector",
             );
             let vector = normalized_vector(&vector);
             for (probe_index, probe) in probes.iter().enumerate() {

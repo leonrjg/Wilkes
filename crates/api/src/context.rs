@@ -63,6 +63,9 @@ use wilkes_core::worker::manager::{
 };
 
 use crate::commands::search::{start_search, SearchHandle};
+use wilkes_core::consumer::{ConsumerError, ConsumerErrorCode};
+use wilkes_core::{consumer_bail, consumer_ensure};
+
 use crate::commands::settings::{get_scoped_settings, update_scoped_settings};
 #[cfg(test)]
 use crate::commands::settings::{get_settings, update_settings};
@@ -511,9 +514,10 @@ fn backup_managed_directory_parts(
 
     let index = SemanticIndex::open_for_maintenance(projection_data_dir)?;
     let actual_space = index.embedding_space_identity()?.id().0;
-    anyhow::ensure!(
+    consumer_ensure!(
         actual_space == expected_embedding_space_id,
-        "EMBEDDING_SPACE_MISMATCH: index={actual_space}, request={expected_embedding_space_id}"
+        ConsumerErrorCode::EmbeddingSpaceMismatch,
+        "index={actual_space}, request={expected_embedding_space_id}",
     );
     drop(index);
 
@@ -1102,8 +1106,7 @@ impl AppContext {
         // role: a build alternates recognition and embedding file by file, and
         // sharing a manager between them would restart and reload a model on
         // every alternation.
-        let (recognize_manager, recognize_event_rx, recognize_loop_fut) =
-            WorkerManager::new(paths);
+        let (recognize_manager, recognize_event_rx, recognize_loop_fut) = WorkerManager::new(paths);
         let bookmarks_path = data_dir.join("bookmarks.json");
         let model_dir = shared_data_dir.join("models");
         let ctx = Arc::new(Self {
@@ -1855,7 +1858,7 @@ impl AppContext {
     /// Attach the immutable managed workspace configuration to a concrete
     /// embedder and index. This is idempotent and refuses any exact-space
     /// mismatch; it never rewrites the managed manifest.
-    pub async fn ensure_managed_runtime(self: &Arc<Self>) -> Result<String, String> {
+    pub async fn ensure_managed_runtime(self: &Arc<Self>) -> Result<String, ConsumerError> {
         let _pending = PendingManagedOperation::new(&self.managed_pending_builds);
         let _runtime_guard = self.managed_runtime_lock.lock().await;
         if let Some(embedder) = self.embedder.lock().clone() {
@@ -1887,16 +1890,18 @@ impl AppContext {
             .map_err(|error| format!("Could not install managed embedding model: {error:#}"))?;
         let model_dir = self.model_dir.clone();
         let installer_for_build = Arc::clone(&installer);
-        let embedder =
-            tokio::task::spawn_blocking(move || installer_for_build.build(&model_dir))
-                .await
-                .map_err(|error| format!("Managed embedder task panicked: {error}"))?
-                .map_err(|error| format!("Could not load managed embedder: {error:#}"))?;
+        let embedder = tokio::task::spawn_blocking(move || installer_for_build.build(&model_dir))
+            .await
+            .map_err(|error| format!("Managed embedder task panicked: {error}"))?
+            .map_err(|error| format!("Could not load managed embedder: {error:#}"))?;
         if embedder.dimension() != selected.dimension {
-            return Err(format!(
-                "MANAGED_WORKSPACE_CONFIGURATION_MISMATCH: configured dimension {}, runtime dimension {}",
-                selected.dimension,
-                embedder.dimension()
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::ManagedWorkspaceConfigurationMismatch,
+                format!(
+                    "configured dimension {}, runtime dimension {}",
+                    selected.dimension,
+                    embedder.dimension()
+                ),
             ));
         }
         let expected_identity = embedder.embedding_space_identity();
@@ -1971,7 +1976,10 @@ impl AppContext {
             || source_after_sha256 != source_sha256
         {
             let _ = std::fs::remove_file(&temporary);
-            anyhow::bail!("SOURCE_CHANGED_DURING_IMPORT");
+            consumer_bail!(
+                ConsumerErrorCode::SourceChangedDuringImport,
+                "the source changed while it was being copied",
+            );
         }
         let snapshot_dir = managed_sources.join(&source_sha256);
         std::fs::create_dir_all(&snapshot_dir)?;
@@ -1989,7 +1997,10 @@ impl AppContext {
         let snapshot = if let Some(existing) = existing {
             if wilkes_core::embed::identity::sha256_file(&existing)? != source_sha256 {
                 let _ = std::fs::remove_file(&temporary);
-                anyhow::bail!("DOCUMENT_INDEX_INCOMPLETE: retained snapshot digest mismatch");
+                consumer_bail!(
+                    ConsumerErrorCode::DocumentIndexIncomplete,
+                    "retained snapshot digest mismatch",
+                );
             }
             let _ = std::fs::remove_file(&temporary);
             existing
@@ -2007,8 +2018,9 @@ impl AppContext {
                     })?;
                     if destination_sha256 != source_sha256 {
                         let _ = std::fs::remove_file(&temporary);
-                        anyhow::bail!(
-                            "DOCUMENT_INDEX_INCOMPLETE: retained snapshot digest mismatch"
+                        consumer_bail!(
+                            ConsumerErrorCode::DocumentIndexIncomplete,
+                            "retained snapshot digest mismatch",
                         );
                     }
                     let _ = std::fs::remove_file(&temporary);
@@ -2034,7 +2046,7 @@ impl AppContext {
         &self,
         root: PathBuf,
         path: PathBuf,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<PathBuf, ConsumerError> {
         let settings = self.settings().await;
         let (library_roots, _) = library_roots(&settings);
         let root = Self::canonicalize_search_root(&root)?;
@@ -2056,13 +2068,14 @@ impl AppContext {
         source_path: PathBuf,
         source_workspace: Option<Arc<AppContext>>,
         original_source_provenance: serde_json::Value,
-    ) -> Result<ManagedDocumentExport, String> {
+    ) -> Result<ManagedDocumentExport, ConsumerError> {
         let _pending = PendingManagedOperation::new(&self.managed_pending_imports);
         let _import_guard = self.managed_import_lock.lock().await;
         if idempotency_key.trim().is_empty() || idempotency_key.len() > 256 {
-            return Err(
-                "IDEMPOTENCY_KEY_CONFLICT: idempotency key must contain 1 to 256 bytes".to_string(),
-            );
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::IdempotencyKeyConflict,
+                "idempotency key must contain 1 to 256 bytes",
+            ));
         }
         let settings = self.settings().await;
         let extension = source_path
@@ -2074,15 +2087,17 @@ impl AppContext {
             .iter()
             .any(|supported| supported.eq_ignore_ascii_case(extension))
         {
-            return Err(format!("Unsupported managed import extension: {extension}"));
+            return Err(ConsumerError::untyped(format!(
+                "Unsupported managed import extension: {extension}"
+            )));
         }
         let metadata = std::fs::metadata(&source_path)
             .map_err(|error| format!("External source cannot be read: {error}"))?;
         if metadata.len() > settings.max_file_size {
-            return Err(format!(
+            return Err(ConsumerError::untyped(format!(
                 "Managed import exceeds the configured {} byte file limit",
                 settings.max_file_size
-            ));
+            )));
         }
         let (snapshot_path, relative_path, source_sha256) = {
             let data_dir = self.data_dir.clone();
@@ -2101,7 +2116,12 @@ impl AppContext {
                 .map_err(|_| "Semantic index lock was poisoned")?;
             guard
                 .as_ref()
-                .ok_or_else(|| "MANAGED_WORKSPACE_NOT_FOUND: runtime is not ready".to_string())?
+                .ok_or_else(|| {
+                    ConsumerError::new(
+                        ConsumerErrorCode::ManagedWorkspaceNotFound,
+                        "runtime is not ready",
+                    )
+                })?
                 .embedding_space_identity()
                 .map_err(|error| error.to_string())?
         };
@@ -2187,7 +2207,10 @@ impl AppContext {
             prepared
         } else {
             let embedder = self.embedder.lock().clone().ok_or_else(|| {
-                "MANAGED_WORKSPACE_NOT_FOUND: managed embedder is unavailable".to_string()
+                ConsumerError::new(
+                    ConsumerErrorCode::ManagedWorkspaceNotFound,
+                    "managed embedder is unavailable",
+                )
             })?;
             let snapshot_for_task = snapshot_path.clone();
             let chunk_size = settings.semantic.chunk_size;
@@ -2208,7 +2231,10 @@ impl AppContext {
         };
         let expected_chunks = prepared.chunks.len();
         if expected_chunks == 0 {
-            return Err("DOCUMENT_INDEX_INCOMPLETE: document produced no chunks".to_string());
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "document produced no chunks",
+            ));
         }
         let managed = {
             let index_arc = self.index.lock().clone();
@@ -2232,7 +2258,10 @@ impl AppContext {
             managed
         };
         if managed.source_sha256 != source_sha256 || managed.chunks.len() != expected_chunks {
-            return Err("DOCUMENT_INDEX_INCOMPLETE: publication verification failed".to_string());
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "publication verification failed",
+            ));
         }
         Self::managed_export(
             corpus_id,
@@ -2254,13 +2283,14 @@ impl AppContext {
         canonical: &Arc<Self>,
         canonical_snapshot_path: PathBuf,
         original_source_provenance: serde_json::Value,
-    ) -> Result<ManagedDocumentExport, String> {
+    ) -> Result<ManagedDocumentExport, ConsumerError> {
         let _pending = PendingManagedOperation::new(&self.managed_pending_imports);
         let _import_guard = self.managed_import_lock.lock().await;
         if idempotency_key.trim().is_empty() || idempotency_key.len() > 256 {
-            return Err(
-                "IDEMPOTENCY_KEY_CONFLICT: idempotency key must contain 1 to 256 bytes".to_string(),
-            );
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::IdempotencyKeyConflict,
+                "idempotency key must contain 1 to 256 bytes",
+            ));
         }
         let source_sha256 = wilkes_core::embed::identity::sha256_file(&canonical_snapshot_path)
             .map_err(|error| format!("Could not verify canonical managed snapshot: {error:#}"))?;
@@ -2278,7 +2308,12 @@ impl AppContext {
                 .map_err(|_| "Semantic index lock was poisoned")?;
             guard
                 .as_ref()
-                .ok_or_else(|| "MANAGED_WORKSPACE_NOT_FOUND: runtime is not ready".to_string())?
+                .ok_or_else(|| {
+                    ConsumerError::new(
+                        ConsumerErrorCode::ManagedWorkspaceNotFound,
+                        "runtime is not ready",
+                    )
+                })?
                 .embedding_space_identity()
                 .map_err(|error| error.to_string())?
         };
@@ -2311,7 +2346,10 @@ impl AppContext {
             guard
                 .as_ref()
                 .ok_or_else(|| {
-                    "MANAGED_WORKSPACE_NOT_FOUND: canonical index is unavailable".to_string()
+                    ConsumerError::new(
+                        ConsumerErrorCode::ManagedWorkspaceNotFound,
+                        "canonical index is unavailable",
+                    )
                 })?
                 .managed_file_structure_for_reembedding(
                     &canonical_snapshot_path,
@@ -2320,14 +2358,23 @@ impl AppContext {
                 )
                 .map_err(|error| format!("Could not read canonical rendition: {error:#}"))?
                 .ok_or_else(|| {
-                    "DOCUMENT_INDEX_INCOMPLETE: canonical snapshot is not admitted".to_string()
+                    ConsumerError::new(
+                        ConsumerErrorCode::DocumentIndexIncomplete,
+                        "canonical snapshot is not admitted",
+                    )
                 })?
         };
         if prepared.chunks.is_empty() {
-            return Err("DOCUMENT_INDEX_INCOMPLETE: document produced no chunks".to_string());
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "document produced no chunks",
+            ));
         }
         let embedder = self.embedder.lock().clone().ok_or_else(|| {
-            "MANAGED_WORKSPACE_NOT_FOUND: managed embedder is unavailable".to_string()
+            ConsumerError::new(
+                ConsumerErrorCode::ManagedWorkspaceNotFound,
+                "managed embedder is unavailable",
+            )
         })?;
         let texts: Vec<&str> = prepared
             .chunks
@@ -2338,10 +2385,13 @@ impl AppContext {
             .embed_passages(&texts)
             .map_err(|error| format!("Could not embed canonical rendition: {error:#}"))?;
         if embeddings.len() != prepared.chunks.len() {
-            return Err(format!(
-                "DOCUMENT_INDEX_INCOMPLETE: embedder returned {} vectors for {} canonical chunks",
-                embeddings.len(),
-                prepared.chunks.len()
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                format!(
+                    "embedder returned {} vectors for {} canonical chunks",
+                    embeddings.len(),
+                    prepared.chunks.len()
+                ),
             ));
         }
         for ((_, vector), embedding) in prepared.chunks.iter_mut().zip(embeddings) {
@@ -2369,7 +2419,10 @@ impl AppContext {
                 .map_err(|error| format!("Could not publish embedding projection: {error:#}"))?
         };
         if managed.source_sha256 != source_sha256 || managed.chunks.len() != expected_chunks {
-            return Err("DOCUMENT_INDEX_INCOMPLETE: projection verification failed".to_string());
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "projection verification failed",
+            ));
         }
         Self::managed_export(
             corpus_id,
@@ -2382,7 +2435,7 @@ impl AppContext {
 
     /// The retained snapshots this managed corpus has admitted — what a
     /// projection must hold to be level with it.
-    pub fn managed_admitted_sources(&self) -> Result<Vec<PathBuf>, String> {
+    pub fn managed_admitted_sources(&self) -> Result<Vec<PathBuf>, ConsumerError> {
         let index_arc = self.index.lock().clone();
         let guard = index_arc
             .lock()
@@ -2391,7 +2444,7 @@ impl AppContext {
             .as_ref()
             .ok_or_else(|| "Managed index unavailable".to_string())?
             .managed_admitted_source_paths()
-            .map_err(|error| error.to_string())
+            .map_err(|error| ConsumerError::from_anyhow(&error))
     }
 
     pub fn managed_pending_operations(&self) -> (u64, u64) {
@@ -2410,7 +2463,7 @@ impl AppContext {
         &self,
         corpus_id: String,
         expected_embedding_space_id: String,
-    ) -> Result<ManagedCorpusBackup, String> {
+    ) -> Result<ManagedCorpusBackup, ConsumerError> {
         let _import_guard = self.managed_import_lock.lock().await;
         let _runtime_guard = self.managed_runtime_lock.lock().await;
         let data_dir = self.data_dir.clone();
@@ -2428,8 +2481,10 @@ impl AppContext {
             )
         })
         .await
-        .map_err(|error| format!("Managed backup task panicked: {error}"))?
-        .map_err(|error| format!("Could not back up managed corpus: {error:#}"))
+        .map_err(|error| ConsumerError::untyped(format!("Managed backup task panicked: {error}")))?
+        .map_err(|error| {
+            ConsumerError::from_anyhow(&error.context("Could not back up managed corpus"))
+        })
     }
 
     /// Back up canonical membership with whichever embedding projection is
@@ -2441,7 +2496,7 @@ impl AppContext {
         projection: &Arc<Self>,
         corpus_id: String,
         expected_embedding_space_id: String,
-    ) -> Result<ManagedCorpusBackup, String> {
+    ) -> Result<ManagedCorpusBackup, ConsumerError> {
         let _canonical_import_guard = self.managed_import_lock.lock().await;
         let _canonical_runtime_guard = self.managed_runtime_lock.lock().await;
         let _projection_import_guard = projection.managed_import_lock.lock().await;
@@ -2463,8 +2518,10 @@ impl AppContext {
             )
         })
         .await
-        .map_err(|error| format!("Managed backup task panicked: {error}"))?
-        .map_err(|error| format!("Could not back up managed corpus: {error:#}"))
+        .map_err(|error| ConsumerError::untyped(format!("Managed backup task panicked: {error}")))?
+        .map_err(|error| {
+            ConsumerError::from_anyhow(&error.context("Could not back up managed corpus"))
+        })
     }
 
     fn managed_export(
@@ -2473,7 +2530,7 @@ impl AppContext {
         embedding_identity: &wilkes_core::embed::EmbeddingSpaceIdentity,
         snapshot_path: PathBuf,
         reused: bool,
-    ) -> Result<ManagedDocumentExport, String> {
+    ) -> Result<ManagedDocumentExport, ConsumerError> {
         let source_byte_len = std::fs::metadata(&snapshot_path)
             .map_err(|error| format!("Could not read retained snapshot metadata: {error}"))?
             .len();
@@ -2535,7 +2592,7 @@ impl AppContext {
     pub async fn managed_embed_texts(
         &self,
         texts: Vec<String>,
-    ) -> Result<ManagedEmbeddedTexts, String> {
+    ) -> Result<ManagedEmbeddedTexts, ConsumerError> {
         let embedded = self.embed_texts(texts).await?;
         let space = {
             let index_arc = self.index.lock().clone();
@@ -2560,13 +2617,15 @@ impl AppContext {
     pub async fn managed_accumulate(
         &self,
         groups: Vec<Vec<ChunkRef>>,
-    ) -> Result<ManagedAccumulations, String> {
+    ) -> Result<ManagedAccumulations, ConsumerError> {
         if groups.is_empty() {
-            return Err("Aggregate request names no groups".to_string());
+            return Err(ConsumerError::untyped("Aggregate request names no groups"));
         }
         let total: usize = groups.iter().map(Vec::len).sum();
         if groups.len() > MAX_CENTROID_GROUPS || total > MAX_CENTROID_CHUNK_IDS {
-            return Err("Aggregate request exceeds the documented request cap".to_string());
+            return Err(ConsumerError::untyped(
+                "Aggregate request exceeds the documented request cap",
+            ));
         }
         let index_arc = self.index.lock().clone();
         tokio::task::spawn_blocking(move || {
@@ -2601,12 +2660,16 @@ impl AppContext {
     pub async fn managed_resolve_chunks(
         &self,
         refs: Vec<ChunkRef>,
-    ) -> Result<ManagedChunkResolution, String> {
+    ) -> Result<ManagedChunkResolution, ConsumerError> {
         if refs.is_empty() {
-            return Err("Resolve request names no chunk refs".to_string());
+            return Err(ConsumerError::untyped(
+                "Resolve request names no chunk refs",
+            ));
         }
         if refs.len() > MAX_SIMILARITY_CHUNK_IDS {
-            return Err("Resolve request exceeds the documented request cap".to_string());
+            return Err(ConsumerError::untyped(
+                "Resolve request exceeds the documented request cap",
+            ));
         }
         let index_arc = self.index.lock().clone();
         tokio::task::spawn_blocking(move || {
@@ -2645,13 +2708,15 @@ impl AppContext {
         &self,
         probes: Vec<ManagedSimilarityProbeRequest>,
         chunk_refs: Vec<ChunkRef>,
-    ) -> Result<ManagedChunkSimilarities, String> {
+    ) -> Result<ManagedChunkSimilarities, ConsumerError> {
         if probes.is_empty() {
-            return Err("Similarity request names no probes".to_string());
+            return Err(ConsumerError::untyped("Similarity request names no probes"));
         }
         let total = chunk_refs.len() + probes.iter().map(|probe| probe.scope.len()).sum::<usize>();
         if probes.len() > MAX_SIMILARITY_PROBES || total > MAX_SIMILARITY_CHUNK_IDS {
-            return Err("Similarity request exceeds the documented request cap".to_string());
+            return Err(ConsumerError::untyped(
+                "Similarity request exceeds the documented request cap",
+            ));
         }
         let index_arc = self.index.lock().clone();
         tokio::task::spawn_blocking(move || {
@@ -2729,15 +2794,17 @@ impl AppContext {
         probes: Vec<ManagedSearchProbeInput>,
         top_k: usize,
         min_similarity: f32,
-    ) -> Result<ManagedChunkSearch, String> {
+    ) -> Result<ManagedChunkSearch, ConsumerError> {
         if probes.is_empty() {
-            return Err("Search request names no probes".to_string());
+            return Err(ConsumerError::untyped("Search request names no probes"));
         }
         if probes.len() > MAX_MANAGED_SEARCH_PROBES
             || top_k == 0
             || top_k > MAX_MANAGED_SEARCH_TOP_K
         {
-            return Err("Search request exceeds the documented request cap".to_string());
+            return Err(ConsumerError::untyped(
+                "Search request exceeds the documented request cap",
+            ));
         }
         let probes = self.resolve_search_probes(probes).await?;
         let index_arc = self.index.lock().clone();
@@ -4339,13 +4406,12 @@ impl AppContext {
     /// Deliberately not applied to [`Self::import_managed_document`] and the
     /// rest of the managed corpus API. That caller *is* the workspace's owner;
     /// it is every other caller that must be turned away.
-    pub fn ensure_writable(&self) -> Result<(), String> {
+    pub fn ensure_writable(&self) -> Result<(), ConsumerError> {
         if self.is_application_managed() {
-            return Err(
-                "MANAGED_WORKSPACE_PROTECTED: this workspace is owned by another application and \
-                 can only be read"
-                    .to_string(),
-            );
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::ManagedWorkspaceProtected,
+                "this workspace is owned by another application and can only be read",
+            ));
         }
         Ok(())
     }
@@ -4681,7 +4747,8 @@ impl AppContext {
             return Err(error);
         }
         self.load_image_analyzer().await?;
-        self.events.emit("image-analysis-done", serde_json::json!({}));
+        self.events
+            .emit("image-analysis-done", serde_json::json!({}));
         Ok(())
     }
 
@@ -5176,7 +5243,7 @@ impl AppContext {
     /// inside the configured library; saving never becomes a path-creation or
     /// arbitrary-filesystem API.
     pub async fn save_document(&self, path: PathBuf, text: String) -> Result<(), String> {
-        self.ensure_writable()?;
+        self.ensure_writable().map_err(|error| error.to_string())?;
         let settings = self.get_settings().await;
         let (roots, _) = library_roots(&settings);
         let path = std::fs::canonicalize(&path)
@@ -5203,8 +5270,7 @@ impl AppContext {
 
     pub async fn list_generation_models(&self) -> anyhow::Result<Vec<GeneratorDescriptor>> {
         let settings = self.generation_settings().await;
-        generate_dispatch::list_models(settings.engine, &self.model_dir, &settings.ollama_url)
-            .await
+        generate_dispatch::list_models(settings.engine, &self.model_dir, &settings.ollama_url).await
     }
 
     pub async fn fetch_generation_model_size(&self, model_id: &str) -> anyhow::Result<u64> {
@@ -6168,7 +6234,7 @@ impl AppContext {
         root: String,
         selected: SelectedEmbedder,
     ) -> Result<(), String> {
-        self.ensure_writable()?;
+        self.ensure_writable().map_err(|error| error.to_string())?;
         info!(
             "AppContext::start_build_index: root={}, engine={}, model={}",
             root,
@@ -9273,7 +9339,11 @@ mod tests {
         );
         assert!(managed.is_read_only());
         let error = managed.ensure_writable().unwrap_err();
-        assert!(error.contains("MANAGED_WORKSPACE_PROTECTED"), "{error}");
+        assert_eq!(
+            error.code(),
+            Some(wilkes_core::consumer::ConsumerErrorCode::ManagedWorkspaceProtected),
+            "{error}"
+        );
         assert!(managed
             .save_document(dir.path().join("note.md"), "text".to_string())
             .await

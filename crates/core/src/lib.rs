@@ -1,6 +1,7 @@
 pub mod acquire;
 pub mod catalogue;
 pub mod completion;
+pub mod consumer;
 pub mod directory_watcher;
 pub mod embed;
 pub mod extract;

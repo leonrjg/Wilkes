@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::http::errors::{err, managed_err, server_err, ErrorBody};
+use crate::http::errors::{consumer_anyhow_err, consumer_err, err, server_err, ErrorBody};
 use crate::http::search::forward_search_results;
 #[cfg(test)]
 use crate::http::state::BroadcastEmitter;
@@ -43,6 +43,7 @@ use wilkes_api::workspace::{
     ManagedWorkspaceStatus, WorkspaceState, WorkspaceSummary,
 };
 use wilkes_core::completion::{CompletionFeedback, CompletionRequest};
+use wilkes_core::consumer::{ConsumerError, ConsumerErrorCode};
 use wilkes_core::embed::ChunkRef;
 use wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryInput;
 use wilkes_core::types::{
@@ -264,25 +265,26 @@ async fn ensure_managed_workspace_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<EnsureManagedWorkspace>,
 ) -> Result<Json<ManagedWorkspaceStatus>, (StatusCode, Json<ErrorBody>)> {
-    let manager = state.workspaces.as_ref().ok_or_else(|| {
-        managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
-    })?;
+    let manager = state
+        .workspaces
+        .as_ref()
+        .ok_or_else(|| workspace_manager_unavailable())?;
     let initial = manager
         .ensure_managed_workspace(request)
         .await
-        .map_err(|error| managed_err(format!("{error:#}")))?;
+        .map_err(consumer_anyhow_err)?;
     let context = manager
         .context_for(&initial.corpus_id)
         .await
-        .map_err(|error| managed_err(format!("{error:#}")))?;
+        .map_err(consumer_anyhow_err)?;
     context
         .ensure_managed_runtime()
         .await
-        .map_err(managed_err)?;
+        .map_err(consumer_err)?;
     let status = manager
         .managed_workspace_status(&initial.corpus_id)
         .await
-        .map_err(|error| managed_err(format!("{error:#}")))?;
+        .map_err(consumer_anyhow_err)?;
     Ok(Json(managed_status_with_pending(status, &context)))
 }
 
@@ -306,17 +308,18 @@ async fn managed_workspace_status_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ManagedStatusQuery>,
 ) -> Result<Json<ManagedWorkspaceStatus>, (StatusCode, Json<ErrorBody>)> {
-    let manager = state.workspaces.as_ref().ok_or_else(|| {
-        managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
-    })?;
+    let manager = state
+        .workspaces
+        .as_ref()
+        .ok_or_else(|| workspace_manager_unavailable())?;
     let status = manager
         .managed_workspace_status(&query.corpus_id)
         .await
-        .map_err(|error| managed_err(format!("{error:#}")))?;
+        .map_err(consumer_anyhow_err)?;
     let context = manager
         .context_for(&query.corpus_id)
         .await
-        .map_err(|error| managed_err(format!("{error:#}")))?;
+        .map_err(consumer_anyhow_err)?;
     Ok(Json(managed_status_with_pending(status, &context)))
 }
 
@@ -324,14 +327,15 @@ async fn ensure_managed_space_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<EnsureManagedEmbeddingSpace>,
 ) -> Result<Json<ManagedEmbeddingSpaceStatus>, (StatusCode, Json<ErrorBody>)> {
-    let manager = state.workspaces.as_ref().ok_or_else(|| {
-        managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
-    })?;
+    let manager = state
+        .workspaces
+        .as_ref()
+        .ok_or_else(|| workspace_manager_unavailable())?;
     manager
         .ensure_managed_space(request)
         .await
         .map(Json)
-        .map_err(|error| managed_err(format!("{error:#}")))
+        .map_err(consumer_anyhow_err)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -364,13 +368,14 @@ async fn import_managed_document_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedImportBody>,
 ) -> Result<Json<wilkes_api::context::ManagedDocumentExport>, (StatusCode, Json<ErrorBody>)> {
-    let manager = state.workspaces.as_ref().ok_or_else(|| {
-        managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
-    })?;
+    let manager = state
+        .workspaces
+        .as_ref()
+        .ok_or_else(|| workspace_manager_unavailable())?;
     let status = manager
         .managed_workspace_status(&body.corpus_id)
         .await
-        .map_err(|error| managed_err(format!("{error:#}")))?;
+        .map_err(consumer_anyhow_err)?;
     let expected_exists = match body.expected_embedding_space_id.as_deref() {
         Some(expected) => status
             .spaces
@@ -379,20 +384,23 @@ async fn import_managed_document_handler(
         None => status.spaces.is_empty(),
     };
     if !expected_exists {
-        return Err(managed_err(format!(
-            "EMBEDDING_SPACE_MISMATCH: corpus={}, request={}",
-            describe_space(status.embedding_space_id.as_deref()),
-            describe_space(body.expected_embedding_space_id.as_deref())
+        return Err(consumer_err(ConsumerError::new(
+            ConsumerErrorCode::EmbeddingSpaceMismatch,
+            format!(
+                "corpus={}, request={}",
+                describe_space(status.embedding_space_id.as_deref()),
+                describe_space(body.expected_embedding_space_id.as_deref())
+            ),
         )));
     }
     let managed = manager
         .context_for(&body.corpus_id)
         .await
-        .map_err(|error| managed_err(format!("{error:#}")))?;
+        .map_err(consumer_anyhow_err)?;
     managed
         .ensure_managed_runtime()
         .await
-        .map_err(managed_err)?;
+        .map_err(consumer_err)?;
     let (path, source_workspace) = match &body.source {
         ManagedImportSource::Path { path } => (path.clone(), None),
         ManagedImportSource::WilkesFile {
@@ -403,16 +411,19 @@ async fn import_managed_document_handler(
             let source = manager
                 .context_for(workspace_id)
                 .await
-                .map_err(|error| managed_err(format!("{error:#}")))?;
+                .map_err(consumer_anyhow_err)?;
             let path = source
                 .authorize_managed_workspace_file(root.clone(), path.clone())
                 .await
-                .map_err(managed_err)?;
+                .map_err(consumer_err)?;
             (path, Some(source))
         }
     };
-    let provenance = serde_json::to_value(&body.source)
-        .map_err(|error| managed_err(format!("Could not encode import provenance: {error}")))?;
+    let provenance = serde_json::to_value(&body.source).map_err(|error| {
+        consumer_err(ConsumerError::untyped(format!(
+            "Could not encode import provenance: {error}"
+        )))
+    })?;
     let exported = managed
         .import_managed_document(
             body.corpus_id.clone(),
@@ -422,7 +433,7 @@ async fn import_managed_document_handler(
             provenance.clone(),
         )
         .await
-        .map_err(managed_err)?;
+        .map_err(consumer_err)?;
     // The document is admitted to the canonical corpus above; the spaces are
     // brought to it here. A secondary model that is slow, unavailable, or
     // broken must not decide whether a document is in the corpus — the corpus
@@ -432,7 +443,7 @@ async fn import_managed_document_handler(
     let failures = manager
         .catch_up_corpus(&body.corpus_id)
         .await
-        .map_err(|error| managed_err(format!("{error:#}")))?;
+        .map_err(consumer_anyhow_err)?;
     for (space, error) in &failures {
         // Left owed rather than raised: the space is already unservable while
         // it is behind, and the next catch-up — the next import, or the
@@ -468,7 +479,7 @@ async fn chunks_resolve_handler(
         .managed_resolve_chunks(body.chunk_refs)
         .await
         .map(Json)
-        .map_err(managed_err)
+        .map_err(consumer_err)
 }
 
 async fn chunks_accumulate_handler(
@@ -481,7 +492,7 @@ async fn chunks_accumulate_handler(
         .managed_accumulate(body.groups)
         .await
         .map(Json)
-        .map_err(managed_err)
+        .map_err(consumer_err)
 }
 
 #[derive(Deserialize)]
@@ -504,7 +515,7 @@ async fn chunks_similarity_handler(
         .managed_chunk_similarity(body.probes, body.chunk_refs)
         .await
         .map(Json)
-        .map_err(managed_err)
+        .map_err(consumer_err)
 }
 
 #[derive(Deserialize)]
@@ -864,7 +875,7 @@ async fn chunks_search_handler(
         )
         .await
         .map(Json)
-        .map_err(managed_err)
+        .map_err(consumer_err)
 }
 
 #[derive(Deserialize)]
@@ -895,23 +906,25 @@ async fn managed_backup_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedBackupBody>,
 ) -> Result<Json<wilkes_api::context::ManagedCorpusBackup>, (StatusCode, Json<ErrorBody>)> {
-    let manager = state.workspaces.as_ref().ok_or_else(|| {
-        managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
-    })?;
+    let manager = state
+        .workspaces
+        .as_ref()
+        .ok_or_else(|| workspace_manager_unavailable())?;
     manager
         .backup_managed_corpus(&body.corpus_id, &body.expected_embedding_space_id)
         .await
         .map(Json)
-        .map_err(|error| managed_err(format!("{error:#}")))
+        .map_err(consumer_anyhow_err)
 }
 
 async fn managed_restore_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedRestoreBody>,
 ) -> Result<Json<ManagedWorkspaceStatus>, (StatusCode, Json<ErrorBody>)> {
-    let manager = state.workspaces.as_ref().ok_or_else(|| {
-        managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
-    })?;
+    let manager = state
+        .workspaces
+        .as_ref()
+        .ok_or_else(|| workspace_manager_unavailable())?;
     manager
         .restore_managed_workspace(
             &body.backup_name,
@@ -921,7 +934,7 @@ async fn managed_restore_handler(
         )
         .await
         .map(Json)
-        .map_err(|error| managed_err(format!("{error:#}")))
+        .map_err(consumer_anyhow_err)
 }
 
 async fn managed_embed_text_handler(
@@ -934,7 +947,7 @@ async fn managed_embed_text_handler(
         .managed_embed_texts(body.texts)
         .await
         .map(Json)
-        .map_err(managed_err)
+        .map_err(consumer_err)
 }
 
 /// What this Wilkes can embed with — the models, their dimensions, and the
@@ -955,6 +968,15 @@ async fn embedder_capabilities_handler(
     ))
 }
 
+/// A server with no workspace manager can serve no corpus, so there is no id
+/// it could be said to disagree about.
+fn workspace_manager_unavailable() -> (StatusCode, Json<ErrorBody>) {
+    consumer_err(ConsumerError::new(
+        ConsumerErrorCode::ManagedWorkspaceNotFound,
+        "workspace manager is unavailable",
+    ))
+}
+
 /// Render a corpus or request embedding space for an error message. A corpus
 /// with no index has no space, which is a distinct state from disagreeing
 /// about which space is in use.
@@ -967,20 +989,22 @@ async fn managed_context(
     corpus_id: &str,
     expected_embedding_space_id: &str,
 ) -> Result<Arc<wilkes_api::context::AppContext>, (StatusCode, Json<ErrorBody>)> {
-    let manager = state.workspaces.as_ref().ok_or_else(|| {
-        managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
-    })?;
+    let manager = state
+        .workspaces
+        .as_ref()
+        .ok_or_else(|| workspace_manager_unavailable())?;
     let context = manager
         .managed_space_context(corpus_id, expected_embedding_space_id)
         .await
-        .map_err(|error| managed_err(format!("{error:#}")))?;
+        .map_err(consumer_anyhow_err)?;
     let actual = context
         .ensure_managed_runtime()
         .await
-        .map_err(managed_err)?;
+        .map_err(consumer_err)?;
     if actual != expected_embedding_space_id {
-        return Err(managed_err(format!(
-            "EMBEDDING_SPACE_MISMATCH: runtime={actual}, request={expected_embedding_space_id}"
+        return Err(consumer_err(ConsumerError::new(
+            ConsumerErrorCode::EmbeddingSpaceMismatch,
+            format!("runtime={actual}, request={expected_embedding_space_id}"),
         )));
     }
     Ok(context)
@@ -1904,7 +1928,7 @@ async fn upload_handler(
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     let (ctx, uploads_dir) = state.workspace_snapshot();
-    ctx.ensure_writable().map_err(err)?;
+    ctx.ensure_writable().map_err(consumer_err)?;
     let current_size = TokioServerFs.dir_size(&uploads_dir).await.unwrap_or(0);
     if current_size >= MAX_UPLOAD_BYTES {
         return Err(err(format!(
@@ -1956,7 +1980,7 @@ async fn delete_upload_handler(
     Query(params): Query<DeleteUploadQuery>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     let (ctx, uploads_dir) = state.workspace_snapshot();
-    ctx.ensure_writable().map_err(err)?;
+    ctx.ensure_writable().map_err(consumer_err)?;
     let requested = PathBuf::from(&params.path);
     if requested.as_os_str().is_empty() {
         return Err(err(
@@ -2007,7 +2031,7 @@ async fn delete_all_upload_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     let (ctx, uploads_dir) = state.workspace_snapshot();
-    ctx.ensure_writable().map_err(err)?;
+    ctx.ensure_writable().map_err(consumer_err)?;
     TokioServerFs
         .remove_dir_all(&uploads_dir)
         .await
