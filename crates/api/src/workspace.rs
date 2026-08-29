@@ -73,7 +73,16 @@ pub enum WorkspaceKind {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EnsureManagedWorkspace {
+    /// The application this corpus belongs to, as it appears in
+    /// [`WorkspaceKind::ApplicationManaged`].
+    ///
+    /// Supplied rather than compiled in: a managed semantic corpus is a thing
+    /// Wilkes offers, not a thing one named consumer is. The manifests already
+    /// carry the owner, so a consumer that sends its own name matches the
+    /// corpus it already had — no migration.
+    pub owner: String,
     pub corpus_key: String,
     pub embedding: SelectedEmbedder,
     pub chunk_size: usize,
@@ -754,13 +763,15 @@ impl WorkspaceManager {
         Ok(state)
     }
 
-    /// Create or retrieve Underdog's protected corpus workspace. Configuration
-    /// is immutable after the first successful ensure.
-    pub async fn ensure_underdog_workspace(
+    /// Create or retrieve one application's protected corpus workspace.
+    /// Configuration is immutable after the first successful ensure.
+    pub async fn ensure_managed_workspace(
         &self,
         request: EnsureManagedWorkspace,
     ) -> anyhow::Result<ManagedWorkspaceStatus> {
         let corpus_key = request.corpus_key.trim();
+        let owner = request.owner.trim();
+        anyhow::ensure!(!owner.is_empty(), "owner must not be empty");
         anyhow::ensure!(!corpus_key.is_empty(), "corpus_key must not be empty");
         anyhow::ensure!(request.chunk_size > 0, "chunk_size must be positive");
         anyhow::ensure!(
@@ -785,12 +796,14 @@ impl WorkspaceManager {
                 if matches!(
                     &manifest.kind,
                     WorkspaceKind::ApplicationManaged {
-                        owner,
+                        owner: existing_owner,
                         purpose,
                         corpus_key: key,
                         parent_corpus_id: None,
                     }
-                        if owner == "underdog" && purpose == "semantic-corpus" && key == corpus_key
+                        if existing_owner == owner
+                            && purpose == "semantic-corpus"
+                            && key == corpus_key
                 ) {
                     existing = Some(manifest);
                     break;
@@ -817,9 +830,9 @@ impl WorkspaceManager {
                 let manifest = WorkspaceManifest {
                     version: MANIFEST_VERSION,
                     id: id.clone(),
-                    name: "Underdog semantic corpus".to_string(),
+                    name: format!("{owner} semantic corpus"),
                     kind: WorkspaceKind::ApplicationManaged {
-                        owner: "underdog".to_string(),
+                        owner: owner.to_string(),
                         purpose: "semantic-corpus".to_string(),
                         corpus_key: corpus_key.to_string(),
                         parent_corpus_id: None,
@@ -835,10 +848,10 @@ impl WorkspaceManager {
                 id
             }
         };
-        self.underdog_workspace_status(&id).await
+        self.managed_workspace_status(&id).await
     }
 
-    /// The registry half of [`Self::ensure_underdog_space`]: the projection's
+    /// The registry half of [`Self::ensure_managed_space`]: the projection's
     /// manifest, keyed by its parent corpus and its embedder, and idempotent
     /// on both. Separated because it is the part that decides what a
     /// projection *is* — a hidden child of one canonical corpus, sharing that
@@ -847,6 +860,7 @@ impl WorkspaceManager {
     fn ensure_projection_workspace(
         &self,
         corpus_id: &str,
+        owner: &str,
         corpus_key: &str,
         parent_semantic: &SemanticSettings,
         embedding: &SelectedEmbedder,
@@ -879,9 +893,9 @@ impl WorkspaceManager {
         let manifest = WorkspaceManifest {
             version: MANIFEST_VERSION,
             id: id.clone(),
-            name: "Underdog embedding projection".to_string(),
+            name: format!("{owner} embedding projection"),
             kind: WorkspaceKind::ApplicationManaged {
-                owner: "underdog".to_string(),
+                owner: owner.to_string(),
                 purpose: "semantic-corpus".to_string(),
                 corpus_key: corpus_key.to_string(),
                 parent_corpus_id: Some(corpus_id.to_string()),
@@ -900,13 +914,13 @@ impl WorkspaceManager {
     /// Adds one derived embedding projection to an existing managed corpus.
     /// The child workspace is an implementation detail: callers continue to
     /// address the canonical `corpus_id` plus the returned opaque space id.
-    pub async fn ensure_underdog_space(
+    pub async fn ensure_managed_space(
         &self,
         request: EnsureManagedEmbeddingSpace,
     ) -> anyhow::Result<ManagedEmbeddingSpaceStatus> {
         let parent_path = workspace_manifest_path(&self.app_data_dir, &request.corpus_id);
         let parent = read_manifest(&parent_path)?;
-        let (corpus_key, parent_semantic) = match (&parent.kind, &parent.semantic) {
+        let (owner, corpus_key, parent_semantic) = match (&parent.kind, &parent.semantic) {
             (
                 WorkspaceKind::ApplicationManaged {
                     owner,
@@ -915,14 +929,15 @@ impl WorkspaceManager {
                     parent_corpus_id: None,
                 },
                 Some(semantic),
-            ) if owner == "underdog" && purpose == "semantic-corpus" => {
-                (corpus_key.clone(), semantic.clone())
+            ) if purpose == "semantic-corpus" => {
+                (owner.clone(), corpus_key.clone(), semantic.clone())
             }
             _ => anyhow::bail!("MANAGED_WORKSPACE_NOT_FOUND"),
         };
 
         let id = self.ensure_projection_workspace(
             &request.corpus_id,
+            &owner,
             &corpus_key,
             &parent_semantic,
             &request.embedding,
@@ -930,7 +945,7 @@ impl WorkspaceManager {
 
         self.catch_up_projection(&request.corpus_id, &id).await?;
 
-        let canonical = self.underdog_workspace_status(&request.corpus_id).await?;
+        let canonical = self.managed_workspace_status(&request.corpus_id).await?;
         canonical
             .spaces
             .into_iter()
@@ -997,7 +1012,7 @@ impl WorkspaceManager {
     /// the spaces are independent derivations of the same membership, and a
     /// space that cannot catch up simply goes on failing closed until it can.
     pub async fn catch_up_corpus(&self, corpus_id: &str) -> anyhow::Result<Vec<(String, String)>> {
-        let status = self.underdog_workspace_status(corpus_id).await?;
+        let status = self.managed_workspace_status(corpus_id).await?;
         let mut failures = Vec::new();
         for space in status.spaces.iter().filter(|space| !space.primary) {
             if space.ready && space.indexed_generation == status.corpus_generation {
@@ -1022,12 +1037,12 @@ impl WorkspaceManager {
     /// endpoint performs it. Serving the stale space instead would be the one
     /// unacceptable outcome — coordinates for a corpus this space does not
     /// hold.
-    pub async fn underdog_space_context(
+    pub async fn managed_space_context(
         &self,
         corpus_id: &str,
         embedding_space_id: &str,
     ) -> anyhow::Result<Arc<AppContext>> {
-        let status = self.underdog_workspace_status(corpus_id).await?;
+        let status = self.managed_workspace_status(corpus_id).await?;
         let space = status
             .spaces
             .iter()
@@ -1043,13 +1058,13 @@ impl WorkspaceManager {
         self.context_for(&space.workspace_id).await
     }
 
-    pub async fn backup_underdog_corpus(
+    pub async fn backup_managed_corpus(
         self: &Arc<Self>,
         corpus_id: &str,
         embedding_space_id: &str,
     ) -> anyhow::Result<crate::context::ManagedCorpusBackup> {
         let projection = self
-            .underdog_space_context(corpus_id, embedding_space_id)
+            .managed_space_context(corpus_id, embedding_space_id)
             .await?;
         let canonical = self.context_for(corpus_id).await?;
         if Arc::ptr_eq(&canonical, &projection) {
@@ -1068,18 +1083,17 @@ impl WorkspaceManager {
             .map_err(anyhow::Error::msg)
     }
 
-    pub async fn underdog_workspace_status(
+    pub async fn managed_workspace_status(
         &self,
         corpus_id: &str,
     ) -> anyhow::Result<ManagedWorkspaceStatus> {
         let manifest = read_manifest(&workspace_manifest_path(&self.app_data_dir, corpus_id))?;
         let parent_corpus_id = match &manifest.kind {
             WorkspaceKind::ApplicationManaged {
-                owner,
                 purpose,
                 parent_corpus_id,
                 ..
-            } if owner == "underdog" && purpose == "semantic-corpus" => parent_corpus_id.clone(),
+            } if purpose == "semantic-corpus" => parent_corpus_id.clone(),
             _ => anyhow::bail!("MANAGED_WORKSPACE_NOT_FOUND"),
         };
         let semantic = manifest.semantic.ok_or_else(|| {
@@ -1105,7 +1119,7 @@ impl WorkspaceManager {
                     // unreadable index, which the caller only sees as a corpus
                     // that reports no embedding space.
                     tracing::info!(
-                        "underdog_workspace_status: no readable index at {}: {error:#}",
+                        "managed_workspace_status: no readable index at {}: {error:#}",
                         index_root.display()
                     );
                     None
@@ -1256,9 +1270,10 @@ impl WorkspaceManager {
 
     /// Restores a self-verifying backup from Wilkes's own managed-backup
     /// directory. The caller names only one directory leaf, never an arbitrary
-    /// path. A pre-created corpus for the same Underdog store may be replaced
-    /// only while it is empty; an established corpus is never overwritten.
-    pub async fn restore_underdog_workspace(
+    /// path. A pre-created corpus for the same owner and store key may be
+    /// replaced only while it is empty; an established corpus is never
+    /// overwritten.
+    pub async fn restore_managed_workspace(
         self: &Arc<Self>,
         backup_name: &str,
         expected_corpus_id: &str,
@@ -1294,16 +1309,19 @@ impl WorkspaceManager {
             manifest.id == expected_corpus_id,
             "workspace manifest corpus mismatch"
         );
-        anyhow::ensure!(
-            matches!(
-                &manifest.kind,
-                WorkspaceKind::ApplicationManaged { owner, purpose, corpus_key, .. }
-                    if owner == "underdog"
-                        && purpose == "semantic-corpus"
-                        && corpus_key == expected_corpus_key
-            ),
-            "backup belongs to a different managed owner or corpus key"
-        );
+        // The owner is read out of the backup rather than compared against a
+        // compiled-in name: a backup carries the corpus it was taken from, and
+        // what has to hold is that the corpus being replaced belongs to that
+        // same application under that same store key.
+        let owner = match &manifest.kind {
+            WorkspaceKind::ApplicationManaged {
+                owner,
+                purpose,
+                corpus_key,
+                ..
+            } if purpose == "semantic-corpus" && corpus_key == expected_corpus_key => owner.clone(),
+            _ => anyhow::bail!("backup belongs to a different managed owner or corpus key"),
+        };
 
         let _switch_guard = self.switch_lock.lock().await;
         let existing = {
@@ -1313,8 +1331,8 @@ impl WorkspaceManager {
                 let found = read_manifest(&workspace_manifest_path(&self.app_data_dir, id)).ok()?;
                 matches!(
                     &found.kind,
-                    WorkspaceKind::ApplicationManaged { owner, purpose, corpus_key, .. }
-                        if owner == "underdog"
+                    WorkspaceKind::ApplicationManaged { owner: found_owner, purpose, corpus_key, .. }
+                        if found_owner == &owner
                             && purpose == "semantic-corpus"
                             && corpus_key == expected_corpus_key
                 )
@@ -1334,7 +1352,7 @@ impl WorkspaceManager {
                     "RESTORE_TARGET_NOT_EMPTY"
                 );
                 drop(_switch_guard);
-                let status = self.underdog_workspace_status(existing_id).await?;
+                let status = self.managed_workspace_status(existing_id).await?;
                 anyhow::ensure!(
                     status.ready
                         && status.embedding_space_id.as_deref()
@@ -1393,7 +1411,7 @@ impl WorkspaceManager {
             atomic_write_json(&registry_path(&self.app_data_dir), &registry)?;
         }
         drop(_switch_guard);
-        self.underdog_workspace_status(expected_corpus_id).await
+        self.managed_workspace_status(expected_corpus_id).await
     }
 }
 
@@ -1498,7 +1516,8 @@ mod tests {
             WorkspaceManager::new(dir.path().to_path_buf(), settings, Arc::clone(&events)).unwrap();
         let embedding = SelectedEmbedder::default();
         let status = manager
-            .ensure_underdog_workspace(EnsureManagedWorkspace {
+            .ensure_managed_workspace(EnsureManagedWorkspace {
+                owner: "underdog".to_string(),
                 corpus_key: "store-empty".to_string(),
                 embedding: embedding.clone(),
                 chunk_size: 600,
@@ -1534,7 +1553,7 @@ mod tests {
         // Once an index exists the corpus reports that index's own id, and
         // keeps reporting it: the value never changes under the caller.
         let status = manager
-            .underdog_workspace_status(&status.corpus_id)
+            .managed_workspace_status(&status.corpus_id)
             .await
             .unwrap();
         assert_eq!(status.embedding_space_id, Some(space));
@@ -1598,7 +1617,8 @@ mod tests {
             dimension: 2,
         };
         let corpus = manager
-            .ensure_underdog_workspace(EnsureManagedWorkspace {
+            .ensure_managed_workspace(EnsureManagedWorkspace {
+                owner: "underdog".to_string(),
                 corpus_key: "store-spaces".to_string(),
                 embedding: embedding.clone(),
                 chunk_size: 600,
@@ -1639,6 +1659,7 @@ mod tests {
         let projection_id = manager
             .ensure_projection_workspace(
                 &corpus_id,
+                "underdog",
                 "store-spaces",
                 manifest.semantic.as_ref().unwrap(),
                 &secondary,
@@ -1648,6 +1669,7 @@ mod tests {
             manager
                 .ensure_projection_workspace(
                     &corpus_id,
+                    "underdog",
                     "store-spaces",
                     manifest.semantic.as_ref().unwrap(),
                     &secondary,
@@ -1678,7 +1700,7 @@ mod tests {
             "an embedding projection is not a workspace the user has"
         );
 
-        let status = manager.underdog_workspace_status(&corpus_id).await.unwrap();
+        let status = manager.managed_workspace_status(&corpus_id).await.unwrap();
         let projection_space = status
             .spaces
             .iter()
@@ -1700,7 +1722,7 @@ mod tests {
         // Refused by generation, not by absence: the space exists, is named
         // correctly, and still may not answer a query.
         let error = manager
-            .underdog_space_context(&corpus_id, &projection_space.embedding_space_id)
+            .managed_space_context(&corpus_id, &projection_space.embedding_space_id)
             .await
             .err()
             .expect("a projection behind the corpus must not serve");
@@ -1729,7 +1751,7 @@ mod tests {
             )
             .unwrap();
 
-        let status = manager.underdog_workspace_status(&corpus_id).await.unwrap();
+        let status = manager.managed_workspace_status(&corpus_id).await.unwrap();
         let caught_up = status
             .spaces
             .iter()
@@ -1743,7 +1765,7 @@ mod tests {
         );
         assert!(
             manager
-                .underdog_space_context(&corpus_id, &caught_up.embedding_space_id)
+                .managed_space_context(&corpus_id, &caught_up.embedding_space_id)
                 .await
                 .is_ok(),
             "a projection at the corpus generation serves"
@@ -1758,7 +1780,7 @@ mod tests {
             vec![0.5, 0.5],
             &recipe,
         );
-        let status = manager.underdog_workspace_status(&corpus_id).await.unwrap();
+        let status = manager.managed_workspace_status(&corpus_id).await.unwrap();
         let lagging = status
             .spaces
             .iter()
@@ -1767,7 +1789,7 @@ mod tests {
         assert!(!lagging.ready);
         assert!(
             manager
-                .underdog_space_context(&corpus_id, &lagging.embedding_space_id)
+                .managed_space_context(&corpus_id, &lagging.embedding_space_id)
                 .await
                 .is_err(),
             "membership that only the corpus has is membership no projection may answer for"
@@ -1801,7 +1823,8 @@ mod tests {
             dimension: 2,
         };
         let corpus = manager
-            .ensure_underdog_workspace(EnsureManagedWorkspace {
+            .ensure_managed_workspace(EnsureManagedWorkspace {
+                owner: "underdog".to_string(),
                 corpus_key: "store-level".to_string(),
                 embedding: embedding.clone(),
                 chunk_size: 600,
@@ -1848,7 +1871,8 @@ mod tests {
         .unwrap();
         let embedding = SelectedEmbedder::default();
         let source_status = source_manager
-            .ensure_underdog_workspace(EnsureManagedWorkspace {
+            .ensure_managed_workspace(EnsureManagedWorkspace {
+                owner: "underdog".to_string(),
                 corpus_key: "store-restore".to_string(),
                 embedding: embedding.clone(),
                 chunk_size: 600,
@@ -1889,7 +1913,8 @@ mod tests {
         )
         .unwrap();
         let empty = target_manager
-            .ensure_underdog_workspace(EnsureManagedWorkspace {
+            .ensure_managed_workspace(EnsureManagedWorkspace {
+                owner: "underdog".to_string(),
                 corpus_key: "store-restore".to_string(),
                 embedding,
                 chunk_size: 600,
@@ -1914,7 +1939,7 @@ mod tests {
         .unwrap();
         std::fs::write(target_backup.join("unlisted.txt"), b"not in manifest").unwrap();
         let inventory_error = target_manager
-            .restore_underdog_workspace("inbox", &source_status.corpus_id, &space, "store-restore")
+            .restore_managed_workspace("inbox", &source_status.corpus_id, &space, "store-restore")
             .await
             .unwrap_err();
         assert!(inventory_error
@@ -1923,7 +1948,7 @@ mod tests {
         std::fs::remove_file(target_backup.join("unlisted.txt")).unwrap();
 
         let restored = target_manager
-            .restore_underdog_workspace("inbox", &source_status.corpus_id, &space, "store-restore")
+            .restore_managed_workspace("inbox", &source_status.corpus_id, &space, "store-restore")
             .await
             .unwrap();
         assert_eq!(restored.corpus_id, source_status.corpus_id);
@@ -1942,7 +1967,7 @@ mod tests {
             1
         );
         let retried = target_manager
-            .restore_underdog_workspace("inbox", &source_status.corpus_id, &space, "store-restore")
+            .restore_managed_workspace("inbox", &source_status.corpus_id, &space, "store-restore")
             .await
             .unwrap();
         assert_eq!(retried.corpus_id, restored.corpus_id);
@@ -2007,16 +2032,17 @@ mod tests {
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings_path, events).unwrap();
         let request = EnsureManagedWorkspace {
+            owner: "underdog".to_string(),
             corpus_key: "store-1".to_string(),
             embedding: SelectedEmbedder::default(),
             chunk_size: 600,
             chunk_overlap: 128,
         };
         let first = manager
-            .ensure_underdog_workspace(request.clone())
+            .ensure_managed_workspace(request.clone())
             .await
             .unwrap();
-        let second = manager.ensure_underdog_workspace(request).await.unwrap();
+        let second = manager.ensure_managed_workspace(request).await.unwrap();
         assert_eq!(first.corpus_id, second.corpus_id);
         let state = manager.state().await.unwrap();
         assert_eq!(
@@ -2057,7 +2083,8 @@ mod tests {
         let mut mismatch = SelectedEmbedder::default();
         mismatch.dimension += 1;
         assert!(manager
-            .ensure_underdog_workspace(EnsureManagedWorkspace {
+            .ensure_managed_workspace(EnsureManagedWorkspace {
+                owner: "underdog".to_string(),
                 corpus_key: "store-1".to_string(),
                 embedding: mismatch,
                 chunk_size: 600,

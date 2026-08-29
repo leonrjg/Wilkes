@@ -260,7 +260,7 @@ async fn switch_workspace_handler(
         .map_err(|error| server_err(error.to_string()))
 }
 
-async fn ensure_underdog_workspace_handler(
+async fn ensure_managed_workspace_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<EnsureManagedWorkspace>,
 ) -> Result<Json<ManagedWorkspaceStatus>, (StatusCode, Json<ErrorBody>)> {
@@ -268,7 +268,7 @@ async fn ensure_underdog_workspace_handler(
         managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
     })?;
     let initial = manager
-        .ensure_underdog_workspace(request)
+        .ensure_managed_workspace(request)
         .await
         .map_err(|error| managed_err(format!("{error:#}")))?;
     let context = manager
@@ -280,7 +280,7 @@ async fn ensure_underdog_workspace_handler(
         .await
         .map_err(managed_err)?;
     let status = manager
-        .underdog_workspace_status(&initial.corpus_id)
+        .managed_workspace_status(&initial.corpus_id)
         .await
         .map_err(|error| managed_err(format!("{error:#}")))?;
     Ok(Json(managed_status_with_pending(status, &context)))
@@ -302,7 +302,7 @@ struct ManagedStatusQuery {
     corpus_id: String,
 }
 
-async fn underdog_workspace_status_handler(
+async fn managed_workspace_status_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ManagedStatusQuery>,
 ) -> Result<Json<ManagedWorkspaceStatus>, (StatusCode, Json<ErrorBody>)> {
@@ -310,7 +310,7 @@ async fn underdog_workspace_status_handler(
         managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
     })?;
     let status = manager
-        .underdog_workspace_status(&query.corpus_id)
+        .managed_workspace_status(&query.corpus_id)
         .await
         .map_err(|error| managed_err(format!("{error:#}")))?;
     let context = manager
@@ -320,7 +320,7 @@ async fn underdog_workspace_status_handler(
     Ok(Json(managed_status_with_pending(status, &context)))
 }
 
-async fn ensure_underdog_space_handler(
+async fn ensure_managed_space_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<EnsureManagedEmbeddingSpace>,
 ) -> Result<Json<ManagedEmbeddingSpaceStatus>, (StatusCode, Json<ErrorBody>)> {
@@ -328,7 +328,7 @@ async fn ensure_underdog_space_handler(
         managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
     })?;
     manager
-        .ensure_underdog_space(request)
+        .ensure_managed_space(request)
         .await
         .map(Json)
         .map_err(|error| managed_err(format!("{error:#}")))
@@ -360,7 +360,7 @@ struct ManagedImportBody {
     source: ManagedImportSource,
 }
 
-async fn import_underdog_document_handler(
+async fn import_managed_document_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedImportBody>,
 ) -> Result<Json<wilkes_api::context::ManagedDocumentExport>, (StatusCode, Json<ErrorBody>)> {
@@ -368,7 +368,7 @@ async fn import_underdog_document_handler(
         managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
     })?;
     let status = manager
-        .underdog_workspace_status(&body.corpus_id)
+        .managed_workspace_status(&body.corpus_id)
         .await
         .map_err(|error| managed_err(format!("{error:#}")))?;
     let expected_exists = match body.expected_embedding_space_id.as_deref() {
@@ -458,7 +458,7 @@ struct ManagedResolveBody {
     chunk_refs: Vec<ChunkRef>,
 }
 
-async fn underdog_resolve_handler(
+async fn chunks_resolve_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedResolveBody>,
 ) -> Result<Json<wilkes_api::context::ManagedChunkResolution>, (StatusCode, Json<ErrorBody>)> {
@@ -471,7 +471,7 @@ async fn underdog_resolve_handler(
         .map_err(managed_err)
 }
 
-async fn underdog_accumulate_handler(
+async fn chunks_accumulate_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedGroupsBody>,
 ) -> Result<Json<wilkes_api::context::ManagedAccumulations>, (StatusCode, Json<ErrorBody>)> {
@@ -494,7 +494,7 @@ struct ManagedSimilarityBody {
     chunk_refs: Vec<ChunkRef>,
 }
 
-async fn underdog_similarity_handler(
+async fn chunks_similarity_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedSimilarityBody>,
 ) -> Result<Json<wilkes_api::context::ManagedChunkSimilarities>, (StatusCode, Json<ErrorBody>)> {
@@ -569,7 +569,7 @@ struct ManagedSearchBody {
 /// model is not.
 ///
 /// None of these three routes goes through `managed_context`, and that is
-/// deliberate rather than an oversight. Every other underdog route is scoped
+/// deliberate rather than an oversight. Every other consumer route is scoped
 /// by a corpus and an embedding space because it reads the user's own
 /// documents. A catalogue record is not the user's document and has no
 /// vectors — it describes something nobody here holds yet. There is no
@@ -629,7 +629,7 @@ struct CatalogueSearchResponse {
 
 const MAX_CATALOGUE_QUERIES: usize = 64;
 
-async fn underdog_catalogue_search_handler(
+async fn catalogue_search_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogueSearchBody>,
 ) -> Result<Json<CatalogueSearchResponse>, (StatusCode, Json<ErrorBody>)> {
@@ -715,7 +715,7 @@ struct CatalogueSyncResponse {
     total_records: i64,
 }
 
-async fn underdog_catalogue_sync_handler(
+async fn catalogue_sync_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogueSyncBody>,
 ) -> Result<Json<CatalogueSyncResponse>, (StatusCode, Json<ErrorBody>)> {
@@ -808,7 +808,7 @@ struct CatalogueAcquireBody {
 /// another application owns; this is that application fetching into Wilkes's
 /// own staging area on its way to the managed import API, which is the
 /// corpus's writer by contract.
-async fn underdog_catalogue_acquire_handler(
+async fn catalogue_acquire_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogueAcquireBody>,
 ) -> Result<Json<wilkes_core::acquire::DownloadResponse>, (StatusCode, Json<ErrorBody>)> {
@@ -834,7 +834,7 @@ struct CatalogueStatusResponse {
     total_records: i64,
 }
 
-async fn underdog_catalogue_status_handler(
+async fn catalogue_status_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<CatalogueStatusResponse>, (StatusCode, Json<ErrorBody>)> {
     let store = catalogue_store(&state)?;
@@ -850,7 +850,7 @@ async fn underdog_catalogue_status_handler(
     }))
 }
 
-async fn underdog_search_handler(
+async fn chunks_search_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedSearchBody>,
 ) -> Result<Json<wilkes_api::context::ManagedChunkSearch>, (StatusCode, Json<ErrorBody>)> {
@@ -891,7 +891,7 @@ struct ManagedRestoreBody {
     expected_corpus_key: String,
 }
 
-async fn underdog_backup_handler(
+async fn managed_backup_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedBackupBody>,
 ) -> Result<Json<wilkes_api::context::ManagedCorpusBackup>, (StatusCode, Json<ErrorBody>)> {
@@ -899,13 +899,13 @@ async fn underdog_backup_handler(
         managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
     })?;
     manager
-        .backup_underdog_corpus(&body.corpus_id, &body.expected_embedding_space_id)
+        .backup_managed_corpus(&body.corpus_id, &body.expected_embedding_space_id)
         .await
         .map(Json)
         .map_err(|error| managed_err(format!("{error:#}")))
 }
 
-async fn underdog_restore_handler(
+async fn managed_restore_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedRestoreBody>,
 ) -> Result<Json<ManagedWorkspaceStatus>, (StatusCode, Json<ErrorBody>)> {
@@ -913,7 +913,7 @@ async fn underdog_restore_handler(
         managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
     })?;
     manager
-        .restore_underdog_workspace(
+        .restore_managed_workspace(
             &body.backup_name,
             &body.expected_corpus_id,
             &body.expected_embedding_space_id,
@@ -924,7 +924,7 @@ async fn underdog_restore_handler(
         .map_err(|error| managed_err(format!("{error:#}")))
 }
 
-async fn underdog_embed_text_handler(
+async fn managed_embed_text_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedEmbedTextBody>,
 ) -> Result<Json<wilkes_api::context::ManagedEmbeddedTexts>, (StatusCode, Json<ErrorBody>)> {
@@ -944,7 +944,7 @@ async fn underdog_embed_text_handler(
 /// nothing of the user's documents and there is no corpus for it to pin. It
 /// describes the host's embedders, and a consumer asks it *before* it has a
 /// corpus in the space it is asking about.
-async fn underdog_embedding_models_handler(
+async fn embedder_capabilities_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<wilkes_core::types::EmbedderCapabilityManifest> {
     let context = state.context();
@@ -971,7 +971,7 @@ async fn managed_context(
         managed_err("MANAGED_WORKSPACE_NOT_FOUND: workspace manager is unavailable")
     })?;
     let context = manager
-        .underdog_space_context(corpus_id, expected_embedding_space_id)
+        .managed_space_context(corpus_id, expected_embedding_space_id)
         .await
         .map_err(|error| managed_err(format!("{error:#}")))?;
     let actual = context
@@ -2107,8 +2107,7 @@ async fn list_models_handler(
     Query(params): Query<ListModelsQuery>,
 ) -> impl IntoResponse {
     let models: Vec<ModelDescriptor> =
-        wilkes_api::commands::embed::list_models(params.engine, &state.context().model_dir)
-            .await;
+        wilkes_api::commands::embed::list_models(params.engine, &state.context().model_dir).await;
     Json(models)
 }
 
@@ -2275,67 +2274,67 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/integrations/underdog/workspace",
-            put(ensure_underdog_workspace_handler),
+            put(ensure_managed_workspace_handler),
         )
         .route(
             "/api/integrations/underdog/spaces",
-            put(ensure_underdog_space_handler),
+            put(ensure_managed_space_handler),
         )
         .route(
             "/api/integrations/underdog/status",
-            get(underdog_workspace_status_handler),
+            get(managed_workspace_status_handler),
         )
         .route(
             "/api/integrations/underdog/documents/import",
-            post(import_underdog_document_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+            post(import_managed_document_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route(
             "/api/integrations/underdog/chunks/resolve",
-            post(underdog_resolve_handler),
+            post(chunks_resolve_handler),
         )
         .route(
             "/api/integrations/underdog/chunks/accumulate",
-            post(underdog_accumulate_handler),
+            post(chunks_accumulate_handler),
         )
         .route(
             "/api/integrations/underdog/chunks/similarity",
-            post(underdog_similarity_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+            post(chunks_similarity_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route(
             "/api/integrations/underdog/chunks/search",
-            post(underdog_search_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+            post(chunks_search_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route(
             "/api/integrations/underdog/catalogue/search",
-            post(underdog_catalogue_search_handler),
+            post(catalogue_search_handler),
         )
         .route(
             "/api/integrations/underdog/catalogue/sync",
-            post(underdog_catalogue_sync_handler),
+            post(catalogue_sync_handler),
         )
         .route(
             "/api/integrations/underdog/catalogue/status",
-            get(underdog_catalogue_status_handler),
+            get(catalogue_status_handler),
         )
         .route(
             "/api/integrations/underdog/catalogue/acquire",
-            post(underdog_catalogue_acquire_handler),
+            post(catalogue_acquire_handler),
         )
         .route(
             "/api/integrations/underdog/embed/text",
-            post(underdog_embed_text_handler),
+            post(managed_embed_text_handler),
         )
         .route(
             "/api/integrations/underdog/embed/models",
-            get(underdog_embedding_models_handler),
+            get(embedder_capabilities_handler),
         )
         .route(
             "/api/integrations/underdog/backup",
-            post(underdog_backup_handler),
+            post(managed_backup_handler),
         )
         .route(
             "/api/integrations/underdog/restore",
-            post(underdog_restore_handler),
+            post(managed_restore_handler),
         )
         .route("/api/bookmarks", get(list_bookmarks_handler))
         .route("/api/bookmarks", post(add_bookmark_handler))
@@ -2702,7 +2701,7 @@ mod tests {
     #[tokio::test]
     async fn catalogue_status_reports_an_unsynced_mirror_rather_than_failing() {
         let (_dir, state) = catalogue_state();
-        let response = match underdog_catalogue_status_handler(State(state)).await {
+        let response = match catalogue_status_handler(State(state)).await {
             Ok(response) => response,
             Err(error) => panic!("status failed: {}", error.1 .0.error),
         };
@@ -2721,7 +2720,7 @@ mod tests {
             }],
             limit: 8,
         };
-        let error = match underdog_catalogue_search_handler(State(state), Json(body)).await {
+        let error = match catalogue_search_handler(State(state), Json(body)).await {
             Ok(_) => panic!("unknown grain must be refused"),
             Err(error) => error,
         };
@@ -2740,7 +2739,7 @@ mod tests {
             queries: Vec::new(),
             limit: 8,
         };
-        let error = match underdog_catalogue_search_handler(State(state), Json(body)).await {
+        let error = match catalogue_search_handler(State(state), Json(body)).await {
             Ok(_) => panic!("empty batch must be refused"),
             Err(error) => error,
         };
@@ -2760,7 +2759,7 @@ mod tests {
                 .collect(),
             limit: 8,
         };
-        let error = match underdog_catalogue_search_handler(State(state), Json(body)).await {
+        let error = match catalogue_search_handler(State(state), Json(body)).await {
             Ok(_) => panic!("oversized batch must be refused"),
             Err(error) => error,
         };
@@ -2773,7 +2772,7 @@ mod tests {
         let body = CatalogueSyncBody {
             providers: Some(vec!["nonexistent".into()]),
         };
-        let error = match underdog_catalogue_sync_handler(State(state), Json(body)).await {
+        let error = match catalogue_sync_handler(State(state), Json(body)).await {
             Ok(_) => panic!("unknown provider must be refused"),
             Err(error) => error,
         };

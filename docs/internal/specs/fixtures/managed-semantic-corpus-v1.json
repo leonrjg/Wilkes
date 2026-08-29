@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "ensure_request": {
+    "owner": "underdog",
     "corpus_key": "store-018f",
     "embedding": {
       "engine": "candle",
