@@ -27,7 +27,7 @@
 //! Neither is a layout *model*. FIGURE.md's phase three names a small ONNX
 //! layout detector for this job; what is built here is the cheaper thing that
 //! the document already tells us, and it is deliberately narrow. Its failures
-//! are stated in [`formula_lines`] and [`table_regions`].
+//! are stated in [`expressions`] and [`table_regions`].
 //!
 //! ## Everything it finds fails safe
 //!
@@ -56,7 +56,7 @@ use crate::types::{BoundingBox, ImageTransform, Point, RegionOrigin};
 /// rendered. Part of the enrichment recipe an extractor declares, so a reading
 /// produced under different routing is never mistaken for one produced under
 /// this.
-pub(super) const ROUTING_VERSION: &str = "typeset-routing-v3";
+pub(super) const ROUTING_VERSION: &str = "typeset-routing-v4";
 
 /// The share of a line's glyphs that must come from a math font for the line
 /// to be part of a formula.
@@ -219,23 +219,6 @@ pub(super) struct SurveyedLine {
 }
 
 impl SurveyedLine {
-    /// Whether this line is a formula worth reading again.
-    ///
-    /// Three conditions, and the third is the one that matters. The
-    /// typography says the line is mathematics; it is long enough not to be a
-    /// stray symbol; and flattening it destroyed something.
-    ///
-    /// That last condition replaced a length floor, which was the wrong
-    /// question asked in the wrong units. On the document that prompted this,
-    /// a floor kept `ETAOINSRHDLUCMFYWGPBVKXQJZ` — a cipher alphabet, twenty-
-    /// six glyphs, nothing to recover and a transcription that could only
-    /// damage it — and dropped `c = me` at four. The structure test gets both
-    /// right, and it does so by asking what the feature is for rather than by
-    /// counting characters.
-    fn is_formula(&self) -> bool {
-        self.glyphs >= MIN_FORMULA_GLYPHS && self.is_mathematics() && self.structure_flattened
-    }
-
     /// Whether the typography says this line is mathematics, without asking
     /// whether it is worth reading on its own.
     ///
@@ -535,37 +518,113 @@ fn spread(values: &[f32]) -> f32 {
 
 // ── Marking out regions ─────────────────────────────────────────────────────
 
-/// The formula regions of one page: runs of adjacent lines the typography says
-/// are mathematics.
+/// The expressions on one page: maximal runs of math-dominant lines the page
+/// drew as one thing.
 ///
-/// Adjacent lines join because an aligned equation is one formula and its
-/// halves are not two. Adjacency is vertical and measured in line heights, so
-/// a second equation further down the page is its own region.
+/// A run continues two ways. **Along a baseline**, because a page may draw one
+/// expression as several text objects — `y_B^{x_A}(mod q)` reaches MuPDF as
+/// three lines, `yB`, its raised `xA`, and `mod q`. And **down the page**,
+/// because an aligned equation is one formula and its rows are not two.
 ///
-/// What this does not find: inline mathematics, for the reason on
-/// [`MATH_GLYPH_SHARE`]; an equation number set in a text font beside a
-/// display equation, which sits on the same line and lowers its share; and any
+/// Nothing here asks whether a run is worth reading. That is
+/// [`is_worth_reading`], and asking it of a *fragment* was the defect this
+/// function exists to remove: every piece of `y_B^{x_A}(mod q)` is two to four
+/// glyphs, so every piece failed a minimum the whole expression passes
+/// easily, no piece seeded a region, and the formula reached the reading as
+/// flattened text. How a page divides an expression into text objects is a
+/// fact about the typesetter, not about the mathematics.
+///
+/// What this does not find: an equation number set in a text font beside a
+/// display equation, which lowers the share of the line it shares; and any
 /// formula in a document that sets mathematics without switching fonts.
-fn formula_lines(lines: &[SurveyedLine], taken: &[bool]) -> Vec<Vec<usize>> {
-    let mut regions: Vec<Vec<usize>> = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        if taken[index] || !line.is_formula() {
+fn expressions(lines: &[SurveyedLine], taken: &[bool]) -> Vec<Vec<usize>> {
+    let mut claimed: Vec<bool> = taken.to_vec();
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+
+    for index in 0..lines.len() {
+        if claimed[index] || !lines[index].is_mathematics() {
             continue;
         }
-        let joins = regions.last().is_some_and(|last: &Vec<usize>| {
-            let previous = &lines[*last.last().expect("a region has a line")];
-            // Consecutive in the survey, and close enough vertically that the
-            // page set them as one displayed block.
-            *last.last().expect("a region has a line") + 1 == index
-                && line.bbox.y - (previous.bbox.y + previous.bbox.height)
-                    < previous.bbox.height.max(1.0) * LINE_GAP_FACTOR
-        });
-        match (joins, regions.last_mut()) {
-            (true, Some(last)) => last.push(index),
-            _ => regions.push(vec![index]),
+        claimed[index] = true;
+        let mut run = vec![index];
+        // Repeated until nothing more joins, so an expression drawn in three
+        // runs is reached in three passes.
+        while let Some(next) = (0..lines.len()).find(|candidate| {
+            !claimed[*candidate]
+                && lines[*candidate].is_mathematics()
+                && run
+                    .iter()
+                    .any(|member| lines[*member].continues_into(&lines[*candidate]))
+        }) {
+            claimed[next] = true;
+            run.push(next);
+        }
+        run.sort_unstable();
+        runs.push(run);
+    }
+
+    merge_stacked(runs, lines)
+}
+
+/// Join runs the page stacked. An aligned equation is one formula, and reading
+/// its rows apart would produce expressions neither of which is what the page
+/// shows.
+///
+/// Vertical adjacency *and* horizontal overlap. Without the second, a column
+/// of unrelated inline fragments down one margin would chain into a single
+/// region spanning half a page.
+fn merge_stacked(runs: Vec<Vec<usize>>, lines: &[SurveyedLine]) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    for run in runs {
+        let joins = out
+            .last()
+            .is_some_and(|last| stacked(last, &run, lines));
+        match (joins, out.last_mut()) {
+            (true, Some(last)) => last.extend(run),
+            _ => out.push(run),
         }
     }
-    regions
+    out
+}
+
+fn stacked(above: &[usize], below: &[usize], lines: &[SurveyedLine]) -> bool {
+    let (Some(a), Some(b)) = (hull_of(above, lines), hull_of(below, lines)) else {
+        return false;
+    };
+    let gap = b.y - (a.y + a.height);
+    gap >= 0.0
+        && gap < a.height.max(1.0) * LINE_GAP_FACTOR
+        && b.x < a.x + a.width
+        && a.x < b.x + b.width
+}
+
+fn hull_of(run: &[usize], lines: &[SurveyedLine]) -> Option<BoundingBox> {
+    let (first, rest) = run.split_first()?;
+    Some(rest.iter().fold(lines[*first].bbox.clone(), |hull, index| {
+        hull.merge(&lines[*index].bbox)
+    }))
+}
+
+/// Whether an expression is worth a recognizer call, and worth standing in
+/// place of the glyphs the page drew.
+///
+/// Asked of the whole expression and never of a fragment, for the reason on
+/// [`expressions`]. Two conditions, and the second is the one that matters:
+/// the run is long enough not to be a stray symbol, and flattening it
+/// destroyed something — a subscript, a superscript, a stacked term.
+///
+/// The structure test replaced a length floor, which was the wrong question
+/// asked in the wrong units. On the document that prompted this, a floor kept
+/// `ETAOINSRHDLUCMFYWGPBVKXQJZ` — a cipher alphabet, twenty-six glyphs,
+/// nothing to recover and a transcription that could only damage it — and
+/// dropped `c = me` at four. The structure test gets both right, by asking
+/// what the feature is *for* rather than by counting characters.
+fn is_worth_reading(run: &[usize], lines: &[SurveyedLine]) -> bool {
+    let glyphs: usize = run.iter().map(|index| lines[*index].glyphs).sum();
+    glyphs >= MIN_FORMULA_GLYPHS
+        && run
+            .iter()
+            .any(|index| lines[*index].structure_flattened)
 }
 
 /// The table regions of one page: stacks of rules, and whatever lines they
@@ -646,22 +705,18 @@ pub(super) fn regions(page: u32, survey: &Survey, lines: &[SurveyedLine]) -> Vec
         });
     }
 
-    for mut group in formula_lines(lines, &taken) {
-        for index in &group {
+    for run in expressions(lines, &taken) {
+        if !is_worth_reading(&run, lines) {
+            continue;
+        }
+        for index in &run {
             taken[*index] = true;
         }
-        grow_to_fragments(&mut group, lines, &mut taken);
-        group.sort_unstable();
-        let hull = group
-            .iter()
-            .skip(1)
-            .fold(lines[group[0]].bbox.clone(), |hull, index| {
-                hull.merge(&lines[*index].bbox)
-            });
+        let hull = hull_of(&run, lines).expect("a run has a line");
         found.push(TypesetRegion {
             page,
-            bbox: with_margin_clear_of(&hull, lines, &group),
-            lines: group
+            bbox: with_margin_clear_of(&hull, lines, &run),
+            lines: run
                 .iter()
                 .map(|index| (lines[*index].block, lines[*index].line))
                 .collect(),
@@ -672,36 +727,6 @@ pub(super) fn regions(page: u32, survey: &Survey, lines: &[SurveyedLine]) -> Vec
     // whichever rule marked them out.
     found.sort_by(|a, b| a.bbox.y.total_cmp(&b.bbox.y));
     found
-}
-
-/// Take in every math fragment the region's own baselines run into.
-///
-/// A display formula is one expression and the page may draw it as several
-/// text objects: on the reported page `yB = wxB` and `mod q` are two runs 3.9
-/// points apart on one baseline, which MuPDF reports as two lines. Only the
-/// first carries the subscripts that make it a seed, and the seeding rule is
-/// right not to start a region for `mod q` alone.
-///
-/// But a region that stops at its seed is a region whose crop *cuts the
-/// expression in half*. The recognizer was then shown `y_B = w^{x_B}` followed
-/// by an opening parenthesis and four points of the next glyph, and it
-/// completed what it was given — `( n_{0} )` where the page says `(mod q)`.
-/// That is not the model being unreliable; it is the crop lying about where
-/// the formula ends.
-///
-/// Repeated until nothing more is taken, so an expression drawn in three runs
-/// is reached in three passes.
-fn grow_to_fragments(group: &mut Vec<usize>, lines: &[SurveyedLine], taken: &mut [bool]) {
-    while let Some(next) = lines.iter().enumerate().position(|(index, candidate)| {
-        !taken[index]
-            && candidate.is_mathematics()
-            && group
-                .iter()
-                .any(|member| lines[*member].continues_into(candidate))
-    }) {
-        taken[next] = true;
-        group.push(next);
-    }
 }
 
 /// The region's margin, cut back on any side where it would reach into a line
@@ -1058,6 +1083,25 @@ mod tests {
 
     // ── Formula lines ────────────────────────────────────────────────────
 
+    /// The lines each region claims, by survey index.
+    fn claimed(lines: &[SurveyedLine]) -> Vec<Vec<usize>> {
+        claimed_with(&Survey::default(), lines)
+    }
+
+    fn claimed_with(survey: &Survey, lines: &[SurveyedLine]) -> Vec<Vec<usize>> {
+        regions(1, survey, lines)
+            .into_iter()
+            .map(|region| {
+                lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| region.lines.contains(&(l.block, l.line)))
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .collect()
+    }
+
     /// The reported case: a display line that is almost all math glyphs is a
     /// formula, and the sentence above it — which mentions two variables — is
     /// not.
@@ -1067,9 +1111,7 @@ mod tests {
             line(0, 0, 100.0, 25, 2), // "for all i = 1, ..., n we have"
             line(0, 1, 130.0, 8, 7),  // "ci = ai ⊕ bi"
         ];
-        let regions = formula_lines(&lines, &[false, false]);
-        assert_eq!(regions.len(), 1, "one formula on the page");
-        assert_eq!(regions[0], vec![1]);
+        assert_eq!(claimed(&lines), vec![vec![1]], "one formula on the page");
     }
 
     /// The rule that decides whether a line is worth reading again is not its
@@ -1077,10 +1119,11 @@ mod tests {
     /// either way; `ci = ai ⊕bi` lost two subscripts.
     #[test]
     fn a_line_that_flattened_to_itself_is_not_read_again() {
-        let flat = flat_line(0, 0, 100.0, 8, 8, false);
-        assert!(!flat.is_formula(), "nothing was destroyed, so nothing to repair");
-        let structured = flat_line(0, 0, 100.0, 8, 8, true);
-        assert!(structured.is_formula());
+        assert!(
+            claimed(&[flat_line(0, 0, 100.0, 8, 8, false)]).is_empty(),
+            "nothing was destroyed, so nothing to repair"
+        );
+        assert_eq!(claimed(&[flat_line(0, 0, 100.0, 8, 8, true)]), vec![vec![0]]);
     }
 
     /// A long run in a math face with nothing stacked in it is still not a
@@ -1089,7 +1132,7 @@ mod tests {
     /// and a transcription of it could only be worse than the glyphs.
     #[test]
     fn a_long_flat_run_in_a_math_face_is_not_a_formula() {
-        assert!(!flat_line(0, 0, 100.0, 26, 26, false).is_formula());
+        assert!(claimed(&[flat_line(0, 0, 100.0, 26, 26, false)]).is_empty());
     }
 
     /// The spread is measured, not the count of distinct values: two glyphs a
@@ -1166,8 +1209,41 @@ mod tests {
             fragment(0, 287.8, 41.4, 6, 6, true),  // yB = wxB
             fragment(1, 333.1, 26.6, 4, 4, false), // (mod q)
         ];
-        assert!(!lines[1].is_formula(), "the fragment is not a seed on its own");
+        assert!(
+            claimed(&[fragment(0, 333.1, 26.6, 4, 4, false)]).is_empty(),
+            "the fragment is not worth reading on its own"
+        );
         assert_eq!(only_region(&lines), vec![(0, 0), (1, 0)]);
+    }
+
+    /// The second reported failure, and the reason admission moved off the
+    /// fragment. `y_B^{x_A}(mod q)` reaches MuPDF as three lines — `yB`, its
+    /// raised `xA`, and `mod q` — of two, two and four glyphs. Every one is
+    /// under the minimum or flat, so under a per-fragment rule none seeds a
+    /// region, none grows one, and the formula stays in the reading as
+    /// `yB\nxA\nmod q`. The expression is eight glyphs with two levels of
+    /// script.
+    #[test]
+    fn an_expression_no_fragment_of_which_would_seed_is_still_a_formula() {
+        let lines = vec![
+            fragment(0, 244.7, 10.6, 2, 3, true),  // yB
+            fragment(1, 249.6, 10.3, 2, 2, true),  // xA, raised
+            fragment(2, 263.7, 26.7, 4, 4, false), // (mod q)
+        ];
+        for line in &lines {
+            assert!(
+                line.glyphs < MIN_FORMULA_GLYPHS || !line.structure_flattened,
+                "no fragment of this expression could seed a region alone"
+            );
+        }
+        assert_eq!(only_region(&lines), vec![(0, 0), (1, 0), (2, 0)]);
+    }
+
+    /// The minimum still bites, on the expression rather than the fragment: a
+    /// stray raised symbol beside nothing is not mathematics worth reading.
+    #[test]
+    fn an_expression_below_the_minimum_is_still_refused() {
+        assert!(claimed(&[fragment(0, 244.7, 10.6, 2, 2, true)]).is_empty());
     }
 
     /// And the crop then covers all of it, margin and all.
@@ -1255,7 +1331,7 @@ mod tests {
     #[test]
     fn a_line_too_short_to_be_an_equation_is_not_one() {
         let lines = vec![line(0, 0, 100.0, 2, 2)];
-        assert!(formula_lines(&lines, &[false]).is_empty());
+        assert!(claimed(&lines).is_empty());
     }
 
     /// An aligned equation is one formula. Reading its halves apart would
@@ -1267,9 +1343,7 @@ mod tests {
             line(0, 1, 116.0, 8, 8),
             line(0, 2, 132.0, 8, 8),
         ];
-        let regions = formula_lines(&lines, &[false; 3]);
-        assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0], vec![0, 1, 2]);
+        assert_eq!(claimed(&lines), vec![vec![0, 1, 2]]);
     }
 
     /// A second equation further down the page is its own region: the gap
@@ -1281,14 +1355,24 @@ mod tests {
             line(0, 1, 140.0, 30, 1),
             line(0, 2, 180.0, 8, 8),
         ];
-        let regions = formula_lines(&lines, &[false; 3]);
-        assert_eq!(regions.len(), 2);
+        assert_eq!(claimed(&lines).len(), 2);
     }
 
     #[test]
     fn a_line_already_taken_by_a_table_is_not_also_a_formula() {
         let lines = vec![line(0, 0, 100.0, 8, 8)];
-        assert!(formula_lines(&lines, &[true]).is_empty());
+        // The table claims it first, so the formula rule never sees it.
+        let survey = Survey {
+            math_origins: Vec::new(),
+            faces: BTreeMap::new(),
+            rules: vec![
+                rule(90.0, 100.0, 300.0),
+                rule(105.0, 100.0, 300.0),
+                rule(120.0, 100.0, 300.0),
+            ],
+        };
+        let found = claimed_with(&survey, &lines);
+        assert_eq!(found, vec![vec![0]], "one region, the table's");
     }
 
     // ── Table rules ──────────────────────────────────────────────────────
@@ -1501,5 +1585,6 @@ mod tests {
         assert_eq!(diagnostics.typeset_regions_over_budget, 0);
     }
 }
+
 
 

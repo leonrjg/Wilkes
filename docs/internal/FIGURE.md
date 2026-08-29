@@ -1138,6 +1138,27 @@ at fault, for lying about where the formula ended. Two rules now:
   what invites it to invent the other half, so where the geometry is something
   neither rule anticipated the crop stops at a clean edge instead.
 
+**"Worth reading" is asked of the expression, never of a fragment.** The
+second failure from the same document, and the reason the previous rule was
+still wrong in shape rather than in degree. `y_B^{x_A}(mod q)` reaches MuPDF
+as three lines — `yB`, its raised `xA`, and `mod q` — of two, two and four
+glyphs. Every one is under the minimum or carries no structure, so under a
+per-fragment rule none seeded a region, none grew one, and the formula stayed
+in the reading as `yB\nxA\nmod q`. The whole expression is eight glyphs with
+two levels of script.
+
+How a page divides an expression into text objects is a fact about the
+typesetter, not about the mathematics. So the pass now groups math-dominant
+lines into expressions first — along a baseline and down the page — and then
+asks the admission question of the group: long enough not to be a stray
+symbol, and something destroyed by flattening. The grow-after-seed rule that
+preceded it is gone rather than kept beside it; it was the same question
+asked at the wrong granularity, and two rules for one decision is what the
+first version of this got wrong.
+
+Measured across the document before and after: 39 regions became 40, so
+nothing costs meaningfully more, and both reported formulas are now whole.
+
 **A document that yields nothing says why.** The faces a document draws with,
 and which of them were read as mathematics, are reported once per document —
 at info when *none* was, because that is the case a reader needs to see. Before
