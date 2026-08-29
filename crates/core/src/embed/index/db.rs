@@ -430,7 +430,10 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "10"
+            // The ladder runs to the end, whatever the end currently is: a
+            // literal here says "migrate as far as 10", which is a different
+            // claim and one that goes stale on the next migration.
+            SCHEMA_VERSION.to_string()
         );
     }
 
@@ -1367,55 +1370,6 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_centroids_weighs_passages_not_magnitudes() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let mut idx =
-            SemanticIndex::create(root, "m", 2, EmbeddingEngine::Candle, Some(root)).unwrap();
-        let doc = root.join("doc.txt");
-        fs::write(&doc, "content").unwrap();
-
-        // The long/short asymmetry the pre-normalisation exists for: a raw
-        // mean of these two would land at (0.75, 0.25) and call the region
-        // "mostly the first passage" on the strength of a vector norm.
-        idx.write_file(PreparedFile {
-            full_text: String::new(),
-            path: doc.clone(),
-            chunks: vec![
-                (test_chunk(&doc, "long"), vec![3.0, 0.0]),
-                (test_chunk(&doc, "short"), vec![0.0, 1.0]),
-            ],
-        })
-        .unwrap();
-
-        let ids: Vec<i64> = idx
-            .topic_chunks_for_file(root, &doc)
-            .unwrap()
-            .iter()
-            .map(|chunk| chunk.chunk_id)
-            .collect();
-        assert_eq!(ids.len(), 2);
-
-        let centroids = idx
-            .chunk_centroids(&[vec![ids[0], ids[1]], vec![ids[0]]])
-            .unwrap();
-        assert_eq!(centroids.len(), 2);
-        let halfway = std::f32::consts::FRAC_1_SQRT_2;
-        assert!(
-            (centroids[0][0] - halfway).abs() < 1e-5,
-            "{:?}",
-            centroids[0]
-        );
-        assert!(
-            (centroids[0][1] - halfway).abs() < 1e-5,
-            "{:?}",
-            centroids[0]
-        );
-        // A group of one is that chunk's direction, magnitude discarded.
-        assert!((centroids[1][0] - 1.0).abs() < 1e-5, "{:?}", centroids[1]);
-    }
-
-    #[test]
     fn managed_refs_resolve_and_aggregate_without_exposing_rowids() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("managed_sources");
@@ -1471,7 +1425,17 @@ mod tests {
         ]];
         let accumulated = index.accumulate_chunk_refs(&groups).unwrap();
         assert_eq!(accumulated[0].member_count, 2);
+        // (3,0) and (0,4) sum to (1,1) only because each member is
+        // L2-normalized first. Without that, the longer passage's vector norm
+        // would out-vote the other and the aggregate would report the region
+        // as mostly the first passage on the strength of a magnitude.
         assert_eq!(accumulated[0].sum, vec![1.0, 1.0]);
+        // A group of no chunks is not a vector, and answering with a zero one
+        // would be a well-formed reply to a question nobody can have meant.
+        assert!(
+            index.accumulate_chunk_refs(&[vec![]]).is_err(),
+            "empty group"
+        );
         let resolved = index
             .managed_chunks_for_refs(&groups[0])
             .expect("stable refs resolve");
@@ -1864,32 +1828,6 @@ mod tests {
 
         assert!(idx.managed_chunk_search(&[vec![1.0]], 8, 0.0).is_err());
         assert!(idx.managed_chunk_search(&[vec![1.0, 0.0]], 0, 0.0).is_err());
-    }
-
-    #[test]
-    fn test_chunk_centroids_refuse_ids_the_index_does_not_hold() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let mut idx =
-            SemanticIndex::create(root, "m", 2, EmbeddingEngine::Candle, Some(root)).unwrap();
-        let doc = root.join("doc.txt");
-        fs::write(&doc, "content").unwrap();
-        idx.write_file(PreparedFile {
-            full_text: String::new(),
-            path: doc.clone(),
-            chunks: vec![(test_chunk(&doc, "only"), vec![1.0, 0.0])],
-        })
-        .unwrap();
-        let id = idx.topic_chunks_for_file(root, &doc).unwrap()[0].chunk_id;
-
-        // A stale id must not quietly reduce the group to the chunks that
-        // survived: that answer is a vector too, and nothing about it says so.
-        let error = idx
-            .chunk_centroids(&[vec![id, 999_999]])
-            .expect_err("stale id must refuse");
-        assert!(format!("{error:#}").contains("999999"), "{error:#}");
-
-        assert!(idx.chunk_centroids(&[vec![]]).is_err(), "empty group");
     }
 
     #[test]
@@ -2812,6 +2750,11 @@ pub struct TopicChunkData {
     pub file_id: i64,
     pub file_path: PathBuf,
     pub chunk_text: String,
+    /// The stable identity of this passage, absent only on an index built
+    /// before schema v10 — which is why an export that names passages refuses
+    /// such an index rather than reporting nulls.
+    pub chunk_ref: Option<ChunkRef>,
+    pub text_sha256: Option<String>,
     pub extraction_byte_range: ByteRange,
     pub origin: SourceOrigin,
     pub embedding: Vec<f32>,
@@ -2838,7 +2781,13 @@ pub struct ManagedDocumentData {
     pub chunks: Vec<ManagedChunkData>,
 }
 
-#[derive(Clone, Debug)]
+/// The unnormalized sum of the L2-normalized vectors of one named group, and
+/// how many there were.
+///
+/// The sum rather than the mean, because the mean is derivable from the sum
+/// and the reverse is not: a caller partitioning a large group across several
+/// requests adds the sums and the counts and normalizes exactly once.
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ChunkAccumulation {
     pub sum: Vec<f32>,
     pub member_count: usize,
@@ -6766,35 +6715,6 @@ impl SemanticIndex {
             .collect())
     }
 
-    /// The normalized mean of the stored vectors of named chunks, one mean per
-    /// group, in the order the groups arrived.
-    ///
-    /// The same accumulation [`Self::related_documents`] does at document
-    /// granularity — normalize each member, sum, divide, normalize the sum —
-    /// with the membership named by the caller instead of read off `file_id`.
-    /// Members are normalized *before* the mean because otherwise a long chunk
-    /// with a large-norm vector would out-vote several short ones, and the
-    /// question being asked ("what region do these passages occupy") weighs
-    /// passages, not magnitudes.
-    ///
-    /// A chunk id the index does not hold is an error, never a skipped member.
-    /// Chunk ids are rowids reissued when a file is re-indexed, so a caller
-    /// holding ids from an earlier index would otherwise be handed a mean over
-    /// whichever of its ids happened to survive — a different number, with
-    /// nothing in the reply to say so. The chunk-text lookup on the export
-    /// surface refuses stale ids for the same reason; here it matters more,
-    /// because a partial mean still looks like a perfectly good vector.
-    ///
-    /// Groups are scanned together: one pass over the union of the ids, so the
-    /// cost is the ids asked for and not the groups they are arranged into.
-    pub fn chunk_centroids(&self, groups: &[Vec<i64>]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(self
-            .accumulate_chunk_ids(groups, "Centroid request")?
-            .into_iter()
-            .map(|group| normalized_vector(&centroid(&group.sum, group.member_count)))
-            .collect())
-    }
-
     /// How close each probe vector sits to a named set of chunks, both ways
     /// round, without any chunk vector leaving this index.
     ///
@@ -7225,7 +7145,7 @@ impl SemanticIndex {
             "SELECT c.id, f.id, f.file_path, c.byte_start, c.byte_end,
                     c.origin_type, c.page, c.line, c.col,
                     c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.chunk_text,
-                    v.embedding
+                    v.embedding, c.chunk_ref, c.text_sha256
              FROM root_files rf
              JOIN files f ON f.id = rf.file_id
              JOIN chunks c ON c.file_id = f.id
@@ -7251,6 +7171,8 @@ impl SemanticIndex {
                 row.get::<_, Option<f64>>(12)?,
                 row.get::<_, String>(13)?,
                 row.get::<_, Vec<u8>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<String>>(16)?,
             ))
         })?;
 
@@ -7272,6 +7194,8 @@ impl SemanticIndex {
                 bbox_h,
                 chunk_text,
                 embedding_bytes,
+                chunk_ref,
+                text_sha256,
             ) = row?;
             let origin = source_origin_from_parts(
                 &origin_type,
@@ -7296,6 +7220,8 @@ impl SemanticIndex {
                 file_id,
                 file_path: self.key_to_display_path(&file_path),
                 chunk_text,
+                chunk_ref: chunk_ref.map(ChunkRef),
+                text_sha256,
                 extraction_byte_range: ByteRange {
                     start: byte_start as usize,
                     end: byte_end as usize,

@@ -4,6 +4,31 @@
 
 ### Added
 
+- Passages are addressed at `/api/chunks/{resolve,accumulate,similarity,search}`
+  with one vocabulary: a `scope` naming the index and stable `ChunkRef`s naming
+  the passages. Every one of these existed twice — once taking a corpus id and
+  a pinned embedding space, once taking a workspace id and SQLite rowids — and
+  the second vocabulary was never safe for a caller that stored anything, since
+  a rowid is reissued when its file is re-indexed. `/api/embed/centroid`,
+  `/api/embed/similarity` and `/api/export/chunk-text` are deleted, and
+  `/api/embed/text` and the `/api/export/*` routes take the same `scope`.
+
+  Refs work on an ordinary workspace, not only a managed corpus: the indexing
+  path already writes them. An index built before they existed refuses with
+  `INDEX_IDENTITY_UNVERIFIED`, naming a rebuild, rather than answering with
+  nulls that read like passages. `/api/export/chunks` therefore names its
+  chunks by `chunk_ref` and carries `text_sha256`, in the same shape
+  `chunks/resolve` returns plus the vector — one definition of what a chunk
+  looks like on the wire.
+
+  `accumulate` returns the unnormalized sum of individually L2-normalized
+  members and their count, and the normalized mean `/api/embed/centroid`
+  returned is gone: the mean is derivable from the sum and the reverse is not,
+  so a caller partitioning a large group across requests adds the sums and
+  normalizes exactly once. `resolve` caps at 512 refs, reconciling a 64 that
+  was sized for displaying a passage against an 8,192 borrowed from an
+  operation that returns two scalars.
+
 - One answer about what this build can embed with, at
   `GET /api/embed/capabilities`. It replaces `/api/embed/engines`,
   `/api/embed/models`, and the consumer's own model list: the UI's picker used
@@ -65,6 +90,13 @@
   list.
 
 ### Fixed
+
+- A document indexed by the live file watcher now carries the same stable
+  passage identities a build writes. The watcher called `write_file` where the
+  build calls `write_file_with_recipe`, so a file edited while Wilkes was
+  running landed with no `chunk_ref` — passages that could not be named,
+  indistinguishable from passages that do not exist to every route that
+  addresses one by ref.
 
 - Downloading the same content to the same name reports it as already present
   instead of refusing. The name was checked before the request, so a fetch that

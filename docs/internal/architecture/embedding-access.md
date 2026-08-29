@@ -79,21 +79,22 @@ trace is a `tracing::debug!`.
 
 ---
 
-## 3. What a managed consumer can reach
+## 3. What a consumer can reach
 
-Underdog is the only managed consumer. Its whole surface is
-`/api/integrations/underdog/*`, and the embedding-relevant part is:
+The consumer surface is `/api/chunks/*`, `/api/embed/*` and `/api/export/*`,
+and the embedding-relevant part is:
 
 | route | takes | role used |
 |---|---|---|
 | `embed/text` | texts | **`embed_passages`**, always |
-| `chunks/search` | **vectors only** (`ManagedSearchProbe { vector }`, [lib.rs:474](../../../crates/server/src/lib.rs)) | — |
+| `chunks/search` | vectors **or text** (`SearchProbe`, untagged) | `embed_query` for text probes |
 | `chunks/similarity` | **vectors only** | — |
 | `chunks/accumulate`, `chunks/resolve` | chunk refs | — |
 
-`managed_embed_texts` → `embed_texts` → `embed_passages`
-([context.rs:1732](../../../crates/api/src/context.rs)). There is no role in the
-request and no way to ask for one.
+`embed_texts` → `embed_passages`, with no role in the request and no way to ask
+for one — deliberately, because the vectors it returns are stored. The query
+role is reachable only through `chunks/search`, where sending text says what
+the text is *for*.
 
 **This is the finding that matters.** Every vector Underdog holds — knowledge
 point labels, evidence centroids, goal-scope subject probes, acquisition target
@@ -118,31 +119,26 @@ asymmetric model.
 
 ---
 
-## 4. The managed/plain split is a trust boundary, not a copy
+## 4. The split was a trust boundary, and it is now one rule
 
-The obvious reading is that `/api/embed/text` and
-`/api/integrations/underdog/embed/text` are the same endpoint twice. They are
-not, and the difference is entirely in how the workspace is addressed.
+There used to be two of each of these routes: a plain one addressed by
+`workspace_id` and SQLite rowids, and a managed one addressed by `corpus_id`
+plus `expected_embedding_space_id` and stable `ChunkRef`s. The trust boundary
+was real — a consumer keeping a vector space of its own must never be handed
+vectors from another model, and the plain route could not promise that — but
+the second *vocabulary* was not, because a rowid is reissued when a file is
+re-indexed and so was never safe for a caller that stored anything.
 
-| | plain | managed |
-|---|---|---|
-| addressed by | `workspace_id` ([lib.rs:1180](../../../crates/server/src/lib.rs)) | `corpus_id` + `expected_embedding_space_id` |
-| on space mismatch | nothing to mismatch | `EMBEDDING_SPACE_MISMATCH`, refused |
-| reply names the space | no | yes |
-| shared implementation | `embed_texts` | the same `embed_texts` |
-
-`managed_embed_texts` is 24 lines and computes nothing. What earns it is
-`managed_context`: a consumer keeping a vector space of its own must never be
-handed vectors from another model, and the plain route cannot promise that.
-Underdog's client already respects this — its `legacy_embed_texts` is
-`#[cfg(test)]` and unreachable in production.
-
-The same reasoning explains the rest of the managed surface. The managed API
-addresses chunks by **stable `ChunkRef`/snapshot/rendition**; the plain API by
-**file path and rowid**, which do not survive a rebuild. Different identity
-contracts need different projections, and that is why `accumulate_chunk_refs`
-([db.rs:6293](../../../crates/core/src/embed/index/db.rs)) exists beside
-`chunk_centroids` ([db.rs:6441](../../../crates/core/src/embed/index/db.rs)).
+What survives is the boundary without the duplication. One `scope` object
+addresses every route, its `expected_embedding_space_id` is the pin, and the
+resolver refuses a mismatch wherever it is supplied. Chunks are named by
+`ChunkRef` everywhere, on an ordinary workspace as much as a managed corpus:
+the ordinary indexing path already writes those identities, and an index too
+old to carry them answers `INDEX_IDENTITY_UNVERIFIED` rather than returning
+nulls that read like passages. `accumulate_chunk_refs`
+([db.rs](../../../crates/core/src/embed/index/db.rs)) is now the only
+accumulation; `chunk_centroids`, which took rowids and returned a normalized
+mean, is deleted — the mean is derivable from the sum and the reverse is not.
 
 ---
 
@@ -153,7 +149,7 @@ contracts need different projections, and that is why `accumulate_chunk_refs`
 * `query_corpus` ([db.rs:5551](../../../crates/core/src/embed/index/db.rs)) —
   one probe, `WHERE v.embedding MATCH ?1 AND v.k = ?2 ORDER BY v.distance`,
   through the vec extension.
-* `managed_chunk_search` ([db.rs:6553](../../../crates/core/src/embed/index/db.rs))
+* `managed_chunk_search` ([db.rs](../../../crates/core/src/embed/index/db.rs))
   — N probes, `SELECT … FROM chunks JOIN files JOIN vec_chunks` **with no
   WHERE clause**: every row, decode every blob, normalize, dot in Rust against
   every probe, sort, truncate per probe.

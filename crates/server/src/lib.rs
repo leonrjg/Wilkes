@@ -453,30 +453,37 @@ async fn import_managed_document_handler(
     Ok(Json(exported))
 }
 
+/// A chunk request names an index with `scope` and its passages with refs, and
+/// that is the whole of its addressing.
+///
+/// There were two of each of these routes — one taking a corpus id and a
+/// pinned space, one taking a workspace id and SQLite rowids — and they
+/// disagreed about what a caller could name. A rowid is reissued when a file
+/// is re-indexed, so the second vocabulary could only ever be safe for a
+/// caller that never stored anything, which is not the caller these exist for.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ManagedGroupsBody {
-    corpus_id: String,
-    expected_embedding_space_id: String,
+struct ChunksGroupsBody {
+    #[serde(default)]
+    scope: ConsumerScope,
     groups: Vec<Vec<ChunkRef>>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ManagedResolveBody {
-    corpus_id: String,
-    expected_embedding_space_id: String,
+struct ChunksResolveBody {
+    #[serde(default)]
+    scope: ConsumerScope,
     chunk_refs: Vec<ChunkRef>,
 }
 
 async fn chunks_resolve_handler(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<ManagedResolveBody>,
-) -> Result<Json<wilkes_api::context::ManagedChunkResolution>, (StatusCode, Json<ErrorBody>)> {
-    let context =
-        managed_context(&state, &body.corpus_id, &body.expected_embedding_space_id).await?;
-    context
-        .managed_resolve_chunks(body.chunk_refs)
+    Json(body): Json<ChunksResolveBody>,
+) -> Result<Json<wilkes_api::context::ChunkResolution>, (StatusCode, Json<ErrorBody>)> {
+    addressable_context(&state, &body.scope)
+        .await?
+        .resolve_chunks(body.chunk_refs)
         .await
         .map(Json)
         .map_err(consumer_err)
@@ -484,12 +491,11 @@ async fn chunks_resolve_handler(
 
 async fn chunks_accumulate_handler(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<ManagedGroupsBody>,
-) -> Result<Json<wilkes_api::context::ManagedAccumulations>, (StatusCode, Json<ErrorBody>)> {
-    let context =
-        managed_context(&state, &body.corpus_id, &body.expected_embedding_space_id).await?;
-    context
-        .managed_accumulate(body.groups)
+    Json(body): Json<ChunksGroupsBody>,
+) -> Result<Json<wilkes_api::context::ChunkAccumulations>, (StatusCode, Json<ErrorBody>)> {
+    addressable_context(&state, &body.scope)
+        .await?
+        .accumulate_chunks(body.groups)
         .await
         .map(Json)
         .map_err(consumer_err)
@@ -497,22 +503,21 @@ async fn chunks_accumulate_handler(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ManagedSimilarityBody {
-    corpus_id: String,
-    expected_embedding_space_id: String,
-    probes: Vec<wilkes_api::context::ManagedSimilarityProbeRequest>,
+struct ChunksSimilarityBody {
+    #[serde(default)]
+    scope: ConsumerScope,
+    probes: Vec<wilkes_api::context::ProbeRequest>,
     #[serde(default)]
     chunk_refs: Vec<ChunkRef>,
 }
 
 async fn chunks_similarity_handler(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<ManagedSimilarityBody>,
-) -> Result<Json<wilkes_api::context::ManagedChunkSimilarities>, (StatusCode, Json<ErrorBody>)> {
-    let context =
-        managed_context(&state, &body.corpus_id, &body.expected_embedding_space_id).await?;
-    context
-        .managed_chunk_similarity(body.probes, body.chunk_refs)
+    Json(body): Json<ChunksSimilarityBody>,
+) -> Result<Json<wilkes_api::context::ChunkSimilarities>, (StatusCode, Json<ErrorBody>)> {
+    addressable_context(&state, &body.scope)
+        .await?
+        .chunk_similarity(body.probes, body.chunk_refs)
         .await
         .map(Json)
         .map_err(consumer_err)
@@ -546,26 +551,26 @@ struct TextProbe {
 /// send.
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum ManagedSearchProbe {
+enum SearchProbe {
     Vector(VectorProbe),
     Text(TextProbe),
 }
 
-impl From<ManagedSearchProbe> for wilkes_api::context::ManagedSearchProbeInput {
-    fn from(probe: ManagedSearchProbe) -> Self {
+impl From<SearchProbe> for wilkes_api::context::SearchProbeInput {
+    fn from(probe: SearchProbe) -> Self {
         match probe {
-            ManagedSearchProbe::Vector(probe) => Self::Vector(probe.vector),
-            ManagedSearchProbe::Text(probe) => Self::Text(probe.text),
+            SearchProbe::Vector(probe) => Self::Vector(probe.vector),
+            SearchProbe::Text(probe) => Self::Text(probe.text),
         }
     }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ManagedSearchBody {
-    corpus_id: String,
-    expected_embedding_space_id: String,
-    probes: Vec<ManagedSearchProbe>,
+struct ChunksSearchBody {
+    #[serde(default)]
+    scope: ConsumerScope,
+    probes: Vec<SearchProbe>,
     top_k: usize,
     min_similarity: f32,
 }
@@ -863,12 +868,11 @@ async fn catalogue_status_handler(
 
 async fn chunks_search_handler(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<ManagedSearchBody>,
-) -> Result<Json<wilkes_api::context::ManagedChunkSearch>, (StatusCode, Json<ErrorBody>)> {
-    let context =
-        managed_context(&state, &body.corpus_id, &body.expected_embedding_space_id).await?;
-    context
-        .managed_chunk_search(
+    Json(body): Json<ChunksSearchBody>,
+) -> Result<Json<wilkes_api::context::ChunkSearch>, (StatusCode, Json<ErrorBody>)> {
+    addressable_context(&state, &body.scope)
+        .await?
+        .chunk_search(
             body.probes.into_iter().map(Into::into).collect(),
             body.top_k,
             body.min_similarity,
@@ -876,14 +880,6 @@ async fn chunks_search_handler(
         .await
         .map(Json)
         .map_err(consumer_err)
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ManagedEmbedTextBody {
-    corpus_id: String,
-    expected_embedding_space_id: String,
-    texts: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -937,19 +933,6 @@ async fn managed_restore_handler(
         .map_err(consumer_anyhow_err)
 }
 
-async fn managed_embed_text_handler(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<ManagedEmbedTextBody>,
-) -> Result<Json<wilkes_api::context::ManagedEmbeddedTexts>, (StatusCode, Json<ErrorBody>)> {
-    let context =
-        managed_context(&state, &body.corpus_id, &body.expected_embedding_space_id).await?;
-    context
-        .managed_embed_texts(body.texts)
-        .await
-        .map(Json)
-        .map_err(consumer_err)
-}
-
 /// What this Wilkes can embed with — the models, their dimensions, and the
 /// input recipes they require.
 ///
@@ -984,18 +967,19 @@ fn describe_space(space: Option<&str>) -> &str {
     space.unwrap_or("none")
 }
 
-async fn managed_context(
+/// The index behind a scope, for a route that is about to name passages.
+///
+/// Every `/api/chunks` route needs the same two things: the resolver's
+/// verdict on the scope, and the refusal owed to an index whose chunk refs
+/// are all null. Answering the second per route is how one of them ends up
+/// returning a list of nulls that reads like a list of passages.
+async fn addressable_context(
     state: &Arc<AppState>,
-    corpus_id: &str,
-    expected_embedding_space_id: &str,
+    scope: &ConsumerScope,
 ) -> Result<Arc<wilkes_api::context::AppContext>, (StatusCode, Json<ErrorBody>)> {
-    Ok(state
-        .consumer_index(&ConsumerScope {
-            workspace_id: Some(corpus_id.to_string()),
-            expected_embedding_space_id: Some(expected_embedding_space_id.to_string()),
-        })
-        .await?
-        .into_context())
+    let index = state.consumer_index(scope).await?;
+    index.addressable_space_id().map_err(consumer_err)?;
+    Ok(index.into_context())
 }
 
 async fn list_bookmarks_handler(
@@ -1261,18 +1245,23 @@ async fn is_semantic_ready_handler(State(state): State<Arc<AppState>>) -> Json<b
 #[derive(Deserialize)]
 struct EmbedTextBody {
     texts: Vec<String>,
-    /// Which workspace's embedder to use. Absent means the active one.
+    /// Which index's embedder to use, and which space the caller believes it
+    /// is talking to.
     ///
-    /// A consumer keeping one vector space across workspaces (Underdog pins
-    /// model + dimension) cannot let "whichever workspace the user last
-    /// opened" decide what embeds its text: the model would change under it
-    /// when the user switches windows.
+    /// A consumer keeping one vector space cannot let "whichever workspace the
+    /// user last opened" decide what embeds its text: the model would change
+    /// under it when the user switches windows. Pinning the space is how it
+    /// says so.
     #[serde(default)]
-    workspace_id: Option<String>,
+    scope: ConsumerScope,
 }
 
-/// Embed arbitrary strings with the model the semantic index uses. Sidecar
-/// consumers (Underdog) pin the returned model id + dimension.
+/// Embed arbitrary strings with the model the addressed index uses, in the
+/// **passage** role — the role the vectors it returns are stored under.
+///
+/// The reply names the embedding space when the index has one, which is what a
+/// consumer pins against. It is null only when the addressed workspace holds
+/// no index at all: embedding text does not require one.
 async fn embed_text_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<EmbedTextBody>,
@@ -1280,102 +1269,11 @@ async fn embed_text_handler(
     if body.texts.is_empty() {
         return Err(err("texts must not be empty"));
     }
-    state
-        .consumer_index(&ConsumerScope {
-            workspace_id: body.workspace_id.clone(),
-            expected_embedding_space_id: None,
-        })
-        .await?
+    let index = state.consumer_index(&body.scope).await?;
+    let space = index.embedding_space_id().map(str::to_string);
+    index
         .into_context()
-        .embed_texts(body.texts)
-        .await
-        .map(Json)
-        .map_err(server_err)
-}
-
-#[derive(Deserialize)]
-struct EmbedCentroidBody {
-    /// One group of chunk ids per centroid wanted, in the order the reply
-    /// should carry them.
-    groups: Vec<Vec<i64>>,
-    /// Which workspace's index holds those chunk ids. Absent means the active
-    /// one.
-    ///
-    /// Not a filter: chunk ids are per-index rowids, so the same number names
-    /// a different passage in every workspace. Answering from "whichever one
-    /// is open" would return a centroid of the wrong passages rather than an
-    /// error about ids that do not exist.
-    #[serde(default)]
-    workspace_id: Option<String>,
-}
-
-/// The normalized mean of named chunks' stored vectors, one per group — for a
-/// consumer that keeps its own vector space and wants a region of this index
-/// expressed in it, without receiving the index's vectors to average itself.
-///
-/// Beside `/api/embed/text` rather than under `/api/export` because that is
-/// what it answers with: a vector in the index's space, carrying the model id
-/// and dimension a consumer pins against, exactly as text embedding does.
-async fn embed_centroid_handler(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<EmbedCentroidBody>,
-) -> Result<Json<wilkes_api::context::ChunkCentroids>, (StatusCode, Json<ErrorBody>)> {
-    if body.groups.is_empty() {
-        return Err(err("groups must not be empty"));
-    }
-    state
-        .consumer_index(&ConsumerScope {
-            workspace_id: body.workspace_id.clone(),
-            expected_embedding_space_id: None,
-        })
-        .await?
-        .into_context()
-        .chunk_centroids(body.groups)
-        .await
-        .map(Json)
-        .map_err(server_err)
-}
-
-#[derive(Deserialize)]
-struct EmbedSimilarityBody {
-    /// The consumer's own vectors, in the order the reply should carry them.
-    probes: Vec<wilkes_api::context::SimilarityProbeRequest>,
-    /// The chunks to search. May be empty when only the probes' scope means
-    /// are wanted — asking for a bar without asking for a nearest is a
-    /// legitimate request, not a malformed one.
-    #[serde(default)]
-    chunk_ids: Vec<i64>,
-    /// Which workspace's index holds those chunk ids. Absent means the active
-    /// one — and, as on `/api/embed/centroid`, this is not a filter: chunk ids
-    /// are per-index rowids, so answering from whichever workspace is open
-    /// would return confident similarities against the wrong passages.
-    #[serde(default)]
-    workspace_id: Option<String>,
-}
-
-/// How close a caller's own vectors sit to named chunks, both directions, plus
-/// a per-probe mean over a scope it names — for a consumer measuring its model
-/// of a document against the document, without receiving the document's
-/// vectors.
-///
-/// Beside `/api/embed/centroid` for the same reason that one sits beside
-/// `/api/embed/text`: what it answers with is a reading of this index's vector
-/// space, carrying the model id and dimension a consumer pins against.
-async fn embed_similarity_handler(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<EmbedSimilarityBody>,
-) -> Result<Json<wilkes_api::context::ChunkSimilarities>, (StatusCode, Json<ErrorBody>)> {
-    if body.probes.is_empty() {
-        return Err(err("probes must not be empty"));
-    }
-    state
-        .consumer_index(&ConsumerScope {
-            workspace_id: body.workspace_id.clone(),
-            expected_embedding_space_id: None,
-        })
-        .await?
-        .into_context()
-        .chunk_similarity(body.probes, body.chunk_ids)
+        .embed_texts(body.texts, space)
         .await
         .map(Json)
         .map_err(server_err)
@@ -1385,13 +1283,14 @@ async fn embed_similarity_handler(
 struct ExportChunksBody {
     root: PathBuf,
     path: PathBuf,
-    /// Which workspace indexed this file. Absent means the active one.
+    /// Which index holds this file's passages. Absent means the active
+    /// workspace.
     ///
     /// Each workspace owns its index, so this is not a filter — it names the
     /// database the chunks are read from. Without it, exporting a document
     /// from another library meant switching the whole server to it first.
     #[serde(default)]
-    workspace_id: Option<String>,
+    scope: ConsumerScope,
 }
 
 /// The document scope shared by export routes that read one source file.
@@ -1402,7 +1301,7 @@ struct ExportOutlineBody {
     /// Which workspace owns the configured library root. Absent means the
     /// active workspace, consistent with the rest of the export surface.
     #[serde(default)]
-    workspace_id: Option<String>,
+    scope: ConsumerScope,
 }
 
 /// Chunk + vector export for one indexed file: text, byte ranges, source
@@ -1411,13 +1310,8 @@ async fn export_chunks_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ExportChunksBody>,
 ) -> Result<Json<wilkes_api::context::FileChunkExport>, (StatusCode, Json<ErrorBody>)> {
-    state
-        .consumer_index(&ConsumerScope {
-            workspace_id: body.workspace_id.clone(),
-            expected_embedding_space_id: None,
-        })
+    addressable_context(&state, &body.scope)
         .await?
-        .into_context()
         .export_file_chunks(body.root, body.path)
         .await
         .map(Json)
@@ -1432,10 +1326,7 @@ async fn export_outline_handler(
     Json(body): Json<ExportOutlineBody>,
 ) -> Result<Json<wilkes_api::context::FileOutlineExport>, (StatusCode, Json<ErrorBody>)> {
     state
-        .consumer_index(&ConsumerScope {
-            workspace_id: body.workspace_id.clone(),
-            expected_embedding_space_id: None,
-        })
+        .consumer_index(&body.scope)
         .await?
         .into_context()
         .export_file_outline(body.root, body.path)
@@ -1450,7 +1341,7 @@ struct ExportFilesBody {
     /// Which workspace's library and index to read. Absent means the active
     /// one, as everywhere else on the export surface.
     #[serde(default)]
-    workspace_id: Option<String>,
+    scope: ConsumerScope,
 }
 
 /// The documents one library root holds, each with the passage count that says
@@ -1466,45 +1357,10 @@ async fn export_files_handler(
     Json(body): Json<ExportFilesBody>,
 ) -> Result<Json<wilkes_api::context::LibraryFileExport>, (StatusCode, Json<ErrorBody>)> {
     state
-        .consumer_index(&ConsumerScope {
-            workspace_id: body.workspace_id.clone(),
-            expected_embedding_space_id: None,
-        })
+        .consumer_index(&body.scope)
         .await?
         .into_context()
         .export_library_files(body.root)
-        .await
-        .map(Json)
-        .map_err(server_err)
-}
-
-#[derive(Deserialize)]
-struct ExportChunkTextBody {
-    root: PathBuf,
-    path: PathBuf,
-    /// Chunk ids as `/api/export/chunks` reported them, which is where a caller
-    /// gets them.
-    chunk_ids: Vec<i64>,
-    /// The workspace those chunk ids belong to — they are keyed per index, so
-    /// reading them against another workspace would answer about other text.
-    #[serde(default)]
-    workspace_id: Option<String>,
-}
-
-/// The text of named chunks of one indexed file, without their vectors — the
-/// lookup behind "show me the passage this came from".
-async fn export_chunk_text_handler(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<ExportChunkTextBody>,
-) -> Result<Json<wilkes_api::context::ChunkTextExport>, (StatusCode, Json<ErrorBody>)> {
-    state
-        .consumer_index(&ConsumerScope {
-            workspace_id: body.workspace_id.clone(),
-            expected_embedding_space_id: None,
-        })
-        .await?
-        .into_context()
-        .export_chunk_text(body.root, body.path, body.chunk_ids)
         .await
         .map(Json)
         .map_err(server_err)
@@ -2310,30 +2166,26 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             "/api/integrations/underdog/documents/import",
             post(import_managed_document_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
+        .route("/api/chunks/resolve", post(chunks_resolve_handler))
+        .route("/api/chunks/accumulate", post(chunks_accumulate_handler))
         .route(
-            "/api/integrations/underdog/chunks/resolve",
-            post(chunks_resolve_handler),
-        )
-        .route(
-            "/api/integrations/underdog/chunks/accumulate",
-            post(chunks_accumulate_handler),
-        )
-        .route(
-            "/api/integrations/underdog/chunks/similarity",
+            "/api/chunks/similarity",
+            // The one endpoint whose *request* is large: MAX_SIMILARITY_PROBES
+            // vectors of the index's dimension, spelled out as JSON floats.
+            // 512 × 768 dims at ~13 bytes a float is a little over 5 MB, and
+            // axum's 2 MB default silently turned the documented cap into a
+            // 413 for anything past about half of it. A cap the transport
+            // cannot carry is not a cap, it is a trap.
             post(chunks_similarity_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route(
-            "/api/integrations/underdog/chunks/search",
+            "/api/chunks/search",
             post(chunks_search_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route("/api/catalogue/search", post(catalogue_search_handler))
         .route("/api/catalogue/sync", post(catalogue_sync_handler))
         .route("/api/catalogue/status", get(catalogue_status_handler))
         .route("/api/catalogue/acquire", post(catalogue_acquire_handler))
-        .route(
-            "/api/integrations/underdog/embed/text",
-            post(managed_embed_text_handler),
-        )
         .route(
             "/api/integrations/underdog/backup",
             post(managed_backup_handler),
@@ -2405,20 +2257,8 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/embed/ready", get(is_semantic_ready_handler))
         .route("/api/embed/text", post(embed_text_handler))
-        .route("/api/embed/centroid", post(embed_centroid_handler))
-        .route(
-            "/api/embed/similarity",
-            // The one endpoint whose *request* is large: MAX_SIMILARITY_PROBES
-            // vectors of the index's dimension, spelled out as JSON floats.
-            // 512 × 768 dims at ~13 bytes a float is a little over 5 MB, and
-            // axum's 2 MB default silently turned the documented cap into a
-            // 413 for anything past about half of it. A cap the transport
-            // cannot carry is not a cap, it is a trap.
-            post(embed_similarity_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
-        )
         .route("/api/export/chunks", post(export_chunks_handler))
         .route("/api/export/outline", post(export_outline_handler))
-        .route("/api/export/chunk-text", post(export_chunk_text_handler))
         .route("/api/export/files", post(export_files_handler))
         .route("/api/generation/ready", get(is_generation_ready_handler))
         .route(
@@ -2604,15 +2444,15 @@ mod tests {
     /// first.
     #[test]
     fn a_probe_is_a_vector_or_a_text_and_never_both() {
-        let vector: ManagedSearchProbe =
+        let vector: SearchProbe =
             serde_json::from_str(r#"{"vector":[1.0,0.0]}"#).expect("a vector probe");
-        assert!(matches!(vector, ManagedSearchProbe::Vector(_)));
+        assert!(matches!(vector, SearchProbe::Vector(_)));
 
-        let text: ManagedSearchProbe =
+        let text: SearchProbe =
             serde_json::from_str(r#"{"text":"causal inference"}"#).expect("a text probe");
         match text {
-            ManagedSearchProbe::Text(probe) => assert_eq!(probe.text, "causal inference"),
-            ManagedSearchProbe::Vector(_) => panic!("text read as a vector"),
+            SearchProbe::Text(probe) => assert_eq!(probe.text, "causal inference"),
+            SearchProbe::Vector(_) => panic!("text read as a vector"),
         }
 
         for malformed in [
@@ -2622,7 +2462,7 @@ mod tests {
             r#"{"txt":"misspelled"}"#,
         ] {
             assert!(
-                serde_json::from_str::<ManagedSearchProbe>(malformed).is_err(),
+                serde_json::from_str::<SearchProbe>(malformed).is_err(),
                 "{malformed} must be refused"
             );
         }

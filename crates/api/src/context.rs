@@ -400,7 +400,7 @@ enum EmbedRole {
 /// rather than two, and it is the only form under which the query role can
 /// reach the embedder at all.
 #[derive(Clone, Debug)]
-pub enum ManagedSearchProbeInput {
+pub enum SearchProbeInput {
     Vector(Vec<f32>),
     Text(String),
 }
@@ -439,8 +439,13 @@ impl IndexSpace {
 
 /// Result of `embed_texts`: vectors from the same model the index uses,
 /// with the identity consumers pin against.
+///
+/// `embedding_space_id` is absent exactly when the addressed workspace holds
+/// no index — embedding text does not require one — and present whenever the
+/// caller pinned a space, since a pin implies an index.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct EmbeddedTexts {
+    pub embedding_space_id: Option<String>,
     pub engine: String,
     pub model_id: String,
     pub dimension: usize,
@@ -448,16 +453,7 @@ pub struct EmbeddedTexts {
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct ManagedEmbeddedTexts {
-    pub embedding_space_id: String,
-    pub engine: String,
-    pub model_id: String,
-    pub dimension: usize,
-    pub vectors: Vec<Vec<f32>>,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ManagedChunkExport {
+pub struct ChunkExport {
     pub chunk_ref: ChunkRef,
     pub ordinal: usize,
     pub text: String,
@@ -494,7 +490,7 @@ pub struct ManagedDocumentExport {
     /// clustered into a body column and which were too ambiguous to reorder,
     /// what was removed as furniture, how the wrap hyphens resolved.
     pub extraction: wilkes_core::types::ExtractionDiagnostics,
-    pub chunks: Vec<ManagedChunkExport>,
+    pub chunks: Vec<ChunkExport>,
     pub embedding_work: ManagedEmbeddingWork,
 }
 
@@ -661,34 +657,34 @@ pub(crate) fn managed_backup_files(root: &Path) -> anyhow::Result<Vec<ManagedBac
     Ok(out)
 }
 
+/// Result of `accumulate_chunks`: one accumulation per requested group, in
+/// the order the groups arrived.
+///
+/// The group shape is the index's own [`ChunkAccumulation`] rather than a
+/// copy of it here: it is the same two numbers, and a second definition would
+/// be a second place for them to drift.
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct ManagedAccumulation {
-    pub sum: Vec<f32>,
-    pub member_count: usize,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ManagedAccumulations {
+pub struct ChunkAccumulations {
     pub embedding_space_id: String,
     pub dimension: usize,
-    pub groups: Vec<ManagedAccumulation>,
+    pub groups: Vec<ChunkAccumulation>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct ManagedChunkResolution {
+pub struct ChunkResolution {
     pub embedding_space_id: String,
-    pub chunks: Vec<ManagedChunkExport>,
+    pub chunks: Vec<ChunkExport>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
-pub struct ManagedSimilarityProbeRequest {
+pub struct ProbeRequest {
     pub vector: Vec<f32>,
     #[serde(default)]
     pub scope: Vec<ChunkRef>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct ManagedProbeSimilarity {
+pub struct ProbeSimilarity {
     pub nearest_chunk_ref: Option<ChunkRef>,
     pub similarity: Option<f32>,
     pub scope_mean: Option<f32>,
@@ -696,22 +692,22 @@ pub struct ManagedProbeSimilarity {
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct ManagedChunkNearest {
+pub struct ChunkNearest {
     pub chunk_ref: ChunkRef,
     pub probe: usize,
     pub similarity: f32,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct ManagedChunkSimilarities {
+pub struct ChunkSimilarities {
     pub embedding_space_id: String,
     pub dimension: usize,
-    pub probes: Vec<ManagedProbeSimilarity>,
-    pub chunks: Vec<ManagedChunkNearest>,
+    pub probes: Vec<ProbeSimilarity>,
+    pub chunks: Vec<ChunkNearest>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct ManagedChunkSearchHit {
+pub struct ChunkSearchHit {
     pub chunk_ref: ChunkRef,
     pub snapshot_id: String,
     pub rendition_id: String,
@@ -720,19 +716,19 @@ pub struct ManagedChunkSearchHit {
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct ManagedProbeSearch {
-    pub hits: Vec<ManagedChunkSearchHit>,
+pub struct ProbeSearch {
+    pub hits: Vec<ChunkSearchHit>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct ManagedChunkSearch {
+pub struct ChunkSearch {
     pub embedding_space_id: String,
     pub dimension: usize,
-    pub probes: Vec<ManagedProbeSearch>,
+    pub probes: Vec<ProbeSearch>,
 }
 
-pub const MAX_MANAGED_SEARCH_PROBES: usize = 512;
-pub const MAX_MANAGED_SEARCH_TOP_K: usize = 100;
+pub const MAX_SEARCH_PROBES: usize = 512;
+pub const MAX_SEARCH_TOP_K: usize = 100;
 
 /// Most groups one `chunk_centroids` request may name, and most chunk ids it
 /// may name across all of them.
@@ -743,23 +739,8 @@ pub const MAX_MANAGED_SEARCH_TOP_K: usize = 100;
 /// of the question: a caller asking for more than a few hundred regions in one
 /// request is building a projection of the index, which is what
 /// `export_file_chunks` is for.
-pub const MAX_CENTROID_GROUPS: usize = 256;
-pub const MAX_CENTROID_CHUNK_IDS: usize = 4_096;
-
-/// Result of `chunk_centroids`: one normalized mean per requested group, in
-/// the order the groups were asked for.
-///
-/// `model_id` and `dimension` are the index's own — the identity of the model
-/// that produced the vectors being averaged, not of whatever embedder happens
-/// to be loaded — because a consumer storing these beside vectors of its own
-/// refuses on a mismatch and needs the comparison to be about the same thing.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ChunkCentroids {
-    pub engine: String,
-    pub model_id: String,
-    pub dimension: usize,
-    pub centroids: Vec<Vec<f32>>,
-}
+pub const MAX_ACCUMULATE_GROUPS: usize = 256;
+pub const MAX_ACCUMULATE_REFS: usize = 4_096;
 
 /// Most probes one `chunk_similarity` request may carry, and most chunk ids it
 /// may name across the searched set and every scope together.
@@ -770,63 +751,19 @@ pub struct ChunkCentroids {
 /// second, and a caller wanting more is measuring a library rather than a
 /// document and should say so one document at a time.
 pub const MAX_SIMILARITY_PROBES: usize = 512;
-pub const MAX_SIMILARITY_CHUNK_IDS: usize = 8_192;
+pub const MAX_SIMILARITY_REFS: usize = 8_192;
 
-/// One probe of `chunk_similarity`: a vector in the index's space, and
-/// optionally the chunk ids to average it over.
-#[derive(Clone, Debug, serde::Deserialize)]
-pub struct SimilarityProbeRequest {
-    pub vector: Vec<f32>,
-    #[serde(default)]
-    pub scope: Vec<i64>,
-}
-
-/// What one probe found: its nearest chunk among the searched set, and the
-/// mean similarity over its own scope when it named one.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ProbeSimilarity {
-    pub nearest_chunk_id: Option<i64>,
-    pub similarity: Option<f32>,
-    pub scope_mean: Option<f32>,
-    pub scope_size: usize,
-}
-
-/// What one searched chunk found: the probe it sits closest to, named by its
-/// index in the request.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ChunkNearest {
-    pub chunk_id: i64,
-    pub probe: usize,
-    pub similarity: f32,
-}
-
-/// Result of `chunk_similarity`: both directions of one comparison, plus the
-/// identity of the model whose stored vectors answered.
+/// One exported chunk: the same passage `resolve` returns, plus the stored
+/// vector.
 ///
-/// `model_id` and `dimension` travel for the reason they travel on
-/// [`ChunkCentroids`]: a consumer comparing these numbers against readings
-/// taken elsewhere has to be able to refuse rather than average across two
-/// spaces. Here it is sharper still — the probes are the consumer's own
-/// vectors, so a model mismatch makes every number in the reply a comparison
-/// between two different embedders and nothing in the shape says so.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ChunkSimilarities {
-    pub engine: String,
-    pub model_id: String,
-    pub dimension: usize,
-    pub probes: Vec<ProbeSimilarity>,
-    pub chunks: Vec<ChunkNearest>,
-}
-
-/// One exported chunk: text, locators (byte range into the extracted text
-/// plus resolved source origin), and the stored vector.
+/// Flattened rather than restated, so there is one definition of what a chunk
+/// looks like on the wire. A consumer that stored a passage from an export and
+/// later resolved it by ref must be able to match the two, and two structs
+/// listing the same fields is how they come to differ by one.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ExportedChunk {
-    pub chunk_id: i64,
-    pub ordinal: usize,
-    pub text: String,
-    pub byte_range: wilkes_core::types::ByteRange,
-    pub origin: wilkes_core::types::SourceOrigin,
+    #[serde(flatten)]
+    pub chunk: ChunkExport,
     pub embedding: Vec<f32>,
 }
 
@@ -912,31 +849,16 @@ pub struct LibraryFileExport {
     pub files: Vec<LibraryFile>,
 }
 
-/// Most chunks one `export_chunk_text` request may name.
+/// Most chunk refs one `resolve` request may name.
 ///
-/// A bound rather than a preference: the endpoint exists so that displaying a
-/// passage costs a passage, and a caller that can ask for a thousand chunks has
-/// simply rebuilt the full export with extra steps. Generous enough for a long
-/// section, small enough that no reply is a surprise.
-pub const MAX_CHUNK_TEXT_IDS: usize = 64;
-
-/// One chunk's text and locators, without the vector.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ChunkText {
-    pub chunk_id: i64,
-    pub ordinal: usize,
-    pub text: String,
-    pub byte_range: wilkes_core::types::ByteRange,
-    pub origin: wilkes_core::types::SourceOrigin,
-}
-
-/// Result of `export_chunk_text`, ascending by ordinal — reading order, not the
-/// order the ids were asked for.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ChunkTextExport {
-    pub file_path: PathBuf,
-    pub chunks: Vec<ChunkText>,
-}
+/// The two surfaces this replaces disagreed: the export route capped at 64 on
+/// the reasoning that displaying a passage should cost a passage, and the
+/// managed route borrowed the similarity cap of 8,192, which is sized for an
+/// operation returning two scalars per probe rather than one returning full
+/// text. This is chosen against what the reply actually weighs — roughly half
+/// a megabyte at typical chunk sizes, comparable to the other consumer
+/// responses — and callers wanting more page.
+pub const MAX_RESOLVE_REFS: usize = 512;
 
 /// Maps each outline entry onto the first exported chunk at or after its
 /// position, dropping entries that resolve past the end of the document.
@@ -954,15 +876,15 @@ trait OutlineChunk {
 
 impl OutlineChunk for ExportedChunk {
     fn outline_ordinal(&self) -> usize {
-        self.ordinal
+        self.chunk.ordinal
     }
 
     fn outline_byte_range(&self) -> &wilkes_core::types::ByteRange {
-        &self.byte_range
+        &self.chunk.byte_range
     }
 
     fn outline_origin(&self) -> &wilkes_core::types::SourceOrigin {
-        &self.origin
+        &self.chunk.origin
     }
 }
 
@@ -1826,8 +1748,20 @@ impl AppContext {
     /// uses. Consumers (the Underdog sidecar client) pin the returned model
     /// id and dimension and treat any later mismatch as a hard error, so the
     /// response always names both.
-    pub async fn embed_texts(&self, texts: Vec<String>) -> Result<EmbeddedTexts, String> {
-        self.embed_texts_in_role(texts, EmbedRole::Passage).await
+    /// Embed arbitrary strings with the model this workspace's index uses.
+    ///
+    /// `embedding_space_id` is passed in rather than read back out of the
+    /// index: the resolver already established which space this request is
+    /// about, and asking the index again would be a second answer that could
+    /// disagree with the pin the caller was checked against.
+    pub async fn embed_texts(
+        &self,
+        texts: Vec<String>,
+        embedding_space_id: Option<String>,
+    ) -> Result<EmbeddedTexts, String> {
+        let mut embedded = self.embed_texts_in_role(texts, EmbedRole::Passage).await?;
+        embedded.embedding_space_id = embedding_space_id;
+        Ok(embedded)
     }
 
     /// The two roles an asymmetric model distinguishes. Which one applies is
@@ -1880,6 +1814,7 @@ impl AppContext {
             }
         }
         Ok(EmbeddedTexts {
+            embedding_space_id: None,
             engine,
             model_id,
             dimension,
@@ -2604,7 +2539,7 @@ impl AppContext {
             chunks: document
                 .chunks
                 .into_iter()
-                .map(|chunk| ManagedChunkExport {
+                .map(|chunk| ChunkExport {
                     chunk_ref: chunk.chunk_ref,
                     ordinal: chunk.ordinal,
                     text: chunk.text,
@@ -2621,40 +2556,15 @@ impl AppContext {
         })
     }
 
-    pub async fn managed_embed_texts(
-        &self,
-        texts: Vec<String>,
-    ) -> Result<ManagedEmbeddedTexts, ConsumerError> {
-        let embedded = self.embed_texts(texts).await?;
-        let space = {
-            let index_arc = self.index.lock().clone();
-            let guard = index_arc
-                .lock()
-                .map_err(|_| "Semantic index lock was poisoned")?;
-            guard
-                .as_ref()
-                .ok_or_else(|| "Managed index unavailable".to_string())?
-                .embedding_space_id()
-                .map_err(|error| error.to_string())?
-        };
-        Ok(ManagedEmbeddedTexts {
-            embedding_space_id: space.0,
-            engine: embedded.engine,
-            model_id: embedded.model_id,
-            dimension: embedded.dimension,
-            vectors: embedded.vectors,
-        })
-    }
-
-    pub async fn managed_accumulate(
+    pub async fn accumulate_chunks(
         &self,
         groups: Vec<Vec<ChunkRef>>,
-    ) -> Result<ManagedAccumulations, ConsumerError> {
+    ) -> Result<ChunkAccumulations, ConsumerError> {
         if groups.is_empty() {
             return Err(ConsumerError::untyped("Aggregate request names no groups"));
         }
         let total: usize = groups.iter().map(Vec::len).sum();
-        if groups.len() > MAX_CENTROID_GROUPS || total > MAX_CENTROID_CHUNK_IDS {
+        if groups.len() > MAX_ACCUMULATE_GROUPS || total > MAX_ACCUMULATE_REFS {
             return Err(ConsumerError::untyped(
                 "Aggregate request exceeds the documented request cap",
             ));
@@ -2673,35 +2583,30 @@ impl AppContext {
             let groups: Vec<ChunkAccumulation> = index
                 .accumulate_chunk_refs(&groups)
                 .map_err(|error| error.to_string())?;
-            Ok(ManagedAccumulations {
+            Ok(ChunkAccumulations {
                 embedding_space_id: space.0,
                 dimension: index.status().dimension,
-                groups: groups
-                    .into_iter()
-                    .map(|group| ManagedAccumulation {
-                        sum: group.sum,
-                        member_count: group.member_count,
-                    })
-                    .collect(),
+                groups,
             })
         })
         .await
         .map_err(|error| format!("Aggregate task panicked: {error}"))?
     }
 
-    pub async fn managed_resolve_chunks(
+    pub async fn resolve_chunks(
         &self,
         refs: Vec<ChunkRef>,
-    ) -> Result<ManagedChunkResolution, ConsumerError> {
+    ) -> Result<ChunkResolution, ConsumerError> {
         if refs.is_empty() {
             return Err(ConsumerError::untyped(
                 "Resolve request names no chunk refs",
             ));
         }
-        if refs.len() > MAX_SIMILARITY_CHUNK_IDS {
-            return Err(ConsumerError::untyped(
-                "Resolve request exceeds the documented request cap",
-            ));
+        if refs.len() > MAX_RESOLVE_REFS {
+            return Err(ConsumerError::untyped(format!(
+                "Resolve request names {} chunk refs; {MAX_RESOLVE_REFS} is the most one request                  may ask for.",
+                refs.len(),
+            )));
         }
         let index_arc = self.index.lock().clone();
         tokio::task::spawn_blocking(move || {
@@ -2714,14 +2619,14 @@ impl AppContext {
             let chunks = index
                 .managed_chunks_for_refs(&refs)
                 .map_err(|error| error.to_string())?;
-            Ok(ManagedChunkResolution {
+            Ok(ChunkResolution {
                 embedding_space_id: index
                     .embedding_space_id()
                     .map_err(|error| error.to_string())?
                     .0,
                 chunks: chunks
                     .into_iter()
-                    .map(|chunk| ManagedChunkExport {
+                    .map(|chunk| ChunkExport {
                         chunk_ref: chunk.chunk_ref,
                         ordinal: chunk.ordinal,
                         text: chunk.text,
@@ -2736,16 +2641,16 @@ impl AppContext {
         .map_err(|error| format!("Resolve task panicked: {error}"))?
     }
 
-    pub async fn managed_chunk_similarity(
+    pub async fn chunk_similarity(
         &self,
-        probes: Vec<ManagedSimilarityProbeRequest>,
+        probes: Vec<ProbeRequest>,
         chunk_refs: Vec<ChunkRef>,
-    ) -> Result<ManagedChunkSimilarities, ConsumerError> {
+    ) -> Result<ChunkSimilarities, ConsumerError> {
         if probes.is_empty() {
             return Err(ConsumerError::untyped("Similarity request names no probes"));
         }
         let total = chunk_refs.len() + probes.iter().map(|probe| probe.scope.len()).sum::<usize>();
-        if probes.len() > MAX_SIMILARITY_PROBES || total > MAX_SIMILARITY_CHUNK_IDS {
+        if probes.len() > MAX_SIMILARITY_PROBES || total > MAX_SIMILARITY_REFS {
             return Err(ConsumerError::untyped(
                 "Similarity request exceeds the documented request cap",
             ));
@@ -2788,7 +2693,7 @@ impl AppContext {
             let found = index
                 .chunk_similarity(&probes, &searched)
                 .map_err(|error| error.to_string())?;
-            Ok(ManagedChunkSimilarities {
+            Ok(ChunkSimilarities {
                 embedding_space_id: index
                     .embedding_space_id()
                     .map_err(|error| error.to_string())?
@@ -2797,7 +2702,7 @@ impl AppContext {
                 probes: found
                     .probes
                     .into_iter()
-                    .map(|probe| ManagedProbeSimilarity {
+                    .map(|probe| ProbeSimilarity {
                         nearest_chunk_ref: probe
                             .nearest_chunk_id
                             .map(|rowid| reverse[&rowid].clone()),
@@ -2809,7 +2714,7 @@ impl AppContext {
                 chunks: found
                     .chunks
                     .into_iter()
-                    .map(|chunk| ManagedChunkNearest {
+                    .map(|chunk| ChunkNearest {
                         chunk_ref: reverse[&chunk.chunk_id].clone(),
                         probe: chunk.probe,
                         similarity: chunk.similarity,
@@ -2821,19 +2726,16 @@ impl AppContext {
         .map_err(|error| format!("Similarity task panicked: {error}"))?
     }
 
-    pub async fn managed_chunk_search(
+    pub async fn chunk_search(
         &self,
-        probes: Vec<ManagedSearchProbeInput>,
+        probes: Vec<SearchProbeInput>,
         top_k: usize,
         min_similarity: f32,
-    ) -> Result<ManagedChunkSearch, ConsumerError> {
+    ) -> Result<ChunkSearch, ConsumerError> {
         if probes.is_empty() {
             return Err(ConsumerError::untyped("Search request names no probes"));
         }
-        if probes.len() > MAX_MANAGED_SEARCH_PROBES
-            || top_k == 0
-            || top_k > MAX_MANAGED_SEARCH_TOP_K
-        {
+        if probes.len() > MAX_SEARCH_PROBES || top_k == 0 || top_k > MAX_SEARCH_TOP_K {
             return Err(ConsumerError::untyped(
                 "Search request exceeds the documented request cap",
             ));
@@ -2850,7 +2752,7 @@ impl AppContext {
             let hits = index
                 .managed_chunk_search(&probes, top_k, min_similarity)
                 .map_err(|error| error.to_string())?;
-            Ok(ManagedChunkSearch {
+            Ok(ChunkSearch {
                 embedding_space_id: index
                     .embedding_space_id()
                     .map_err(|error| error.to_string())?
@@ -2858,10 +2760,10 @@ impl AppContext {
                 dimension: index.status().dimension,
                 probes: hits
                     .into_iter()
-                    .map(|hits| ManagedProbeSearch {
+                    .map(|hits| ProbeSearch {
                         hits: hits
                             .into_iter()
-                            .map(|hit| ManagedChunkSearchHit {
+                            .map(|hit| ChunkSearchHit {
                                 chunk_ref: hit.chunk_ref,
                                 snapshot_id: hit.snapshot_id.0,
                                 rendition_id: hit.rendition_id.0,
@@ -2884,21 +2786,21 @@ impl AppContext {
     /// embed calls are two chances for a model to be swapped between them.
     async fn resolve_search_probes(
         &self,
-        probes: Vec<ManagedSearchProbeInput>,
+        probes: Vec<SearchProbeInput>,
     ) -> Result<Vec<Vec<f32>>, String> {
         let texts: Vec<String> = probes
             .iter()
             .filter_map(|probe| match probe {
-                ManagedSearchProbeInput::Text(text) => Some(text.clone()),
-                ManagedSearchProbeInput::Vector(_) => None,
+                SearchProbeInput::Text(text) => Some(text.clone()),
+                SearchProbeInput::Vector(_) => None,
             })
             .collect();
         if texts.is_empty() {
             return Ok(probes
                 .into_iter()
                 .map(|probe| match probe {
-                    ManagedSearchProbeInput::Vector(vector) => vector,
-                    ManagedSearchProbeInput::Text(_) => unreachable!("no text probes"),
+                    SearchProbeInput::Vector(vector) => vector,
+                    SearchProbeInput::Text(_) => unreachable!("no text probes"),
                 })
                 .collect());
         }
@@ -2910,170 +2812,12 @@ impl AppContext {
         probes
             .into_iter()
             .map(|probe| match probe {
-                ManagedSearchProbeInput::Vector(vector) => Ok(vector),
-                ManagedSearchProbeInput::Text(_) => embedded
+                SearchProbeInput::Vector(vector) => Ok(vector),
+                SearchProbeInput::Text(_) => embedded
                     .next()
                     .ok_or_else(|| "Embedder returned fewer vectors than text probes".to_string()),
             })
             .collect()
-    }
-
-    /// The normalized mean of the stored vectors of named chunks, one mean per
-    /// group.
-    ///
-    /// This is the whole of what a consumer needs when it wants to know *where
-    /// in the corpus* a set of passages sits, and it is deliberately not a way
-    /// to get the passages' vectors. `export_file_chunks` hands those out for
-    /// ingestion — a consumer that must never re-extract has to receive what
-    /// the index holds — but a consumer keeping a vector space of its own is
-    /// better served by asking Wilkes for the number than by rebuilding the
-    /// arithmetic on its side, where the mean, the normalisation and the
-    /// dimension check would all become a second definition of a vector this
-    /// index already knows how to make.
-    ///
-    /// Groups rather than a single set for the same reason `embed_texts` takes
-    /// a list: a caller computing one region per concept has hundreds of them,
-    /// and one request per region turns a scan into a stampede.
-    ///
-    /// Chunk ids the index does not hold are an error, not an omission — see
-    /// `SemanticIndex::chunk_centroids`, which owns that rule.
-    pub async fn chunk_centroids(&self, groups: Vec<Vec<i64>>) -> Result<ChunkCentroids, String> {
-        if groups.is_empty() {
-            return Err("Centroid request names no groups.".to_string());
-        }
-        if groups.len() > MAX_CENTROID_GROUPS {
-            return Err(format!(
-                "Centroid request names {} groups; {MAX_CENTROID_GROUPS} is the most one request \
-                 may ask for.",
-                groups.len(),
-            ));
-        }
-        let total: usize = groups.iter().map(Vec::len).sum();
-        if total > MAX_CENTROID_CHUNK_IDS {
-            return Err(format!(
-                "Centroid request names {total} chunk ids; {MAX_CENTROID_CHUNK_IDS} is the most \
-                 one request may ask for.",
-            ));
-        }
-        // The same refusal the chunk export makes: mid-rebuild, the ids in
-        // flight belong to neither the old index nor the new one.
-        self.ensure_no_active_embed_task(
-            "Semantic index is currently being built. Please wait before asking for centroids.",
-        )?;
-
-        let index_arc = self.index.lock().clone();
-        tokio::task::spawn_blocking(move || {
-            let guard = index_arc
-                .lock()
-                .map_err(|_| "Semantic index lock was poisoned".to_string())?;
-            let index = guard.as_ref().ok_or_else(|| {
-                "Semantic index unavailable. Build or restore the semantic index first.".to_string()
-            })?;
-            let status = index.status();
-            let centroids = index
-                .chunk_centroids(&groups)
-                .map_err(|error| format!("Could not compute chunk centroids: {error:#}"))?;
-            Ok(ChunkCentroids {
-                engine: status.engine.as_str().to_string(),
-                model_id: status.model_id,
-                dimension: status.dimension,
-                centroids,
-            })
-        })
-        .await
-        .map_err(|error| format!("Centroid task panicked: {error}"))?
-    }
-
-    /// How close a consumer's own vectors sit to named passages of this index,
-    /// in both directions, plus a per-probe mean over a scope of the consumer's
-    /// choosing.
-    ///
-    /// The sibling of [`Self::chunk_centroids`] and it exists for the same
-    /// reason: a consumer that keeps its own vector space wants a *number*
-    /// about this index, and the way to give it one without handing over the
-    /// index's vectors is to do the arithmetic here. The centroid endpoint
-    /// answers "where do these passages sit"; this one answers "how far is
-    /// this from them", which is the question a coverage measurement asks in
-    /// both directions at once.
-    ///
-    /// Probe vectors are used as given — see `SemanticIndex::chunk_similarity`,
-    /// which owns that rule and explains why normalizing here would break the
-    /// group-mean probe.
-    pub async fn chunk_similarity(
-        &self,
-        probes: Vec<SimilarityProbeRequest>,
-        chunk_ids: Vec<i64>,
-    ) -> Result<ChunkSimilarities, String> {
-        if probes.is_empty() {
-            return Err("Similarity request names no probes.".to_string());
-        }
-        if probes.len() > MAX_SIMILARITY_PROBES {
-            return Err(format!(
-                "Similarity request names {} probes; {MAX_SIMILARITY_PROBES} is the most one \
-                 request may ask for.",
-                probes.len(),
-            ));
-        }
-        let total: usize =
-            chunk_ids.len() + probes.iter().map(|probe| probe.scope.len()).sum::<usize>();
-        if total > MAX_SIMILARITY_CHUNK_IDS {
-            return Err(format!(
-                "Similarity request names {total} chunk ids across the searched set and its \
-                 scopes; {MAX_SIMILARITY_CHUNK_IDS} is the most one request may ask for.",
-            ));
-        }
-        // The same refusal the centroid and the chunk export make: mid-rebuild,
-        // the ids in flight belong to neither the old index nor the new one.
-        self.ensure_no_active_embed_task(
-            "Semantic index is currently being built. Please wait before asking for similarities.",
-        )?;
-
-        let index_arc = self.index.lock().clone();
-        tokio::task::spawn_blocking(move || {
-            let guard = index_arc
-                .lock()
-                .map_err(|_| "Semantic index lock was poisoned".to_string())?;
-            let index = guard.as_ref().ok_or_else(|| {
-                "Semantic index unavailable. Build or restore the semantic index first.".to_string()
-            })?;
-            let status = index.status();
-            let probes: Vec<wilkes_core::embed::index::db::SimilarityProbe> = probes
-                .into_iter()
-                .map(|probe| wilkes_core::embed::index::db::SimilarityProbe {
-                    vector: probe.vector,
-                    scope: probe.scope,
-                })
-                .collect();
-            let found = index
-                .chunk_similarity(&probes, &chunk_ids)
-                .map_err(|error| format!("Could not compute chunk similarities: {error:#}"))?;
-            Ok(ChunkSimilarities {
-                engine: status.engine.as_str().to_string(),
-                model_id: status.model_id,
-                dimension: status.dimension,
-                probes: found
-                    .probes
-                    .into_iter()
-                    .map(|probe| ProbeSimilarity {
-                        nearest_chunk_id: probe.nearest_chunk_id,
-                        similarity: probe.similarity,
-                        scope_mean: probe.scope_mean,
-                        scope_size: probe.scope_size,
-                    })
-                    .collect(),
-                chunks: found
-                    .chunks
-                    .into_iter()
-                    .map(|chunk| ChunkNearest {
-                        chunk_id: chunk.chunk_id,
-                        probe: chunk.probe,
-                        similarity: chunk.similarity,
-                    })
-                    .collect(),
-            })
-        })
-        .await
-        .map_err(|error| format!("Similarity task panicked: {error}"))?
     }
 
     /// One indexed document's chunks, in extraction order, with the ordinals
@@ -3117,15 +2861,30 @@ impl AppContext {
         let chunks = chunks
             .into_iter()
             .enumerate()
-            .map(|(ordinal, chunk)| ExportedChunk {
-                chunk_id: chunk.chunk_id,
-                ordinal,
-                text: chunk.chunk_text,
-                byte_range: chunk.extraction_byte_range,
-                origin: chunk.origin,
-                embedding: chunk.embedding,
+            .map(|(ordinal, chunk)| {
+                // The route resolved an addressable index before reaching
+                // here, so a passage without a ref is a fault rather than a
+                // state — and naming it is worth more than a null would be.
+                let (Some(chunk_ref), Some(text_sha256)) = (chunk.chunk_ref, chunk.text_sha256)
+                else {
+                    return Err(format!(
+                        "Chunk at byte {} carries no stable reference; rebuild this index.",
+                        chunk.extraction_byte_range.start
+                    ));
+                };
+                Ok(ExportedChunk {
+                    chunk: ChunkExport {
+                        chunk_ref,
+                        ordinal,
+                        text: chunk.chunk_text,
+                        text_sha256,
+                        byte_range: chunk.extraction_byte_range,
+                        origin: chunk.origin,
+                    },
+                    embedding: chunk.embedding,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         Ok((path, chunks))
     }
 
@@ -3287,81 +3046,6 @@ impl AppContext {
         files.sort_by(|a, b| a.path.cmp(&b.path));
 
         Ok(LibraryFileExport { root, files })
-    }
-
-    /// The text of named chunks of one indexed document, without their vectors
-    /// — for a consumer that already knows which passage it wants and needs to
-    /// show it to a person.
-    ///
-    /// Separate from [`Self::export_file_chunks`] because the two answer
-    /// different questions at different scales. A full export is a
-    /// once-per-document ingestion step whose reply runs to megabytes, nearly
-    /// all of it embeddings; this is a per-view lookup of a paragraph or two,
-    /// and asking for a whole book to display one of them would make the size
-    /// of the reply a function of the document rather than of the request.
-    ///
-    /// Chunks are named by `chunk_id` because that is the addressing a consumer
-    /// keeps: an export hands back both, but it is the id that gets written down
-    /// against whatever the consumer derived from the passage. The reply carries
-    /// the ordinal too, so positional locators recorded from an export stay
-    /// usable without a second round trip to translate them.
-    ///
-    /// An id this document does not have is an error rather than an omission. It
-    /// means the file was re-indexed since the caller recorded that id, and
-    /// returning the chunks that *did* resolve would show a person a passage
-    /// from the wrong place while looking like a complete answer.
-    pub async fn export_chunk_text(
-        &self,
-        root: PathBuf,
-        path: PathBuf,
-        chunk_ids: Vec<i64>,
-    ) -> Result<ChunkTextExport, String> {
-        if chunk_ids.is_empty() {
-            return Err("Chunk text export names no chunks.".to_string());
-        }
-        if chunk_ids.len() > MAX_CHUNK_TEXT_IDS {
-            return Err(format!(
-                "Chunk text export asks for {} chunks; {MAX_CHUNK_TEXT_IDS} is the most one \
-                 request may name. Ask for the passage you mean to show, not the document.",
-                chunk_ids.len(),
-            ));
-        }
-
-        let (path, chunks) = self.indexed_chunks(root, path).await?;
-
-        let mut wanted: Vec<i64> = chunk_ids;
-        wanted.sort_unstable();
-        wanted.dedup();
-        let mut found: Vec<ChunkText> = chunks
-            .iter()
-            .filter(|chunk| wanted.binary_search(&chunk.chunk_id).is_ok())
-            .map(|chunk| ChunkText {
-                chunk_id: chunk.chunk_id,
-                ordinal: chunk.ordinal,
-                text: chunk.text.clone(),
-                byte_range: chunk.byte_range.clone(),
-                origin: chunk.origin.clone(),
-            })
-            .collect();
-        if found.len() != wanted.len() {
-            let missing: Vec<String> = wanted
-                .iter()
-                .filter(|id| !found.iter().any(|chunk| chunk.chunk_id == **id))
-                .map(i64::to_string)
-                .collect();
-            return Err(format!(
-                "Chunk text export asks for chunk{} {} which this document does not have — it was \
-                 re-indexed since those ids were recorded.",
-                if missing.len() == 1 { "" } else { "s" },
-                missing.join(", "),
-            ));
-        }
-        // Ascending by ordinal: reading order, whatever order the ids arrived in.
-        found.sort_by_key(|chunk| chunk.ordinal);
-        Ok(ChunkTextExport {
-            file_path: path,
-            chunks: found,
-        })
     }
 
     pub async fn chunk_topics(
@@ -7692,6 +7376,8 @@ mod tests {
             file_id,
             file_path: PathBuf::from(format!("/library/{file_id}.txt")),
             chunk_text: format!("chunk {chunk_id}"),
+            chunk_ref: Some(ChunkRef(format!("chunk-ref-{chunk_id}"))),
+            text_sha256: Some(format!("sha-{chunk_id}")),
             extraction_byte_range: ByteRange {
                 start: chunk_id as usize,
                 end: chunk_id as usize + 1,
@@ -7875,20 +7561,31 @@ mod tests {
         let (_dir, ctx) = test_ctx();
 
         // No embedder loaded: loud, actionable error.
-        let err = ctx.embed_texts(vec!["a".to_string()]).await.unwrap_err();
+        let err = ctx
+            .embed_texts(vec!["a".to_string()], None)
+            .await
+            .unwrap_err();
         assert!(err.contains("Semantic model unavailable"), "{err}");
 
         *ctx.embedder.lock() = Some(Arc::new(TopicEmbedder {
             calls: Arc::new(AtomicUsize::new(0)),
         }));
 
-        let err = ctx.embed_texts(Vec::new()).await.unwrap_err();
+        let err = ctx.embed_texts(Vec::new(), None).await.unwrap_err();
         assert!(err.contains("No texts provided"), "{err}");
 
         let result = ctx
-            .embed_texts(vec!["cat concept".to_string(), "dog concept".to_string()])
+            .embed_texts(
+                vec!["cat concept".to_string(), "dog concept".to_string()],
+                Some("space-under-test".to_string()),
+            )
             .await
             .unwrap();
+        assert_eq!(
+            result.embedding_space_id.as_deref(),
+            Some("space-under-test"),
+            "the reply names the space the caller was verified against"
+        );
         assert_eq!(result.model_id, "topic-test");
         assert_eq!(result.dimension, 2);
         assert_eq!(result.vectors.len(), 2);
@@ -7944,12 +7641,22 @@ mod tests {
                 vec![1.0, 0.0],
             ),
         ];
+        // Written the way indexing writes, so the passages carry the refs the
+        // export names them by.
         index
-            .write_file(wilkes_core::embed::index::db::PreparedFile {
-                full_text: String::new(),
-                path: document.clone(),
-                chunks,
-            })
+            .write_file_with_recipe(
+                wilkes_core::embed::index::db::PreparedFile {
+                    full_text: String::new(),
+                    path: document.clone(),
+                    chunks,
+                },
+                &ExtractionRecipe::new(600, 128),
+                None,
+                None,
+                false,
+                false,
+                None,
+            )
             .unwrap();
         *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
 
@@ -7960,12 +7667,19 @@ mod tests {
         assert_eq!(export.dimension, Some(2));
         assert_eq!(export.model_id, None, "no live embedder loaded");
         assert_eq!(export.chunks.len(), 2);
-        assert_eq!(export.chunks[0].ordinal, 0);
-        assert_eq!(export.chunks[0].text, "first passage");
-        assert_eq!(export.chunks[0].byte_range.start, 0);
+        assert_eq!(export.chunks[0].chunk.ordinal, 0);
+        assert_eq!(export.chunks[0].chunk.text, "first passage");
+        assert_eq!(export.chunks[0].chunk.byte_range.start, 0);
         assert_eq!(export.chunks[0].embedding, vec![1.0, 0.0]);
-        assert_eq!(export.chunks[1].ordinal, 1);
-        assert_eq!(export.chunks[1].text, "second passage");
+        assert_eq!(export.chunks[1].chunk.ordinal, 1);
+        assert_eq!(export.chunks[1].chunk.text, "second passage");
+        // The export names passages the way every other route does, and its
+        // refs are the ones `chunks/resolve` answers for.
+        assert_ne!(
+            export.chunks[0].chunk.chunk_ref,
+            export.chunks[1].chunk.chunk_ref
+        );
+        assert!(!export.chunks[0].chunk.text_sha256.is_empty());
         assert!(
             export.outline.is_empty(),
             "the document declares no headings"
@@ -8126,36 +7840,44 @@ mod tests {
         )
         .unwrap();
         index
-            .write_file(wilkes_core::embed::index::db::PreparedFile {
-                full_text: text.to_string(),
-                path: document.clone(),
-                chunks: vec![
-                    (
-                        wilkes_core::embed::index::chunk::Chunk {
-                            file_path: document.clone(),
-                            text: "# One\nalpha body".to_string(),
-                            byte_range: ByteRange {
-                                start: 0,
-                                end: second_heading,
+            .write_file_with_recipe(
+                wilkes_core::embed::index::db::PreparedFile {
+                    full_text: text.to_string(),
+                    path: document.clone(),
+                    chunks: vec![
+                        (
+                            wilkes_core::embed::index::chunk::Chunk {
+                                file_path: document.clone(),
+                                text: "# One\nalpha body".to_string(),
+                                byte_range: ByteRange {
+                                    start: 0,
+                                    end: second_heading,
+                                },
+                                origin: SourceOrigin::TextFile { line: 1, col: 1 },
                             },
-                            origin: SourceOrigin::TextFile { line: 1, col: 1 },
-                        },
-                        vec![1.0, 0.0],
-                    ),
-                    (
-                        wilkes_core::embed::index::chunk::Chunk {
-                            file_path: document.clone(),
-                            text: "## One point one\nbeta body".to_string(),
-                            byte_range: ByteRange {
-                                start: second_heading,
-                                end: text.len(),
+                            vec![1.0, 0.0],
+                        ),
+                        (
+                            wilkes_core::embed::index::chunk::Chunk {
+                                file_path: document.clone(),
+                                text: "## One point one\nbeta body".to_string(),
+                                byte_range: ByteRange {
+                                    start: second_heading,
+                                    end: text.len(),
+                                },
+                                origin: SourceOrigin::TextFile { line: 3, col: 1 },
                             },
-                            origin: SourceOrigin::TextFile { line: 3, col: 1 },
-                        },
-                        vec![0.0, 1.0],
-                    ),
-                ],
-            })
+                            vec![0.0, 1.0],
+                        ),
+                    ],
+                },
+                &ExtractionRecipe::new(600, 128),
+                None,
+                None,
+                false,
+                false,
+                None,
+            )
             .unwrap();
         *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
 
@@ -8184,11 +7906,14 @@ mod tests {
     #[test]
     fn outline_entries_that_resolve_past_the_document_are_dropped() {
         let chunk = |ordinal: usize, start: usize, end: usize, page: u32| ExportedChunk {
-            chunk_id: ordinal as i64,
-            ordinal,
-            text: String::new(),
-            byte_range: ByteRange { start, end },
-            origin: SourceOrigin::PdfPage { page, bbox: None },
+            chunk: ChunkExport {
+                chunk_ref: ChunkRef(format!("chunk-{ordinal}")),
+                ordinal,
+                text: String::new(),
+                text_sha256: String::new(),
+                byte_range: ByteRange { start, end },
+                origin: SourceOrigin::PdfPage { page, bbox: None },
+            },
             embedding: Vec::new(),
         };
         let chunks = vec![chunk(0, 0, 10, 1), chunk(1, 10, 20, 4)];
@@ -10085,9 +9810,9 @@ mod tests {
         held[7] = 1.0;
         let resolved = ctx
             .resolve_search_probes(vec![
-                ManagedSearchProbeInput::Text("what teaches this".to_string()),
-                ManagedSearchProbeInput::Vector(held.clone()),
-                ManagedSearchProbeInput::Text("and this".to_string()),
+                SearchProbeInput::Text("what teaches this".to_string()),
+                SearchProbeInput::Vector(held.clone()),
+                SearchProbeInput::Text("and this".to_string()),
             ])
             .await
             .expect("probes resolve");
@@ -10105,7 +9830,7 @@ mod tests {
         let (_dir, ctx) = test_ctx();
         assert!(ctx.embedder.lock().is_none());
         let resolved = ctx
-            .resolve_search_probes(vec![ManagedSearchProbeInput::Vector(vec![1.0, 0.0])])
+            .resolve_search_probes(vec![SearchProbeInput::Vector(vec![1.0, 0.0])])
             .await
             .expect("vectors need no model");
         assert_eq!(resolved, vec![vec![1.0, 0.0]]);
@@ -10116,7 +9841,7 @@ mod tests {
         let (_dir, ctx) = test_ctx();
         *ctx.embedder.lock() = Some(Arc::new(MockEmbedder::default()) as Arc<dyn Embedder>);
         let error = ctx
-            .resolve_search_probes(vec![ManagedSearchProbeInput::Text("   ".to_string())])
+            .resolve_search_probes(vec![SearchProbeInput::Text("   ".to_string())])
             .await
             .expect_err("an empty probe names nothing");
         assert!(error.contains("empty"), "{error}");

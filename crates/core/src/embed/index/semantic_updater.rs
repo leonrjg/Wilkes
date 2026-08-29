@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tracing::{error, info};
 
-use super::super::Embedder;
+use super::super::{Embedder, ExtractionRecipe};
 use super::SemanticIndex;
 use crate::directory_watcher::{
     collect_supported_files, path_has_supported_extension, DirectoryChangeBatch,
@@ -225,9 +225,18 @@ fn handle_event(
         chunk_overlap,
     ) {
         Ok(prepared) => {
+            // The same write the build does, recipe and all. A document the
+            // watcher indexed used to land without a chunk ref while every
+            // document the build indexed had one, so an index could hold
+            // passages that could not be named — invisible to every route
+            // that addresses a passage by ref, and indistinguishable from
+            // passages that simply do not exist.
+            let recipe = ExtractionRecipe::for_path(path, extractors, chunk_size, chunk_overlap);
             if let Ok(mut guard) = index.lock() {
                 if let Some(idx) = guard.as_mut() {
-                    if let Err(e) = idx.write_file(prepared) {
+                    if let Err(e) = idx
+                        .write_file_with_recipe(prepared, &recipe, None, None, false, false, None)
+                    {
                         error!("[SemanticUpdater] write_file {}: {e:#}", path.display());
                     }
                 }
