@@ -159,18 +159,12 @@ impl EmbedderInstaller for SBERTInstaller {
         // Otherwise, perform the Live Probe asynchronously.
         let request = WorkerRequest {
             mode: "info".to_string(),
-            root: std::path::PathBuf::new(),
             role: WorkerRole::Embed(EmbeddingEngine::SBERT),
             model: model_id.to_string(),
-            index_dir: None,
             model_dir: std::path::PathBuf::new(),
-            chunk_size: None,
-            chunk_overlap: None,
             device: self.device.clone(),
-            paths: None,
             texts: None,
             generate: None,
-            supported_extensions: Vec::new(),
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);

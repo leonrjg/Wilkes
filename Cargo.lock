@@ -8724,7 +8724,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "wilkes-api",
  "wilkes-core",
 ]
 

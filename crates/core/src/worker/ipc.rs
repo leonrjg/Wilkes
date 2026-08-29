@@ -75,12 +75,19 @@ impl<'de> serde::Deserialize<'de> for WorkerRole {
     }
 }
 
-/// Sent once from the desktop to the worker on stdin to configure the build.
+/// Sent from the host to a worker on stdin to name the work and the model it
+/// needs.
+///
+/// Everything here describes *inference*. A worker is handed texts or a
+/// prompt, never a corpus: extraction, chunking and index writing stay in the
+/// process that owns the settings, because they are what decides the
+/// extraction recipe a document is read under. A field that named a root, an
+/// index or a chunk size would be an invitation to move that decision back
+/// out here, where the configured image analyzer does not exist.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct WorkerRequest {
     #[serde(default = "default_mode")]
-    pub mode: String, // "build", "embed", "info" or "generate"
-    pub root: PathBuf,
+    pub mode: String, // "embed", "info" or "generate"
     /// Kept under the legacy `engine` key so a mixed-version host and worker
     /// still parse each other's requests.
     #[serde(rename = "engine")]
@@ -95,29 +102,16 @@ pub struct WorkerRequest {
     /// still parse each other's requests.
     #[serde(rename = "data_dir")]
     pub model_dir: PathBuf,
-    /// Where the index is written. Only used for "build" mode; absent (None)
-    /// in "embed", "info" and "generate" requests, which is why it is separate
-    /// from `model_dir` rather than derived from it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub index_dir: Option<PathBuf>,
-    /// Only used for "build" mode; absent (None) in "embed" and "info" requests.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_size: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_overlap: Option<usize>,
     #[serde(default = "default_device")]
     pub device: String, // "auto", "cpu", "mps", "cuda", etc.
-    pub paths: Option<Vec<PathBuf>>, // Optional: incremental update for specific files
-    pub texts: Option<Vec<String>>,  // Used by "embed" mode
+    pub texts: Option<Vec<String>>, // Used by "embed" mode
     /// Used by "generate" mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generate: Option<GenerationRequest>,
-    #[serde(default)]
-    pub supported_extensions: Vec<String>,
 }
 
 fn default_mode() -> String {
-    "build".to_string()
+    "embed".to_string()
 }
 
 fn default_device() -> String {
@@ -125,7 +119,7 @@ fn default_device() -> String {
 }
 
 /// Out-of-band line the host writes to worker stdin to stop an in-flight
-/// generation. Confined to generation mode: build and embed never poll for it,
+/// generation. Confined to generation mode: embed and info never poll for it,
 /// so their framing is untouched.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct CancelSignal {
@@ -182,19 +176,13 @@ mod tests {
 
     fn sample_request() -> WorkerRequest {
         WorkerRequest {
-            mode: "build".to_string(),
-            root: PathBuf::from("root"),
+            mode: "embed".to_string(),
             role: WorkerRole::Embed(EmbeddingEngine::Fastembed),
             model: "model".to_string(),
-            index_dir: None,
             model_dir: PathBuf::from("data"),
-            chunk_size: Some(100),
-            chunk_overlap: Some(10),
             device: "cpu".to_string(),
-            paths: None,
             texts: None,
             generate: None,
-            supported_extensions: vec!["txt".to_string()],
         }
     }
 
@@ -202,7 +190,7 @@ mod tests {
     fn test_worker_request_serialization() {
         let json = serde_json::to_string(&sample_request()).unwrap();
         let de: WorkerRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(de.mode, "build");
+        assert_eq!(de.mode, "embed");
         assert_eq!(de.model, "model");
         assert_eq!(de.role, WorkerRole::Embed(EmbeddingEngine::Fastembed));
     }
@@ -213,14 +201,30 @@ mod tests {
         let obj = json.as_object_mut().unwrap();
         obj.remove("mode");
         obj.remove("device");
-        obj.remove("chunk_size");
-        obj.remove("chunk_overlap");
 
         let de: WorkerRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(de.mode, "build");
+        assert_eq!(de.mode, "embed");
         assert_eq!(de.device, "auto");
-        assert_eq!(de.chunk_size, None);
-        assert_eq!(de.chunk_overlap, None);
+    }
+
+    /// A host that still sends the fields a build request used to carry must
+    /// not break the worker it is paired with. Removal is the safe direction
+    /// across a version skew — serde ignores what it does not know — and this
+    /// is the test that says so out loud.
+    #[test]
+    fn a_request_carrying_the_removed_build_fields_still_parses() {
+        let mut json = serde_json::to_value(sample_request()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.insert("root".into(), serde_json::json!("/corpus"));
+        obj.insert("index_dir".into(), serde_json::json!("/index"));
+        obj.insert("chunk_size".into(), serde_json::json!(600));
+        obj.insert("chunk_overlap".into(), serde_json::json!(128));
+        obj.insert("paths".into(), serde_json::json!(["/corpus/a.pdf"]));
+        obj.insert("supported_extensions".into(), serde_json::json!(["pdf"]));
+
+        let de: WorkerRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(de.mode, "embed");
+        assert_eq!(de.model, "model");
     }
 
     #[test]

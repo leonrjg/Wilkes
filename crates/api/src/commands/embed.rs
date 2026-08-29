@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use ignore::WalkBuilder;
@@ -7,9 +7,7 @@ use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::installer::EmbedderInstaller;
 use wilkes_core::embed::Embedder;
 use wilkes_core::models::progress::ProgressTx;
-use wilkes_core::types::{EmbeddingEngine, IndexStatus, SelectedEmbedder};
-use wilkes_core::worker::ipc::{WorkerEvent, WorkerRequest, WorkerRole};
-use wilkes_core::worker::manager::{ManagerCommand, WorkerManager};
+use wilkes_core::types::{IndexStatus, SelectedEmbedder};
 
 pub struct BuildIndexOptions {
     pub manager: Option<wilkes_core::worker::manager::WorkerManager>,
@@ -112,6 +110,18 @@ pub async fn build_index_with_embedder(
 /// Returns the `Arc<dyn Embedder>` used during the build so the caller can store
 /// it in state without loading the model a second time.
 ///
+/// Every engine builds here, in the process that owns the settings. The
+/// subprocess owns model inference and nothing else: each engine's installer
+/// hands back a `WorkerEmbedder` that carries `embed` across the boundary, so
+/// a crash in ONNX, CoreML, Metal or Python still cannot reach the host. What
+/// must not cross is extraction — a second process extracting is a second
+/// process deciding what a document says, and it decides it under whatever
+/// `extract::image::configure` was never called on. That is not a hypothetical:
+/// a build relocated into the worker read every PDF without the configured
+/// image analyzer while the watcher, in this process, read the same PDFs with
+/// it, and wrote both answers into one index under extraction recipes that
+/// disagreed.
+///
 /// Cancellation is handled by the caller via `tokio::select!` on the returned
 /// future; this function runs to completion once started.
 pub async fn build_index(
@@ -128,13 +138,6 @@ pub async fn build_index(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("device is required for build_index"))?;
 
-    if matches!(
-        selected.engine,
-        EmbeddingEngine::Fastembed | EmbeddingEngine::Candle
-    ) {
-        return build_index_via_worker(root, selected, manager, device, options).await;
-    }
-
     let installer = wilkes_core::embed::dispatch::get_installer(
         selected.engine,
         selected.model,
@@ -143,72 +146,6 @@ pub async fn build_index(
     );
 
     build_index_with_installer(root, installer, options).await
-}
-
-async fn build_index_via_worker(
-    root: PathBuf,
-    selected: SelectedEmbedder,
-    manager: WorkerManager,
-    device: String,
-    options: BuildIndexOptions,
-) -> anyhow::Result<Arc<dyn Embedder>> {
-    let request = WorkerRequest {
-        mode: "build".to_string(),
-        root,
-        role: WorkerRole::Embed(selected.engine),
-        model: selected.model.model_id().to_string(),
-        model_dir: options.model_dir.clone(),
-        index_dir: Some(options.index_dir.clone()),
-        chunk_size: Some(options.chunk_size),
-        chunk_overlap: Some(options.chunk_overlap),
-        device: device.clone(),
-        paths: None,
-        texts: None,
-        generate: None,
-        supported_extensions: options.supported_extensions.clone(),
-    };
-
-    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(128);
-    manager
-        .send(ManagerCommand::Submit {
-            req: Box::new(request),
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to send build command to manager: {e}"))?;
-
-    loop {
-        if options.cancel_flag.load(Ordering::Relaxed) {
-            anyhow::bail!("Build cancelled");
-        }
-
-        match tokio::time::timeout(std::time::Duration::from_millis(100), reply_rx.recv()).await {
-            Ok(Some(event)) => match event {
-                WorkerEvent::Progress(progress) => {
-                    let _ = options.tx.send(progress).await;
-                }
-                WorkerEvent::Done => {
-                    let installer = wilkes_core::embed::dispatch::get_installer(
-                        selected.engine,
-                        selected.model.clone(),
-                        manager,
-                        device,
-                    );
-                    return installer.build(&options.model_dir);
-                }
-                WorkerEvent::Error(err) => {
-                    anyhow::bail!(err);
-                }
-                // A build never generates; these can only mean a protocol
-                // mismatch, so log rather than swallow silently.
-                other => tracing::warn!("build: ignoring unexpected worker event: {other:?}"),
-            },
-            Ok(None) => break,
-            Err(_) => continue,
-        }
-    }
-
-    anyhow::bail!("Worker finished without returning build status")
 }
 
 pub async fn build_index_with_installer(

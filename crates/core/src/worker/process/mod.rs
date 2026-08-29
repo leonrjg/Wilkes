@@ -223,18 +223,12 @@ exit 0
 
         let req = WorkerRequest {
             mode: "embed".to_string(),
-            root: dir.path().to_path_buf(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
-            index_dir: None,
             model_dir: dir.path().to_path_buf(),
-            chunk_size: None,
-            chunk_overlap: None,
             device: "cpu".to_string(),
-            paths: None,
             texts: Some(vec!["hello".to_string()]),
             generate: None,
-            supported_extensions: vec![],
         };
 
         let active_pid = AtomicU32::new(0);
@@ -291,18 +285,12 @@ echo '"Done"'
         };
         let req = WorkerRequest {
             mode: "generate".to_string(),
-            root: dir.path().to_path_buf(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
-            index_dir: None,
             model_dir: dir.path().to_path_buf(),
-            chunk_size: None,
-            chunk_overlap: None,
             device: "cpu".to_string(),
-            paths: None,
             texts: None,
             generate: None,
-            supported_extensions: vec![],
         };
         let req_json = serde_json::to_string(&req).unwrap();
 
@@ -353,18 +341,12 @@ echo '"Done"'
 
         let req = WorkerRequest {
             mode: "embed".to_string(),
-            root: dir.path().to_path_buf(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
-            index_dir: None,
             model_dir: dir.path().to_path_buf(),
-            chunk_size: None,
-            chunk_overlap: None,
             device: "cpu".to_string(),
-            paths: None,
             texts: Some(vec!["hello".to_string()]),
             generate: None,
-            supported_extensions: vec![],
         };
 
         let active_pid = AtomicU32::new(0);
@@ -399,18 +381,12 @@ echo '"Done"'
 
         let req = WorkerRequest {
             mode: "embed".to_string(),
-            root: dir.path().to_path_buf(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
-            index_dir: None,
             model_dir: dir.path().to_path_buf(),
-            chunk_size: None,
-            chunk_overlap: None,
             device: "cpu".to_string(),
-            paths: None,
             texts: Some(vec!["hello".to_string()]),
             generate: None,
-            supported_extensions: vec![],
         };
 
         let active_pid = AtomicU32::new(0);
@@ -452,18 +428,12 @@ exit 0
 
         let req = WorkerRequest {
             mode: "embed".to_string(),
-            root: dir.path().to_path_buf(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
-            index_dir: None,
             model_dir: dir.path().to_path_buf(),
-            chunk_size: None,
-            chunk_overlap: None,
             device: "cpu".to_string(),
-            paths: None,
             texts: Some(vec!["hello".to_string()]),
             generate: None,
-            supported_extensions: vec![],
         };
 
         let active_pid = AtomicU32::new(0);
@@ -498,18 +468,12 @@ exit 0
 
         let req = WorkerRequest {
             mode: "embed".to_string(),
-            root: dir.path().to_path_buf(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
-            index_dir: None,
             model_dir: dir.path().to_path_buf(),
-            chunk_size: None,
-            chunk_overlap: None,
             device: "cpu".to_string(),
-            paths: None,
             texts: Some(vec!["hello".to_string()]),
             generate: None,
-            supported_extensions: vec![],
         };
 
         let active_pid = AtomicU32::new(0);
@@ -541,18 +505,12 @@ exit 0
 
         let req = WorkerRequest {
             mode: "embed".to_string(),
-            root: dir.path().to_path_buf(),
             role: WorkerRole::Embed(EmbeddingEngine::SBERT),
             model: "intfloat/e5-small-v2".to_string(),
-            index_dir: None,
             model_dir: dir.path().to_path_buf(),
-            chunk_size: None,
-            chunk_overlap: None,
             device: "cpu".to_string(),
-            paths: None,
             texts: Some(vec!["hello".to_string()]),
             generate: None,
-            supported_extensions: vec![],
         };
 
         let active_pid = AtomicU32::new(0);
@@ -617,18 +575,12 @@ exit 0
 
         let req = WorkerRequest {
             mode: "embed".to_string(),
-            root: dir.path().to_path_buf(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
-            index_dir: None,
             model_dir: dir.path().to_path_buf(),
-            chunk_size: None,
-            chunk_overlap: None,
             device: "cpu".to_string(),
-            paths: None,
             texts: Some(vec!["hello".to_string()]),
             generate: None,
-            supported_extensions: vec![],
         };
 
         let active_pid = AtomicU32::new(0);

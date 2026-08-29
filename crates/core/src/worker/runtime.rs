@@ -683,13 +683,7 @@ mod tests {
             texts: None,
             generate: None,
             mode: "generate".to_string(),
-            root: std::path::PathBuf::from("root"),
-            index_dir: None,
             model_dir: std::path::PathBuf::from("data"),
-            chunk_size: None,
-            chunk_overlap: None,
-            paths: None,
-            supported_extensions: vec![],
         };
         let (reply_tx, _reply_rx) = mpsc::channel(4);
         let (timeout_done_tx, timeout_done_rx) = tokio::sync::oneshot::channel();
@@ -807,13 +801,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             mode: "embed".to_string(),
-            root: std::path::PathBuf::from("root"),
-            index_dir: None,
             model_dir: std::path::PathBuf::from("data"),
-            chunk_size: Some(16),
-            chunk_overlap: Some(4),
-            paths: None,
-            supported_extensions: vec!["txt".to_string()],
         };
 
         let json = serialize_request_for_worker(&req).unwrap();
@@ -821,7 +809,7 @@ mod tests {
         assert_eq!(value["mode"], "embed");
         assert_eq!(value["model"], "model-a");
         assert_eq!(value["device"], "cpu");
-        assert_eq!(value["chunk_size"], 16);
+        assert_eq!(value["texts"][0], "hello");
     }
 
     #[tokio::test]
@@ -857,13 +845,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             mode: "embed".to_string(),
-            root: std::path::PathBuf::from("root"),
-            index_dir: None,
             model_dir: std::path::PathBuf::from("data"),
-            chunk_size: Some(0),
-            chunk_overlap: Some(0),
-            paths: None,
-            supported_extensions: vec![],
         };
         let (reply_tx, mut reply_rx) = mpsc::channel(4);
 
@@ -952,13 +934,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             mode: "embed".to_string(),
-            root: std::path::PathBuf::from("root"),
-            index_dir: None,
             model_dir: std::path::PathBuf::from("data"),
-            chunk_size: Some(0),
-            chunk_overlap: Some(0),
-            paths: None,
-            supported_extensions: vec![],
         };
         let (reply_tx, mut reply_rx) = mpsc::channel(4);
 
@@ -981,13 +957,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             mode: "embed".to_string(),
-            root: std::path::PathBuf::from("root"),
-            index_dir: None,
             model_dir: std::path::PathBuf::from("data"),
-            chunk_size: Some(0),
-            chunk_overlap: Some(0),
-            paths: None,
-            supported_extensions: vec![],
         };
         let (reply_tx, _reply_rx) = mpsc::channel(4);
 
@@ -1008,13 +978,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             mode: "embed".to_string(),
-            root: std::path::PathBuf::from("root"),
-            index_dir: None,
             model_dir: std::path::PathBuf::from("data"),
-            chunk_size: Some(0),
-            chunk_overlap: Some(0),
-            paths: None,
-            supported_extensions: vec![],
         };
         let second = WorkerRequest {
             role: WorkerRole::Embed(EmbeddingEngine::SBERT),
@@ -1044,13 +1008,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             mode: "embed".to_string(),
-            root: std::path::PathBuf::from("root"),
-            index_dir: None,
             model_dir: std::path::PathBuf::from("data"),
-            chunk_size: Some(0),
-            chunk_overlap: Some(0),
-            paths: None,
-            supported_extensions: vec![],
         };
 
         runtime.maybe_hot_swap_tracking(&req);
@@ -1108,13 +1066,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             mode: "embed".to_string(),
-            root: std::path::PathBuf::from("root"),
-            index_dir: None,
             model_dir: std::path::PathBuf::from("data"),
-            chunk_size: Some(0),
-            chunk_overlap: Some(0),
-            paths: None,
-            supported_extensions: vec![],
         };
         let (reply_tx, mut reply_rx) = mpsc::channel(4);
 

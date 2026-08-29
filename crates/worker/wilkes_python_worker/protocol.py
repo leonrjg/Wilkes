@@ -1,8 +1,8 @@
 """
 IPC contract between the Rust host and this Python worker.
 
-Inbound shape mirrors WorkerRequest in crates/core/src/embed/worker_ipc.rs.
-Outbound shapes mirror WorkerEvent in crates/core/src/embed/worker_ipc.rs.
+Inbound shape mirrors WorkerRequest in crates/core/src/worker/ipc.rs.
+Outbound shapes mirror WorkerEvent in crates/core/src/worker/ipc.rs.
 
 When either Rust struct changes, update this file to match.
 """

@@ -80,7 +80,6 @@ enum WorkerLoopAction {
 
 #[derive(Debug, PartialEq, Eq)]
 enum WorkerRequestKind {
-    Build,
     Embed,
     Info,
     Generate,
@@ -203,7 +202,6 @@ fn classify_input_line(line: &str) -> WorkerLoopAction {
 
 fn classify_worker_request(req: &WorkerRequest) -> WorkerRequestKind {
     match req.mode.as_str() {
-        "build" => WorkerRequestKind::Build,
         "embed" => WorkerRequestKind::Embed,
         "info" => WorkerRequestKind::Info,
         "generate" => WorkerRequestKind::Generate,
@@ -295,9 +293,6 @@ async fn handle_worker_request(
     cancel_flag: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     match classify_worker_request(&req) {
-        WorkerRequestKind::Build => {
-            handle_build_plan(req, active_model, event_tx, loader).await?;
-        }
         WorkerRequestKind::Embed => {
             handle_embed_plan(req, active_model, event_tx, loader).await?;
         }
@@ -311,67 +306,6 @@ async fn handle_worker_request(
             let _ = event_tx
                 .send(WorkerEvent::Error(format!("Unknown mode: {other}")))
                 .await;
-        }
-    }
-    Ok(())
-}
-
-async fn handle_build_plan(
-    req: WorkerRequest,
-    active_model: &mut Option<LoadedModel>,
-    event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
-    loader: &impl ModelLoader,
-) -> anyhow::Result<()> {
-    tracing::info!("[worker] build: loading embedder");
-    let embedder = get_or_load(active_model, &req, loader, Some(&event_tx))
-        .await?
-        .embedder()?;
-    tracing::info!(
-        "[worker] build: embedder loaded (role={:?}, model={}, dim={})",
-        req.role,
-        embedder.model_id(),
-        embedder.dimension()
-    );
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<EmbedProgress>(64);
-    let tx_c = event_tx.clone();
-    let forward = tokio::spawn(async move {
-        while let Some(progress) = rx.recv().await {
-            let _ = tx_c.send(WorkerEvent::Progress(progress)).await;
-        }
-    });
-
-    let options = wilkes_api::commands::embed::BuildIndexOptions {
-        manager: None,
-        device: None,
-        model_dir: req.model_dir,
-        index_dir: req
-            .index_dir
-            .ok_or_else(|| anyhow::anyhow!("build request missing index_dir"))?,
-        tx,
-        cancel_flag: Arc::new(AtomicBool::new(false)),
-        chunk_size: req
-            .chunk_size
-            .ok_or_else(|| anyhow::anyhow!("build request missing chunk_size"))?,
-        chunk_overlap: req
-            .chunk_overlap
-            .ok_or_else(|| anyhow::anyhow!("build request missing chunk_overlap"))?,
-        supported_extensions: req.supported_extensions,
-    };
-
-    tracing::info!("[worker] build: starting build_index_with_embedder");
-    let result =
-        wilkes_api::commands::embed::build_index_with_embedder(req.root, embedder, options).await;
-    tracing::info!("[worker] build: build_index_with_embedder returned");
-
-    forward.await?;
-
-    match result {
-        Ok(_) => {
-            let _ = event_tx.send(WorkerEvent::Done).await;
-        }
-        Err(e) => {
-            let _ = event_tx.send(WorkerEvent::Error(e.to_string())).await;
         }
     }
     Ok(())
@@ -583,18 +517,12 @@ mod tests {
     fn request(mode: &str, role: WorkerRole, data_dir: PathBuf) -> WorkerRequest {
         WorkerRequest {
             mode: mode.to_string(),
-            root: data_dir.clone(),
             role,
             model: "model-a".to_string(),
             model_dir: data_dir.clone(),
-            index_dir: Some(data_dir),
-            chunk_size: Some(32),
-            chunk_overlap: Some(8),
             device: "cpu".to_string(),
-            paths: None,
             texts: Some(vec!["hello".to_string()]),
             generate: None,
-            supported_extensions: vec!["txt".to_string()],
         }
     }
 
@@ -666,10 +594,6 @@ mod tests {
     #[test]
     fn test_classify_worker_request_variants() {
         assert_eq!(
-            classify_worker_request(&embed_request("build")),
-            WorkerRequestKind::Build
-        );
-        assert_eq!(
             classify_worker_request(&embed_request("embed")),
             WorkerRequestKind::Embed
         );
@@ -684,6 +608,13 @@ mod tests {
 
         match classify_worker_request(&embed_request("unknown")) {
             WorkerRequestKind::Unknown(value) => assert_eq!(value, "unknown"),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+
+        // "build" is not a mode a worker has: the host builds, and a request
+        // that says otherwise is an unknown one.
+        match classify_worker_request(&embed_request("build")) {
+            WorkerRequestKind::Unknown(value) => assert_eq!(value, "build"),
             other => panic!("expected Unknown, got {other:?}"),
         }
     }
@@ -918,8 +849,11 @@ mod tests {
         assert!(matches!(rx.recv().await.unwrap(), WorkerEvent::Error(_)));
     }
 
+    /// A worker does not build. Extraction decides the recipe a document is
+    /// read under and belongs to the process holding the settings, so a build
+    /// request arriving here is a mistake to report, not a mode to serve.
     #[tokio::test]
-    async fn test_handle_worker_request_build() {
+    async fn a_build_request_is_refused_rather_than_served() {
         let dir = tempdir().unwrap();
         let mut active = None;
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
@@ -933,31 +867,13 @@ mod tests {
             .await
             .unwrap();
 
-        let mut found_done = false;
-        while let Some(ev) = rx.recv().await {
-            if matches!(ev, WorkerEvent::Done) {
-                found_done = true;
-                break;
-            }
+        match rx.recv().await.unwrap() {
+            WorkerEvent::Error(message) => assert!(
+                message.contains("build"),
+                "expected the mode to be named, got {message}"
+            ),
+            other => panic!("expected an error event, got {other:?}"),
         }
-        assert!(found_done);
-    }
-
-    #[tokio::test]
-    async fn test_handle_worker_request_build_missing_options() {
-        let dir = tempdir().unwrap();
-        let mut active = None;
-        let (tx, _rx) = tokio::sync::mpsc::channel(10);
-        let mut req = request(
-            "build",
-            WorkerRole::Embed(EmbeddingEngine::Candle),
-            dir.path().to_path_buf(),
-        );
-        req.chunk_size = None;
-        req.chunk_overlap = None;
-
-        let res = handle_worker_request(req, &mut active, tx, &SuccessLoader, &no_cancel()).await;
-        assert!(res.unwrap_err().to_string().contains("missing chunk_size"));
     }
 
     #[test]

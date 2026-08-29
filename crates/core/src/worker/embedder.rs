@@ -51,18 +51,12 @@ impl WorkerEmbedder {
     fn send_embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         let request = WorkerRequest {
             mode: "embed".to_string(),
-            root: std::path::PathBuf::new(),
             role: WorkerRole::Embed(self.engine),
             model: self.model_id.clone(),
-            index_dir: None,
             model_dir: self.data_dir.clone(),
-            chunk_size: None,
-            chunk_overlap: None,
             device: self.device.clone(),
-            paths: None,
             texts: Some(texts.iter().map(|s| s.to_string()).collect()),
             generate: None,
-            supported_extensions: Vec::new(),
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);

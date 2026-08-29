@@ -46,18 +46,12 @@ impl WorkerGenerator {
     fn worker_request(&self, req: GenerationRequest) -> WorkerRequest {
         WorkerRequest {
             mode: "generate".to_string(),
-            root: std::path::PathBuf::new(),
             role: WorkerRole::Generate(self.engine),
             model: self.model_id.clone(),
-            index_dir: None,
             model_dir: self.data_dir.clone(),
-            chunk_size: None,
-            chunk_overlap: None,
             device: self.device.clone(),
-            paths: None,
             texts: None,
             generate: Some(req),
-            supported_extensions: Vec::new(),
         }
     }
 }
