@@ -878,6 +878,7 @@ ocr_regions_accepted
 ocr_regions_rejected_low_confidence
 ocr_regions_deduplicated_against_native_text
 regions_routed_by_kind{text,formula,table,chart}
+regions_marked_not_text
 regions_unroutable
 formulas_accepted
 formulas_rejected_invalid_latex
@@ -1413,7 +1414,7 @@ amendment specified *downstream of routing* was built for them:
 
 | | |
 | --- | --- |
-| **Completed** | `RegionKind` on `ImageOcrRegion` and on `TextProvenance::ImageOcr`; per-kind admission (text on the threshold, formulas on LaTeX validity, tables and charts on being a rectangular Markdown table of at least 2×2); one label per kind, with the exhaustive match that stops a kind reaching the reading unlabelled; the formula-and-table chunk rule; `ADMISSION_RULES_VERSION` in the analyzer identity; the per-kind and unroutable diagnostics; and the recognizer reporting what it could not route rather than dropping it. |
+| **Completed** | `RegionKind` on `ImageOcrRegion` and on `TextProvenance::ImageOcr`; per-kind admission (text on the threshold, formulas on LaTeX validity, tables and charts on being a rectangular Markdown table of at least 2×2); one label per kind, with the exhaustive match that stops a kind reaching the reading unlabelled; the formula-and-table chunk rule; `ADMISSION_RULES_VERSION` in the analyzer identity; the per-kind and unroutable diagnostics; and the recognizer reporting what it could not route rather than dropping it — amended 2026-08-29 to separate a region it *named* as carrying no text, a `<picture>`, from one this build could not name at all, since a document parser answers the first once per figure and the two together are unreadable as one number. |
 | **Partial** | The polygon criterion, unchanged from 2026-08-28. |
 | **Not built** | `parsing-v1`: PaddleOCR-VL's `Formula Recognition:`, `Table Recognition:` and `Chart Recognition:` prompts, and the layout detector that routes regions to them. |
 

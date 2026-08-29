@@ -351,20 +351,63 @@ struct Element {
     span: (usize, usize),
 }
 
-/// Which DocTags tag maps to which kind. Tags with no entry are structural
-/// (`<doctag>`, `<page_break>`) or are containers whose contents are handled
-/// by their own tag, and are skipped rather than guessed at.
-fn kind_of(tag: &str) -> Option<RegionKind> {
+/// What this build does with a DocTags tag.
+///
+/// Three answers, not two. The distinction that matters is between a tag this
+/// build *knows* carries no text and a tag it has never heard of: the first is
+/// the recognizer working correctly and the second is a gap in this build's
+/// coverage, and reporting them as one number means neither can be read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Routing {
+    /// Text to transcribe, of this kind.
+    Read(RegionKind),
+    /// A region the recognizer named and that carries no text to read. There
+    /// is no [`RegionKind`] for it because there would be nothing to put in
+    /// the reading — the element is a box around a thing seen, not a
+    /// transcription of anything.
+    NotText,
+    /// A tag this build has no answer for at all.
+    Unknown,
+}
+
+/// Which DocTags tag maps to which routing.
+///
+/// [`Routing::Unknown`] covers two different things and is told apart later by
+/// whether the element carries a location: structure — `<doctag>`,
+/// `<page_break>`, the classification markers inside a picture, the containers
+/// whose contents are handled by their own tag — carries none and is passed
+/// over, and located content carries one and is counted.
+fn routing_of(tag: &str) -> Routing {
     match tag {
         "text" | "paragraph" | "caption" | "footnote" | "page_header" | "page_footer"
-        | "title" | "list_item" => Some(RegionKind::Text),
-        t if t.starts_with("section_header") => Some(RegionKind::Text),
-        "formula" => Some(RegionKind::Formula),
-        "otsl" => Some(RegionKind::Table),
-        "chart" => Some(RegionKind::Chart),
-        "code" => Some(RegionKind::Code),
-        _ => None,
+        | "title" | "list_item" => Routing::Read(RegionKind::Text),
+        t if t.starts_with("section_header") => Routing::Read(RegionKind::Text),
+        "formula" => Routing::Read(RegionKind::Formula),
+        "otsl" => Routing::Read(RegionKind::Table),
+        "chart" => Routing::Read(RegionKind::Chart),
+        "code" => Routing::Read(RegionKind::Code),
+        // A figure. Wilkes' answer to "what is in this picture" is the
+        // describer's, written under its own label from a separate model; the
+        // recognizer saying *that there is a picture here* adds a box and no
+        // bytes. Contents the model marked out inside it — a caption, the
+        // labels on a diagram — are their own elements and are read, because
+        // parsing continues inside this element's body rather than skipping
+        // past it.
+        "picture" => Routing::NotText,
+        _ => Routing::Unknown,
     }
+}
+
+/// The located regions a decode marked out that produced no element.
+///
+/// Two counts and not one, because they are two different facts. `not_text` is
+/// the recognizer working: it named a picture, and a picture has no
+/// transcription. `unroutable` is this build's coverage falling short: the
+/// model named something and Wilkes has no answer for the tag at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Unread {
+    not_text: u32,
+    unroutable: u32,
 }
 
 /// Parse a DocTags stream into elements.
@@ -377,9 +420,9 @@ fn kind_of(tag: &str) -> Option<RegionKind> {
 /// An element whose location is absent or is not four values is **dropped**,
 /// never placed at a guessed position. Half a rectangle is not a location, and
 /// the reading would carry text pointing at the wrong part of the page.
-fn parse_doctags(stream: &str) -> (Vec<Element>, u32) {
+fn parse_doctags(stream: &str) -> (Vec<Element>, Unread) {
     let mut elements = Vec::new();
-    let mut unroutable = 0u32;
+    let mut unread = Unread::default();
     let bytes: Vec<char> = stream.chars().collect();
     let mut i = 0usize;
 
@@ -390,20 +433,37 @@ fn parse_doctags(stream: &str) -> (Vec<Element>, u32) {
         }
         let Some(open_end) = find(&bytes, i, '>') else { break };
         let tag: String = bytes[i + 1..open_end].iter().collect();
-        let Some(kind) = kind_of(&tag) else {
-            // A tag this build has no kind for. Counted when it delimits
-            // content — a located, closed element — and passed over when it
-            // is structure, which is what `<doctag>` and the cell markers
-            // inside a table are. A location is what tells them apart: DocTags
-            // gives every content element one and gives structure none.
+        let routing = routing_of(&tag);
+        let Routing::Read(kind) = routing else {
+            // A tag that yields no text. Counted when it delimits content — a
+            // located, closed element — and passed over when it is structure,
+            // which is what `<doctag>` and the cell markers inside a table
+            // are. A location is what tells them apart: DocTags gives every
+            // content element one and gives structure none.
+            //
+            // Either way parsing continues *inside* the body rather than
+            // skipping past the element, so anything the model marked out
+            // within it is read on its own terms.
             if let Some(close_at) = find_str(&bytes, open_end + 1, &format!("</{tag}>")) {
                 let body: String = bytes[open_end + 1..close_at].iter().collect();
                 if split_location(&body).0.is_some() {
-                    tracing::warn!(
-                        "{MODEL_ID} marked out a <{tag}> region this build has no kind \
-                         for; it is counted and left out of the reading"
-                    );
-                    unroutable += 1;
+                    if routing == Routing::NotText {
+                        // Expected, and frequent: every figure crop given to
+                        // this model comes back as one of these. Debug, not a
+                        // warning — a warning that fires once per figure
+                        // teaches a reader to ignore warnings.
+                        tracing::debug!(
+                            "{MODEL_ID} marked out a <{tag}> region, which carries no \
+                             text to read"
+                        );
+                        unread.not_text += 1;
+                    } else {
+                        tracing::warn!(
+                            "{MODEL_ID} marked out a <{tag}> region this build has no kind \
+                             for; it is counted and left out of the reading"
+                        );
+                        unread.unroutable += 1;
+                    }
                 }
             }
             i = open_end + 1;
@@ -436,7 +496,7 @@ fn parse_doctags(stream: &str) -> (Vec<Element>, u32) {
         }
         i = close_at + close.chars().count();
     }
-    (elements, unroutable)
+    (elements, unread)
 }
 
 fn find(haystack: &[char], from: usize, needle: char) -> Option<usize> {
@@ -675,13 +735,14 @@ impl GraniteDocling {
             .map_err(|e| anyhow::anyhow!("could not decode the response: {e}"))?;
         let char_ends = token_char_ends(&self.tokenizer, &ids)?;
 
-        let (elements, unroutable) = parse_doctags(&stream);
+        let (elements, unread) = parse_doctags(&stream);
         Ok(ImageRecognition {
             regions: elements
                 .into_iter()
                 .filter_map(|element| to_region(element, &char_ends, &logprobs))
                 .collect(),
-            unroutable,
+            unroutable: unread.unroutable,
+            not_text: unread.not_text,
         })
     }
 }
@@ -828,9 +889,9 @@ Expert Systems in Practice</section_header_level_1>\
 <formula><loc_95><loc_158><loc_268><loc_183>S ( q , d ) = \\Sigma w</formula>\
 <otsl><loc_39><loc_218><loc_440><loc_287><ched>Corpus<ched>Recall<nl>\
 <fcel>Reports<fcel>0.91<nl><fcel>Manuals<fcel>0.87<nl></otsl></doctag>";
-        let (elements, unroutable) = parse_doctags(stream);
+        let (elements, unread) = parse_doctags(stream);
         assert_eq!(elements.len(), 4, "{elements:#?}");
-        assert_eq!(unroutable, 0);
+        assert_eq!(unread, Unread::default());
 
         assert_eq!(elements[0].kind, RegionKind::Text);
         assert_eq!(elements[0].text, "Expert Systems in Practice");
@@ -889,10 +950,51 @@ Expert Systems in Practice</section_header_level_1>\
     fn a_region_of_an_unknown_kind_is_counted_rather_than_dropped() {
         let stream = "<doctag><text><loc_1><loc_2><loc_3><loc_4>read</text>\
 <checkbox_selected><loc_5><loc_6><loc_7><loc_8>x</checkbox_selected></doctag>";
-        let (elements, unroutable) = parse_doctags(stream);
+        let (elements, unread) = parse_doctags(stream);
         assert_eq!(elements.len(), 1);
         assert_eq!(elements[0].text, "read");
-        assert_eq!(unroutable, 1);
+        assert_eq!(unread.unroutable, 1);
+        assert_eq!(unread.not_text, 0, "a checkbox is not a picture");
+    }
+
+    /// A picture is not an unroutable region. This model is a document parser
+    /// and every figure crop it is handed comes back as one, so counting it
+    /// with the tags this build genuinely cannot route would make that count
+    /// say nothing: a hundred figures correctly named and a hundred regions
+    /// of content lost would read the same.
+    #[test]
+    fn a_picture_is_counted_as_carrying_no_text_and_not_as_an_unknown_kind() {
+        let stream = "<doctag><picture><loc_0><loc_0><loc_500><loc_500></picture></doctag>";
+        let (elements, unread) = parse_doctags(stream);
+        assert!(elements.is_empty(), "{elements:#?}");
+        assert_eq!(unread.not_text, 1);
+        assert_eq!(unread.unroutable, 0, "the recognizer is not falling short here");
+    }
+
+    /// What the model marks out *inside* a picture is read on its own terms:
+    /// the parser continues into the body rather than skipping past the
+    /// element, so a diagram's caption and its labels still reach the reading.
+    /// The picture itself contributes the box and no bytes.
+    #[test]
+    fn the_contents_of_a_picture_are_still_read() {
+        let stream = "<doctag><picture><loc_0><loc_0><loc_500><loc_500>\
+<caption><loc_10><loc_10><loc_90><loc_20>Figure 3: components</caption>\
+<text><loc_20><loc_30><loc_80><loc_40>Knowledge base</text>\
+</picture></doctag>";
+        let (elements, unread) = parse_doctags(stream);
+        let read: Vec<&str> = elements.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(read, vec!["Figure 3: components", "Knowledge base"]);
+        assert_eq!(unread.not_text, 1);
+        assert_eq!(unread.unroutable, 0);
+    }
+
+    /// A picture with no location is structure, not a region, and is passed
+    /// over exactly as an unknown structural tag is.
+    #[test]
+    fn a_picture_without_a_location_is_not_counted() {
+        let (elements, unread) = parse_doctags("<doctag><picture></picture></doctag>");
+        assert!(elements.is_empty());
+        assert_eq!(unread, Unread::default());
     }
 
     #[test]

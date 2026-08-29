@@ -49,18 +49,31 @@ pub struct SpottedRegion {
 
 /// What a recognizer made of one image.
 ///
-/// The regions are the answer; `unroutable` is the part of the answer Wilkes
-/// could not use. A recognizer that marks out a region of a kind this build
-/// has no name for must say so rather than drop it, because a reading missing
-/// that content and a picture that never held any read identically otherwise
-/// — which is the same reason every rejected region is kept.
+/// The regions are the answer; the two counts are the parts of the answer that
+/// produced no region, kept apart because they are opposite facts. A recognizer
+/// that marks out a region of a kind this build has no name for must say so
+/// rather than drop it, because a reading missing that content and a picture
+/// that never held any read identically otherwise — which is the same reason
+/// every rejected region is kept.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ImageRecognition {
     pub regions: Vec<SpottedRegion>,
     /// Regions the recognizer delimited and this build has no [`RegionKind`]
     /// for. Reported, counted, and not guessed at.
+    ///
+    /// A gap in this build, so any of these is worth a reader's attention.
     #[serde(default)]
     pub unroutable: u32,
+    /// Regions the recognizer delimited that carry no text to read — a
+    /// picture, most often the whole of a figure crop.
+    ///
+    /// The recognizer working correctly, not a gap: a document parser given a
+    /// figure answers "this is a figure", and there is nothing to transcribe
+    /// in that. Counted anyway, and counted *separately*, because one number
+    /// covering both cannot distinguish a hundred figures correctly named
+    /// from a hundred regions of content this build lost.
+    #[serde(default)]
+    pub not_text: u32,
 }
 
 impl ImageRecognition {
@@ -68,6 +81,7 @@ impl ImageRecognition {
         Self {
             regions,
             unroutable: 0,
+            not_text: 0,
         }
     }
 }

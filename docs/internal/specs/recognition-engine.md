@@ -222,9 +222,26 @@ Corrected 2026-08-29, from what was built: this row first read `Picture` and
 `Caption` too. A caption is prose and is read as `Text` — a separate kind for
 it would be caption *association*, which FIGURE.md defers — and a picture
 region is a region with nothing recognized in it, which the reading has no use
-for. Neither is a `RegionKind`, so neither may be advertised as one. A
-`<picture>` element is what `regions_unroutable` counts: marked out by the
-model, and named by nothing in this build.
+for. Neither is a `RegionKind`, so neither may be advertised as one.
+
+Amended again, later the same day: a `<picture>` is **not** what
+`regions_unroutable` counts, and treating it as such was a mistake that made
+the counter unreadable. This model is a document parser, so every figure crop
+handed to it comes back as a `<picture>` covering the whole crop — the correct
+answer, once per figure, at WARN. Routing now has three outcomes rather than
+two: a tag that yields text (`Routing::Read`), a tag known to yield none
+(`Routing::NotText` — `<picture>`, counted in `regions_marked_not_text` and
+logged at debug), and a tag this build has never heard of (`Routing::Unknown`,
+still `regions_unroutable`, still a warning). The two counters say opposite
+things about the build — one is the recognizer working, the other is this
+build's coverage falling short — and one number covering both could not tell a
+hundred figures correctly named from a hundred regions of content lost.
+
+The parse is byte-identical either way and no recipe version moves: a
+`<picture>` produced no element before and produces none now. What its contents
+produce is unchanged too, and was never in doubt — parsing continues *inside*
+an unread element's body, so a caption or a diagram's labels marked out within
+a picture are read as their own elements.
 
 The difference is one of integration, not capability, and the table must not be
 read as "Paddle cannot do tables". `parsing-v1` is

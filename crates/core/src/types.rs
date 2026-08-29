@@ -574,8 +574,23 @@ pub struct ExtractionDiagnostics {
     /// reached no admission rule and no label. Never silently dropped: a
     /// region nobody can name is a fact about the coverage of this build's
     /// kinds, and the count is where it is answerable.
+    ///
+    /// Read it against `regions_marked_not_text` below, which is the count
+    /// this one used to be mixed with. A non-zero number here is a gap worth
+    /// looking at; a non-zero number there is the recognizer doing its job.
     #[serde(default)]
     pub regions_unroutable: u32,
+    /// Regions the recognizer marked out that carry no text to read — a
+    /// picture, most often the whole of a figure crop handed to a document
+    /// parser.
+    ///
+    /// Expected, and roughly one per textless figure. It is counted because a
+    /// figure the recognizer named and one it never saw read identically in a
+    /// reading that contains neither, and it is counted *here* rather than
+    /// with the unroutable regions because those two say opposite things
+    /// about the build.
+    #[serde(default)]
+    pub regions_marked_not_text: u32,
 
     // ── Per-kind admission ───────────────────────────────────────────────
     //

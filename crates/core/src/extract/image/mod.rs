@@ -565,6 +565,7 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                 Ok(read) => {
                     diagnostics.images_ocr_succeeded += 1;
                     diagnostics.regions_unroutable += read.unroutable;
+                    diagnostics.regions_marked_not_text += read.not_text;
                     image.ocr_regions = ocr::place_and_admit(
                         read.regions.clone(),
                         &image.transform,
@@ -755,7 +756,7 @@ pub fn analyze(
         "images: {} found, {} analyzed, {} skipped, {} ocr ok, {} ocr failed, \
          {} regions accepted, {} rejected, {} deduplicated; \
          kinds: {} text, {} formula ({} invalid), {} table ({} malformed), \
-         {} chart ({} malformed), {} code, {} unroutable",
+         {} chart ({} malformed), {} code, {} not text, {} unroutable",
         diagnostics.native_images_found,
         diagnostics.native_images_analyzed,
         diagnostics.native_images_skipped_technical_limit,
@@ -772,6 +773,7 @@ pub fn analyze(
         diagnostics.regions_routed_chart,
         diagnostics.charts_rejected_malformed,
         diagnostics.regions_routed_code,
+        diagnostics.regions_marked_not_text,
         diagnostics.regions_unroutable,
     );
     images

@@ -400,6 +400,7 @@ mod tests {
             ImageRecognition {
                 regions: regions.clone(),
                 unroutable: 2,
+                not_text: 1,
             },
             ImageRecognition::default(),
         ];

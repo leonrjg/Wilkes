@@ -270,7 +270,8 @@ fn read_document(
              {} transcribed, {} recognition failures, {} regions accepted, \
              {} below the threshold, {} already native text, \
              {} formulas ({} invalid LaTeX), {} tables ({} malformed), \
-             {} charts ({} malformed), {} of no known kind, \
+             {} charts ({} malformed), {} with no text to read, \
+             {} of no known kind, \
              {} described, {} description failures, {} with no describer configured",
             path,
             diagnostics.native_images_found,
@@ -287,6 +288,7 @@ fn read_document(
             diagnostics.tables_rejected_malformed,
             diagnostics.charts_accepted,
             diagnostics.charts_rejected_malformed,
+            diagnostics.regions_marked_not_text,
             diagnostics.regions_unroutable,
             diagnostics.images_description_succeeded,
             diagnostics.images_description_failed,
