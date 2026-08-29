@@ -374,7 +374,14 @@ impl ImageAnalyzer for NativeImageAnalyzer {
         diagnostics: &mut ExtractionDiagnostics,
     ) {
         let identity = self.identity();
-        for (image, found) in images.iter_mut().zip(discovered) {
+        let total = images.len();
+        for (index, (image, found)) in images.iter_mut().zip(discovered).enumerate() {
+            // Every image reports one line, because the alternative is a
+            // process that looks hung. A single figure can take minutes, and a
+            // reader cannot tell slow work from no work without a heartbeat
+            // that names what is being worked on.
+            let position = format!("image {}/{total} (page {})", index + 1, image.page);
+            let started = std::time::Instant::now();
             image.analyzer_identity = identity.clone();
 
             let Some(decoded) = &found.decoded else {
@@ -383,6 +390,7 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                     .clone()
                     .unwrap_or_else(|| "not decoded".to_string());
                 diagnostics.native_images_skipped_technical_limit += 1;
+                debug!("{position}: skipped, {reason}");
                 image.status = ImageAnalysisStatus::SkippedTechnicalLimit { reason };
                 continue;
             };
@@ -404,9 +412,17 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                 } else if self.describer.is_none() {
                     diagnostics.images_description_not_configured += 1;
                 }
+                debug!(
+                    "{position}: {}x{}, already analyzed under this recipe",
+                    image.pixel_width, image.pixel_height
+                );
                 continue;
             }
 
+            info!(
+                "{position}: {}x{}, recognizing…",
+                image.pixel_width, image.pixel_height
+            );
             diagnostics.native_images_analyzed += 1;
             let mut failures = Vec::new();
 
@@ -453,6 +469,18 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                     }
                 }
             }
+
+            info!(
+                "{position}: {} of {} region(s) accepted{} in {:.1}s",
+                image.accepted_ocr().count(),
+                image.ocr_regions.len(),
+                if image.description.is_some() {
+                    ", described"
+                } else {
+                    ""
+                },
+                started.elapsed().as_secs_f32()
+            );
 
             image.status = if failures.is_empty() {
                 ImageAnalysisStatus::Complete

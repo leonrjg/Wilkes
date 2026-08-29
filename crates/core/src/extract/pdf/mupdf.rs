@@ -144,6 +144,27 @@ fn read_document(
 
     let mut diagnostics = ExtractionDiagnostics::default();
     let context = AnalysisContext::new(native_words(&pages));
+    // Said before the work rather than after it. Analysis is the slow part of
+    // reading a document — minutes per figure on a CPU — and a reader watching
+    // the log needs to know both that it is about to happen and whether an
+    // analyzer exists to do it. Silence here is indistinguishable from a
+    // runtime that has no analyzer attached, which is a thing that has
+    // happened and was invisible for exactly this reason.
+    if !discovered.is_empty() {
+        match analyzer {
+            Some(analyzer) => info!(
+                "images in {:?}: analyzing {} with {}",
+                path,
+                discovered.len(),
+                analyzer.identity()
+            ),
+            None => info!(
+                "images in {:?}: {} found, no analyzer configured — not enriching",
+                path,
+                discovered.len()
+            ),
+        }
+    }
     let mut images = image::analyze(&discovered, &context, analyzer, &mut diagnostics);
     // The pixels have done their work. Dropping them here rather than at the
     // end of extraction keeps a document's worth of decoded artwork out of
