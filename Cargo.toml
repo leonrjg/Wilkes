@@ -16,6 +16,15 @@ opt-level = 1
 # Our own crates keep file:line in panic backtraces; line tables cost a
 # fraction of what full DWARF does.
 debug = "line-tables-only"
+# ...and Cargo's macOS default for that debug info is `unpacked`, which leaves
+# the DWARF sitting in the per-codegen-unit object files. rustc must then keep
+# those objects alive for the debugger, and neither rustc nor Cargo ever deletes
+# the set a previous build wrote: every edit mints a fresh `*.rcgu.o` family in
+# target/debug/deps and the old one stays there for good. That, not the size of
+# any single artifact, is what makes this directory grow without bound.
+# `packed` hands the objects to dsymutil, which consolidates the DWARF into a
+# .dSYM bundle and frees rustc to delete them. file:line survives intact.
+split-debuginfo = "packed"
 debug-assertions = true
 overflow-checks = true
 
