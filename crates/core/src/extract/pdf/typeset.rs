@@ -703,16 +703,17 @@ fn render_scale(bbox: &BoundingBox) -> f32 {
 /// Draw one region of one page, and hand back what the recognizer will read
 /// together with the page rectangle those pixels cover.
 ///
-/// The returned rectangle is the page area the *canvas* covers — the padded
-/// region, rounded out to whole pixels. Padding is done in page space and the
-/// rectangle is derived back from the pixel grid so that the transform
-/// recorded for the render is an exact map from a pixel of it to a point of
-/// the page, not one off by the rounding. A recognized region's polygon
-/// therefore lands where the page draws it, which is what every consumer of
-/// the source map resolves.
+/// The returned rectangle is the page area the *canvas* covers, derived back
+/// from the pixel grid so that the transform recorded for the render is an
+/// exact map from a pixel of it to a point of the page. A recognized region's
+/// polygon therefore lands where the page draws it, which is what every
+/// consumer of the source map resolves.
+///
+/// Padding is applied to the pixel rectangle and not to the page rectangle.
+/// Doing it in page space and rounding to pixels afterwards was the same idea
+/// and cost twice the model: see [`pad_to_aspect`].
 fn render(page: &mupdf::Page, bbox: &BoundingBox) -> anyhow::Result<(NativeImage, BoundingBox)> {
     let scale = render_scale(bbox);
-    let padded = pad_to_aspect(bbox);
     let scaled = |rect: &BoundingBox| IRect {
         x0: (rect.x * scale).floor() as i32,
         y0: (rect.y * scale).floor() as i32,
@@ -720,7 +721,7 @@ fn render(page: &mupdf::Page, bbox: &BoundingBox) -> anyhow::Result<(NativeImage
         y1: ((rect.y + rect.height) * scale).ceil() as i32,
     };
 
-    let canvas = scaled(&padded);
+    let canvas = pad_to_aspect(scaled(bbox));
     let (width, height) = ((canvas.x1 - canvas.x0) as u32, (canvas.y1 - canvas.y0) as u32);
     if let Some(reason) = image::technical_limit(width, height) {
         anyhow::bail!("region {width}x{height} at scale {scale:.1}: {reason}");
@@ -757,22 +758,37 @@ fn render(page: &mupdf::Page, bbox: &BoundingBox) -> anyhow::Result<(NativeImage
     ))
 }
 
-/// Widen or heighten a region until it is no more lopsided than
-/// [`MAX_ASPECT`], for the reason given there. Symmetric, so the content stays
-/// centred where the recognizer expects to find it.
-fn pad_to_aspect(bbox: &BoundingBox) -> BoundingBox {
-    let (width, height) = (bbox.width.max(1.0), bbox.height.max(1.0));
-    let (mut padded_width, mut padded_height) = (width, height);
-    if width / height > MAX_ASPECT {
-        padded_height = width / MAX_ASPECT;
-    } else if height / width > MAX_ASPECT {
-        padded_width = height / MAX_ASPECT;
-    }
-    BoundingBox {
-        x: bbox.x - (padded_width - width) / 2.0,
-        y: bbox.y - (padded_height - height) / 2.0,
-        width: padded_width,
-        height: padded_height,
+/// Grow a rendered region until it is no more lopsided than [`MAX_ASPECT`],
+/// for the reason given there. In pixels, symmetric, and never shrinking.
+///
+/// The rounding is the whole point of doing this here. A recognizer's tiler
+/// takes the *pixel* dimensions and rounds them up to whole tiles, so a canvas
+/// a hair under the bound is charged for a second row of them — measured, an
+/// 1409x353 crop is 4x2 tiles where 1409x352 is 4x1, the same picture for
+/// nearly twice the prefill. Padding in page points and rounding to pixels
+/// afterwards could land on either side of that; padding the pixels lands on
+/// the right one by construction.
+///
+/// Hence `floor` on the derived edge: it makes the padded ratio meet or pass
+/// the bound rather than fall a fraction short of it. `max` against the
+/// region's own edge keeps that from ever shrinking the region, which the
+/// clip would then crop.
+fn pad_to_aspect(region: IRect) -> IRect {
+    let (width, height) = (region.x1 - region.x0, region.y1 - region.y0);
+    let (padded_width, padded_height) = if width as f32 > height as f32 * MAX_ASPECT {
+        (width, ((width as f32 / MAX_ASPECT).floor() as i32).max(height))
+    } else if height as f32 > width as f32 * MAX_ASPECT {
+        (((height as f32 / MAX_ASPECT).floor() as i32).max(width), height)
+    } else {
+        (width, height)
+    };
+    let x0 = region.x0 - (padded_width - width) / 2;
+    let y0 = region.y0 - (padded_height - height) / 2;
+    IRect {
+        x0,
+        y0,
+        x1: x0 + padded_width,
+        y1: y0 + padded_height,
     }
 }
 
@@ -1106,36 +1122,76 @@ mod tests {
 
     // ── Geometry handed to the recognizer ────────────────────────────────
 
+    fn rect(width: i32, height: i32) -> IRect {
+        IRect {
+            x0: 100,
+            y0: 200,
+            x1: 100 + width,
+            y1: 200 + height,
+        }
+    }
+
+    fn ratio(r: IRect) -> f32 {
+        (r.x1 - r.x0) as f32 / (r.y1 - r.y0) as f32
+    }
+
     /// A display formula is a sliver, and a recognizer that resizes it onto a
     /// square-ish grid would stretch every glyph. Padding is what keeps the
     /// shapes.
     #[test]
     fn a_sliver_is_padded_rather_than_left_to_be_squashed() {
-        let padded = pad_to_aspect(&BoundingBox {
-            x: 100.0,
-            y: 200.0,
-            width: 400.0,
-            height: 14.0,
-        });
-        assert!(
-            (padded.width / padded.height - MAX_ASPECT).abs() < 0.01,
-            "{padded:?}"
-        );
+        let padded = pad_to_aspect(rect(1600, 56));
+        assert!((ratio(padded) - MAX_ASPECT).abs() < 0.05, "{padded:?}");
         // Symmetric: the formula stays where it was, centred in the pad.
-        assert!((padded.x - 100.0).abs() < 0.01);
-        assert!((padded.y + padded.height / 2.0 - 207.0).abs() < 0.01);
+        assert_eq!(padded.x0, 100, "the long edge is untouched");
+        assert_eq!(
+            (padded.y0 + padded.y1) / 2,
+            200 + 28,
+            "the region stays centred"
+        );
+    }
+
+    /// The property that costs tiles. A recognizer rounds the canvas up to
+    /// whole tiles, so a ratio a hair *under* the bound buys a second row of
+    /// them — the same picture for nearly twice the prefill. Padding must
+    /// never land there, at any size.
+    #[test]
+    fn a_padded_sliver_never_lands_just_under_the_bound() {
+        for width in [401, 999, 1409, 1410, 1411, 1412, 2825, 4097] {
+            for height in [17, 41, 100, 225, 353] {
+                let padded = pad_to_aspect(rect(width, height));
+                let ratio = ratio(padded);
+                let lopsided = width as f32 > height as f32 * MAX_ASPECT
+                    || height as f32 > width as f32 * MAX_ASPECT;
+                assert!(
+                    !lopsided || ratio >= MAX_ASPECT || ratio <= 1.0 / MAX_ASPECT,
+                    "{width}x{height} padded to {padded:?}, ratio {ratio}"
+                );
+            }
+        }
+    }
+
+    /// Padding grows the canvas and never crops it: the region has to survive
+    /// whole, or the clip would cut the formula it was marked out for.
+    #[test]
+    fn padding_never_shrinks_the_region() {
+        for (width, height) in [(1600, 56), (56, 1600), (300, 200), (1, 1), (4000, 3)] {
+            let region = rect(width, height);
+            let padded = pad_to_aspect(region);
+            assert!(
+                padded.x0 <= region.x0
+                    && padded.y0 <= region.y0
+                    && padded.x1 >= region.x1
+                    && padded.y1 >= region.y1,
+                "{width}x{height}: {padded:?} does not contain {region:?}"
+            );
+        }
     }
 
     #[test]
     fn a_region_already_within_the_aspect_bound_is_not_padded() {
-        let bbox = BoundingBox {
-            x: 100.0,
-            y: 200.0,
-            width: 300.0,
-            height: 200.0,
-        };
-        let padded = pad_to_aspect(&bbox);
-        assert!((padded.width - 300.0).abs() < 0.01 && (padded.height - 200.0).abs() < 0.01);
+        let region = rect(300, 200);
+        assert_eq!(pad_to_aspect(region), region);
     }
 
     #[test]

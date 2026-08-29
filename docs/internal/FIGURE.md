@@ -1123,6 +1123,33 @@ formulas and looked exactly like a document with no mathematics in it; finding
 the difference took a throwaway probe against the file. The face names are the
 evidence and they are only in the PDF, so the log is where they belong.
 
+**The crop is padded in pixels, not in points.** A recognizer's tiler takes
+the canvas's pixel dimensions and rounds them up to whole tiles, so a canvas a
+hair under the aspect bound is charged for a second row of them. Measured on
+this document's regions: 1409x353 tiles as 4x2 — nine tiles with the thumbnail,
+576 visual tokens — where 1409x352 tiles as 4x1, five tiles and 320 tokens, for
+the same picture. The first version padded the page rectangle and rounded to
+pixels afterwards, which landed on the wrong side of that boundary every time
+and paid ~80% more prefill per region than it needed. Padding the pixel
+rectangle, with `floor` on the derived edge so the ratio meets or passes the
+bound, lands on the right side by construction.
+
+That coupling is real and cannot be asserted from inside the renderer, because
+the rounding happens on the other side of the module boundary. One test spans
+it — `the_render_pads_a_sliver_with_paper_and_not_with_the_rest_of_the_page`
+runs the produced canvas through `granite_docling::tile_grid` and requires one
+row — and it is the only place the two modules meet.
+
+**Known, and not fixed here: embedded figures are squashed.** `prepare_tiles`
+resizes an image onto the tile grid without padding it first, so any image
+whose aspect is not exactly `cols:rows` is distorted on the way in — the
+worked example's 1559x499 figure arrives at 2048x1024, a 1.56x vertical
+stretch. That is the same defect as the one above on the other side of the
+boundary, and fixing it properly means moving the fit into `prepare_tiles`,
+which owns the grid, and correcting recognized coordinates back through the
+pad. It changes what every embedded image looks like to the model, so it needs
+`doctags-v1` to move and the library to re-read. Not done.
+
 **Cost is bounded and the bound is reported.** Recognition is tens of seconds
 a region, so inline mathematics is deliberately unreachable — the unit is the
 line, and an inline formula shares its line with prose — and a per-document

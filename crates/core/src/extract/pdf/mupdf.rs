@@ -1404,6 +1404,23 @@ mod tests {
             (*width as f32 / *height as f32) <= 4.5,
             "the sliver was padded: {width}x{height}"
         );
+
+        // The padding exists to fit a recognizer's tiler, and the tiler is the
+        // only thing that can say whether it did. A canvas a hair under the
+        // bound is rounded up to a second row of tiles — the same picture for
+        // nearly twice the prefill — and no assertion inside the renderer can
+        // see that, because the rounding happens on the other side of the
+        // boundary. This is the one place the two meet.
+        #[cfg(feature = "recognize-onnx")]
+        {
+            let (_, _, cols, rows) =
+                crate::extract::image::granite_docling::tile_grid(*width, *height);
+            assert_eq!(
+                rows, 1,
+                "a padded sliver costs one row of tiles, not two: {width}x{height} \
+                 tiled {cols}x{rows}"
+            );
+        }
         assert!(!inked.is_empty(), "the equation is in the crop");
 
         // Every inked row is in the middle band. The pad above and below is
