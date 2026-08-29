@@ -195,6 +195,8 @@ fn read_document(
             "images in {:?}: {} found, {} analyzed, {} skipped by a technical limit, \
              {} transcribed, {} recognition failures, {} regions accepted, \
              {} below the threshold, {} already native text, \
+             {} formulas ({} invalid LaTeX), {} tables ({} malformed), \
+             {} charts ({} malformed), {} of no known kind, \
              {} described, {} description failures, {} with no describer configured",
             path,
             diagnostics.native_images_found,
@@ -205,6 +207,13 @@ fn read_document(
             diagnostics.ocr_regions_accepted,
             diagnostics.ocr_regions_rejected_low_confidence,
             diagnostics.ocr_regions_deduplicated_against_native_text,
+            diagnostics.formulas_accepted,
+            diagnostics.formulas_rejected_invalid_latex,
+            diagnostics.tables_accepted,
+            diagnostics.tables_rejected_malformed,
+            diagnostics.charts_accepted,
+            diagnostics.charts_rejected_malformed,
+            diagnostics.regions_unroutable,
             diagnostics.images_description_succeeded,
             diagnostics.images_description_failed,
             diagnostics.images_description_not_configured,
@@ -908,6 +917,7 @@ mod tests {
                     diagnostics.ocr_regions_accepted += 1;
                     image.analyzer_identity = self.identity();
                     image.ocr_regions = vec![ImageOcrRegion {
+                        kind: Default::default(),
                         text: "Knowledge base".to_string(),
                         confidence: 0.9,
                         polygon_within_image: vec![Point { x: 0.0, y: 0.0 }],
@@ -977,6 +987,7 @@ mod tests {
                 for image in images {
                     image.analyzer_identity = self.identity();
                     image.ocr_regions = vec![ImageOcrRegion {
+                        kind: Default::default(),
                         text: "Expert knowledge".to_string(),
                         confidence: 0.87,
                         polygon_within_image: vec![Point { x: 0.0, y: 0.0 }],

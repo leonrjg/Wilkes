@@ -44,7 +44,7 @@ use tracing::{debug, info, warn};
 
 use crate::types::{
     BoundingBox, ExtractedImage, ExtractionDiagnostics, ImageAnalysisStatus, ImageTransform,
-    OcrAdmission,
+    OcrAdmission, RegionKind,
 };
 
 use describe::FigureDescriber;
@@ -423,9 +423,10 @@ impl NativeImageAnalyzer {
 impl ImageAnalyzer for NativeImageAnalyzer {
     fn identity(&self) -> String {
         format!(
-            "{}+{}+{}+{}+{}",
+            "{}+{}+{}+{}+{}+{}",
             LIMITS_VERSION,
             ocr::MAPPING_VERSION,
+            ocr::ADMISSION_RULES_VERSION,
             serialize::SERIALIZATION_VERSION,
             self.ocr.identity(),
             self.describer
@@ -547,10 +548,11 @@ impl ImageAnalyzer for NativeImageAnalyzer {
             let mut failures = Vec::new();
 
             match spotted.as_ref().map(|all| &all[position]) {
-                Ok(regions) => {
+                Ok(read) => {
                     diagnostics.images_ocr_succeeded += 1;
+                    diagnostics.regions_unroutable += read.unroutable;
                     image.ocr_regions = ocr::place_and_admit(
-                        regions.clone(),
+                        read.regions.clone(),
                         &image.transform,
                         &image.bbox,
                         image.pixel_width,
@@ -611,8 +613,22 @@ impl ImageAnalyzer for NativeImageAnalyzer {
     }
 }
 
+/// Count what was read and what became of it.
+///
+/// Two questions, counted separately because they fail separately: what kind
+/// of content the recognizer found, and which of it entered the reading. A
+/// table nobody recognized and a table recognized and refused as ragged are
+/// both absent from the reading and are not the same fact about the document.
 fn count_regions(image: &ExtractedImage, diagnostics: &mut ExtractionDiagnostics) {
     for region in &image.ocr_regions {
+        match region.kind {
+            RegionKind::Text => diagnostics.regions_routed_text += 1,
+            RegionKind::Formula => diagnostics.regions_routed_formula += 1,
+            RegionKind::Table => diagnostics.regions_routed_table += 1,
+            RegionKind::Chart => diagnostics.regions_routed_chart += 1,
+            RegionKind::Code => diagnostics.regions_routed_code += 1,
+        }
+
         match region.admission {
             OcrAdmission::Accepted => diagnostics.ocr_regions_accepted += 1,
             OcrAdmission::RejectedLowConfidence => {
@@ -620,6 +636,22 @@ fn count_regions(image: &ExtractedImage, diagnostics: &mut ExtractionDiagnostics
             }
             OcrAdmission::DeduplicatedAgainstNativeText => {
                 diagnostics.ocr_regions_deduplicated_against_native_text += 1
+            }
+            OcrAdmission::RejectedInvalidLatex => {
+                diagnostics.formulas_rejected_invalid_latex += 1
+            }
+            OcrAdmission::RejectedMalformedTable => match region.kind {
+                RegionKind::Chart => diagnostics.charts_rejected_malformed += 1,
+                _ => diagnostics.tables_rejected_malformed += 1,
+            },
+        }
+
+        if region.admission == OcrAdmission::Accepted {
+            match region.kind {
+                RegionKind::Formula => diagnostics.formulas_accepted += 1,
+                RegionKind::Table => diagnostics.tables_accepted += 1,
+                RegionKind::Chart => diagnostics.charts_accepted += 1,
+                RegionKind::Text | RegionKind::Code => {}
             }
         }
     }
@@ -690,7 +722,9 @@ pub fn analyze(
 
     debug!(
         "images: {} found, {} analyzed, {} skipped, {} ocr ok, {} ocr failed, \
-         {} regions accepted, {} rejected, {} deduplicated",
+         {} regions accepted, {} rejected, {} deduplicated; \
+         kinds: {} text, {} formula ({} invalid), {} table ({} malformed), \
+         {} chart ({} malformed), {} code, {} unroutable",
         diagnostics.native_images_found,
         diagnostics.native_images_analyzed,
         diagnostics.native_images_skipped_technical_limit,
@@ -699,6 +733,15 @@ pub fn analyze(
         diagnostics.ocr_regions_accepted,
         diagnostics.ocr_regions_rejected_low_confidence,
         diagnostics.ocr_regions_deduplicated_against_native_text,
+        diagnostics.regions_routed_text,
+        diagnostics.regions_routed_formula,
+        diagnostics.formulas_rejected_invalid_latex,
+        diagnostics.regions_routed_table,
+        diagnostics.tables_rejected_malformed,
+        diagnostics.regions_routed_chart,
+        diagnostics.charts_rejected_malformed,
+        diagnostics.regions_routed_code,
+        diagnostics.regions_unroutable,
     );
     images
 }
@@ -848,7 +891,7 @@ mod tests {
     #[test]
     fn every_input_that_changes_the_bytes_changes_the_recipe() {
         use crate::extract::image::describe::FigureDescriber;
-        use crate::extract::image::ocr::{OcrEngine, SpottedRegion};
+        use crate::extract::image::ocr::OcrEngine;
 
         struct Recognizer(&'static str, f32);
         impl OcrEngine for Recognizer {
@@ -861,8 +904,8 @@ mod tests {
             fn spot_batch(
                 &self,
                 images: &[image::RgbImage],
-            ) -> anyhow::Result<Vec<Vec<SpottedRegion>>> {
-                Ok(vec![Vec::new(); images.len()])
+            ) -> anyhow::Result<Vec<ocr::ImageRecognition>> {
+                Ok(vec![ocr::ImageRecognition::default(); images.len()])
             }
         }
 
@@ -903,6 +946,13 @@ mod tests {
             "serialization: {baseline}"
         );
         assert!(baseline.contains(LIMITS_VERSION), "limits: {baseline}");
+        // The per-kind admission rules decide which recognized bytes reach
+        // the reading, so two readings produced under different rules are
+        // different readings even when one model read one picture.
+        assert!(
+            baseline.contains(ocr::ADMISSION_RULES_VERSION),
+            "admission rules: {baseline}"
+        );
 
         // And configuring a describer at all is a different reading from not.
         assert_ne!(

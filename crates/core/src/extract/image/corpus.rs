@@ -25,7 +25,7 @@ use crate::types::{
 };
 
 use super::describe::FigureDescriber;
-use super::ocr::{OcrEngine, RegionKind, SpottedRegion};
+use super::ocr::{ImageRecognition, OcrEngine, RegionKind, SpottedRegion};
 use super::NativeImageAnalyzer;
 
 // ── A capture of what a real document actually draws ─────────────────────────
@@ -53,12 +53,12 @@ impl OcrEngine for Arc<ImageCapture> {
     fn spot_batch(
         &self,
         images: &[image::RgbImage],
-    ) -> anyhow::Result<Vec<Vec<SpottedRegion>>> {
+    ) -> anyhow::Result<Vec<ImageRecognition>> {
         self.images
             .lock()
             .expect("capture lock")
             .extend(images.iter().cloned());
-        Ok(vec![Vec::new(); images.len()])
+        Ok(vec![ImageRecognition::default(); images.len()])
     }
 }
 
@@ -534,8 +534,11 @@ pub(super) fn build_pdf(pages: Vec<PageSpec>) -> Vec<u8> {
 /// What the double should do for one image, in the order images are found.
 #[derive(Clone)]
 pub(super) enum Script {
-    /// Regions as the model would emit them, in fractions of the image.
+    /// Prose regions as the model would emit them, in fractions of the image.
     Spots(Vec<(&'static str, f32, [f32; 8])>),
+    /// Regions of any kind — what a recognizer that parses a document
+    /// returns, rather than one that only transcribes.
+    Reads(Vec<(RegionKind, &'static str, f32, [f32; 8])>),
     /// A recognition failure. The reading keeps its native text and the result
     /// says it is partial.
     Fails(&'static str),
@@ -572,10 +575,10 @@ impl OcrEngine for ScriptedOcr {
     fn spot_batch(
         &self,
         images: &[image::RgbImage],
-    ) -> anyhow::Result<Vec<Vec<SpottedRegion>>> {
+    ) -> anyhow::Result<Vec<ImageRecognition>> {
         let mut all = Vec::with_capacity(images.len());
         for _ in images {
-            all.push(self.spot_one()?);
+            all.push(ImageRecognition::from_regions(self.spot_one()?));
         }
         Ok(all)
     }
@@ -589,6 +592,20 @@ impl ScriptedOcr {
         match self.script.get(index) {
             None => Ok(Vec::new()),
             Some(Script::Fails(reason)) => anyhow::bail!("{reason}"),
+            Some(Script::Reads(reads)) => Ok(reads
+                .iter()
+                .map(|(kind, text, confidence, quad)| SpottedRegion {
+                    kind: *kind,
+                    text: (*text).to_string(),
+                    confidence: *confidence,
+                    quad: [
+                        Point { x: quad[0], y: quad[1] },
+                        Point { x: quad[2], y: quad[3] },
+                        Point { x: quad[4], y: quad[5] },
+                        Point { x: quad[6], y: quad[7] },
+                    ],
+                })
+                .collect()),
             Some(Script::Spots(spots)) => Ok(spots
                 .iter()
                 .map(|(text, confidence, quad)| SpottedRegion {
@@ -661,6 +678,133 @@ fn extract(
 const MIDDLE: [f32; 8] = [0.25, 0.25, 0.75, 0.25, 0.75, 0.75, 0.25, 0.75];
 
 // ── The corpus ───────────────────────────────────────────────────────────────
+
+/// A figure holding a formula, a table and a chart beside its labels: each
+/// kind reaches the reading under its own label, so a reader and a language
+/// model can tell a transcription from a reconstruction without consulting
+/// metadata.
+#[test]
+fn every_recognized_kind_reaches_the_reading_under_its_own_label() {
+    let table = "| Corpus | Recall |\n| --- | --- |\n| Reports | 0.91 |";
+    let (content, diagnostics) = extract(
+        vec![PageSpec::default()
+            .with_text(20.0, 250.0, "Before the figure")
+            .with_image(ImageSpec::gradient(64, 32))],
+        vec![Script::Reads(vec![
+            (RegionKind::Text, "Knowledge base", 0.95, MIDDLE),
+            (RegionKind::Formula, "S(q,d) = \\Sigma_{i} w_{i}", 0.90, MIDDLE),
+            (RegionKind::Table, table, 0.88, MIDDLE),
+            (RegionKind::Chart, table, 0.86, MIDDLE),
+        ])],
+        None,
+    );
+
+    assert!(content.text.contains("Image embedded text: Knowledge base."));
+    assert!(content
+        .text
+        .contains("Image embedded formula: S(q,d) = \\Sigma_{i} w_{i}."));
+    assert!(content
+        .text
+        .contains("Image embedded table:\n| Corpus | Recall |"));
+    assert!(content
+        .text
+        .contains("Image transcribed chart:\n| Corpus | Recall |"));
+
+    assert_eq!(diagnostics.regions_routed_text, 1);
+    assert_eq!(diagnostics.regions_routed_formula, 1);
+    assert_eq!(diagnostics.regions_routed_table, 1);
+    assert_eq!(diagnostics.regions_routed_chart, 1);
+    assert_eq!(diagnostics.formulas_accepted, 1);
+    assert_eq!(diagnostics.tables_accepted, 1);
+    assert_eq!(diagnostics.charts_accepted, 1);
+}
+
+/// A formula the decoder truncated is confident and invalid. It is refused,
+/// the refusal is counted with its own reason, and the string never reaches
+/// the reading.
+#[test]
+fn a_formula_that_does_not_parse_is_refused_with_its_reason() {
+    let (content, diagnostics) = extract(
+        vec![PageSpec::default()
+            .with_text(20.0, 250.0, "Before the figure")
+            .with_image(ImageSpec::gradient(64, 32))],
+        vec![Script::Reads(vec![(
+            RegionKind::Formula,
+            "S(q,d) = \\frac{a}{b",
+            0.99,
+            MIDDLE,
+        )])],
+        None,
+    );
+
+    assert!(!content.text.contains("\\frac{a}{b"));
+    assert!(!content.text.contains("Image embedded formula:"));
+    assert_eq!(diagnostics.formulas_rejected_invalid_latex, 1);
+    assert_eq!(diagnostics.formulas_accepted, 0);
+    // Kept on the image, where a missing formula is answerable.
+    let region = &content.images[0].ocr_regions[0];
+    assert_eq!(region.admission, crate::types::OcrAdmission::RejectedInvalidLatex);
+}
+
+/// A ragged table is a failed recognition wearing the shape of a result. It
+/// is refused on structure rather than on confidence, and a chart refused the
+/// same way is counted as a chart.
+#[test]
+fn a_table_that_is_not_rectangular_is_refused_on_structure() {
+    let (content, diagnostics) = extract(
+        vec![PageSpec::default()
+            .with_text(20.0, 250.0, "Before the figure")
+            .with_image(ImageSpec::gradient(64, 32))],
+        vec![Script::Reads(vec![
+            (RegionKind::Table, "| a | b |\n| --- | --- |\n| 1 |", 0.99, MIDDLE),
+            (RegionKind::Chart, "rising, roughly", 0.99, MIDDLE),
+        ])],
+        None,
+    );
+
+    assert!(!content.text.contains("Image embedded table:"));
+    assert!(!content.text.contains("Image transcribed chart:"));
+    assert_eq!(diagnostics.tables_rejected_malformed, 1);
+    assert_eq!(diagnostics.charts_rejected_malformed, 1);
+    assert_eq!(diagnostics.tables_accepted, 0);
+    assert_eq!(diagnostics.charts_accepted, 0);
+}
+
+/// Every byte a recognized table contributes says it is a table, so a
+/// consumer resolving provenance is told what it has without reading the
+/// label out of the text.
+#[test]
+fn a_tables_bytes_carry_its_kind_in_their_provenance() {
+    let table = "| Corpus | Recall |\n| --- | --- |\n| Reports | 0.91 |";
+    let (content, _) = extract(
+        vec![PageSpec::default()
+            .with_text(20.0, 250.0, "Before the figure")
+            .with_image(ImageSpec::gradient(64, 32))],
+        vec![Script::Reads(vec![(RegionKind::Table, table, 0.9, MIDDLE)])],
+        None,
+    );
+
+    let block = content.images[0]
+        .reading_range
+        .clone()
+        .expect("the table reached the reading");
+    let covering: Vec<&crate::types::SourceSegment> = content
+        .source_map
+        .segments
+        .iter()
+        .filter(|segment| {
+            segment.text_range.start >= block.start && segment.text_range.end <= block.end
+        })
+        .collect();
+    assert!(!covering.is_empty());
+    assert!(covering.iter().all(|segment| matches!(
+        segment.provenance,
+        TextProvenance::ImageOcr {
+            kind: RegionKind::Table,
+            ..
+        }
+    )));
+}
 
 /// A diagram whose labels the recognizer reads: they reach the reading, in the
 /// order the model emitted them, at the image's position.
@@ -967,7 +1111,9 @@ fn exact_search_finds_a_transcribed_label_at_its_own_polygon() {
         .iter()
         .find(|segment| segment.text_range.start == range.start)
         .expect("the label has its own segment");
-    let TextProvenance::ImageOcr { image_id, confidence } = &segment.provenance else {
+    let TextProvenance::ImageOcr {
+        image_id, confidence, ..
+    } = &segment.provenance else {
         panic!("expected transcription provenance, got {:?}", segment.provenance);
     };
     assert_eq!(image_id, &image.id);

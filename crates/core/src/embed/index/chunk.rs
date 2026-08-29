@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use text_splitter::{ChunkConfig, TextSplitter};
 
-use crate::types::{ByteRange, ExtractedContent, SourceOrigin};
+use crate::types::{ByteRange, ExtractedContent, SourceOrigin, TextProvenance};
 
 // ── Chunk ─────────────────────────────────────────────────────────────────────
 
@@ -39,6 +39,10 @@ pub struct Chunk {
 /// fit, and no overlap window drags unrelated body prose across the seam. A
 /// block too large for one chunk is split inside itself, by the same splitter,
 /// and every piece still resolves to the same image.
+///
+/// One rule overrides that: a boundary never falls inside a recognized formula
+/// or table. Those reconstruct to something a consumer can parse or to nothing
+/// at all, so one that exceeds the configured size is its own oversized chunk.
 pub fn chunk_content(
     content: &ExtractedContent,
     file_path: PathBuf,
@@ -54,6 +58,7 @@ pub fn chunk_content(
         .expect("overlap must be smaller than chunk size");
     let splitter = TextSplitter::new(config);
 
+    let indivisible = indivisible_ranges(content);
     let mut spans: Vec<ByteRange> = Vec::new();
     for run in structural_runs(content) {
         let text = &content.text[run.start..run.end];
@@ -62,18 +67,18 @@ pub fn chunk_content(
         // byte offset. Whitespace-only chunks carry no passage, so their bytes
         // are absorbed by the preceding chunk's range below instead of forming
         // a chunk of their own.
-        spans.extend(
-            splitter
-                .chunks(text)
-                .filter(|chunk_str| !chunk_str.trim().is_empty())
-                .map(|chunk_str| {
-                    let offset = chunk_str.as_ptr() as usize - base + run.start;
-                    ByteRange {
-                        start: offset,
-                        end: offset + chunk_str.len(),
-                    }
-                }),
-        );
+        let run_spans: Vec<ByteRange> = splitter
+            .chunks(text)
+            .filter(|chunk_str| !chunk_str.trim().is_empty())
+            .map(|chunk_str| {
+                let offset = chunk_str.as_ptr() as usize - base + run.start;
+                ByteRange {
+                    start: offset,
+                    end: offset + chunk_str.len(),
+                }
+            })
+            .collect();
+        spans.extend(keep_indivisible_whole(run_spans, &indivisible));
     }
 
     let Some(first) = spans.first_mut() else {
@@ -174,6 +179,74 @@ fn structural_runs(content: &ExtractedContent) -> Vec<ByteRange> {
         });
     }
     runs
+}
+
+/// The stretches of the reading a chunk boundary may not fall inside.
+///
+/// A recognized formula or table, label and all: half a LaTeX expression is
+/// not a shorter expression, it is an invalid one, and half a Markdown table
+/// is not a smaller table. Both would reconstruct to bytes no consumer can
+/// parse, which is worse than an oversized chunk.
+///
+/// Read from the source map rather than from the images, because the source
+/// map is where the reading records what each of its bytes *is* — the same
+/// provenance an export or an MCP read resolves. Adjacent segments of the same
+/// indivisible kind are one range: a table's label and its rows are written as
+/// separate pieces and a boundary between them would strand the label.
+fn indivisible_ranges(content: &ExtractedContent) -> Vec<ByteRange> {
+    let mut ranges: Vec<ByteRange> = Vec::new();
+    for segment in &content.source_map.segments {
+        let TextProvenance::ImageOcr { kind, .. } = &segment.provenance else {
+            continue;
+        };
+        if !kind.is_indivisible() {
+            continue;
+        }
+        match ranges.last_mut() {
+            Some(last) if last.end == segment.text_range.start => {
+                last.end = segment.text_range.end
+            }
+            _ => ranges.push(segment.text_range.clone()),
+        }
+    }
+    ranges
+}
+
+/// Merge the spans of one run until no boundary falls strictly inside an
+/// indivisible range.
+///
+/// A merge and not a forced boundary: when the whole enrichment block already
+/// fits in one chunk — the ordinary case — nothing here changes anything, so
+/// the rule that a formula is never cut does not cost the rule that a
+/// transcription and its description stay together. It only bites where the
+/// splitter would otherwise have cut, and there it wins, which is what makes
+/// it the stronger of the two.
+fn keep_indivisible_whole(
+    mut spans: Vec<ByteRange>,
+    indivisible: &[ByteRange],
+) -> Vec<ByteRange> {
+    for range in indivisible {
+        // Every span this range touches becomes one span. Spans are ordered
+        // and tile the run, so the touched ones are contiguous.
+        let touched: Vec<usize> = spans
+            .iter()
+            .enumerate()
+            .filter(|(_, span)| span.start < range.end && span.end > range.start)
+            .map(|(index, _)| index)
+            .collect();
+        let (Some(first), Some(last)) = (touched.first(), touched.last()) else {
+            continue;
+        };
+        if first == last {
+            continue;
+        }
+        let merged = ByteRange {
+            start: spans[*first].start,
+            end: spans[*last].end,
+        };
+        spans.splice(*first..=*last, [merged]);
+    }
+    spans
 }
 
 /// Verify that ordinal-ordered `chunks` rebuild `text` byte for byte: each
@@ -489,6 +562,126 @@ mod tests {
                 .map(|chunk| (&chunk.byte_range, chunk.text.as_str())),
         )
         .expect("chunks rebuild the reading");
+    }
+
+    /// A rendition whose enrichment block is one recognized table, marked in
+    /// the source map as the indivisible thing it is.
+    fn table_content(rows: usize) -> ExtractedContent {
+        let mut table = String::from("Image embedded table:\n| Corpus | Recall |\n| --- | --- |\n");
+        for row in 0..rows {
+            table.push_str(&format!("| Report number {row} | 0.9{row} |\n"));
+        }
+        let prose = "The table below reports recall by corpus. ".repeat(6);
+        let text = format!("{prose}\n{table}\nAnd the discussion continues afterwards.\n");
+        let start = text.find("Image embedded table:").expect("the block is there");
+        let end = start + table.len();
+
+        let mut content = image_content(text, start, end);
+        content.source_map.segments = vec![
+            SourceSegment {
+                text_range: ByteRange { start: 0, end: start },
+                origin: SourceOrigin::PdfPage {
+                    page: 1,
+                    bbox: None,
+                },
+                provenance: TextProvenance::Native,
+            },
+            SourceSegment {
+                text_range: ByteRange { start, end },
+                origin: SourceOrigin::PdfPage {
+                    page: 1,
+                    bbox: None,
+                },
+                provenance: TextProvenance::ImageOcr {
+                    image_id: "p1-i0".into(),
+                    confidence: None,
+                    kind: crate::types::RegionKind::Table,
+                },
+            },
+            SourceSegment {
+                text_range: ByteRange {
+                    start: end,
+                    end: content.text.len(),
+                },
+                origin: SourceOrigin::PdfPage {
+                    page: 1,
+                    bbox: None,
+                },
+                provenance: TextProvenance::Native,
+            },
+        ];
+        content
+    }
+
+    /// A table larger than the configured chunk is one oversized chunk rather
+    /// than two halves of a table. Half a Markdown table is not a smaller
+    /// table, and no consumer can parse what a split would leave.
+    #[test]
+    fn a_table_larger_than_a_chunk_is_not_cut_in_half() {
+        let content = table_content(12);
+        let block = content.images[0]
+            .reading_range
+            .clone()
+            .expect("the block has a range");
+        let chunks = chunk_content(&content, PathBuf::from("doc.pdf"), 200, 20);
+
+        assert!(
+            block.end - block.start > 200,
+            "the fixture must exceed the window for this to test anything"
+        );
+        for chunk in &chunks {
+            let cuts_in =
+                chunk.byte_range.start > block.start && chunk.byte_range.start < block.end;
+            assert!(
+                !cuts_in,
+                "a chunk starts at {} inside the table at {}..{}",
+                chunk.byte_range.start, block.start, block.end
+            );
+        }
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.text.contains("| Corpus | Recall |")
+                    && chunk.text.contains("| Report number 11 |")),
+            "the whole table is in one chunk"
+        );
+    }
+
+    /// The reconstruction invariant survives the oversized chunk that rule
+    /// produces — the ranges still tile the reading exactly.
+    #[test]
+    fn chunks_still_reconstruct_across_an_oversized_table() {
+        let content = table_content(12);
+        let chunks = chunk_content(&content, PathBuf::from("doc.pdf"), 200, 20);
+        ensure_chunks_reconstruct(
+            &content.text,
+            chunks
+                .iter()
+                .map(|chunk| (&chunk.byte_range, chunk.text.as_str())),
+        )
+        .expect("the chunks rebuild the reading");
+    }
+
+    /// The rule only bites where the splitter would have cut. A table that
+    /// fits keeps the ordinary behaviour, block and all in one chunk.
+    #[test]
+    fn a_table_that_fits_is_chunked_as_it_always_was() {
+        let content = table_content(2);
+        let chunks = chunk_content(&content, PathBuf::from("doc.pdf"), 1200, 100);
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.text.contains("Image embedded table:")
+                    && chunk.text.contains("| Report number 1 |")),
+            "the block is still one passage"
+        );
+        ensure_chunks_reconstruct(
+            &content.text,
+            chunks
+                .iter()
+                .map(|chunk| (&chunk.byte_range, chunk.text.as_str())),
+        )
+        .expect("the chunks rebuild the reading");
     }
 
     /// A range that does not describe a place in the text cannot be allowed to

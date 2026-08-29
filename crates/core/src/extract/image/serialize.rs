@@ -13,13 +13,24 @@
 //! model reading the export is told which is which in the text itself rather
 //! than being trusted to guess.
 
-use crate::types::{BoundingBox, ExtractedImage, ImageOcrRegion, Point, TextProvenance};
+use crate::types::{
+    BoundingBox, ExtractedImage, ImageOcrRegion, Point, RegionKind, TextProvenance,
+};
 
 /// Bumped whenever these bytes change for the same analysis — a new label, a
 /// new separator, a new order. Part of the extraction recipe.
-pub const SERIALIZATION_VERSION: &str = "image-enrichment-v1";
+///
+/// v2: one label per recognized kind. A reading written under v1 labelled a
+/// transcribed table `Image embedded text:` — the same bytes under a claim
+/// that is no longer made, which is exactly what a recipe version exists to
+/// keep apart.
+pub const SERIALIZATION_VERSION: &str = "image-enrichment-v2";
 
-pub const OCR_LABEL: &str = "Image embedded text:";
+/// The label prose is transcribed under. The other kinds' labels are on
+/// [`RegionKind::label`], where the exhaustive match keeps every kind from
+/// reaching the reading unlabelled; this name is kept because callers outside
+/// this module ask for the transcription label by it.
+pub const OCR_LABEL: &str = RegionKind::Text.label();
 pub const DESCRIPTION_LABEL: &str = "Image description:";
 
 /// Between two spotted regions. A separator rather than a newline: the regions
@@ -71,6 +82,42 @@ pub fn polygon_hull(polygon: &[Point], fallback: &BoundingBox) -> BoundingBox {
     }
 }
 
+/// One labelled run of the reading: the regions it covers, all of one kind.
+struct Block<'a> {
+    kind: RegionKind,
+    regions: Vec<&'a ImageOcrRegion>,
+}
+
+/// Whether this kind's body begins its own line rather than following its
+/// label.
+fn starts_a_line(kind: RegionKind) -> bool {
+    matches!(kind, RegionKind::Table | RegionKind::Chart | RegionKind::Code)
+}
+
+/// Group accepted regions into labelled blocks, in the order the recognizer
+/// emitted them.
+///
+/// Consecutive prose regions are one list, as they have always been. Every
+/// other kind is a block of its own: two LaTeX expressions joined by `; ` are
+/// not a longer expression, and two Markdown tables run together are not a
+/// bigger table. Emission order is never disturbed to gather same-kind
+/// regions — that would be a layout decision, and reordering the reading is
+/// not this module's to make.
+fn blocks<'a>(accepted: &[&'a ImageOcrRegion]) -> Vec<Block<'a>> {
+    let mut blocks: Vec<Block<'a>> = Vec::new();
+    for region in accepted {
+        let joinable = region.kind == RegionKind::Text;
+        match blocks.last_mut() {
+            Some(last) if joinable && last.kind == region.kind => last.regions.push(region),
+            _ => blocks.push(Block {
+                kind: region.kind,
+                regions: vec![region],
+            }),
+        }
+    }
+    blocks
+}
+
 /// The enrichment block for one image, or an empty list when the image
 /// contributed nothing to the reading.
 ///
@@ -96,16 +143,28 @@ pub fn enrichment_pieces(image: &ExtractedImage) -> Vec<Piece> {
         bbox: image.bbox.clone(),
         provenance,
     };
-    let structural_ocr = || TextProvenance::ImageOcr {
+    let structural_ocr = |kind: RegionKind| TextProvenance::ImageOcr {
         image_id: image.id.clone(),
         confidence: None,
+        kind,
     };
 
-    if !accepted.is_empty() {
-        pieces.push(whole(&format!("{OCR_LABEL} "), structural_ocr()));
-        for (index, region) in accepted.iter().enumerate() {
+    for (index, block) in blocks(&accepted).into_iter().enumerate() {
+        if index > 0 {
+            pieces.push(whole("\n", structural_ocr(block.kind)));
+        }
+        let kind = block.kind;
+        // A table and a code listing are line-structured — a Markdown table
+        // that does not start at the beginning of a line is not a Markdown
+        // table — so their label ends its own line. A phrase or an inline
+        // formula follows its label.
+        pieces.push(whole(
+            &format!("{}{}", kind.label(), if starts_a_line(kind) { "\n" } else { " " }),
+            structural_ocr(kind),
+        ));
+        for (index, region) in block.regions.iter().enumerate() {
             if index > 0 {
-                pieces.push(whole(REGION_SEPARATOR, structural_ocr()));
+                pieces.push(whole(REGION_SEPARATOR, structural_ocr(kind)));
             }
             pieces.push(Piece {
                 text: region.text.clone(),
@@ -113,20 +172,23 @@ pub fn enrichment_pieces(image: &ExtractedImage) -> Vec<Piece> {
                 provenance: TextProvenance::ImageOcr {
                     image_id: image.id.clone(),
                     confidence: Some(region.confidence),
+                    kind,
                 },
             });
         }
-        // A terminator, so the list reads as a sentence to an embedder and a
+        // A terminator, so the block reads as a sentence to an embedder and a
         // language model rather than running into whatever follows. Omitted
         // when the last region already ends in one, which is the common case
-        // for a transcribed caption.
-        let ends_closed = accepted
-            .last()
-            .and_then(|region| region.text.chars().next_back())
-            .is_some_and(|c| matches!(c, '.' | '!' | '?' | ':' | ';'));
+        // for a transcribed caption and is always the case for a table.
+        let ends_closed = starts_a_line(kind)
+            || block
+                .regions
+                .last()
+                .and_then(|region| region.text.chars().next_back())
+                .is_some_and(|c| matches!(c, '.' | '!' | '?' | ':' | ';'));
         pieces.push(whole(
             if ends_closed { "\n" } else { ".\n" },
-            structural_ocr(),
+            structural_ocr(kind),
         ));
     }
 
@@ -188,7 +250,17 @@ mod tests {
     }
 
     fn region(text: &str, confidence: f32, admission: OcrAdmission) -> ImageOcrRegion {
+        kinded(RegionKind::Text, text, confidence, admission)
+    }
+
+    fn kinded(
+        kind: RegionKind,
+        text: &str,
+        confidence: f32,
+        admission: OcrAdmission,
+    ) -> ImageOcrRegion {
         ImageOcrRegion {
+            kind,
             text: text.to_string(),
             confidence,
             polygon_within_image: Vec::new(),
@@ -252,6 +324,109 @@ mod tests {
         // The region's own polygon, not the whole image.
         assert_eq!(transcribed.bbox.x, 40.0);
         assert_eq!(transcribed.bbox.width, 50.0);
+    }
+
+    /// Every kind reaches the reading under its own label, in the order the
+    /// recognizer emitted them, and a kind that is not prose is a block of
+    /// its own rather than an item in a list.
+    #[test]
+    fn each_kind_is_written_under_its_own_label() {
+        let table = "| a | b |\n| --- | --- |\n| 1 | 2 |";
+        let pieces = enrichment_pieces(&image(
+            vec![
+                kinded(RegionKind::Text, "Figure 3", 0.9, OcrAdmission::Accepted),
+                kinded(
+                    RegionKind::Formula,
+                    "E = mc^{2}",
+                    0.9,
+                    OcrAdmission::Accepted,
+                ),
+                kinded(RegionKind::Table, table, 0.9, OcrAdmission::Accepted),
+                kinded(RegionKind::Chart, table, 0.9, OcrAdmission::Accepted),
+                kinded(RegionKind::Code, "let x = 1;", 0.9, OcrAdmission::Accepted),
+            ],
+            None,
+        ));
+        assert_eq!(
+            rendered(&pieces),
+            "Image embedded text: Figure 3.\n\
+             \n\
+             Image embedded formula: E = mc^{2}.\n\
+             \n\
+             Image embedded table:\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\
+             \n\
+             Image transcribed chart:\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\
+             \n\
+             Image embedded code:\nlet x = 1;\n"
+        );
+    }
+
+    /// A chart is Wilkes' reconstruction of what a picture depicts, not a
+    /// quotation of ruled cells, and the label is the only place a consumer
+    /// learns that. No other kind may claim the same words.
+    #[test]
+    fn a_chart_is_labelled_a_transcription_and_a_table_is_not() {
+        assert_eq!(RegionKind::Chart.label(), "Image transcribed chart:");
+        assert!(!RegionKind::Chart.label().contains("embedded"));
+        assert!(RegionKind::Table.label().contains("embedded"));
+    }
+
+    /// The mechanism behind "a fifth kind cannot appear without a label": the
+    /// match in `label` is exhaustive, so a new kind does not compile until it
+    /// has one, and no two kinds share.
+    #[test]
+    fn every_kind_has_a_distinct_label() {
+        let labels: Vec<&str> = RegionKind::ALL.iter().map(|kind| kind.label()).collect();
+        assert_eq!(labels.len(), RegionKind::ALL.len());
+        for (index, label) in labels.iter().enumerate() {
+            assert!(label.ends_with(':'), "{label}");
+            assert!(!labels[..index].contains(label), "{label} is used twice");
+        }
+    }
+
+    /// Two prose regions are one list; two formulas are two blocks. Joining
+    /// LaTeX with `; ` would produce an expression neither region contains.
+    #[test]
+    fn prose_regions_share_a_block_and_formulas_do_not() {
+        let pieces = enrichment_pieces(&image(
+            vec![
+                kinded(RegionKind::Text, "Non-expert", 0.9, OcrAdmission::Accepted),
+                kinded(RegionKind::Text, "User", 0.9, OcrAdmission::Accepted),
+                kinded(RegionKind::Formula, "a^{2}", 0.9, OcrAdmission::Accepted),
+                kinded(RegionKind::Formula, "b^{2}", 0.9, OcrAdmission::Accepted),
+            ],
+            None,
+        ));
+        assert_eq!(
+            rendered(&pieces),
+            "Image embedded text: Non-expert; User.\n\
+             \n\
+             Image embedded formula: a^{2}.\n\
+             \n\
+             Image embedded formula: b^{2}.\n"
+        );
+    }
+
+    /// Every byte of a transcription says what kind of claim it is, including
+    /// the label and the separators Wilkes wrote itself.
+    #[test]
+    fn provenance_names_the_kind_of_every_transcribed_byte() {
+        let pieces = enrichment_pieces(&image(
+            vec![kinded(
+                RegionKind::Formula,
+                "E = mc^{2}",
+                0.9,
+                OcrAdmission::Accepted,
+            )],
+            None,
+        ));
+        assert!(pieces.iter().all(|piece| matches!(
+            piece.provenance,
+            TextProvenance::ImageOcr {
+                kind: RegionKind::Formula,
+                ..
+            }
+        )));
     }
 
     /// Rejected and deduplicated regions stay out of the reading; they are

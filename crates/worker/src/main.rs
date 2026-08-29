@@ -617,17 +617,19 @@ mod tests {
         fn spot_batch(
             &self,
             images: &[image::RgbImage],
-        ) -> anyhow::Result<Vec<Vec<wilkes_core::extract::image::ocr::SpottedRegion>>> {
+        ) -> anyhow::Result<Vec<wilkes_core::extract::image::ocr::ImageRecognition>> {
             let corner = wilkes_core::types::Point { x: 0.0, y: 0.0 };
             Ok(images
                 .iter()
                 .map(|image| {
-                    vec![wilkes_core::extract::image::ocr::SpottedRegion {
-                        kind: wilkes_core::extract::image::ocr::RegionKind::Text,
-                        text: format!("{}x{}", image.width(), image.height()),
-                        confidence: 0.9,
-                        quad: [corner; 4],
-                    }]
+                    wilkes_core::extract::image::ocr::ImageRecognition::from_regions(vec![
+                        wilkes_core::extract::image::ocr::SpottedRegion {
+                            kind: wilkes_core::extract::image::ocr::RegionKind::Text,
+                            text: format!("{}x{}", image.width(), image.height()),
+                            confidence: 0.9,
+                            quad: [corner; 4],
+                        },
+                    ])
                 })
                 .collect())
         }
@@ -1017,8 +1019,8 @@ mod tests {
                 // dimensions it was handed, so these are the host's images
                 // and not a canned reply, and they are not transposed.
                 assert_eq!(batch.len(), 2);
-                assert_eq!(batch[0][0].text, "11x5");
-                assert_eq!(batch[1][0].text, "6x9");
+                assert_eq!(batch[0].regions[0].text, "11x5");
+                assert_eq!(batch[1].regions[0].text, "6x9");
             }
             other => panic!("expected Regions, got {other:?}"),
         }

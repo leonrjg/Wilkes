@@ -182,6 +182,7 @@ mod tests {
     fn annotation(text: &str, status: ImageAnalysisStatus) -> Annotation {
         Annotation {
             ocr_regions: vec![ImageOcrRegion {
+                kind: Default::default(),
                 text: text.to_string(),
                 confidence: 0.9,
                 polygon_within_image: vec![Point { x: 1.0, y: 2.0 }],

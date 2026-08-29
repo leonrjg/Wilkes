@@ -1329,3 +1329,52 @@ Nothing in the third row has been implemented. This amendment moves it out of
 the roadmap and into scope; it does not move it into the build. The first
 verification item — that the candle module drives the three prompts at all —
 gates every other item in that row and has not been run.
+
+### Status after the recognition-engine change, 2026-08-29
+
+The row above is superseded, and not by the work it described.
+[recognition-engine.md](specs/recognition-engine.md) made the recognizer an
+engine × model choice and shipped granite-docling under ONNX as the default,
+and granite-docling *self-classifies*: one decode returns DocTags in which a
+formula is a formula, a table is a table and a chart is a chart, with no router
+in front of it. So the kinds arrived through the ONNX engine rather than
+through `Formula Recognition:` and a detection graph, and everything this
+amendment specified *downstream of routing* was built for them:
+
+| | |
+| --- | --- |
+| **Completed** | `RegionKind` on `ImageOcrRegion` and on `TextProvenance::ImageOcr`; per-kind admission (text on the threshold, formulas on LaTeX validity, tables and charts on being a rectangular Markdown table of at least 2×2); one label per kind, with the exhaustive match that stops a kind reaching the reading unlabelled; the formula-and-table chunk rule; `ADMISSION_RULES_VERSION` in the analyzer identity; the per-kind and unroutable diagnostics; and the recognizer reporting what it could not route rather than dropping it. |
+| **Partial** | The polygon criterion, unchanged from 2026-08-28. |
+| **Not built** | `parsing-v1`: PaddleOCR-VL's `Formula Recognition:`, `Table Recognition:` and `Chart Recognition:` prompts, and the layout detector that routes regions to them. |
+
+Six of the eight criteria added by the amendment now hold, each pinned by a
+test:
+
+| Criterion | Held by |
+| --- | --- |
+| Every kind under its own label; no fifth kind without one | `each_kind_is_written_under_its_own_label`, `every_kind_has_a_distinct_label`, `every_recognized_kind_reaches_the_reading_under_its_own_label` |
+| An unparseable formula is rejected with a reason | `a_formula_is_admitted_on_whether_its_latex_closes`, `a_formula_that_does_not_parse_is_refused_with_its_reason` |
+| A table is Markdown or is rejected; no engine format crosses | `a_table_is_admitted_on_being_rectangular`, `a_ragged_table_converts_and_is_refused_by_admission`, `a_table_that_is_not_rectangular_is_refused_on_structure` |
+| A chart is labelled a transcription | `a_chart_is_labelled_a_transcription_and_a_table_is_not` |
+| No boundary inside a formula or table; reconstruction holds | `a_table_larger_than_a_chunk_is_not_cut_in_half`, `chunks_still_reconstruct_across_an_oversized_table`, `a_table_that_fits_is_chunked_as_it_always_was` |
+| Routing is one mechanism | `placement_carries_the_kind_and_does_not_assign_one` — the kind is the recognizer's answer, carried through placement and admission, and assigned nowhere else |
+
+The two that do not are the two that name `parsing-v1`'s parts. "The task-prompt
+set and the detector digest are both in the extraction identity" holds for its
+first half — the task configuration is in every engine's identity string, which
+is what makes `spotting-v2` and `doctags-v1` different recipes — and has no
+second half to hold: there is no detector, because the shipped engine needs
+none. And "every one of the four driven task prompts produces canonical output"
+is not a statement about this build, which drives one prompt per engine.
+
+**What `parsing-v1` still is, and why it did not land here.** It is not made
+redundant by granite-docling: it is the Candle engine's second task
+configuration, and a user who chooses PaddleOCR-VL gets `Spotting:` and prose
+only. Building it needs an ONNX detection graph pinned by repository, revision,
+file list and SHA-256 — digests that can only come from the artifact, never from
+reasoning about it — and the verification item that gates the whole of it, that
+the candle module drives the three prompts against the shipped checkpoint at
+all, needs 1.9 GB of weights and has still not been run. Writing the prompts and
+the detector against neither would be shipping an unmeasured second routing
+path, which is the thing the amendment's own reasoning rejects. It stays named
+here, unbuilt, with its gate unchanged.

@@ -4,7 +4,7 @@ use crate::generate::{
     GenerationEngine, GenerationRequest, GenerationRuntime, GenerationTimings, StopReason,
 };
 use crate::extract::image::dispatch::RecognitionEngine;
-use crate::extract::image::ocr::SpottedRegion;
+use crate::extract::image::ocr::ImageRecognition;
 use crate::extract::image::RecognitionRequest;
 use crate::models::progress::EmbedProgress;
 use crate::types::EmbeddingEngine;
@@ -201,7 +201,7 @@ pub enum WorkerEvent {
     /// admission threshold and whether the document already draws them as
     /// glyphs are all decided by the host, because they are extraction rather
     /// than inference and the host is what owns the extraction recipe.
-    Regions(Vec<Vec<SpottedRegion>>),
+    Regions(Vec<ImageRecognition>),
     /// Index build completed successfully.
     Done,
     /// Index build failed.

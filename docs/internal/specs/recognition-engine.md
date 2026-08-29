@@ -196,7 +196,7 @@ Flattening DocTags into `text` would discard exactly what the model was chosen
 for.
 
 ```rust
-pub enum RegionKind { Text, Formula, Table, Picture, Chart, Code, Caption }
+pub enum RegionKind { Text, Formula, Table, Chart, Code }
 
 pub struct SpottedRegion {
     pub kind: RegionKind,
@@ -216,7 +216,15 @@ quadrilaterals. So the honest catalogue entry is:
 |---|---|---|
 | `paddleocr-vl-1.6` | `spotting-v2` | `Text` |
 | `paddleocr-vl-1.6` | `parsing-v1` | `Text`, `Formula`, `Table`, `Chart` |
-| `granite-docling-258M` | `doctags-v1` | `Text`, `Formula`, `Table`, `Picture`, `Chart`, `Code`, `Caption` |
+| `granite-docling-258M` | `doctags-v1` | `Text`, `Formula`, `Table`, `Chart`, `Code` |
+
+Corrected 2026-08-29, from what was built: this row first read `Picture` and
+`Caption` too. A caption is prose and is read as `Text` — a separate kind for
+it would be caption *association*, which FIGURE.md defers — and a picture
+region is a region with nothing recognized in it, which the reading has no use
+for. Neither is a `RegionKind`, so neither may be advertised as one. A
+`<picture>` element is what `regions_unroutable` counts: marked out by the
+model, and named by nothing in this build.
 
 The difference is one of integration, not capability, and the table must not be
 read as "Paddle cannot do tables". `parsing-v1` is

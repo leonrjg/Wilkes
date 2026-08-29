@@ -133,6 +133,7 @@ mod tests {
 
     fn region(text: &str, x: f32, y: f32) -> ImageOcrRegion {
         ImageOcrRegion {
+            kind: Default::default(),
             text: text.to_string(),
             confidence: 0.9,
             polygon_within_image: vec![Point { x, y }],

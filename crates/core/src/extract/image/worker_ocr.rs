@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 
 use super::dispatch::{self, RecognitionEngine};
-use super::ocr::{OcrEngine, SpottedRegion};
+use super::ocr::{ImageRecognition, OcrEngine};
 use super::RecognitionRequest;
 use crate::worker::ipc::{WorkerEvent, WorkerRequest, WorkerRole};
 use crate::worker::manager::{ManagerCommand, WorkerManager};
@@ -115,7 +115,7 @@ impl OcrEngine for WorkerOcr {
     fn spot_batch(
         &self,
         images: &[image::RgbImage],
-    ) -> anyhow::Result<Vec<Vec<SpottedRegion>>> {
+    ) -> anyhow::Result<Vec<ImageRecognition>> {
         if images.is_empty() {
             return Ok(Vec::new());
         }
@@ -141,7 +141,7 @@ impl OcrEngine for WorkerOcr {
             reply: tx,
         };
 
-        let regions: Vec<Vec<SpottedRegion>> = self.tokio_handle.block_on(async move {
+        let regions: Vec<ImageRecognition> = self.tokio_handle.block_on(async move {
             self.manager
                 .send(cmd)
                 .await
@@ -205,7 +205,7 @@ pub fn read_staged_image(path: &Path) -> anyhow::Result<image::RgbImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::ocr::RegionKind;
+    use super::super::ocr::{RegionKind, SpottedRegion};
 
     /// The pixels the worker reads must be the pixels the host saw. A lossy
     /// staging would move the transcription of small type without moving the
@@ -364,7 +364,7 @@ mod tests {
             .unwrap()
             .expect("the recognizer should answer");
         assert_eq!(batch.len(), 1, "one answer per image");
-        let regions = batch.remove(0);
+        let regions = batch.remove(0).regions;
         let read = regions
             .iter()
             .map(|region| region.text.as_str())
@@ -396,7 +396,13 @@ mod tests {
                 crate::types::Point { x: 0.1, y: 0.4 },
             ],
         }];
-        let batch = vec![regions.clone(), Vec::new()];
+        let batch = vec![
+            ImageRecognition {
+                regions: regions.clone(),
+                unroutable: 2,
+            },
+            ImageRecognition::default(),
+        ];
         let wire = serde_json::to_string(&WorkerEvent::Regions(batch.clone())).unwrap();
         assert!(wire.contains("Figure 1"), "{wire}");
         match serde_json::from_str::<WorkerEvent>(&wire).unwrap() {

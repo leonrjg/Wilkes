@@ -11,61 +11,20 @@
 //! would mean two answers to "what does this document say", and the whole
 //! design rests on there being one.
 
-use crate::types::{
-    BoundingBox, ImageOcrRegion, ImageTransform, OcrAdmission, Point,
-};
+use crate::types::{BoundingBox, ImageOcrRegion, ImageTransform, OcrAdmission, Point};
 
 use super::AnalysisContext;
+
+// The kind of a region is a property of the region and crosses the API
+// boundary on both [`ImageOcrRegion`] and [`crate::types::TextProvenance`], so
+// it is declared beside them and re-exported here — this module is still where
+// a recognizer reaches for it.
+pub use crate::types::RegionKind;
 
 /// The largest location token. The recognizer emits coordinates as
 /// `<|LOC_0|>` .. `<|LOC_1000|>`, so the grid has 1001 stops and a coordinate
 /// is `n / 1000` of the way across the image it was given.
 pub const LOC_MAX: u16 = 1000;
-
-/// What a recognized region *is*, and therefore how its text is to be read.
-///
-/// A recognizer that only transcribes prose has no use for this and says
-/// `Text` for everything. One that parses a document does: a formula's text is
-/// LaTeX and a table's is a Markdown table, and a consumer that cannot tell
-/// them apart from prose will quote a table as if the document had written it
-/// in pipes.
-///
-/// The kind belongs to the region and not to the engine, because it is a
-/// property of what was read. Which kinds an engine can produce at all is a
-/// property of the engine *and its task configuration*, and is answered by the
-/// recognizer catalogue rather than inferred from here.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum RegionKind {
-    /// Prose, a heading, a caption — the reading, verbatim.
-    #[default]
-    Text,
-    /// LaTeX.
-    Formula,
-    /// A Markdown table.
-    Table,
-    /// A Markdown table reconstructed from a chart. Distinct from `Table`
-    /// because it is Wilkes' reading of a picture rather than a transcription
-    /// of ruled cells, and a consumer is entitled to know which it has.
-    Chart,
-    /// A source-code listing, verbatim.
-    Code,
-}
-
-impl RegionKind {
-    /// The label this kind is serialized under in the canonical reading.
-    pub fn label(&self) -> &'static str {
-        match self {
-            RegionKind::Text => "Image embedded text:",
-            RegionKind::Formula => "Image embedded formula:",
-            RegionKind::Table => "Image embedded table:",
-            RegionKind::Chart => "Image transcribed chart:",
-            RegionKind::Code => "Image embedded code:",
-        }
-    }
-}
 
 /// One region as the model emitted it: text, an admission signal, and a
 /// quadrilateral in fractions of the image, before any of Wilkes' geometry.
@@ -84,6 +43,31 @@ pub struct SpottedRegion {
     /// Top-left, top-right, bottom-right, bottom-left, each in `0.0..=1.0` of
     /// the image's width and height.
     pub quad: [Point; 4],
+}
+
+/// What a recognizer made of one image.
+///
+/// The regions are the answer; `unroutable` is the part of the answer Wilkes
+/// could not use. A recognizer that marks out a region of a kind this build
+/// has no name for must say so rather than drop it, because a reading missing
+/// that content and a picture that never held any read identically otherwise
+/// — which is the same reason every rejected region is kept.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ImageRecognition {
+    pub regions: Vec<SpottedRegion>,
+    /// Regions the recognizer delimited and this build has no [`RegionKind`]
+    /// for. Reported, counted, and not guessed at.
+    #[serde(default)]
+    pub unroutable: u32,
+}
+
+impl ImageRecognition {
+    pub fn from_regions(regions: Vec<SpottedRegion>) -> Self {
+        Self {
+            regions,
+            unroutable: 0,
+        }
+    }
 }
 
 /// One decoded token of a spotting response.
@@ -127,7 +111,7 @@ pub trait OcrEngine: Send + Sync {
     fn spot_batch(
         &self,
         images: &[image::RgbImage],
-    ) -> anyhow::Result<Vec<Vec<SpottedRegion>>>;
+    ) -> anyhow::Result<Vec<ImageRecognition>>;
 }
 
 /// Parse a spotting response into regions.
@@ -249,6 +233,231 @@ pub fn normalize_recognized_text(text: &str) -> String {
 /// avoid.
 pub const MAPPING_VERSION: &str = "image-mapping-v1";
 
+/// Bumped when a kind's admission rule changes: the threshold comparison, what
+/// counts as parseable LaTeX, or what shape a table has to have.
+///
+/// In the analyzer identity for the same reason the threshold is in the
+/// engine's: the rules decide which recognized bytes reach the reading, so two
+/// readings produced under different rules are different readings even when
+/// the same model read the same picture.
+pub const ADMISSION_RULES_VERSION: &str = "image-admission-v1";
+
+/// Whether a formula's LaTeX parses.
+///
+/// Structural, not semantic: this says the expression is *closed* — every
+/// group, environment and `\left` has its partner, and it does not stop in the
+/// middle of a command. That is the failure a truncating decoder produces, and
+/// it is the one confidence cannot see. Judging whether the mathematics is the
+/// mathematics the figure draws is not something a parser can do, and nothing
+/// here pretends otherwise.
+///
+/// Character-aware throughout: LaTeX carries arbitrary Unicode in its text
+/// arguments and there is no byte offset here safe to assume lands on a
+/// character boundary.
+pub fn latex_parses(latex: &str) -> bool {
+    let text = latex.trim();
+    if text.is_empty() {
+        return false;
+    }
+
+    let mut braces = 0i32;
+    let mut brackets = 0i32;
+    let mut left_right = 0i32;
+    let mut environments: Vec<String> = Vec::new();
+    let mut dollars = 0u32;
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            // An escape covers exactly the next character, so `\{` and `\$`
+            // are literals and never delimiters.
+            '\\' => {
+                let Some(command) = read_command(&chars, i) else {
+                    // A trailing backslash with nothing after it: the decode
+                    // stopped inside a command.
+                    return false;
+                };
+                match command.name.as_str() {
+                    "left" => left_right += 1,
+                    "right" => left_right -= 1,
+                    "begin" | "end" => {
+                        let Some(name) = read_group(&chars, command.end) else {
+                            return false;
+                        };
+                        if command.name == "begin" {
+                            environments.push(name.text);
+                        } else if environments.pop().as_deref() != Some(name.text.as_str()) {
+                            return false;
+                        }
+                        i = name.end;
+                        continue;
+                    }
+                    _ => {}
+                }
+                if left_right < 0 {
+                    return false;
+                }
+                i = command.end;
+                continue;
+            }
+            '{' => braces += 1,
+            '}' => {
+                braces -= 1;
+                if braces < 0 {
+                    return false;
+                }
+            }
+            '[' => brackets += 1,
+            ']' => {
+                brackets -= 1;
+                if brackets < 0 {
+                    return false;
+                }
+            }
+            '$' => dollars += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    braces == 0 && brackets == 0 && left_right == 0 && environments.is_empty() && dollars.is_multiple_of(2)
+}
+
+struct Command {
+    name: String,
+    /// Index of the first character after the command.
+    end: usize,
+}
+
+/// Read `\name` — or `\<single character>` for the escapes that are not
+/// alphabetic — starting at the backslash.
+fn read_command(chars: &[char], at: usize) -> Option<Command> {
+    let mut end = at + 1;
+    if end >= chars.len() {
+        return None;
+    }
+    if !chars[end].is_alphabetic() {
+        return Some(Command {
+            name: chars[end].to_string(),
+            end: end + 1,
+        });
+    }
+    let start = end;
+    while end < chars.len() && chars[end].is_alphabetic() {
+        end += 1;
+    }
+    Some(Command {
+        name: chars[start..end].iter().collect(),
+        end,
+    })
+}
+
+struct Group {
+    text: String,
+    /// Index of the first character after the closing brace.
+    end: usize,
+}
+
+/// Read `{...}` at `at`, skipping the spaces LaTeX allows before it.
+fn read_group(chars: &[char], at: usize) -> Option<Group> {
+    let mut start = at;
+    while start < chars.len() && chars[start] == ' ' {
+        start += 1;
+    }
+    if start >= chars.len() || chars[start] != '{' {
+        return None;
+    }
+    let mut end = start + 1;
+    while end < chars.len() && chars[end] != '}' {
+        end += 1;
+    }
+    if end >= chars.len() {
+        return None;
+    }
+    Some(Group {
+        text: chars[start + 1..end].iter().collect(),
+        end: end + 1,
+    })
+}
+
+/// Whether a transcription is a well-formed Markdown table: a header row, its
+/// delimiter, at least one body row, and every row the same width of at least
+/// two columns.
+///
+/// This is the admission rule for both `Table` and `Chart`, and it lives here
+/// rather than inside a recognizer's parser so that one rule decides it for
+/// every engine. A parser that quietly returned nothing for a ragged table
+/// would be a second admission mechanism, and a rejection nobody counted.
+pub fn markdown_table_is_rectangular(table: &str) -> bool {
+    let rows: Vec<Vec<&str>> = table
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.trim_start_matches('|')
+                .trim_end_matches('|')
+                .split('|')
+                .map(str::trim)
+                .collect()
+        })
+        .collect();
+    // Header, delimiter, and a body row.
+    if rows.len() < 3 {
+        return false;
+    }
+    let width = rows[0].len();
+    if width < 2 || rows.iter().any(|row| row.len() != width) {
+        return false;
+    }
+    rows[1]
+        .iter()
+        .all(|cell| !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':'))
+}
+
+/// Whether one region enters the reading, and why not when it does not.
+///
+/// Each kind is admitted by what makes *that* kind wrong. Confidence-
+/// thresholding is a text rule and does not transfer: a formula is admitted on
+/// validity and a table on structure, because a decoder that truncates them
+/// scores its own truncation highly. The native-glyph check comes first for
+/// every kind — the document's own glyphs are the better evidence whatever the
+/// recognizer called this region.
+fn admit(
+    kind: RegionKind,
+    text: &str,
+    confidence: f32,
+    threshold: f32,
+    drawn_natively: bool,
+) -> OcrAdmission {
+    if drawn_natively {
+        return OcrAdmission::DeduplicatedAgainstNativeText;
+    }
+    match kind {
+        RegionKind::Text | RegionKind::Code => {
+            if confidence < threshold {
+                OcrAdmission::RejectedLowConfidence
+            } else {
+                OcrAdmission::Accepted
+            }
+        }
+        RegionKind::Formula => {
+            if latex_parses(text) {
+                OcrAdmission::Accepted
+            } else {
+                OcrAdmission::RejectedInvalidLatex
+            }
+        }
+        RegionKind::Table | RegionKind::Chart => {
+            if markdown_table_is_rectangular(text) {
+                OcrAdmission::Accepted
+            } else {
+                OcrAdmission::RejectedMalformedTable
+            }
+        }
+    }
+}
+
 /// Place each spotted region on the page, and decide whether it enters the
 /// reading.
 ///
@@ -285,14 +494,21 @@ pub fn place_and_admit(
                 })
                 .collect();
             let comparable = normalize_for_comparison(&region.text);
-            let admission = if !comparable.is_empty() && native.contains(comparable.as_str()) {
-                OcrAdmission::DeduplicatedAgainstNativeText
-            } else if region.confidence < threshold {
-                OcrAdmission::RejectedLowConfidence
-            } else {
-                OcrAdmission::Accepted
-            };
+            let drawn_natively =
+                !comparable.is_empty() && native.contains(comparable.as_str());
+            let admission = admit(
+                region.kind,
+                &region.text,
+                region.confidence,
+                threshold,
+                drawn_natively,
+            );
             ImageOcrRegion {
+                // Carried, never decided here. What a region contains is the
+                // recognizer's answer; this function places it on the page and
+                // says whether it may enter the reading, and a kind assigned
+                // downstream would be a second router.
+                kind: region.kind,
                 text: region.text,
                 confidence: region.confidence,
                 polygon_within_image,
@@ -434,6 +650,170 @@ mod tests {
         assert_eq!(
             normalize_recognized_text("  50 %\tof\n Größe — Ω  "),
             "50 % of Größe — Ω"
+        );
+    }
+
+    /// A truncating decoder is perfectly confident about every token it did
+    /// emit, so confidence cannot see the failure that matters for a formula.
+    /// Validity can.
+    #[test]
+    fn a_formula_is_admitted_on_whether_its_latex_closes() {
+        assert!(latex_parses("S(q,d) = \\Sigma_{i} w_{i}"));
+        assert!(latex_parses("\\left( \\frac{a}{b} \\right)^{2}"));
+        assert!(latex_parses("\\begin{matrix} a & b \\\\ c & d \\end{matrix}"));
+        assert!(latex_parses("x \\{ y \\}"), "an escaped brace is a literal");
+
+        assert!(!latex_parses(""));
+        assert!(!latex_parses("   "));
+        assert!(!latex_parses("\\frac{a}{b"), "a group left open");
+        assert!(!latex_parses("a}"), "a group closed that never opened");
+        assert!(!latex_parses("\\left( a"), "a \\left with no \\right");
+        assert!(!latex_parses("a \\right)"), "a \\right with no \\left");
+        assert!(
+            !latex_parses("\\begin{matrix} a"),
+            "an environment left open"
+        );
+        assert!(
+            !latex_parses("\\begin{matrix} a \\end{pmatrix}"),
+            "an environment closed as another"
+        );
+        assert!(!latex_parses("a + b \\"), "a decode that stopped in a command");
+        assert!(!latex_parses("$x = 1"), "an unclosed inline segment");
+    }
+
+    /// LaTeX carries arbitrary Unicode in its text arguments, and nothing here
+    /// may assume a byte offset lands on a character boundary.
+    #[test]
+    fn latex_validity_is_character_safe() {
+        assert!(latex_parses("\\text{Größe} = 日本語^{2}"));
+        assert!(!latex_parses("\\text{Größe"));
+    }
+
+    /// A ragged table is a failed recognition wearing the shape of a result,
+    /// so structure — not confidence — is what admits one.
+    #[test]
+    fn a_table_is_admitted_on_being_rectangular() {
+        assert!(markdown_table_is_rectangular(
+            "| Corpus | Recall |\n| --- | --- |\n| Reports | 0.91 |"
+        ));
+        assert!(markdown_table_is_rectangular(
+            "| a | b |\n| :-- | --: |\n| 1 | 2 |\n| 3 | 4 |"
+        ));
+
+        assert!(
+            !markdown_table_is_rectangular("| a | b |\n| --- | --- |"),
+            "a header and a rule are not yet a table"
+        );
+        assert!(
+            !markdown_table_is_rectangular("| a |\n| --- |\n| 1 |"),
+            "one column is not a table"
+        );
+        assert!(
+            !markdown_table_is_rectangular("| a | b |\n| --- | --- |\n| 1 |"),
+            "a short row makes it ragged"
+        );
+        assert!(
+            !markdown_table_is_rectangular("| a | b |\n| x | y |\n| 1 | 2 |"),
+            "the delimiter row is part of being a Markdown table"
+        );
+        assert!(!markdown_table_is_rectangular(""));
+    }
+
+    /// Each kind is admitted by what makes *that* kind wrong. A formula and a
+    /// table both score highly and are both refused when they are broken; a
+    /// paragraph is refused only by the threshold.
+    #[test]
+    fn each_kind_is_admitted_by_its_own_rule() {
+        let table = "| a | b |\n| --- | --- |\n| 1 | 2 |";
+        assert_eq!(
+            admit(RegionKind::Text, "Knowledge base", 0.9, 0.7, false),
+            OcrAdmission::Accepted
+        );
+        assert_eq!(
+            admit(RegionKind::Text, "blurred", 0.4, 0.7, false),
+            OcrAdmission::RejectedLowConfidence
+        );
+        assert_eq!(
+            admit(RegionKind::Formula, "E = mc^{2}", 0.1, 0.7, false),
+            OcrAdmission::Accepted,
+            "a valid formula is not thresholded on confidence"
+        );
+        assert_eq!(
+            admit(RegionKind::Formula, "\\frac{a}{b", 0.99, 0.7, false),
+            OcrAdmission::RejectedInvalidLatex,
+            "a confident truncation is still a truncation"
+        );
+        assert_eq!(
+            admit(RegionKind::Table, table, 0.1, 0.7, false),
+            OcrAdmission::Accepted
+        );
+        assert_eq!(
+            admit(RegionKind::Table, "| a |\n| --- |\n| 1 |", 0.99, 0.7, false),
+            OcrAdmission::RejectedMalformedTable
+        );
+        assert_eq!(
+            admit(RegionKind::Chart, table, 0.99, 0.7, false),
+            OcrAdmission::Accepted,
+            "a chart is admitted as a table, by the same rule"
+        );
+        assert_eq!(
+            admit(RegionKind::Chart, "roughly rising", 0.99, 0.7, false),
+            OcrAdmission::RejectedMalformedTable
+        );
+    }
+
+    /// The document's own glyphs are the better evidence whatever the
+    /// recognizer called the region, so the native check comes first for every
+    /// kind.
+    #[test]
+    fn native_glyphs_outrank_every_kinds_rule() {
+        for kind in RegionKind::ALL {
+            assert_eq!(
+                admit(kind, "E = mc^{2}", 0.99, 0.7, true),
+                OcrAdmission::DeduplicatedAgainstNativeText,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// Placement carries the recognizer's answer about what a region is; it
+    /// never forms one of its own. A kind decided here would be a second
+    /// router, and the design has exactly one.
+    #[test]
+    fn placement_carries_the_kind_and_does_not_assign_one() {
+        let spotted = vec![SpottedRegion {
+            kind: RegionKind::Formula,
+            text: "E = mc^{2}".to_string(),
+            confidence: 0.2,
+            quad: [Point { x: 0.0, y: 0.0 }; 4],
+        }];
+        let placed = place_and_admit(
+            spotted,
+            &ImageTransform {
+                a: 10.0,
+                b: 0.0,
+                c: 0.0,
+                d: 10.0,
+                e: 0.0,
+                f: 0.0,
+            },
+            &BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            100,
+            100,
+            1,
+            &AnalysisContext::default(),
+            0.7,
+        );
+        assert_eq!(placed[0].kind, RegionKind::Formula);
+        assert_eq!(
+            placed[0].admission,
+            OcrAdmission::Accepted,
+            "the formula rule ran, not the threshold"
         );
     }
 

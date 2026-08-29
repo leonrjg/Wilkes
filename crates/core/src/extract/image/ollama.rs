@@ -199,6 +199,7 @@ mod tests {
 
     fn transcription() -> Vec<ImageOcrRegion> {
         vec![ImageOcrRegion {
+            kind: Default::default(),
             text: "Knowledge base".to_string(),
             confidence: 0.9,
             polygon_within_image: vec![Point { x: 2.0, y: 1.0 }],

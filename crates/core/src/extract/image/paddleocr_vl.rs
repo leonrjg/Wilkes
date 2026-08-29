@@ -28,7 +28,8 @@ use crate::models::hf_hub::HfProgressReporter;
 use crate::models::progress::ProgressTx;
 
 use super::ocr::{
-    parse_spotting, OcrEngine, SpottedRegion, SpottingDecoder, SpottingToken, LOC_MAX,
+    parse_spotting, ImageRecognition, OcrEngine, SpottedRegion, SpottingDecoder,
+    SpottingToken, LOC_MAX,
 };
 
 // ── The pinned recipe ────────────────────────────────────────────────────────
@@ -748,7 +749,7 @@ impl OcrEngine for PaddleOcrVl {
     fn spot_batch(
         &self,
         images: &[image::RgbImage],
-    ) -> anyhow::Result<Vec<Vec<SpottedRegion>>> {
+    ) -> anyhow::Result<Vec<ImageRecognition>> {
         let mut all = Vec::with_capacity(images.len());
         for (index, image) in images.iter().enumerate() {
             let started = std::time::Instant::now();
@@ -767,7 +768,7 @@ impl OcrEngine for PaddleOcrVl {
                 regions.len(),
                 started.elapsed().as_secs_f32()
             );
-            all.push(regions);
+            all.push(ImageRecognition::from_regions(regions));
         }
         Ok(all)
     }

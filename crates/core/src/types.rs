@@ -381,6 +381,16 @@ pub enum TextProvenance {
         /// and inventing a confidence for them would be the one kind of lie
         /// this enum exists to prevent.
         confidence: Option<f32>,
+        /// What was recognized here, and therefore how these bytes are to be
+        /// read. A formula and a paragraph are both recognized content and
+        /// are not the same claim about the document, so provenance names the
+        /// kind rather than leaving a consumer to infer it from the label
+        /// standing in front of it.
+        ///
+        /// Defaulted on read: a source map written before recognizers
+        /// distinguished kinds transcribed prose and says so.
+        #[serde(default)]
+        kind: RegionKind,
     },
     ImageDescription {
         image_id: String,
@@ -524,6 +534,52 @@ pub struct ExtractionDiagnostics {
     pub ocr_regions_rejected_low_confidence: u32,
     #[serde(default)]
     pub ocr_regions_deduplicated_against_native_text: u32,
+
+    // ── What was recognized, by kind ─────────────────────────────────────
+    //
+    // A recognizer that parses a document answers a second question beside
+    // "how much text": *what kind* of content it found. Counted separately
+    // from admission because they fail differently — a table Wilkes never
+    // recognized and a table it recognized and rejected as ragged read
+    // identically in a reading that contains neither.
+    /// Regions by the kind they were read as. Sums to the regions the
+    /// recognizer returned.
+    #[serde(default)]
+    pub regions_routed_text: u32,
+    #[serde(default)]
+    pub regions_routed_formula: u32,
+    #[serde(default)]
+    pub regions_routed_table: u32,
+    #[serde(default)]
+    pub regions_routed_chart: u32,
+    #[serde(default)]
+    pub regions_routed_code: u32,
+    /// Content the recognizer marked out and Wilkes has no kind for, so it
+    /// reached no admission rule and no label. Never silently dropped: a
+    /// region nobody can name is a fact about the coverage of this build's
+    /// kinds, and the count is where it is answerable.
+    #[serde(default)]
+    pub regions_unroutable: u32,
+
+    // ── Per-kind admission ───────────────────────────────────────────────
+    //
+    // Each kind is admitted by what makes *that* kind wrong, so each is
+    // counted by what rejected it. A low-confidence paragraph, an
+    // unparseable formula and a ragged table are three different failures
+    // and one number would hide all three.
+    #[serde(default)]
+    pub formulas_accepted: u32,
+    #[serde(default)]
+    pub formulas_rejected_invalid_latex: u32,
+    #[serde(default)]
+    pub tables_accepted: u32,
+    #[serde(default)]
+    pub tables_rejected_malformed: u32,
+    #[serde(default)]
+    pub charts_accepted: u32,
+    #[serde(default)]
+    pub charts_rejected_malformed: u32,
+
     #[serde(default)]
     pub images_description_succeeded: u32,
     #[serde(default)]
@@ -670,9 +726,94 @@ impl ImageTransform {
     }
 }
 
+/// What a recognized region *is*, and therefore how its text is to be read.
+///
+/// A recognizer that only transcribes prose has no use for this and says
+/// `Text` for everything. One that parses a document does: a formula's text is
+/// LaTeX and a table's is a Markdown table, and a consumer that cannot tell
+/// them apart from prose will quote a table as if the document had written it
+/// in pipes.
+///
+/// The kind belongs to the region and not to the engine, because it is a
+/// property of what was read. Which kinds an engine can produce at all is a
+/// property of the engine *and its task configuration*, and is answered by the
+/// recognizer catalogue rather than inferred from here.
+///
+/// It lives here, beside [`ImageOcrRegion`] and [`TextProvenance`], because
+/// both carry it across the API boundary — the same reason
+/// [`RecognizerInventory`] is here rather than inside the model module that
+/// first needed it.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionKind {
+    /// Prose, a heading, a caption — the reading, verbatim.
+    #[default]
+    Text,
+    /// LaTeX.
+    Formula,
+    /// A Markdown table.
+    Table,
+    /// A Markdown table reconstructed from a chart. Distinct from `Table`
+    /// because it is Wilkes' reading of a picture rather than a transcription
+    /// of ruled cells, and a consumer is entitled to know which it has.
+    Chart,
+    /// A source-code listing, verbatim.
+    Code,
+}
+
+impl RegionKind {
+    /// Every kind, so a consumer that must handle all of them can be checked
+    /// against the list rather than against its own memory of it.
+    pub const ALL: [RegionKind; 5] = [
+        RegionKind::Text,
+        RegionKind::Formula,
+        RegionKind::Table,
+        RegionKind::Chart,
+        RegionKind::Code,
+    ];
+
+    /// The label this kind is serialized under in the canonical reading.
+    ///
+    /// Every kind has one, and the exhaustive match is the mechanism: a kind
+    /// added without a label does not compile, so a reader cannot meet
+    /// recognized content that does not say what it is.
+    ///
+    /// `Image transcribed chart:` deliberately does not say *embedded*. The
+    /// other labels name content that is present in the image and was read; a
+    /// chart rendered as rows is Wilkes' reconstruction of what the picture
+    /// depicts, and the label is the only place a consumer learns that.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            RegionKind::Text => "Image embedded text:",
+            RegionKind::Formula => "Image embedded formula:",
+            RegionKind::Table => "Image embedded table:",
+            RegionKind::Chart => "Image transcribed chart:",
+            RegionKind::Code => "Image embedded code:",
+        }
+    }
+
+    /// Whether these bytes are indivisible in the reading.
+    ///
+    /// Half a LaTeX expression is not a shorter expression, it is an invalid
+    /// one, and half a Markdown table is not a smaller table. Prose survives
+    /// being cut; these do not, so a chunk boundary may not fall inside them.
+    pub const fn is_indivisible(&self) -> bool {
+        match self {
+            RegionKind::Formula | RegionKind::Table | RegionKind::Chart => true,
+            RegionKind::Text | RegionKind::Code => false,
+        }
+    }
+}
+
 /// One region of text the recognizer spotted inside a native image.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImageOcrRegion {
+    /// What `text` is. Defaulted so an annotation cached before recognizers
+    /// distinguished kinds still reads as the prose it was.
+    #[serde(default)]
+    pub kind: RegionKind,
     pub text: String,
     /// Admission signal derived from token log-probabilities. Explicitly
     /// uncalibrated: it orders regions of one image by how confidently the
@@ -700,6 +841,18 @@ pub enum OcrAdmission {
     /// The page draws this text natively over the image; the document's own
     /// glyphs already carry it and are the better evidence.
     DeduplicatedAgainstNativeText,
+    /// A formula whose LaTeX does not parse.
+    ///
+    /// Confidence is the wrong question for a formula: an autoregressive
+    /// decoder that truncates mid-expression is perfectly confident about
+    /// every token it did emit, and the result is invalid LaTeX at a high
+    /// score. A formula that does not parse is a rejected region with a
+    /// recorded reason, never a string inserted and hoped over.
+    RejectedInvalidLatex,
+    /// A table or chart whose transcription is not a rectangular table of at
+    /// least two rows and two columns. A ragged table is a failed recognition
+    /// wearing the shape of a result.
+    RejectedMalformedTable,
 }
 
 /// A semantic description of what an image shows, generated rather than read.

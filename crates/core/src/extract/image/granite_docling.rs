@@ -43,7 +43,9 @@ use image::imageops::FilterType;
 use image::RgbImage;
 use tokenizers::Tokenizer;
 
-use super::ocr::{normalize_recognized_text, OcrEngine, RegionKind, SpottedRegion};
+use super::ocr::{
+    normalize_recognized_text, ImageRecognition, OcrEngine, RegionKind, SpottedRegion,
+};
 use super::onnx_vlm::{splice_image_features, OnnxVlm};
 use crate::types::Point;
 
@@ -375,8 +377,9 @@ fn kind_of(tag: &str) -> Option<RegionKind> {
 /// An element whose location is absent or is not four values is **dropped**,
 /// never placed at a guessed position. Half a rectangle is not a location, and
 /// the reading would carry text pointing at the wrong part of the page.
-fn parse_doctags(stream: &str) -> Vec<Element> {
+fn parse_doctags(stream: &str) -> (Vec<Element>, u32) {
     let mut elements = Vec::new();
+    let mut unroutable = 0u32;
     let bytes: Vec<char> = stream.chars().collect();
     let mut i = 0usize;
 
@@ -388,6 +391,21 @@ fn parse_doctags(stream: &str) -> Vec<Element> {
         let Some(open_end) = find(&bytes, i, '>') else { break };
         let tag: String = bytes[i + 1..open_end].iter().collect();
         let Some(kind) = kind_of(&tag) else {
+            // A tag this build has no kind for. Counted when it delimits
+            // content — a located, closed element — and passed over when it
+            // is structure, which is what `<doctag>` and the cell markers
+            // inside a table are. A location is what tells them apart: DocTags
+            // gives every content element one and gives structure none.
+            if let Some(close_at) = find_str(&bytes, open_end + 1, &format!("</{tag}>")) {
+                let body: String = bytes[open_end + 1..close_at].iter().collect();
+                if split_location(&body).0.is_some() {
+                    tracing::warn!(
+                        "{MODEL_ID} marked out a <{tag}> region this build has no kind \
+                         for; it is counted and left out of the reading"
+                    );
+                    unroutable += 1;
+                }
+            }
             i = open_end + 1;
             continue;
         };
@@ -399,7 +417,11 @@ fn parse_doctags(stream: &str) -> Vec<Element> {
         };
         let body: String = bytes[open_end + 1..close_at].iter().collect();
         let (location, text) = split_location(&body);
-        let text = if kind == RegionKind::Table {
+        // A chart's contents arrive as cells, the same as a table's, and the
+        // canonical form for both is a Markdown table. Whether the result is
+        // *rectangular enough to be one* is the admission rule's question,
+        // not this parser's.
+        let text = if matches!(kind, RegionKind::Table | RegionKind::Chart) {
             otsl_to_markdown(&text)
         } else {
             normalize_recognized_text(&strip_tags(&text))
@@ -414,7 +436,7 @@ fn parse_doctags(stream: &str) -> Vec<Element> {
         }
         i = close_at + close.chars().count();
     }
-    elements
+    (elements, unroutable)
 }
 
 fn find(haystack: &[char], from: usize, needle: char) -> Option<usize> {
@@ -470,9 +492,11 @@ fn strip_tags(text: &str) -> String {
 /// consumers rather than for the model: OTSL is compact and neither an
 /// embedder nor a reader can do anything with it.
 ///
-/// A table that does not come out rectangular with at least two rows and two
-/// columns is rejected by returning nothing — a ragged table is a failed
-/// recognition wearing the shape of a result.
+/// The cells are converted as they were found; whether what comes out is a
+/// well-formed table is decided once, by the admission rule in
+/// [`super::ocr::markdown_table_is_rectangular`], so a ragged table is a
+/// counted rejection rather than a silent nothing. This function's only claim
+/// is that the engine's own format does not cross the extraction boundary.
 fn otsl_to_markdown(body: &str) -> String {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut row: Vec<String> = Vec::new();
@@ -533,8 +557,8 @@ fn otsl_to_markdown(body: &str) -> String {
         rows.push(row);
     }
 
-    let width = rows.first().map_or(0, |r| r.len());
-    if rows.len() < 2 || width < 2 || rows.iter().any(|r| r.len() != width) {
+    let width = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if rows.is_empty() || width == 0 {
         return String::new();
     }
 
@@ -588,7 +612,7 @@ impl GraniteDocling {
     }
 
     /// Read one image into elements.
-    fn read(&self, image: &RgbImage) -> Result<Vec<SpottedRegion>> {
+    fn read(&self, image: &RgbImage) -> Result<ImageRecognition> {
         let (pixels, tiles, rows, cols) = prepare_tiles(image);
         let prompt = prompt_text(rows, cols);
         let encoded = self
@@ -651,10 +675,14 @@ impl GraniteDocling {
             .map_err(|e| anyhow::anyhow!("could not decode the response: {e}"))?;
         let char_ends = token_char_ends(&self.tokenizer, &ids)?;
 
-        Ok(parse_doctags(&stream)
-            .into_iter()
-            .filter_map(|element| to_region(element, &char_ends, &logprobs))
-            .collect())
+        let (elements, unroutable) = parse_doctags(&stream);
+        Ok(ImageRecognition {
+            regions: elements
+                .into_iter()
+                .filter_map(|element| to_region(element, &char_ends, &logprobs))
+                .collect(),
+            unroutable,
+        })
     }
 }
 
@@ -721,7 +749,7 @@ impl OcrEngine for GraniteDocling {
         ADMISSION_THRESHOLD
     }
 
-    fn spot_batch(&self, images: &[RgbImage]) -> Result<Vec<Vec<SpottedRegion>>> {
+    fn spot_batch(&self, images: &[RgbImage]) -> Result<Vec<ImageRecognition>> {
         let mut out = Vec::with_capacity(images.len());
         for (nth, image) in images.iter().enumerate() {
             tracing::info!(
@@ -800,8 +828,9 @@ Expert Systems in Practice</section_header_level_1>\
 <formula><loc_95><loc_158><loc_268><loc_183>S ( q , d ) = \\Sigma w</formula>\
 <otsl><loc_39><loc_218><loc_440><loc_287><ched>Corpus<ched>Recall<nl>\
 <fcel>Reports<fcel>0.91<nl><fcel>Manuals<fcel>0.87<nl></otsl></doctag>";
-        let elements = parse_doctags(stream);
+        let (elements, unroutable) = parse_doctags(stream);
         assert_eq!(elements.len(), 4, "{elements:#?}");
+        assert_eq!(unroutable, 0);
 
         assert_eq!(elements[0].kind, RegionKind::Text);
         assert_eq!(elements[0].text, "Expert Systems in Practice");
@@ -818,21 +847,58 @@ Expert Systems in Practice</section_header_level_1>\
         );
     }
 
+    /// The conversion squares nothing off, and the rule that a ragged table
+    /// is not a table lives in admission, where the rejection is counted.
+    /// Converting and admitting are two jobs and one of them is not this
+    /// module's.
     #[test]
-    fn a_ragged_table_is_rejected_rather_than_squared_off() {
-        let ragged = "<ched>A<ched>B<nl><fcel>1<nl>";
-        assert_eq!(otsl_to_markdown(ragged), "");
+    fn a_ragged_table_converts_and_is_refused_by_admission() {
+        let ragged = otsl_to_markdown("<ched>A<ched>B<nl><fcel>1<nl>");
+        assert!(!ragged.is_empty(), "the cells are still converted");
+        assert!(!crate::extract::image::ocr::markdown_table_is_rectangular(&ragged));
     }
 
     #[test]
     fn a_table_with_one_column_is_not_a_table() {
-        assert_eq!(otsl_to_markdown("<ched>A<nl><fcel>1<nl>"), "");
+        let single = otsl_to_markdown("<ched>A<nl><fcel>1<nl>");
+        assert!(!crate::extract::image::ocr::markdown_table_is_rectangular(&single));
+    }
+
+    /// A chart's cells are the same cells, and reach the reading as the same
+    /// Markdown. The engine's own format never crosses the boundary.
+    #[test]
+    fn a_chart_is_converted_to_a_markdown_table() {
+        let stream = "<chart><loc_10><loc_10><loc_90><loc_90><ched>Year<ched>Share<nl>\
+<fcel>2024<fcel>0.4<nl><fcel>2025<fcel>0.6<nl></chart>";
+        let (elements, _) = parse_doctags(stream);
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].kind, RegionKind::Chart);
+        assert_eq!(
+            elements[0].text,
+            "| Year | Share |\n| --- | --- |\n| 2024 | 0.4 |\n| 2025 | 0.6 |"
+        );
+        assert!(crate::extract::image::ocr::markdown_table_is_rectangular(
+            &elements[0].text
+        ));
+    }
+
+    /// A located, closed element whose tag this build has no kind for is
+    /// counted rather than passed over, and structure — which carries no
+    /// location — is not counted as content.
+    #[test]
+    fn a_region_of_an_unknown_kind_is_counted_rather_than_dropped() {
+        let stream = "<doctag><text><loc_1><loc_2><loc_3><loc_4>read</text>\
+<checkbox_selected><loc_5><loc_6><loc_7><loc_8>x</checkbox_selected></doctag>";
+        let (elements, unroutable) = parse_doctags(stream);
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].text, "read");
+        assert_eq!(unroutable, 1);
     }
 
     #[test]
     fn an_unterminated_element_is_dropped_with_what_follows_it() {
         let truncated = "<text><loc_1><loc_2><loc_3><loc_4>kept</text><text><loc_5>cut off";
-        let elements = parse_doctags(truncated);
+        let (elements, _) = parse_doctags(truncated);
         assert_eq!(elements.len(), 1);
         assert_eq!(elements[0].text, "kept");
     }
@@ -889,7 +955,8 @@ Expert Systems in Practice</section_header_level_1>\
         let regions = engine
             .spot_batch(std::slice::from_ref(&image))
             .expect("the page is read")
-            .remove(0);
+            .remove(0)
+            .regions;
         eprintln!("read {} regions in {:?}", regions.len(), started.elapsed());
         for region in &regions {
             eprintln!(
