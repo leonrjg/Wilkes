@@ -619,18 +619,26 @@ pub struct ExtractionDiagnostics {
     // differently and fail differently: an embedded figure that reads as
     // nothing leaves the reading as it was, and a typeset region that reads
     // as nothing leaves the page's own glyph run in place of it.
-    /// Areas the typography marked out as a formula or a ruled table.
+    /// Pages the typography gate sent to the recognizer.
+    ///
+    /// A page and not a region: what is marked out on it is the recognizer's
+    /// answer, from the coordinates it returns, and the gate decides only
+    /// whether to look.
+    #[serde(default)]
+    pub typeset_pages_read: u32,
+    /// Formulas, tables and charts the recognizer found on those pages.
     #[serde(default)]
     pub typeset_regions_found: u32,
-    /// Regions past the per-document budget, discovered and not rendered.
+    /// Pages past the per-document budget, gated in and not rendered.
     /// Never silently dropped: a bounded run that reports nothing dropped
     /// reads identically to a document that had no more to find.
     #[serde(default)]
     pub typeset_regions_over_budget: u32,
-    /// Regions whose reading was admitted, and which therefore stand in the
-    /// canonical reading in place of the glyphs the page drew there. The
-    /// difference from `typeset_regions_found` is the regions where the page's
-    /// own glyphs were kept because the recognizer's answer was refused.
+    /// Regions whose reading was admitted *and* which covered native glyphs to
+    /// stand in place of. The difference from `typeset_regions_found` is the
+    /// regions refused by admission, plus any the recognizer placed where the
+    /// page draws no text of its own — which have nothing to supersede and so
+    /// are not written into the reading.
     #[serde(default)]
     pub typeset_regions_superseded_native_text: u32,
 
