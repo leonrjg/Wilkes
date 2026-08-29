@@ -51,6 +51,7 @@ reqwest = { version = "0.12", features = ["json", "blocking"] }
 urlencoding = "2"
 url = "2"
 base64 = "0.22"
+tempfile = "3.10"
 uuid = { version = "1", features = ["v4"] }
 
 [dependencies.ort]

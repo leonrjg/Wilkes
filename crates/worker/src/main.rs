@@ -349,12 +349,12 @@ async fn handle_worker_request(
     Ok(())
 }
 
-/// Recognize the text drawn in one image.
+/// Recognize the text drawn in a document's images.
 ///
-/// One image per request, because that is the unit the host analyzes and the
-/// unit it caches. Batching them would mean holding a document's artwork in
-/// two processes to save a round trip that is already dwarfed by the
-/// recognition it carries.
+/// A whole document per request, so the host waits in one place instead of
+/// looping over per-image requests it could not be interrupted between. The
+/// images arrive as paths the host staged and owns; this process only reads
+/// them.
 async fn handle_recognize_plan(
     req: WorkerRequest,
     active_model: &mut Option<LoadedModel>,
@@ -364,13 +364,19 @@ async fn handle_recognize_plan(
     let Some(payload) = req.recognize.clone() else {
         let _ = event_tx
             .send(WorkerEvent::Error(
-                "recognize request carries no image".to_string(),
+                "recognize request carries no images".to_string(),
             ))
             .await;
         return Ok(());
     };
-    let image = match worker_ocr::decode_request_image(&payload) {
-        Ok(image) => image,
+
+    let images = payload
+        .image_paths
+        .iter()
+        .map(|path| worker_ocr::read_staged_image(path))
+        .collect::<anyhow::Result<Vec<_>>>();
+    let images = match images {
+        Ok(images) => images,
         Err(error) => {
             let _ = event_tx
                 .send(WorkerEvent::Error(format!("{error:#}")))
@@ -383,10 +389,10 @@ async fn handle_recognize_plan(
         .await?
         .recognizer()?;
 
-    // Off the async executor: this is seconds to minutes of inference, and
-    // leaving it on the runtime would stall the cancel signal with it.
+    // Off the async executor: this is minutes of inference per image, and
+    // leaving it on the runtime would stall this process's stdin with it.
     let spotted =
-        tokio::task::spawn_blocking(move || recognizer.spot(&image)).await?;
+        tokio::task::spawn_blocking(move || recognizer.spot_batch(&images)).await?;
 
     match spotted {
         Ok(regions) => {
@@ -596,8 +602,9 @@ mod tests {
         }
     }
 
-    /// Returns one region whose text names the image it was given, so a test
-    /// can tell a real round trip from a canned reply.
+    /// Returns, per image, one region whose text names that image's size — so
+    /// a test can tell a real round trip from a canned reply, and can tell the
+    /// images apart within a batch.
     struct MockRecognizer;
 
     impl OcrEngine for MockRecognizer {
@@ -607,16 +614,21 @@ mod tests {
         fn admission_threshold(&self) -> f32 {
             0.5
         }
-        fn spot(
+        fn spot_batch(
             &self,
-            image: &image::RgbImage,
-        ) -> anyhow::Result<Vec<wilkes_core::extract::image::ocr::SpottedRegion>> {
+            images: &[image::RgbImage],
+        ) -> anyhow::Result<Vec<Vec<wilkes_core::extract::image::ocr::SpottedRegion>>> {
             let corner = wilkes_core::types::Point { x: 0.0, y: 0.0 };
-            Ok(vec![wilkes_core::extract::image::ocr::SpottedRegion {
-                text: format!("{}x{}", image.width(), image.height()),
-                confidence: 0.9,
-                quad: [corner; 4],
-            }])
+            Ok(images
+                .iter()
+                .map(|image| {
+                    vec![wilkes_core::extract::image::ocr::SpottedRegion {
+                        text: format!("{}x{}", image.width(), image.height()),
+                        confidence: 0.9,
+                        quad: [corner; 4],
+                    }]
+                })
+                .collect())
         }
     }
 
@@ -971,15 +983,20 @@ mod tests {
     /// The whole hop, in one test: the host's encoding, the worker's decode,
     /// the recognizer, and the regions coming back over the event channel.
     #[tokio::test]
-    async fn a_recognize_request_returns_the_regions_of_the_image_it_carried() {
+    async fn a_recognize_request_returns_the_regions_of_each_image_it_carried() {
         let dir = tempdir().unwrap();
         let mut active = None;
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
 
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(image::RgbImage::new(11, 5))
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
+        // Two images of different sizes, staged the way the host stages them.
+        let mut image_paths = Vec::new();
+        for (index, (width, height)) in [(11u32, 5u32), (6, 9)].into_iter().enumerate() {
+            let path = dir.path().join(format!("{index}.png"));
+            image::RgbImage::new(width, height)
+                .save_with_format(&path, image::ImageFormat::Png)
+                .unwrap();
+            image_paths.push(path);
+        }
         let mut req = request(
             "recognize",
             WorkerRole::Recognize(
@@ -987,23 +1004,20 @@ mod tests {
             ),
             dir.path().to_path_buf(),
         );
-        req.recognize = Some(wilkes_core::extract::image::RecognitionRequest {
-            image_png_base64: base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                png.into_inner(),
-            ),
-        });
+        req.recognize = Some(wilkes_core::extract::image::RecognitionRequest { image_paths });
 
         handle_worker_request(req, &mut active, tx, &SuccessLoader, &no_cancel())
             .await
             .unwrap();
 
         match rx.recv().await.unwrap() {
-            WorkerEvent::Regions(regions) => {
-                assert_eq!(regions.len(), 1);
-                // The recognizer reports the dimensions it was handed, so this
-                // is the host's image and not a canned reply.
-                assert_eq!(regions[0].text, "11x5");
+            WorkerEvent::Regions(batch) => {
+                // One answer per image, in order. The recognizer reports the
+                // dimensions it was handed, so these are the host's images
+                // and not a canned reply, and they are not transposed.
+                assert_eq!(batch.len(), 2);
+                assert_eq!(batch[0][0].text, "11x5");
+                assert_eq!(batch[1][0].text, "6x9");
             }
             other => panic!("expected Regions, got {other:?}"),
         }
@@ -1011,7 +1025,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_recognize_request_without_an_image_reports_an_error() {
+    async fn a_recognize_request_without_images_reports_an_error() {
         let dir = tempdir().unwrap();
         let mut active = None;
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);

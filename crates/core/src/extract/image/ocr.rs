@@ -62,8 +62,23 @@ pub trait OcrEngine: Send + Sync {
     /// The threshold this engine's admission signal is compared against.
     fn admission_threshold(&self) -> f32;
 
-    /// Transcribe every text region of one image.
-    fn spot(&self, image: &image::RgbImage) -> anyhow::Result<Vec<SpottedRegion>>;
+    /// Transcribe every text region of each image, one result per input, in
+    /// the order they were given.
+    ///
+    /// A batch and not a single image, because this is the unit that crosses a
+    /// process boundary and the boundary is what makes it a batch. Recognizing
+    /// one image per request left the host looping — issuing a request,
+    /// waiting minutes, issuing another — and a loop that issues requests is
+    /// work that outlives any attempt to kill the process serving it. A
+    /// document's images go in one call, so the caller waits in exactly one
+    /// place and killing the recognizer ends the wait.
+    ///
+    /// An engine that recognizes one image at a time satisfies this by
+    /// looping; the point is where the loop lives, not that one exists.
+    fn spot_batch(
+        &self,
+        images: &[image::RgbImage],
+    ) -> anyhow::Result<Vec<Vec<SpottedRegion>>>;
 }
 
 /// Parse a spotting response into regions.

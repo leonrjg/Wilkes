@@ -140,11 +140,13 @@ impl WorkerRequest {
             .texts
             .as_ref()
             .map(|texts| vec![format!("<{} text(s)>", texts.len())]);
+        // The paths are short and naming them is what makes a log useful; it
+        // is the count that a reader wants first.
         redacted.recognize = self.recognize.as_ref().map(|request| RecognitionRequest {
-            image_png_base64: format!(
-                "<{} base64 chars of PNG>",
-                request.image_png_base64.len()
-            ),
+            image_paths: vec![std::path::PathBuf::from(format!(
+                "<{} image(s)>",
+                request.image_paths.len()
+            ))],
         });
         redacted
     }
@@ -191,14 +193,15 @@ pub enum WorkerEvent {
     /// Carries no text: the text is the concatenation of the `Token` events,
     /// and a second copy would only invite the two to disagree.
     Completion { tokens: usize, stop: StopReason },
-    /// Every text region one image was found to carry. Emitted for
-    /// "recognize" mode, before its terminal event.
+    /// The text regions of each image of a recognition request, one entry per
+    /// image, in the order they were asked for. Emitted before its terminal
+    /// event.
     ///
     /// Regions only: where they land on the page, whether they clear the
     /// admission threshold and whether the document already draws them as
     /// glyphs are all decided by the host, because they are extraction rather
     /// than inference and the host is what owns the extraction recipe.
-    Regions(Vec<SpottedRegion>),
+    Regions(Vec<Vec<SpottedRegion>>),
     /// Index build completed successfully.
     Done,
     /// Index build failed.
@@ -286,15 +289,20 @@ mod tests {
         request.mode = "recognize".to_string();
         request.texts = Some(vec!["one".to_string(), "two".to_string()]);
         request.recognize = Some(RecognitionRequest {
-            image_png_base64: "QUJD".repeat(4096),
+            image_paths: (0..40)
+                .map(|n| std::path::PathBuf::from(format!("/scratch/secret-document-{n}.png")))
+                .collect(),
         });
 
         let logged = serde_json::to_string(&request.redacted_for_log()).unwrap();
-        assert!(!logged.contains("QUJD"), "the image reached the log: {logged}");
+        assert!(
+            !logged.contains("secret-document"),
+            "the staged paths reached the log: {logged}"
+        );
         assert!(!logged.contains("\"one\""), "the texts reached the log: {logged}");
-        // Present, and sized: an absent payload is a different request and a
+        // Present, and counted: an absent payload is a different request and a
         // real error, and the log must not make the two look alike.
-        assert!(logged.contains("16384 base64 chars"), "{logged}");
+        assert!(logged.contains("40 image(s)"), "{logged}");
         assert!(logged.contains("2 text(s)"), "{logged}");
         assert!(logged.contains("recognize"), "{logged}");
 
@@ -310,12 +318,12 @@ mod tests {
     fn redacting_for_the_log_does_not_touch_the_request_that_is_sent() {
         let mut request = sample_request();
         request.recognize = Some(RecognitionRequest {
-            image_png_base64: "QUJD".to_string(),
+            image_paths: vec![std::path::PathBuf::from("/scratch/0.png")],
         });
         let _ = request.redacted_for_log();
         assert_eq!(
-            request.recognize.as_ref().unwrap().image_png_base64,
-            "QUJD"
+            request.recognize.as_ref().unwrap().image_paths,
+            vec![std::path::PathBuf::from("/scratch/0.png")]
         );
     }
 

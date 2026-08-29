@@ -763,7 +763,44 @@ impl OcrEngine for PaddleOcrVl {
         ADMISSION_THRESHOLD
     }
 
-    fn spot(&self, image: &image::RgbImage) -> anyhow::Result<Vec<SpottedRegion>> {
+    /// One image at a time, because the decode is autoregressive and there is
+    /// nothing to gain by interleaving two of them on one device. The loop is
+    /// here, in the process doing the work, rather than in the host driving
+    /// it — which is the whole reason the trait takes a batch.
+    ///
+    /// The per-image line is the only sign of life during a batch that can run
+    /// for an hour. It goes to this process's stderr, which the host forwards
+    /// into its own log.
+    fn spot_batch(
+        &self,
+        images: &[image::RgbImage],
+    ) -> anyhow::Result<Vec<Vec<SpottedRegion>>> {
+        let mut all = Vec::with_capacity(images.len());
+        for (index, image) in images.iter().enumerate() {
+            let started = std::time::Instant::now();
+            info!(
+                "recognizing image {}/{} ({}x{})",
+                index + 1,
+                images.len(),
+                image.width(),
+                image.height()
+            );
+            let regions = self.spot_one(image)?;
+            info!(
+                "image {}/{}: {} region(s) in {:.1}s",
+                index + 1,
+                images.len(),
+                regions.len(),
+                started.elapsed().as_secs_f32()
+            );
+            all.push(regions);
+        }
+        Ok(all)
+    }
+}
+
+impl PaddleOcrVl {
+    fn spot_one(&self, image: &image::RgbImage) -> anyhow::Result<Vec<SpottedRegion>> {
         let (pixels, width, height) = pixel_tensor(image, &self.device, self.dtype)?;
         let (grid_height, grid_width) = (
             height as usize / self.patch_size,
@@ -1030,7 +1067,7 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
             .sum();
         expected_words += case_words;
 
-        let regions = match engine.spot(&case.image) {
+        let regions = match engine.spot_one(&case.image) {
             Ok(regions) => regions,
             Err(error) => {
                 warn!("{}/{}: recognition failed: {error:#}", engine.checkpoint.name, case.name);

@@ -6446,7 +6446,10 @@ impl AppContext {
                     _ = cancel_for_task.cancelled(), if !cancel_flag.load(Ordering::Relaxed) => {
                         info!("AppContext::spawn_build_index_task: cancellation observed");
                         cancel_flag.store(true, Ordering::Relaxed);
-                        ctx.worker_manager.request_shutdown();
+                        // Every worker, not the embedder alone: the build is
+                        // waiting on whichever one it last submitted to, and a
+                        // kill that misses that one is not a kill.
+                        ctx.kill_all_workers();
                     }
 
                     res = &mut build_fut => {
@@ -6580,8 +6583,8 @@ impl AppContext {
 
     pub async fn cancel_embed(&self) {
         info!("AppContext::cancel_embed: requested");
-        info!("AppContext::cancel_embed: requesting worker shutdown immediately");
-        self.worker_manager.request_shutdown();
+        info!("AppContext::cancel_embed: killing every worker immediately");
+        self.kill_all_workers();
         let Some(task) = self.embed_task.lock().take() else {
             info!("AppContext::cancel_embed: no active task");
             return;
@@ -6670,11 +6673,10 @@ impl AppContext {
     /// Status of every worker. Two processes can die independently, so a single
     /// status would misreport a dead generation worker as healthy.
     pub fn get_worker_statuses(&self) -> Vec<WorkerStatus> {
-        vec![
-            self.worker_manager.status(),
-            self.generate_manager.status(),
-            self.recognize_manager.status(),
-        ]
+        self.managers()
+            .into_iter()
+            .map(|manager| manager.status())
+            .collect()
     }
 
     /// The embedding worker's status. Kept for callers that only care about
@@ -6683,20 +6685,39 @@ impl AppContext {
         self.worker_manager.status()
     }
 
+    /// Every worker this context owns, and the only list of them.
+    ///
+    /// Written once because it was written three times: `status`, `shutdown`
+    /// and cancellation each named the managers by hand, so adding the
+    /// recognition worker meant remembering it in three places and it was
+    /// remembered in two. Cancelling a build then killed the embedder — which
+    /// the build was not waiting on — and left the recognizer running.
+    fn managers(&self) -> [&WorkerManager; 3] {
+        [
+            &self.worker_manager,
+            &self.generate_manager,
+            &self.recognize_manager,
+        ]
+    }
+
     pub fn kill_worker(&self) {
         self.worker_manager.request_shutdown();
     }
 
     pub fn kill_generation_worker(&self) {
         self.generate_manager.request_shutdown();
+    }
+
+    pub fn kill_recognition_worker(&self) {
         self.recognize_manager.request_shutdown();
     }
 
     /// Shut down every worker. A missed one leaks a multi-gigabyte process past
-    /// app exit.
+    /// app exit, and — during a cancellation — leaves the build waiting on it.
     pub fn kill_all_workers(&self) {
-        self.kill_worker();
-        self.kill_generation_worker();
+        for manager in self.managers() {
+            manager.request_shutdown();
+        }
     }
 
     pub async fn set_worker_timeout(&self, secs: u64) -> anyhow::Result<()> {

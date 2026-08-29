@@ -46,19 +46,25 @@ use crate::types::{
 use describe::FigureDescriber;
 use ocr::OcrEngine;
 
-/// One image handed to a recognizer, as it travels between processes.
+/// The images of one document, handed to a recognizer.
 ///
-/// The pixels go as a base64 PNG rather than as an array of numbers, and the
-/// reply is a list of regions with fractional coordinates. Both halves are
-/// ordinary JSON that any language can produce: recognition is addressed by
-/// this protocol rather than by a Rust trait object precisely so the engine
-/// serving it need not be Rust, and a payload of raw f32s would have made that
-/// a fiction. PNG because it is lossless — a recognizer reading small type off
-/// a diagram is exactly the reader that a lossy re-encode fails.
+/// Paths, not pixels. A document's worth of figures inlined as base64 would be
+/// a single JSON line of a hundred megabytes, held whole on both sides of the
+/// pipe; a path is a path. It costs nothing in speed either way — recognition
+/// is minutes per image and encoding is milliseconds — so the choice is about
+/// what the protocol does on a fifty-figure document, which is to stay the
+/// same size.
+///
+/// PNG because it is lossless, and files because every language opens a file:
+/// the recognizer serving this need not be Rust, and a Rust-shaped payload
+/// would have made that a fiction.
+///
+/// The files belong to the caller, which writes them somewhere it owns and
+/// removes them when the batch is done, killed or not.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RecognitionRequest {
-    /// One image, PNG-encoded, then base64.
-    pub image_png_base64: String,
+    /// One PNG per image, in the order the results must come back.
+    pub image_paths: Vec<std::path::PathBuf>,
 }
 
 /// The decoded pixels of one native image block, held only for as long as
@@ -282,6 +288,7 @@ pub fn build_analyzer(
         engine,
         model_id,
         model_dir.to_path_buf(),
+        cache_dir.join("recognition-scratch"),
         settings.device.as_deref().unwrap_or("auto"),
     )
     .context("could not address the image recognizer")?;
@@ -405,26 +412,26 @@ impl ImageAnalyzer for NativeImageAnalyzer {
         diagnostics: &mut ExtractionDiagnostics,
     ) {
         let identity = self.identity();
-        let total = images.len();
+
+        // Pass one settles everything settleable without the recognizer: what
+        // a technical limit rejected, and what a previous reading under this
+        // same recipe already answered. What is left is the batch — and only
+        // that, so re-reading a document whose figures are all cached sends
+        // nothing at all.
+        let mut pending: Vec<usize> = Vec::new();
         for (index, (image, found)) in images.iter_mut().zip(discovered).enumerate() {
-            // Every image reports one line, because the alternative is a
-            // process that looks hung. A single figure can take minutes, and a
-            // reader cannot tell slow work from no work without a heartbeat
-            // that names what is being worked on.
-            let position = format!("image {}/{total} (page {})", index + 1, image.page);
-            let started = std::time::Instant::now();
             image.analyzer_identity = identity.clone();
 
-            let Some(decoded) = &found.decoded else {
+            if found.decoded.is_none() {
                 let reason = found
                     .rejected
                     .clone()
                     .unwrap_or_else(|| "not decoded".to_string());
                 diagnostics.native_images_skipped_technical_limit += 1;
-                debug!("{position}: skipped, {reason}");
+                debug!("image {} skipped: {reason}", image.id);
                 image.status = ImageAnalysisStatus::SkippedTechnicalLimit { reason };
                 continue;
-            };
+            }
 
             // A cached annotation is the same analysis, already done. It is
             // still counted as analyzed: what the reading contains is what a
@@ -443,28 +450,77 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                 } else if self.describer.is_none() {
                     diagnostics.images_description_not_configured += 1;
                 }
-                debug!(
-                    "{position}: {}x{}, already analyzed under this recipe",
-                    image.pixel_width, image.pixel_height
-                );
+                debug!("image {} was already analyzed under this recipe", image.id);
                 continue;
             }
 
-            info!(
-                "{position}: {}x{}, recognizing…",
-                image.pixel_width, image.pixel_height
-            );
+            pending.push(index);
+        }
+
+        if pending.is_empty() {
+            return;
+        }
+
+        // One call, one wait. The loop that used to be here — ask, wait
+        // minutes, ask again — was work the host could not be stopped in the
+        // middle of, and killing the recognizer only made it ask again for the
+        // next image, spawning a replacement. The recognizer's own loop runs
+        // inside the process that can be killed.
+        let batch: Vec<image::RgbImage> = pending
+            .iter()
+            .map(|index| {
+                discovered[*index]
+                    .decoded
+                    .as_ref()
+                    .expect("a pending image is a decoded one")
+                    .pixels
+                    .clone()
+            })
+            .collect();
+        info!("recognizing {} image(s)", batch.len());
+        let started = std::time::Instant::now();
+        let spotted = self.ocr.spot_batch(&batch);
+        drop(batch);
+
+        // A batch fails as a batch: one recognizer, one request, one outcome.
+        // Every image it covered is a partial result carrying the reason, not
+        // a complete analysis that happened to find nothing — a killed
+        // recognizer must not read as a document whose figures have no text
+        // in them.
+        let spotted = match spotted {
+            Ok(spotted) => {
+                info!(
+                    "recognized {} image(s) in {:.1}s",
+                    spotted.len(),
+                    started.elapsed().as_secs_f32()
+                );
+                Ok(spotted)
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                warn!(
+                    "recognition failed for {} image(s): {reason}",
+                    pending.len()
+                );
+                Err(reason)
+            }
+        };
+
+        for (position, index) in pending.into_iter().enumerate() {
+            let decoded = discovered[index]
+                .decoded
+                .as_ref()
+                .expect("a pending image is a decoded one");
+            let image = &mut images[index];
+            let key = self.cache_key(image);
             diagnostics.native_images_analyzed += 1;
             let mut failures = Vec::new();
 
-            // The recognizer runs whether or not a describer is configured:
-            // the transcription is a fact about the document, and a missing
-            // describer is a fact about this machine.
-            match self.ocr.spot(&decoded.pixels) {
+            match spotted.as_ref().map(|all| &all[position]) {
                 Ok(regions) => {
                     diagnostics.images_ocr_succeeded += 1;
                     image.ocr_regions = ocr::place_and_admit(
-                        regions,
+                        regions.clone(),
                         &image.transform,
                         &image.bbox,
                         image.pixel_width,
@@ -474,10 +530,9 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                         self.ocr.admission_threshold(),
                     );
                 }
-                Err(error) => {
+                Err(reason) => {
                     diagnostics.images_ocr_failed += 1;
-                    warn!("image {}: recognition failed: {error:#}", image.id);
-                    failures.push(format!("recognition: {error}"));
+                    failures.push(format!("recognition: {reason}"));
                 }
             }
 
@@ -501,33 +556,26 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                 }
             }
 
-            info!(
-                "{position}: {} of {} region(s) accepted{} in {:.1}s",
-                image.accepted_ocr().count(),
-                image.ocr_regions.len(),
-                if image.description.is_some() {
-                    ", described"
-                } else {
-                    ""
-                },
-                started.elapsed().as_secs_f32()
-            );
-
             image.status = if failures.is_empty() {
                 ImageAnalysisStatus::Complete
             } else {
                 ImageAnalysisStatus::Partial { failures }
             };
 
-            if let Some(cache) = &self.cache {
-                cache.put(
-                    &key,
-                    &cache::Annotation {
-                        ocr_regions: image.ocr_regions.clone(),
-                        description: image.description.clone(),
-                        status: image.status.clone(),
-                    },
-                );
+            // Only a reading the recognizer actually produced is worth
+            // keeping. Caching a failure would make one killed batch the
+            // permanent answer for every figure it covered.
+            if self.cache.is_some() && spotted.is_ok() {
+                if let Some(cache) = &self.cache {
+                    cache.put(
+                        &key,
+                        &cache::Annotation {
+                            ocr_regions: image.ocr_regions.clone(),
+                            description: image.description.clone(),
+                            status: image.status.clone(),
+                        },
+                    );
+                }
             }
         }
     }
@@ -780,8 +828,11 @@ mod tests {
             fn admission_threshold(&self) -> f32 {
                 self.1
             }
-            fn spot(&self, _image: &image::RgbImage) -> anyhow::Result<Vec<SpottedRegion>> {
-                Ok(Vec::new())
+            fn spot_batch(
+                &self,
+                images: &[image::RgbImage],
+            ) -> anyhow::Result<Vec<Vec<SpottedRegion>>> {
+                Ok(vec![Vec::new(); images.len()])
             }
         }
 

@@ -50,12 +50,15 @@ impl OcrEngine for Arc<ImageCapture> {
         1.0
     }
 
-    fn spot(&self, image: &image::RgbImage) -> anyhow::Result<Vec<SpottedRegion>> {
+    fn spot_batch(
+        &self,
+        images: &[image::RgbImage],
+    ) -> anyhow::Result<Vec<Vec<SpottedRegion>>> {
         self.images
             .lock()
             .expect("capture lock")
-            .push(image.clone());
-        Ok(Vec::new())
+            .extend(images.iter().cloned());
+        Ok(vec![Vec::new(); images.len()])
     }
 }
 
@@ -563,7 +566,23 @@ impl OcrEngine for ScriptedOcr {
         self.threshold
     }
 
-    fn spot(&self, _image: &image::RgbImage) -> anyhow::Result<Vec<SpottedRegion>> {
+    /// One script entry per image, and a scripted failure fails the whole
+    /// batch — which is what a real recognizer does, since the batch is one
+    /// request to one process.
+    fn spot_batch(
+        &self,
+        images: &[image::RgbImage],
+    ) -> anyhow::Result<Vec<Vec<SpottedRegion>>> {
+        let mut all = Vec::with_capacity(images.len());
+        for _ in images {
+            all.push(self.spot_one()?);
+        }
+        Ok(all)
+    }
+}
+
+impl ScriptedOcr {
+    fn spot_one(&self) -> anyhow::Result<Vec<SpottedRegion>> {
         let mut seen = self.seen.lock().expect("the script's lock");
         let index = *seen;
         *seen += 1;

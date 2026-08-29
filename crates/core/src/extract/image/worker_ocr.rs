@@ -3,21 +3,25 @@
 //! Recognition is candle inference against 1.9 GB of weights on whatever
 //! accelerator the device resolves to. Running it in the host means a fault in
 //! it takes the application down, and it is the same class of runtime the
-//! embedder was moved out of process for. So the pixels go out and the regions
+//! embedder was moved out of process for. So the images go out and the regions
 //! come back, and the host keeps everything that is not inference: which
 //! images exist, where each region lands on the page, whether it clears the
 //! admission threshold, whether the document already draws it as glyphs, and
 //! the recipe the whole reading is recorded under.
+//!
+//! A document's images go in one request. That is not a throughput
+//! optimization — recognition is minutes an image and the hop is milliseconds
+//! — it is what makes the work killable. Asking image by image left the host
+//! in a loop that outlived the process serving it: kill the recognizer and the
+//! loop simply asked again, spawning a replacement. With one request the host
+//! waits in exactly one place, and killing the recognizer ends the wait.
 //!
 //! `identity` and `admission_threshold` answer from constants without asking
 //! the worker. They enter the extraction recipe and are needed before a single
 //! image is sent — and a recipe that had to round-trip to a subprocess to be
 //! known is one that could differ depending on whether the subprocess was up.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use base64::Engine as _;
+use std::path::{Path, PathBuf};
 
 use super::dispatch::{self, RecognitionEngine};
 use super::ocr::{OcrEngine, SpottedRegion};
@@ -27,16 +31,20 @@ use crate::worker::manager::{ManagerCommand, WorkerManager};
 
 pub struct WorkerOcr {
     manager: WorkerManager,
-    /// Captured at construction, always in an async context, so `spot` can be
-    /// called from the blocking extraction thread it actually runs on.
+    /// Captured at construction, always in an async context, so `spot_batch`
+    /// can be called from the blocking extraction thread it actually runs on.
     tokio_handle: tokio::runtime::Handle,
     engine: RecognitionEngine,
     model_id: String,
     model_dir: PathBuf,
     device: String,
+    /// Where a batch's PNGs are staged. Under the application's own data
+    /// directory rather than the system temp: these are pages of the user's
+    /// documents, and they should not be written somewhere world-readable.
+    scratch_root: PathBuf,
     /// Resolved once at construction. Both are pure functions of the engine
-    /// and model, and recomputing them per image would be per-image work to
-    /// answer a question that cannot change.
+    /// and model, and recomputing them per batch would be work to answer a
+    /// question that cannot change.
     identity: String,
     admission_threshold: f32,
 }
@@ -46,12 +54,13 @@ impl WorkerOcr {
     ///
     /// Fails when the pair names no recognizer this build ships. That is
     /// checked here, before any document is read, because the alternative is
-    /// discovering it once per image with a library half-extracted.
+    /// discovering it once per batch with a library half-extracted.
     pub fn new(
         manager: WorkerManager,
         engine: RecognitionEngine,
         model_id: &str,
         model_dir: PathBuf,
+        scratch_root: PathBuf,
         device: &str,
     ) -> anyhow::Result<Self> {
         Ok(Self {
@@ -61,9 +70,36 @@ impl WorkerOcr {
             model_id: model_id.to_string(),
             model_dir,
             device: device.to_string(),
+            scratch_root,
             identity: dispatch::identity(engine, model_id)?,
             admission_threshold: dispatch::admission_threshold(engine, model_id)?,
         })
+    }
+
+    /// Stage one batch as PNG files and return where they went.
+    ///
+    /// The directory is returned alongside the paths so the caller holds it
+    /// for exactly as long as the request: dropping it removes the files,
+    /// whether the request succeeded, failed or was killed underneath.
+    fn stage(&self, images: &[image::RgbImage]) -> anyhow::Result<(tempfile::TempDir, Vec<PathBuf>)> {
+        std::fs::create_dir_all(&self.scratch_root).map_err(|error| {
+            anyhow::anyhow!(
+                "could not create the recognition scratch directory {}: {error}",
+                self.scratch_root.display()
+            )
+        })?;
+        let staged = tempfile::Builder::new()
+            .prefix("recognize-")
+            .tempdir_in(&self.scratch_root)?;
+        let mut paths = Vec::with_capacity(images.len());
+        for (index, image) in images.iter().enumerate() {
+            let path = staged.path().join(format!("{index}.png"));
+            image.save_with_format(&path, image::ImageFormat::Png).map_err(|error| {
+                anyhow::anyhow!("could not stage image {index} for recognition: {error}")
+            })?;
+            paths.push(path);
+        }
+        Ok((staged, paths))
     }
 }
 
@@ -76,11 +112,17 @@ impl OcrEngine for WorkerOcr {
         self.admission_threshold
     }
 
-    fn spot(&self, image: &image::RgbImage) -> anyhow::Result<Vec<SpottedRegion>> {
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(image.clone())
-            .write_to(&mut png, image::ImageFormat::Png)
-            .map_err(|error| anyhow::anyhow!("could not encode the image for recognition: {error}"))?;
+    fn spot_batch(
+        &self,
+        images: &[image::RgbImage],
+    ) -> anyhow::Result<Vec<Vec<SpottedRegion>>> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Held until the request is over. Named, because dropping it is what
+        // removes the files and an unnamed temporary would drop it here.
+        let (_staged, image_paths) = self.stage(images)?;
+        let expected = image_paths.len();
 
         let request = WorkerRequest {
             mode: "recognize".to_string(),
@@ -90,10 +132,7 @@ impl OcrEngine for WorkerOcr {
             device: self.device.clone(),
             texts: None,
             generate: None,
-            recognize: Some(RecognitionRequest {
-                image_png_base64: base64::engine::general_purpose::STANDARD
-                    .encode(png.into_inner()),
-            }),
+            recognize: Some(RecognitionRequest { image_paths }),
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -102,7 +141,7 @@ impl OcrEngine for WorkerOcr {
             reply: tx,
         };
 
-        self.tokio_handle.block_on(async move {
+        let regions: Vec<Vec<SpottedRegion>> = self.tokio_handle.block_on(async move {
             self.manager
                 .send(cmd)
                 .await
@@ -121,7 +160,17 @@ impl OcrEngine for WorkerOcr {
             Err(anyhow::anyhow!(
                 "the recognizer finished without returning regions"
             ))
-        })
+        })?;
+
+        // Results are positional — the caller pairs them back with its own
+        // images by index — so a short reply is a wrong answer, not a partial
+        // one, and must not be silently zipped against the wrong images.
+        anyhow::ensure!(
+            regions.len() == expected,
+            "the recognizer answered for {} of {expected} image(s)",
+            regions.len()
+        );
+        Ok(regions)
     }
 }
 
@@ -131,20 +180,25 @@ pub fn attach(
     engine: RecognitionEngine,
     model_id: &str,
     model_dir: PathBuf,
+    scratch_root: PathBuf,
     device: &str,
 ) -> anyhow::Result<Box<dyn OcrEngine>> {
     Ok(Box::new(WorkerOcr::new(
-        manager, engine, model_id, model_dir, device,
+        manager,
+        engine,
+        model_id,
+        model_dir,
+        scratch_root,
+        device,
     )?))
 }
 
-/// Decode what [`WorkerOcr::spot`] encoded. The worker's half of the hop.
-pub fn decode_request_image(request: &RecognitionRequest) -> anyhow::Result<image::RgbImage> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&request.image_png_base64)
-        .map_err(|error| anyhow::anyhow!("the recognition payload is not base64: {error}"))?;
-    Ok(image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
-        .map_err(|error| anyhow::anyhow!("the recognition payload is not a PNG: {error}"))?
+/// Read back what the host staged. The worker's half of the hop.
+pub fn read_staged_image(path: &Path) -> anyhow::Result<image::RgbImage> {
+    Ok(image::ImageReader::open(path)
+        .map_err(|error| anyhow::anyhow!("could not open {}: {error}", path.display()))?
+        .decode()
+        .map_err(|error| anyhow::anyhow!("{} is not a readable image: {error}", path.display()))?
         .to_rgb8())
 }
 
@@ -152,43 +206,82 @@ pub fn decode_request_image(request: &RecognitionRequest) -> anyhow::Result<imag
 mod tests {
     use super::*;
 
-    /// The pixels the worker recognizes must be the pixels the host saw. A
-    /// lossy hop would move the transcription of small type without moving the
+    /// The pixels the worker reads must be the pixels the host saw. A lossy
+    /// staging would move the transcription of small type without moving the
     /// recipe that claims to describe it.
-    #[test]
-    fn the_image_survives_the_hop_unchanged() {
+    #[tokio::test]
+    async fn images_survive_staging_unchanged() {
         let mut original = image::RgbImage::new(7, 3);
         for (x, y, pixel) in original.enumerate_pixels_mut() {
             *pixel = image::Rgb([(x * 30) as u8, (y * 70) as u8, ((x + y) * 20) as u8]);
         }
+        let second = image::RgbImage::from_pixel(4, 4, image::Rgb([1, 2, 3]));
 
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(original.clone())
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
-        let request = RecognitionRequest {
-            image_png_base64: base64::engine::general_purpose::STANDARD
-                .encode(png.into_inner()),
+        let root = tempfile::tempdir().unwrap();
+        let ocr = WorkerOcr {
+            manager: test_manager(),
+            tokio_handle: tokio::runtime::Handle::current(),
+            engine: RecognitionEngine::default(),
+            model_id: "m".to_string(),
+            model_dir: PathBuf::new(),
+            device: "cpu".to_string(),
+            scratch_root: root.path().join("scratch"),
+            identity: "id".to_string(),
+            admission_threshold: 0.5,
         };
 
-        // Through JSON, because that is what the hop actually is.
-        let wire = serde_json::to_string(&request).unwrap();
-        let received: RecognitionRequest = serde_json::from_str(&wire).unwrap();
+        let (staged, paths) = ocr.stage(&[original.clone(), second.clone()]).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(read_staged_image(&paths[0]).unwrap(), original);
+        assert_eq!(read_staged_image(&paths[1]).unwrap(), second);
 
-        assert_eq!(decode_request_image(&received).unwrap(), original);
+        // The staging directory owns the files: dropping it takes them with
+        // it, whether the request succeeded, failed or was killed.
+        let path = paths[0].clone();
+        drop(staged);
+        assert!(!path.exists(), "staged files outlived the batch");
+    }
+
+    /// The images are the user's documents. They are staged under the
+    /// application's own directory, not somewhere world-readable.
+    #[tokio::test]
+    async fn staging_happens_under_the_root_it_was_given() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("scratch");
+        let ocr = WorkerOcr {
+            manager: test_manager(),
+            tokio_handle: tokio::runtime::Handle::current(),
+            engine: RecognitionEngine::default(),
+            model_id: "m".to_string(),
+            model_dir: PathBuf::new(),
+            device: "cpu".to_string(),
+            scratch_root: scratch.clone(),
+            identity: "id".to_string(),
+            admission_threshold: 0.5,
+        };
+        let (_staged, paths) = ocr.stage(&[image::RgbImage::new(2, 2)]).unwrap();
+        assert!(paths[0].starts_with(&scratch), "{}", paths[0].display());
     }
 
     #[test]
-    fn a_payload_that_is_not_a_png_is_an_error() {
-        let request = RecognitionRequest {
-            image_png_base64: base64::engine::general_purpose::STANDARD.encode("not a png"),
-        };
-        assert!(decode_request_image(&request).is_err());
+    fn a_path_that_is_not_an_image_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-png");
+        std::fs::write(&path, b"not a png").unwrap();
+        assert!(read_staged_image(&path).is_err());
+        assert!(read_staged_image(&dir.path().join("absent.png")).is_err());
+    }
 
-        let request = RecognitionRequest {
-            image_png_base64: "!!! not base64 !!!".to_string(),
-        };
-        assert!(decode_request_image(&request).is_err());
+    fn test_manager() -> WorkerManager {
+        crate::worker::manager::WorkerManager::new(crate::worker::manager::WorkerPaths {
+            python_path: PathBuf::new(),
+            python_package_dir: PathBuf::new(),
+            requirements_path: PathBuf::new(),
+            venv_dir: PathBuf::new(),
+            worker_bin: PathBuf::new(),
+            data_dir: PathBuf::new(),
+        })
+        .0
     }
 
     /// The whole chain against the real recognizer: spawn the worker binary,
@@ -242,7 +335,16 @@ mod tests {
             model_dir.display()
         );
 
-        let recognizer = attach(manager, engine, model_id, model_dir, "auto").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let recognizer = attach(
+            manager,
+            engine,
+            model_id,
+            model_dir,
+            scratch.path().to_path_buf(),
+            "auto",
+        )
+        .unwrap();
         let identity = recognizer.identity();
         assert!(identity.contains(model_id), "{identity}");
 
@@ -256,10 +358,12 @@ mod tests {
         let image = crate::extract::image::corpus::render_page(&pdf, 0, 4.0);
 
         let started = std::time::Instant::now();
-        let regions = tokio::task::spawn_blocking(move || recognizer.spot(&image))
+        let mut batch = tokio::task::spawn_blocking(move || recognizer.spot_batch(&[image]))
             .await
             .unwrap()
             .expect("the recognizer should answer");
+        assert_eq!(batch.len(), 1, "one answer per image");
+        let regions = batch.remove(0);
         let read = regions
             .iter()
             .map(|region| region.text.as_str())
@@ -290,10 +394,14 @@ mod tests {
                 crate::types::Point { x: 0.1, y: 0.4 },
             ],
         }];
-        let wire = serde_json::to_string(&WorkerEvent::Regions(regions.clone())).unwrap();
+        let batch = vec![regions.clone(), Vec::new()];
+        let wire = serde_json::to_string(&WorkerEvent::Regions(batch.clone())).unwrap();
         assert!(wire.contains("Figure 1"), "{wire}");
         match serde_json::from_str::<WorkerEvent>(&wire).unwrap() {
-            WorkerEvent::Regions(back) => assert_eq!(back, regions),
+            // One entry per image, including the image that had no text in
+            // it: results are positional and a dropped empty would shift
+            // every region after it onto the wrong figure.
+            WorkerEvent::Regions(back) => assert_eq!(back, batch),
             other => panic!("expected Regions, got {other:?}"),
         }
     }
