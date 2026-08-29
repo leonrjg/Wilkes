@@ -5,8 +5,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 use wilkes_api::context::EventEmitter;
+use wilkes_api::workspace::{ConsumerIndex, ConsumerScope};
 
-use super::errors::{err, server_err, ErrorBody};
+use super::errors::{consumer_err, err, server_err, ErrorBody};
 use axum::http::StatusCode;
 use axum::Json;
 
@@ -45,28 +46,37 @@ impl AppState {
         self.workspace_snapshot().0
     }
 
-    /// The context for a named workspace, or the active one when the request
-    /// names none.
+    /// The index one consumer request addresses.
     ///
     /// Naming a workspace does not activate it: this opens that workspace's
     /// context alongside the active one, so a request can read a document out
     /// of a library the user is not currently looking at without the registry,
     /// the window, or anyone else's in-flight request moving.
-    pub async fn context_for(
+    ///
+    /// Every chunk, embed and export route reaches its index through here, and
+    /// the decisions it makes — which workspace, which projection, whether the
+    /// pin agrees — belong to [`WorkspaceManager::consumer_index`], not to the
+    /// route.
+    pub async fn consumer_index(
         &self,
-        workspace_id: Option<&str>,
-    ) -> Result<Arc<wilkes_api::context::AppContext>, (StatusCode, Json<ErrorBody>)> {
-        let Some(id) = workspace_id else {
-            return Ok(self.context());
-        };
-        let manager = self
-            .workspaces
-            .as_ref()
-            .ok_or_else(|| server_err("Workspace manager is unavailable"))?;
-        manager
-            .context_for(id)
-            .await
-            .map_err(|error| server_err(error.to_string()))
+        scope: &ConsumerScope,
+    ) -> Result<ConsumerIndex, (StatusCode, Json<ErrorBody>)> {
+        match &self.workspaces {
+            Some(manager) => manager.consumer_index(scope).await.map_err(consumer_err),
+            // The handler-test adapter, which owns one context and no
+            // registry. It can still be addressed, but only as itself.
+            None if scope.workspace_id.is_none() => {
+                let context = self.context();
+                let space = context.index_space().map_err(consumer_err)?;
+                ConsumerIndex::verified(
+                    context,
+                    space,
+                    scope.expected_embedding_space_id.as_deref(),
+                )
+                .map_err(consumer_err)
+            }
+            None => Err(server_err("Workspace manager is unavailable")),
+        }
     }
 }
 

@@ -9,11 +9,11 @@ use wilkes_core::embed::{EmbeddingSpaceIdentity, ExtractionRecipe};
 use wilkes_core::types::{SelectedEmbedder, SemanticSettings};
 use wilkes_core::worker::manager::{ManagerEvent, WorkerPaths};
 
-use wilkes_core::consumer::{consumer_error, ConsumerErrorCode};
+use wilkes_core::consumer::{consumer_error, ConsumerError, ConsumerErrorCode};
 use wilkes_core::{consumer_bail, consumer_ensure};
 
 use crate::commands::settings::get_scoped_settings;
-use crate::context::{AppContext, EventEmitter, ManagedCorpusBackup};
+use crate::context::{AppContext, EventEmitter, IndexSpace, ManagedCorpusBackup};
 use crate::startup::{StartupAction, StartupBlocker};
 
 const REGISTRY_VERSION: u32 = 1;
@@ -73,6 +73,98 @@ pub enum WorkspaceKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_corpus_id: Option<String>,
     },
+}
+
+/// How a consumer request names the index it is asking about. The whole of it:
+/// every chunk, embed and export route takes this object and nothing else for
+/// addressing.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConsumerScope {
+    /// Absent means the active workspace. A managed corpus is addressed by
+    /// putting its `corpus_id` here — they are the same token, and pretending
+    /// otherwise was the adapter's doing rather than the data model's.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    /// The embedding space the caller believes it is talking to. Optional on a
+    /// user workspace, where it verifies; required on a managed corpus, where
+    /// it also routes.
+    #[serde(default)]
+    pub expected_embedding_space_id: Option<String>,
+}
+
+/// An opened index and what it can be asked.
+pub struct ConsumerIndex {
+    context: Arc<AppContext>,
+    space: IndexSpace,
+}
+
+/// The context behind an opened index is a live workspace, not a value; what
+/// is worth printing about one of these is which space it turned out to be.
+impl std::fmt::Debug for ConsumerIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsumerIndex")
+            .field("space", &self.space)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConsumerIndex {
+    /// An opened index, checked against the pin the caller supplied.
+    ///
+    /// This is the whole of the rule for an index that is addressed as
+    /// itself — a user workspace, or the one context a handler test owns. A
+    /// pin only ever verifies here: an index that cannot prove which space it
+    /// is fails exactly as an index of another space does, because neither can
+    /// be shown to be the one the caller named.
+    pub fn verified(
+        context: Arc<AppContext>,
+        space: IndexSpace,
+        expected_embedding_space_id: Option<&str>,
+    ) -> Result<Self, ConsumerError> {
+        if let Some(pin) = expected_embedding_space_id {
+            if space.id() != Some(pin) {
+                return Err(ConsumerError::new(
+                    ConsumerErrorCode::EmbeddingSpaceMismatch,
+                    format!("index={}, request={pin}", space.id().unwrap_or("none")),
+                ));
+            }
+        }
+        Ok(Self { context, space })
+    }
+
+    pub fn context(&self) -> &Arc<AppContext> {
+        &self.context
+    }
+
+    pub fn into_context(self) -> Arc<AppContext> {
+        self.context
+    }
+
+    /// The space id to report, which is `None` exactly when the index cannot
+    /// prove one — no index, or one built before schema v10.
+    pub fn embedding_space_id(&self) -> Option<&str> {
+        self.space.id()
+    }
+
+    /// The space id, for a route that is about to name passages.
+    ///
+    /// An index without chunk refs refuses here rather than degrading: every
+    /// ref it could return would be null, and a shorter answer would look
+    /// like a complete one.
+    pub fn addressable_space_id(&self) -> Result<&str, ConsumerError> {
+        match &self.space {
+            IndexSpace::Exact(id) => Ok(id.as_str()),
+            IndexSpace::Unverified => Err(ConsumerError::new(
+                ConsumerErrorCode::IndexIdentityUnverified,
+                "this index predates stable chunk references and cannot address a passage; \
+                 rebuild it",
+            )),
+            IndexSpace::Absent => Err(ConsumerError::untyped(
+                "Semantic index unavailable. Build or restore the semantic index first.",
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1073,6 +1165,112 @@ impl WorkspaceManager {
             status.corpus_generation,
         );
         self.context_for(&space.workspace_id).await
+    }
+
+    /// The one way a consumer route opens an index.
+    ///
+    /// Every chunk, embed and export route addresses an index with the same
+    /// object, and this is where that object becomes a database. Before this
+    /// there were two resolvers — a workspace one that opened whatever was
+    /// asked for, and a managed one that also routed a corpus to the
+    /// projection holding a space — and a route inherited its addressing from
+    /// whichever half it had been written against.
+    ///
+    /// The pin is optional on a user workspace and required on a managed
+    /// corpus because on a managed corpus it *routes* as well as verifies.
+    /// That is one rule with a stated reason rather than two mechanisms: in
+    /// both cases a supplied pin is honoured exactly, and in neither case is a
+    /// mismatch ever served.
+    pub async fn consumer_index(
+        &self,
+        scope: &ConsumerScope,
+    ) -> Result<ConsumerIndex, ConsumerError> {
+        let id = match &scope.workspace_id {
+            Some(id) => id.clone(),
+            // Not a filter, and not "whichever workspace happens to be open"
+            // by accident: chunk refs are per-index, so an unnamed workspace
+            // has to resolve to exactly one index and say which.
+            None => self
+                .active_workspace_id()
+                .map_err(|error| ConsumerError::from_anyhow(&error))?,
+        };
+        let manifest =
+            read_manifest(&workspace_manifest_path(&self.app_data_dir, &id)).map_err(|_| {
+                ConsumerError::new(
+                    ConsumerErrorCode::ManagedWorkspaceNotFound,
+                    format!("no workspace with id {id}"),
+                )
+            })?;
+        let pin = scope.expected_embedding_space_id.as_deref();
+
+        let parent_corpus_id = match &manifest.kind {
+            WorkspaceKind::User => {
+                let context = self
+                    .context_for(&id)
+                    .await
+                    .map_err(|error| ConsumerError::from_anyhow(&error))?;
+                let space = context.index_space()?;
+                return ConsumerIndex::verified(context, space, pin);
+            }
+            WorkspaceKind::ApplicationManaged {
+                parent_corpus_id, ..
+            } => parent_corpus_id.clone(),
+        };
+
+        // An internal projection is an implementation detail of the corpus
+        // that owns it, reachable only as one of that corpus's spaces.
+        if parent_corpus_id.is_some() {
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::ManagedWorkspaceNotFound,
+                format!("{id} is an internal projection of another corpus, not a corpus"),
+            ));
+        }
+
+        let Some(pin) = pin else {
+            let status = self
+                .managed_workspace_status(&id)
+                .await
+                .map_err(|error| ConsumerError::from_anyhow(&error))?;
+            // A corpus with no index has no coordinate system to disagree
+            // about yet, which is the one case where an unpinned managed
+            // request is answerable.
+            if let Some(existing) = status.embedding_space_id {
+                return Err(ConsumerError::new(
+                    ConsumerErrorCode::EmbeddingSpaceMismatch,
+                    format!("corpus={existing}, request=none"),
+                ));
+            }
+            let context = self
+                .context_for(&id)
+                .await
+                .map_err(|error| ConsumerError::from_anyhow(&error))?;
+            return Ok(ConsumerIndex {
+                context,
+                space: IndexSpace::Absent,
+            });
+        };
+
+        let context = self
+            .managed_space_context(&id, pin)
+            .await
+            .map_err(|error| ConsumerError::from_anyhow(&error))?;
+        let actual = context.ensure_managed_runtime().await?;
+        if actual != pin {
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::EmbeddingSpaceMismatch,
+                format!("runtime={actual}, request={pin}"),
+            ));
+        }
+        Ok(ConsumerIndex {
+            context,
+            space: IndexSpace::Exact(actual),
+        })
+    }
+
+    /// The workspace a request that names none is answered from.
+    pub fn active_workspace_id(&self) -> anyhow::Result<String> {
+        let _guard = self.registry_lock.lock();
+        Ok(load_registry(&self.app_data_dir)?.active_workspace_id)
     }
 
     pub async fn backup_managed_corpus(
@@ -2370,6 +2568,182 @@ mod tests {
             .err()
             .is_some_and(|error| error.contains("no-such-workspace")));
 
+        manager.shutdown_all().await;
+    }
+
+    /// The scope table, at the resolver rather than at each route.
+    ///
+    /// One object addresses every consumer request, so the cases a caller can
+    /// put to it are worth stating once, here, rather than being discovered
+    /// per route.
+    #[tokio::test]
+    async fn an_unnamed_scope_answers_from_the_active_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("global-settings.json");
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
+        let active = manager.state().await.unwrap().active_workspace_id;
+
+        let index = manager
+            .consumer_index(&ConsumerScope::default())
+            .await
+            .unwrap();
+
+        assert_eq!(index.context().data_dir, manager.active().data_dir);
+        assert_eq!(manager.active_workspace_id().unwrap(), active);
+        // No index has been built, so there is no space to report — and a
+        // route that is about to name passages says why rather than
+        // returning an empty answer that reads like a complete one.
+        assert_eq!(index.embedding_space_id(), None);
+        assert!(index.addressable_space_id().is_err());
+
+        manager.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn a_pin_no_index_can_prove_is_refused_rather_than_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("global-settings.json");
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
+
+        let error = manager
+            .consumer_index(&ConsumerScope {
+                workspace_id: None,
+                expected_embedding_space_id: Some("space-the-caller-imagined".to_string()),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            Some(ConsumerErrorCode::EmbeddingSpaceMismatch)
+        );
+        manager.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_id_names_no_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("global-settings.json");
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
+
+        let error = manager
+            .consumer_index(&ConsumerScope {
+                workspace_id: Some("no-such-workspace".to_string()),
+                expected_embedding_space_id: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            Some(ConsumerErrorCode::ManagedWorkspaceNotFound)
+        );
+        manager.shutdown_all().await;
+    }
+
+    /// A corpus with nothing in it has no coordinate system to disagree
+    /// about; once it has one, a request that declines to name a space is
+    /// asking to be served whatever happens to be there, which is the thing
+    /// a pinned consumer surface exists to prevent.
+    #[tokio::test]
+    async fn a_managed_corpus_stops_answering_unpinned_once_it_holds_an_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("global-settings.json");
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
+        let embedding = SelectedEmbedder::default();
+        let corpus = manager
+            .ensure_managed_workspace(EnsureManagedWorkspace {
+                owner: "underdog".to_string(),
+                corpus_key: "store-scope".to_string(),
+                embedding: embedding.clone(),
+                chunk_size: 600,
+                chunk_overlap: 128,
+            })
+            .await
+            .unwrap();
+        let scope = ConsumerScope {
+            workspace_id: Some(corpus.corpus_id.clone()),
+            expected_embedding_space_id: None,
+        };
+
+        assert!(manager.consumer_index(&scope).await.is_ok());
+
+        let root = workspace_root(dir.path(), &corpus.corpus_id);
+        let index = SemanticIndex::create(
+            &root,
+            embedding.model.model_id(),
+            embedding.dimension,
+            embedding.engine,
+            None,
+        )
+        .unwrap();
+        drop(index);
+
+        let error = manager.consumer_index(&scope).await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            Some(ConsumerErrorCode::EmbeddingSpaceMismatch)
+        );
+
+        manager.shutdown_all().await;
+    }
+
+    /// A projection is how a corpus holds a second space, not a second thing
+    /// to address. Reachable directly, it would be a way to be handed vectors
+    /// without having named the space they are in.
+    #[tokio::test]
+    async fn an_internal_projection_is_not_addressable_as_a_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("global-settings.json");
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
+        let embedding = SelectedEmbedder::default();
+        let corpus = manager
+            .ensure_managed_workspace(EnsureManagedWorkspace {
+                owner: "underdog".to_string(),
+                corpus_key: "store-projection".to_string(),
+                embedding: embedding.clone(),
+                chunk_size: 600,
+                chunk_overlap: 128,
+            })
+            .await
+            .unwrap();
+        let parent_semantic =
+            read_manifest(&workspace_manifest_path(dir.path(), &corpus.corpus_id))
+                .unwrap()
+                .semantic
+                .unwrap();
+        let projection = manager
+            .ensure_projection_workspace(
+                &corpus.corpus_id,
+                "underdog",
+                "store-projection",
+                &parent_semantic,
+                &embedding,
+            )
+            .unwrap();
+
+        let error = manager
+            .consumer_index(&ConsumerScope {
+                workspace_id: Some(projection),
+                expected_embedding_space_id: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            Some(ConsumerErrorCode::ManagedWorkspaceNotFound)
+        );
         manager.shutdown_all().await;
     }
 }

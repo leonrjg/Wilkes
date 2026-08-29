@@ -405,6 +405,38 @@ pub enum ManagedSearchProbeInput {
     Text(String),
 }
 
+/// The coordinate system one workspace's index carries, as a consumer route
+/// has to see it before it answers about passages.
+///
+/// Three states rather than an `Option<String>`, because "there is no index"
+/// and "there is an index that cannot say which space it is" are different
+/// answers with different remedies: build one, and rebuild one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexSpace {
+    /// The workspace holds no index. Embedding text still works here; nothing
+    /// that addresses a passage does.
+    Absent,
+    /// An index migrated from before schema v10: its `exact_identity` is
+    /// absent and its `chunk_ref` is null on every row. Its vectors remain
+    /// usable by Wilkes locally, where the engine/model/dimension tuple
+    /// matching the runtime is enough — that tuple is not, and never was,
+    /// vector-compatibility proof for a consumer.
+    Unverified,
+    /// The index knows exactly which space it is, so its passages can be
+    /// named.
+    Exact(String),
+}
+
+impl IndexSpace {
+    /// The id to report, which exists only when the index can prove it.
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Self::Exact(id) => Some(id.as_str()),
+            Self::Absent | Self::Unverified => None,
+        }
+    }
+}
+
 /// Result of `embed_texts`: vectors from the same model the index uses,
 /// with the identity consumers pin against.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -5417,6 +5449,32 @@ impl AppContext {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .is_some()
+    }
+
+    /// Which coordinate system this workspace's index carries.
+    ///
+    /// Read from the index's own stored metadata rather than from the
+    /// embedder that happens to be loaded: the vectors were produced by
+    /// whatever built the index, and it is those the caller is about to be
+    /// told something about.
+    pub fn index_space(&self) -> Result<IndexSpace, ConsumerError> {
+        let index_arc = self.index.lock().clone();
+        let guard = index_arc
+            .lock()
+            .map_err(|_| "Semantic index lock was poisoned")?;
+        let Some(index) = guard.as_ref() else {
+            return Ok(IndexSpace::Absent);
+        };
+        // An index that cannot be asked what it is is a fault, not a state:
+        // answering "unverified" here would report a rebuildable index where
+        // there is an unreadable one.
+        let metadata = index
+            .embedding_metadata()
+            .map_err(|error| ConsumerError::from_anyhow(&error))?;
+        Ok(match metadata.exact_identity {
+            Some(identity) => IndexSpace::Exact(identity.id().0),
+            None => IndexSpace::Unverified,
+        })
     }
 
     // ── Search ────────────────────────────────────────────────────────────────

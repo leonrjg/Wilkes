@@ -39,8 +39,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 use wilkes_api::context::AppContext;
 use wilkes_api::workspace::{
-    EnsureManagedEmbeddingSpace, EnsureManagedWorkspace, ManagedEmbeddingSpaceStatus,
-    ManagedWorkspaceStatus, WorkspaceState, WorkspaceSummary,
+    ConsumerScope, EnsureManagedEmbeddingSpace, EnsureManagedWorkspace,
+    ManagedEmbeddingSpaceStatus, ManagedWorkspaceStatus, WorkspaceState, WorkspaceSummary,
 };
 use wilkes_core::completion::{CompletionFeedback, CompletionRequest};
 use wilkes_core::consumer::{ConsumerError, ConsumerErrorCode};
@@ -989,25 +989,13 @@ async fn managed_context(
     corpus_id: &str,
     expected_embedding_space_id: &str,
 ) -> Result<Arc<wilkes_api::context::AppContext>, (StatusCode, Json<ErrorBody>)> {
-    let manager = state
-        .workspaces
-        .as_ref()
-        .ok_or_else(|| workspace_manager_unavailable())?;
-    let context = manager
-        .managed_space_context(corpus_id, expected_embedding_space_id)
-        .await
-        .map_err(consumer_anyhow_err)?;
-    let actual = context
-        .ensure_managed_runtime()
-        .await
-        .map_err(consumer_err)?;
-    if actual != expected_embedding_space_id {
-        return Err(consumer_err(ConsumerError::new(
-            ConsumerErrorCode::EmbeddingSpaceMismatch,
-            format!("runtime={actual}, request={expected_embedding_space_id}"),
-        )));
-    }
-    Ok(context)
+    Ok(state
+        .consumer_index(&ConsumerScope {
+            workspace_id: Some(corpus_id.to_string()),
+            expected_embedding_space_id: Some(expected_embedding_space_id.to_string()),
+        })
+        .await?
+        .into_context())
 }
 
 async fn list_bookmarks_handler(
@@ -1293,8 +1281,12 @@ async fn embed_text_handler(
         return Err(err("texts must not be empty"));
     }
     state
-        .context_for(body.workspace_id.as_deref())
+        .consumer_index(&ConsumerScope {
+            workspace_id: body.workspace_id.clone(),
+            expected_embedding_space_id: None,
+        })
         .await?
+        .into_context()
         .embed_texts(body.texts)
         .await
         .map(Json)
@@ -1332,8 +1324,12 @@ async fn embed_centroid_handler(
         return Err(err("groups must not be empty"));
     }
     state
-        .context_for(body.workspace_id.as_deref())
+        .consumer_index(&ConsumerScope {
+            workspace_id: body.workspace_id.clone(),
+            expected_embedding_space_id: None,
+        })
         .await?
+        .into_context()
         .chunk_centroids(body.groups)
         .await
         .map(Json)
@@ -1373,8 +1369,12 @@ async fn embed_similarity_handler(
         return Err(err("probes must not be empty"));
     }
     state
-        .context_for(body.workspace_id.as_deref())
+        .consumer_index(&ConsumerScope {
+            workspace_id: body.workspace_id.clone(),
+            expected_embedding_space_id: None,
+        })
         .await?
+        .into_context()
         .chunk_similarity(body.probes, body.chunk_ids)
         .await
         .map(Json)
@@ -1412,8 +1412,12 @@ async fn export_chunks_handler(
     Json(body): Json<ExportChunksBody>,
 ) -> Result<Json<wilkes_api::context::FileChunkExport>, (StatusCode, Json<ErrorBody>)> {
     state
-        .context_for(body.workspace_id.as_deref())
+        .consumer_index(&ConsumerScope {
+            workspace_id: body.workspace_id.clone(),
+            expected_embedding_space_id: None,
+        })
         .await?
+        .into_context()
         .export_file_chunks(body.root, body.path)
         .await
         .map(Json)
@@ -1428,8 +1432,12 @@ async fn export_outline_handler(
     Json(body): Json<ExportOutlineBody>,
 ) -> Result<Json<wilkes_api::context::FileOutlineExport>, (StatusCode, Json<ErrorBody>)> {
     state
-        .context_for(body.workspace_id.as_deref())
+        .consumer_index(&ConsumerScope {
+            workspace_id: body.workspace_id.clone(),
+            expected_embedding_space_id: None,
+        })
         .await?
+        .into_context()
         .export_file_outline(body.root, body.path)
         .await
         .map(Json)
@@ -1458,8 +1466,12 @@ async fn export_files_handler(
     Json(body): Json<ExportFilesBody>,
 ) -> Result<Json<wilkes_api::context::LibraryFileExport>, (StatusCode, Json<ErrorBody>)> {
     state
-        .context_for(body.workspace_id.as_deref())
+        .consumer_index(&ConsumerScope {
+            workspace_id: body.workspace_id.clone(),
+            expected_embedding_space_id: None,
+        })
         .await?
+        .into_context()
         .export_library_files(body.root)
         .await
         .map(Json)
@@ -1486,8 +1498,12 @@ async fn export_chunk_text_handler(
     Json(body): Json<ExportChunkTextBody>,
 ) -> Result<Json<wilkes_api::context::ChunkTextExport>, (StatusCode, Json<ErrorBody>)> {
     state
-        .context_for(body.workspace_id.as_deref())
+        .consumer_index(&ConsumerScope {
+            workspace_id: body.workspace_id.clone(),
+            expected_embedding_space_id: None,
+        })
         .await?
+        .into_context()
         .export_chunk_text(body.root, body.path, body.chunk_ids)
         .await
         .map(Json)
