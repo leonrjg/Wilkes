@@ -1159,6 +1159,26 @@ first version of this got wrong.
 Measured across the document before and after: 39 regions became 40, so
 nothing costs meaningfully more, and both reported formulas are now whole.
 
+**Whole-page reading was tried and abandoned, on cost.** The delimiting rules
+below kept failing in new ways, so the obvious move was to stop delimiting:
+hand the recognizer the page and take the `<loc_>` coordinates it already
+emits. The measurement that seemed to support it compared 40 hand-cut crops
+(364 vision tiles) against one call on each of the 31 pages carrying
+mathematics (403) — a wash. That comparison was wrong, and wrong in the
+direction that mattered: the 31 was itself produced by a font-based gate, and
+a gate on the font list is exactly the mechanism that had just failed on
+`DBAMWK+Formula`. Reading *every* page, which is the only version that does
+not depend on it, is 142 pages at 13 tiles — **1846 tiles, around five times
+the cost, an hour on an M1 for one course book.** Not viable, and the flat
+comparison was an artifact of assuming the thing under dispute.
+
+What the attempt did establish: a crop can never cost less than five tiles
+however small the formula, because the tiler quantizes to whole 512-pixel
+tiles, so per-crop reading has a high fixed floor and the two approaches are
+closer than they look. If page rendering ever becomes cheap — a smaller
+recognizer, a GPU provider — the argument reopens, and it reopens on cost
+rather than on design.
+
 **A document that yields nothing says why.** The faces a document draws with,
 and which of them were read as mathematics, are reported once per document —
 at info when *none* was, because that is the case a reader needs to see. Before
@@ -1284,6 +1304,16 @@ Added 2026-08-29, for typeset routing:
   mode of a threshold set too low is cost — a prose line marked out, read, and
   refused by admission — and of one set too high is a formula left as the
   glyph run it is today. Neither corrupts a reading.
+- **The two rules added after the whole-page attempt are measured on one
+  document only.** Not stacking across an intervening line, and admitting a
+  run whose fragments have a vector mark in the gap between them. Together
+  they take the reported document from 40 regions to 63, and the tiles from
+  364 to 547 — half again as much work — in exchange for the expressions whose
+  delimiters are drawn as paths rather than set as glyphs: `w ∈ GF(q)`,
+  `Φ(n) = n − 1`, `HMAC_k(M)`, `h(k ⊕ ipad ‖ M)`. Whether that trade holds on a
+  document that is not this one is unmeasured, and the mark rule in particular
+  is calibrated against a publisher whose mathematics is *entirely* set with
+  path delimiters.
 - **The font list is a list, and a list is not a rule.** `math`, `formula`,
   `equation` and the TeX families cover what has been seen; a publisher who
   names its math face for its course code is not covered, and nothing in the

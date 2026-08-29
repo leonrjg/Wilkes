@@ -50,6 +50,15 @@ pub(super) struct Line {
     pub leading: String,
     pub words: Vec<Word>,
     pub trailing: Vec<String>,
+    /// The typeset region marked out over this line, as an index into the
+    /// document's images.
+    ///
+    /// Marked at discovery and acted on in [`supersede_typeset_regions`],
+    /// after the recognizer has answered — because until then it is not known
+    /// whether these words are leaving. A region whose reading is refused
+    /// leaves its lines exactly where the page put them, which is what makes
+    /// a false positive cost time and no bytes.
+    pub typeset: Option<usize>,
 }
 
 impl Line {
@@ -222,26 +231,21 @@ pub(super) fn sanitize(
 
 // ── Typeset regions ─────────────────────────────────────────────────────────
 
-/// Hand the lines a recognized region covers over to that region.
+/// Hand the lines of an admitted typeset region over to that region.
 ///
 /// This is the one place the ownership of those bytes is settled, and it
-/// settles it by removing the competing claim rather than reconciling two. A
-/// display formula reaches this point twice over: as the glyph run MuPDF read
-/// off the page — `ci = ai ⊕bi`, which is not mathematics — and as the region
-/// a recognizer read as LaTeX. Exactly one of them is in the reading
+/// settles it by removing the competing claim rather than by reconciling two.
+/// A display formula reaches this point twice over: as the glyph run MuPDF
+/// read off the page — `ci = ai ⊕bi`, which is not mathematics — and as the
+/// region a recognizer read as LaTeX. Exactly one of them is in the reading
 /// afterwards.
 ///
-/// **The recognizer's own geometry decides which lines, and a containment
-/// rule bounds what that can cost.** A region takes a line only when most of
-/// the line lies inside it, so a box drawn generously around a formula cannot
-/// swallow the full-width prose line beside it — a formula is narrower than a
-/// column, and a paragraph overlapping one at the edge stays put. Together
-/// with the kind rule, which admits only a formula, a table or a chart from a
-/// typeset origin, a page render can never take prose out of the reading.
-///
-/// A region covering no line at all is written nowhere. It has nothing to
-/// supersede, and a typeset region exists to replace glyphs; one that replaces
-/// nothing has no position in the reading to claim.
+/// The recognizer wins only where it actually said something admissible. A
+/// region whose formula did not parse, whose table came back ragged, or whose
+/// recognition failed outright leaves its lines untouched, and the reading is
+/// what it was before typeset routing existed. That is deliberate: the
+/// failure mode of a wrongly marked-out region is a wasted recognizer call,
+/// never a paragraph replaced by nothing.
 ///
 /// Run before every other pass here so that what follows sees an image block
 /// where the region is — a formula is not a furniture candidate and not a
@@ -252,29 +256,23 @@ fn supersede_typeset_regions(
     images: &[ExtractedImage],
     diagnostics: &mut ExtractionDiagnostics,
 ) {
-    let mut by_page: std::collections::HashMap<u32, Vec<usize>> = Default::default();
-    for (index, image) in images.iter().enumerate() {
-        if image.origin == crate::types::RegionOrigin::Typeset
-            && image.accepted_ocr().next().is_some()
-        {
-            by_page.entry(image.page).or_default().push(index);
-        }
-    }
-    if by_page.is_empty() {
-        return;
-    }
-    let mut placed: std::collections::HashSet<usize> = Default::default();
+    let admitted = |index: usize| {
+        images
+            .get(index)
+            .is_some_and(|image| image.accepted_ocr().next().is_some())
+    };
+    let mut placed: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     for page in pages.iter_mut() {
-        let Some(candidates) = by_page.get(&page.number) else {
-            continue;
-        };
         let mut rebuilt: Vec<Block> = Vec::new();
         for block in std::mem::take(&mut page.blocks) {
             if block.image.is_some() {
                 rebuilt.push(block);
                 continue;
             }
+            // Consecutive lines of one region are one run. A region that
+            // spans two of the page's blocks is still one image, so its block
+            // is written where its first line was and the rest simply go.
             let mut pending: Vec<Line> = Vec::new();
             let flush = |pending: &mut Vec<Line>, rebuilt: &mut Vec<Block>| {
                 if !pending.is_empty() {
@@ -285,13 +283,7 @@ fn supersede_typeset_regions(
                 }
             };
             for line in block.lines {
-                let covering = line_extent(&line).and_then(|extent| {
-                    candidates
-                        .iter()
-                        .copied()
-                        .find(|index| mostly_inside(&extent, &images[*index].bbox))
-                });
-                match covering {
+                match line.typeset.filter(|index| admitted(*index)) {
                     Some(index) => {
                         flush(&mut pending, &mut rebuilt);
                         if placed.insert(index) {
@@ -309,45 +301,6 @@ fn supersede_typeset_regions(
         }
         page.blocks = rebuilt;
     }
-}
-
-/// The box one line's words were drawn in, or `None` for a line of whitespace.
-fn line_extent(line: &Line) -> Option<BoundingBox> {
-    line.words
-        .iter()
-        .filter_map(|word| word.bbox.as_ref())
-        .fold(None, |extent: Option<BoundingBox>, bbox| {
-            Some(match extent {
-                Some(existing) => existing.merge(bbox),
-                None => bbox.clone(),
-            })
-        })
-}
-
-/// How much of a line must lie inside a region before the region owns it.
-///
-/// The share, not the centre: a centre test would hand a full-width paragraph
-/// to any formula box that reached the middle of it.
-///
-/// Set high, and deliberately biased. The two ways this can be wrong are not
-/// equally bad. Too permissive deletes a paragraph, silently — the reading
-/// loses text the document contains and nothing says so. Too strict leaves the
-/// page's glyphs beside the LaTeX, which is redundant and visible and still
-/// contains the truth. So the threshold sits where a formula's own line
-/// clears it comfortably — the recognizer's box comes from the same pixels the
-/// line was drawn in, so containment is near total — and a prose line only
-/// clipped by that box does not: the fixture below is a column line a formula
-/// box reaches two-thirds of the way across, and it stays.
-const MOSTLY: f32 = 0.8;
-
-fn mostly_inside(line: &BoundingBox, region: &BoundingBox) -> bool {
-    let width = (line.x + line.width).min(region.x + region.width) - line.x.max(region.x);
-    let height = (line.y + line.height).min(region.y + region.height) - line.y.max(region.y);
-    if width <= 0.0 || height <= 0.0 {
-        return false;
-    }
-    let area = line.width * line.height;
-    area > 0.0 && (width * height) >= area * MOSTLY
 }
 
 // ── Class 2: page furniture ─────────────────────────────────────────────────
@@ -923,6 +876,7 @@ mod tests {
                       word("ai", 140.0, 100.0)]),
             line(vec![word("prose", 100.0, 120.0), word("below", 140.0, 120.0)]),
         ];
+        lines[1].typeset = Some(0);
         Page {
             number: 1,
             height: 800.0,
@@ -985,8 +939,10 @@ mod tests {
     /// its lines simply go.
     #[test]
     fn a_region_spanning_two_blocks_is_written_once() {
-        let first = line(vec![word("ci", 100.0, 100.0), word("=", 120.0, 100.0)]);
-        let second = line(vec![word("ai", 100.0, 108.0), word("+", 120.0, 108.0)]);
+        let mut first = line(vec![word("ci", 100.0, 100.0), word("=", 120.0, 100.0)]);
+        first.typeset = Some(0);
+        let mut second = line(vec![word("ai", 100.0, 116.0), word("+", 120.0, 116.0)]);
+        second.typeset = Some(0);
         let page = Page {
             number: 1,
             height: 800.0,
@@ -1007,42 +963,6 @@ mod tests {
             reading.text
         );
         assert_eq!(diagnostics.typeset_regions_superseded_native_text, 1);
-    }
-
-    /// The recognizer's box decides which lines leave the reading, so the
-    /// containment rule is what bounds the cost of a generous one. A
-    /// full-width paragraph that a formula box merely reaches into stays put:
-    /// a formula is narrower than a column, so most of the paragraph is
-    /// outside it.
-    #[test]
-    fn a_generous_region_cannot_swallow_the_paragraph_beside_it() {
-        // A prose line running the width of the column, and a formula box
-        // over its left third.
-        let prose = line(vec![
-            word("the", 100.0, 100.0),
-            word("sentence", 130.0, 100.0),
-            word("continues", 200.0, 100.0),
-            word("across", 280.0, 100.0),
-            word("the", 340.0, 100.0),
-            word("column", 380.0, 100.0),
-        ]);
-        let page = Page {
-            number: 1,
-            height: 800.0,
-            blocks: vec![Block { lines: vec![prose], image: None }],
-        };
-        let mut images = [recognized(true)];
-        let mut diagnostics = ExtractionDiagnostics::default();
-        let reading = sanitize(vec![page], &mut images, &mut diagnostics);
-
-        // The box covers x 90..290 of a line running 100..416: 60% of it,
-        // well clear of a formula line's near-total containment.
-        assert!(
-            reading.text.contains("the sentence continues across the column"),
-            "the paragraph survives: {:?}",
-            reading.text
-        );
-        assert_eq!(diagnostics.typeset_regions_superseded_native_text, 0);
     }
 
     #[test]

@@ -131,6 +131,8 @@ fn read_document(
     let mut pages = Vec::with_capacity(page_count as usize);
     let mut discovered: Vec<DiscoveredImage> = Vec::new();
     let mut diagnostics = ExtractionDiagnostics::default();
+    let mut pending: Vec<typeset::TypesetRegion> = Vec::new();
+    let mut faces: std::collections::BTreeMap<String, usize> = Default::default();
     for i in 0..page_count as i32 {
         let page = doc.load_page(i)?;
         let height = page.bounds().map(|bounds| bounds.y1 - bounds.y0)?;
@@ -139,32 +141,71 @@ fn read_document(
         // in the order the page draws them — which is the only discovery
         // signal this phase needs, and the only thing that establishes where
         // an image sits relative to the text around it.
-        let text_page = page.to_text_page(
-            TextPageFlags::ACCURATE_BBOXES | TextPageFlags::PRESERVE_IMAGES,
-        )?;
+        // COLLECT_VECTORS adds the rules the page drew as blocks of their own.
+        // They carry no lines, so nothing but the typeset survey sees them.
+        let mut flags = TextPageFlags::ACCURATE_BBOXES | TextPageFlags::PRESERVE_IMAGES;
+        if route_typeset {
+            flags |= TextPageFlags::COLLECT_VECTORS;
+        }
+        let text_page = page.to_text_page(flags)?;
+        let survey = if route_typeset {
+            typeset::survey(&page, &text_page)
+        } else {
+            typeset::Survey::default()
+        };
+        let mut lines = Vec::new();
         pages.push(extract_page_words(
             &text_page,
             (i + 1) as u32,
             height,
             &mut discovered,
+            &survey,
+            &mut lines,
         ));
+        for (name, glyphs) in &survey.faces {
+            *faces.entry(name.clone()).or_default() += glyphs;
+        }
+        if route_typeset && !survey.is_empty() {
+            pending.extend(typeset::regions((i + 1) as u32, &survey, &lines));
+        }
     }
 
-    // Every page, when there is a recognizer to read them. Deciding *which*
-    // pages might contain mathematics is the job this module used to do with
-    // a font list, and the font list is what failed: a publisher's own face
-    // named `Formula` matched nothing in it, and a gate built on it would
-    // have skipped that document silently rather than merely misreading it.
-    // There is no cheap test for "is there anything here" that is not the
-    // recognizer's own answer, so the recognizer is asked.
     if route_typeset {
-        for page_number in typeset::within_budget(
-            (1..=page_count).collect::<Vec<u32>>(),
-            &mut diagnostics,
-        ) {
-            let page = doc.load_page(page_number as i32 - 1)?;
-            typeset::discover_page(&page, page_number, &mut discovered);
+        typeset::report_faces(path, &faces);
+    }
+
+    // Bounded across the document rather than per page: the budget is what a
+    // reader will wait for in total, and a page-by-page bound would spend it
+    // on whichever pages came first regardless.
+    let mut budgeted = typeset::within_budget(pending, &mut diagnostics);
+    // One page loaded per page that has regions, and its regions rendered
+    // together: loading a page is cheap and doing it per region would still be
+    // an avoidable repetition of the parse.
+    budgeted.sort_by_key(|region| region.page);
+    let mut at = 0usize;
+    while at < budgeted.len() {
+        let page_number = budgeted[at].page;
+        let end = budgeted[at..]
+            .iter()
+            .position(|region| region.page != page_number)
+            .map_or(budgeted.len(), |offset| at + offset);
+        let page = doc.load_page(page_number as i32 - 1)?;
+        let placed = typeset::discover(&page, &budgeted[at..end], &mut discovered);
+        for (region, image_index) in budgeted[at..end].iter().zip(placed) {
+            // The lines this region speaks for learn which image will speak
+            // for them. Whether it actually does is settled after recognition,
+            // in `sanitize::supersede_typeset_regions`.
+            for (block, line) in &region.lines {
+                if let Some(line) = pages[page_number as usize - 1]
+                    .blocks
+                    .get_mut(*block)
+                    .and_then(|block| block.lines.get_mut(*line))
+                {
+                    line.typeset = Some(image_index);
+                }
+            }
         }
+        at = end;
     }
 
     let context = AnalysisContext::new(native_words(&pages));
@@ -195,10 +236,7 @@ fn read_document(
             ),
         }
     }
-    let mut images = typeset::split_page_regions(
-        image::analyze(&discovered, &context, analyzer, &mut diagnostics),
-        &mut diagnostics,
-    );
+    let mut images = image::analyze(&discovered, &context, analyzer, &mut diagnostics);
     // The pixels have done their work. Dropping them here rather than at the
     // end of extraction keeps a document's worth of decoded artwork out of
     // memory while the reading is being built.
@@ -223,14 +261,13 @@ fn read_document(
         );
     }
 
-    if diagnostics.typeset_pages_read > 0 {
+    if diagnostics.typeset_regions_found > 0 {
         info!(
-            "typeset routing in {:?}: {} pages read, {} over the budget and left unread, \
-             {} regions found, {} standing in place of the page's own glyphs",
+            "typeset regions in {:?}: {} found, {} over the budget and left unread, \
+             {} admitted and now standing in place of the page's own glyphs",
             path,
-            diagnostics.typeset_pages_read,
-            diagnostics.typeset_regions_over_budget,
             diagnostics.typeset_regions_found,
+            diagnostics.typeset_regions_over_budget,
             diagnostics.typeset_regions_superseded_native_text,
         );
     }
@@ -484,6 +521,8 @@ fn extract_page_words(
     page_num: u32,
     height: f32,
     discovered: &mut Vec<DiscoveredImage>,
+    survey: &typeset::Survey,
+    surveyed: &mut Vec<typeset::SurveyedLine>,
 ) -> Page {
     let mut blocks = Vec::new();
 
@@ -503,6 +542,16 @@ fn extract_page_words(
             let mut out = Line::default();
             let mut word_chars = String::new();
             let mut bbox: Option<BoundingBox> = None;
+            // The whole line's extent and glyph count, for the typeset survey,
+            // with the size and baseline of each glyph. Taken here rather than
+            // from the words because it is the line the survey measures: a
+            // word box says nothing about the line's ascender and descender,
+            // and a subscript is a property of the run rather than of any word
+            // in it.
+            let mut extent: Option<BoundingBox> = None;
+            let mut glyphs = 0usize;
+            let mut sizes: Vec<f32> = Vec::new();
+            let mut baselines: Vec<f32> = Vec::new();
 
             for ch in line.chars() {
                 let c = match ch.char() {
@@ -517,6 +566,8 @@ fn extract_page_words(
                 }
 
                 word_chars.push(c);
+                sizes.push(ch.size());
+                baselines.push(ch.origin().y);
 
                 // Derive an axis-aligned rect from the character's bounding quad.
                 let q = ch.quad();
@@ -532,6 +583,11 @@ fn extract_page_words(
                         width: x2 - x1,
                         height: y2 - y1,
                     };
+                    glyphs += 1;
+                    extent = Some(match &extent {
+                        Some(existing) => existing.merge(&next),
+                        None => next.clone(),
+                    });
                     bbox = Some(match bbox {
                         Some(existing) => existing.merge(&next),
                         None => next,
@@ -542,6 +598,21 @@ fn extract_page_words(
             // End of line: flush any trailing word. The line itself becomes a
             // newline when the reading is rendered.
             flush(&mut out, &mut word_chars, &mut bbox);
+            if let Some(extent) = extent {
+                // Addressed by the indices this reading uses, not by MuPDF's:
+                // an image block and an empty block both shift them, and a
+                // region that marked out the wrong line would silently remove
+                // a paragraph.
+                surveyed.push(typeset::surveyed_line(
+                    survey,
+                    blocks.len(),
+                    lines.len(),
+                    extent,
+                    glyphs,
+                    &sizes,
+                    &baselines,
+                ));
+            }
             lines.push(out);
         }
         if !lines.is_empty() {
@@ -1188,18 +1259,12 @@ mod tests {
 
     // ── Typeset regions ─────────────────────────────────────────────────
 
-    /// The recognizer, standing in for one. It is handed a whole page and
-    /// answers where the formula is, which is what a document parser does —
-    /// the coordinates below are the page-space box of `MATH_PDF_BASE64`'s
-    /// display line, hand-written so the thing under test, which lines the
-    /// answer takes with it, is visible in the source that asserts about it.
+    /// The recognizer, standing in for one: it reads every typeset region as
+    /// the same LaTeX, and reads nothing in an embedded picture. Enough to
+    /// assert what *routing* did, which is what these tests are about.
     struct FormulaReader {
         latex: Option<&'static str>,
     }
-
-    /// The equation's own box: below the first prose line (page y 42..52) and
-    /// above the second (82..92), so the region covers the equation alone.
-    const EQUATION_BOX: (f32, f32, f32, f32) = (35.0, 55.0, 245.0, 80.0);
 
     impl crate::extract::image::ImageAnalyzer for FormulaReader {
         fn identity(&self) -> String {
@@ -1214,7 +1279,6 @@ mod tests {
             diagnostics: &mut ExtractionDiagnostics,
         ) {
             use crate::types::{ImageOcrRegion, OcrAdmission, Point, RegionKind};
-            let (x0, y0, x1, y1) = EQUATION_BOX;
             for image in images {
                 diagnostics.native_images_analyzed += 1;
                 image.analyzer_identity = self.identity();
@@ -1225,18 +1289,11 @@ mod tests {
                     kind: RegionKind::Formula,
                     text: latex.to_string(),
                     confidence: 0.95,
-                    polygon_within_image: vec![
-                        Point { x: 0.0, y: 0.0 },
-                        Point { x: 800.0, y: 0.0 },
-                        Point { x: 800.0, y: 100.0 },
-                        Point { x: 0.0, y: 100.0 },
-                    ],
-                    page_polygon: vec![
-                        Point { x: x0, y: y0 },
-                        Point { x: x1, y: y0 },
-                        Point { x: x1, y: y1 },
-                        Point { x: x0, y: y1 },
-                    ],
+                    polygon_within_image: vec![Point { x: 0.0, y: 0.0 }],
+                    page_polygon: vec![Point {
+                        x: image.bbox.x,
+                        y: image.bbox.y,
+                    }],
                     admission: OcrAdmission::Accepted,
                 }];
             }
@@ -1262,18 +1319,10 @@ mod tests {
             .iter()
             .filter(|image| image.origin == RegionOrigin::Typeset)
             .collect();
-        assert_eq!(
-            typeset.len(),
-            1,
-            "the page produced one region: {:?}",
-            content.images.iter().map(|i| (&i.id, i.origin)).collect::<Vec<_>>()
-        );
+        assert_eq!(typeset.len(), 1, "the display line is one region: {:?}",
+            content.images.iter().map(|i| (&i.id, i.origin)).collect::<Vec<_>>());
         assert_eq!(typeset[0].id, "p1-v0", "typeset ids are told apart from embedded ones");
-        assert!(
-            (typeset[0].bbox.y - EQUATION_BOX.1).abs() < 0.01,
-            "the region is the recognizer's box, not the page: {:?}",
-            typeset[0].bbox
-        );
+        assert!(typeset[0].pixel_width > 0 && typeset[0].pixel_height > 0, "it was rendered");
 
         assert!(
             content.text.contains("Page formula: c_i = a_i \\oplus b_i."),
@@ -1290,6 +1339,101 @@ mod tests {
                 && content.text.contains("and the discussion continues afterwards"),
             "the prose around it is untouched: {:?}",
             content.text
+        );
+    }
+
+    /// The rendered crop shows the region and nothing else.
+    ///
+    /// A display formula is a sliver, and it is padded out so a recognizer's
+    /// resize does not squash every glyph in it. If that pad were more of the
+    /// page rather than paper, the crop would carry the paragraphs above and
+    /// below — and the recognizer would read prose the reading already has,
+    /// which would then be written into it a second time. So: ink only where
+    /// the region is.
+    #[test]
+    fn the_render_pads_a_sliver_with_paper_and_not_with_the_rest_of_the_page() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Capture {
+            seen: Mutex<Vec<(u32, u32, Vec<u32>)>>,
+        }
+
+        impl crate::extract::image::ImageAnalyzer for Capture {
+            fn identity(&self) -> String {
+                "capture-v1".to_string()
+            }
+            fn analyze(
+                &self,
+                _images: &mut [ExtractedImage],
+                discovered: &[DiscoveredImage],
+                _context: &crate::extract::image::AnalysisContext,
+                _diagnostics: &mut ExtractionDiagnostics,
+            ) {
+                for found in discovered {
+                    let Some(decoded) = &found.decoded else {
+                        continue;
+                    };
+                    let pixels = &decoded.pixels;
+                    // Rows with any ink in them.
+                    let inked = (0..pixels.height())
+                        .filter(|y| {
+                            (0..pixels.width())
+                                .any(|x| pixels.get_pixel(x, *y).0.iter().any(|c| *c < 200))
+                        })
+                        .collect();
+                    self.seen
+                        .lock()
+                        .expect("not poisoned")
+                        .push((pixels.width(), pixels.height(), inked));
+                }
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let path = write_pdf(dir.path(), "math.pdf", MATH_PDF_BASE64);
+        let capture = Arc::new(Capture::default());
+        MuPdfBackend::new(Some(capture.clone()))
+            .extract(&path)
+            .expect("extracts");
+
+        let seen = capture.seen.lock().expect("not poisoned");
+        assert_eq!(seen.len(), 1, "one region was rendered");
+        let (width, height, inked) = &seen[0];
+        assert!(
+            (*width as f32 / *height as f32) <= 4.5,
+            "the sliver was padded: {width}x{height}"
+        );
+
+        // The padding exists to fit a recognizer's tiler, and the tiler is the
+        // only thing that can say whether it did. A canvas a hair under the
+        // bound is rounded up to a second row of tiles — the same picture for
+        // nearly twice the prefill — and no assertion inside the renderer can
+        // see that, because the rounding happens on the other side of the
+        // boundary. This is the one place the two meet.
+        #[cfg(feature = "recognize-onnx")]
+        {
+            let (_, _, cols, rows) =
+                crate::extract::image::granite_docling::tile_grid(*width, *height);
+            assert_eq!(
+                rows, 1,
+                "a padded sliver costs one row of tiles, not two: {width}x{height} \
+                 tiled {cols}x{rows}"
+            );
+        }
+        assert!(!inked.is_empty(), "the equation is in the crop");
+
+        // Every inked row is in the middle band. The pad above and below is
+        // paper, and the prose lines the page draws there are not in it.
+        let (first, last) = (inked[0], inked[inked.len() - 1]);
+        assert!(
+            first > 0 && last < height - 1,
+            "ink reaches the edge of the pad: rows {first}..={last} of {height}"
+        );
+        let band = last - first + 1;
+        assert!(
+            band < height / 2,
+            "the ink is one line, not the page: {band} of {height} rows"
         );
     }
 
@@ -1326,7 +1470,7 @@ mod tests {
             .outline(&path)
             .expect("outline reads")
             .diagnostics;
-        assert_eq!(diagnostics.typeset_pages_read, 0);
+        assert_eq!(diagnostics.typeset_regions_found, 0);
     }
 
     /// The counters separate "found" from "took the page's place": a region
@@ -1344,15 +1488,13 @@ mod tests {
         };
 
         let admitted = read(Some("c_i = a_i \\oplus b_i"));
-        assert_eq!(admitted.typeset_pages_read, 1, "one page was gated in");
         assert_eq!(admitted.typeset_regions_found, 1);
         assert_eq!(admitted.typeset_regions_superseded_native_text, 1);
         // A typeset region is not one of the document's own images.
         assert_eq!(admitted.native_images_found, 0);
 
         let refused = read(None);
-        assert_eq!(refused.typeset_pages_read, 1, "the page was still read");
-        assert_eq!(refused.typeset_regions_found, 0, "and yielded nothing");
+        assert_eq!(refused.typeset_regions_found, 1);
         assert_eq!(refused.typeset_regions_superseded_native_text, 0);
     }
 
