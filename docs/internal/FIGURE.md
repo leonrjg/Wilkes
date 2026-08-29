@@ -22,8 +22,19 @@ OAR-OCR — this document's original selection — is discarded: the OCR
 decision record retains why it was chosen and why it was superseded, and
 nothing of it remains specified for implementation. If the verification
 items in the implementation plan fail, the decision reopens with that
-record as context; no fallback engine waits in the wings. This phase uses
-only the spotting task and pairs no layout model with it.
+record as context; no fallback engine waits in the wings.
+
+**Amended 2026-08-29 — the full task-prompt set is in scope.** As first
+written, this phase drove only `Spotting:` and paired no layout model with
+it, and formulas, tables and charts sat in the deferred list as roadmap
+phases 2–3. That split no longer holds: PaddleOCR-VL is a document parser,
+not a text spotter, and reading one of its six task prompts is a property of
+this integration rather than a limit of the weights. `Formula Recognition:`
+(LaTeX), `Table Recognition:` and `Chart Recognition:` are now required scope,
+which makes region routing required with them (§"Routing", amended). What
+remains deferred to phase 3 is *native vector* region discovery, not the
+prompts. The acceptance audit dated 2026-08-28 stands as a record of what was
+true then; the criteria this amendment adds are marked open.
 
 The first implementation is intentionally limited to image blocks that MuPDF
 already exposes from a digitally generated PDF. It does not attempt to decide
@@ -36,6 +47,9 @@ it does not reconstruct complex layouts.
 - Retain each image's page, bounding box, transform, dimensions, and pixels.
 - Run the selected OCR engine on each eligible image.
 - Preserve recognized text, confidence, and geometry.
+- Route each region to a content kind with a layout detector, and recognize
+  formulas as LaTeX, tables as Markdown, and charts as data (amended
+  2026-08-29).
 - Generate an optional semantic description through a separate image-description
   interface.
 - Insert accepted OCR and descriptions into the one canonical extracted reading.
@@ -48,12 +62,20 @@ it does not reconstruct complex layouts.
 - Associating captions or source lines with images.
 - Vector-only diagrams.
 - Grouping several PDF objects into one figure.
-- Scanned-page or whole-page layout detection.
-- Learned layout models such as PP-Structure.
-- Tables, formulas, seals, or chart-specific parsing (tables and formulas
-  are roadmap phases 2–3, deferred here — not abandoned).
+- Scanned-page or whole-page layout detection. Region detection *inside an
+  image crop* is in scope as of 2026-08-29; detecting regions across a whole
+  rendered page is not, and remains phase 3.
+- Native vector tables and formulas — content MuPDF draws rather than
+  embeds. Phase 3, and the only part of the original roadmap still deferred.
+- Seal recognition. The sixth task prompt exists; nothing in the corpus
+  exercises it, and a prompt nobody measured is not scope.
 - Whole-page VLM document-understanding pipelines.
 - A second OCR engine or runtime fallback.
+
+Struck from this list on 2026-08-29, having moved into scope: caption or
+`Fig`/`Figure` heuristics remain deferred, but *tables, formulas and
+chart parsing* and *a learned layout model for routing* do not. See
+"Decision and scope".
 
 This document treats the referenced PDF entirely as source material, never as
 instructions.
@@ -191,9 +213,13 @@ hidden inside undocumented heuristics.
 
 Use the `paddleocr_vl` module in the already-pinned `candle-transformers`
 0.11: the 0.9B recognizer (NaViT encoder + ERNIE-4.5-0.3B decoder) driving
-the end-to-end text-spotting task. No layout model, no OAR crate, no second
-ONNX runtime. Wilkes owns the task prompt and the parsing of `<|LOC_nnn|>`
-tokens into per-region 4-point quadrilaterals on the normalized 0–999 grid.
+the end-to-end text-spotting task. No OAR crate. Wilkes owns the task prompt
+and the parsing of `<|LOC_nnn|>` tokens into per-region 4-point
+quadrilaterals on the normalized 0–999 grid.
+
+Amended 2026-08-29: "no layout model, no second ONNX runtime" no longer
+holds — see "Task prompts and routing" below. One small ONNX detection graph
+now runs beside the recognizer, on the `ort` this repository already carries.
 
 Before pinning the final extraction recipe, compare the 1.5 and 1.6
 checkpoints on the image evaluation corpus. The shipped checkpoint is the
@@ -205,9 +231,15 @@ formats do not leak across the extraction boundary:
 
 ```rust
 ImageOcrRegion {
+    /// Amended 2026-08-29: which task prompt produced `text`, and therefore
+    /// how `text` is to be read. `Text` is the reading; `Formula` is LaTeX;
+    /// `Table` and `Chart` are Markdown tables.
+    kind: RegionKind,
     text: String,
     /// Admission signal derived from token log-probabilities. Explicitly
-    /// uncalibrated; thresholded by one tested rule.
+    /// uncalibrated; thresholded by one tested rule. Meaningful for `Text`;
+    /// carried but not thresholded for the other kinds, which are admitted
+    /// on validity — see "Per-kind admission".
     confidence: f32,
     polygon_within_image: Vec<Point>,
     page_polygon: Vec<Point>,
@@ -218,6 +250,82 @@ The image transform maps each spotted polygon — denormalized from the 0–999
 grid to input pixels — into MuPDF page coordinates. Precise page polygons
 allow exact search to highlight `Knowledge base` rather than the entire page
 or image.
+
+### Task prompts and routing (amended 2026-08-29)
+
+PaddleOCR-VL 1.6 was post-trained on six task prompts. Wilkes drives four of
+them; the strings are the model's, exactly, and are not paraphrased:
+
+| Prompt | Produces | Wilkes' canonical form |
+| --- | --- | --- |
+| `Spotting:` | text instances with `<|LOC_nnn|>` quads | reading text, per-region polygons |
+| `Formula Recognition:` | LaTeX | LaTeX, verbatim |
+| `Table Recognition:` | table structure | Markdown table |
+| `Chart Recognition:` | chart contents | Markdown table |
+| `OCR:` | plain text, no geometry | *not driven* — `Spotting:` is `OCR:` plus the coordinates, and running both would be two answers to one question |
+| `Seal Recognition:` | seal text | *not driven* — deferred, unmeasured |
+
+`Spotting:` remains the only prompt that returns geometry. The other three
+return content for the crop they are given and nothing about where it sits,
+which is the whole of the routing problem: **something must decide what a
+region contains before a prompt can be chosen for it.**
+
+#### Routing is a layout detector, decided once
+
+"LaTeX decision analysis" left three options open. One is now closed by
+evidence and one by design:
+
+- **Self-classification is ruled out.** The 1.6 model card documents six
+  task-specific prompts and no unified parsing prompt; the official pipeline
+  routes with PP-DocLayoutV2 before the VLM ever sees a region. The
+  hypothesis that 1.6 might self-classify a figure crop was worth checking
+  and did not survive the check.
+- **Running every prompt and arbitrating is rejected.** It costs 4× the
+  decode per crop, and it needs an arbitration rule — is this "valid" LaTeX
+  a formula or a bar chart the formula prompt hallucinated over? — that
+  exists only until phase 3 lands a detector and makes it dead code. Adding a
+  second routing mechanism with a known expiry date is the thing this
+  codebase's rules exist to prevent.
+- **The layout detector moves from phase 3 to now.** The roadmap already
+  committed to a PP-DocLayoutV2-class ONNX detection graph
+  (RT-DETR/PicoDet) for native vector regions. It is the same routing
+  question, and one router answering it twice is the structural fix; two
+  routers, one temporary, is the ad-hoc one.
+
+The cost of this decision is honest and should not be understated: it breaks
+"no new artifacts" for the prompt work. It adds one detection graph — tens of
+megabytes against the recognizer's 1.9 GB — and its digest joins the
+extraction identity, which the original design explicitly did not have to
+carry ("No detector or dictionary digest", under "Determinism, caching, and
+identity"). That paragraph is amended by this one: the pipeline now has a
+detector, so the recipe names it. What it buys is that phases 2 and 3 share a
+mechanism instead of each having their own.
+
+The detector runs on the `ort` already in the tree. Wilkes uses the model
+artifacts and owns the pre- and post-processing, as the roadmap specified —
+not the OAR crate.
+
+#### Per-kind admission
+
+Confidence-thresholding is a text rule and does not transfer. Each kind is
+admitted by what makes *that* kind wrong:
+
+- **Text** keeps the existing rule: mean token probability against the
+  engine's tested threshold.
+- **Formula** is admitted on validity: the LaTeX must parse. An
+  autoregressive decoder that truncates mid-expression produces high-
+  confidence invalid LaTeX, so confidence is the wrong question. A formula
+  that does not parse is a rejected region with a recorded reason, never a
+  string inserted and hoped over.
+- **Table** is admitted on structure: the parse must yield a rectangular
+  table of at least two rows and two columns, every row the same width. A
+  ragged table is a failed recognition wearing the shape of a result.
+- **Chart** is admitted as a table, by the same rule, and is labeled
+  distinctly in the reading — a chart transcribed to rows is a
+  *reconstruction*, not a quotation, and must not be presented as one.
+
+Every rejection is recorded in diagnostics with its kind and its reason, as
+low-confidence text regions already are.
 
 ### Admission and normalization
 
@@ -597,6 +705,30 @@ The labels `Image embedded text:` and `Image description:` are deliberate:
 - exports remain interpretable without private metadata;
 - generated claims are not presented as literal source text.
 
+Amended 2026-08-29: one label per recognized kind, on the same reasoning.
+A reader and an LLM must be able to tell a transcription from a
+reconstruction without consulting metadata:
+
+| Kind | Label | Body |
+| --- | --- | --- |
+| Text | `Image embedded text:` | the reading, regions separated as today |
+| Formula | `Image embedded formula:` | LaTeX, verbatim, no fencing added |
+| Table | `Image embedded table:` | a Markdown table |
+| Chart | `Image transcribed chart:` | a Markdown table |
+
+`Image transcribed chart:` deliberately does not say *embedded*. The other
+three labels name content that is present in the image and was read; a chart
+rendered as rows is Wilkes' reconstruction of what the picture depicts, and
+the label is the only place a consumer learns that. This is the same
+distinction the `Image description:` label already draws, applied to a case
+that sits between quotation and description.
+
+Tables serialize as Markdown, as decided under "Roadmap → Decisions taken
+now" — one canonical table format, versioned in the recipe. The
+`Table Recognition:` prompt's own output format is converted to it; whatever
+the model emits is an engine token format and does not cross the extraction
+boundary, exactly as `<|LOC_nnn|>` does not.
+
 Add structured metadata beside canonical text:
 
 ```rust
@@ -617,6 +749,11 @@ enum TextProvenance {
     ImageOcr {
         image_id: String,
         confidence: Option<f32>,
+        /// Amended 2026-08-29. Which prompt produced these bytes. A formula
+        /// and a paragraph are both recognized content and are not the same
+        /// claim about the document, so provenance names the kind rather
+        /// than leaving a consumer to infer it from the label.
+        kind: RegionKind,
     },
     ImageDescription {
         image_id: String,
@@ -652,6 +789,13 @@ as a structural unit:
 - Prefer a boundary immediately after the block.
 - If a large block exceeds the configured size, split at OCR-region or
   paragraph boundaries while retaining the same image locator.
+- **Never split inside a formula or a table** (amended 2026-08-29). Half a
+  LaTeX expression is not a shorter expression, it is an invalid one, and
+  half a Markdown table is not a smaller table. A formula or table that
+  exceeds the configured chunk size is its own oversized chunk; the
+  alternative is a chunk that reconstructs to bytes no consumer can parse.
+  This is a stronger rule than the region-boundary preference above, and it
+  overrides it.
 - Do not overlap unrelated body prose across the image boundary.
 - Continue satisfying the existing byte-for-byte reconstruction invariant in
   [chunk.rs](crates/core/src/embed/index/chunk.rs:21).
@@ -667,6 +811,8 @@ page
 + decoded image pixel SHA-256
 + OCR engine crate/pipeline version
 + recognizer SHA-256
++ task-prompt set and per-kind admission rules   (amended 2026-08-29)
++ layout detector SHA-256 and its settings        (amended 2026-08-29)
 + OCR preprocessing and admission settings
 + description model revision
 + description prompt version
@@ -686,6 +832,12 @@ Three differences from the first sketch of this key, all as built:
   single checkpoint does detection and recognition in one pass, which is the
   reason it was selected. Keying on artifacts that do not exist would be
   pretending the pipeline is the one that was rejected.
+
+  *Superseded 2026-08-29.* There is now a detector — the routing graph — and
+  the key carries its SHA-256 and its post-processing settings. The reasoning
+  above was never "detectors do not belong in the key"; it was that keying on
+  an artifact this pipeline did not have would be pretending. It has one now,
+  so it names it. There is still no dictionary.
 - **The coordinate mapping and the technical limits are in the key.** Both
   are Wilkes' own and neither is inside the engine's settings, so neither
   would otherwise move the recipe. A region that moves is a different
@@ -719,6 +871,14 @@ images_ocr_failed
 ocr_regions_accepted
 ocr_regions_rejected_low_confidence
 ocr_regions_deduplicated_against_native_text
+regions_routed_by_kind{text,formula,table,chart}
+regions_unroutable
+formulas_accepted
+formulas_rejected_invalid_latex
+tables_accepted
+tables_rejected_malformed
+charts_accepted
+charts_rejected_malformed
 images_description_succeeded
 images_description_failed
 images_description_not_configured
@@ -819,9 +979,17 @@ not timing.
 ### LaTeX decision analysis
 
 LaTeX fidelity is a committed goal: the roadmap below exercises it in its
-second and third phases. It is still a scope change relative to this phase —
-formulas sit in the deferred list above — and this is the analysis that
-settled how it will be met:
+second and third phases. This is the analysis that settled how it will be
+met.
+
+**Resolved 2026-08-29.** The sentence that stood here — "it is still a scope
+change relative to this phase; formulas sit in the deferred list above" — no
+longer holds. Formulas, tables and charts are required scope; the routing
+question this analysis identified as decisive is answered under "Task prompts
+and routing"; the scope amendments it demanded (a serialization label,
+provenance, chunk boundaries, metrics) are made in their own sections rather
+than left as a list of things somebody should do. The analysis below is
+retained because its reasoning is what produced those answers:
 
 - The presumption flips to PaddleOCR-VL. Its formula recognition is the same
   pinned 0.9B weights behind a `Formula Recognition:` task prompt — no new
@@ -838,10 +1006,15 @@ settled how it will be met:
   classifier stage, running both the OCR and Formula prompts under one
   explicit tested admission rule (~2x compute), or verifying whether 1.6's
   unified parsing self-classifies figure crops.
+  → **Answered 2026-08-29:** self-classification does not exist in 1.6; the
+  multi-prompt rule is rejected as a mechanism with a built-in expiry; the
+  phase-3 layout detector moves forward and routes both cases.
 - Required scope amendments: an `Image embedded formula:` serialization
   label, formula provenance, chunk boundaries that never split inside a
   formula, and formula metrics (ExpRate/CDM-style plus a LaTeX-validity
   admission check) in the evaluation.
+  → **Made 2026-08-29**, under "Canonical representation and provenance",
+  "Chunking", and "Verification items" respectively.
 - LaTeX chiefly serves exact search, export, and reading fidelity. Text
   embedders handle raw LaTeX poorly, so semantic retrieval of formula
   content still rides on the describer's natural-language rendering.
@@ -862,21 +1035,31 @@ This document, with PaddleOCR-VL as the engine: MuPDF native image blocks,
 the spotting task for text and page polygons, the Qwen3-VL describer, and
 canonical labeled blocks.
 
-### Phase 2 — Formulas and tables inside figures
+### Phase 2 — Formulas, tables and charts inside figures
 
-Same crops, same weights, different task prompts: `Formula Recognition:`
-yields LaTeX, `Table Recognition:` yields a structured table. The new design
-work is the routing rule for what a crop contains — options recorded under
-"LaTeX decision analysis" — plus that section's serialization,
-provenance, and chunking amendments. This picks up equations embedded as
-images nearly for free.
+**Folded into scope 2026-08-29; no longer a later phase.** Same crops, same
+weights, different task prompts: `Formula Recognition:` yields LaTeX,
+`Table Recognition:` and `Chart Recognition:` yield Markdown tables. The
+routing rule is decided (a layout detector, brought forward from phase 3) and
+the serialization, provenance, chunking and metric amendments are made in
+their own sections.
+
+The phrase this section used to end on — "nearly for free" — was wrong, and
+the correction is the substance of the amendment. The prompts are free; the
+*routing* is not, and it was the whole cost all along. Pricing it honestly is
+what moved the detector forward instead of leaving a cheap-looking phase that
+could not be built.
 
 ### Phase 3 — Native vector tables and formulas
 
 Born-digital PDFs draw most tables and math as vector content, invisible to
-the image-block scope. The blocker is region detection, and the routing
-problem that recurs through this document has one answer Wilkes can hold
-without the OAR migration: PP-DocLayoutV2-class layout detectors
+the image-block scope. Amended 2026-08-29: the detector below is no longer
+introduced here — phase 2 brings it forward and phase 3 inherits it. What
+remains phase 3 is running it over a *rendered page* rather than an image
+crop, and the reading-anchor placement that follows. The blocker is region
+detection, and the routing problem that recurs through this document has one
+answer Wilkes can hold without the OAR migration: PP-DocLayoutV2-class layout
+detectors
 (RT-DETR/PicoDet) are plain ONNX detection graphs — OAR's registry hosts
 ONNX conversions — and Wilkes already carries `ort = "=2.0.0-rc.11"` for
 FastEmbed. Wilkes uses the model artifacts, not the OAR crate, and owns the
@@ -912,7 +1095,35 @@ labeled block at the region's reading anchor.
 - Phase 1: the candle `paddleocr_vl` module drives the 1.5/1.6 checkpoints
   and task prompts, and `<|LOC|>` output parses to usable quads.
 - Phase 3: the chosen layout detector's ONNX opset runs on the pinned
-  `ort = "=2.0.0-rc.11"`.
+  `ort`. Amended 2026-08-29: this is now a phase 2 item, and the pin is no
+  longer `=2.0.0-rc.11` — see the note on `ort` below.
+
+Added 2026-08-29, for the prompt work:
+
+- The candle `paddleocr_vl` module accepts `Formula Recognition:`,
+  `Table Recognition:` and `Chart Recognition:` against the shipped
+  checkpoint, and each returns parseable output for a known-good crop. This
+  is the first item and it gates the rest: the module was verified for
+  spotting only, and a prompt the module cannot drive is a decision to
+  reopen, not a bug to work around.
+- The layout detector's opset runs on the `ort` in the tree, and its
+  labels map onto `RegionKind` without a residual class that has nowhere to
+  go.
+- Formula metrics on the evaluation corpus: ExpRate/CDM-style accuracy plus
+  the LaTeX-validity admission check, reported beside the existing character
+  error and coordinate accuracy.
+- Table metrics: TEDS, or a stated reason for a different measure.
+- End to end, a page whose only equation is a raster image resolves that
+  equation's LaTeX through exact search.
+
+**On the `ort` pin.** This document's acceptance list contains "no new
+inference dependency, toolchain change, or `ort` bump entered", and that was
+true of the phase it audited. Both halves are now superseded: the detector is
+a second inference path, and
+[recognition-engine.md](specs/recognition-engine.md) moves the pin to
+`=2.0.0-rc.13` for reasons of its own. The two changes must land in one
+`ort` version, not two — whichever ships first sets it, and the other is
+written against it.
 
 Nothing here is scheduled; the roadmap records order and decisions, not
 timing.
@@ -1043,10 +1254,30 @@ The scoped feature is complete only when:
   results.
 - The recognizer and describer run on the already-pinned candle runtime; no
   new inference dependency, toolchain change, or `ort` bump entered.
+  *(Superseded 2026-08-29 — the routing detector is a second inference path
+  and the pin moves. See "Verification items → On the `ort` pin".)*
 - PaddleOCR-VL alone owns OCR behavior; no `ocrs`, Tesseract, OAR, or
-  runtime fallback is retained.
+  runtime fallback is retained. *(Still holds, and note what it says: no
+  fallback. A second **selectable** recognizer, named in the recipe, is a
+  different thing — see [recognition-engine.md](specs/recognition-engine.md).)*
 - No caption association, vector reconstruction, scanned-page layout inference,
   or whole-page VLM parsing has entered this phase implicitly.
+
+Added 2026-08-29 for the prompt work, and **none of these is met yet**:
+
+- Every one of the four driven task prompts produces canonical output under
+  its own label, and a fifth kind cannot appear without a label.
+- A formula that does not parse as LaTeX is rejected with a recorded reason
+  and does not reach the reading.
+- A table region reaches the reading as a Markdown table, or is rejected;
+  the engine's own table format never crosses the extraction boundary.
+- A chart is labeled as a transcription, not as embedded content.
+- No chunk boundary falls inside a formula or a table, and byte-for-byte
+  reconstruction still holds across an oversized one.
+- The task-prompt set and the detector digest are both in the extraction
+  identity, and changing either forces re-extraction.
+- Routing is one mechanism. There is no second path that decides what a
+  region contains.
 
 ### Where the list stands, 2026-08-28
 
@@ -1082,3 +1313,19 @@ The selected first implementation is therefore **MuPDF native image blocks +
 PaddleOCR-VL spotting + a Qwen3-VL describer through the candle engine +
 canonical-text integration**. More ambitious figure detection remains a
 later, explicit feature rather than an accidental expansion of this one.
+
+### Status after the 2026-08-29 amendment
+
+The audit above is a record of 2026-08-28 and is not restated as current.
+Against the amended scope, this document now describes:
+
+| | |
+| --- | --- |
+| **Completed** | Everything in the table above: native image discovery, `Spotting:`, admission, canonical integration, provenance, chunking, identity, diagnostics. Twelve of thirteen criteria, each held by a named test. |
+| **Partial** | The polygon criterion, unchanged — the mechanism holds, the sample does not, and `a_label_split_across_two_drawn_lines_is_two_regions_in_the_reading` keeps it from being forgotten. |
+| **Specified, not built** | The three added task prompts, the routing detector, per-kind admission, the three new labels, `RegionKind` on regions and provenance, the formula and table chunk rule, the identity additions, and the eight criteria added above. |
+
+Nothing in the third row has been implemented. This amendment moves it out of
+the roadmap and into scope; it does not move it into the build. The first
+verification item — that the candle module drives the three prompts at all —
+gates every other item in that row and has not been run.

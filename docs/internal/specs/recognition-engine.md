@@ -213,14 +213,22 @@ quadrilaterals. So the honest catalogue entry is:
 | model | task configuration | emits |
 |---|---|---|
 | `paddleocr-vl-1.6` | `spotting-v2` | `Text` |
+| `paddleocr-vl-1.6` | `parsing-v1` | `Text`, `Formula`, `Table`, `Chart` |
 | `granite-docling-258M` | `doctags-v1` | `Text`, `Formula`, `Table`, `Picture`, `Chart`, `Code`, `Caption` |
 
 The difference is one of integration, not capability, and the table must not be
-read as "Paddle cannot do tables". Driving PaddleOCR-VL's other task prompts is
-a later, separate change: it is a second decode per image per task, which is a
-cost decision, and it would be a new task-configuration id with a new recipe
-identity. It is out of scope here and this design must not be taken to have
-closed it off — the `emits` field is precisely what makes it expressible later.
+read as "Paddle cannot do tables". `parsing-v1` is
+[FIGURE.md](../FIGURE.md)'s 2026-08-29 amendment: PaddleOCR-VL's
+`Formula Recognition:`, `Table Recognition:` and `Chart Recognition:` prompts
+driven beside `Spotting:`, with a layout detector routing regions to them.
+It is a distinct task configuration with its own recipe identity, so a library
+read under `spotting-v2` is untouched by its arrival.
+
+The two engines reach the same kinds by different means, and the difference is
+worth stating because it is the strongest argument for the ONNX default:
+granite-docling self-classifies in one decode, so it needs no router at all,
+while `parsing-v1` needs a detection graph and one decode per routed region.
+Neither is a fallback for the other; the recipe names which produced a reading.
 
 Because `emits` is keyed on the task configuration, it already lives inside the
 identity string via `EXTRACTION_SETTINGS_VERSION`. Nothing new needs to be
@@ -431,9 +439,13 @@ exist, which is not.
 
 ## 10. What this does not settle
 
-- **Driving PaddleOCR-VL's other task prompts** (table, formula, chart). §5.3
-  makes it expressible; it is not implemented here, and the `emits` column must
-  not be read as a statement about the model's capability.
+- **Driving PaddleOCR-VL's other task prompts** (table, formula, chart) is
+  specified in [FIGURE.md](../FIGURE.md) as `parsing-v1`, not here. §5.3 makes
+  it expressible and the two documents must stay agreed on one thing: `emits`
+  is keyed on the task configuration, so neither document may state a model's
+  kinds without naming the configuration alongside. The `ort` pin is the other
+  shared surface — §5.6 moves it to rc.13 and FIGURE.md's routing detector runs
+  on whatever it lands at. One version, not two.
 - **The tile budget as a user-facing setting.** §5.7 fixes it at the config's
   2048 longest edge for now. It is the dominant cost and it belongs in the task
   configuration id, so exposing it later is a recipe change, not a preference.
