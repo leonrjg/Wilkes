@@ -4,6 +4,14 @@
 
 ### Added
 
+- The managed corpus lifecycle is addressed at `/api/corpora/*`, and
+  `/api/integrations/underdog/` is gone. A route path that names one consumer
+  claims that surface belongs to it; a corpus belongs to whichever application
+  created it, and `owner` — which the ensure request now carries — is where
+  that is said. Nothing about the corpus contract changes: the six routes,
+  their shapes and their refusals are what they were, at paths that describe
+  what they do rather than who asked.
+
 - Passages are addressed at `/api/chunks/{resolve,accumulate,similarity,search}`
   with one vocabulary: a `scope` naming the index and stable `ChunkRef`s naming
   the passages. Every one of these existed twice — once taking a corpus id and
@@ -46,7 +54,7 @@
   about ownership that was never true.
 
 - A managed corpus can carry more than one embedding space.
-  `PUT /api/integrations/underdog/spaces` adds a projection of an existing
+  `PUT /api/corpora/spaces` adds a projection of an existing
   corpus under a second model: it reads that corpus's admitted renditions and
   computes only its own vectors, so the source is retained once, extracted
   once, and every space shares the same rendition ids and chunk refs. The

@@ -2150,20 +2150,11 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             "/api/workspaces/{id}/activate",
             post(switch_workspace_handler),
         )
+        .route("/api/corpora", put(ensure_managed_workspace_handler))
+        .route("/api/corpora/spaces", put(ensure_managed_space_handler))
+        .route("/api/corpora/status", get(managed_workspace_status_handler))
         .route(
-            "/api/integrations/underdog/workspace",
-            put(ensure_managed_workspace_handler),
-        )
-        .route(
-            "/api/integrations/underdog/spaces",
-            put(ensure_managed_space_handler),
-        )
-        .route(
-            "/api/integrations/underdog/status",
-            get(managed_workspace_status_handler),
-        )
-        .route(
-            "/api/integrations/underdog/documents/import",
+            "/api/corpora/documents/import",
             post(import_managed_document_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route("/api/chunks/resolve", post(chunks_resolve_handler))
@@ -2186,14 +2177,8 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/catalogue/sync", post(catalogue_sync_handler))
         .route("/api/catalogue/status", get(catalogue_status_handler))
         .route("/api/catalogue/acquire", post(catalogue_acquire_handler))
-        .route(
-            "/api/integrations/underdog/backup",
-            post(managed_backup_handler),
-        )
-        .route(
-            "/api/integrations/underdog/restore",
-            post(managed_restore_handler),
-        )
+        .route("/api/corpora/backup", post(managed_backup_handler))
+        .route("/api/corpora/restore", post(managed_restore_handler))
         .route("/api/bookmarks", get(list_bookmarks_handler))
         .route("/api/bookmarks", post(add_bookmark_handler))
         .route("/api/bookmarks/clusters", post(cluster_bookmarks_handler))
