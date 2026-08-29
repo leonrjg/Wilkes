@@ -1140,15 +1140,41 @@ it — `the_render_pads_a_sliver_with_paper_and_not_with_the_rest_of_the_page`
 runs the produced canvas through `granite_docling::tile_grid` and requires one
 row — and it is the only place the two modules meet.
 
-**Known, and not fixed here: embedded figures are squashed.** `prepare_tiles`
-resizes an image onto the tile grid without padding it first, so any image
-whose aspect is not exactly `cols:rows` is distorted on the way in — the
-worked example's 1559x499 figure arrives at 2048x1024, a 1.56x vertical
-stretch. That is the same defect as the one above on the other side of the
-boundary, and fixing it properly means moving the fit into `prepare_tiles`,
-which owns the grid, and correcting recognized coordinates back through the
-pad. It changes what every embedded image looks like to the model, so it needs
-`doctags-v1` to move and the library to re-read. Not done.
+**Withdrawn: "embedded figures are squashed" was not a defect.** This section
+briefly recorded one — `prepare_tiles` resizes an image onto the tile grid
+without padding it first, so the worked example's 1559x499 figure arrives at
+2048x1024, a 1.56x vertical stretch — and proposed letterboxing it. Checked
+against the reference before building it, and the claim was wrong.
+
+granite-docling's `preprocessor_config.json` names `Idefics3ImageProcessor`
+with `size.longest_edge: 2048` and `max_image_size.longest_edge: 512`, and that
+processor's `resize_for_vision_encoder` is:
+
+```python
+if width >= height:
+    width = ceil(width / 512) * 512
+    height = int(width / aspect_ratio)
+    height = ceil(height / 512) * 512
+```
+
+followed by a plain resize to those dimensions. Both edges are rounded up
+independently and the image is then stretched onto the result — the *reference*
+distorts, by construction, and 1559x499 goes to 2048x1024 there too.
+`tile_grid` reproduces it. (`do_pad: true` in that config pads a *batch* to a
+common size; it is not aspect-preserving letterboxing of one image.)
+
+So the stretch is what the weights were trained and evaluated under, and every
+page in training carried it — a portrait page is stretched about 30% wide by
+the same rule. Letterboxing instead would take the model off the distribution
+it learned, in exchange for a property nobody measured wanting. Not a fix, and
+not done.
+
+What this does *not* excuse is an arbitrary stretch. The typeset crop is
+Wilkes' own construction and can be any shape, and a 20:1 sliver resized onto a
+4:1 grid is a 5x distortion the model never saw at any point. Padding it to
+4:1 keeps the distortion inside the range the reference produces from real
+pages, which is the justification for that padding and the reason it lives in
+the module that makes the crop rather than in the one that tiles it.
 
 **Cost is bounded and the bound is reported.** Recognition is tens of seconds
 a region, so inline mathematics is deliberately unreachable — the unit is the

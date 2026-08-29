@@ -231,6 +231,25 @@ pub fn install(
 /// whole tiles, because the split is an exact partition and a remainder strip
 /// would be silently dropped rather than padded.
 ///
+/// **Rounding both edges independently stretches the image, and that is
+/// correct.** It reproduces `Idefics3ImageProcessor::resize_for_vision_encoder`
+/// — the processor this checkpoint's `preprocessor_config.json` names — which
+/// does exactly this and then resizes onto the result:
+///
+/// ```text
+/// if width >= height:
+///     width  = ceil(width / 512) * 512
+///     height = int(width / aspect_ratio)
+///     height = ceil(height / 512) * 512
+/// ```
+///
+/// So a 1559x499 figure arrives at 2048x1024 here and in the reference alike,
+/// and a portrait page is stretched about 30% wide by the same rule. Every
+/// image the weights were trained on carried that distortion. Letterboxing the
+/// image onto the grid instead — which reads like the obvious fix, and was
+/// proposed once — would take the model off the distribution it learned, so it
+/// is deliberately not done. See FIGURE.md, "Withdrawn".
+///
 /// Returned rather than applied so the cost is inspectable: a page at the
 /// default bound is 16 tiles plus a thumbnail, and 17 x 64 = 1088 visual
 /// tokens is the prefill that dominates a laptop's wall-clock.
