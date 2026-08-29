@@ -298,8 +298,7 @@ impl WorkerRuntime {
             }
         };
 
-        let mut log_req = req.clone();
-        log_req.texts = None;
+        let log_req = req.redacted_for_log();
         tracing::info!(
             "WorkerManager: sending request: {:?}",
             serde_json::to_string(&log_req).unwrap_or_default()

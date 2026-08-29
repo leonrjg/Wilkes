@@ -292,8 +292,7 @@ async fn main() -> anyhow::Result<()> {
             WorkerLoopAction::Cancel => {}
             WorkerLoopAction::ParseError(message) => sink.emit(WorkerEvent::Error(message)),
             WorkerLoopAction::Dispatch(req) => {
-                let mut log_req = req.clone();
-                log_req.texts = None;
+                let log_req = req.redacted_for_log();
                 tracing::info!(
                     "[worker] received request: {}",
                     serde_json::to_string(&log_req).unwrap_or_default()

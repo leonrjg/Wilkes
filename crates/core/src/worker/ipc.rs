@@ -122,6 +122,34 @@ pub struct WorkerRequest {
     pub recognize: Option<RecognitionRequest>,
 }
 
+impl WorkerRequest {
+    /// This request with its bulk payloads replaced by their size, for logging.
+    ///
+    /// One owner, because there are two callers and the interesting failure is
+    /// a new payload field that one of them forgets: a recognition request
+    /// carries a whole PNG as base64, and logging it verbatim writes megabytes
+    /// per image into the log a person is reading to find out whether
+    /// recognition is running at all.
+    ///
+    /// A size rather than nothing. Dropping the field would make a request
+    /// that carries an image indistinguishable, in the log, from one that
+    /// forgot to — which is a real error with its own error message.
+    pub fn redacted_for_log(&self) -> Self {
+        let mut redacted = self.clone();
+        redacted.texts = self
+            .texts
+            .as_ref()
+            .map(|texts| vec![format!("<{} text(s)>", texts.len())]);
+        redacted.recognize = self.recognize.as_ref().map(|request| RecognitionRequest {
+            image_png_base64: format!(
+                "<{} base64 chars of PNG>",
+                request.image_png_base64.len()
+            ),
+        });
+        redacted
+    }
+}
+
 fn default_mode() -> String {
     "embed".to_string()
 }
@@ -246,6 +274,49 @@ mod tests {
         let de: WorkerRequest = serde_json::from_value(json).unwrap();
         assert_eq!(de.mode, "embed");
         assert_eq!(de.model, "model");
+    }
+
+    /// Nothing a request carries in bulk reaches the log. The image is the
+    /// one that hurts: a page-width figure is megabytes of base64, and it
+    /// would be written once per image into the log someone is reading to
+    /// find out whether recognition is running.
+    #[test]
+    fn a_logged_request_carries_the_size_of_its_payloads_and_not_their_contents() {
+        let mut request = sample_request();
+        request.mode = "recognize".to_string();
+        request.texts = Some(vec!["one".to_string(), "two".to_string()]);
+        request.recognize = Some(RecognitionRequest {
+            image_png_base64: "QUJD".repeat(4096),
+        });
+
+        let logged = serde_json::to_string(&request.redacted_for_log()).unwrap();
+        assert!(!logged.contains("QUJD"), "the image reached the log: {logged}");
+        assert!(!logged.contains("\"one\""), "the texts reached the log: {logged}");
+        // Present, and sized: an absent payload is a different request and a
+        // real error, and the log must not make the two look alike.
+        assert!(logged.contains("16384 base64 chars"), "{logged}");
+        assert!(logged.contains("2 text(s)"), "{logged}");
+        assert!(logged.contains("recognize"), "{logged}");
+
+        // What is not bulk is still there to read.
+        assert!(logged.contains("model"), "{logged}");
+        assert!(logged.contains("cpu"), "{logged}");
+    }
+
+    /// Redaction is for the log only. What actually goes to the worker is
+    /// untouched — the two are separate values and the request is not
+    /// consumed by being logged.
+    #[test]
+    fn redacting_for_the_log_does_not_touch_the_request_that_is_sent() {
+        let mut request = sample_request();
+        request.recognize = Some(RecognitionRequest {
+            image_png_base64: "QUJD".to_string(),
+        });
+        let _ = request.redacted_for_log();
+        assert_eq!(
+            request.recognize.as_ref().unwrap().image_png_base64,
+            "QUJD"
+        );
     }
 
     #[test]

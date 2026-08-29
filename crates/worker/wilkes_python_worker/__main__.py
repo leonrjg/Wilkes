@@ -32,6 +32,19 @@ def configure_logging():
     except ImportError:
         pass
 
+# Mirrors WorkerRequest::redacted_for_log on the Rust side. A payload logged
+# verbatim is megabytes a line — a base64 image especially — and the log is
+# what someone reads to find out whether the worker is doing anything.
+BULK_FIELDS = ("texts", "recognize")
+
+
+def redacted_for_log(request: WorkerRequest) -> dict:
+    return {
+        key: f"<{key} payload>" if key in BULK_FIELDS else value
+        for key, value in request.items()
+    }
+
+
 def main():
     configure_logging()
     
@@ -42,7 +55,7 @@ def main():
 
         try:
             request: WorkerRequest = json.loads(line)
-            sys.stderr.write(f"Request: {json.dumps({k: v for k, v in request.items() if k != 'texts'})}\n")
+            sys.stderr.write(f"Request: {json.dumps(redacted_for_log(request))}\n")
             mode = request.get("mode", "embed")
 
             if mode == "embed":
