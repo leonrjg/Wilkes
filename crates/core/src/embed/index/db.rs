@@ -2274,6 +2274,65 @@ mod tests {
         }
     }
 
+    /// A rebuild that merges into the existing database must still report
+    /// itself as the last build. The merge path returns the live database and
+    /// drops the temporary one it filled, so a stamp written at creation — or
+    /// into the temporary — left the panel showing the age of the file while
+    /// its contents were rebuilt underneath it.
+    #[test]
+    fn a_rebuild_that_merges_still_moves_the_build_stamp_forward() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("doc.txt");
+        fs::write(&path, "body").unwrap();
+
+        let registry = ExtractorRegistry::new();
+        let build = || {
+            let (tx, _rx) = tokio::sync::mpsc::channel(10);
+            SemanticIndex::build(
+                &data_dir,
+                &root,
+                std::slice::from_ref(&path),
+                &registry,
+                &CountingEmbedder::new(),
+                tx,
+                Arc::new(AtomicBool::new(false)),
+                &txt_indexing(),
+            )
+            .unwrap()
+        };
+
+        let first = build().status();
+        let first_built_at = first.built_at.expect("a build records when it finished");
+        assert!(
+            first.build_duration_ms.is_some(),
+            "a build records how long it took"
+        );
+
+        // Far enough back that the second build's stamp cannot tie with the
+        // first at one-second resolution.
+        SemanticIndex::open_exact(
+            &data_dir,
+            &CountingEmbedder::new().embedding_space_identity(),
+        )
+        .unwrap()
+        .conn
+        .execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('built_at', ?1)",
+            params![(first_built_at - 3600).to_string()],
+        )
+        .unwrap();
+
+        let second = build().status();
+        assert!(
+            second.built_at.unwrap() >= first_built_at,
+            "the rebuild left a stale stamp: {:?} < {first_built_at}",
+            second.built_at
+        );
+    }
+
     #[test]
     fn test_backfill_missing_full_text_fills_only_unchanged_stale_rows() {
         use std::sync::Mutex;
@@ -3255,15 +3314,6 @@ impl SemanticIndex {
 
         Self::create_schema(&conn, embedding_identity)?;
 
-        let built_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('built_at', ?1)",
-            params![built_at.to_string()],
-        )?;
-
         let mut index = Self {
             conn,
             dimension: embedding_identity.dimension,
@@ -3414,12 +3464,6 @@ impl SemanticIndex {
             }
         }
 
-        let duration_ms = start_time.elapsed().as_millis() as u64;
-        idx.conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('build_duration_ms', ?1)",
-            params![duration_ms.to_string()],
-        )?;
-
         idx.finish_active_root_build()?;
         idx.validate_embedding_space(&embedding_identity)?;
         let integrity: String = idx
@@ -3489,7 +3533,34 @@ impl SemanticIndex {
             }
         };
         live.activate_root(root_path)?;
+        live.record_build_completion(start_time.elapsed())?;
         Ok(live)
+    }
+
+    /// Record that a build finished now, and how long it took.
+    ///
+    /// Written to whichever database ends up live, at the end, because that is
+    /// the only point at which both facts are true of it. Creating a file is
+    /// not building an index and filling a temporary one is not either: a
+    /// build that merges into an existing database drops the temporary it
+    /// filled, so a stamp made at creation left the live database reporting
+    /// the age of the file while its contents were rebuilt underneath. The
+    /// elapsed time is taken here rather than before the merge so it covers
+    /// the whole build the user waited through.
+    fn record_build_completion(&self, elapsed: std::time::Duration) -> anyhow::Result<()> {
+        let finished_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('built_at', ?1)",
+            params![finished_at.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('build_duration_ms', ?1)",
+            params![(elapsed.as_millis() as u64).to_string()],
+        )?;
+        Ok(())
     }
 
     fn create_schema(conn: &Connection, identity: &EmbeddingSpaceIdentity) -> anyhow::Result<()> {
