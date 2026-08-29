@@ -18,7 +18,11 @@ mod corpus;
 pub mod describe;
 /// What recognizers exist and how one is addressed, engine by engine.
 pub mod dispatch;
+#[cfg(feature = "recognize-onnx")]
+pub mod granite_docling;
 pub mod ocr;
+#[cfg(feature = "recognize-onnx")]
+pub mod onnx_vlm;
 /// The external door for description: whatever the user has pulled into
 /// Ollama, asked with the same prompt as the first-class path.
 pub mod ollama;
@@ -277,16 +281,19 @@ pub fn build_analyzer(
     if !settings.enabled {
         return Ok(None);
     }
-    let engine = dispatch::RecognitionEngine::default();
-    let model_id = dispatch::shipped_model_id(engine);
+    let engine = settings.engine;
+    let model_id = settings
+        .model
+        .clone()
+        .unwrap_or_else(|| engine.default_model().to_string());
     anyhow::ensure!(
-        dispatch::installed(engine, model_id, model_dir)?,
+        dispatch::installed(engine, &model_id, model_dir)?,
         "the '{model_id}' recognizer is enabled but not installed"
     );
     let recognizer = worker_ocr::attach(
         recognizers,
         engine,
-        model_id,
+        &model_id,
         model_dir.to_path_buf(),
         cache_dir.join("recognition-scratch"),
         settings.device.as_deref().unwrap_or("auto"),
@@ -303,30 +310,53 @@ pub fn build_analyzer(
     Ok(Some(Arc::new(analyzer)))
 }
 
-#[cfg(feature = "candle")]
-/// Whether the recognizer the shipped recipe names is installed and intact.
-pub fn recognizer_installed(data_dir: &std::path::Path) -> bool {
-    paddleocr_vl::is_installed(data_dir, &paddleocr_vl::SHIPPED_CHECKPOINT)
+/// Whether a recognizer is installed and intact.
+///
+/// Keyed by engine and model, like every other question about a recognizer.
+/// It used to answer only for the shipped PaddleOCR-VL checkpoint, which was
+/// indistinguishable from the right answer while there was one recognizer.
+pub fn recognizer_installed(
+    engine: dispatch::RecognitionEngine,
+    model_id: &str,
+    data_dir: &std::path::Path,
+) -> bool {
+    dispatch::installed(engine, model_id, data_dir).unwrap_or(false)
 }
 
-#[cfg(feature = "candle")]
-/// What the shipped recognizer is, where it came from, and under what terms.
+/// Whether the recognizer the default recipe names is installed.
+pub fn default_recognizer_installed(data_dir: &std::path::Path) -> bool {
+    let engine = dispatch::RecognitionEngine::default();
+    recognizer_installed(engine, engine.default_model(), data_dir)
+}
+
+/// What a recognizer is, where it came from, and under what terms.
 ///
 /// Static: this describes the recipe, not the machine, so it answers before
 /// anything is installed. That is the point of it — the terms and the size are
-/// disclosed where the download is offered, rather than after 1.9 GB has
+/// disclosed where the download is offered, rather than after the bytes have
 /// arrived.
-pub fn recognizer_inventory() -> paddleocr_vl::RecognizerInventory {
-    paddleocr_vl::inventory(&paddleocr_vl::SHIPPED_CHECKPOINT)
+pub fn recognizer_inventory(
+    engine: dispatch::RecognitionEngine,
+    model_id: &str,
+) -> anyhow::Result<crate::types::RecognizerInventory> {
+    dispatch::inventory(engine, model_id)
 }
 
-#[cfg(feature = "candle")]
-/// Download and verify the recognizer the shipped recipe names.
+/// What every recognizer this build can read with is, described.
+pub fn recognizer_catalogue(
+    data_dir: &std::path::Path,
+) -> Vec<dispatch::RecognizerDescriptor> {
+    dispatch::list_models(data_dir)
+}
+
+/// Download and verify a recognizer.
 pub fn install_recognizer(
+    engine: dispatch::RecognitionEngine,
+    model_id: &str,
     data_dir: &std::path::Path,
     progress: Option<crate::models::progress::ProgressTx>,
 ) -> anyhow::Result<()> {
-    paddleocr_vl::install(data_dir, &paddleocr_vl::SHIPPED_CHECKPOINT, progress)
+    dispatch::install(engine, model_id, data_dir, progress)
 }
 
 /// One configured way to enrich native images.
@@ -809,7 +839,7 @@ mod tests {
             format!("{error:#}").contains("recognizer"),
             "the failure should name what is missing: {error:#}"
         );
-        assert!(!recognizer_installed(dir.path()));
+        assert!(!default_recognizer_installed(dir.path()));
     }
 
     /// FIGURE.md's acceptance criterion on identity, in one place: *model,

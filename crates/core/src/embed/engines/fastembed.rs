@@ -158,19 +158,19 @@ impl FastembedRuntimeFactory for RealFastembedRuntimeFactory {
     fn try_new(&self, request: FastembedInitRequest) -> anyhow::Result<TextEmbedding> {
         let providers = match request.execution_plan {
             FastembedExecutionPlan::CpuOnly => {
-                vec![ort::ep::CPUExecutionProvider::default().into()]
+                vec![ort::ep::CPU::default().into()]
             }
             FastembedExecutionPlan::CoreMlThenCpu => {
                 #[cfg(feature = "fastembed-coreml")]
                 {
                     vec![
-                        ort::ep::CoreMLExecutionProvider::default().into(),
-                        ort::ep::CPUExecutionProvider::default().into(),
+                        ort::ep::CoreML::default().into(),
+                        ort::ep::CPU::default().into(),
                     ]
                 }
                 #[cfg(not(feature = "fastembed-coreml"))]
                 {
-                    vec![ort::ep::CPUExecutionProvider::default().into()]
+                    vec![ort::ep::CPU::default().into()]
                 }
             }
         };

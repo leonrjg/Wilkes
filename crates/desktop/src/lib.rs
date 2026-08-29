@@ -2485,18 +2485,21 @@ async fn load_generation_model(app: AppHandle) -> Result<bool, String> {
 
 /// Whether the image recognizer the shipped recipe names is on disk.
 #[tauri::command]
-fn is_image_recognizer_installed(app: AppHandle) -> bool {
-    app_context(&app).is_image_recognizer_installed()
+async fn is_image_recognizer_installed(app: AppHandle) -> bool {
+    app_context(&app).is_image_recognizer_installed().await
 }
 
 /// What the image recognizer is, where it came from, and under what licence.
 /// Answers whether or not it is installed: it describes the recipe, and the
 /// point of it is to be readable before the download rather than after.
 #[tauri::command]
-fn image_recognizer_inventory(
+async fn image_recognizer_inventory(
     app: AppHandle,
-) -> wilkes_core::extract::image::paddleocr_vl::RecognizerInventory {
-    app_context(&app).image_recognizer_inventory()
+) -> Result<wilkes_core::types::RecognizerInventory, String> {
+    app_context(&app)
+        .image_recognizer_inventory()
+        .await
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// Download (if needed) and verify the image recognizer, then attach the

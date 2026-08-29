@@ -22,10 +22,59 @@ use super::AnalysisContext;
 /// is `n / 1000` of the way across the image it was given.
 pub const LOC_MAX: u16 = 1000;
 
+/// What a recognized region *is*, and therefore how its text is to be read.
+///
+/// A recognizer that only transcribes prose has no use for this and says
+/// `Text` for everything. One that parses a document does: a formula's text is
+/// LaTeX and a table's is a Markdown table, and a consumer that cannot tell
+/// them apart from prose will quote a table as if the document had written it
+/// in pipes.
+///
+/// The kind belongs to the region and not to the engine, because it is a
+/// property of what was read. Which kinds an engine can produce at all is a
+/// property of the engine *and its task configuration*, and is answered by the
+/// recognizer catalogue rather than inferred from here.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionKind {
+    /// Prose, a heading, a caption — the reading, verbatim.
+    #[default]
+    Text,
+    /// LaTeX.
+    Formula,
+    /// A Markdown table.
+    Table,
+    /// A Markdown table reconstructed from a chart. Distinct from `Table`
+    /// because it is Wilkes' reading of a picture rather than a transcription
+    /// of ruled cells, and a consumer is entitled to know which it has.
+    Chart,
+    /// A source-code listing, verbatim.
+    Code,
+}
+
+impl RegionKind {
+    /// The label this kind is serialized under in the canonical reading.
+    pub fn label(&self) -> &'static str {
+        match self {
+            RegionKind::Text => "Image embedded text:",
+            RegionKind::Formula => "Image embedded formula:",
+            RegionKind::Table => "Image embedded table:",
+            RegionKind::Chart => "Image transcribed chart:",
+            RegionKind::Code => "Image embedded code:",
+        }
+    }
+}
+
 /// One region as the model emitted it: text, an admission signal, and a
 /// quadrilateral in fractions of the image, before any of Wilkes' geometry.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SpottedRegion {
+    /// What `text` is. Defaulted so a stored region written before recognizers
+    /// distinguished kinds still reads as the prose it was.
+    #[serde(default)]
+    pub kind: RegionKind,
     pub text: String,
     /// Mean probability of the tokens that spell `text`, from the decode's own
     /// log-probabilities. Uncalibrated by construction — it says how sure the
@@ -155,6 +204,10 @@ fn finish(
         (logprobs.iter().sum::<f32>() / logprobs.len() as f32).exp()
     };
     Ok(Some(SpottedRegion {
+        // Spotting transcribes; it does not classify. Every region it
+        // produces is the reading, and saying so here is what keeps the kind
+        // a fact about the region rather than a guess made downstream.
+        kind: RegionKind::Text,
         text,
         confidence: confidence.clamp(0.0, 1.0),
         quad: [point(0), point(1), point(2), point(3)],

@@ -205,6 +205,7 @@ pub fn read_staged_image(path: &Path) -> anyhow::Result<image::RgbImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::ocr::RegionKind;
 
     /// The pixels the worker reads must be the pixels the host saw. A lossy
     /// staging would move the transcription of small type without moving the
@@ -385,6 +386,7 @@ mod tests {
     #[test]
     fn regions_round_trip_as_plain_json() {
         let regions = vec![SpottedRegion {
+            kind: RegionKind::Text,
             text: "Figure 1".to_string(),
             confidence: 0.87,
             quad: [

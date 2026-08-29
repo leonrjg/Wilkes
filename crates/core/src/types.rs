@@ -1201,6 +1201,18 @@ pub struct GenerationSettings {
 pub struct ImageAnalysisSettings {
     #[serde(default)]
     pub enabled: bool,
+    /// Which recognizer reads the pictures.
+    ///
+    /// Defaulted, and the default is the ONNX engine — which means a settings
+    /// file written before this field existed would silently change
+    /// recognizer, change the extraction recipe, and re-read every document
+    /// with a picture in it. `migrate_recognizer_choice` exists to stop that;
+    /// see its note.
+    #[serde(default)]
+    pub engine: crate::extract::image::dispatch::RecognitionEngine,
+    /// The recognizer's model id. Absent takes the engine's default.
+    #[serde(default)]
+    pub model: Option<String>,
     /// "auto", "cpu", "metal". Absent takes the recognizer's default.
     #[serde(default)]
     pub device: Option<String>,
@@ -1328,6 +1340,45 @@ impl EmbeddingEngine {
 pub struct CustomModel {
     pub engine: EmbeddingEngine,
     pub model_id: String,
+}
+
+// ── Recognizer inventory ──────────────────────────────────────────────────────
+
+/// One file of a recognizer, as an inventory names it.
+#[derive(Debug, Clone, Serialize)]
+pub struct InventoriedArtifact {
+    pub filename: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+/// What a recognizer is, where it came from, and under what terms.
+///
+/// FIGURE.md requires this of a redistributed checkpoint before it is
+/// packaged, and it is data rather than prose for the reason the pins
+/// themselves are: an inventory kept in a comment is one nobody can check.
+/// Every file the install writes appears here with the digest it is verified
+/// against, so the inventory describes the bytes on disk and not a
+/// recollection of them.
+///
+/// Wilkes fetches these artifacts at the user's request rather than shipping
+/// them inside the application, which is why the inventory is shown where the
+/// download is offered: the terms are disclosed before the bytes arrive, not
+/// after.
+///
+/// Lives here rather than in a model module because the desktop, server and
+/// MCP surfaces all name it. A type three API boundaries carry should not be
+/// owned by whichever recognizer happened to need it first.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecognizerInventory {
+    pub name: String,
+    pub repo: String,
+    pub revision: String,
+    pub license: String,
+    pub license_url: String,
+    pub derived_from: Vec<String>,
+    pub artifacts: Vec<InventoriedArtifact>,
+    pub footprint_bytes: u64,
 }
 
 // ── Semantic settings ─────────────────────────────────────────────────────────

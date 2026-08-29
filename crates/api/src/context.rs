@@ -4602,18 +4602,49 @@ impl AppContext {
         }
     }
 
-    /// Whether the recognizer the shipped recipe names is on disk and intact.
-    pub fn is_image_recognizer_installed(&self) -> bool {
-        wilkes_core::extract::image::recognizer_installed(&self.model_dir)
+    /// Whether the recognizer the settings name is on disk and intact.
+    pub async fn is_image_recognizer_installed(&self) -> bool {
+        let (engine, model_id) = self.configured_recognizer().await;
+        wilkes_core::extract::image::recognizer_installed(engine, &model_id, &self.model_dir)
+    }
+
+    /// The recognizer this Wilkes is configured to read with.
+    ///
+    /// One place answers it, because the install, the inventory and the
+    /// analyzer must all be talking about the same recognizer — three call
+    /// sites each deriving it from the settings is three chances to disagree.
+    async fn configured_recognizer(
+        &self,
+    ) -> (
+        wilkes_core::extract::image::dispatch::RecognitionEngine,
+        String,
+    ) {
+        let settings = self.settings().await;
+        let engine = settings.image_analysis.engine;
+        let model_id = settings
+            .image_analysis
+            .model
+            .clone()
+            .unwrap_or_else(|| engine.default_model().to_string());
+        (engine, model_id)
+    }
+
+    /// Every recognizer this build can read with, described: what it costs,
+    /// what kinds of region it produces, whether its weights are here.
+    pub fn image_recognizer_catalogue(
+        &self,
+    ) -> Vec<wilkes_core::extract::image::dispatch::RecognizerDescriptor> {
+        wilkes_core::extract::image::recognizer_catalogue(&self.model_dir)
     }
 
     /// What the shipped recognizer is, where it came from, and under what
     /// terms. Answers before the download, which is the only time it is of
     /// any use to whoever has to decide about it.
-    pub fn image_recognizer_inventory(
+    pub async fn image_recognizer_inventory(
         &self,
-    ) -> wilkes_core::extract::image::paddleocr_vl::RecognizerInventory {
-        wilkes_core::extract::image::recognizer_inventory()
+    ) -> anyhow::Result<wilkes_core::types::RecognizerInventory> {
+        let (engine, model_id) = self.configured_recognizer().await;
+        wilkes_core::extract::image::recognizer_inventory(engine, &model_id)
     }
 
     /// Download and verify the recognizer, then attach the analyzer if the
@@ -4631,8 +4662,14 @@ impl AppContext {
             }
         });
         let model_dir = self.model_dir.clone();
+        let (engine, model_id) = self.configured_recognizer().await;
         let installed = tokio::task::spawn_blocking(move || {
-            wilkes_core::extract::image::install_recognizer(&model_dir, Some(progress_tx))
+            wilkes_core::extract::image::install_recognizer(
+                engine,
+                &model_id,
+                &model_dir,
+                Some(progress_tx),
+            )
         })
         .await?;
         let _ = forward.await;
@@ -9857,7 +9894,7 @@ mod tests {
         .await
         .unwrap();
         assert!(wilkes_core::extract::image::configured().is_none());
-        assert!(!ctx.is_image_recognizer_installed());
+        assert!(!ctx.is_image_recognizer_installed().await);
     }
 
     #[tokio::test]

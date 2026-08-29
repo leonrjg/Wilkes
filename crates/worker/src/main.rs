@@ -623,6 +623,7 @@ mod tests {
                 .iter()
                 .map(|image| {
                     vec![wilkes_core::extract::image::ocr::SpottedRegion {
+                        kind: wilkes_core::extract::image::ocr::RegionKind::Text,
                         text: format!("{}x{}", image.width(), image.height()),
                         confidence: 0.9,
                         quad: [corner; 4],

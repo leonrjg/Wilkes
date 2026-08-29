@@ -4,11 +4,15 @@ version.workspace = true
 edition = "2021"
 
 [features]
-default = ["fastembed", "candle", "generate"]
+default = ["fastembed", "candle", "generate", "recognize-onnx"]
 test-utils = []
 fastembed = ["dep:fastembed", "dep:hf-hub", "dep:ureq", "dep:ort"]
 fastembed-coreml = ["fastembed", "ort/coreml"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "dep:ureq"]
+# Recognition over ONNX Runtime. The default recognizer lives here, so this is
+# in `default` while `candle` stays in it for the alternative one; a build with
+# neither compiles and reports an empty recognizer catalogue.
+recognize-onnx = ["dep:ort", "dep:tokenizers", "dep:hf-hub", "dep:ureq"]
 candle-metal = ["candle", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 # CPU BLAS. Opt-in and deliberately NOT implied by candle-metal: candle's
 # accelerate CPU backend bails on f16 matmul, which breaks quantized generation
@@ -55,7 +59,11 @@ tempfile = "3.10"
 uuid = { version = "1", features = ["v4"] }
 
 [dependencies.ort]
-version = "=2.0.0-rc.11"
+# Exact, because fastembed pins ort exactly and two ort versions in one
+# process is two ONNX Runtimes. Moved rc.11 -> rc.13 with fastembed 5.17:
+# rc.12 relocated `ort::tensor` into `ort::value`, so recognition is written
+# against rc.13's paths rather than against paths that were about to move.
+version = "=2.0.0-rc.13"
 optional = true
 
 [dependencies.fastembed]

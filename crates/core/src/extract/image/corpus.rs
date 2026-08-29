@@ -25,7 +25,7 @@ use crate::types::{
 };
 
 use super::describe::FigureDescriber;
-use super::ocr::{OcrEngine, SpottedRegion};
+use super::ocr::{OcrEngine, RegionKind, SpottedRegion};
 use super::NativeImageAnalyzer;
 
 // ── A capture of what a real document actually draws ─────────────────────────
@@ -592,6 +592,7 @@ impl ScriptedOcr {
             Some(Script::Spots(spots)) => Ok(spots
                 .iter()
                 .map(|(text, confidence, quad)| SpottedRegion {
+                    kind: RegionKind::Text,
                     text: (*text).to_string(),
                     confidence: *confidence,
                     quad: [

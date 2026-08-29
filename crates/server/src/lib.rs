@@ -1517,7 +1517,7 @@ async fn load_generation_model_handler(
 }
 
 async fn is_image_recognizer_installed_handler(State(state): State<Arc<AppState>>) -> Json<bool> {
-    Json(state.context().is_image_recognizer_installed())
+    Json(state.context().is_image_recognizer_installed().await)
 }
 
 /// What the recognizer is, where it came from, and under what licence. Static,
@@ -1525,8 +1525,13 @@ async fn is_image_recognizer_installed_handler(State(state): State<Arc<AppState>
 /// disclosed by, so it has to be readable before the download.
 async fn image_recognizer_inventory_handler(
     State(state): State<Arc<AppState>>,
-) -> Json<wilkes_core::extract::image::paddleocr_vl::RecognizerInventory> {
-    Json(state.context().image_recognizer_inventory())
+) -> Result<Json<wilkes_core::types::RecognizerInventory>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .image_recognizer_inventory()
+        .await
+        .map(Json)
+        .map_err(|e| server_err(format!("{e:#}")))
 }
 
 async fn install_image_recognizer_handler(

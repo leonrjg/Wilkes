@@ -192,38 +192,12 @@ pub fn identity_of(checkpoint: &Checkpoint) -> String {
 
 // ── The license and provenance inventory ─────────────────────────────────────
 
-/// One file of a checkpoint, as an inventory names it.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct InventoriedArtifact {
-    pub filename: String,
-    pub size_bytes: u64,
-    pub sha256: String,
-}
-
-/// What the recognizer is, where it came from, and under what terms.
-///
-/// FIGURE.md requires this of the redistributed checkpoint before it is
-/// packaged, and it is data rather than prose for the reason the pins
-/// themselves are: an inventory kept in a comment is one nobody can check.
-/// Every file the install writes appears here with the digest it is verified
-/// against, so the inventory describes the bytes on disk and not a
-/// recollection of them.
-///
-/// Wilkes fetches these artifacts at the user's request rather than shipping
-/// them inside the application, which is why the inventory is shown where the
-/// download is offered: the terms are disclosed before the bytes arrive, not
-/// after.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct RecognizerInventory {
-    pub name: String,
-    pub repo: String,
-    pub revision: String,
-    pub license: String,
-    pub license_url: String,
-    pub derived_from: Vec<String>,
-    pub artifacts: Vec<InventoriedArtifact>,
-    pub footprint_bytes: u64,
-}
+// The inventory types themselves live in `crate::types`, beside the
+// embedder's capability manifest and for the same reason: they cross the API
+// boundary, and a type the desktop, server and MCP surfaces all name should
+// not be owned by whichever model happened to need it first. Re-exported here
+// so this module still reads as the place a PaddleOCR-VL inventory comes from.
+pub use crate::types::{InventoriedArtifact, RecognizerInventory};
 
 /// The inventory of one checkpoint.
 pub fn inventory(checkpoint: &Checkpoint) -> RecognizerInventory {
