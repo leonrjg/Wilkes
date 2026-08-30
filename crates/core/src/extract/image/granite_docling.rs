@@ -748,7 +748,11 @@ impl GraniteDocling {
             );
         }
 
-        let (stream, char_ends) = decode_with_token_ends(&self.tokenizer, &ids)?;
+        let stream = self
+            .tokenizer
+            .decode(&ids, false)
+            .map_err(|e| anyhow::anyhow!("could not decode the response: {e}"))?;
+        let char_ends = token_char_ends(&self.tokenizer, &ids)?;
 
         let (elements, unread) = parse_doctags(&stream);
         Ok(ImageRecognition {
@@ -762,38 +766,28 @@ impl GraniteDocling {
     }
 }
 
-/// The decoded stream, and the end offset in its characters of each token.
+/// The end offset, in characters of the decoded stream, of each token.
 ///
 /// Byte-level BPE does not decode a token in isolation the way it decodes it
-/// in context, so a token's span cannot come from decoding it alone. Decoding
-/// growing prefixes would answer that, but it re-decodes the whole answer once
-/// per token — quadratic in the length of the reading, on the page whose
-/// reading is longest.
+/// in context, so the spans come from decoding growing prefixes rather than
+/// from decoding each token alone.
 ///
-/// The tokenizer's decode stream carries exactly the context a byte-level
-/// decoder needs and drops the rest, so one pass gives both the text and the
-/// offsets. They come from the same pass on purpose: the offsets index into
-/// this string, and a second, separately decoded string is a second answer to
-/// the same question that could disagree with it.
-fn decode_with_token_ends(tokenizer: &Tokenizer, ids: &[u32]) -> Result<(String, Vec<usize>)> {
-    let mut stream = tokenizer.decode_stream(false);
-    let mut text = String::new();
-    let mut chars = 0usize;
+/// Growing prefixes are quadratic in the length of the reading, and the
+/// tokenizer's own `DecodeStream` is the linear answer to exactly this — but
+/// the pinned tokenizers 0.20 `step_decode_stream` underflows its prefix index
+/// and panics part-way through a page's worth of DocTags. Until that
+/// dependency moves, the slower decode is the one that is correct; the cost is
+/// bounded by the 2048-token cap and is small beside the decode that produced
+/// the tokens.
+fn token_char_ends(tokenizer: &Tokenizer, ids: &[u32]) -> Result<Vec<usize>> {
     let mut ends = Vec::with_capacity(ids.len());
-    for id in ids {
-        // `None` means this token did not complete a character yet; its span
-        // is empty and the character it starts is attributed to the token
-        // that finishes it.
-        if let Some(piece) = stream
-            .step(*id)
-            .map_err(|e| anyhow::anyhow!("could not decode the response: {e}"))?
-        {
-            chars += piece.chars().count();
-            text.push_str(&piece);
-        }
-        ends.push(chars);
+    for upto in 1..=ids.len() {
+        let text = tokenizer
+            .decode(&ids[..upto], false)
+            .map_err(|e| anyhow::anyhow!("could not decode a prefix: {e}"))?;
+        ends.push(text.chars().count());
     }
-    Ok((text, ends))
+    Ok(ends)
 }
 
 /// Turn a parsed element into a region, scored by the tokens that spell it.
