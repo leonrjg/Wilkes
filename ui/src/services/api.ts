@@ -54,6 +54,8 @@ import type {
   WorkspaceState,
   WorkspaceSummary,
   StartupStatus,
+  RecognitionEngine,
+  RecognizerCatalogue,
   RecognizerInventory,
 } from "../lib/types";
 
@@ -178,19 +180,26 @@ export interface SearchApi {
   /** Download if needed, then attach. Progress arrives on
    *  `onGenerationProgress`, terminated by `onGenerationDone`/`onGenerationError`. */
   loadGenerationModel(): Promise<boolean>;
-  /** Whether the image recognizer the shipped recipe names is on disk. The
-   *  gate for image enrichment, for the same reason `isGenerationReady` is
-   *  the gate for generation: enabled but not installed is a state that
-   *  reads as broken. */
-  isImageRecognizerInstalled(): Promise<boolean>;
-  /** What the recognizer is, where it came from and under what licence.
-   *  Static — it describes the shipped recipe, not this machine — so it
-   *  answers before the download it discloses. */
-  imageRecognizerInventory(): Promise<RecognizerInventory>;
-  /** Download if needed, verify, then attach the analyzer the settings
-   *  describe. Progress arrives on `onImageAnalysisProgress`, terminated by
-   *  `onImageAnalysisDone`/`onImageAnalysisError`. */
-  installImageRecognizer(): Promise<void>;
+  /** Every recognizer this build can read with, and the engines it compiled
+   *  in — the recognition counterpart of `embedderCapabilities`. */
+  imageRecognizerCatalogue(): Promise<RecognizerCatalogue>;
+  /** What the named recognizer is, where it came from and under what licence.
+   *  Static — it describes the recipe, not this machine — so it answers
+   *  before the download it discloses, and for a recognizer that is merely
+   *  being considered. */
+  imageRecognizerInventory(
+    engine: RecognitionEngine,
+    modelId: string,
+  ): Promise<RecognizerInventory>;
+  /** Download and verify the named recognizer. Progress arrives on
+   *  `onImageAnalysisProgress`, terminated by
+   *  `onImageAnalysisDone`/`onImageAnalysisError`. Installing is not
+   *  choosing: the analyzer is only re-attached when the settings already
+   *  name this recognizer. */
+  installImageRecognizer(
+    engine: RecognitionEngine,
+    modelId: string,
+  ): Promise<void>;
   /** Starts a related-document explanation. Its complete lifecycle arrives on
    *  `onGenerationStream`, correlated by `requestId`. */
   explainRelatedDocument(

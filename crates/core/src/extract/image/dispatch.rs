@@ -92,7 +92,14 @@ pub struct RecognizerDescriptor {
     pub model_id: String,
     pub display_name: String,
     pub description: String,
+    /// The recognizer a fresh install reads with — one across the catalogue.
     pub is_default: bool,
+    /// The recognizer this *engine* reads with unless told otherwise. What a
+    /// picker selects when the engine is switched, and what an
+    /// `ImageAnalysisSettings::model` of `None` resolves to. Derived here
+    /// rather than restated by each consumer, because a consumer's own copy of
+    /// it is how a library gets read under a recognizer nobody chose.
+    pub is_engine_default: bool,
     pub is_cached: bool,
     pub footprint_bytes: u64,
     /// The confidence a region must reach to enter the reading. Per model,
@@ -103,6 +110,19 @@ pub struct RecognizerDescriptor {
     /// configuration*. Not a claim about the weights: PaddleOCR-VL parses
     /// tables and formulas too, behind task prompts Wilkes does not drive.
     pub emits: Vec<super::ocr::RegionKind>,
+}
+
+/// Everything this build can recognize with, as one answer.
+///
+/// The recognition counterpart of [`crate::types::EmbedderCapabilityManifest`],
+/// and it carries the engine list for the same reason that one does: "this
+/// build has no PaddleOCR-VL" and "PaddleOCR-VL offers no models" are
+/// different answers, and only the first one may be shown as an engine the
+/// user cannot choose. Deriving the engines from the models collapses them.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RecognizerCatalogue {
+    pub engines: Vec<RecognitionEngine>,
+    pub models: Vec<RecognizerDescriptor>,
 }
 
 /// Everything this build can recognize with, default first, then cached.
@@ -119,6 +139,8 @@ pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
                       tables. Smaller and broader than PaddleOCR-VL."
             .to_string(),
         is_default: true,
+        is_engine_default: super::granite_docling::MODEL_ID
+            == RecognitionEngine::Onnx.default_model(),
         is_cached: super::granite_docling::is_installed(model_dir),
         footprint_bytes: super::granite_docling::footprint_bytes(),
         admission_threshold: super::granite_docling::ADMISSION_THRESHOLD,
@@ -141,6 +163,7 @@ pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
                           per-region geometry."
                 .to_string(),
             is_default: false,
+            is_engine_default: checkpoint.name == RecognitionEngine::Candle.default_model(),
             is_cached: super::paddleocr_vl::is_installed(model_dir, checkpoint),
             footprint_bytes: checkpoint.footprint_bytes(),
             admission_threshold: super::paddleocr_vl::ADMISSION_THRESHOLD,
@@ -473,6 +496,38 @@ mod tests {
                 "nothing is installed in a fresh directory"
             );
         }
+    }
+
+    /// Every engine the build compiled in offers exactly one default model,
+    /// and it is the one `default_model` names. A picker resolves an absent
+    /// `ImageAnalysisSettings::model` through this, and switching engine
+    /// selects through it: an engine with none would leave the picker with
+    /// nothing to select, and one with two would let the choice depend on the
+    /// order the catalogue happened to be built in.
+    #[test]
+    fn every_supported_engine_offers_exactly_one_default_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalogue = super::super::recognizer_catalogue(dir.path());
+        for engine in &catalogue.engines {
+            let defaults: Vec<&RecognizerDescriptor> = catalogue
+                .models
+                .iter()
+                .filter(|model| model.engine == *engine && model.is_engine_default)
+                .collect();
+            assert_eq!(
+                defaults.len(),
+                1,
+                "{} offers {} default models",
+                engine.as_str(),
+                defaults.len()
+            );
+            assert_eq!(defaults[0].model_id, engine.default_model());
+        }
+        assert_eq!(
+            catalogue.engines,
+            RecognitionEngine::supported_engines(),
+            "the catalogue reports the build's engines, not the ones its models happen to name"
+        );
     }
 
     /// The two recognizers do not read documents under one recipe.

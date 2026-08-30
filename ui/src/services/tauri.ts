@@ -58,6 +58,8 @@ import type {
   WorkspaceState,
   WorkspaceSummary,
   StartupStatus,
+  RecognitionEngine,
+  RecognizerCatalogue,
   RecognizerInventory,
 } from "../lib/types";
 import { randomId } from "../lib/types";
@@ -379,16 +381,25 @@ export class TauriSearchApi implements SearchApi {
     return invoke<boolean>("load_generation_model");
   }
 
-  async isImageRecognizerInstalled(): Promise<boolean> {
-    return invoke<boolean>("is_image_recognizer_installed");
+  async imageRecognizerCatalogue(): Promise<RecognizerCatalogue> {
+    return invoke<RecognizerCatalogue>("image_recognizer_catalogue");
   }
 
-  async imageRecognizerInventory(): Promise<RecognizerInventory> {
-    return invoke<RecognizerInventory>("image_recognizer_inventory");
+  async imageRecognizerInventory(
+    engine: RecognitionEngine,
+    modelId: string,
+  ): Promise<RecognizerInventory> {
+    return invoke<RecognizerInventory>("image_recognizer_inventory", {
+      engine,
+      modelId,
+    });
   }
 
-  async installImageRecognizer(): Promise<void> {
-    return invoke("install_image_recognizer");
+  async installImageRecognizer(
+    engine: RecognitionEngine,
+    modelId: string,
+  ): Promise<void> {
+    return invoke("install_image_recognizer", { engine, modelId });
   }
 
   async explainRelatedDocument(

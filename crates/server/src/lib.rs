@@ -1415,30 +1415,43 @@ async fn load_generation_model_handler(
         .map_err(|e| server_err(format!("{e:#}")))
 }
 
-async fn is_image_recognizer_installed_handler(State(state): State<Arc<AppState>>) -> Json<bool> {
-    Json(state.context().is_image_recognizer_installed().await)
+/// Which recognizer a request is about. The engine and model travel together
+/// everywhere, because a model id means nothing without the engine that
+/// resolves it.
+#[derive(Deserialize)]
+struct RecognizerQuery {
+    engine: wilkes_core::extract::image::dispatch::RecognitionEngine,
+    model_id: String,
 }
 
-/// What the recognizer is, where it came from, and under what licence. Static,
-/// and answers whether or not it is installed: it is what the download is
-/// disclosed by, so it has to be readable before the download.
+/// Every recognizer this build can read with, and the engines it compiled in.
+async fn image_recognizer_catalogue_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<wilkes_core::extract::image::dispatch::RecognizerCatalogue> {
+    Json(state.context().image_recognizer_catalogue())
+}
+
+/// What the named recognizer is, where it came from, and under what licence.
+/// Static, and answers whether or not it is installed: it is what the download
+/// is disclosed by, so it has to be readable before the download.
 async fn image_recognizer_inventory_handler(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<RecognizerQuery>,
 ) -> Result<Json<wilkes_core::types::RecognizerInventory>, (StatusCode, Json<ErrorBody>)> {
     state
         .context()
-        .image_recognizer_inventory()
-        .await
+        .image_recognizer_inventory(query.engine, &query.model_id)
         .map(Json)
         .map_err(|e| server_err(format!("{e:#}")))
 }
 
 async fn install_image_recognizer_handler(
     State(state): State<Arc<AppState>>,
+    Json(body): Json<RecognizerQuery>,
 ) -> Result<Json<bool>, (StatusCode, Json<ErrorBody>)> {
     state
         .context()
-        .install_image_recognizer()
+        .install_image_recognizer(body.engine, body.model_id)
         .await
         .map(|()| Json(true))
         .map_err(|e| server_err(format!("{e:#}")))
@@ -2259,8 +2272,8 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/generation/load", post(load_generation_model_handler))
         .route(
-            "/api/image-analysis/installed",
-            get(is_image_recognizer_installed_handler),
+            "/api/image-analysis/catalogue",
+            get(image_recognizer_catalogue_handler),
         )
         .route(
             "/api/image-analysis/inventory",

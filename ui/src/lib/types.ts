@@ -643,6 +643,7 @@ export interface GenerationSampling {
 }
 
 export type GenerationEngine = "candle" | "ollama";
+export const ALL_GENERATION_ENGINES: GenerationEngine[] = ["candle", "ollama"];
 
 export interface GenerationSettings {
   enabled: boolean;
@@ -661,11 +662,51 @@ export interface GenerationSettings {
  *  picture in it. */
 export interface ImageAnalysisSettings {
   enabled: boolean;
+  /** Which recognizer reads the pictures. */
+  engine: RecognitionEngine;
+  /** The recognizer's model id. Null takes the engine's default. */
+  model: string | null;
   /** "auto" | "cpu" | "metal". Null takes the recognizer's default. */
   device: string | null;
   /** The Ollama tag figures are described with; empty means transcription
    *  only. The server is `generation.ollama_url`. */
   describer_model: string;
+}
+
+/** The recognizers Wilkes knows how to address.
+ *
+ *  Capitalised because that is what the backend enum serializes to; it accepts
+ *  the lowercase spelling on the way in as well, and the two must not be
+ *  allowed to drift into two different answers here. */
+export type RecognitionEngine = "Onnx" | "Candle";
+export const ALL_RECOGNITION_ENGINES: RecognitionEngine[] = ["Onnx", "Candle"];
+
+/** What one recognizer is, and what choosing it would mean: what it costs to
+ *  install, what confidence it admits a region at, and which kinds of region
+ *  it produces under the task configuration Wilkes drives it with. */
+export interface RecognizerDescriptor {
+  engine: RecognitionEngine;
+  model_id: string;
+  display_name: string;
+  description: string;
+  /** The recognizer a fresh install reads with — one across the catalogue. */
+  is_default: boolean;
+  /** The recognizer this engine reads with unless told otherwise: what a
+   *  picker selects when the engine is switched, and what an absent
+   *  `image_analysis.model` resolves to. */
+  is_engine_default: boolean;
+  is_cached: boolean;
+  footprint_bytes: number;
+  admission_threshold: number;
+  emits: string[];
+}
+
+/** What this Wilkes can recognize with, as one answer. The engines come from
+ *  the build, so an engine missing from `engines` is one this build cannot
+ *  read with at all — distinct from an engine that simply has no models. */
+export interface RecognizerCatalogue {
+  engines: RecognitionEngine[];
+  models: RecognizerDescriptor[];
 }
 
 /** One file of the recognizer, as the inventory names it. */

@@ -29,7 +29,9 @@ describe("SettingsModal", () => {
     onGenerationProgress: vi.fn(() => Promise.resolve(() => {})),
     onGenerationDone: vi.fn(() => Promise.resolve(() => {})),
     onGenerationError: vi.fn(() => Promise.resolve(() => {})),
-    isImageRecognizerInstalled: vi.fn(() => Promise.resolve(false)),
+    imageRecognizerCatalogue: vi.fn(() =>
+      Promise.resolve({ engines: ["Onnx"], models: [] }),
+    ),
     imageRecognizerInventory: vi.fn(() =>
       Promise.resolve({
         name: "paddleocr-vl-1.6",

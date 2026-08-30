@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { GeneratorDescriptor, Settings } from "../lib/types";
 import { useGenerationStore } from "../stores/useGenerationStore";
@@ -168,9 +168,10 @@ describe("GenerationPanel", () => {
     );
 
     await screen.findByText("Default Model");
-    fireEvent.change(screen.getByLabelText("Generation backend"), {
-      target: { value: "ollama" },
-    });
+    fireEvent.click(
+      within(screen.getByRole("radiogroup", { name: "Generation backend" }))
+        .getByRole("radio", { name: "Ollama" }),
+    );
 
     await waitFor(() => {
       expect(onUpdateSettings).toHaveBeenCalledWith({

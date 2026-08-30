@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import type { SearchApi } from "../services/api";
-import type {
-  EmbedProgress,
-  GenerationEngine,
-  GeneratorDescriptor,
-  Settings,
+import {
+  ALL_GENERATION_ENGINES,
+  type EmbedProgress,
+  type GenerationEngine,
+  type GeneratorDescriptor,
+  type Settings,
 } from "../lib/types";
 import { useGenerationStore } from "../stores/useGenerationStore";
 import ModelCatalog, { formatModelBytes } from "./ModelCatalog";
@@ -19,6 +20,18 @@ interface DownloadProgress {
   received: number;
   total: number;
 }
+
+const ENGINE_LABELS: Record<GenerationEngine, string> = {
+  candle: "Candle",
+  ollama: "Ollama",
+};
+
+const ENGINE_BLURBS: Record<GenerationEngine, string> = {
+  candle:
+    "Runs entirely on this machine in a separate Wilkes process, on weights Wilkes downloads. Uses the GPU via Metal (Apple Silicon) if available.",
+  ollama:
+    "Whatever the configured Ollama service has pulled. Models and residency are managed there rather than here.",
+};
 
 function downloadLabel(progress: DownloadProgress): string {
   if (progress.total <= 0) {
@@ -314,28 +327,41 @@ export default function GenerationPanel({ api, settings, onUpdateSettings }: Pro
             </span>
           </label>
           <p className="text-[10px] italic text-[var(--text-dim)]">
-            {engine === "candle"
-              ? "Candle runs entirely on this machine in a separate Wilkes process."
-              : "Ollama models and residency are managed by the configured Ollama service."}
-            {" "}Disabling generation hides its features throughout the app.
+            Disabling generation hides its features throughout the app.
           </p>
 
+          {/* The same engine picker embedding has: the backend is a choice
+              between named engines, not a form field, and one interface for
+              choosing an engine is one place to change it. */}
           <div className="border-t border-[var(--border-main)] pt-3">
-            <label className="flex flex-col gap-1">
-              <span className="text-xs text-[var(--text-muted)]">Backend</span>
-              <select
-                aria-label="Generation backend"
-                value={engine}
-                disabled={busy}
-                onChange={(event) =>
-                  void handleEngineChange(event.target.value as GenerationEngine)
-                }
-                className="w-full rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2.5 py-1.5 text-xs text-[var(--text-main)]"
-              >
-                <option value="candle">Candle (built in)</option>
-                <option value="ollama">Ollama</option>
-              </select>
-            </label>
+            <span className="text-xs text-[var(--text-muted)]">Backend</span>
+            <div
+              role="radiogroup"
+              aria-label="Generation backend"
+              className="mt-1 flex w-full rounded-lg bg-[var(--bg-active)] p-0.5"
+            >
+              {ALL_GENERATION_ENGINES.map((candidate) => (
+                <button
+                  key={candidate}
+                  type="button"
+                  role="radio"
+                  aria-checked={engine === candidate}
+                  aria-label={ENGINE_LABELS[candidate]}
+                  disabled={busy}
+                  onClick={() => void handleEngineChange(candidate)}
+                  className={`flex-1 rounded-md px-3 py-1 text-xs transition-all ${
+                    engine === candidate
+                      ? "bg-[var(--bg-app)] text-[var(--text-main)] shadow-sm"
+                      : "text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50"
+                  }`}
+                >
+                  {ENGINE_LABELS[candidate]}
+                </button>
+              ))}
+            </div>
+            <p className="selectable mt-1.5 px-1 text-[10px] text-[var(--text-dim)]">
+              {ENGINE_BLURBS[engine]}
+            </p>
           </div>
 
           {engine === "candle" && generation.enabled && (

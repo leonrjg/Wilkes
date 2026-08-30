@@ -4398,12 +4398,6 @@ impl AppContext {
         }
     }
 
-    /// Whether the recognizer the settings name is on disk and intact.
-    pub async fn is_image_recognizer_installed(&self) -> bool {
-        let (engine, model_id) = self.configured_recognizer().await;
-        wilkes_core::extract::image::recognizer_installed(engine, &model_id, &self.model_dir)
-    }
-
     /// The recognizer this Wilkes is configured to read with.
     ///
     /// One place answers it, because the install, the inventory and the
@@ -4426,30 +4420,48 @@ impl AppContext {
     }
 
     /// Every recognizer this build can read with, described: what it costs,
-    /// what kinds of region it produces, whether its weights are here.
+    /// what kinds of region it produces, whether its weights are here — plus
+    /// the engines the build compiled in, so a picker can tell an engine that
+    /// is absent from one that merely has nothing selected.
     pub fn image_recognizer_catalogue(
         &self,
-    ) -> Vec<wilkes_core::extract::image::dispatch::RecognizerDescriptor> {
+    ) -> wilkes_core::extract::image::dispatch::RecognizerCatalogue {
         wilkes_core::extract::image::recognizer_catalogue(&self.model_dir)
     }
 
-    /// What the shipped recognizer is, where it came from, and under what
-    /// terms. Answers before the download, which is the only time it is of
-    /// any use to whoever has to decide about it.
-    pub async fn image_recognizer_inventory(
+    /// What a recognizer is, where it came from, and under what terms.
+    /// Answers before the download, which is the only time it is of any use to
+    /// whoever has to decide about it.
+    ///
+    /// Named by the caller rather than read out of the settings, because the
+    /// recognizer whose licence and footprint have to be disclosed is the one
+    /// being *considered*, and a picker's answer to that is not yet in the
+    /// settings.
+    pub fn image_recognizer_inventory(
         &self,
+        engine: wilkes_core::extract::image::dispatch::RecognitionEngine,
+        model_id: &str,
     ) -> anyhow::Result<wilkes_core::types::RecognizerInventory> {
-        let (engine, model_id) = self.configured_recognizer().await;
-        wilkes_core::extract::image::recognizer_inventory(engine, &model_id)
+        wilkes_core::extract::image::recognizer_inventory(engine, model_id)
     }
 
-    /// Download and verify the recognizer, then attach the analyzer if the
-    /// settings ask for one.
+    /// Download and verify the named recognizer, then attach the analyzer if
+    /// the settings already ask for that one.
+    ///
+    /// The subject is named by the caller. Reading it out of the settings
+    /// would force a picker to commit a choice before the weights exist, and
+    /// committing to an uninstalled recognizer is precisely the state
+    /// `build_analyzer` refuses — so the order is install, then commit, and
+    /// the settings never name a recognizer that is not on disk.
     ///
     /// Progress travels on its own event stream for the reason the generation
     /// one does: borrowing `embed-*` would put the UI into "indexing" with no
     /// terminal event to leave it.
-    pub async fn install_image_recognizer(self: &Arc<Self>) -> anyhow::Result<()> {
+    pub async fn install_image_recognizer(
+        self: &Arc<Self>,
+        engine: wilkes_core::extract::image::dispatch::RecognitionEngine,
+        model_id: String,
+    ) -> anyhow::Result<()> {
         let (progress_tx, mut progress_rx) = mpsc::channel::<EmbedProgress>(64);
         let events = Arc::clone(&self.events);
         let forward = tokio::spawn(async move {
@@ -4458,7 +4470,7 @@ impl AppContext {
             }
         });
         let model_dir = self.model_dir.clone();
-        let (engine, model_id) = self.configured_recognizer().await;
+        let subject = (engine, model_id.clone());
         let installed = tokio::task::spawn_blocking(move || {
             wilkes_core::extract::image::install_recognizer(
                 engine,
@@ -4476,7 +4488,13 @@ impl AppContext {
             );
             return Err(error);
         }
-        self.load_image_analyzer().await?;
+        // Only the configured recognizer is attachable. Installing one the
+        // settings do not name is a download, not a reconfiguration, and
+        // reconciling here would either re-attach what is already attached or
+        // fail over a recognizer nobody asked to run.
+        if self.configured_recognizer().await == subject {
+            self.load_image_analyzer().await?;
+        }
         self.events
             .emit("image-analysis-done", serde_json::json!({}));
         Ok(())
@@ -9770,7 +9788,13 @@ mod tests {
         .await
         .unwrap();
         assert!(wilkes_core::extract::image::configured().is_none());
-        assert!(!ctx.is_image_recognizer_installed().await);
+        assert!(
+            ctx.image_recognizer_catalogue()
+                .models
+                .iter()
+                .all(|model| !model.is_cached),
+            "the catalogue is the one answer to what is installed, and nothing is"
+        );
     }
 
     #[tokio::test]

@@ -49,6 +49,8 @@ import type {
   CompletionFeedback,
   CompletionRequest,
   SessionSteering,
+  RecognitionEngine,
+  RecognizerCatalogue,
   RecognizerInventory,
 } from "../lib/types";
 import { randomId } from "../lib/types";
@@ -717,20 +719,31 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<boolean>;
   }
 
-  async isImageRecognizerInstalled(): Promise<boolean> {
-    const res = await fetch("/api/image-analysis/installed");
-    if (!res.ok) throw await responseError(res, "isImageRecognizerInstalled");
-    return res.json() as Promise<boolean>;
+  async imageRecognizerCatalogue(): Promise<RecognizerCatalogue> {
+    const res = await fetch("/api/image-analysis/catalogue");
+    if (!res.ok) throw await responseError(res, "imageRecognizerCatalogue");
+    return res.json() as Promise<RecognizerCatalogue>;
   }
 
-  async imageRecognizerInventory(): Promise<RecognizerInventory> {
-    const res = await fetch("/api/image-analysis/inventory");
+  async imageRecognizerInventory(
+    engine: RecognitionEngine,
+    modelId: string,
+  ): Promise<RecognizerInventory> {
+    const query = new URLSearchParams({ engine, model_id: modelId });
+    const res = await fetch(`/api/image-analysis/inventory?${query}`);
     if (!res.ok) throw await responseError(res, "imageRecognizerInventory");
     return res.json() as Promise<RecognizerInventory>;
   }
 
-  async installImageRecognizer(): Promise<void> {
-    const res = await fetch("/api/image-analysis/install", { method: "POST" });
+  async installImageRecognizer(
+    engine: RecognitionEngine,
+    modelId: string,
+  ): Promise<void> {
+    const res = await fetch("/api/image-analysis/install", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ engine, model_id: modelId }),
+    });
     if (!res.ok) throw await responseError(res, "installImageRecognizer");
   }
 

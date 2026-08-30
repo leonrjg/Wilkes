@@ -269,8 +269,8 @@ pub fn configured() -> Option<Arc<dyn ImageAnalyzer>> {
 /// A recognizer that is enabled but that this build does not ship is an error,
 /// not a silent disable: the user asked for enrichment, and a reading that
 /// quietly omits it is indistinguishable from one that found no text. Whether
-/// the weights are actually on disk is a separate question, answered by
-/// [`recognizer_installed`] before the toggle is offered.
+/// the weights are actually on disk is a separate question, answered per
+/// recognizer by [`recognizer_catalogue`] before the toggle is offered.
 ///
 /// `model_dir` is the installation's model cache; `cache_dir` is where the
 /// annotation cache lives. Two parameters because they are two directories:
@@ -316,25 +316,6 @@ pub fn build_analyzer(
     Ok(Some(Arc::new(analyzer)))
 }
 
-/// Whether a recognizer is installed and intact.
-///
-/// Keyed by engine and model, like every other question about a recognizer.
-/// It used to answer only for the shipped PaddleOCR-VL checkpoint, which was
-/// indistinguishable from the right answer while there was one recognizer.
-pub fn recognizer_installed(
-    engine: dispatch::RecognitionEngine,
-    model_id: &str,
-    data_dir: &std::path::Path,
-) -> bool {
-    dispatch::installed(engine, model_id, data_dir).unwrap_or(false)
-}
-
-/// Whether the recognizer the default recipe names is installed.
-pub fn default_recognizer_installed(data_dir: &std::path::Path) -> bool {
-    let engine = dispatch::RecognitionEngine::default();
-    recognizer_installed(engine, engine.default_model(), data_dir)
-}
-
 /// What a recognizer is, where it came from, and under what terms.
 ///
 /// Static: this describes the recipe, not the machine, so it answers before
@@ -348,11 +329,13 @@ pub fn recognizer_inventory(
     dispatch::inventory(engine, model_id)
 }
 
-/// What every recognizer this build can read with is, described.
-pub fn recognizer_catalogue(
-    data_dir: &std::path::Path,
-) -> Vec<dispatch::RecognizerDescriptor> {
-    dispatch::list_models(data_dir)
+/// What every recognizer this build can read with is, described, alongside the
+/// engines the build actually compiled in.
+pub fn recognizer_catalogue(data_dir: &std::path::Path) -> dispatch::RecognizerCatalogue {
+    dispatch::RecognizerCatalogue {
+        engines: dispatch::RecognitionEngine::supported_engines(),
+        models: dispatch::list_models(data_dir),
+    }
 }
 
 /// Download and verify a recognizer.
@@ -915,7 +898,10 @@ mod tests {
             format!("{error:#}").contains("recognizer"),
             "the failure should name what is missing: {error:#}"
         );
-        assert!(!default_recognizer_installed(dir.path()));
+        assert!(recognizer_catalogue(dir.path())
+            .models
+            .iter()
+            .all(|model| !model.is_cached));
     }
 
     /// FIGURE.md's acceptance criterion on identity, in one place: *model,

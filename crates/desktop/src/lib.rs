@@ -2490,33 +2490,40 @@ async fn load_generation_model(app: AppHandle) -> Result<bool, String> {
         .map_err(|e| format!("{e:#}"))
 }
 
-/// Whether the image recognizer the shipped recipe names is on disk.
+/// Every recognizer this build can read with, and the engines it compiled in.
 #[tauri::command]
-async fn is_image_recognizer_installed(app: AppHandle) -> bool {
-    app_context(&app).is_image_recognizer_installed().await
+async fn image_recognizer_catalogue(
+    app: AppHandle,
+) -> wilkes_core::extract::image::dispatch::RecognizerCatalogue {
+    app_context(&app).image_recognizer_catalogue()
 }
 
-/// What the image recognizer is, where it came from, and under what licence.
-/// Answers whether or not it is installed: it describes the recipe, and the
-/// point of it is to be readable before the download rather than after.
+/// What the named image recognizer is, where it came from, and under what
+/// licence. Answers whether or not it is installed: it describes the recipe,
+/// and the point of it is to be readable before the download rather than after.
 #[tauri::command]
 async fn image_recognizer_inventory(
     app: AppHandle,
+    engine: wilkes_core::extract::image::dispatch::RecognitionEngine,
+    model_id: String,
 ) -> Result<wilkes_core::types::RecognizerInventory, String> {
     app_context(&app)
-        .image_recognizer_inventory()
-        .await
+        .image_recognizer_inventory(engine, &model_id)
         .map_err(|e| format!("{e:#}"))
 }
 
-/// Download (if needed) and verify the image recognizer, then attach the
-/// analyzer the settings describe. Progress arrives on the
+/// Download (if needed) and verify the named image recognizer, then attach the
+/// analyzer if the settings already name it. Progress arrives on the
 /// image-analysis-progress stream, terminated by image-analysis-done or
 /// image-analysis-error.
 #[tauri::command]
-async fn install_image_recognizer(app: AppHandle) -> Result<(), String> {
+async fn install_image_recognizer(
+    app: AppHandle,
+    engine: wilkes_core::extract::image::dispatch::RecognitionEngine,
+    model_id: String,
+) -> Result<(), String> {
     app_context(&app)
-        .install_image_recognizer()
+        .install_image_recognizer(engine, model_id)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -2778,7 +2785,7 @@ pub fn run() {
             list_generation_models,
             get_generation_model_size,
             load_generation_model,
-            is_image_recognizer_installed,
+            image_recognizer_catalogue,
             image_recognizer_inventory,
             install_image_recognizer,
             explain_related_document,

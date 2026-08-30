@@ -2918,6 +2918,19 @@ mod tests {
     }
 }
 
+/// One file extracted and waiting for a batch to fill before it is embedded.
+///
+/// This is a `PreparedFile` minus the embeddings, which is exactly what a
+/// cross-file batch has to hold: the chunks are known, but which call will
+/// embed them is not decided until the queue is full.
+struct PendingFile {
+    path: PathBuf,
+    recipe: ExtractionRecipe,
+    full_text: String,
+    chunks: Vec<Chunk>,
+    regions: Vec<ReadingRegion>,
+}
+
 // ── Prepared file (ready to write) ───────────────────────────────────────────
 
 pub struct PreparedFile {
@@ -3514,6 +3527,82 @@ impl SemanticIndex {
         Self::create_at_path_exact(&db_path(data_dir), identity, root_path)
     }
 
+    /// Embed one queue of extracted files in a single call and write them.
+    ///
+    /// The whole queue is one batch because that is the point of queueing: the
+    /// per-call cost is paid once for as many chunks as the model will take.
+    /// A non-fatal embedder failure therefore costs the whole group, and says
+    /// so by naming every file in it — a group is what was attempted, and
+    /// reporting anything narrower would claim a per-file attempt that did not
+    /// happen.
+    fn embed_and_write(
+        idx: &mut Self,
+        embedder: &dyn Embedder,
+        queue: Vec<PendingFile>,
+    ) -> anyhow::Result<()> {
+        if queue.is_empty() {
+            return Ok(());
+        }
+        let texts: Vec<&str> = queue
+            .iter()
+            .flat_map(|file| file.chunks.iter().map(|c| c.text.as_str()))
+            .collect();
+        let total = texts.len();
+
+        let embeddings = match embedder.embed_passages(&texts) {
+            Ok(embeddings) => embeddings,
+            Err(e) => {
+                if Self::is_fatal_embedder_error(&e) {
+                    return Err(e.context(format!(
+                        "Fatal embedder error while indexing {} file(s) starting at {}",
+                        queue.len(),
+                        queue[0].path.display()
+                    )));
+                }
+                error!(
+                    "[SemanticIndex::build] skipping {} file(s) because embed_passages failed \
+                     for their batch: {e:#}; skipped: {}",
+                    queue.len(),
+                    queue
+                        .iter()
+                        .map(|f| f.path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                return Ok(());
+            }
+        };
+        if embeddings.len() != total {
+            error!(
+                "[SemanticIndex::build] skipping {} file(s): embedder returned {} embeddings for \
+                 {total} chunks",
+                queue.len(),
+                embeddings.len()
+            );
+            return Ok(());
+        }
+
+        let mut embeddings = embeddings.into_iter();
+        for file in queue {
+            let taken: Vec<Vec<f32>> = embeddings.by_ref().take(file.chunks.len()).collect();
+            let prepared = PreparedFile {
+                path: file.path.clone(),
+                chunks: file.chunks.into_iter().zip(taken).collect(),
+                full_text: file.full_text,
+                regions: file.regions,
+            };
+            if let Err(e) =
+                idx.write_file_with_recipe(prepared, &file.recipe, None, None, false, false, None)
+            {
+                error!(
+                    "[SemanticIndex::build] skipping {}: failed to write index entry: {e:#}",
+                    file.path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Full build: creates the database at `data_dir`, indexes every path, and
     /// returns the open index.
     #[allow(clippy::too_many_arguments)]
@@ -3540,8 +3629,20 @@ impl SemanticIndex {
 
         let mut idx = Self::create_at_path_exact(&tmp_path, &embedding_identity, Some(root_path))?;
 
-        // Extract, embed, and write one file at a time so peak memory is bounded
-        // to a single file's chunks + embeddings on top of the model weights.
+        // Extract into a queue and embed the queue, not one file at a time.
+        // A corpus of small documents otherwise sends the model batches of one
+        // or two chunks and pays the whole per-call cost — tokenizer setup,
+        // worker round trip, JSON framing — for each of them. The queue is
+        // flushed as soon as it holds a model batch, so peak memory is still
+        // bounded to one file's chunks plus one batch's worth of others.
+        //
+        // A model with no preferred batch size is one whose vectors depend on
+        // what else was in the batch, so it keeps the one-file-per-batch
+        // grouping it had; regrouping its chunks would change them.
+        let batch_target = embedder.preferred_batch_size();
+        let mut queue: Vec<PendingFile> = Vec::new();
+        let mut queued_chunks = 0usize;
+
         for (i, path) in paths.iter().enumerate() {
             let extraction_recipe = ExtractionRecipe::for_path(
                 path,
@@ -3581,57 +3682,34 @@ impl SemanticIndex {
                 _ => continue,
             };
 
-            let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-            let embeddings = match embedder.embed_passages(&texts) {
-                Ok(embeddings) => embeddings,
-                Err(e) => {
-                    if Self::is_fatal_embedder_error(&e) {
-                        return Err(e.context(format!(
-                            "Fatal embedder error while indexing {}",
-                            path.display()
-                        )));
-                    }
-                    error!(
-                        "[SemanticIndex::build] skipping {}: embed_passages failed: {e:#}",
-                        path.display()
-                    );
-                    continue;
-                }
+            queued_chunks += chunks.len();
+            queue.push(PendingFile {
+                path: path.clone(),
+                recipe: extraction_recipe,
+                full_text,
+                chunks,
+                regions,
+            });
+
+            let full = match batch_target {
+                Some(target) => queued_chunks >= target,
+                None => true,
             };
-            if embeddings.len() != chunks.len() {
-                error!(
-                    "[SemanticIndex::build] skipping {}: embedder returned {} embeddings for {} chunks",
-                    path.display(),
-                    embeddings.len(),
-                    chunks.len()
+            if full {
+                anyhow::ensure!(
+                    !cancel_flag.load(Ordering::Relaxed),
+                    "Index build cancelled"
                 );
-                continue;
+                Self::embed_and_write(&mut idx, embedder, std::mem::take(&mut queue))?;
+                queued_chunks = 0;
             }
+        }
+        if !queue.is_empty() {
             anyhow::ensure!(
                 !cancel_flag.load(Ordering::Relaxed),
                 "Index build cancelled"
             );
-
-            let prepared = PreparedFile {
-                path: path.clone(),
-                chunks: chunks.into_iter().zip(embeddings).collect(),
-                full_text,
-                regions,
-            };
-            if let Err(e) = idx.write_file_with_recipe(
-                prepared,
-                &extraction_recipe,
-                None,
-                None,
-                false,
-                false,
-                None,
-            ) {
-                error!(
-                    "[SemanticIndex::build] skipping {}: failed to write index entry: {e:#}",
-                    path.display()
-                );
-            }
+            Self::embed_and_write(&mut idx, embedder, queue)?;
         }
 
         idx.finish_active_root_build()?;
