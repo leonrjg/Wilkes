@@ -217,7 +217,8 @@ echo '{"Completion":{"tokens":3,"stop":"Eos"}}'
 "#,
         );
 
-        let (manager, _rx, loop_fut) = WorkerManager::new(paths(dir.path()));
+        let (manager, _rx, loop_fut) =
+            WorkerManager::new(paths(dir.path()), crate::worker::ipc::WorkerKind::Generate);
         tokio::spawn(loop_fut);
         let generator = std::sync::Arc::new(WorkerGenerator::new(manager, config(dir.path())));
         let decode_generator = std::sync::Arc::clone(&generator);
@@ -253,7 +254,8 @@ echo '{"Error":"worker died"}'
 "#,
         );
 
-        let (manager, _rx, loop_fut) = WorkerManager::new(paths(dir.path()));
+        let (manager, _rx, loop_fut) =
+            WorkerManager::new(paths(dir.path()), crate::worker::ipc::WorkerKind::Generate);
         tokio::spawn(loop_fut);
         let generator = WorkerGenerator::new(manager, config(dir.path()));
 
@@ -283,7 +285,8 @@ echo '{"Token":{"text":"x"}}'
 "#,
         );
 
-        let (manager, _rx, loop_fut) = WorkerManager::new(paths(dir.path()));
+        let (manager, _rx, loop_fut) =
+            WorkerManager::new(paths(dir.path()), crate::worker::ipc::WorkerKind::Generate);
         tokio::spawn(loop_fut);
         let generator = WorkerGenerator::new(manager, config(dir.path()));
 
@@ -296,7 +299,8 @@ echo '{"Token":{"text":"x"}}'
     #[tokio::test]
     async fn request_carries_the_generate_role_and_payload() {
         let dir = tempfile::tempdir().unwrap();
-        let (manager, _rx, _loop_fut) = WorkerManager::new(paths(dir.path()));
+        let (manager, _rx, _loop_fut) =
+            WorkerManager::new(paths(dir.path()), crate::worker::ipc::WorkerKind::Generate);
         let generator = WorkerGenerator::new(manager, config(dir.path()));
 
         let wire = generator.worker_request(request());

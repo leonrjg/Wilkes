@@ -1218,6 +1218,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (manager, _, _) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::ipc::WorkerKind::Embed,
         );
         let installer =
             CandleInstaller::new(EmbedderModel("m1".to_string()), manager, "cpu".to_string());
@@ -1245,6 +1246,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (manager, _, _) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::ipc::WorkerKind::Embed,
         );
         let installer =
             CandleInstaller::new(EmbedderModel("m1".to_string()), manager, "cpu".to_string());

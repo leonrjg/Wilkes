@@ -154,7 +154,8 @@ mod tests {
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
-        let (manager, _event_rx, _loop_fut) = WorkerManager::new(paths);
+        let (manager, _event_rx, _loop_fut) =
+            WorkerManager::new(paths, crate::worker::ipc::WorkerKind::Embed);
 
         let config = WorkerEmbedderConfig {
             model_id: "test-model".to_string(),
@@ -188,7 +189,8 @@ mod tests {
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
-        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let (manager, _event_rx, loop_fut) =
+            WorkerManager::new(paths, crate::worker::ipc::WorkerKind::Embed);
         tokio::spawn(loop_fut);
 
         let config = WorkerEmbedderConfig {
@@ -259,7 +261,8 @@ mod tests {
             worker_bin: worker_bin.clone(),
             data_dir: dir.path().to_path_buf(),
         };
-        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let (manager, _event_rx, loop_fut) =
+            WorkerManager::new(paths, crate::worker::ipc::WorkerKind::Embed);
         tokio::spawn(loop_fut);
 
         let config = WorkerEmbedderConfig {

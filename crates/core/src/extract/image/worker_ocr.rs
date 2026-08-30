@@ -276,14 +276,17 @@ mod tests {
     }
 
     fn test_manager() -> WorkerManager {
-        crate::worker::manager::WorkerManager::new(crate::worker::manager::WorkerPaths {
-            python_path: PathBuf::new(),
-            python_package_dir: PathBuf::new(),
-            requirements_path: PathBuf::new(),
-            venv_dir: PathBuf::new(),
-            worker_bin: PathBuf::new(),
-            data_dir: PathBuf::new(),
-        })
+        crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths {
+                python_path: PathBuf::new(),
+                python_package_dir: PathBuf::new(),
+                requirements_path: PathBuf::new(),
+                venv_dir: PathBuf::new(),
+                worker_bin: PathBuf::new(),
+                data_dir: PathBuf::new(),
+            },
+            crate::worker::ipc::WorkerKind::Recognize,
+        )
         .0
     }
 
@@ -319,15 +322,17 @@ mod tests {
             worker_bin.display()
         );
 
-        let (manager, _events, loop_fut) =
-            crate::worker::manager::WorkerManager::new(crate::worker::manager::WorkerPaths {
+        let (manager, _events, loop_fut) = crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths {
                 python_path: std::path::PathBuf::new(),
                 python_package_dir: std::path::PathBuf::new(),
                 requirements_path: std::path::PathBuf::new(),
                 venv_dir: std::path::PathBuf::new(),
                 worker_bin,
                 data_dir: model_dir.clone(),
-            });
+            },
+            crate::worker::ipc::WorkerKind::Recognize,
+        );
         tokio::spawn(loop_fut);
 
         let engine = RecognitionEngine::default();

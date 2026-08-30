@@ -552,6 +552,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (manager, _, _) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::ipc::WorkerKind::Embed,
         );
         let installer = FastembedInstaller::new(
             EmbedderModel("BGEBaseENV15".to_string()),
@@ -591,6 +592,7 @@ mod tests {
 
         let (manager, _, _) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::ipc::WorkerKind::Embed,
         );
         let installer = FastembedInstaller::new(
             EmbedderModel("BGEBaseENV15".to_string()),
@@ -619,6 +621,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (manager, _, _) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::ipc::WorkerKind::Embed,
         );
         let installer = FastembedInstaller::new(
             EmbedderModel("BGEBaseENV15".to_string()),
@@ -653,6 +656,7 @@ mod tests {
 
         let (manager, _, _) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::ipc::WorkerKind::Embed,
         );
         let installer = FastembedInstaller::new(
             EmbedderModel("BGEBaseENV15".to_string()),

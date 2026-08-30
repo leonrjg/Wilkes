@@ -302,6 +302,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (manager, _, _) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::ipc::WorkerKind::Embed,
         );
         let installer =
             SBERTInstaller::new(EmbedderModel("m".to_string()), manager, "cpu".to_string());
@@ -314,6 +315,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (manager, _, _) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::ipc::WorkerKind::Embed,
         );
         let installer = SBERTInstaller::new(
             EmbedderModel("intfloat/e5-small-v2".to_string()),
@@ -330,6 +332,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (manager, _, _) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::ipc::WorkerKind::Embed,
         );
         let installer =
             SBERTInstaller::new(EmbedderModel("m".to_string()), manager, "cpu".to_string());
@@ -342,6 +345,7 @@ mod tests {
             EmbedderModel("intfloat/e5-small-v2".to_string()),
             crate::worker::manager::WorkerManager::new(
                 crate::worker::manager::WorkerPaths::resolve(dir.path()),
+                crate::worker::ipc::WorkerKind::Embed,
             )
             .0,
             "cpu".to_string(),
@@ -354,6 +358,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (manager, _, _) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::ipc::WorkerKind::Embed,
         );
         let installer = SBERTInstaller::new(
             EmbedderModel("intfloat/e5-small-v2".to_string()),
@@ -373,6 +378,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (manager, _, _) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::ipc::WorkerKind::Embed,
         );
         let installer = SBERTInstaller::new(
             EmbedderModel("custom/model".to_string()),

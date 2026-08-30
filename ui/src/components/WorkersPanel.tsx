@@ -6,6 +6,7 @@ import type { WorkerStatus, Settings } from "../lib/types";
 const ROLE_LABELS: Record<string, string> = {
   embed: "Embedding worker",
   generate: "Generation worker",
+  recognize: "Recognition worker",
 };
 
 function formatMicros(micros: number | null | undefined): string {
@@ -92,13 +93,15 @@ export default function WorkersPanel({ api, settings, onUpdateSettings }: Worker
                 <div className="flex items-center gap-2">
                   <div className={`w-2 h-2 rounded-full ${status.active ? "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]" : "bg-[var(--text-dim)]"}`} />
                   <span className="text-sm font-medium text-[var(--text-main)]">
-                    {ROLE_LABELS[status.role ?? "embed"] ?? status.role}
+                    {status.role ? ROLE_LABELS[status.role] ?? status.role : "Worker"}
                   </span>
                   <span className="text-xs text-[var(--text-muted)]">
                     {status.active ? "Active" : "Idle"}
                   </span>
                 </div>
-                {status.active && status.role !== "generate" && (
+                {/* Only the embedding worker has a kill endpoint; the button
+                    on any other row would kill the embedder instead. */}
+                {status.active && status.role === "embed" && (
                   <button
                     onClick={handleKill}
                     className="px-3 py-1.5 bg-[var(--bg-active)] hover:bg-red-500/20 text-[var(--text-main)] hover:text-red-400 text-xs font-medium rounded transition-colors border border-[var(--border-main)] hover:border-red-500/30"

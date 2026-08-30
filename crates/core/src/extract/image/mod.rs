@@ -848,14 +848,17 @@ mod tests {
     /// the installed check first.
     #[cfg(feature = "candle")]
     fn test_manager() -> crate::worker::manager::WorkerManager {
-        crate::worker::manager::WorkerManager::new(crate::worker::manager::WorkerPaths {
-            python_path: std::path::PathBuf::new(),
-            python_package_dir: std::path::PathBuf::new(),
-            requirements_path: std::path::PathBuf::new(),
-            venv_dir: std::path::PathBuf::new(),
-            worker_bin: std::path::PathBuf::new(),
-            data_dir: std::path::PathBuf::new(),
-        })
+        crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths {
+                python_path: std::path::PathBuf::new(),
+                python_package_dir: std::path::PathBuf::new(),
+                requirements_path: std::path::PathBuf::new(),
+                venv_dir: std::path::PathBuf::new(),
+                worker_bin: std::path::PathBuf::new(),
+                data_dir: std::path::PathBuf::new(),
+            },
+            crate::worker::ipc::WorkerKind::Recognize,
+        )
         .0
     }
 

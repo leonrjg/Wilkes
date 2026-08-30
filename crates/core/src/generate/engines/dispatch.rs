@@ -156,8 +156,10 @@ mod tests {
     #[test]
     fn installer_dispatch_yields_an_unavailable_installer_for_an_empty_dir() {
         let dir = tempdir().unwrap();
-        let (manager, _rx, _fut) =
-            WorkerManager::new(crate::worker::manager::WorkerPaths::resolve(dir.path()));
+        let (manager, _rx, _fut) = WorkerManager::new(
+            crate::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::ipc::WorkerKind::Generate,
+        );
         let installer = candle_installer(
             GeneratorModel(DEFAULT_GENERATOR_MODEL.to_string()),
             manager,

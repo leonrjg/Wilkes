@@ -115,10 +115,12 @@ pub(super) async fn supervised_manager_loop(
     }
 }
 
+/// Clears everything that describes the *running process*. `role` is left
+/// alone: it is the manager's identity, set once at construction, and a
+/// manager whose worker died is still the manager for that role.
 fn reset_worker_status(status: &Arc<RwLock<WorkerStatus>>) {
     if let Ok(mut current) = status.write() {
         current.active = false;
-        current.role = None;
         current.engine = None;
         current.model = None;
         current.device = None;
@@ -437,7 +439,8 @@ impl WorkerRuntime {
     ) {
         if let Ok(mut status) = self.status.write() {
             status.active = true;
-            status.role = Some(role.as_str().to_string());
+            // `role` is owned by the manager, not by the request: see
+            // `reset_worker_status`.
             status.engine = Some(role.engine_str().to_string());
             status.model = Some(model.to_string());
             status.device = if role.as_str() == "generate" {
@@ -462,7 +465,6 @@ impl WorkerRuntime {
     fn update_status_idle(&self) {
         if let Ok(mut status) = self.status.write() {
             status.active = false;
-            status.role = None;
             status.engine = None;
             status.model = None;
             status.device = None;
@@ -569,9 +571,11 @@ mod tests {
         let (_tx, rx) = mpsc::channel(4);
         let (event_tx, event_rx) = mpsc::channel(4);
         let active_pid = Arc::new(AtomicU32::new(0));
+        // Seeded the way `WorkerManager::new` seeds it: the role comes from the
+        // manager and the runtime only ever fills in the process around it.
         let status = Arc::new(RwLock::new(WorkerStatus {
             active: false,
-            role: None,
+            role: Some("embed".to_string()),
             engine: None,
             model: None,
             device: None,
@@ -747,6 +751,8 @@ mod tests {
         assert!(!status.active);
         assert!(status.engine.is_none());
         assert!(status.model.is_none());
+        // The role is the manager's identity, not the dead process's.
+        assert_eq!(status.role.as_deref(), Some("embed"));
     }
 
     #[test]
@@ -1133,6 +1139,9 @@ mod tests {
         assert_eq!(shutdown_calls.load(Ordering::Relaxed), 1);
         drop(tx);
         handle.await.unwrap();
-        assert!(!status.read().unwrap().active);
+        let status = status.read().unwrap();
+        assert!(!status.active);
+        // Going idle unloads the model, not the manager's identity.
+        assert_eq!(status.role.as_deref(), Some("embed"));
     }
 }

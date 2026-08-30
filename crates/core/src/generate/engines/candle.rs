@@ -1268,6 +1268,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (manager, _rx, _fut) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::ipc::WorkerKind::Generate,
         );
         let installer = CandleGeneratorInstaller::new(
             GeneratorModel(DEFAULT_GENERATOR_MODEL.to_string()),

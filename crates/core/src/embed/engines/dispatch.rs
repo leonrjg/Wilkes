@@ -5,7 +5,7 @@ use crate::types::{
     CustomModel, EmbedderCapability, EmbedderCapabilityManifest, EmbedderModel, EmbeddingEngine,
     ModelDescriptor, PrefixSource,
 };
-use crate::worker::ipc::WorkerEvent;
+use crate::worker::ipc::{WorkerEvent, WorkerKind};
 use crate::worker::manager::WorkerManager;
 use std::path::Path;
 use std::sync::Arc;
@@ -261,7 +261,8 @@ pub async fn prepare_embedder(
     match engine {
         EmbeddingEngine::SBERT => {
             let paths = crate::worker::manager::WorkerPaths::resolve(data_dir);
-            let (manager, _event_rx, loop_fut) = crate::worker::manager::WorkerManager::new(paths);
+            let (manager, _event_rx, loop_fut) =
+                crate::worker::manager::WorkerManager::new(paths, WorkerKind::Embed);
             let background_task = tokio::spawn(loop_fut);
             let installer =
                 super::sbert::SBERTInstaller::new(model.clone(), manager, device.to_string());
@@ -377,7 +378,8 @@ mod tests {
     #[test]
     fn test_get_installer_dispatch() {
         let dir = tempdir().unwrap();
-        let (manager, _, _) = WorkerManager::new(WorkerPaths::resolve(dir.path()));
+        let (manager, _, _) =
+            WorkerManager::new(WorkerPaths::resolve(dir.path()), WorkerKind::Embed);
 
         let installer = get_installer(
             EmbeddingEngine::SBERT,

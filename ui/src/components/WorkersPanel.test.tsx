@@ -41,6 +41,16 @@ describe("WorkersPanel", () => {
         pid: null,
         timeout_secs: 300,
       },
+      {
+        active: false,
+        role: "recognize",
+        engine: null,
+        model: null,
+        device: null,
+        request_mode: null,
+        pid: null,
+        timeout_secs: 300,
+      },
     ]);
   });
 
@@ -54,11 +64,12 @@ describe("WorkersPanel", () => {
     });
     
     expect(screen.getByText("Embedding worker")).toBeInTheDocument();
-    // Both roles are listed: two processes can die independently, so one
-    // status would misreport a dead generation worker as healthy.
+    // Every role is listed: the processes die independently, so one status
+    // would misreport a dead generation or recognition worker as healthy.
     expect(screen.getByText("Generation worker")).toBeInTheDocument();
+    expect(screen.getByText("Recognition worker")).toBeInTheDocument();
     expect(screen.getByText("Active")).toBeInTheDocument();
-    expect(screen.getByText("Idle")).toBeInTheDocument();
+    expect(screen.getAllByText("Idle")).toHaveLength(2);
     expect(screen.getByText("SBERT")).toBeInTheDocument();
     expect(screen.getByText("cpu")).toBeInTheDocument();
     expect(screen.getByText("embed")).toBeInTheDocument();
@@ -100,6 +111,55 @@ describe("WorkersPanel", () => {
     expect(screen.getByText("25.0 ms")).toBeInTheDocument();
     expect(screen.getByText(/Requested auto; using cpu/)).toBeInTheDocument();
     expect(screen.getByText(/Metal initialization failed/)).toBeInTheDocument();
+  });
+
+  it("names each idle worker by its own role", async () => {
+    // An idle worker used to report no role at all, and the panel guessed
+    // "embed" for every row: three identical "Embedding worker" headings.
+    mockApi.getWorkerStatuses.mockResolvedValue(
+      ["embed", "generate", "recognize"].map((role) => ({
+        active: false,
+        role,
+        engine: null,
+        model: null,
+        device: null,
+        request_mode: null,
+        pid: null,
+        timeout_secs: 300,
+      })),
+    );
+
+    await act(async () => {
+      render(<WorkersPanel api={mockApi} settings={mockSettings} onUpdateSettings={mockOnUpdateSettings} />);
+    });
+
+    expect(screen.getByText("Embedding worker")).toBeInTheDocument();
+    expect(screen.getByText("Generation worker")).toBeInTheDocument();
+    expect(screen.getByText("Recognition worker")).toBeInTheDocument();
+  });
+
+  it("offers Kill Worker only for the embedding worker", async () => {
+    // `killWorker` kills the embedder, so the button on any other row would
+    // kill a worker other than the one it sits next to.
+    mockApi.getWorkerStatuses.mockResolvedValue([
+      {
+        active: true,
+        role: "recognize",
+        engine: "onnx",
+        model: "recognizer",
+        device: "cpu",
+        request_mode: "recognize",
+        pid: 9001,
+        timeout_secs: 300,
+      },
+    ]);
+
+    await act(async () => {
+      render(<WorkersPanel api={mockApi} settings={mockSettings} onUpdateSettings={mockOnUpdateSettings} />);
+    });
+
+    expect(screen.getByText("Recognition worker")).toBeInTheDocument();
+    expect(screen.queryByText("Kill Worker")).not.toBeInTheDocument();
   });
 
   it("kills worker", async () => {

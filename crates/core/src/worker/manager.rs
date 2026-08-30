@@ -6,15 +6,20 @@ use tokio::sync::mpsc;
 
 use crate::generate::{GenerationRuntime, GenerationTimings};
 
-use super::ipc::{WorkerEvent, WorkerRequest};
+use super::ipc::{WorkerEvent, WorkerKind, WorkerRequest};
 use super::runtime::{supervised_manager_loop, ActiveProcessSlot};
 use super::DEFAULT_IDLE_TIMEOUT_SECS;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkerStatus {
     pub active: bool,
-    /// "embed" or "generate". A sibling of `engine`, not a replacement: the UI
-    /// reads `engine`, and overloading it would break that.
+    /// "embed", "generate" or "recognize". A sibling of `engine`, not a
+    /// replacement: the UI reads `engine`, and overloading it would break that.
+    ///
+    /// Set from the manager's `WorkerKind` at construction and never cleared:
+    /// the role names *which manager this is*, so an idle worker that reported
+    /// no role left the UI guessing, and it guessed "embed" for all three.
+    /// Optional only because older builds serialised statuses without it.
     #[serde(default)]
     pub role: Option<String>,
     pub engine: Option<String>,
@@ -107,8 +112,13 @@ pub struct WorkerManager {
 }
 
 impl WorkerManager {
+    /// `kind` is what this manager supervises, for its whole life. A manager
+    /// holds one worker and a worker serves one role, so the role is the
+    /// manager's own identity rather than something read off the process that
+    /// happens to be running.
     pub fn new(
         paths: WorkerPaths,
+        kind: WorkerKind,
     ) -> (
         Self,
         mpsc::Receiver<ManagerEvent>,
@@ -120,7 +130,7 @@ impl WorkerManager {
         let active_process: ActiveProcessSlot = Arc::new(std::sync::Mutex::new(None));
         let status = Arc::new(RwLock::new(WorkerStatus {
             active: false,
-            role: None,
+            role: Some(kind.as_str().to_string()),
             engine: None,
             model: None,
             device: None,
@@ -238,12 +248,42 @@ mod tests {
             data_dir: PathBuf::from("data"),
         };
 
-        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths, WorkerKind::Embed);
         let _loop_handle = tokio::spawn(loop_fut);
 
         let status = manager.status();
         assert!(!status.active);
         assert_eq!(status.timeout_secs, 300);
+    }
+
+    /// An idle manager still names its role. It used to report `None`, and the
+    /// UI — which has nothing else to go on — labelled all three workers
+    /// "Embedding worker".
+    #[tokio::test]
+    async fn an_idle_manager_reports_the_role_it_supervises() {
+        let paths = WorkerPaths {
+            python_path: PathBuf::from("python"),
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            venv_dir: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
+        };
+
+        for (kind, expected) in [
+            (WorkerKind::Embed, "embed"),
+            (WorkerKind::Generate, "generate"),
+            (WorkerKind::Recognize, "recognize"),
+        ] {
+            let (manager, _event_rx, loop_fut) = WorkerManager::new(paths.clone(), kind);
+            let _loop_handle = tokio::spawn(loop_fut);
+
+            let status = manager.status();
+            assert!(!status.active);
+            assert_eq!(status.role.as_deref(), Some(expected));
+            // The engine belongs to the request, and there is none yet.
+            assert!(status.engine.is_none());
+        }
     }
 
     #[tokio::test]
@@ -256,7 +296,7 @@ mod tests {
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
-        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths, WorkerKind::Generate);
         let _loop_handle = tokio::spawn(loop_fut);
 
         manager.record_generation_runtime(GenerationRuntime {
@@ -303,7 +343,7 @@ mod tests {
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
-        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths, WorkerKind::Embed);
         let _loop_handle = tokio::spawn(loop_fut);
 
         manager.try_send(ManagerCommand::SetTimeout(55)).unwrap();
@@ -331,7 +371,7 @@ mod tests {
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
-        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths, WorkerKind::Embed);
         let _loop_handle = tokio::spawn(loop_fut);
 
         manager.request_shutdown();
@@ -347,7 +387,7 @@ mod tests {
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
-        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths, WorkerKind::Embed);
         let _loop_handle = tokio::spawn(loop_fut);
 
         manager.send(ManagerCommand::SetTimeout(100)).await.unwrap();
@@ -373,7 +413,7 @@ mod tests {
             worker_bin,
             data_dir: PathBuf::from("data"),
         };
-        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths, WorkerKind::Embed);
         let _loop_handle = tokio::spawn(loop_fut);
 
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
@@ -409,7 +449,7 @@ mod tests {
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
-        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths, WorkerKind::Embed);
         let _loop_handle = tokio::spawn(loop_fut);
 
         manager.send(ManagerCommand::SetTimeout(1)).await.unwrap();
@@ -433,7 +473,7 @@ mod tests {
             worker_bin,
             data_dir: PathBuf::from("data"),
         };
-        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths, WorkerKind::Embed);
         let _loop_handle = tokio::spawn(loop_fut);
 
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
@@ -472,7 +512,7 @@ mod tests {
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
-        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths);
+        let (manager, _event_rx, loop_fut) = WorkerManager::new(paths, WorkerKind::Embed);
         let _loop_handle = tokio::spawn(loop_fut);
 
         manager.request_shutdown();

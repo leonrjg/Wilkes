@@ -19,13 +19,40 @@ pub enum WorkerRole {
     Recognize(RecognitionEngine),
 }
 
-impl WorkerRole {
+/// What a *manager* is for, without the engine. A manager supervises one role
+/// for the whole life of the process; the engine within that role is a
+/// property of the request currently in flight, and is gone when the worker
+/// goes idle. Keeping the two apart is what lets a status name its worker
+/// while no process is running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerKind {
+    Embed,
+    Generate,
+    Recognize,
+}
+
+impl WorkerKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            WorkerRole::Embed(_) => "embed",
-            WorkerRole::Generate(_) => "generate",
-            WorkerRole::Recognize(_) => "recognize",
+            WorkerKind::Embed => "embed",
+            WorkerKind::Generate => "generate",
+            WorkerKind::Recognize => "recognize",
         }
+    }
+}
+
+impl WorkerRole {
+    /// The role without its engine.
+    pub fn kind(&self) -> WorkerKind {
+        match self {
+            WorkerRole::Embed(_) => WorkerKind::Embed,
+            WorkerRole::Generate(_) => WorkerKind::Generate,
+            WorkerRole::Recognize(_) => WorkerKind::Recognize,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        self.kind().as_str()
     }
 
     /// The engine name within the role, for status display.

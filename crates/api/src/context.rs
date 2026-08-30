@@ -58,6 +58,7 @@ use wilkes_core::types::{
 use wilkes_core::types::{
     GenerationSettings, GenerationStreamEvent, GenerationTask, GeneratorDescriptor,
 };
+use wilkes_core::worker::ipc::WorkerKind;
 use wilkes_core::worker::manager::{
     ManagerCommand, ManagerEvent, WorkerManager, WorkerPaths, WorkerStatus,
 };
@@ -1053,14 +1054,16 @@ impl AppContext {
         mpsc::Receiver<ManagerEvent>,
         impl std::future::Future<Output = ()> + Send,
     ) {
-        let (worker_manager, event_rx, loop_fut) = WorkerManager::new(paths.clone());
+        let (worker_manager, event_rx, loop_fut) =
+            WorkerManager::new(paths.clone(), WorkerKind::Embed);
         let (generate_manager, generate_event_rx, generate_loop_fut) =
-            WorkerManager::new(paths.clone());
+            WorkerManager::new(paths.clone(), WorkerKind::Generate);
         // A third, because a manager holds one worker and a worker serves one
         // role: a build alternates recognition and embedding file by file, and
         // sharing a manager between them would restart and reload a model on
         // every alternation.
-        let (recognize_manager, recognize_event_rx, recognize_loop_fut) = WorkerManager::new(paths);
+        let (recognize_manager, recognize_event_rx, recognize_loop_fut) =
+            WorkerManager::new(paths, WorkerKind::Recognize);
         let bookmarks_path = data_dir.join("bookmarks.json");
         let model_dir = shared_data_dir.join("models");
         let ctx = Arc::new(Self {
@@ -9327,14 +9330,17 @@ mod tests {
         };
         let (tx, _rx) = mpsc::channel(1);
         let options = AppContext::build_index_options(
-            WorkerManager::new(WorkerPaths {
-                python_path: PathBuf::from("python"),
-                python_package_dir: PathBuf::from("pkg"),
-                requirements_path: PathBuf::from("reqs.txt"),
-                venv_dir: PathBuf::from("venv"),
-                worker_bin: PathBuf::from("worker"),
-                data_dir: dir.path().to_path_buf(),
-            })
+            WorkerManager::new(
+                WorkerPaths {
+                    python_path: PathBuf::from("python"),
+                    python_package_dir: PathBuf::from("pkg"),
+                    requirements_path: PathBuf::from("reqs.txt"),
+                    venv_dir: PathBuf::from("venv"),
+                    worker_bin: PathBuf::from("worker"),
+                    data_dir: dir.path().to_path_buf(),
+                },
+                WorkerKind::Embed,
+            )
             .0,
             dir.path().join("models"),
             dir.path().to_path_buf(),
