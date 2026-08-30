@@ -210,11 +210,25 @@ describe("SettingsModal", () => {
     });
   });
 
-  it("starts the external MCP server from Chat settings", async () => {
+  it("keeps the server listeners out of the Chat tab", async () => {
     await act(async () => {
       render(<SettingsModal {...defaultProps} />);
     });
     fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+
+    // jsdom knows nothing of Tailwind, so ask which pane each control sits in
+    // rather than whether it paints.
+    const paneOf = (el: HTMLElement) => el.closest("div.block, div.hidden");
+    expect(paneOf(screen.getByLabelText("Custom instructions"))).toHaveClass("block");
+    expect(paneOf(screen.getByLabelText("Serve MCP for external clients"))).toHaveClass("hidden");
+    expect(paneOf(screen.getByLabelText("Serve the HTTP API"))).toHaveClass("hidden");
+  });
+
+  it("starts the external MCP server from Servers settings", async () => {
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "MCP and HTTP API servers" }));
 
     await act(async () => {
       fireEvent.click(screen.getByLabelText("Serve MCP for external clients"));
@@ -234,7 +248,7 @@ describe("SettingsModal", () => {
     await act(async () => {
       render(<SettingsModal {...defaultProps} />);
     });
-    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    fireEvent.click(screen.getByRole("button", { name: "MCP and HTTP API servers" }));
     await act(async () => {
       fireEvent.click(screen.getByLabelText("Serve MCP for external clients"));
     });
@@ -264,7 +278,7 @@ describe("SettingsModal", () => {
     await act(async () => {
       render(<SettingsModal {...defaultProps} />);
     });
-    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    fireEvent.click(screen.getByRole("button", { name: "MCP and HTTP API servers" }));
     fireEvent.change(screen.getByLabelText("External MCP bind address"), {
       target: { value: "0.0.0.0" },
     });
@@ -296,7 +310,7 @@ describe("SettingsModal", () => {
     await act(async () => {
       render(<SettingsModal {...defaultProps} />);
     });
-    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    fireEvent.click(screen.getByRole("button", { name: "MCP and HTTP API servers" }));
 
     await act(async () => {
       fireEvent.click(await screen.findByRole("button", { name: "Copy Claude setup" }));

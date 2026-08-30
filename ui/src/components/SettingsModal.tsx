@@ -169,6 +169,7 @@ export default function SettingsModal({
     | "semantic-chunking"
     | "generation-chat"
     | "generation-models"
+    | "servers"
     | "extraction-images"
     | "data"
     | "workers"
@@ -414,6 +415,13 @@ export default function SettingsModal({
               <TabButton id="general" label="General" />
               <TabButton id="extensions" label="File extensions" />
               <TabButton id="integrations" label="Integrations" />
+              {isTauri && (
+                <TabButton
+                  id="servers"
+                  label="Servers"
+                  accessibleLabel="MCP and HTTP API servers"
+                />
+              )}
             </div>
 
             <div className="flex flex-col gap-0.5">
@@ -777,7 +785,46 @@ export default function SettingsModal({
                       </div>
                     </div>
                   </section>
-                  <section className="border-t border-[var(--border-main)] pt-4">
+                </div>
+              )}
+            </div>
+
+            <div className={activeTab === "extensions" ? "block h-full" : "hidden"}>
+              {settings && (
+                <ExtensionsPanel settings={settings} onUpdate={handleUpdateSettings} />
+              )}
+            </div>
+
+            <div className={activeTab === "integrations" ? "block h-full" : "hidden"}>
+              {settings && (
+                <IntegrationsPanel api={api} settings={settings} onUpdate={handleUpdateSettings} />
+              )}
+            </div>
+
+            <div className={activeTab === "semantic-models" ? "block h-full" : "hidden"}>
+              <SemanticPanel
+                api={api}
+                directory={directory}
+                refreshSemanticReady={refreshSemanticReady}
+              />
+            </div>
+
+            <div className={activeTab === "generation-models" ? "block h-full" : "hidden"}>
+              {settings && (
+                <GenerationPanel
+                  api={api}
+                  settings={settings}
+                  onUpdateSettings={handleUpdateSettings}
+                />
+              )}
+            </div>
+
+            {/* Both listeners serve Wilkes to other programs; neither is a
+                property of the chat agent they used to be filed under. */}
+            <div className={activeTab === "servers" ? "block h-full" : "hidden"}>
+              {settings && isTauri && (
+                <div className="space-y-4">
+                  <section>
                     <div className="flex items-center justify-between mb-2">
                       <div>
                         <h3 className="text-[10px] font-medium text-[var(--text-dim)] uppercase tracking-wider">
@@ -1073,36 +1120,6 @@ export default function SettingsModal({
                     </div>
                   </section>
                 </div>
-              )}
-            </div>
-
-            <div className={activeTab === "extensions" ? "block h-full" : "hidden"}>
-              {settings && (
-                <ExtensionsPanel settings={settings} onUpdate={handleUpdateSettings} />
-              )}
-            </div>
-
-            <div className={activeTab === "integrations" ? "block h-full" : "hidden"}>
-              {settings && (
-                <IntegrationsPanel api={api} settings={settings} onUpdate={handleUpdateSettings} />
-              )}
-            </div>
-
-            <div className={activeTab === "semantic-models" ? "block h-full" : "hidden"}>
-              <SemanticPanel
-                api={api}
-                directory={directory}
-                refreshSemanticReady={refreshSemanticReady}
-              />
-            </div>
-
-            <div className={activeTab === "generation-models" ? "block h-full" : "hidden"}>
-              {settings && (
-                <GenerationPanel
-                  api={api}
-                  settings={settings}
-                  onUpdateSettings={handleUpdateSettings}
-                />
               )}
             </div>
 
