@@ -124,10 +124,7 @@ pub trait OcrEngine: Send + Sync {
     ///
     /// An engine that recognizes one image at a time satisfies this by
     /// looping; the point is where the loop lives, not that one exists.
-    fn spot_batch(
-        &self,
-        images: &[image::RgbImage],
-    ) -> anyhow::Result<Vec<ImageRecognition>>;
+    fn spot_batch(&self, images: &[image::RgbImage]) -> anyhow::Result<Vec<ImageRecognition>>;
 }
 
 /// Parse a spotting response into regions.
@@ -342,7 +339,11 @@ pub fn latex_parses(latex: &str) -> bool {
         i += 1;
     }
 
-    braces == 0 && brackets == 0 && left_right == 0 && environments.is_empty() && dollars.is_multiple_of(2)
+    braces == 0
+        && brackets == 0
+        && left_right == 0
+        && environments.is_empty()
+        && dollars.is_multiple_of(2)
 }
 
 struct Command {
@@ -531,13 +532,10 @@ pub fn place_and_admit(
                 .collect();
             let page_polygon: Vec<Point> = polygon_within_image
                 .iter()
-                .map(|point| {
-                    transform.pixel_to_page(point.x, point.y, pixel_width, pixel_height)
-                })
+                .map(|point| transform.pixel_to_page(point.x, point.y, pixel_width, pixel_height))
                 .collect();
             let comparable = normalize_for_comparison(&region.text);
-            let drawn_natively =
-                !comparable.is_empty() && native.contains(comparable.as_str());
+            let drawn_natively = !comparable.is_empty() && native.contains(comparable.as_str());
             let admission = admit(
                 origin,
                 region.kind,
@@ -703,7 +701,9 @@ mod tests {
     fn a_formula_is_admitted_on_whether_its_latex_closes() {
         assert!(latex_parses("S(q,d) = \\Sigma_{i} w_{i}"));
         assert!(latex_parses("\\left( \\frac{a}{b} \\right)^{2}"));
-        assert!(latex_parses("\\begin{matrix} a & b \\\\ c & d \\end{matrix}"));
+        assert!(latex_parses(
+            "\\begin{matrix} a & b \\\\ c & d \\end{matrix}"
+        ));
         assert!(latex_parses("x \\{ y \\}"), "an escaped brace is a literal");
 
         assert!(!latex_parses(""));
@@ -720,7 +720,10 @@ mod tests {
             !latex_parses("\\begin{matrix} a \\end{pmatrix}"),
             "an environment closed as another"
         );
-        assert!(!latex_parses("a + b \\"), "a decode that stopped in a command");
+        assert!(
+            !latex_parses("a + b \\"),
+            "a decode that stopped in a command"
+        );
         assert!(!latex_parses("$x = 1"), "an unclosed inline segment");
     }
 
@@ -780,7 +783,14 @@ mod tests {
             OcrAdmission::Accepted
         );
         assert_eq!(
-            admit(RegionOrigin::Embedded, RegionKind::Text, "blurred", 0.4, 0.7, false),
+            admit(
+                RegionOrigin::Embedded,
+                RegionKind::Text,
+                "blurred",
+                0.4,
+                0.7,
+                false
+            ),
             OcrAdmission::RejectedLowConfidence
         );
         assert_eq!(
@@ -808,7 +818,14 @@ mod tests {
             "a confident truncation is still a truncation"
         );
         assert_eq!(
-            admit(RegionOrigin::Embedded, RegionKind::Table, table, 0.1, 0.7, false),
+            admit(
+                RegionOrigin::Embedded,
+                RegionKind::Table,
+                table,
+                0.1,
+                0.7,
+                false
+            ),
             OcrAdmission::Accepted
         );
         assert_eq!(
@@ -823,12 +840,26 @@ mod tests {
             OcrAdmission::RejectedMalformedTable
         );
         assert_eq!(
-            admit(RegionOrigin::Embedded, RegionKind::Chart, table, 0.99, 0.7, false),
+            admit(
+                RegionOrigin::Embedded,
+                RegionKind::Chart,
+                table,
+                0.99,
+                0.7,
+                false
+            ),
             OcrAdmission::Accepted,
             "a chart is admitted as a table, by the same rule"
         );
         assert_eq!(
-            admit(RegionOrigin::Embedded, RegionKind::Chart, "roughly rising", 0.99, 0.7, false),
+            admit(
+                RegionOrigin::Embedded,
+                RegionKind::Chart,
+                "roughly rising",
+                0.99,
+                0.7,
+                false
+            ),
             OcrAdmission::RejectedMalformedTable
         );
     }
@@ -856,7 +887,10 @@ mod tests {
         let table = "| a | b |\n| --- | --- |\n| 1 | 2 |";
         let of = |kind, text| admit(RegionOrigin::Typeset, kind, text, 0.99, 0.7, false);
 
-        assert_eq!(of(RegionKind::Formula, "E = mc^{2}"), OcrAdmission::Accepted);
+        assert_eq!(
+            of(RegionKind::Formula, "E = mc^{2}"),
+            OcrAdmission::Accepted
+        );
         assert_eq!(of(RegionKind::Table, table), OcrAdmission::Accepted);
         assert_eq!(of(RegionKind::Chart, table), OcrAdmission::Accepted);
         for kind in [RegionKind::Text, RegionKind::Code] {
@@ -932,7 +966,10 @@ mod tests {
     /// Unicode and is never sliced by byte offset.
     #[test]
     fn normalization_is_character_safe() {
-        assert_eq!(normalize_recognized_text("日本語  テキスト"), "日本語 テキスト");
+        assert_eq!(
+            normalize_recognized_text("日本語  テキスト"),
+            "日本語 テキスト"
+        );
         assert_eq!(normalize_for_comparison("«Größe»"), "größe");
     }
 }

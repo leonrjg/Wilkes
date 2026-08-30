@@ -41,14 +41,12 @@ impl PdfExtractor {
         // are handed to the recognizer is as much a determinant of the bytes
         // as which recognizer reads them, and a change to it has to re-read
         // the library the same way a change of model does.
-        let analyzer_identity =
-            format!("{}+{}", typeset::ROUTING_VERSION, analyzer.identity());
+        let analyzer_identity = format!("{}+{}", typeset::ROUTING_VERSION, analyzer.identity());
         Self {
             backend: Box::new(MuPdfBackend::new(Some(analyzer))),
             analyzer_identity,
         }
     }
-
 }
 
 impl Default for PdfExtractor {

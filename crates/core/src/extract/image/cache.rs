@@ -201,10 +201,16 @@ mod tests {
         let key = key("analyzer-v1", "pixels");
 
         assert!(cache.get(&key).is_none());
-        cache.put(&key, &annotation("Knowledge base", ImageAnalysisStatus::Complete));
+        cache.put(
+            &key,
+            &annotation("Knowledge base", ImageAnalysisStatus::Complete),
+        );
         let found = cache.get(&key).expect("hit");
         assert_eq!(found.ocr_regions[0].text, "Knowledge base");
-        assert_eq!(found.ocr_regions[0].page_polygon[0], Point { x: 3.0, y: 4.0 });
+        assert_eq!(
+            found.ocr_regions[0].page_polygon[0],
+            Point { x: 3.0, y: 4.0 }
+        );
     }
 
     /// The point of the key. A different recipe is a different answer, so it

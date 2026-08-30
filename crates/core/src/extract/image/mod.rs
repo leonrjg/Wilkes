@@ -21,11 +21,11 @@ pub mod dispatch;
 #[cfg(feature = "recognize-onnx")]
 pub mod granite_docling;
 pub mod ocr;
-#[cfg(feature = "recognize-onnx")]
-pub mod onnx_vlm;
 /// The external door for description: whatever the user has pulled into
 /// Ollama, asked with the same prompt as the first-class path.
 pub mod ollama;
+#[cfg(feature = "recognize-onnx")]
+pub mod onnx_vlm;
 /// The production recognizer. Behind the `candle` feature because that is the
 /// runtime it uses — the one already pinned, with no second inference
 /// dependency added to reach it.
@@ -38,8 +38,8 @@ pub mod worker_ocr;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use sha2::{Digest, Sha256};
 use anyhow::Context as _;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::types::{
@@ -643,9 +643,7 @@ fn count_regions(image: &ExtractedImage, diagnostics: &mut ExtractionDiagnostics
             OcrAdmission::DeduplicatedAgainstNativeText => {
                 diagnostics.ocr_regions_deduplicated_against_native_text += 1
             }
-            OcrAdmission::RejectedInvalidLatex => {
-                diagnostics.formulas_rejected_invalid_latex += 1
-            }
+            OcrAdmission::RejectedInvalidLatex => diagnostics.formulas_rejected_invalid_latex += 1,
             OcrAdmission::RejectedMalformedTable => match region.kind {
                 RegionKind::Chart => diagnostics.charts_rejected_malformed += 1,
                 _ => diagnostics.tables_rejected_malformed += 1,
@@ -687,12 +685,9 @@ pub fn analyze(
     let mut images: Vec<ExtractedImage> = discovered
         .iter()
         .map(|found| {
-            let (pixel_width, pixel_height) = found
-                .decoded
-                .as_ref()
-                .map_or((0, 0), |decoded| {
-                    (decoded.pixels.width(), decoded.pixels.height())
-                });
+            let (pixel_width, pixel_height) = found.decoded.as_ref().map_or((0, 0), |decoded| {
+                (decoded.pixels.width(), decoded.pixels.height())
+            });
             ExtractedImage {
                 id: found.id.clone(),
                 page: found.page,
@@ -722,7 +717,10 @@ pub fn analyze(
             // No analyzer: the skipped ones are still skipped, and the rest
             // were never looked at. Neither is a success.
             for image in &mut images {
-                if matches!(image.status, ImageAnalysisStatus::SkippedTechnicalLimit { .. }) {
+                if matches!(
+                    image.status,
+                    ImageAnalysisStatus::SkippedTechnicalLimit { .. }
+                ) {
                     if image.origin == RegionOrigin::Embedded {
                         diagnostics.native_images_skipped_technical_limit += 1;
                     }
@@ -836,7 +834,10 @@ mod tests {
         configure(Some(Arc::new(Nothing("first"))));
         assert_eq!(configured().map(|a| a.identity()).as_deref(), Some("first"));
         configure(Some(Arc::new(Nothing("second"))));
-        assert_eq!(configured().map(|a| a.identity()).as_deref(), Some("second"));
+        assert_eq!(
+            configured().map(|a| a.identity()).as_deref(),
+            Some("second")
+        );
         configure(None);
         assert!(configured().is_none());
         configure(restore);
@@ -952,14 +953,21 @@ mod tests {
         let baseline = analyzer("weights-a", 0.6, "prompt-v1");
 
         assert_ne!(baseline, analyzer("weights-b", 0.6, "prompt-v1"), "model");
-        assert_ne!(baseline, analyzer("weights-a", 0.7, "prompt-v1"), "threshold");
+        assert_ne!(
+            baseline,
+            analyzer("weights-a", 0.7, "prompt-v1"),
+            "threshold"
+        );
         assert_ne!(baseline, analyzer("weights-a", 0.6, "prompt-v2"), "prompt");
 
         // The mapping and the serialization are constants rather than
         // configuration, so what a test can hold is that the identity carries
         // them: changing either then changes it by construction, and cannot
         // be changed without this failing to be true.
-        assert!(baseline.contains(ocr::MAPPING_VERSION), "mapping: {baseline}");
+        assert!(
+            baseline.contains(ocr::MAPPING_VERSION),
+            "mapping: {baseline}"
+        );
         assert!(
             baseline.contains(serialize::SERIALIZATION_VERSION),
             "serialization: {baseline}"
@@ -1000,8 +1008,8 @@ mod tests {
 
     #[test]
     fn decoding_reads_rgb_and_greyscale_pixmaps() {
-        let rgb = decode(2, 2, 3, 6, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
-            .expect("rgb decodes");
+        let rgb =
+            decode(2, 2, 3, 6, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]).expect("rgb decodes");
         assert_eq!(rgb.pixels.get_pixel(0, 0).0, [1, 2, 3]);
         assert_eq!(rgb.pixels.get_pixel(1, 0).0, [4, 5, 6]);
         assert_eq!(rgb.pixels.get_pixel(1, 1).0, [10, 11, 12]);
@@ -1016,8 +1024,14 @@ mod tests {
     /// read by stride, not by width times components.
     #[test]
     fn decoding_respects_the_row_stride() {
-        let padded = decode(2, 2, 3, 8, &[1, 2, 3, 4, 5, 6, 0, 0, 7, 8, 9, 10, 11, 12, 0, 0])
-            .expect("padded decodes");
+        let padded = decode(
+            2,
+            2,
+            3,
+            8,
+            &[1, 2, 3, 4, 5, 6, 0, 0, 7, 8, 9, 10, 11, 12, 0, 0],
+        )
+        .expect("padded decodes");
         assert_eq!(padded.pixels.get_pixel(0, 0).0, [1, 2, 3]);
         assert_eq!(padded.pixels.get_pixel(1, 0).0, [4, 5, 6]);
         assert_eq!(padded.pixels.get_pixel(0, 1).0, [7, 8, 9]);

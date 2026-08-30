@@ -796,7 +796,7 @@ mod tests {
         Page {
             number,
             height: 800.0,
-            blocks: vec![Block { lines , image: None }],
+            blocks: vec![Block { lines, image: None }],
         }
     }
 
@@ -872,9 +872,15 @@ mod tests {
     fn page_with_a_formula_in_the_middle() -> Page {
         let mut lines = vec![
             line(vec![word("prose", 100.0, 80.0), word("above", 140.0, 80.0)]),
-            line(vec![word("ci", 100.0, 100.0), word("=", 120.0, 100.0),
-                      word("ai", 140.0, 100.0)]),
-            line(vec![word("prose", 100.0, 120.0), word("below", 140.0, 120.0)]),
+            line(vec![
+                word("ci", 100.0, 100.0),
+                word("=", 120.0, 100.0),
+                word("ai", 140.0, 100.0),
+            ]),
+            line(vec![
+                word("prose", 100.0, 120.0),
+                word("below", 140.0, 120.0),
+            ]),
         ];
         lines[1].typeset = Some(0);
         Page {
@@ -900,7 +906,9 @@ mod tests {
         assert!(reading.text.contains("prose above"), "{:?}", reading.text);
         assert!(reading.text.contains("prose below"), "{:?}", reading.text);
         assert!(
-            reading.text.contains("Page formula: c_i = a_i \\oplus b_i."),
+            reading
+                .text
+                .contains("Page formula: c_i = a_i \\oplus b_i."),
             "{:?}",
             reading.text
         );
@@ -947,8 +955,14 @@ mod tests {
             number: 1,
             height: 800.0,
             blocks: vec![
-                Block { lines: vec![first], image: None },
-                Block { lines: vec![second], image: None },
+                Block {
+                    lines: vec![first],
+                    image: None,
+                },
+                Block {
+                    lines: vec![second],
+                    image: None,
+                },
             ],
         };
 

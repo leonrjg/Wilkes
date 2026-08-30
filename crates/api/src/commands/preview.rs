@@ -249,7 +249,9 @@ mod tests {
             text_range: None,
         };
 
-        let data = preview(match_ref(path), Some(handle.clone())).await.unwrap();
+        let data = preview(match_ref(path), Some(handle.clone()))
+            .await
+            .unwrap();
         let PreviewData::Pdf { superseded, .. } = data else {
             panic!("a PDF match previews as a PDF");
         };

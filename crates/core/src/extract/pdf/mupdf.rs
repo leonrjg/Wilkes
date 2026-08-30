@@ -105,10 +105,7 @@ struct PdfDocument {
 /// and there is exactly one of those. Asking for the outline therefore costs
 /// what extraction costs — the price of the offsets being real rather than a
 /// page number wearing an offset's clothes.
-fn read_document(
-    path: &Path,
-    analyzer: Option<&dyn ImageAnalyzer>,
-) -> anyhow::Result<PdfDocument> {
+fn read_document(path: &Path, analyzer: Option<&dyn ImageAnalyzer>) -> anyhow::Result<PdfDocument> {
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?;
@@ -806,7 +803,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_pdf(dir.path(), "outlined.pdf", OUTLINED_PDF_BASE64);
 
-        let outline = MuPdfBackend::default().outline(&path).expect("outline reads").entries;
+        let outline = MuPdfBackend::default()
+            .outline(&path)
+            .expect("outline reads")
+            .entries;
         let seen: Vec<(&str, u32, Option<u32>)> = outline
             .iter()
             .map(|e| (e.title.as_str(), e.level, e.page))
@@ -832,7 +832,10 @@ mod tests {
         let path = write_pdf(dir.path(), "outlined.pdf", OUTLINED_PDF_BASE64);
 
         let content = MuPdfBackend::default().extract(&path).expect("extracts");
-        let outline = MuPdfBackend::default().outline(&path).expect("outline reads").entries;
+        let outline = MuPdfBackend::default()
+            .outline(&path)
+            .expect("outline reads")
+            .entries;
 
         let chapter_two = outline
             .iter()
@@ -870,7 +873,10 @@ mod tests {
         );
 
         let content = MuPdfBackend::default().extract(&path).expect("extracts");
-        let outline = MuPdfBackend::default().outline(&path).expect("outline reads").entries;
+        let outline = MuPdfBackend::default()
+            .outline(&path)
+            .expect("outline reads")
+            .entries;
 
         let middle = outline.iter().find(|e| e.title == "Middle").expect("entry");
         assert_eq!(middle.anchor, OutlineAnchor::DestinationCoordinate);
@@ -894,7 +900,10 @@ mod tests {
         );
 
         let content = MuPdfBackend::default().extract(&path).expect("extracts");
-        let outline = MuPdfBackend::default().outline(&path).expect("outline reads").entries;
+        let outline = MuPdfBackend::default()
+            .outline(&path)
+            .expect("outline reads")
+            .entries;
 
         let tail = outline
             .iter()
@@ -916,7 +925,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_pdf(dir.path(), "outlined.pdf", OUTLINED_PDF_BASE64);
 
-        let outline = MuPdfBackend::default().outline(&path).expect("outline reads").entries;
+        let outline = MuPdfBackend::default()
+            .outline(&path)
+            .expect("outline reads")
+            .entries;
         let chapter_one = outline
             .iter()
             .find(|e| e.title == "Chapter One")
@@ -988,9 +1000,10 @@ mod tests {
         let (width, height) = (image.pixel_width, image.pixel_height);
 
         let top_left = image.transform.pixel_to_page(0.0, 0.0, width, height);
-        let bottom_right = image
-            .transform
-            .pixel_to_page(width as f32, height as f32, width, height);
+        let bottom_right =
+            image
+                .transform
+                .pixel_to_page(width as f32, height as f32, width, height);
 
         assert!(
             (top_left.x - image.bbox.x).abs() < 1.0 && (top_left.y - image.bbox.y).abs() < 1.0,
@@ -1169,7 +1182,10 @@ mod tests {
             ));
             assert!(matches!(
                 segment.origin,
-                SourceOrigin::PdfPage { page: 1, bbox: Some(_) }
+                SourceOrigin::PdfPage {
+                    page: 1,
+                    bbox: Some(_)
+                }
             ));
         }
         assert_eq!(cursor, range.end, "the block ends where the segments do");
@@ -1183,11 +1199,17 @@ mod tests {
                     .expect("the label is in the reading"),
             )
             .expect("it resolves");
-        let SourceOrigin::PdfPage { bbox: Some(bbox), .. } = label else {
+        let SourceOrigin::PdfPage {
+            bbox: Some(bbox), ..
+        } = label
+        else {
             panic!("expected a page locator, got {label:?}");
         };
         // The region's polygon, not the image's box.
-        assert!((bbox.x - 40.0).abs() < 0.01 && (bbox.width - 60.0).abs() < 0.01, "{bbox:?}");
+        assert!(
+            (bbox.x - 40.0).abs() < 0.01 && (bbox.width - 60.0).abs() < 0.01,
+            "{bbox:?}"
+        );
     }
 
     /// The document this feature was specified against, when it is present.
@@ -1319,13 +1341,29 @@ mod tests {
             .iter()
             .filter(|image| image.origin == RegionOrigin::Typeset)
             .collect();
-        assert_eq!(typeset.len(), 1, "the display line is one region: {:?}",
-            content.images.iter().map(|i| (&i.id, i.origin)).collect::<Vec<_>>());
-        assert_eq!(typeset[0].id, "p1-v0", "typeset ids are told apart from embedded ones");
-        assert!(typeset[0].pixel_width > 0 && typeset[0].pixel_height > 0, "it was rendered");
+        assert_eq!(
+            typeset.len(),
+            1,
+            "the display line is one region: {:?}",
+            content
+                .images
+                .iter()
+                .map(|i| (&i.id, i.origin))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            typeset[0].id, "p1-v0",
+            "typeset ids are told apart from embedded ones"
+        );
+        assert!(
+            typeset[0].pixel_width > 0 && typeset[0].pixel_height > 0,
+            "it was rendered"
+        );
 
         assert!(
-            content.text.contains("Page formula: c_i = a_i \\oplus b_i."),
+            content
+                .text
+                .contains("Page formula: c_i = a_i \\oplus b_i."),
             "the LaTeX is in the reading under a label that does not say embedded: {:?}",
             content.text
         );
@@ -1335,8 +1373,12 @@ mod tests {
             content.text
         );
         assert!(
-            content.text.contains("which is obtained by bitwise addition")
-                && content.text.contains("and the discussion continues afterwards"),
+            content
+                .text
+                .contains("which is obtained by bitwise addition")
+                && content
+                    .text
+                    .contains("and the discussion continues afterwards"),
             "the prose around it is untouched: {:?}",
             content.text
         );
@@ -1382,10 +1424,11 @@ mod tests {
                                 .any(|x| pixels.get_pixel(x, *y).0.iter().any(|c| *c < 200))
                         })
                         .collect();
-                    self.seen
-                        .lock()
-                        .expect("not poisoned")
-                        .push((pixels.width(), pixels.height(), inked));
+                    self.seen.lock().expect("not poisoned").push((
+                        pixels.width(),
+                        pixels.height(),
+                        inked,
+                    ));
                 }
             }
         }
@@ -1497,5 +1540,4 @@ mod tests {
         assert_eq!(refused.typeset_regions_found, 1);
         assert_eq!(refused.typeset_regions_superseded_native_text, 0);
     }
-
 }

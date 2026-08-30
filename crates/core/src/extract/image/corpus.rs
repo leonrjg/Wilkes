@@ -50,10 +50,7 @@ impl OcrEngine for Arc<ImageCapture> {
         1.0
     }
 
-    fn spot_batch(
-        &self,
-        images: &[image::RgbImage],
-    ) -> anyhow::Result<Vec<ImageRecognition>> {
+    fn spot_batch(&self, images: &[image::RgbImage]) -> anyhow::Result<Vec<ImageRecognition>> {
         self.images
             .lock()
             .expect("capture lock")
@@ -100,9 +97,11 @@ pub(super) fn accuracy_corpus() -> Vec<super::paddleocr_vl::EvaluationCase> {
     ];
 
     let diagram_page = || {
-        DIAGRAM.iter().fold(PageSpec::default(), |page, (x, y, text)| {
-            page.with_text(*x, *y, text)
-        })
+        DIAGRAM
+            .iter()
+            .fold(PageSpec::default(), |page, (x, y, text)| {
+                page.with_text(*x, *y, text)
+            })
     };
 
     let case = |name: &str, page: PageSpec, scale: f32, labels: &[(f32, f32, &str)]| {
@@ -182,8 +181,9 @@ pub(super) fn accuracy_corpus() -> Vec<super::paddleocr_vl::EvaluationCase> {
         EvaluationCase {
             name: "no-text".to_string(),
             image: render_page(
-                &build_pdf(vec![PageSpec::default()
-                    .with_image(ImageSpec::gradient(64, 64).at(20.0, 100.0, 160.0, 120.0))]),
+                &build_pdf(vec![PageSpec::default().with_image(
+                    ImageSpec::gradient(64, 64).at(20.0, 100.0, 160.0, 120.0),
+                )]),
                 0,
                 CASE_SCALE,
             ),
@@ -406,8 +406,8 @@ pub(super) fn build_pdf(pages: Vec<PageSpec>) -> Vec<u8> {
     // 1: catalog, 2: page tree, 3: font. Page and content objects follow.
     objects.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
     objects.push(Vec::new()); // page tree, patched below
-    // WinAnsi, so a label's accented characters are the bytes written for them
-    // rather than whatever StandardEncoding happens to put at that code.
+                              // WinAnsi, so a label's accented characters are the bytes written for them
+                              // rather than whatever StandardEncoding happens to put at that code.
     objects.push(
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
             .to_vec(),
@@ -418,8 +418,7 @@ pub(super) fn build_pdf(pages: Vec<PageSpec>) -> Vec<u8> {
         let mut content = Vec::new();
         if let Some((red, green, blue)) = page.background {
             content.extend_from_slice(
-                format!("{red} {green} {blue} rg 0 0 {PAGE_WIDTH} {PAGE_HEIGHT} re f\n")
-                    .as_bytes(),
+                format!("{red} {green} {blue} rg 0 0 {PAGE_WIDTH} {PAGE_HEIGHT} re f\n").as_bytes(),
             );
         }
         for line in &page.text {
@@ -438,9 +437,11 @@ pub(super) fn build_pdf(pages: Vec<PageSpec>) -> Vec<u8> {
             let (radians, (red, green, blue)) = (line.rotation.to_radians(), line.rgb);
             let (cos, sin) = (radians.cos(), radians.sin());
             content.extend_from_slice(
-                format!("BT /F1 12 Tf {red} {green} {blue} rg {cos} {sin} {} {cos} {} {} Tm (",
-                    -sin, line.x, line.y)
-                    .as_bytes(),
+                format!(
+                    "BT /F1 12 Tf {red} {green} {blue} rg {cos} {sin} {} {cos} {} {} Tm (",
+                    -sin, line.x, line.y
+                )
+                .as_bytes(),
             );
             content.extend_from_slice(&bytes);
             content.extend_from_slice(b") Tj ET\n");
@@ -572,10 +573,7 @@ impl OcrEngine for ScriptedOcr {
     /// One script entry per image, and a scripted failure fails the whole
     /// batch — which is what a real recognizer does, since the batch is one
     /// request to one process.
-    fn spot_batch(
-        &self,
-        images: &[image::RgbImage],
-    ) -> anyhow::Result<Vec<ImageRecognition>> {
+    fn spot_batch(&self, images: &[image::RgbImage]) -> anyhow::Result<Vec<ImageRecognition>> {
         let mut all = Vec::with_capacity(images.len());
         for _ in images {
             all.push(ImageRecognition::from_regions(self.spot_one()?));
@@ -599,10 +597,22 @@ impl ScriptedOcr {
                     text: (*text).to_string(),
                     confidence: *confidence,
                     quad: [
-                        Point { x: quad[0], y: quad[1] },
-                        Point { x: quad[2], y: quad[3] },
-                        Point { x: quad[4], y: quad[5] },
-                        Point { x: quad[6], y: quad[7] },
+                        Point {
+                            x: quad[0],
+                            y: quad[1],
+                        },
+                        Point {
+                            x: quad[2],
+                            y: quad[3],
+                        },
+                        Point {
+                            x: quad[4],
+                            y: quad[5],
+                        },
+                        Point {
+                            x: quad[6],
+                            y: quad[7],
+                        },
                     ],
                 })
                 .collect()),
@@ -613,10 +623,22 @@ impl ScriptedOcr {
                     text: (*text).to_string(),
                     confidence: *confidence,
                     quad: [
-                        Point { x: quad[0], y: quad[1] },
-                        Point { x: quad[2], y: quad[3] },
-                        Point { x: quad[4], y: quad[5] },
-                        Point { x: quad[6], y: quad[7] },
+                        Point {
+                            x: quad[0],
+                            y: quad[1],
+                        },
+                        Point {
+                            x: quad[2],
+                            y: quad[3],
+                        },
+                        Point {
+                            x: quad[4],
+                            y: quad[5],
+                        },
+                        Point {
+                            x: quad[6],
+                            y: quad[7],
+                        },
                     ],
                 })
                 .collect()),
@@ -692,14 +714,21 @@ fn every_recognized_kind_reaches_the_reading_under_its_own_label() {
             .with_image(ImageSpec::gradient(64, 32))],
         vec![Script::Reads(vec![
             (RegionKind::Text, "Knowledge base", 0.95, MIDDLE),
-            (RegionKind::Formula, "S(q,d) = \\Sigma_{i} w_{i}", 0.90, MIDDLE),
+            (
+                RegionKind::Formula,
+                "S(q,d) = \\Sigma_{i} w_{i}",
+                0.90,
+                MIDDLE,
+            ),
             (RegionKind::Table, table, 0.88, MIDDLE),
             (RegionKind::Chart, table, 0.86, MIDDLE),
         ])],
         None,
     );
 
-    assert!(content.text.contains("Image embedded text: Knowledge base."));
+    assert!(content
+        .text
+        .contains("Image embedded text: Knowledge base."));
     assert!(content
         .text
         .contains("Image embedded formula: S(q,d) = \\Sigma_{i} w_{i}."));
@@ -743,7 +772,10 @@ fn a_formula_that_does_not_parse_is_refused_with_its_reason() {
     assert_eq!(diagnostics.formulas_accepted, 0);
     // Kept on the image, where a missing formula is answerable.
     let region = &content.images[0].ocr_regions[0];
-    assert_eq!(region.admission, crate::types::OcrAdmission::RejectedInvalidLatex);
+    assert_eq!(
+        region.admission,
+        crate::types::OcrAdmission::RejectedInvalidLatex
+    );
 }
 
 /// A ragged table is a failed recognition wearing the shape of a result. It
@@ -756,7 +788,12 @@ fn a_table_that_is_not_rectangular_is_refused_on_structure() {
             .with_text(20.0, 250.0, "Before the figure")
             .with_image(ImageSpec::gradient(64, 32))],
         vec![Script::Reads(vec![
-            (RegionKind::Table, "| a | b |\n| --- | --- |\n| 1 |", 0.99, MIDDLE),
+            (
+                RegionKind::Table,
+                "| a | b |\n| --- | --- |\n| 1 |",
+                0.99,
+                MIDDLE,
+            ),
             (RegionKind::Chart, "rising, roughly", 0.99, MIDDLE),
         ])],
         None,
@@ -932,7 +969,9 @@ fn native_glyphs_drawn_over_an_image_are_not_transcribed_twice() {
         "the label appears once, as the document's own glyphs: {:?}",
         content.text
     );
-    assert!(content.text.contains("Image embedded text: Inference engine."));
+    assert!(content
+        .text
+        .contains("Image embedded text: Inference engine."));
     assert_eq!(diagnostics.ocr_regions_deduplicated_against_native_text, 1);
     assert_eq!(diagnostics.ocr_regions_accepted, 1);
 }
@@ -951,7 +990,9 @@ fn the_same_words_outside_the_image_do_not_deduplicate_it() {
 
     assert_eq!(diagnostics.ocr_regions_deduplicated_against_native_text, 0);
     assert_eq!(diagnostics.ocr_regions_accepted, 1);
-    assert!(content.text.contains("Image embedded text: Knowledge base."));
+    assert!(content
+        .text
+        .contains("Image embedded text: Knowledge base."));
 }
 
 /// A recognition failure leaves the document's own text intact and reports a
@@ -972,7 +1013,10 @@ fn a_recognition_failure_is_partial_rather_than_empty() {
     assert_eq!(diagnostics.images_ocr_failed, 1);
     assert_eq!(diagnostics.images_ocr_succeeded, 0);
     let ImageAnalysisStatus::Partial { failures } = &content.images[0].status else {
-        panic!("expected a partial analysis, got {:?}", content.images[0].status);
+        panic!(
+            "expected a partial analysis, got {:?}",
+            content.images[0].status
+        );
     };
     assert!(failures[0].contains("decoder error"), "{failures:?}");
 }
@@ -1022,7 +1066,10 @@ fn a_degenerate_image_is_skipped_by_a_technical_limit() {
     assert_eq!(diagnostics.native_images_skipped_technical_limit, 1);
     assert!(!content.text.contains("never asked"));
     let ImageAnalysisStatus::SkippedTechnicalLimit { reason } = &content.images[0].status else {
-        panic!("expected a technical limit, got {:?}", content.images[0].status);
+        panic!(
+            "expected a technical limit, got {:?}",
+            content.images[0].status
+        );
     };
     assert!(reason.contains("degenerate"), "{reason}");
 }
@@ -1054,12 +1101,19 @@ fn exact_search_finds_a_transcribed_label_at_its_own_polygon() {
     use grep_matcher::Matcher;
 
     let (content, _) = extract(
-        vec![PageSpec::default().with_image(
-            ImageSpec::gradient(64, 32).at(20.0, 100.0, 160.0, 80.0),
-        )],
+        vec![PageSpec::default()
+            .with_image(ImageSpec::gradient(64, 32).at(20.0, 100.0, 160.0, 80.0))],
         vec![Script::Spots(vec![
-            ("Expert knowledge", 0.9, [0.1, 0.1, 0.4, 0.1, 0.4, 0.3, 0.1, 0.3]),
-            ("Knowledge base", 0.9, [0.6, 0.6, 0.9, 0.6, 0.9, 0.8, 0.6, 0.8]),
+            (
+                "Expert knowledge",
+                0.9,
+                [0.1, 0.1, 0.4, 0.1, 0.4, 0.3, 0.1, 0.3],
+            ),
+            (
+                "Knowledge base",
+                0.9,
+                [0.6, 0.6, 0.9, 0.6, 0.9, 0.8, 0.6, 0.8],
+            ),
         ])],
         None,
     );
@@ -1082,7 +1136,11 @@ fn exact_search_finds_a_transcribed_label_at_its_own_polygon() {
         .source_map
         .resolve_range(range.clone())
         .expect("the match resolves to a page position");
-    let crate::types::SourceOrigin::PdfPage { page, bbox: Some(bbox) } = origin else {
+    let crate::types::SourceOrigin::PdfPage {
+        page,
+        bbox: Some(bbox),
+    } = origin
+    else {
         panic!("expected a page locator, got {origin:?}");
     };
     assert_eq!(page, 1);
@@ -1112,12 +1170,21 @@ fn exact_search_finds_a_transcribed_label_at_its_own_polygon() {
         .find(|segment| segment.text_range.start == range.start)
         .expect("the label has its own segment");
     let TextProvenance::ImageOcr {
-        image_id, confidence, ..
-    } = &segment.provenance else {
-        panic!("expected transcription provenance, got {:?}", segment.provenance);
+        image_id,
+        confidence,
+        ..
+    } = &segment.provenance
+    else {
+        panic!(
+            "expected transcription provenance, got {:?}",
+            segment.provenance
+        );
     };
     assert_eq!(image_id, &image.id);
-    assert!(confidence.is_some(), "a transcribed region carries its signal");
+    assert!(
+        confidence.is_some(),
+        "a transcribed region carries its signal"
+    );
 }
 
 /// A label the figure sets on two lines is transcribed as two regions, and the
@@ -1156,7 +1223,9 @@ fn a_label_split_across_two_drawn_lines_is_two_regions_in_the_reading() {
     );
 
     assert!(
-        content.text.contains("Image embedded text: User; Inference; interface; engine."),
+        content
+            .text
+            .contains("Image embedded text: User; Inference; interface; engine."),
         "each drawn line is its own region: {:?}",
         content.text
     );
@@ -1212,14 +1281,20 @@ fn a_page_scoped_read_carries_that_pages_enrichment_and_no_others() {
             .map(|segment| segment.text_range.clone())
             .collect();
         assert!(!ranges.is_empty(), "page {page} has no segments at all");
-        let start = ranges.iter().map(|range| range.start).min().expect("a start");
+        let start = ranges
+            .iter()
+            .map(|range| range.start)
+            .min()
+            .expect("a start");
         let end = ranges.iter().map(|range| range.end).max().expect("an end");
         content.text[start..end].to_string()
     };
 
     let first = span(1);
     assert_eq!(
-        first.matches("Image embedded text: Inference engine").count(),
+        first
+            .matches("Image embedded text: Inference engine")
+            .count(),
         1,
         "the enrichment is in the reading of its own page, once: {first:?}"
     );
@@ -1277,7 +1352,9 @@ fn the_enrichment_reaches_the_embedder_as_one_passage() {
         .find(|chunk| chunk.text.contains("Image embedded text:"))
         .expect("the enrichment is in a passage the embedder receives");
     assert!(
-        passage.text.contains("Image description: Expert knowledge feeds"),
+        passage
+            .text
+            .contains("Image description: Expert knowledge feeds"),
         "transcription and description reach the embedder together: {:?}",
         passage.text
     );
@@ -1320,8 +1397,17 @@ fn semantic_search_retrieves_the_enrichment_for_a_question_only_the_picture_answ
     /// One dimension per term of interest. Cosine similarity then ranks by
     /// how much of the question a passage actually contains.
     const TERMS: &[&str] = &[
-        "expert", "knowledge", "enter", "system", "inference", "engine", "base", "component",
-        "figure", "chapter", "reasoning",
+        "expert",
+        "knowledge",
+        "enter",
+        "system",
+        "inference",
+        "engine",
+        "base",
+        "component",
+        "figure",
+        "chapter",
+        "reasoning",
     ];
     fn embed(text: &str) -> Vec<f32> {
         let lowered = text.to_lowercase();
@@ -1359,7 +1445,11 @@ fn semantic_search_retrieves_the_enrichment_for_a_question_only_the_picture_answ
 
     let (content, _) = extract(
         vec![PageSpec::default()
-            .with_text(20.0, 260.0, "This chapter introduces reasoning under uncertainty.")
+            .with_text(
+                20.0,
+                260.0,
+                "This chapter introduces reasoning under uncertainty.",
+            )
             .with_image(ImageSpec::gradient(64, 32))
             .with_text(20.0, 60.0, "Figure 3: Components of an Expert System")],
         vec![Script::Spots(vec![
@@ -1401,9 +1491,13 @@ fn semantic_search_retrieves_the_enrichment_for_a_question_only_the_picture_answ
         .expect("the index answers");
     let best = found.first().expect("the question retrieves something");
     assert!(
-        best.chunk_text.contains("Image description: Expert knowledge enters"),
+        best.chunk_text
+            .contains("Image description: Expert knowledge enters"),
         "the enrichment should answer a question only the picture answers, got {:?}",
-        found.iter().map(|chunk| &chunk.chunk_text).collect::<Vec<_>>()
+        found
+            .iter()
+            .map(|chunk| &chunk.chunk_text)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1436,12 +1530,19 @@ fn a_document_of_figures_counts_and_places_every_one() {
     let alpha = content.text.find("Alpha").expect("the first figure");
     let second_page = content.text.find("Second page prose").expect("page two");
     let beta = content.text.find("Beta").expect("the second figure");
-    assert!(alpha < second_page && second_page < beta, "{:?}", content.text);
+    assert!(
+        alpha < second_page && second_page < beta,
+        "{:?}",
+        content.text
+    );
 
     assert_eq!(content.images[0].page, 1);
     assert_eq!(content.images[1].page, 2);
     assert_eq!(content.images[2].page, 2);
-    assert!(content.images[1].reading_range.is_none(), "the logo says nothing");
+    assert!(
+        content.images[1].reading_range.is_none(),
+        "the logo says nothing"
+    );
 }
 
 /// Analysis is versioned extraction, so it happens once. The second reading of
@@ -1452,7 +1553,9 @@ fn a_second_reading_takes_its_annotation_from_the_cache() {
     let path = dir.path().join("cached.pdf");
     std::fs::write(
         &path,
-        build_pdf(vec![PageSpec::default().with_image(ImageSpec::gradient(64, 32))]),
+        build_pdf(vec![
+            PageSpec::default().with_image(ImageSpec::gradient(64, 32))
+        ]),
     )
     .expect("the fixture is written");
 
@@ -1480,7 +1583,9 @@ fn a_second_reading_takes_its_annotation_from_the_cache() {
         PdfExtractor::with_image_analyzer(analyzer(vec![Script::Fails("must not be called")]));
     let content = second.extract(&path).expect("extracts");
     assert!(
-        content.text.contains("Image embedded text: Knowledge base."),
+        content
+            .text
+            .contains("Image embedded text: Knowledge base."),
         "the cached annotation was not used: {:?}",
         content.text
     );

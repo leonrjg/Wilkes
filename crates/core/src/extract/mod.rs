@@ -246,9 +246,9 @@ mod tests {
         let registry = |analyzer: Option<&'static str>| {
             let mut registry = ExtractorRegistry::new();
             registry.register(match analyzer {
-                Some(name) => Box::new(pdf::PdfExtractor::with_image_analyzer(
-                    std::sync::Arc::new(Named(name)),
-                )) as Box<dyn ContentExtractor>,
+                Some(name) => Box::new(pdf::PdfExtractor::with_image_analyzer(std::sync::Arc::new(
+                    Named(name),
+                ))) as Box<dyn ContentExtractor>,
                 None => Box::new(pdf::PdfExtractor::new()),
             });
             registry

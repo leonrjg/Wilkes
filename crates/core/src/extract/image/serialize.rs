@@ -100,7 +100,10 @@ struct Block<'a> {
 /// Whether this kind's body begins its own line rather than following its
 /// label.
 fn starts_a_line(kind: RegionKind) -> bool {
-    matches!(kind, RegionKind::Table | RegionKind::Chart | RegionKind::Code)
+    matches!(
+        kind,
+        RegionKind::Table | RegionKind::Chart | RegionKind::Code
+    )
 }
 
 /// Group accepted regions into labelled blocks, in the order the recognizer
@@ -213,10 +216,7 @@ pub fn enrichment_pieces(image: &ExtractedImage) -> Vec<Piece> {
         if !accepted.is_empty() {
             pieces.push(whole("\n", provenance.clone()));
         }
-        pieces.push(whole(
-            &format!("{DESCRIPTION_LABEL} "),
-            provenance.clone(),
-        ));
+        pieces.push(whole(&format!("{DESCRIPTION_LABEL} "), provenance.clone()));
         pieces.push(whole(description.description.trim(), provenance.clone()));
         pieces.push(whole("\n", provenance));
     }
@@ -334,9 +334,7 @@ pub fn superseded_areas(full_text: &str, regions: &[ReadingRegion]) -> Vec<Super
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{
-        ImageAnalysisStatus, ImageDescription, ImageTransform, OcrAdmission,
-    };
+    use crate::types::{ImageAnalysisStatus, ImageDescription, ImageTransform, OcrAdmission};
 
     fn image(regions: Vec<ImageOcrRegion>, description: Option<&str>) -> ExtractedImage {
         ExtractedImage {
@@ -446,7 +444,10 @@ mod tests {
     /// own, without the label standing in front of them.
     #[test]
     fn a_typeset_region_is_the_area_and_its_own_bytes() {
-        let content = reading(vec![typeset(RegionKind::Formula, "y_{B} = w^{x_{B}} \\bmod q")]);
+        let content = reading(vec![typeset(
+            RegionKind::Formula,
+            "y_{B} = w^{x_{B}} \\bmod q",
+        )]);
         let regions = reading_regions(&content);
 
         assert_eq!(regions.len(), 1, "{regions:?}");
@@ -503,9 +504,12 @@ mod tests {
     #[test]
     fn the_pieces_of_one_area_are_read_back_as_one() {
         let mut image = typeset(RegionKind::Formula, "x = 1");
-        image
-            .ocr_regions
-            .push(kinded(RegionKind::Formula, "y = 2", 0.9, OcrAdmission::Accepted));
+        image.ocr_regions.push(kinded(
+            RegionKind::Formula,
+            "y = 2",
+            0.9,
+            OcrAdmission::Accepted,
+        ));
         let content = reading(vec![image]);
 
         let areas = superseded_areas(&content.text, &reading_regions(&content));
@@ -614,7 +618,10 @@ mod tests {
     #[test]
     fn a_chart_is_labelled_a_transcription_and_a_table_is_not() {
         let embedded = RegionOrigin::Embedded;
-        assert_eq!(RegionKind::Chart.label(embedded), "Image transcribed chart:");
+        assert_eq!(
+            RegionKind::Chart.label(embedded),
+            "Image transcribed chart:"
+        );
         assert!(!RegionKind::Chart.label(embedded).contains("embedded"));
         assert!(RegionKind::Table.label(embedded).contains("embedded"));
     }
@@ -702,11 +709,7 @@ mod tests {
             vec![
                 region("Expert system", 0.9, OcrAdmission::Accepted),
                 region("blurred", 0.2, OcrAdmission::RejectedLowConfidence),
-                region(
-                    "Figure 3",
-                    0.9,
-                    OcrAdmission::DeduplicatedAgainstNativeText,
-                ),
+                region("Figure 3", 0.9, OcrAdmission::DeduplicatedAgainstNativeText),
             ],
             None,
         ));

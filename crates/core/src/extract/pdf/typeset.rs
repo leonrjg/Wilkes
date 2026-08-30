@@ -377,7 +377,10 @@ fn is_math_font(name: &str) -> bool {
     // others — the course book that prompted this ships `DBAMWK+Formula`,
     // which is as explicit a declaration as `LatinModernMath` and was missed
     // by a list that only knew TeX's names.
-    if ["math", "formula", "equation"].iter().any(|word| stem.contains(word)) {
+    if ["math", "formula", "equation"]
+        .iter()
+        .any(|word| stem.contains(word))
+    {
         return true;
     }
     const FAMILIES: &[&str] = &[
@@ -638,9 +641,7 @@ fn expressions(lines: &[SurveyedLine], taken: &[bool]) -> Vec<Vec<usize>> {
 fn merge_stacked(runs: Vec<Vec<usize>>, lines: &[SurveyedLine]) -> Vec<Vec<usize>> {
     let mut out: Vec<Vec<usize>> = Vec::new();
     for run in runs {
-        let joins = out
-            .last()
-            .is_some_and(|last| stacked(last, &run, lines));
+        let joins = out.last().is_some_and(|last| stacked(last, &run, lines));
         match (joins, out.last_mut()) {
             (true, Some(last)) => last.extend(run),
             _ => out.push(run),
@@ -706,8 +707,7 @@ fn is_worth_reading(run: &[usize], lines: &[SurveyedLine], survey: &Survey) -> b
     if glyphs < MIN_FORMULA_GLYPHS {
         return false;
     }
-    run.iter().any(|index| lines[*index].structure_flattened)
-        || survey.marks_between(run, lines)
+    run.iter().any(|index| lines[*index].structure_flattened) || survey.marks_between(run, lines)
 }
 
 /// The table regions of one page: stacks of rules, and whatever lines they
@@ -953,7 +953,10 @@ fn render(page: &mupdf::Page, bbox: &BoundingBox) -> anyhow::Result<(NativeImage
     };
 
     let canvas = pad_to_aspect(scaled(bbox));
-    let (width, height) = ((canvas.x1 - canvas.x0) as u32, (canvas.y1 - canvas.y0) as u32);
+    let (width, height) = (
+        (canvas.x1 - canvas.x0) as u32,
+        (canvas.y1 - canvas.y0) as u32,
+    );
     if let Some(reason) = image::technical_limit(width, height) {
         anyhow::bail!("region {width}x{height} at scale {scale:.1}: {reason}");
     }
@@ -1007,9 +1010,15 @@ fn render(page: &mupdf::Page, bbox: &BoundingBox) -> anyhow::Result<(NativeImage
 fn pad_to_aspect(region: IRect) -> IRect {
     let (width, height) = (region.x1 - region.x0, region.y1 - region.y0);
     let (padded_width, padded_height) = if width as f32 > height as f32 * MAX_ASPECT {
-        (width, ((width as f32 / MAX_ASPECT).floor() as i32).max(height))
+        (
+            width,
+            ((width as f32 / MAX_ASPECT).floor() as i32).max(height),
+        )
     } else if height as f32 > width as f32 * MAX_ASPECT {
-        (((height as f32 / MAX_ASPECT).floor() as i32).max(width), height)
+        (
+            ((height as f32 / MAX_ASPECT).floor() as i32).max(width),
+            height,
+        )
     } else {
         (width, height)
     };
@@ -1206,7 +1215,10 @@ mod tests {
             claimed(&[flat_line(0, 0, 100.0, 8, 8, false)]).is_empty(),
             "nothing was destroyed, so nothing to repair"
         );
-        assert_eq!(claimed(&[flat_line(0, 0, 100.0, 8, 8, true)]), vec![vec![0]]);
+        assert_eq!(
+            claimed(&[flat_line(0, 0, 100.0, 8, 8, true)]),
+            vec![vec![0]]
+        );
     }
 
     /// A long run in a math face with nothing stacked in it is still not a
@@ -1223,7 +1235,12 @@ mod tests {
     #[test]
     fn jitter_along_one_baseline_is_not_structure() {
         let survey = Survey::default();
-        let bbox = BoundingBox { x: 0.0, y: 0.0, width: 100.0, height: 12.0 };
+        let bbox = BoundingBox {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 12.0,
+        };
         let jittered = surveyed_line(
             &survey,
             0,
@@ -1294,7 +1311,12 @@ mod tests {
     fn only_region(lines: &[SurveyedLine]) -> Vec<(usize, usize)> {
         let survey = Survey::default();
         let found = regions(1, &survey, lines);
-        assert_eq!(found.len(), 1, "one region: {:?}", found.iter().map(|r| &r.lines).collect::<Vec<_>>());
+        assert_eq!(
+            found.len(),
+            1,
+            "one region: {:?}",
+            found.iter().map(|r| &r.lines).collect::<Vec<_>>()
+        );
         found[0].lines.clone()
     }
 
@@ -1366,9 +1388,9 @@ mod tests {
     #[test]
     fn fragments_chain_along_the_baseline() {
         let lines = vec![
-            fragment(0, 327.6, 24.1, 4, 4, true),  // KA, B
-            fragment(1, 356.7, 4.9, 1, 1, false),  // the separator
-            fragment(2, 366.1, 12.9, 2, 2, true),  // ZB
+            fragment(0, 327.6, 24.1, 4, 4, true), // KA, B
+            fragment(1, 356.7, 4.9, 1, 1, false), // the separator
+            fragment(2, 366.1, 12.9, 2, 2, true), // ZB
         ];
         assert_eq!(only_region(&lines), vec![(0, 0), (1, 0), (2, 0)]);
     }
@@ -1387,14 +1409,23 @@ mod tests {
         ];
         let mut apart = rows.clone_rows();
         apart[1].bbox.y += 16.0;
-        assert_eq!(claimed(&apart), vec![vec![0, 1]], "adjacent rows are one formula");
+        assert_eq!(
+            claimed(&apart),
+            vec![vec![0, 1]],
+            "adjacent rows are one formula"
+        );
 
         let mut interrupted = apart.clone_rows();
         // A line of the page's own between them, belonging to neither.
         interrupted.push(SurveyedLine {
             block: 9,
             line: 0,
-            bbox: BoundingBox { x: 100.0, y: 681.0, width: 300.0, height: 9.0 },
+            bbox: BoundingBox {
+                x: 100.0,
+                y: 681.0,
+                width: 300.0,
+                height: 9.0,
+            },
             glyphs: 40,
             math_glyphs: 0,
             structure_flattened: false,
@@ -1512,7 +1543,11 @@ mod tests {
     fn a_region_with_room_keeps_its_whole_margin() {
         let lines = vec![fragment(0, 263.6, 36.7, 4, 4, true)];
         let found = regions(1, &Survey::default(), &lines);
-        assert!((found[0].bbox.x - (263.6 - MARGIN_POINTS)).abs() < 0.01, "{:?}", found[0].bbox);
+        assert!(
+            (found[0].bbox.x - (263.6 - MARGIN_POINTS)).abs() < 0.01,
+            "{:?}",
+            found[0].bbox
+        );
     }
 
     #[test]
@@ -1756,7 +1791,9 @@ mod tests {
         };
         let mut diagnostics = crate::types::ExtractionDiagnostics::default();
         let kept = within_budget(
-            (0..MAX_REGIONS_PER_DOCUMENT + 7).map(|_| region()).collect(),
+            (0..MAX_REGIONS_PER_DOCUMENT + 7)
+                .map(|_| region())
+                .collect(),
             &mut diagnostics,
         );
         assert_eq!(kept.len(), MAX_REGIONS_PER_DOCUMENT);
@@ -1775,7 +1812,3 @@ mod tests {
         assert_eq!(diagnostics.typeset_regions_over_budget, 0);
     }
 }
-
-
-
-

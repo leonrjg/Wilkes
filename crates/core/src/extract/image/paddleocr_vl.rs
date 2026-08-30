@@ -28,8 +28,8 @@ use crate::models::hf_hub::HfProgressReporter;
 use crate::models::progress::ProgressTx;
 
 use super::ocr::{
-    parse_spotting, ImageRecognition, OcrEngine, SpottedRegion, SpottingDecoder,
-    SpottingToken, LOC_MAX,
+    parse_spotting, ImageRecognition, OcrEngine, SpottedRegion, SpottingDecoder, SpottingToken,
+    LOC_MAX,
 };
 
 // ── The pinned recipe ────────────────────────────────────────────────────────
@@ -606,8 +606,9 @@ impl PaddleOcrVl {
 
         let config: Config = serde_json::from_slice(&std::fs::read(&artifacts.config)?)
             .context("could not read the recognizer's config")?;
-        let tokenizer = Tokenizer::from_file(&artifacts.tokenizer)
-            .map_err(|error| anyhow::anyhow!("could not read the recognizer's tokenizer: {error}"))?;
+        let tokenizer = Tokenizer::from_file(&artifacts.tokenizer).map_err(|error| {
+            anyhow::anyhow!("could not read the recognizer's tokenizer: {error}")
+        })?;
         let locations = LocationVocabulary::resolve(&tokenizer)?;
         let eos_token_id = tokenizer
             .token_to_id("</s>")
@@ -746,10 +747,7 @@ impl OcrEngine for PaddleOcrVl {
     /// The per-image line is the only sign of life during a batch that can run
     /// for an hour. It goes to this process's stderr, which the host forwards
     /// into its own log.
-    fn spot_batch(
-        &self,
-        images: &[image::RgbImage],
-    ) -> anyhow::Result<Vec<ImageRecognition>> {
+    fn spot_batch(&self, images: &[image::RgbImage]) -> anyhow::Result<Vec<ImageRecognition>> {
         let mut all = Vec::with_capacity(images.len());
         for (index, image) in images.iter().enumerate() {
             let started = std::time::Instant::now();
@@ -938,7 +936,10 @@ fn peak_memory_bytes() -> Option<u64> {
     // `RUSAGE_SELF`, and it is only read after a success return.
     let read = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
     if read != 0 {
-        warn!("could not read peak memory: {}", std::io::Error::last_os_error());
+        warn!(
+            "could not read peak memory: {}",
+            std::io::Error::last_os_error()
+        );
         return None;
     }
     let maxrss = u64::try_from(unsafe { usage.assume_init() }.ru_maxrss).ok()?;
@@ -1045,7 +1046,10 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
         let regions = match engine.spot_one(&case.image) {
             Ok(regions) => regions,
             Err(error) => {
-                warn!("{}/{}: recognition failed: {error:#}", engine.checkpoint.name, case.name);
+                warn!(
+                    "{}/{}: recognition failed: {error:#}",
+                    engine.checkpoint.name, case.name
+                );
                 missed_regions += case.expected.len();
                 errors += case_chars;
                 word_errors += case_words;
@@ -1130,8 +1134,7 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
                     emitted_positions.push(position);
                     if let Some(want) = case.expected[position].centre {
                         let centre = quad_centre(&region.quad);
-                        let error =
-                            f64::from((centre.x - want.x).hypot(centre.y - want.y));
+                        let error = f64::from((centre.x - want.x).hypot(centre.y - want.y));
                         worst_centre_error = worst_centre_error.max(error);
                         centre_errors.push(error);
                     }
@@ -1182,7 +1185,10 @@ pub fn evaluate(engine: &PaddleOcrVl, corpus: &[EvaluationCase]) -> EvaluationRe
             outcome.expected - outcome.missed,
             outcome.expected,
             outcome.seconds,
-            regions.iter().map(|region| &region.text).collect::<Vec<_>>(),
+            regions
+                .iter()
+                .map(|region| &region.text)
+                .collect::<Vec<_>>(),
         );
         per_case.push(outcome);
     }
@@ -1317,8 +1323,7 @@ mod tests {
     /// The thresholds the sweep reports on. Wide, because the point is to see
     /// the shape of the decoder's confidence and not to confirm a value
     /// somebody already liked.
-    const CANDIDATE_THRESHOLDS: &[f32] =
-        &[0.0, 0.30, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.99];
+    const CANDIDATE_THRESHOLDS: &[f32] = &[0.0, 0.30, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.99];
 
     /// FIGURE.md implementation-plan step 1, second half: the measurement that
     /// chooses the shipped checkpoint and the admission threshold.
@@ -1361,7 +1366,12 @@ mod tests {
             corpus.len(),
             corpus
                 .iter()
-                .map(|case| format!("{} ({}x{})", case.name, case.image.width(), case.image.height()))
+                .map(|case| format!(
+                    "{} ({}x{})",
+                    case.name,
+                    case.image.width(),
+                    case.image.height()
+                ))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -1428,8 +1438,11 @@ mod tests {
         }
 
         if let Some(path) = std::env::var_os("WILKES_EVAL_OUT") {
-            std::fs::write(&path, serde_json::to_vec_pretty(&report).expect("serializes"))
-                .expect("writes the evaluation record");
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&report).expect("serializes"),
+            )
+            .expect("writes the evaluation record");
             println!("\nwrote {}", std::path::Path::new(&path).display());
         }
     }
@@ -1545,7 +1558,10 @@ mod tests {
         for (width, height) in [(1559, 499), (16, 16), (4000, 120), (800, 1200), (3, 900)] {
             let (resized_width, resized_height) = spotting_dimensions(width, height);
             assert_eq!(
-                (resized_width % RESIZE_FACTOR, resized_height % RESIZE_FACTOR),
+                (
+                    resized_width % RESIZE_FACTOR,
+                    resized_height % RESIZE_FACTOR
+                ),
                 (0, 0),
                 "{width}x{height} is not on the grid"
             );
@@ -1595,7 +1611,11 @@ mod tests {
 
         let undecided = Tensor::new(&[[1.0f32, 1.0, 1.0]], &Device::Cpu).unwrap();
         let (_, logprob) = greedy(&undecided).unwrap();
-        assert!((logprob.exp() - 1.0 / 3.0).abs() < 1e-5, "{}", logprob.exp());
+        assert!(
+            (logprob.exp() - 1.0 / 3.0).abs() < 1e-5,
+            "{}",
+            logprob.exp()
+        );
 
         // Shifting every logit by a constant is the same distribution.
         let shifted = Tensor::new(&[[100.0f32, 110.0, 100.0]], &Device::Cpu).unwrap();

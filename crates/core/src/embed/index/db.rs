@@ -776,9 +776,15 @@ mod tests {
         drop(index);
 
         let migrated = SemanticIndex::open(root, "legacy-model", 1).unwrap();
-        assert!(migrated.superseded_areas_for_path(&path).unwrap().is_empty());
+        assert!(migrated
+            .superseded_areas_for_path(&path)
+            .unwrap()
+            .is_empty());
         // And the table is there for the next rendition to write into.
-        assert_eq!(migrated.reading_regions_for_key("nothing").unwrap().len(), 0);
+        assert_eq!(
+            migrated.reading_regions_for_key("nothing").unwrap().len(),
+            0
+        );
     }
 
     fn formula_region(start: usize, end: usize) -> ReadingRegion {
@@ -831,7 +837,8 @@ mod tests {
             )],
         };
 
-        idx.write_file(prepared(vec![formula_region(start, end)])).unwrap();
+        idx.write_file(prepared(vec![formula_region(start, end)]))
+            .unwrap();
         let areas = idx.superseded_areas_for_path(&path).unwrap();
         assert_eq!(areas.len(), 1);
         assert_eq!(areas[0].page, 1);

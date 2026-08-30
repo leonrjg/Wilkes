@@ -339,7 +339,8 @@ mod tests {
         assert!(!local.is_remote());
         assert!(local.identity().ends_with("local"));
 
-        let loopback = OllamaDescriber::new("http://127.0.0.1:11434", "qwen3-vl:2b").expect("local");
+        let loopback =
+            OllamaDescriber::new("http://127.0.0.1:11434", "qwen3-vl:2b").expect("local");
         assert!(!loopback.is_remote());
 
         let elsewhere =
@@ -352,7 +353,8 @@ mod tests {
     /// figure are different readings, and must not share an index.
     #[test]
     fn the_model_named_is_part_of_the_recipe() {
-        let small = OllamaDescriber::new("http://localhost:11434", "qwen3-vl:2b").expect("configures");
+        let small =
+            OllamaDescriber::new("http://localhost:11434", "qwen3-vl:2b").expect("configures");
         let large =
             OllamaDescriber::new("http://localhost:11434", "qwen3-vl:32b").expect("configures");
         assert_ne!(small.identity(), large.identity());

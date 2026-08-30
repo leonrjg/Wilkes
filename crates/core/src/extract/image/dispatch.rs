@@ -534,8 +534,11 @@ mod tests {
     #[cfg(all(feature = "recognize-onnx", feature = "candle"))]
     #[test]
     fn the_two_engines_read_documents_under_two_recipes() {
-        let onnx = identity(RecognitionEngine::Onnx, super::super::granite_docling::MODEL_ID)
-            .unwrap();
+        let onnx = identity(
+            RecognitionEngine::Onnx,
+            super::super::granite_docling::MODEL_ID,
+        )
+        .unwrap();
         let candle = identity(
             RecognitionEngine::Candle,
             RecognitionEngine::Candle.default_model(),
@@ -543,8 +546,11 @@ mod tests {
         .unwrap();
         assert_ne!(onnx, candle);
         assert_ne!(
-            admission_threshold(RecognitionEngine::Onnx, super::super::granite_docling::MODEL_ID)
-                .unwrap(),
+            admission_threshold(
+                RecognitionEngine::Onnx,
+                super::super::granite_docling::MODEL_ID
+            )
+            .unwrap(),
             admission_threshold(
                 RecognitionEngine::Candle,
                 RecognitionEngine::Candle.default_model()

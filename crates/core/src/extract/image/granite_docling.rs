@@ -185,7 +185,8 @@ pub fn install(
     use hf_hub::api::sync::ApiBuilder;
 
     let dir = install_dir(model_dir);
-    std::fs::create_dir_all(dir.join("onnx")).context("could not create the recognizer directory")?;
+    std::fs::create_dir_all(dir.join("onnx"))
+        .context("could not create the recognizer directory")?;
 
     let api = ApiBuilder::new()
         .with_progress(false)
@@ -398,8 +399,8 @@ enum Routing {
 /// over, and located content carries one and is counted.
 fn routing_of(tag: &str) -> Routing {
     match tag {
-        "text" | "paragraph" | "caption" | "footnote" | "page_header" | "page_footer"
-        | "title" | "list_item" => Routing::Read(RegionKind::Text),
+        "text" | "paragraph" | "caption" | "footnote" | "page_header" | "page_footer" | "title"
+        | "list_item" => Routing::Read(RegionKind::Text),
         t if t.starts_with("section_header") => Routing::Read(RegionKind::Text),
         "formula" => Routing::Read(RegionKind::Formula),
         "otsl" => Routing::Read(RegionKind::Table),
@@ -450,7 +451,9 @@ fn parse_doctags(stream: &str) -> (Vec<Element>, Unread) {
             i += 1;
             continue;
         }
-        let Some(open_end) = find(&bytes, i, '>') else { break };
+        let Some(open_end) = find(&bytes, i, '>') else {
+            break;
+        };
         let tag: String = bytes[i + 1..open_end].iter().collect();
         let routing = routing_of(&tag);
         let Routing::Read(kind) = routing else {
@@ -943,13 +946,17 @@ Expert Systems in Practice</section_header_level_1>\
     fn a_ragged_table_converts_and_is_refused_by_admission() {
         let ragged = otsl_to_markdown("<ched>A<ched>B<nl><fcel>1<nl>");
         assert!(!ragged.is_empty(), "the cells are still converted");
-        assert!(!crate::extract::image::ocr::markdown_table_is_rectangular(&ragged));
+        assert!(!crate::extract::image::ocr::markdown_table_is_rectangular(
+            &ragged
+        ));
     }
 
     #[test]
     fn a_table_with_one_column_is_not_a_table() {
         let single = otsl_to_markdown("<ched>A<nl><fcel>1<nl>");
-        assert!(!crate::extract::image::ocr::markdown_table_is_rectangular(&single));
+        assert!(!crate::extract::image::ocr::markdown_table_is_rectangular(
+            &single
+        ));
     }
 
     /// A chart's cells are the same cells, and reach the reading as the same
@@ -995,7 +1002,10 @@ Expert Systems in Practice</section_header_level_1>\
         let (elements, unread) = parse_doctags(stream);
         assert!(elements.is_empty(), "{elements:#?}");
         assert_eq!(unread.not_text, 1);
-        assert_eq!(unread.unroutable, 0, "the recognizer is not falling short here");
+        assert_eq!(
+            unread.unroutable, 0,
+            "the recognizer is not falling short here"
+        );
     }
 
     /// What the model marks out *inside* a picture is read on its own terms:
@@ -1099,8 +1109,9 @@ Expert Systems in Practice</section_header_level_1>\
 
         assert!(regions.len() >= 5, "expected a page's worth of elements");
         assert!(
-            regions.iter().any(|r| r.kind == RegionKind::Formula
-                && r.text.contains("\\Sigma")),
+            regions
+                .iter()
+                .any(|r| r.kind == RegionKind::Formula && r.text.contains("\\Sigma")),
             "the reference run read the equation as LaTeX"
         );
         let table = regions

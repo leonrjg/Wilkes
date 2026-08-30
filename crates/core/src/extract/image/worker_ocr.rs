@@ -81,7 +81,10 @@ impl WorkerOcr {
     /// The directory is returned alongside the paths so the caller holds it
     /// for exactly as long as the request: dropping it removes the files,
     /// whether the request succeeded, failed or was killed underneath.
-    fn stage(&self, images: &[image::RgbImage]) -> anyhow::Result<(tempfile::TempDir, Vec<PathBuf>)> {
+    fn stage(
+        &self,
+        images: &[image::RgbImage],
+    ) -> anyhow::Result<(tempfile::TempDir, Vec<PathBuf>)> {
         std::fs::create_dir_all(&self.scratch_root).map_err(|error| {
             anyhow::anyhow!(
                 "could not create the recognition scratch directory {}: {error}",
@@ -94,9 +97,11 @@ impl WorkerOcr {
         let mut paths = Vec::with_capacity(images.len());
         for (index, image) in images.iter().enumerate() {
             let path = staged.path().join(format!("{index}.png"));
-            image.save_with_format(&path, image::ImageFormat::Png).map_err(|error| {
-                anyhow::anyhow!("could not stage image {index} for recognition: {error}")
-            })?;
+            image
+                .save_with_format(&path, image::ImageFormat::Png)
+                .map_err(|error| {
+                    anyhow::anyhow!("could not stage image {index} for recognition: {error}")
+                })?;
             paths.push(path);
         }
         Ok((staged, paths))
@@ -112,10 +117,7 @@ impl OcrEngine for WorkerOcr {
         self.admission_threshold
     }
 
-    fn spot_batch(
-        &self,
-        images: &[image::RgbImage],
-    ) -> anyhow::Result<Vec<ImageRecognition>> {
+    fn spot_batch(&self, images: &[image::RgbImage]) -> anyhow::Result<Vec<ImageRecognition>> {
         if images.is_empty() {
             return Ok(Vec::new());
         }
@@ -204,8 +206,8 @@ pub fn read_staged_image(path: &Path) -> anyhow::Result<image::RgbImage> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::ocr::{RegionKind, SpottedRegion};
+    use super::*;
 
     /// The pixels the worker reads must be the pixels the host saw. A lossy
     /// staging would move the transcription of small type without moving the
@@ -353,8 +355,11 @@ mod tests {
         // a failure of the chain rather than an honest reading of a blank
         // image. The corpus builder is reused rather than a fixture invented
         // here: it is what the accuracy harness draws with.
-        let page = crate::extract::image::corpus::PageSpec::default()
-            .with_text(20.0, 150.0, "Knowledge base");
+        let page = crate::extract::image::corpus::PageSpec::default().with_text(
+            20.0,
+            150.0,
+            "Knowledge base",
+        );
         let pdf = crate::extract::image::corpus::build_pdf(vec![page]);
         let image = crate::extract::image::corpus::render_page(&pdf, 0, 4.0);
 

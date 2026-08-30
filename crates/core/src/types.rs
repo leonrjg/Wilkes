@@ -812,9 +812,7 @@ impl ImageTransform {
 /// glyphs the page already draws is redundant for an embedded picture and is
 /// the entire *point* for a typeset region, where the recognizer is the
 /// designated owner of those bytes.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RegionOrigin {
     /// A raster image the PDF embeds.
@@ -825,9 +823,7 @@ pub enum RegionOrigin {
     Typeset,
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RegionKind {
     /// Prose, a heading, a caption — the reading, verbatim.

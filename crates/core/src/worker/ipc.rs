@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
-use crate::generate::{
-    GenerationEngine, GenerationRequest, GenerationRuntime, GenerationTimings, StopReason,
-};
 use crate::extract::image::dispatch::RecognitionEngine;
 use crate::extract::image::ocr::ImageRecognition;
 use crate::extract::image::RecognitionRequest;
+use crate::generate::{
+    GenerationEngine, GenerationRequest, GenerationRuntime, GenerationTimings, StopReason,
+};
 use crate::models::progress::EmbedProgress;
 use crate::types::EmbeddingEngine;
 
@@ -299,7 +299,10 @@ mod tests {
             !logged.contains("secret-document"),
             "the staged paths reached the log: {logged}"
         );
-        assert!(!logged.contains("\"one\""), "the texts reached the log: {logged}");
+        assert!(
+            !logged.contains("\"one\""),
+            "the texts reached the log: {logged}"
+        );
         // Present, and counted: an absent payload is a different request and a
         // real error, and the log must not make the two look alike.
         assert!(logged.contains("40 image(s)"), "{logged}");

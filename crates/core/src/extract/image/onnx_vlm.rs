@@ -92,8 +92,10 @@ impl DecoderShape {
         );
         Ok(Self {
             layers,
-            kv_heads: kv_heads.context("the decoder's past_key_values inputs name no head count")?,
-            head_dim: head_dim.context("the decoder's past_key_values inputs name no head width")?,
+            kv_heads: kv_heads
+                .context("the decoder's past_key_values inputs name no head count")?,
+            head_dim: head_dim
+                .context("the decoder's past_key_values inputs name no head width")?,
             wants_position_ids,
         })
     }
@@ -284,10 +286,7 @@ impl OnnxVlm {
             .context("could not build an empty key/value cache entry")?
             .into_dyn())
         };
-        let mut cache: Vec<DynValue> = names
-            .iter()
-            .map(|_| empty())
-            .collect::<Result<Vec<_>>>()?;
+        let mut cache: Vec<DynValue> = names.iter().map(|_| empty()).collect::<Result<Vec<_>>>()?;
 
         let mut current: Vec<f32> = prompt_embeds.to_vec();
         let mut current_len = prompt_len;
@@ -354,9 +353,9 @@ impl OnnxVlm {
             // Carry `present` back into `past` before the outputs are dropped.
             for (past, present) in &names {
                 cache.push(
-                    outputs
-                        .remove(present.as_str())
-                        .with_context(|| format!("the decoder did not return {present} for {past}"))?,
+                    outputs.remove(present.as_str()).with_context(|| {
+                        format!("the decoder did not return {present} for {past}")
+                    })?,
                 );
             }
             drop(outputs);

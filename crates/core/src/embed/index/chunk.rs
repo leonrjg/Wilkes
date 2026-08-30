@@ -203,9 +203,7 @@ fn indivisible_ranges(content: &ExtractedContent) -> Vec<ByteRange> {
             continue;
         }
         match ranges.last_mut() {
-            Some(last) if last.end == segment.text_range.start => {
-                last.end = segment.text_range.end
-            }
+            Some(last) if last.end == segment.text_range.start => last.end = segment.text_range.end,
             _ => ranges.push(segment.text_range.clone()),
         }
     }
@@ -221,10 +219,7 @@ fn indivisible_ranges(content: &ExtractedContent) -> Vec<ByteRange> {
 /// transcription and its description stay together. It only bites where the
 /// splitter would otherwise have cut, and there it wins, which is what makes
 /// it the stronger of the two.
-fn keep_indivisible_whole(
-    mut spans: Vec<ByteRange>,
-    indivisible: &[ByteRange],
-) -> Vec<ByteRange> {
+fn keep_indivisible_whole(mut spans: Vec<ByteRange>, indivisible: &[ByteRange]) -> Vec<ByteRange> {
     for range in indivisible {
         // Every span this range touches becomes one span. Spans are ordered
         // and tile the run, so the touched ones are contiguous.
@@ -480,7 +475,9 @@ mod tests {
                      user interface.\n";
         let after = "The knowledge base is populated by an expert. ".repeat(3);
         let text = format!("{before}\n{block}{after}");
-        let start = text.find("Image embedded text:").expect("the block is there");
+        let start = text
+            .find("Image embedded text:")
+            .expect("the block is there");
         let content = image_content(text.clone(), start, start + block.len());
 
         let chunks = chunk_content(&content, PathBuf::from("doc.pdf"), 400, 60);
@@ -513,13 +510,18 @@ mod tests {
                      labelled boxes joined by arrows.\n";
         let after = "More body prose following the figure. ".repeat(8);
         let text = format!("{before}\n{block}{after}");
-        let start = text.find("Image embedded text:").expect("the block is there");
+        let start = text
+            .find("Image embedded text:")
+            .expect("the block is there");
         let content = image_content(text.clone(), start, start + block.len());
 
         let chunks = chunk_content(&content, PathBuf::from("doc.pdf"), 200, 30);
 
         assert_eq!(chunks.first().expect("a first chunk").byte_range.start, 0);
-        assert_eq!(chunks.last().expect("a last chunk").byte_range.end, text.len());
+        assert_eq!(
+            chunks.last().expect("a last chunk").byte_range.end,
+            text.len()
+        );
         ensure_chunks_reconstruct(
             &text,
             chunks
@@ -541,19 +543,24 @@ mod tests {
                 .join("; ")
         );
         let text = format!("Before the figure.\n{block}After the figure.\n");
-        let start = text.find("Image embedded text:").expect("the block is there");
+        let start = text
+            .find("Image embedded text:")
+            .expect("the block is there");
         let content = image_content(text.clone(), start, start + block.len());
 
         let chunks = chunk_content(&content, PathBuf::from("doc.pdf"), 150, 20);
         let pieces: Vec<&Chunk> = chunks
             .iter()
-            .filter(|chunk| chunk.byte_range.start >= start && chunk.byte_range.end <= start + block.len())
+            .filter(|chunk| {
+                chunk.byte_range.start >= start && chunk.byte_range.end <= start + block.len()
+            })
             .collect();
         assert!(pieces.len() > 1, "the block did not split");
         assert!(
             chunks
                 .iter()
-                .all(|chunk| !(chunk.text.contains("Label number") && chunk.text.contains("After the figure"))),
+                .all(|chunk| !(chunk.text.contains("Label number")
+                    && chunk.text.contains("After the figure"))),
             "a piece of the block swallowed the prose after it"
         );
         ensure_chunks_reconstruct(
@@ -574,13 +581,18 @@ mod tests {
         }
         let prose = "The table below reports recall by corpus. ".repeat(6);
         let text = format!("{prose}\n{table}\nAnd the discussion continues afterwards.\n");
-        let start = text.find("Image embedded table:").expect("the block is there");
+        let start = text
+            .find("Image embedded table:")
+            .expect("the block is there");
         let end = start + table.len();
 
         let mut content = image_content(text, start, end);
         content.source_map.segments = vec![
             SourceSegment {
-                text_range: ByteRange { start: 0, end: start },
+                text_range: ByteRange {
+                    start: 0,
+                    end: start,
+                },
                 origin: SourceOrigin::PdfPage {
                     page: 1,
                     bbox: None,

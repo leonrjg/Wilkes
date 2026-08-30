@@ -56,21 +56,30 @@ impl LoadedModel {
     fn embedder(&self) -> anyhow::Result<Arc<dyn wilkes_core::embed::Embedder>> {
         match &self.payload {
             LoadedPayload::Embedder(embedder) => Ok(Arc::clone(embedder)),
-            other => anyhow::bail!("worker holds {} but received an embedding request", other.what()),
+            other => anyhow::bail!(
+                "worker holds {} but received an embedding request",
+                other.what()
+            ),
         }
     }
 
     fn generator(&self) -> anyhow::Result<Arc<dyn Generator>> {
         match &self.payload {
             LoadedPayload::Generator(generator) => Ok(Arc::clone(generator)),
-            other => anyhow::bail!("worker holds {} but received a generation request", other.what()),
+            other => anyhow::bail!(
+                "worker holds {} but received a generation request",
+                other.what()
+            ),
         }
     }
 
     fn recognizer(&self) -> anyhow::Result<Arc<dyn OcrEngine>> {
         match &self.payload {
             LoadedPayload::Recognizer(recognizer) => Ok(Arc::clone(recognizer)),
-            other => anyhow::bail!("worker holds {} but received a recognition request", other.what()),
+            other => anyhow::bail!(
+                "worker holds {} but received a recognition request",
+                other.what()
+            ),
         }
     }
 }
@@ -391,8 +400,7 @@ async fn handle_recognize_plan(
 
     // Off the async executor: this is minutes of inference per image, and
     // leaving it on the runtime would stall this process's stdin with it.
-    let spotted =
-        tokio::task::spawn_blocking(move || recognizer.spot_batch(&images)).await?;
+    let spotted = tokio::task::spawn_blocking(move || recognizer.spot_batch(&images)).await?;
 
     match spotted {
         Ok(regions) => {
@@ -590,9 +598,7 @@ mod tests {
                         "Cache invalidation strategy",
                     ])))
                 }
-                WorkerRole::Recognize(_) => {
-                    LoadedPayload::Recognizer(Arc::new(MockRecognizer))
-                }
+                WorkerRole::Recognize(_) => LoadedPayload::Recognizer(Arc::new(MockRecognizer)),
             };
             Ok(LoadedModel {
                 key: key.clone(),
@@ -1002,9 +1008,7 @@ mod tests {
         }
         let mut req = request(
             "recognize",
-            WorkerRole::Recognize(
-                wilkes_core::extract::image::dispatch::RecognitionEngine::Candle,
-            ),
+            WorkerRole::Recognize(wilkes_core::extract::image::dispatch::RecognitionEngine::Candle),
             dir.path().to_path_buf(),
         );
         req.recognize = Some(wilkes_core::extract::image::RecognitionRequest { image_paths });
@@ -1034,9 +1038,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let req = request(
             "recognize",
-            WorkerRole::Recognize(
-                wilkes_core::extract::image::dispatch::RecognitionEngine::Candle,
-            ),
+            WorkerRole::Recognize(wilkes_core::extract::image::dispatch::RecognitionEngine::Candle),
             dir.path().to_path_buf(),
         );
 
