@@ -2555,6 +2555,36 @@ pub struct CatalogueHit {
     pub recall_score: f64,
 }
 
+/// One query's recall, with the terms it was actually run with.
+///
+/// The terms are returned because an empty `hits` has two causes that a caller
+/// must not confuse: nothing in the mirror matched, or nothing in the query
+/// survived stopword and length filtering. The second is ordinary — a probe of
+/// `C` or `the` reduces to no terms at all — and only the store knows it
+/// happened, since reconstructing it outside would mean a second copy of the
+/// filtering rules.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CatalogueRecall {
+    /// What the FTS query was built from, in the order the terms were taken.
+    pub terms: Vec<String>,
+    pub hits: Vec<CatalogueHit>,
+}
+
+/// How far one provider's fetch has got.
+///
+/// `records` rather than a percentage: none of these catalogues says how much
+/// it holds before it has been walked, and the one that publishes a total —
+/// LibreTexts' `numTotal` — is wrong by about 1,700 books. A count that rises
+/// is honest; a bar claiming to know the end would not be.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CatalogueFetchProgress {
+    pub provider: String,
+    /// Requests completed against this provider. One for a catalogue served
+    /// whole, one per page for a paged one.
+    pub pages: usize,
+    pub records: usize,
+}
+
 /// Per-provider state of the local catalogue mirror.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CatalogueProviderStatus {
@@ -2638,9 +2668,20 @@ pub enum OmittedFileReason {
 
 // ── Paths ────────────────────────────────────────────────────────────────────
 
+/// Where this installation keeps things, as the Data settings page says it.
+///
+/// Two paths because there are two answers, and `app_data` used to give the
+/// second one under the first one's name: what the page called the
+/// application's data directory was the active workspace's directory inside
+/// it, so the installation root — the thing that holds `workspaces/`, the
+/// model cache and the catalogue mirror — could not be named at all.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DataPaths {
+    /// The installation's data directory: the one that contains `workspaces/`.
     pub app_data: String,
+    /// The active workspace's own directory, under `app_data/workspaces/<id>`.
+    /// Its databases — the semantic index among them — live here.
+    pub workspace: String,
 }
 
 // ── Capabilities ─────────────────────────────────────────────────────────────

@@ -957,6 +957,16 @@ pub struct AppContext {
     /// the same path — the embedding-space identity is derived from the cache
     /// root's contents, so two roots are two identities for one model.
     pub model_dir: PathBuf,
+    /// The one catalogue mirror for the installation:
+    /// `shared_data_dir/catalogue`.
+    ///
+    /// Shared rather than workspace-owned because its contents are not this
+    /// workspace's: it is a copy of what four public catalogues publish, and
+    /// the same copy answers every workspace. Per-workspace, an installation
+    /// paid for a sync once per workspace and held one table per workspace to
+    /// show for it, and a consumer that synced under one workspace found an
+    /// empty mirror under the next.
+    pub catalogue_dir: PathBuf,
     pub settings_path: PathBuf,
     pub workspace_path: PathBuf,
     pub bookmarks_path: PathBuf,
@@ -1066,10 +1076,12 @@ impl AppContext {
             WorkerManager::new(paths, WorkerKind::Recognize);
         let bookmarks_path = data_dir.join("bookmarks.json");
         let model_dir = shared_data_dir.join("models");
+        let catalogue_dir = shared_data_dir.join("catalogue");
         let ctx = Arc::new(Self {
             data_dir,
             shared_data_dir,
             model_dir,
+            catalogue_dir,
             bookmarks_path,
             settings_path,
             workspace_path,
@@ -6160,6 +6172,12 @@ impl AppContext {
         let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp"));
         let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp-wal"));
         let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp-shm"));
+    }
+
+    /// The application's event stream, for code in sibling modules that has
+    /// progress to report and no other way to reach the shell.
+    pub(crate) fn emitter(&self) -> Arc<dyn EventEmitter> {
+        Arc::clone(&self.events)
     }
 
     fn emit_progress_event(&self, progress: &EmbedProgress) {

@@ -56,6 +56,7 @@ import {
   type DetailIcon,
   type DocumentDetail,
 } from "./DocumentEntryRow";
+import CatalogueGapStrip, { CatalogueGapPrompt } from "./CatalogueGapStrip";
 import SearchResultsSummary from "./SearchResultsSummary";
 import {
   buildSearchResultsChatPrompt,
@@ -873,6 +874,15 @@ export default function ResultList({
           </div>
         )}
 
+        {/* A completed search that found nothing is the one moment the library
+            has proved it falls short, and the query is already in the user's
+            own words. Anything less than zero rows is theirs to judge, not
+            ours, so the strip does not appear over a thin result. */}
+        {rows.length === 0 && !searching && stats !== null &&
+          resultContext?.kind === "search" && resultContext.subject.trim() !== "" && (
+            <CatalogueGapStrip query={resultContext.subject} />
+          )}
+
         <div
           style={{
             height: `${rowVirtualizer.getTotalSize()}px`,
@@ -960,6 +970,15 @@ export default function ResultList({
             })}
           </div>
         </div>
+
+        {/* The same offer under a search that did return something. A line, and
+            nothing is fetched until it is clicked: grep matches carry no
+            relevance score, so any threshold for "thin" would be invented, and
+            deciding a user's own results are inadequate is not ours to do. */}
+        {rows.length > 0 && !searching && stats !== null &&
+          resultContext?.kind === "search" && resultContext.subject.trim() !== "" && (
+            <CatalogueGapPrompt query={resultContext.subject} />
+          )}
       </div>
       </div>
       {fileMenu}

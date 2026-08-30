@@ -7,6 +7,7 @@ import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useGenerationStore } from "../stores/useGenerationStore";
 import { useTopicsStore } from "../stores/useTopicsStore";
 import { useSearchStore } from "../stores/useSearchStore";
+import { useCatalogueStore } from "../stores/useCatalogueStore";
 
 export function useGlobalEvents() {
   const { addToast, removeToast } = useToasts();
@@ -18,6 +19,7 @@ export function useGlobalEvents() {
     let metadataUnlisten: (() => void) | undefined;
     let clusterLabelUnlisten: (() => void) | undefined;
     let topicLabelUnlisten: (() => void) | undefined;
+    let catalogueDownloadUnlisten: (() => void) | undefined;
     let mounted = true;
 
     const closeReindexToast = () => {
@@ -50,6 +52,19 @@ export function useGlobalEvents() {
         u();
       } else {
         managerUnlisten = u;
+      }
+    });
+
+    // Subscribed once here rather than per row: a download is reported by URL
+    // and any number of candidate rows may be rendering at the time.
+    api.onCatalogueDownloadProgress((progress) => {
+      if (!mounted) return;
+      useCatalogueStore.getState().noteDownloadProgress(progress);
+    }).then((u) => {
+      if (!mounted) {
+        u();
+      } else {
+        catalogueDownloadUnlisten = u;
       }
     });
 
@@ -120,6 +135,7 @@ export function useGlobalEvents() {
       if (metadataUnlisten) metadataUnlisten();
       if (clusterLabelUnlisten) clusterLabelUnlisten();
       if (topicLabelUnlisten) topicLabelUnlisten();
+      if (catalogueDownloadUnlisten) catalogueDownloadUnlisten();
     };
   }, [addToast, removeToast]);
 }

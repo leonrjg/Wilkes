@@ -344,7 +344,7 @@ mod tests {
     async fn scoped_settings_keep_roots_and_semantic_state_out_of_global_preferences() {
         let dir = tempdir().unwrap();
         let global = dir.path().join("settings.json");
-        let active = crate::workspace::initialize_workspace_registry(dir.path()).unwrap();
+        let active = crate::workspace::initialize_workspace_registry(dir.path(), &global).unwrap();
         let manifest = crate::workspace::workspace_manifest_path(dir.path(), &active);
         let root = dir.path().join("library");
         std::fs::create_dir_all(&root).unwrap();

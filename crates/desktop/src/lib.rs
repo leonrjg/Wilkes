@@ -55,16 +55,18 @@ fn get_startup_status(app: AppHandle) -> StartupStatus {
 /// The single registration point for feature preflights. A future breaking
 /// feature adds its provider here and the shell/UI need no corresponding
 /// special case.
+///
+/// No feature contributes a blocker today: the pre-workspace library migration
+/// that used to stop startup is performed by the application itself. The gate
+/// stays because the shape of the question — is there anything only the user
+/// can resolve before this build may open their data — outlives the one
+/// feature that first had to ask it, and an unexpected startup failure is
+/// still reported through it.
 fn collect_startup_status(
-    data_dir: &std::path::Path,
-    settings_path: &std::path::Path,
+    _data_dir: &std::path::Path,
+    _settings_path: &std::path::Path,
 ) -> anyhow::Result<StartupStatus> {
-    let mut status = StartupStatus::ready();
-    status.extend(wilkes_api::workspace::startup_blockers(
-        data_dir,
-        settings_path,
-    )?);
-    Ok(status)
+    Ok(StartupStatus::ready())
 }
 
 fn app_context(app: &AppHandle) -> Arc<AppContext> {
@@ -83,8 +85,11 @@ fn active_searches_state(app: &AppHandle) -> Arc<ActiveSearches> {
     app.state::<Arc<ActiveSearches>>().inner().clone()
 }
 
-fn data_paths_from(app_data: String) -> DataPaths {
-    DataPaths { app_data }
+fn data_paths_from(app_data: String, workspace: String) -> DataPaths {
+    DataPaths {
+        app_data,
+        workspace,
+    }
 }
 
 async fn list_files_for_ctx(
@@ -1258,8 +1263,11 @@ fn cancel_search_for_ctx(active_searches: Arc<ActiveSearches>, search_id: &str) 
 
 #[tauri::command]
 async fn get_data_paths(app: AppHandle) -> Result<DataPaths, String> {
-    let app_data = app_context(&app).data_dir.display().to_string();
-    Ok(data_paths_from(app_data))
+    let ctx = app_context(&app);
+    Ok(data_paths_from(
+        ctx.shared_data_dir.display().to_string(),
+        ctx.data_dir.display().to_string(),
+    ))
 }
 
 #[tauri::command]
@@ -2490,6 +2498,68 @@ async fn load_generation_model(app: AppHandle) -> Result<bool, String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+// ── Catalogue ────────────────────────────────────────────────────────────────
+//
+// The mirror of the open teaching catalogues. Installation-wide, not
+// workspace-owned: what it holds is what four public catalogues publish, which
+// is the same answer whichever workspace is open.
+
+fn catalogue_failed(error: wilkes_api::commands::catalogue::CatalogueError) -> String {
+    format!("{error}")
+}
+
+/// Every provider this build knows, what the mirror holds for it, and when it
+/// last did. Reports a provider that has never synced rather than omitting it.
+#[tauri::command]
+async fn catalogue_status(
+    app: AppHandle,
+) -> Result<wilkes_api::commands::catalogue::CatalogueStatusResponse, String> {
+    wilkes_api::commands::catalogue::status(&app_context(&app).catalogue_dir)
+        .map_err(catalogue_failed)
+}
+
+/// Recall over the mirror. Not a ranking — see `wilkes_core::catalogue`.
+#[tauri::command]
+async fn catalogue_search(
+    app: AppHandle,
+    queries: Vec<wilkes_api::commands::catalogue::CatalogueProbe>,
+    limit: Option<usize>,
+) -> Result<wilkes_api::commands::catalogue::CatalogueSearchResponse, String> {
+    let dir = app_context(&app).catalogue_dir.clone();
+    let limit = limit.unwrap_or(wilkes_api::commands::catalogue::DEFAULT_LIMIT);
+    wilkes_api::commands::catalogue::search(&dir, queries, limit).map_err(catalogue_failed)
+}
+
+/// Refreshes the named providers, or all of them when none is named. Minutes,
+/// for all four — the settings panel names one at a time so it can show which,
+/// and each page lands on `catalogue-sync-progress` as it arrives.
+#[tauri::command]
+async fn catalogue_sync(
+    app: AppHandle,
+    providers: Option<Vec<String>>,
+) -> Result<wilkes_api::commands::catalogue::CatalogueSyncResponse, String> {
+    app_context(&app)
+        .catalogue_sync(providers)
+        .await
+        .map_err(catalogue_failed)
+}
+
+/// Fetches a candidate into the workspace's uploads directory. Importing it
+/// into a library root is a separate step, and the user's: this writes only
+/// into Wilkes's own staging area. Bytes are reported on
+/// `catalogue-download-progress` as they arrive.
+#[tauri::command]
+async fn catalogue_acquire(
+    app: AppHandle,
+    url: String,
+    filename: Option<String>,
+) -> Result<wilkes_core::acquire::DownloadResponse, String> {
+    app_context(&app)
+        .catalogue_acquire(url, filename)
+        .await
+        .map_err(catalogue_failed)
+}
+
 /// Every recognizer this build can read with, and the engines it compiled in.
 #[tauri::command]
 async fn image_recognizer_catalogue(
@@ -2785,6 +2855,10 @@ pub fn run() {
             list_generation_models,
             get_generation_model_size,
             load_generation_model,
+            catalogue_status,
+            catalogue_search,
+            catalogue_sync,
+            catalogue_acquire,
             image_recognizer_catalogue,
             image_recognizer_inventory,
             install_image_recognizer,
@@ -2843,8 +2917,10 @@ mod tests {
         assert_eq!(status.blockers[0].id, "application.startup-failed");
     }
 
+    /// An alpha install reaches the application instead of the gate: its
+    /// library is adopted at startup, so there is nothing for the user to do.
     #[test]
-    fn desktop_preflight_aggregates_breaking_feature_blockers() {
+    fn desktop_preflight_does_not_stop_a_pre_workspace_install() {
         let dir = tempdir().unwrap();
         let settings_path = dir.path().join("settings.json");
         std::fs::write(
@@ -2858,8 +2934,7 @@ mod tests {
 
         let status = collect_startup_status(dir.path(), &settings_path).unwrap();
 
-        assert!(!status.is_ready());
-        assert_eq!(status.blockers[0].id, "workspaces.alpha-library-migration");
+        assert!(status.is_ready());
     }
 
     #[test]
@@ -3784,8 +3859,14 @@ mod tests {
     async fn test_data_paths_and_logs_for_ctx() {
         let (_dir, _ctx) = test_ctx();
 
-        let paths = data_paths_from("test-data".to_string());
+        let paths = data_paths_from(
+            "test-data".to_string(),
+            "test-data/workspaces/w1".to_string(),
+        );
         assert_eq!(paths.app_data, "test-data");
+        // The workspace path is its own answer, not the installation's: the
+        // Data page names both, and naming one twice is what it used to do.
+        assert_eq!(paths.workspace, "test-data/workspaces/w1");
 
         let _ = super::get_python_info().await;
 

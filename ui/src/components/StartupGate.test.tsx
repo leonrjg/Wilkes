@@ -28,27 +28,27 @@ describe("StartupGate", () => {
   it("renders feature-owned remediation without mounting the application", async () => {
     vi.mocked(api.getStartupStatus).mockResolvedValue({
       blockers: [{
-        id: "workspaces.migration",
-        feature: "Workspaces",
-        title: "Migration required",
-        message: "Move the existing library into a workspace.",
+        id: "feature.breaking-change",
+        feature: "Semantic index",
+        title: "Index rebuild required",
+        message: "This build reads an index this installation does not have yet.",
         actions: [{
-          label: "Run migration",
+          label: "Rebuild the index",
           description: "Quit Wilkes first.",
-          command: "python3 scripts/migrate_workspace.py",
+          command: "wilkes index rebuild",
         }],
       }],
     });
 
     render(<StartupGate><div>Full application</div></StartupGate>);
 
-    expect(await screen.findByText("Migration required")).toBeInTheDocument();
-    expect(screen.getByText("Workspaces")).toBeInTheDocument();
+    expect(await screen.findByText("Index rebuild required")).toBeInTheDocument();
+    expect(screen.getByText("Semantic index")).toBeInTheDocument();
     expect(screen.queryByText("Full application")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Copy" }));
     await waitFor(() => expect(api.writeClipboard).toHaveBeenCalledWith(
-      "python3 scripts/migrate_workspace.py",
+      "wilkes index rebuild",
     ));
   });
 

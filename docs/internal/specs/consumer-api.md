@@ -394,12 +394,22 @@ route and fail to match it against the other.
 | GET | `/api/catalogue/status` | `underdog/catalogue/status` |
 | POST | `/api/catalogue/acquire` | `underdog/catalogue/acquire` |
 
-Shapes unchanged. The mirror stays one-per-workspace in the workspace data
-directory: duplicating a few thousand rows is the cheaper of the two available
-mistakes, since the alternative is a second global storage location existing
-for one feature. `search` keeps its 64-query cap and its grain filter, where an
-unknown grain name is a `400` that names it, and a query matching nothing is an
-empty `hits` rather than a failed batch. `acquire` continues to delegate to
+The mirror is one per *installation*, in
+`shared_data_dir/catalogue`, alongside the model cache and the managed
+backups. It was per-workspace, on the argument that duplicating a few thousand
+rows was cheaper than a second global storage location; the argument does not
+survive the routes being unscoped. What the mirror holds is what four public
+catalogues publish, which is the same answer for every workspace, so the
+per-workspace copy charged a sync per workspace and still let a consumer that
+synced under one workspace find an empty mirror under the next.
+
+`search` gains one field: each result carries the `terms` its query reduced to
+after stopword and length filtering, because an empty `hits` has two causes a
+caller must not confuse — nothing matched, or nothing in the query was
+searchable at all — and only the store can tell them apart. Otherwise the
+shapes are unchanged: the 64-query cap and the grain filter stand, an unknown
+grain name is a `400` that names it, and a query matching nothing is an empty
+`hits` rather than a failed batch. `acquire` continues to delegate to
 `wilkes_core::acquire::download_to_root` — the same downloader behind the MCP
 `download` tool — and to land bytes in uploads rather than a library root,
 because a library root is a place the user put their files.

@@ -182,7 +182,7 @@ describe("TauriSearchApi", () => {
   });
 
   it("should resolve pdf url", () => {
-    const url = api.resolvePdfUrl("/path/to/file.pdf");
+    const url = api.resolveAssetUrl("/path/to/file.pdf");
     expect(url).toContain("/path/to/file.pdf");
   });
 
@@ -275,10 +275,10 @@ describe("TauriSearchApi", () => {
   });
 
   it("should call get_data_paths", async () => {
-    (invoke as any).mockResolvedValue({ app_data: "/app" });
+    (invoke as any).mockResolvedValue({ app_data: "/app", workspace: "/app/workspaces/w1" });
     const result = await api.getDataPaths();
     expect(invoke).toHaveBeenCalledWith("get_data_paths");
-    expect(result).toEqual({ app_data: "/app" });
+    expect(result).toEqual({ app_data: "/app", workspace: "/app/workspaces/w1" });
   });
 
   it("should call open_path", async () => {

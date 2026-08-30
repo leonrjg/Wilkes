@@ -7,9 +7,49 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
 use crate::network::ProviderHttpClient;
-use crate::types::{CatalogueGrain, CatalogueRecord};
+use crate::types::{CatalogueFetchProgress, CatalogueGrain, CatalogueRecord};
+
+/// Where a provider says how far through its catalogue it has got.
+///
+/// Passed in rather than returned because a whole-catalogue fetch is minutes
+/// long and the interesting part is the middle of it: a caller handed only the
+/// final `Vec` learns nothing until there is nothing left to learn.
+pub struct FetchReporter {
+    provider: &'static str,
+    tx: Option<mpsc::Sender<CatalogueFetchProgress>>,
+}
+
+impl FetchReporter {
+    pub fn new(provider: &'static str, tx: mpsc::Sender<CatalogueFetchProgress>) -> Self {
+        Self {
+            provider,
+            tx: Some(tx),
+        }
+    }
+
+    /// A reporter nobody is listening to, for callers that only want the result.
+    pub fn silent() -> Self {
+        Self {
+            provider: "",
+            tx: None,
+        }
+    }
+
+    /// One page landed. `try_send` because progress must never slow the fetch
+    /// down, and a report nobody drained is a report nobody wanted.
+    pub fn page(&self, pages: usize, records: usize) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(CatalogueFetchProgress {
+                provider: self.provider.to_string(),
+                pages,
+                records,
+            });
+        }
+    }
+}
 
 /// A catalogue of acquirable teaching resources.
 ///
@@ -30,7 +70,10 @@ pub trait CatalogueSource: Send + Sync {
     ///
     /// Whole-catalogue rather than incremental because none of these providers
     /// exposes a change feed; see [`super::store::CatalogueStore::replace_provider`].
-    async fn fetch_all(&self) -> anyhow::Result<Vec<CatalogueRecord>>;
+    ///
+    /// `progress` is told after each request completes. A provider that serves
+    /// its catalogue whole reports once; a paged one reports per page.
+    async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>>;
 }
 
 /// Every catalogue this build knows.
@@ -162,7 +205,7 @@ impl CatalogueSource for LibreTexts {
         CatalogueGrain::Textbook
     }
 
-    async fn fetch_all(&self) -> anyhow::Result<Vec<CatalogueRecord>> {
+    async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>> {
         let mut out: Vec<CatalogueRecord> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut dry = 0usize;
@@ -199,6 +242,7 @@ impl CatalogueSource for LibreTexts {
                     pages: book.export_info.and_then(|e| e.content_page_count),
                 });
             }
+            progress.page(page, out.len());
             // Termination is by exhaustion, not by the provider's own count.
             // `numTotal` (4,095) is reached by the *offered* count at page 41
             // while new ids are still arriving at page 150, so trusting it lost
@@ -297,13 +341,15 @@ impl CatalogueSource for OpenStax {
         CatalogueGrain::Textbook
     }
 
-    async fn fetch_all(&self) -> anyhow::Result<Vec<CatalogueRecord>> {
+    async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>> {
         let url = format!(
             "{}/apps/cms/api/v2/pages/?type=books.Book&limit=500\
              &fields=title,book_subjects,description,pdf_url,license_name",
             self.base_url
         );
         let body: OpenStaxPage = self.http.get_json(url, &[]).await?;
+        // Served whole, so there is one report and it is the last one.
+        progress.page(1, body.items.len());
         Ok(body
             .items
             .into_iter()
@@ -388,7 +434,7 @@ impl CatalogueSource for MitOpenCourseWare {
         CatalogueGrain::Course
     }
 
-    async fn fetch_all(&self) -> anyhow::Result<Vec<CatalogueRecord>> {
+    async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>> {
         let mut out: Vec<CatalogueRecord> = Vec::new();
         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
         let mut dry = 0usize;
@@ -427,6 +473,7 @@ impl CatalogueSource for MitOpenCourseWare {
                     pages: None,
                 });
             }
+            progress.page(page + 1, out.len());
             if seen.len() == before {
                 dry += 1;
                 if dry >= DRY_PAGES_BEFORE_STOP {
@@ -495,9 +542,10 @@ impl CatalogueSource for DevDocs {
         CatalogueGrain::Reference
     }
 
-    async fn fetch_all(&self) -> anyhow::Result<Vec<CatalogueRecord>> {
+    async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>> {
         let url = format!("{}/docs.json", self.base_url);
         let body: Vec<DevDocsEntry> = self.http.get_json(url, &[]).await?;
+        progress.page(1, body.len());
         Ok(body
             .into_iter()
             .map(|entry| {
@@ -604,7 +652,7 @@ mod tests {
             .await;
 
         let records = LibreTexts::new(&server.url())
-            .fetch_all()
+            .fetch_all(&FetchReporter::silent())
             .await
             .expect("fetch");
         mock.assert_async().await;
@@ -622,6 +670,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_paged_fetch_reports_each_page_as_it_lands() {
+        let mut server = mockito::Server::new_async().await;
+        let _first = server
+            .mock("GET", "/api/v1/commons/catalog")
+            .match_query(mockito::Matcher::UrlEncoded("page".into(), "1".into()))
+            .with_status(200)
+            .with_body(
+                r#"{"err":false,"numTotal":2,"books":[
+                    {"bookID":"math-1","title":"Calculus","descrip":"Limits.",
+                     "subject":"math","library":"math","author":"A","license":"ccby",
+                     "links":{"online":"https://example.invalid/1"}}]}"#,
+            )
+            .create_async()
+            .await;
+        let _rest = server
+            .mock("GET", "/api/v1/commons/catalog")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"err":false,"numTotal":2,"books":[]}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let records = LibreTexts::new(&server.url())
+            .fetch_all(&FetchReporter::new("libretexts", tx))
+            .await
+            .expect("fetch");
+        assert_eq!(records.len(), 1);
+
+        // The first page is reported before the walk ends, which is the whole
+        // point: a caller must not have to wait for the last page to learn that
+        // the first one landed.
+        let first = rx.try_recv().expect("a page must be reported");
+        assert_eq!(first.provider, "libretexts");
+        assert_eq!(first.pages, 1);
+        assert_eq!(first.records, 1);
+    }
+
+    #[tokio::test]
+    async fn a_provider_served_whole_reports_once() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/docs.json")
+            .with_status(200)
+            .with_body(
+                r#"[{"name":"Python","slug":"python~3.12","version":"3.12",
+                     "links":{"home":"https://python.org"},"license":"PSF"}]"#,
+            )
+            .create_async()
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(64);
+        DevDocs::new(&server.url())
+            .fetch_all(&FetchReporter::new("devdocs", tx))
+            .await
+            .expect("fetch");
+        let only = rx.try_recv().expect("one report");
+        assert_eq!((only.pages, only.records), (1, 1));
+        assert!(rx.try_recv().is_err(), "a whole catalogue is one page");
+    }
+
+    #[tokio::test]
     async fn devdocs_builds_searchable_prose_for_a_manifest_with_none() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
@@ -635,7 +746,7 @@ mod tests {
             .await;
 
         let records = DevDocs::new(&server.url())
-            .fetch_all()
+            .fetch_all(&FetchReporter::silent())
             .await
             .expect("fetch");
         mock.assert_async().await;

@@ -4,6 +4,61 @@
 
 ### Added
 
+- HTML files are read rather than inspected. A `.html` or `.htm` document opens
+  rendered, with the same source/rendered toggle Markdown has, the same
+  remembered choice per document, the same find bar and zoom, and bookmarks,
+  search highlights and selections in the file's own bytes — a selection in a
+  rendered page produces the same bookmark the source view would have.
+
+  It is a reader, not a browser. The file supplies structure and text and the
+  reader supplies the typography: scripts, author stylesheets, frames, forms
+  and plugins do not survive parsing, and nothing in a document can cause a
+  request to leave the machine, so opening a file cannot tell anyone that it
+  was opened. Pictures beside the document do load — a relative `src` is
+  resolved against the document and served through the application, which is
+  also the only place that reach into the filesystem is judged — while remote
+  addresses are refused and `data:` images, being part of the file, are kept.
+  Links are destinations rather than navigations: `#fragment` scrolls within
+  the document, a link to a neighbouring file is opened by the application, and
+  anything else goes to the browser.
+
+- Catalogue fetches say where they have got to. A provider sync reports each
+  page as it lands — "Fetching… page 12, 1,204 records" — and a document
+  download reports its bytes against the total, or without one when the server
+  declared no length. Both travel on their own event streams
+  (`catalogue-sync-progress`, `catalogue-download-progress`), and both are
+  logged: every download now records its start, its outcome and each refusal,
+  and every provider fetch records what it offered, stored and dropped, with
+  how long it took.
+
+  Reading the body a chunk at a time is what makes the byte count possible, and
+  it fixes something else on the way: a response that lied about its length, or
+  declared none, is now refused at the moment it crosses the 100 MiB limit
+  rather than after all of it has been buffered.
+
+- The teaching catalogues are part of Wilkes rather than a route nobody called.
+  Settings › Catalogues says what the mirror holds per provider, when each was
+  last fetched, and syncs them one at a time so a five-minute refresh reports
+  each catalogue as it lands instead of going quiet; a provider that fails is
+  reported next to the three that did not. A catalogue pane searches the mirror
+  and adds what it finds — fetched into the workspace's uploads directory and
+  imported from there, so nothing is written into a library root behind the
+  user's back — and a record the provider does not serve whole offers its
+  landing page instead of an Add button that would fail. A search of your own
+  library that returns nothing now offers what the catalogues hold on the same
+  question, in your own words, fetching nothing until you ask; a search that
+  returns something offers the same in one line.
+
+  The operations moved to `wilkes_api::commands::catalogue`, which is why any
+  of this is possible: the sync loop and the provider registry walk used to
+  live inside an axum handler, so the desktop shell had nothing to call. The
+  HTTP routes are now wrappers over the same four operations the Tauri commands
+  call.
+
+  Recall is presented as recall. The order is a text match and every surface
+  says so — ranking these by which is the better place to start needs the
+  library-coverage measure that is not built yet.
+
 - The managed corpus lifecycle is addressed at `/api/corpora/*`, and
   `/api/integrations/underdog/` is gone. A route path that names one consumer
   claims that surface belongs to it; a corpus belongs to whichever application
@@ -120,6 +175,59 @@
   unrecognised content type is reported rather than guessed at.
 
 ### Changed
+
+- `catalogue/search` returns the `terms` each query reduced to alongside its
+  hits. An empty result had two causes a caller could not tell apart — nothing
+  matched, or nothing in the query survived stopword and length filtering, as
+  happens to any single-letter term — and only the store knew which. The UI now
+  says "nothing in that could be searched for" where it used to imply the
+  catalogues were empty.
+
+- The Data settings page names two paths where it named one. What it labelled
+  the application's data directory was the active workspace's directory inside
+  it, so the installation root — which holds `workspaces/`, the model cache and
+  the catalogue mirror — could not be seen from the page at all, and the
+  workspace path was shown under a name that belonged to its parent.
+  `DataPaths.app_data` is now that root and `DataPaths.workspace` is the
+  workspace, each with its own button.
+
+- The catalogue mirror is one per installation, in `shared_data_dir/catalogue`
+  beside the model cache, rather than one per workspace. Its rows are what four
+  public catalogues publish, which is the same answer whichever workspace asks:
+  per-workspace, an installation paid for a sync once per workspace, and a
+  consumer that synced under one workspace found an empty mirror under the
+  next. Existing per-workspace `catalogue.db` files are not migrated or read —
+  the mirror is refetchable by definition, so the first `/api/catalogue/sync`
+  refills the shared one — and they can be deleted.
+
+- `catalogue_records.grain` no longer carries a CHECK constraint listing the
+  grains this build knows. SQLite cannot drop a CHECK in place, so the three
+  variants in the schema were three variants no existing database could be
+  talked out of: a fourth grain would have needed the table rebuilt anyway.
+  Opening a v1 database rebuilds it once, carrying the rowids across because
+  the FTS index is keyed by them. The column's domain is the Rust type's to
+  state, and a `grain` no variant covers is now an error naming the value
+  rather than a row served as a textbook.
+
+- A pre-workspace ("alpha") installation is migrated into its Default workspace
+  by the application, on the start that finds it. The library, its databases'
+  companion files and the roots the settings file had open move into one
+  workspace; the roots and semantic block that the manifest now owns are
+  dropped from global settings, so nothing answers "what is open" twice. The
+  migration is resumable: the workspace it commits to is recorded before the
+  first file moves, and the registry — what makes the workspace real — is
+  written only after the last one lands. It refuses, having moved nothing, when
+  the same library file exists in both the data and the config directory, since
+  only the user knows which one is theirs.
+
+  The startup screen that used to ask for this, and `scripts/migrate_workspace.py`
+  that it told the user to run, are gone. The migration is mechanical — the
+  whole library becomes one workspace and there is nothing to decide — so
+  asking cost every alpha user a manual step to reach a state the app could
+  reach itself, and left an install able to answer the question twice: run the
+  script, or start a build that would create a fresh empty registry beside the
+  library. The startup gate itself stays, with no feature contributing a
+  blocker today; an unexpected startup failure is still reported through it.
 
 - An application-managed workspace — Underdog's semantic corpus — is now listed,
   activatable and searchable by the user instead of being hidden from the

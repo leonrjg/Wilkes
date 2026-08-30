@@ -1,3 +1,4 @@
+pub mod catalogue;
 pub mod chat;
 pub mod embed;
 pub mod files;

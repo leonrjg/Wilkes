@@ -21,6 +21,8 @@ vi.mock("./services", () => ({
     onFileListChanged: vi.fn(() => Promise.resolve(() => {})),
     onBookmarkClusterLabelled: vi.fn(() => Promise.resolve(() => {})),
     onChunkTopicLabelled: vi.fn(() => Promise.resolve(() => {})),
+    onCatalogueDownloadProgress: vi.fn(() => Promise.resolve(() => {})),
+    onCatalogueSyncProgress: vi.fn(() => Promise.resolve(() => {})),
     listWorkspaces: vi.fn(() => Promise.resolve({
       active_workspace_id: "workspace-1",
       workspaces: [{ id: "workspace-1", name: "Default", roots: [], active_root: "/test/dir" }],
@@ -53,7 +55,7 @@ vi.mock("./services", () => ({
     ),
     getIndexStatus: vi.fn(() => Promise.resolve(null)),
     isSemanticReady: vi.fn(() => Promise.resolve(true)),
-    getDataPaths: vi.fn(() => Promise.resolve({ app_data: "" })),
+    getDataPaths: vi.fn(() => Promise.resolve({ app_data: "", workspace: "" })),
     listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
   },
   source: {

@@ -137,14 +137,14 @@ export default function DataPanel({ api, isActive }: Props) {
               <div className="flex flex-col gap-1">
                 <span className="text-[10px] text-[var(--text-dim)] uppercase font-bold tracking-tighter">Path</span>
                 <span className="text-[10px] text-[var(--text-main)] font-mono break-all selectable">
-                  {paths.app_data}/semantic_index.db
+                  {paths.workspace}/semantic_index.db
                 </span>
               </div>
 
               <div className="flex gap-2 mt-1">
                 {isTauri && (
                   <button
-                    onClick={() => onOpen(paths.app_data)}
+                    onClick={() => onOpen(paths.workspace)}
                     className="px-3 py-1.5 bg-[var(--bg-app)] hover:bg-[var(--bg-active)] text-[var(--text-main)] text-[10px] font-bold uppercase tracking-wider rounded border border-[var(--border-main)] transition-colors"
                   >
                     Open in File Manager
@@ -175,23 +175,40 @@ export default function DataPanel({ api, isActive }: Props) {
         <div className="flex flex-col gap-1.5 mb-4">
           <h3 className="text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Application Data</h3>
           <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">
-            Local storage for settings, logs, and cache.
+            Local storage for settings, logs, and cache. The installation directory
+            holds everything shared across workspaces — the model cache and the
+            catalogue mirror; the workspace directory holds this library's own
+            databases.
           </p>
         </div>
 
         <div className="p-3 bg-[var(--bg-active)] rounded-lg border border-[var(--border-main)] flex flex-col gap-3">
           <div className="flex flex-col gap-1">
-            <span className="text-[10px] text-[var(--text-dim)] uppercase font-bold tracking-tighter">Path</span>
+            <span className="text-[10px] text-[var(--text-dim)] uppercase font-bold tracking-tighter">Installation Path</span>
             <span className="text-[10px] text-[var(--text-main)] font-mono break-all selectable">
               {paths.app_data}
             </span>
           </div>
-          <button
-            onClick={() => onOpen(paths.app_data)}
-            className="w-fit px-3 py-1.5 bg-[var(--bg-app)] hover:bg-[var(--bg-active)] text-[var(--text-main)] text-[10px] font-bold uppercase tracking-wider rounded border border-[var(--border-main)] transition-colors"
-          >
-            Open in File Manager
-          </button>
+          <div className="flex flex-col gap-1">
+            <span className="text-[10px] text-[var(--text-dim)] uppercase font-bold tracking-tighter">Workspace Path</span>
+            <span className="text-[10px] text-[var(--text-main)] font-mono break-all selectable">
+              {paths.workspace}
+            </span>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => onOpen(paths.app_data)}
+              className="w-fit px-3 py-1.5 bg-[var(--bg-app)] hover:bg-[var(--bg-active)] text-[var(--text-main)] text-[10px] font-bold uppercase tracking-wider rounded border border-[var(--border-main)] transition-colors"
+            >
+              Open Installation Folder
+            </button>
+            <button
+              onClick={() => onOpen(paths.workspace)}
+              className="w-fit px-3 py-1.5 bg-[var(--bg-app)] hover:bg-[var(--bg-active)] text-[var(--text-main)] text-[10px] font-bold uppercase tracking-wider rounded border border-[var(--border-main)] transition-colors"
+            >
+              Open Workspace Folder
+            </button>
+          </div>
         </div>
       </section>
 

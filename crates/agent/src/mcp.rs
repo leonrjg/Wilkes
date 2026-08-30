@@ -1246,12 +1246,15 @@ impl WilkesMcp {
                 return CallToolResult::error(vec![ContentBlock::text(message)]);
             }
         };
+        // No progress sink: an MCP call is one request and one reply, with
+        // nowhere to render a bar between them.
         match download_to_root(
             &root,
             wilkes_core::acquire::DownloadParams {
                 url: params.url,
                 filename: params.filename,
             },
+            None,
         )
         .await
         {

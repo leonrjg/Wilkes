@@ -9,7 +9,8 @@ import { useSettingsStore } from "../stores/useSettingsStore";
 import { useTopicsStore } from "../stores/useTopicsStore";
 import { useSearchStore } from "../stores/useSearchStore";
 import { api } from "../services";
-import { saveMarkdownViewMode } from "./markdownViewMode";
+import { useReaderHost, type ReaderHostServices } from "@leonrjg/wilkes-reader";
+import { saveTextViewMode } from "./textViewMode";
 
 /** Invoke a reader's `selectionActions` slot and read back the chrome it
  *  produced, so tests can drive Wilkes' handlers without a real reader. */
@@ -27,6 +28,14 @@ const decorationFor = (props: any, id: string) =>
 
 const mockCodeViewer = vi.fn(() => <div data-testid="code-viewer">CodeViewer</div>);
 const mockMarkdownViewer = vi.fn(() => <div data-testid="markdown-viewer">MarkdownViewer</div>);
+// Reads the host the pane provides from inside the tree, which is the only
+// place a reader ever sees it.
+let capturedReaderHost: ReaderHostServices | null = null;
+const readerHostValue = () => capturedReaderHost!;
+const mockHtmlViewer = vi.fn(() => {
+  capturedReaderHost = useReaderHost();
+  return <div data-testid="html-viewer">HtmlViewer</div>;
+});
 const mockPdfViewer = vi.fn(() => <div data-testid="pdf-viewer">PdfViewer</div>);
 // The readers are stood in for so this pane is tested on what it hands them.
 // Everything else the package exports stays real: the pane is built out of it.
@@ -34,6 +43,7 @@ vi.mock("@leonrjg/wilkes-reader", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   CodeViewer: (props: any) => mockCodeViewer(props),
   MarkdownViewer: (props: any) => mockMarkdownViewer(props),
+  HtmlViewer: (props: any) => mockHtmlViewer(props),
   PdfViewer: (props: any) => mockPdfViewer(props),
 }));
 vi.mock("./DocumentEditor", () => ({ default: () => <div data-testid="document-editor">DocumentEditor</div> }));
@@ -49,7 +59,7 @@ vi.mock("../services", () => ({
       navigator.clipboard.writeText(text);
       return Promise.resolve();
     }),
-    resolvePdfUrl: vi.fn((path: string) => path),
+    resolveAssetUrl: vi.fn((path: string) => path),
     relatedDocuments: vi.fn(() => Promise.resolve([])),
     chunkTopics: vi.fn(() => Promise.resolve({ topics: [] })),
     cancelChunkTopics: vi.fn(() => Promise.resolve()),
@@ -247,7 +257,7 @@ describe("PreviewPane", () => {
           expect.objectContaining({
             id: "rendered-bookmark",
             anchor: { kind: "range", range: { start: 2, end: 7 } },
-            className: "markdown-bookmark-highlight",
+            className: "rendered-bookmark-highlight",
             onActivate: expect.any(Function),
           }),
         ],
@@ -262,8 +272,102 @@ describe("PreviewPane", () => {
       .toBeInTheDocument();
   });
 
+  it("defaults HTML files to rendered and toggles to source with an icon button", () => {
+    setViewerState({
+      selectedMatch: { path: "page.html", origin: { TextFile: { line: 1, col: 0 } } },
+      previewData: {
+        Text: {
+          content: "<html><body><h1>Findings</h1></body></html>",
+          language: "html",
+          highlight_line: 1,
+          highlight_range: { start: 0, end: 0 },
+        },
+      },
+    });
+    useBookmarksStore.setState({
+      bookmarks: [{
+        id: "html-bookmark",
+        path: "page.html",
+        origin: { TextFile: { line: 1, col: 16 } },
+        text_range: { start: 16, end: 24 },
+        quote: "Findings",
+        created_at: "2026-01-01T00:00:00Z",
+        rects: [],
+      }],
+    });
+
+    render(<PreviewPane />);
+
+    expect(screen.getByTestId("html-viewer")).toBeInTheDocument();
+    expect(mockHtmlViewer.mock.calls.at(-1)?.[0]).toEqual(
+      expect.objectContaining({
+        content: expect.stringContaining("<h1>Findings</h1>"),
+        documentPath: "page.html",
+        highlightRange: { start: 0, end: 0 },
+        // The same anchor and the same palette as rendered Markdown: what a
+        // bookmark is does not change with the document it is in.
+        decorations: [
+          expect.objectContaining({
+            id: "html-bookmark",
+            anchor: { kind: "range", range: { start: 16, end: 24 } },
+            className: "rendered-bookmark-highlight",
+            onActivate: expect.any(Function),
+          }),
+        ],
+        slots: expect.objectContaining({ selectionActions: expect.any(Function) }),
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "View HTML source" }));
+
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    expect(decorationFor(mockCodeViewer.mock.calls.at(-1)?.[0], "html-bookmark").className)
+      .toBe("cm-bookmark-highlight");
+    expect(screen.getByRole("button", { name: "View rendered HTML" })).toBeInTheDocument();
+  });
+
+  it("remembers the view a document was last read in, whichever kind it is", () => {
+    saveTextViewMode("remembered.html", "source");
+    setViewerState({
+      selectedMatch: { path: "remembered.html", origin: { TextFile: { line: 0, col: 0 } } },
+      previewData: {
+        Text: {
+          content: "<p>Body</p>",
+          language: "html",
+          highlight_line: 0,
+          highlight_range: { start: 0, end: 0 },
+        },
+      },
+    });
+
+    render(<PreviewPane />);
+
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View rendered HTML" })).toBeInTheDocument();
+  });
+
+  it("offers the readers a URL for the files a document sits beside", () => {
+    setViewerState({
+      selectedMatch: { path: "/corpus/page.html", origin: { TextFile: { line: 0, col: 0 } } },
+      previewData: {
+        Text: {
+          content: "<p>Body</p>",
+          language: "html",
+          highlight_line: 0,
+          highlight_range: { start: 0, end: 0 },
+        },
+      },
+    });
+
+    render(<PreviewPane />);
+
+    expect(readerHostValue().resolveLocalAsset?.("/corpus/figures/one.png"))
+      .toBe("/corpus/figures/one.png");
+    expect(api.resolveAssetUrl).toHaveBeenCalledWith("/corpus/figures/one.png");
+  });
+
   it("restores the Markdown view selected for a previously opened document", () => {
-    saveMarkdownViewMode("markdown-restored.md", "source");
+    saveTextViewMode("markdown-restored.md", "source");
     setViewerState({
       selectedMatch: { path: "markdown-restored.md", origin: { TextFile: { line: 0, col: 0 } } },
       previewData: {
@@ -284,7 +388,7 @@ describe("PreviewPane", () => {
 
   it("uses the bookmark's UTF-8 range for the rendered navigation target", () => {
     const path = "markdown-unicode-bookmark.md";
-    saveMarkdownViewMode(path, "rendered");
+    saveTextViewMode(path, "rendered");
     setViewerState({
       selectedMatch: {
         path,

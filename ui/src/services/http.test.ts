@@ -316,8 +316,8 @@ describe("HttpSearchApi", () => {
     }));
   });
 
-  it("resolvePdfUrl returns correctly formatted URL", () => {
-    const url = api.resolvePdfUrl("/path/to/test.pdf");
+  it("resolveAssetUrl returns correctly formatted URL", () => {
+    const url = api.resolveAssetUrl("/path/to/test.pdf");
     expect(url).toBe("/asset?path=%2Fpath%2Fto%2Ftest.pdf");
   });
 

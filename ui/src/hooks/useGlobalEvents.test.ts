@@ -15,6 +15,8 @@ vi.mock("../services", () => ({
     onFileMetadataUpdated: vi.fn().mockResolvedValue(vi.fn()),
     onBookmarkClusterLabelled: vi.fn().mockResolvedValue(vi.fn()),
     onChunkTopicLabelled: vi.fn().mockResolvedValue(vi.fn()),
+    onCatalogueDownloadProgress: vi.fn().mockResolvedValue(vi.fn()),
+    onCatalogueSyncProgress: vi.fn().mockResolvedValue(vi.fn()),
     isGenerationReady: vi.fn().mockResolvedValue(false),
   },
 }));

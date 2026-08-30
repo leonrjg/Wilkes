@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
 
 /// Cap on a single download. Checked twice: against the advertised
 /// `Content-Length` before reading, and against the bytes actually received,
@@ -21,6 +22,40 @@ pub struct DownloadParams {
     pub url: String,
     #[serde(default)]
     pub filename: Option<String>,
+}
+
+/// How far a download has got.
+///
+/// `total_bytes` is what the server said it was sending, and its absence is
+/// ordinary rather than exceptional — a chunked response has no length until
+/// it ends. A consumer that assumed a total would show a progress bar that
+/// never fills for exactly the downloads that take longest.
+#[derive(Clone, Debug, Serialize)]
+pub struct DownloadProgress {
+    pub url: String,
+    /// The name the bytes are being saved under, once it is known.
+    pub filename: String,
+    pub received_bytes: u64,
+    pub total_bytes: Option<u64>,
+    /// True on the last report, whatever the total turned out to be.
+    pub done: bool,
+}
+
+/// One progress report per this many bytes. A 40 MB textbook is then about
+/// 160 reports: enough for a bar that moves, few enough that the reporting is
+/// not itself the work.
+const PROGRESS_STRIDE: u64 = 256 * 1024;
+
+/// Reports without waiting to be heard.
+///
+/// `try_send` rather than `send().await`: progress is lossy by nature, and a
+/// consumer that stopped draining must slow nothing down — least of all a
+/// download it is no longer watching. The caller learns the outcome from the
+/// return value, so a dropped report costs nothing that matters.
+fn report(progress: Option<&mpsc::Sender<DownloadProgress>>, update: DownloadProgress) {
+    if let Some(tx) = progress {
+        let _ = tx.try_send(update);
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -59,16 +94,20 @@ fn extension_for_mime(mime: &str) -> Option<&'static str> {
 pub async fn download_to_root(
     root: &Path,
     params: DownloadParams,
+    progress: Option<mpsc::Sender<DownloadProgress>>,
 ) -> Result<DownloadResponse, String> {
     if !root.is_dir() {
-        return Err(format!(
-            "Current Wilkes root does not exist: {}",
-            root.display()
-        ));
+        let message = format!("Current Wilkes root does not exist: {}", root.display());
+        tracing::warn!("download refused: {message}");
+        return Err(message);
     }
-    let url = reqwest::Url::parse(params.url.trim())
-        .map_err(|error| format!("Invalid download URL: {error}"))?;
+    let requested_url = params.url.trim().to_string();
+    let url = reqwest::Url::parse(&requested_url).map_err(|error| {
+        tracing::warn!(url = %requested_url, "download refused: invalid URL: {error}");
+        format!("Invalid download URL: {error}")
+    })?;
     if !matches!(url.scheme(), "http" | "https") {
+        tracing::warn!(url = %url, scheme = url.scheme(), "download refused: unsupported scheme");
         return Err("Download URL must use HTTP or HTTPS.".to_string());
     }
     let filename = params
@@ -87,21 +126,32 @@ pub async fn download_to_root(
             Some(std::path::Component::Normal(_))
         )
     {
+        tracing::warn!(filename, "download refused: filename is not a single name");
         return Err("filename must be a single file name without directories.".to_string());
     }
     let target = root.join(filename_path);
 
+    tracing::info!(url = %url, root = %root.display(), "download started");
     let response = reqwest::Client::new()
-        .get(url)
+        .get(url.clone())
         .send()
         .await
-        .map_err(|error| format!("Download failed: {error}"))?
+        .map_err(|error| {
+            tracing::warn!(url = %url, "download failed before any bytes: {error}");
+            format!("Download failed: {error}")
+        })?
         .error_for_status()
-        .map_err(|error| format!("Download failed: {error}"))?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_DOWNLOAD_BYTES as u64)
-    {
+        .map_err(|error| {
+            tracing::warn!(url = %url, "download refused by the server: {error}");
+            format!("Download failed: {error}")
+        })?;
+    let total_bytes = response.content_length();
+    if total_bytes.is_some_and(|length| length > MAX_DOWNLOAD_BYTES as u64) {
+        tracing::warn!(
+            url = %url,
+            advertised = total_bytes,
+            "download refused: over the size limit before reading"
+        );
         return Err(format!(
             "Download exceeds the {} MiB limit.",
             MAX_DOWNLOAD_BYTES / 1024 / 1024
@@ -131,16 +181,76 @@ pub async fn download_to_root(
         _ => target,
     };
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("Failed to read download: {error}"))?;
-    if bytes.len() > MAX_DOWNLOAD_BYTES {
-        return Err(format!(
-            "Download exceeds the {} MiB limit.",
-            MAX_DOWNLOAD_BYTES / 1024 / 1024
-        ));
+    // Read the body a chunk at a time rather than in one `bytes()` call. Two
+    // reasons, and only one of them is the progress bar: a body that lied about
+    // its length, or never declared one, is now refused at the moment it
+    // crosses the limit instead of after it has all been buffered.
+    let saved_as = target
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| filename.clone());
+    let mut response = response;
+    let mut bytes: Vec<u8> = Vec::with_capacity(total_bytes.unwrap_or(0).min(1024 * 1024) as usize);
+    let mut received: u64 = 0;
+    let mut next_report: u64 = PROGRESS_STRIDE;
+    report(
+        progress.as_ref(),
+        DownloadProgress {
+            url: requested_url.clone(),
+            filename: saved_as.clone(),
+            received_bytes: 0,
+            total_bytes,
+            done: false,
+        },
+    );
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(
+                    url = %url,
+                    received,
+                    "download failed after {received} bytes: {error}"
+                );
+                return Err(format!("Failed to read download: {error}"));
+            }
+        };
+        received += chunk.len() as u64;
+        if received > MAX_DOWNLOAD_BYTES as u64 {
+            tracing::warn!(url = %url, received, "download refused: over the size limit while reading");
+            return Err(format!(
+                "Download exceeds the {} MiB limit.",
+                MAX_DOWNLOAD_BYTES / 1024 / 1024
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+        if received >= next_report {
+            report(
+                progress.as_ref(),
+                DownloadProgress {
+                    url: requested_url.clone(),
+                    filename: saved_as.clone(),
+                    received_bytes: received,
+                    total_bytes,
+                    done: false,
+                },
+            );
+            next_report = received + PROGRESS_STRIDE;
+        }
     }
+    report(
+        progress.as_ref(),
+        DownloadProgress {
+            url: requested_url.clone(),
+            filename: saved_as,
+            received_bytes: received,
+            // Whatever the server claimed, this is what arrived, and the last
+            // report is the one a bar settles on.
+            total_bytes: Some(received),
+            done: true,
+        },
+    );
     // The name is checked here rather than before the request, because
     // whether an existing file is a collision depends on what is in it. A
     // caller that fetches the same record twice — an acquisition retried after
@@ -153,26 +263,51 @@ pub async fn download_to_root(
         let existing = std::fs::read(&target)
             .map_err(|error| format!("Failed to read {}: {error}", target.display()))?;
         if Sha256::digest(&existing) == Sha256::digest(&bytes) {
+            tracing::info!(
+                url = %url,
+                path = %target.display(),
+                bytes = bytes.len(),
+                "download already present under the same name; nothing written"
+            );
             return Ok(DownloadResponse {
                 path: display_path(&target),
                 bytes: bytes.len(),
                 already_present: true,
             });
         }
+        tracing::warn!(
+            url = %url,
+            path = %target.display(),
+            "download refused: a different file already has that name"
+        );
         return Err(format!(
             "Refusing to overwrite existing file: {}",
             target.display()
         ));
     }
     if let Some(existing) = find_file_with_content(root, &target, &bytes)? {
+        tracing::info!(
+            url = %url,
+            path = %existing.display(),
+            bytes = bytes.len(),
+            "download already present under another name; nothing written"
+        );
         return Ok(DownloadResponse {
             path: display_path(&existing),
             bytes: bytes.len(),
             already_present: true,
         });
     }
-    std::fs::write(&target, &bytes)
-        .map_err(|error| format!("Failed to save {}: {error}", target.display()))?;
+    std::fs::write(&target, &bytes).map_err(|error| {
+        tracing::warn!(path = %target.display(), "download could not be saved: {error}");
+        format!("Failed to save {}: {error}", target.display())
+    })?;
+    tracing::info!(
+        url = %url,
+        path = %target.display(),
+        bytes = bytes.len(),
+        "download saved"
+    );
     Ok(DownloadResponse {
         path: display_path(&target),
         bytes: bytes.len(),
@@ -244,6 +379,7 @@ mod tests {
                 url: "https://example.test/paper.pdf".to_string(),
                 filename: Some("../paper.pdf".to_string()),
             },
+            None,
         )
         .await
         .unwrap_err();
@@ -274,6 +410,7 @@ mod tests {
                 url: format!("{}/paper.pdf", server.url()),
                 filename: Some("paper.pdf".to_string()),
             },
+            None,
         )
         .await
         .unwrap_err();
@@ -304,12 +441,103 @@ mod tests {
             filename: Some("paper.pdf".to_string()),
         };
 
-        let first = download_to_root(dir.path(), params()).await.unwrap();
+        let first = download_to_root(dir.path(), params(), None).await.unwrap();
         assert!(!first.already_present);
-        let second = download_to_root(dir.path(), params()).await.unwrap();
+        let second = download_to_root(dir.path(), params(), None).await.unwrap();
         assert!(second.already_present, "a second fetch is not a collision");
         assert_eq!(second.path, first.path);
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_download_reports_its_bytes_as_they_arrive() {
+        let dir = tempdir().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        // Larger than one stride, so the middle of the download is reported
+        // and not only its two ends.
+        let body = vec![b'x'; (PROGRESS_STRIDE * 2 + 1024) as usize];
+        let expected = body.len() as u64;
+        let _mock = server
+            .mock("GET", "/book.pdf")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let response = download_to_root(
+            dir.path(),
+            DownloadParams {
+                url: format!("{}/book.pdf", server.url()),
+                filename: Some("book.pdf".to_string()),
+            },
+            Some(tx),
+        )
+        .await
+        .expect("download");
+        assert_eq!(response.bytes as u64, expected);
+
+        let mut reports = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            reports.push(update);
+        }
+        assert!(reports.len() >= 3, "expected a middle, got {reports:?}");
+        // The first report is sent before any byte has arrived, so a bar can
+        // appear at the moment the click happens rather than a stride later.
+        assert_eq!(reports[0].received_bytes, 0);
+        assert!(!reports[0].done);
+        assert!(
+            reports
+                .windows(2)
+                .all(|w| w[0].received_bytes <= w[1].received_bytes),
+            "progress must not go backwards: {reports:?}"
+        );
+        let last = reports.last().expect("a final report");
+        assert!(last.done);
+        assert_eq!(last.received_bytes, expected);
+        // Whatever the server claimed, the last report settles on what arrived.
+        assert_eq!(last.total_bytes, Some(expected));
+        // The URL is echoed as it was requested, so a caller can match its own
+        // request without knowing how the URL parser normalizes.
+        assert_eq!(last.url, format!("{}/book.pdf", server.url()));
+        assert_eq!(last.filename, "book.pdf");
+    }
+
+    #[tokio::test]
+    async fn a_download_that_outgrows_the_limit_is_refused_while_it_reads() {
+        let dir = tempdir().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        // No `Content-Length` to check against: the body is only known to be
+        // too big once enough of it has arrived, which is the case that used
+        // to be caught after buffering all of it.
+        let _mock = server
+            .mock("GET", "/huge.pdf")
+            .with_status(200)
+            .with_chunked_body(|writer| {
+                let chunk = vec![b'x'; 1024 * 1024];
+                for _ in 0..(MAX_DOWNLOAD_BYTES / chunk.len() + 2) {
+                    writer.write_all(&chunk)?;
+                }
+                Ok(())
+            })
+            .create_async()
+            .await;
+
+        let error = download_to_root(
+            dir.path(),
+            DownloadParams {
+                url: format!("{}/huge.pdf", server.url()),
+                filename: Some("huge.pdf".to_string()),
+            },
+            None,
+        )
+        .await
+        .expect_err("a body past the limit must be refused");
+        assert!(error.contains("exceeds"), "{error}");
+        assert!(
+            !dir.path().join("huge.pdf").exists(),
+            "a refused download must leave nothing behind"
+        );
     }
 
     #[test]

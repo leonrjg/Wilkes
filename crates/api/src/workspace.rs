@@ -14,7 +14,6 @@ use wilkes_core::{consumer_bail, consumer_ensure};
 
 use crate::commands::settings::get_scoped_settings;
 use crate::context::{AppContext, EventEmitter, IndexSpace, ManagedCorpusBackup};
-use crate::startup::{StartupAction, StartupBlocker};
 
 const REGISTRY_VERSION: u32 = 1;
 const MANIFEST_VERSION: u32 = 1;
@@ -355,41 +354,240 @@ fn settings_contain_legacy_roots(settings_path: &Path) -> anyhow::Result<bool> {
             .is_some_and(|root| !root.is_null()))
 }
 
-/// Workspace's contribution to the generic application startup gate.
-/// Future breaking features can contribute their own blockers alongside this
-/// one without changing either the desktop shell or the frontend splash.
-pub fn startup_blockers(
+/// Everything a pre-workspace ("alpha") library kept beside the settings
+/// file, in the order it is moved into the workspace that adopts it.
+///
+/// Broader than [`contains_legacy_library`]'s list on purpose: that one names
+/// the files whose presence proves an old library exists, while this one has
+/// to name every companion file too — a SQLite database left without its
+/// `-wal` sibling loses the writes that sibling holds.
+const LEGACY_LIBRARY_ENTRIES: &[&str] = &[
+    "semantic_index.db",
+    "semantic_index.db-wal",
+    "semantic_index.db-shm",
+    "semantic_index.db.tmp",
+    "semantic_index.db.tmp-wal",
+    "semantic_index.db.tmp-shm",
+    "semantic_index.db.replacement-backup",
+    "semantic_index.status.json",
+    "file_metadata.db",
+    "file_metadata.db-wal",
+    "file_metadata.db-shm",
+    "research.db",
+    "research.db-wal",
+    "research.db-shm",
+    "chat-conversations.json",
+    "bookmarks.json",
+    "bookmarks.json.migrated",
+    "uploads",
+];
+
+/// Records the workspace an interrupted migration had already committed to.
+///
+/// Written before the first file moves: once anything has moved, a second
+/// attempt must adopt the same workspace id and the same manifest, or it would
+/// leave half the library under one id and half under another.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MigrationPlan {
+    workspace_id: String,
+    manifest: WorkspaceManifest,
+}
+
+fn migration_plan_path(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join(".workspace-migration.json")
+}
+
+struct LegacyRoots {
+    favorites: Vec<PathBuf>,
+    recent_roots: Vec<PathBuf>,
+    active_root: Option<PathBuf>,
+    semantic: Option<SemanticSettings>,
+}
+
+/// The workspace-owned half of a pre-workspace settings file.
+///
+/// Every field is genuinely optional — an alpha install that never opened a
+/// directory wrote none of them — but a value that is present and unreadable
+/// is a fault, not an absence, and is reported rather than dropped: those
+/// roots are the only record of what the user had open.
+fn read_legacy_roots(settings_path: &Path) -> anyhow::Result<LegacyRoots> {
+    if !settings_path.exists() {
+        return Ok(LegacyRoots {
+            favorites: Vec::new(),
+            recent_roots: Vec::new(),
+            active_root: None,
+            semantic: None,
+        });
+    }
+    let settings: serde_json::Value = serde_json::from_slice(&std::fs::read(settings_path)?)?;
+    let field = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| settings.get(*name))
+            .filter(|value| !value.is_null())
+            .cloned()
+    };
+    fn parse<T: serde::de::DeserializeOwned>(
+        value: Option<serde_json::Value>,
+        name: &str,
+    ) -> anyhow::Result<Option<T>> {
+        value
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("legacy setting {name} is unreadable: {error}"))
+    }
+    Ok(LegacyRoots {
+        favorites: parse(field(&["favorites", "bookmarked_dirs"]), "favorites")?
+            .unwrap_or_default(),
+        recent_roots: parse(field(&["recent_dirs"]), "recent_dirs")?.unwrap_or_default(),
+        active_root: parse(field(&["last_directory"]), "last_directory")?,
+        semantic: parse(field(&["semantic"]), "semantic")?,
+    })
+}
+
+/// Drops the keys the adopting workspace manifest now owns, leaving every
+/// other global preference untouched. Left in place they would be a second,
+/// stale answer to which roots are open.
+fn clear_legacy_roots(settings_path: &Path) -> anyhow::Result<()> {
+    if !settings_path.exists() {
+        return Ok(());
+    }
+    let mut settings: serde_json::Value = serde_json::from_slice(&std::fs::read(settings_path)?)?;
+    let Some(object) = settings.as_object_mut() else {
+        anyhow::bail!(
+            "settings file {} is not a JSON object",
+            settings_path.display()
+        );
+    };
+    for key in [
+        "favorites",
+        "bookmarked_dirs",
+        "recent_dirs",
+        "last_directory",
+        "semantic",
+    ] {
+        object.remove(key);
+    }
+    atomic_write_json(settings_path, &settings)
+}
+
+/// Where each surviving legacy entry has to move, refusing rather than
+/// choosing when the same entry exists in both the data and the config
+/// directory: only the user knows which of two libraries is the real one.
+fn plan_legacy_moves(
     app_data_dir: &Path,
     settings_path: &Path,
-) -> anyhow::Result<Vec<StartupBlocker>> {
-    if registry_path(app_data_dir).exists() {
-        return Ok(Vec::new());
-    }
-    if !contains_legacy_library(app_data_dir) && !settings_contain_legacy_roots(settings_path)? {
-        return Ok(Vec::new());
+    workspace_dir: &Path,
+) -> anyhow::Result<Vec<(PathBuf, PathBuf)>> {
+    let mut source_dirs = vec![app_data_dir.to_path_buf()];
+    if let Some(config_dir) = settings_path.parent() {
+        if config_dir != app_data_dir {
+            source_dirs.push(config_dir.to_path_buf());
+        }
     }
 
-    Ok(vec![StartupBlocker {
-        id: "workspaces.alpha-library-migration".to_string(),
-        feature: "Workspaces".to_string(),
-        title: "Your library needs a one-time workspace migration".to_string(),
-        message: "This alpha installation predates workspaces. Quit Wilkes, migrate the existing library into its Default workspace, then reopen the app. Your index and opened roots will be preserved."
-            .to_string(),
-        actions: vec![
-            StartupAction {
-                label: "Preview migration".to_string(),
-                description: "From the Wilkes source directory, inspect the files that will move."
-                    .to_string(),
-                command: Some("python3 scripts/migrate_workspace.py --dry-run".to_string()),
-            },
-            StartupAction {
-                label: "Run migration".to_string(),
-                description: "After quitting Wilkes, run the one-off migration."
-                    .to_string(),
-                command: Some("python3 scripts/migrate_workspace.py".to_string()),
-            },
-        ],
-    }])
+    let mut moves = Vec::new();
+    for entry in LEGACY_LIBRARY_ENTRIES {
+        let candidates: Vec<PathBuf> = source_dirs
+            .iter()
+            .map(|dir| dir.join(entry))
+            .filter(|path| path.exists())
+            .collect();
+        anyhow::ensure!(
+            candidates.len() <= 1,
+            "multiple pre-workspace copies of {entry} exist; refusing to choose between {}",
+            candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if let Some(source) = candidates.into_iter().next() {
+            let destination = workspace_dir.join(entry);
+            moves.push((source, destination));
+        }
+    }
+    Ok(moves)
+}
+
+/// Adopts a pre-workspace ("alpha") library into a Default workspace, in
+/// place, at startup.
+///
+/// Done by the application rather than by a script the user is told to run:
+/// the migration is mechanical — the whole library becomes one workspace, and
+/// there is nothing to decide — so a startup screen asking for it only cost
+/// every alpha user a manual step to reach a state the app could have reached
+/// itself.
+///
+/// Resumable rather than transactional: files move one at a time and the run
+/// can be interrupted between any two. The plan file records the workspace id
+/// and manifest before the first move, so a second attempt continues the same
+/// migration instead of starting a rival one, and the registry — the thing
+/// that makes the workspace real — is written only once every file has landed.
+fn migrate_legacy_library(app_data_dir: &Path, settings_path: &Path) -> anyhow::Result<String> {
+    let plan_path = migration_plan_path(app_data_dir);
+    let (id, manifest) = if plan_path.exists() {
+        let plan: MigrationPlan = serde_json::from_slice(&std::fs::read(&plan_path)?)?;
+        anyhow::ensure!(
+            plan.manifest.id == plan.workspace_id,
+            "interrupted workspace migration records a manifest for a different workspace"
+        );
+        (plan.workspace_id, plan.manifest)
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        let legacy = read_legacy_roots(settings_path)?;
+        let mut manifest = WorkspaceManifest::new(id.clone(), "Default".to_string());
+        manifest.favorites = legacy.favorites;
+        manifest.recent_roots = legacy.recent_roots;
+        manifest.active_root = legacy.active_root;
+        manifest.semantic = legacy.semantic;
+        (id, manifest)
+    };
+
+    let workspace_dir = workspace_root(app_data_dir, &id);
+    let moves = plan_legacy_moves(app_data_dir, settings_path, &workspace_dir)?;
+    tracing::info!(
+        workspace = %id,
+        entries = moves.len(),
+        "adopting pre-workspace library into a Default workspace"
+    );
+
+    std::fs::create_dir_all(app_data_dir)?;
+    atomic_write_json(
+        &plan_path,
+        &MigrationPlan {
+            workspace_id: id.clone(),
+            manifest: manifest.clone(),
+        },
+    )?;
+    std::fs::create_dir_all(&workspace_dir)?;
+    for (source, destination) in moves {
+        anyhow::ensure!(
+            !destination.exists(),
+            "workspace migration would overwrite {}",
+            destination.display()
+        );
+        std::fs::rename(&source, &destination).map_err(|error| {
+            anyhow::anyhow!(
+                "could not move {} into the workspace at {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
+
+    write_manifest(&workspace_manifest_path(app_data_dir, &id), &manifest)?;
+    clear_legacy_roots(settings_path)?;
+    atomic_write_json(
+        &registry_path(app_data_dir),
+        &WorkspaceRegistryFile {
+            version: REGISTRY_VERSION,
+            active_workspace_id: id.clone(),
+            workspace_ids: vec![id.clone()],
+        },
+    )?;
+    std::fs::remove_file(&plan_path)?;
+    Ok(id)
 }
 
 fn atomic_write_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
@@ -460,24 +658,38 @@ fn load_registry(app_data_dir: &Path) -> anyhow::Result<WorkspaceRegistryFile> {
     Ok(registry)
 }
 
-/// Creates a brand-new registry and reports the id of the workspace it made
-/// active. This is intentionally only for fresh installs and tests; existing
-/// pre-workspace installations are migrated by the explicit one-off script
-/// rather than by a second compatibility path in the app.
+/// Reports the id of the active workspace, creating the registry if this
+/// installation has none: a fresh install gets one empty Default workspace,
+/// and a pre-workspace ("alpha") install has its existing library adopted into
+/// one by [`migrate_legacy_library`].
+///
+/// One entry point rather than a registry-creating path beside a separate
+/// migration the user has to invoke: whether an installation predates
+/// workspaces is answered by looking at it, and answering it twice — once here
+/// and once by whoever decided to run a script — is how an install ends up
+/// with both a fresh empty registry and an unadopted library.
 ///
 /// The id rather than a [`WorkspaceState`]: describing the registry is
 /// [`read_workspace_state`]'s job, and it has to read every manifest and the
 /// settings that merge over them to do it. Creating a registry needs none of
 /// that, and callers here are starting a manager, not rendering a list.
-pub fn initialize_workspace_registry(app_data_dir: &Path) -> anyhow::Result<String> {
+pub fn initialize_workspace_registry(
+    app_data_dir: &Path,
+    settings_path: &Path,
+) -> anyhow::Result<String> {
     let path = registry_path(app_data_dir);
     if path.exists() {
         return Ok(load_registry(app_data_dir)?.active_workspace_id);
     }
-    anyhow::ensure!(
-        !contains_legacy_library(app_data_dir),
-        "This installation contains a pre-workspace library. Run scripts/migrate_workspace.py before starting Wilkes."
-    );
+    // The plan file first: an interrupted migration may already have moved
+    // every file out of the way, leaving nothing for the other two checks to
+    // recognize, and finishing it is still the only correct outcome.
+    if migration_plan_path(app_data_dir).exists()
+        || contains_legacy_library(app_data_dir)
+        || settings_contain_legacy_roots(settings_path)?
+    {
+        return migrate_legacy_library(app_data_dir, settings_path);
+    }
     std::fs::create_dir_all(app_data_dir)?;
     let id = uuid::Uuid::new_v4().to_string();
     let manifest = WorkspaceManifest::new(id.clone(), "Default".to_string());
@@ -624,15 +836,7 @@ impl WorkspaceManager {
         mpsc::Receiver<ManagerEvent>,
         impl std::future::Future<Output = ()> + Send,
     )> {
-        let blockers = startup_blockers(&app_data_dir, &settings_path)?;
-        if let Some(blocker) = blockers.first() {
-            anyhow::bail!(blocker.message.clone());
-        }
-        let id = if registry_path(&app_data_dir).exists() {
-            load_registry(&app_data_dir)?.active_workspace_id
-        } else {
-            initialize_workspace_registry(&app_data_dir)?
-        };
+        let id = initialize_workspace_registry(&app_data_dir, &settings_path)?;
         let active_event_workspace_id = Arc::new(RwLock::new(id.clone()));
         let data_dir = workspace_root(&app_data_dir, &id);
         let manifest_path = workspace_manifest_path(&app_data_dir, &id);
@@ -2225,7 +2429,7 @@ mod tests {
     async fn fresh_registry_creates_one_empty_default_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("global-settings.json");
-        let id = initialize_workspace_registry(dir.path()).unwrap();
+        let id = initialize_workspace_registry(dir.path(), &settings_path).unwrap();
         let state = read_workspace_state(dir.path(), &settings_path)
             .await
             .unwrap();
@@ -2316,37 +2520,136 @@ mod tests {
         manager.shutdown_all().await;
     }
 
-    #[test]
-    fn legacy_library_requires_the_explicit_migration() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("research.db"), b"legacy").unwrap();
-        let error = initialize_workspace_registry(dir.path()).unwrap_err();
-        assert!(error.to_string().contains("migrate_workspace.py"));
-        assert!(!dir.path().join("workspaces.json").exists());
-    }
-
-    #[test]
-    fn legacy_roots_produce_a_structured_startup_blocker() {
+    /// The whole alpha library — its databases, their companion files and the
+    /// roots the user had open — arrives in one Default workspace, and the
+    /// global settings stop being a second answer to what is open.
+    #[tokio::test]
+    async fn an_alpha_library_is_adopted_into_a_default_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("settings.json");
+        let library = dir.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let library = library.canonicalize().unwrap();
+        for entry in ["research.db", "research.db-wal", "semantic_index.db"] {
+            std::fs::write(dir.path().join(entry), b"legacy").unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("uploads")).unwrap();
+        std::fs::write(dir.path().join("uploads").join("paper.pdf"), b"pdf").unwrap();
+        let mut legacy_settings =
+            serde_json::to_value(wilkes_core::types::Settings::default()).unwrap();
+        legacy_settings["favorites"] = serde_json::json!([&library]);
+        legacy_settings["last_directory"] = serde_json::json!(&library);
+        legacy_settings["semantic"]["chunk_size"] = serde_json::json!(777);
+        legacy_settings["theme"] = serde_json::json!("Dark");
         std::fs::write(
             &settings_path,
-            serde_json::to_vec(&serde_json::json!({
-                "favorites": [dir.path().join("library")]
-            }))
-            .unwrap(),
+            serde_json::to_vec(&legacy_settings).unwrap(),
         )
         .unwrap();
 
-        let blockers = startup_blockers(dir.path(), &settings_path).unwrap();
+        let id = initialize_workspace_registry(dir.path(), &settings_path).unwrap();
 
-        assert_eq!(blockers.len(), 1);
-        assert_eq!(blockers[0].id, "workspaces.alpha-library-migration");
-        assert_eq!(blockers[0].feature, "Workspaces");
-        assert!(blockers[0].actions.iter().any(
-            |action| action.command.as_deref() == Some("python3 scripts/migrate_workspace.py")
-        ));
-        assert!(!dir.path().join("workspaces.json").exists());
+        let workspace_dir = workspace_root(dir.path(), &id);
+        for entry in ["research.db", "research.db-wal", "semantic_index.db"] {
+            assert!(workspace_dir.join(entry).exists(), "{entry} did not move");
+            assert!(!dir.path().join(entry).exists(), "{entry} was left behind");
+        }
+        assert!(workspace_dir.join("uploads").join("paper.pdf").exists());
+        assert!(!dir.path().join(".workspace-migration.json").exists());
+
+        let state = read_workspace_state(dir.path(), &settings_path)
+            .await
+            .unwrap();
+        assert_eq!(state.active_workspace_id, id);
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].name, "Default");
+        assert_eq!(state.workspaces[0].roots, vec![library.clone()]);
+        assert_eq!(state.workspaces[0].active_root, Some(library));
+
+        let manifest = read_manifest(&workspace_manifest_path(dir.path(), &id)).unwrap();
+        assert_eq!(manifest.semantic.unwrap().chunk_size, 777);
+
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(settings.get("theme").unwrap(), "Dark");
+        for key in ["favorites", "last_directory", "semantic"] {
+            assert!(settings.get(key).is_none(), "{key} was left in settings");
+        }
+    }
+
+    /// A migration killed between two moves is finished by the next start,
+    /// into the workspace it had already committed to.
+    #[test]
+    fn an_interrupted_migration_resumes_into_the_same_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let id = "11111111-2222-3333-4444-555555555555".to_string();
+        let mut manifest = WorkspaceManifest::new(id.clone(), "Default".to_string());
+        manifest.active_root = Some(dir.path().join("library"));
+        let workspace_dir = workspace_root(dir.path(), &id);
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        // Half moved before the interruption, half still in place.
+        std::fs::write(workspace_dir.join("research.db"), b"legacy").unwrap();
+        std::fs::write(dir.path().join("semantic_index.db"), b"legacy").unwrap();
+        atomic_write_json(
+            &migration_plan_path(dir.path()),
+            &MigrationPlan {
+                workspace_id: id.clone(),
+                manifest,
+            },
+        )
+        .unwrap();
+
+        let resumed = initialize_workspace_registry(dir.path(), &settings_path).unwrap();
+
+        assert_eq!(resumed, id);
+        assert!(workspace_dir.join("semantic_index.db").exists());
+        assert!(!dir.path().join("semantic_index.db").exists());
+        assert!(!dir.path().join(".workspace-migration.json").exists());
+        assert_eq!(
+            read_manifest(&workspace_manifest_path(dir.path(), &id))
+                .unwrap()
+                .active_root,
+            Some(dir.path().join("library"))
+        );
+    }
+
+    /// Two libraries and no way to tell which one the user means: the
+    /// migration stops rather than picking, and nothing has moved when it does.
+    #[test]
+    fn ambiguous_legacy_copies_refuse_to_migrate() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let settings_path = config_dir.path().join("settings.json");
+        std::fs::write(data_dir.path().join("research.db"), b"data").unwrap();
+        std::fs::write(config_dir.path().join("research.db"), b"config").unwrap();
+
+        let error = initialize_workspace_registry(data_dir.path(), &settings_path).unwrap_err();
+
+        assert!(error.to_string().contains("refusing to choose"));
+        assert!(!data_dir.path().join("workspaces.json").exists());
+        assert!(data_dir.path().join("research.db").exists());
+        assert!(config_dir.path().join("research.db").exists());
+    }
+
+    /// The manager starts on an alpha install instead of refusing to: the
+    /// adoption is the first thing it does.
+    #[tokio::test]
+    async fn the_manager_starts_on_an_alpha_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        std::fs::write(dir.path().join("research.db"), b"legacy").unwrap();
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings_path, events).unwrap();
+
+        let state = manager.state().await.unwrap();
+        assert_eq!(state.workspaces.len(), 1);
+        assert!(workspace_root(dir.path(), &state.active_workspace_id)
+            .join("research.db")
+            .exists());
+        manager.active().shutdown().await;
     }
 
     #[tokio::test]

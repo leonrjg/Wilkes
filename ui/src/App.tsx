@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { Bookmark, Cloud, MessageSquare, Settings as SettingsIcon, ChevronDown, Loader } from "react-feather";
+import { BookOpen, Bookmark, Cloud, MessageSquare, Settings as SettingsIcon, ChevronDown, Loader } from "react-feather";
 import SearchBar from "./components/SearchBar";
 import ResultList from "./components/ResultList";
 import PreviewPane from "./components/PreviewPane";
@@ -10,6 +10,7 @@ import TopicCloudPane from "./components/TopicCloudPane";
 import DirectoryPicker from "./components/DirectoryPicker";
 import WorkspacePicker from "./components/WorkspacePicker";
 import UploadZone from "./components/UploadZone";
+import CataloguePane from "./components/CataloguePane";
 import SettingsModal from "./components/SettingsModal";
 import { useToasts } from "./components/Toast";
 import { useContextMenu, ContextMenu } from "./components/ContextMenu";
@@ -19,6 +20,7 @@ import { useBookmarksStore } from "./stores/useBookmarksStore";
 import { useChatStore } from "./stores/useChatStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useTopicsStore } from "./stores/useTopicsStore";
+import { useCatalogueStore } from "./stores/useCatalogueStore";
 import { useActiveWorkspaceReadOnly, useWorkspaceStore } from "./stores/useWorkspaceStore";
 import { activeViewerTab, useViewerStore } from "./stores/useViewerStore";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
@@ -54,6 +56,9 @@ export default function App() {
   const handleIndexUpdated = useSemanticStore((s) => s.handleIndexUpdated);
   const semanticReadyForRoot = useSemanticStore((s) => s.readyForCurrentRoot);
   const preferSemantic = useSettingsStore((s) => s.preferSemantic);
+  const cataloguePaneOpen = useCatalogueStore((s) => s.paneOpen);
+  const openCataloguePane = useCatalogueStore((s) => s.openPane);
+  const closeCataloguePane = useCatalogueStore((s) => s.closePane);
   const topicsPaneOpen = useTopicsStore((s) => s.paneOpen);
   const openTopicsPane = useTopicsStore((s) => s.openPane);
   const closeTopicsPane = useTopicsStore((s) => s.closePane);
@@ -76,6 +81,7 @@ export default function App() {
   const [sidebarWidth, setSidebarWidth] = useState(320);
   const [bookmarksWidth, setBookmarksWidth] = useState(320);
   const [topicsWidth, setTopicsWidth] = useState(340);
+  const [catalogueWidth, setCatalogueWidth] = useState(360);
   const [chatWidth, setChatWidth] = useState(320);
   const [fileFilterText, setFileFilterText] = useState("");
   const resizeRef = useRef<{
@@ -407,6 +413,24 @@ export default function App() {
           <Cloud size={14} fill={topicsPaneOpen ? "currentColor" : "none"} />
         </button>
       </Tooltip>
+      <Tooltip content="Teaching catalogues">
+        <button
+          type="button"
+          onClick={() => {
+            if (cataloguePaneOpen) closeCataloguePane();
+            else openCataloguePane();
+          }}
+          aria-label="Teaching catalogues"
+          aria-pressed={cataloguePaneOpen}
+          className={`w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] transition-all border border-[var(--border-main)] ${
+            cataloguePaneOpen
+              ? "text-[var(--accent-blue)] shadow-inner"
+              : "text-[var(--text-muted)] hover:border-[var(--border-strong)] hover:text-[var(--text-main)]"
+          }`}
+        >
+          <BookOpen size={14} />
+        </button>
+      </Tooltip>
       <Tooltip content="Settings">
         <button
           onClick={() => setSettingsOpen(true)}
@@ -520,6 +544,29 @@ export default function App() {
     </>
   ) : null;
 
+  // Right-dock only, like chat: the left dock is bookmarks' and the pane is a
+  // companion to the file list, not a second reading column.
+  const catalogueColumn = cataloguePaneOpen ? (
+    <>
+      <div
+        onMouseDown={startResize({
+          width: catalogueWidth,
+          setWidth: setCatalogueWidth,
+          direction: -1,
+          minWidth: 300,
+          maxWidth: window.innerWidth * 0.5,
+        })}
+        className="w-1 cursor-col-resize flex-shrink-0 bg-transparent hover:bg-[var(--accent-blue)]/30 border-l border-[var(--border-main)] transition-colors"
+      />
+      <div
+        className="flex-shrink-0 overflow-hidden"
+        style={{ width: `${catalogueWidth}px`, minWidth: "300px" }}
+      >
+        <CataloguePane />
+      </div>
+    </>
+  ) : null;
+
   return (
     <div
       aria-busy={workspaceSwitching}
@@ -566,6 +613,7 @@ export default function App() {
 
         {bookmarksDock === "Right" && bookmarksColumn}
         {bookmarksDock === "Right" && topicsColumn}
+        {catalogueColumn}
         {chatColumn}
       </div>
     </div>

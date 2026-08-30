@@ -23,6 +23,7 @@ vi.mock("../services", () => ({
 describe("DataPanel", () => {
   const mockPaths = {
     app_data: "/app/data",
+    workspace: "/app/data/workspaces/w1",
   };
 
   const mockIndexStatus = {
@@ -60,6 +61,12 @@ describe("DataPanel", () => {
     });
     
     expect(screen.getByText("/app/data")).toBeInTheDocument();
+    // Both paths are named, and neither stands in for the other: the index
+    // lives in the workspace, the installation directory contains it.
+    expect(screen.getByText("/app/data/workspaces/w1")).toBeInTheDocument();
+    expect(
+      screen.getByText("/app/data/workspaces/w1/semantic_index.db"),
+    ).toBeInTheDocument();
     expect(screen.getByText("Ready (10 files)")).toBeInTheDocument();
   });
 
@@ -71,7 +78,13 @@ describe("DataPanel", () => {
     const openButtons = screen.getAllByText("Open in File Manager");
     fireEvent.click(openButtons[0]);
     
+    expect(mockApi.openPath).toHaveBeenCalledWith("/app/data/workspaces/w1");
+
+    fireEvent.click(screen.getByText("Open Installation Folder"));
     expect(mockApi.openPath).toHaveBeenCalledWith("/app/data");
+
+    fireEvent.click(screen.getByText("Open Workspace Folder"));
+    expect(mockApi.openPath).toHaveBeenCalledWith("/app/data/workspaces/w1");
   });
 
   it("calls deleteIndex when Delete Database is clicked", async () => {

@@ -3,6 +3,13 @@ import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import type {
+  CatalogueDownload,
+  CatalogueDownloadProgress,
+  CatalogueFetchProgress,
+  CatalogueProbe,
+  CatalogueSearchResponse,
+  CatalogueStatus,
+  CatalogueSyncResponse,
   EmbedDone,
   EmbedError,
   EmbedProgress,
@@ -279,7 +286,7 @@ export class TauriSearchApi implements SearchApi {
     return invoke<OpenAlexWork>("openalex_lookup", { doi });
   }
 
-  resolvePdfUrl(path: string): string {
+  resolveAssetUrl(path: string): string {
     return convertFileSrc(path);
   }
 
@@ -379,6 +386,41 @@ export class TauriSearchApi implements SearchApi {
 
   async loadGenerationModel(): Promise<boolean> {
     return invoke<boolean>("load_generation_model");
+  }
+
+  async catalogueStatus(): Promise<CatalogueStatus> {
+    return invoke<CatalogueStatus>("catalogue_status");
+  }
+
+  async catalogueSearch(
+    probes: CatalogueProbe[],
+    limit?: number,
+  ): Promise<CatalogueSearchResponse> {
+    return invoke<CatalogueSearchResponse>("catalogue_search", { queries: probes, limit });
+  }
+
+  async catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse> {
+    return invoke<CatalogueSyncResponse>("catalogue_sync", { providers });
+  }
+
+  async catalogueAcquire(url: string, filename?: string): Promise<CatalogueDownload> {
+    return invoke<CatalogueDownload>("catalogue_acquire", { url, filename });
+  }
+
+  async onCatalogueSyncProgress(
+    handler: (progress: CatalogueFetchProgress) => void,
+  ): Promise<() => void> {
+    return listen<CatalogueFetchProgress>("catalogue-sync-progress", (e) =>
+      handler(e.payload),
+    );
+  }
+
+  async onCatalogueDownloadProgress(
+    handler: (progress: CatalogueDownloadProgress) => void,
+  ): Promise<() => void> {
+    return listen<CatalogueDownloadProgress>("catalogue-download-progress", (e) =>
+      handler(e.payload),
+    );
   }
 
   async imageRecognizerCatalogue(): Promise<RecognizerCatalogue> {

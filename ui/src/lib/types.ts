@@ -1167,3 +1167,116 @@ export interface ChatStartResult {
 export interface ChatSendResult {
   conversation_id: string | null;
 }
+
+// ── Catalogue ────────────────────────────────────────────────────────────────
+
+/** What a catalogue record can answer. A provider serves exactly one grain —
+ *  a documentation set is never a textbook — so this describes the source as
+ *  much as the record. */
+export type CatalogueGrain = "textbook" | "course" | "reference";
+
+/** One acquirable teaching resource, as some provider publishes it. */
+export interface CatalogueRecord {
+  provider: string;
+  external_id: string;
+  title: string;
+  summary: string;
+  subject: string;
+  authors: string;
+  license: string;
+  landing_url: string | null;
+  /** Present only where the provider serves the whole work at a stable URL.
+   *  Its absence is why a candidate can be discoverable and not acquirable. */
+  pdf_url: string | null;
+  outline_url: string | null;
+  grain: CatalogueGrain;
+  pages: number | null;
+}
+
+/** A record matched against a probe, with the recall score that surfaced it.
+ *  BM25 over title, subject and summary — explicitly not a ranking of which
+ *  record is the better thing to read. */
+export interface CatalogueHit extends CatalogueRecord {
+  recall_score: number;
+}
+
+/** One probe's answer. `terms` is what the query reduced to after stopword and
+ *  length filtering: empty `terms` with empty `hits` means the query held no
+ *  usable term, which is a different answer from "the mirror holds nothing". */
+export interface CatalogueQueryResult {
+  key: string;
+  terms: string[];
+  hits: CatalogueHit[];
+}
+
+export interface CatalogueSearchResponse {
+  results: CatalogueQueryResult[];
+}
+
+export interface CatalogueProbe {
+  key: string;
+  text: string;
+  /** Which kinds of source this query accepts; absent or empty means all. */
+  grains?: CatalogueGrain[] | null;
+}
+
+/** Per-provider state of the mirror. `records: 0` with a null `synced_at_ms`
+ *  is a provider that has never been fetched, not one that published nothing. */
+export interface CatalogueProviderStatus {
+  provider: string;
+  grain: CatalogueGrain;
+  records: number;
+  synced_at_ms: number | null;
+}
+
+export interface CatalogueStatus {
+  providers: CatalogueProviderStatus[];
+  total_records: number;
+}
+
+/** What one provider's sync did. `records` absent with `error` set is that
+ *  provider failing while the others in the same request did not. */
+export interface CatalogueSyncOutcome {
+  provider: string;
+  grain: CatalogueGrain;
+  records: number | null;
+  offered: number | null;
+  duplicates: number | null;
+  unusable: number | null;
+  error: string | null;
+}
+
+export interface CatalogueSyncResponse {
+  providers: CatalogueSyncOutcome[];
+  total_records: number;
+}
+
+/** How far one provider's fetch has got. `records` rather than a percentage:
+ *  no catalogue says how much it holds before it has been walked, and the one
+ *  that publishes a total is wrong by about 1,700 books. */
+export interface CatalogueFetchProgress {
+  provider: string;
+  pages: number;
+  records: number;
+}
+
+/** How far one document download has got. `total_bytes` is absent whenever the
+ *  server declared no length, which is ordinary for a chunked response — a bar
+ *  that assumed a total would never fill for exactly the slowest downloads.
+ *  `url` is the URL as it was requested, so a caller can match its own request
+ *  against the reports without guessing at normalization. */
+export interface CatalogueDownloadProgress {
+  url: string;
+  filename: string;
+  received_bytes: number;
+  total_bytes: number | null;
+  done: boolean;
+}
+
+/** Where a fetched candidate landed. `already_present` means the exact bytes
+ *  were in the uploads directory under some other name and nothing was written. */
+export interface CatalogueDownload {
+  path: string;
+  bytes: number;
+  already_present: boolean;
+}

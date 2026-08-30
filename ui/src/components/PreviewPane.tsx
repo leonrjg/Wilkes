@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud, Share2, Edit3 } from "react-feather";
 import DocumentEditor from "./DocumentEditor";
 // Everything this pane takes from the readers comes through their public
@@ -6,6 +6,7 @@ import DocumentEditor from "./DocumentEditor";
 // a reader's internals is how a shared package stops being shareable.
 import {
   CodeViewer,
+  HtmlViewer,
   MarkdownViewer,
   PdfViewer,
   ReaderHostProvider,
@@ -16,7 +17,7 @@ import {
   type ReaderHostServices,
   type SelectionActionsSlot,
 } from "@leonrjg/wilkes-reader";
-import { readMarkdownViewMode, saveMarkdownViewMode } from "./markdownViewMode";
+import { readTextViewMode, saveTextViewMode } from "./textViewMode";
 import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useChatStore } from "../stores/useChatStore";
@@ -148,6 +149,12 @@ export default function PreviewPane() {
     (state) => state.settings?.pdf_auto_zoom_target_px,
   );
   const colorScheme = useSettingsStore((state) => state.colorScheme);
+  // A document may show the files it sits beside, and only through here: the
+  // reader has already resolved the reference against the document, and this is
+  // the application saying it will serve what that names. Nothing remote
+  // reaches it -- the readers refuse those before asking. Kept stable on its
+  // own, because a reader re-parses its document when this changes.
+  const resolveLocalAsset = useCallback((path: string) => api.resolveAssetUrl(path), []);
   // Everything the readers need from this application. They take it from here
   // rather than importing the Tauri bridge and the settings store directly, so
   // the same components can be mounted by a host that has neither.
@@ -157,11 +164,12 @@ export default function PreviewPane() {
         api.openPath(url).catch((e) => console.error("Open link failed:", e)),
       colorScheme,
       pdfAutoZoomTargetPx,
+      resolveLocalAsset,
     }),
-    [colorScheme, pdfAutoZoomTargetPx],
+    [colorScheme, pdfAutoZoomTargetPx, resolveLocalAsset],
   );
   const [sidePanel, setSidePanel] = useState<ViewerSidePanel>(null);
-  const [markdownView, setMarkdownView] = useState<"source" | "rendered">("rendered");
+  const [textView, setTextView] = useState<"source" | "rendered">("rendered");
   const [editing, setEditing] = useState(false);
   const [openBookmarkTarget, setOpenBookmarkTarget] = useState<{
     id: string;
@@ -202,13 +210,13 @@ export default function PreviewPane() {
 
   useEffect(() => {
     if (!selectedMatch || "PdfPage" in selectedMatch.origin) return;
-    setMarkdownView(readMarkdownViewMode(selectedMatch.path));
+    setTextView(readTextViewMode(selectedMatch.path));
   }, [selectedMatch?.path]);
 
-  const setRememberedMarkdownView = (view: "source" | "rendered") => {
+  const setRememberedTextView = (view: "source" | "rendered") => {
     if (!selectedMatch) return;
-    saveMarkdownViewMode(selectedMatch.path, view);
-    setMarkdownView(view);
+    saveTextViewMode(selectedMatch.path, view);
+    setTextView(view);
   };
 
   // PreviewPane is the single owner of "what's currently being viewed" since
@@ -250,7 +258,7 @@ export default function PreviewPane() {
     if (selectedMatch) {
       const isPdf = selectedMatch.path.toLowerCase().endsWith(".pdf");
       if (isPdf) {
-        const newUrl = api.resolvePdfUrl(selectedMatch.path);
+        const newUrl = api.resolveAssetUrl(selectedMatch.path);
         const isNewFile = newUrl !== prevPdfUrlRef.current;
         prevPdfUrlRef.current = newUrl;
         if (isNewFile) setIsPdfRendering(true);
@@ -282,6 +290,14 @@ export default function PreviewPane() {
   const isPdfFile = "PdfPage" in selectedMatch.origin;
   const isMarkdownFile =
     !isPdfFile && displayData != null && "Text" in displayData && displayData.Text.language === "markdown";
+  const isHtmlFile =
+    !isPdfFile && displayData != null && "Text" in displayData && displayData.Text.language === "html";
+  // The two kinds of text document that have a second presentation. What
+  // differs between them is which reader renders it, which is decided below;
+  // everything else -- the toggle, the remembered choice, which palette a
+  // bookmark is drawn in -- is the same question for both.
+  const isRenderableFile = isMarkdownFile || isHtmlFile;
+  const renderedFileLabel = isHtmlFile ? "HTML" : "Markdown";
   const shouldRestoreSourceScroll =
     !isPdfFile &&
     "TextFile" in selectedMatch.origin &&
@@ -340,8 +356,8 @@ export default function PreviewPane() {
       return [{
         ...shared,
         anchor: { kind: "range" as const, range: bookmark.text_range },
-        className: isMarkdownFile && markdownView === "rendered"
-          ? "markdown-bookmark-highlight"
+        className: isRenderableFile && textView === "rendered"
+          ? "rendered-bookmark-highlight"
           : "cm-bookmark-highlight",
       }];
     }
@@ -632,15 +648,15 @@ export default function PreviewPane() {
           </button>
         </Tooltip>
 
-        {isMarkdownFile && (
-          <Tooltip content={markdownView === "rendered" ? "View Markdown source" : "View rendered Markdown"}>
+        {isRenderableFile && (
+          <Tooltip content={textView === "rendered" ? `View ${renderedFileLabel} source` : `View rendered ${renderedFileLabel}`}>
             <button
               type="button"
-              onClick={() => setRememberedMarkdownView(markdownView === "rendered" ? "source" : "rendered")}
-              aria-label={markdownView === "rendered" ? "View Markdown source" : "View rendered Markdown"}
+              onClick={() => setRememberedTextView(textView === "rendered" ? "source" : "rendered")}
+              aria-label={textView === "rendered" ? `View ${renderedFileLabel} source` : `View rendered ${renderedFileLabel}`}
               className="inline-flex p-1 rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-header)] hover:text-[var(--text-main)]"
             >
-              {markdownView === "rendered" ? <Code size={16} /> : <Eye size={16} />}
+              {textView === "rendered" ? <Code size={16} /> : <Eye size={16} />}
             </button>
           </Tooltip>
         )}
@@ -651,7 +667,7 @@ export default function PreviewPane() {
               type="button"
               onClick={() => {
                 setEditing((current) => !current);
-                if (!editing) setRememberedMarkdownView("source");
+                if (!editing) setRememberedTextView("source");
               }}
               aria-label={editing ? "Finish editing document" : "Edit document"}
               className={`inline-flex rounded border border-[var(--border-main)] p-1 text-[var(--text-dim)] ${editing ? "bg-[var(--bg-active)] text-[var(--text-main)]" : ""}`}
@@ -714,8 +730,8 @@ export default function PreviewPane() {
             )}
             {isPdfFile ? (
               <PdfViewer
-                key={api.resolvePdfUrl(selectedMatch.path)}
-                source={api.resolvePdfUrl(selectedMatch.path)}
+                key={api.resolveAssetUrl(selectedMatch.path)}
+                source={api.resolveAssetUrl(selectedMatch.path)}
                 loadAttempt={pdfLoadAttempt}
                 page={pdfPage}
                 highlight_bbox={pdfBbox}
@@ -727,8 +743,17 @@ export default function PreviewPane() {
                 onLoadError={(error) => reportTabLoadError(activeTab.id, error)}
                 onPageChange={handleChatPageChange}
               />
-            ) : isMarkdownFile && markdownView === "rendered" ? (
+            ) : isMarkdownFile && textView === "rendered" ? (
               <MarkdownViewer
+                content={displayData.Text.content}
+                documentPath={selectedMatch.path}
+                restoreScrollPosition={shouldRestoreSourceScroll}
+                highlightRange={renderedHighlightRange}
+                decorations={readerDecorations}
+                slots={{ selectionActions: selectionActionsSlot }}
+              />
+            ) : isHtmlFile && textView === "rendered" ? (
+              <HtmlViewer
                 content={displayData.Text.content}
                 documentPath={selectedMatch.path}
                 restoreScrollPosition={shouldRestoreSourceScroll}

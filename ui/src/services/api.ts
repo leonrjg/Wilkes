@@ -5,6 +5,13 @@ import type {
   EmbeddingEngine,
   Bookmark,
   BookmarkClustersQuery,
+  CatalogueDownload,
+  CatalogueDownloadProgress,
+  CatalogueFetchProgress,
+  CatalogueProbe,
+  CatalogueSearchResponse,
+  CatalogueStatus,
+  CatalogueSyncResponse,
   BookmarkClustersResult,
   ChunkTopicsQuery,
   ChunkTopicsResult,
@@ -60,7 +67,10 @@ import type {
 } from "../lib/types";
 
 export interface DataPaths {
+  /** The installation's data directory: the one that contains `workspaces/`. */
   app_data: string;
+  /** The active workspace's own directory, under `app_data/workspaces/<id>`. */
+  workspace: string;
 }
 
 // Shared across desktop and web. All methods are identical.
@@ -136,7 +146,9 @@ export interface SearchApi {
   semanticScholarLookup(doi: string): Promise<SemanticScholarPaper>;
   openAlexStatus(): Promise<IntegrationStatus>;
   openAlexLookup(doi: string): Promise<OpenAlexWork>;
-  resolvePdfUrl(path: string): string;
+  /** A URL this application will serve a local file at, whatever the file is:
+   *  the PDF a reader loads, and the pictures an HTML document sits beside. */
+  resolveAssetUrl(path: string): string;
   getLogs(): Promise<string[]>;
   clearLogs(): Promise<void>;
   getPythonInfo(): Promise<string>;
@@ -147,6 +159,32 @@ export interface SearchApi {
    *  native plugin, which (unlike `navigator.clipboard`) does not require the
    *  call to happen inside a transient user-activation window. */
   writeClipboard(text: string): Promise<void>;
+
+  // ── Catalogue ──────────────────────────────────────────────────────────────
+  /** What the mirror holds, per provider, and when each was last fetched.
+   *  Installation-wide: the mirror lives beside the model cache, not in the
+   *  workspace, so these numbers do not change when the workspace does. */
+  catalogueStatus(): Promise<CatalogueStatus>;
+  /** Recall over the mirror — wide, and explicitly not a ranking of which
+   *  record is the better thing to read. Batched because a caller with several
+   *  gaps should pay for one round trip, and keyed so answers can be reattached
+   *  without relying on order. */
+  catalogueSearch(probes: CatalogueProbe[], limit?: number): Promise<CatalogueSearchResponse>;
+  /** Refreshes the named providers, or every one of them when none is named.
+   *  All four is a minutes-long call; name one at a time to show progress. */
+  catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse>;
+  /** Fetches a candidate into the workspace's uploads directory. Getting it
+   *  from there into a library root is a separate, user-driven step. */
+  catalogueAcquire(url: string, filename?: string): Promise<CatalogueDownload>;
+  /** Each page of a provider's catalogue, as it lands. A whole-catalogue fetch
+   *  is minutes long, and this is the only thing that happens in the middle. */
+  onCatalogueSyncProgress(
+    handler: (progress: CatalogueFetchProgress) => void,
+  ): Promise<() => void>;
+  /** Bytes of a document being acquired, as they arrive. */
+  onCatalogueDownloadProgress(
+    handler: (progress: CatalogueDownloadProgress) => void,
+  ): Promise<() => void>;
 
   // ── Worker Management ────────────────────────────────────────────────────────
   getWorkerStatus(): Promise<import("../lib/types").WorkerStatus>;

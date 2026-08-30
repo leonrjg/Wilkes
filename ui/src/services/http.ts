@@ -1,4 +1,11 @@
 import type {
+  CatalogueDownload,
+  CatalogueDownloadProgress,
+  CatalogueFetchProgress,
+  CatalogueProbe,
+  CatalogueSearchResponse,
+  CatalogueStatus,
+  CatalogueSyncResponse,
   EmbedDone,
   EmbedError,
   EmbedProgress,
@@ -446,7 +453,7 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<OpenAlexWork>;
   }
 
-  resolvePdfUrl(path: string): string {
+  resolveAssetUrl(path: string): string {
     return `/asset?path=${encodeURIComponent(path)}`;
   }
 
@@ -717,6 +724,63 @@ export class HttpSearchApi implements SearchApi {
     const res = await fetch("/api/generation/load", { method: "POST" });
     if (!res.ok) throw await responseError(res, "loadGenerationModel");
     return res.json() as Promise<boolean>;
+  }
+
+  async catalogueStatus(): Promise<CatalogueStatus> {
+    const res = await fetch("/api/catalogue/status");
+    if (!res.ok) throw await responseError(res, "catalogueStatus");
+    return res.json() as Promise<CatalogueStatus>;
+  }
+
+  async catalogueSearch(
+    probes: CatalogueProbe[],
+    limit?: number,
+  ): Promise<CatalogueSearchResponse> {
+    const res = await fetch("/api/catalogue/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(limit === undefined ? { queries: probes } : { queries: probes, limit }),
+    });
+    if (!res.ok) throw await responseError(res, "catalogueSearch");
+    return res.json() as Promise<CatalogueSearchResponse>;
+  }
+
+  async catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse> {
+    const res = await fetch("/api/catalogue/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(providers === undefined ? {} : { providers }),
+    });
+    if (!res.ok) throw await responseError(res, "catalogueSync");
+    return res.json() as Promise<CatalogueSyncResponse>;
+  }
+
+  async catalogueAcquire(url: string, filename?: string): Promise<CatalogueDownload> {
+    const res = await fetch("/api/catalogue/acquire", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(filename === undefined ? { url } : { url, filename }),
+    });
+    if (!res.ok) throw await responseError(res, "catalogueAcquire");
+    return res.json() as Promise<CatalogueDownload>;
+  }
+
+  async onCatalogueSyncProgress(
+    handler: (progress: CatalogueFetchProgress) => void,
+  ): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("catalogue-sync-progress", listener);
+    return () => this.releaseEventSource("catalogue-sync-progress", listener);
+  }
+
+  async onCatalogueDownloadProgress(
+    handler: (progress: CatalogueDownloadProgress) => void,
+  ): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("catalogue-download-progress", listener);
+    return () => this.releaseEventSource("catalogue-download-progress", listener);
   }
 
   async imageRecognizerCatalogue(): Promise<RecognizerCatalogue> {

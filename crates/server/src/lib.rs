@@ -169,8 +169,11 @@ async fn clear_logs_handler() -> StatusCode {
 }
 
 async fn get_data_paths_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let app_data = state.context().data_dir.display().to_string();
-    Json(wilkes_core::types::DataPaths { app_data })
+    let ctx = state.context();
+    Json(wilkes_core::types::DataPaths {
+        app_data: ctx.shared_data_dir.display().to_string(),
+        workspace: ctx.data_dir.display().to_string(),
+    })
 }
 
 async fn get_python_info_handler() -> impl IntoResponse {
@@ -578,126 +581,65 @@ struct ChunksSearchBody {
     min_similarity: f32,
 }
 
-/// The catalogue mirror lives in the active workspace's data directory.
-///
-/// One mirror per workspace duplicates a few thousand rows, which is the
-/// cheaper of the two mistakes available: the alternative is a second,
-/// global storage location existing solely for this feature, and a second
-/// place where Wilkes keeps state is exactly the divergence AGENTS.md asks
-/// us not to introduce. A duplicated mirror is re-syncable; a split storage
-/// model is not.
-///
-/// None of these three routes goes through `managed_context`, and that is
-/// deliberate rather than an oversight. Every other consumer route is scoped
-/// by a corpus and an embedding space because it reads the user's own
-/// documents. A catalogue record is not the user's document and has no
-/// vectors — it describes something nobody here holds yet. There is no
-/// corpus to pin, so pinning one would be theatre.
-fn catalogue_store(
-    state: &AppState,
-) -> Result<wilkes_core::catalogue::CatalogueStore, (StatusCode, Json<ErrorBody>)> {
-    let data_dir = state.context().data_dir.clone();
-    wilkes_core::catalogue::CatalogueStore::open(&data_dir)
-        .map_err(|error| server_err(format!("Catalogue store unavailable: {error:#}")))
+// ── Catalogue ────────────────────────────────────────────────────────────────
+//
+// Four wrappers. The operations themselves live in
+// `wilkes_api::commands::catalogue`, so the desktop shell reaches the same
+// mirror through the same code rather than through a second implementation of
+// the sync loop.
+//
+// None of these routes goes through `managed_context`, and that is deliberate
+// rather than an oversight. Every other consumer route is scoped by a corpus
+// and an embedding space because it reads the user's own documents. A
+// catalogue record is not the user's document and has no vectors — it
+// describes something nobody here holds yet. There is no corpus to pin, so
+// pinning one would be theatre.
+
+fn catalogue_err(
+    error: wilkes_api::commands::catalogue::CatalogueError,
+) -> (StatusCode, Json<ErrorBody>) {
+    match error {
+        wilkes_api::commands::catalogue::CatalogueError::Request(message) => err(message),
+        wilkes_api::commands::catalogue::CatalogueError::Failed(message) => server_err(message),
+    }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CatalogueQuery {
-    /// Echoed back on the matching result so a caller batching many gaps can
-    /// reattach each answer without relying on ordering.
-    key: String,
-    text: String,
-    /// Which kinds of source this query will accept. Absent or empty means
-    /// all of them.
-    ///
-    /// A set rather than one value: the caller knows which kinds could answer
-    /// its question and that is often more than one — a broad subject is
-    /// better served by a course than a textbook, but a textbook still
-    /// teaches it, and filtering to the single preferred kind silently hides
-    /// every provider that publishes at another grain.
-    #[serde(default)]
-    grains: Option<Vec<String>>,
+/// The installation's catalogue mirror lives in `catalogue_dir`, not the
+/// workspace's `data_dir`: it describes the public world rather than any one
+/// library, which is also why these routes take no corpus scope.
+fn catalogue_dir(state: &AppState) -> std::path::PathBuf {
+    state.context().catalogue_dir.clone()
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CatalogueSearchBody {
-    queries: Vec<CatalogueQuery>,
+    queries: Vec<wilkes_api::commands::catalogue::CatalogueProbe>,
     #[serde(default = "default_catalogue_limit")]
     limit: usize,
 }
 
 fn default_catalogue_limit() -> usize {
-    24
+    wilkes_api::commands::catalogue::DEFAULT_LIMIT
 }
-
-/// One query batched with many others may legitimately match nothing; the
-/// whole request failing because one probe was empty would make batching
-/// worse than looping.
-#[derive(Serialize)]
-struct CatalogueQueryResult {
-    key: String,
-    hits: Vec<wilkes_core::types::CatalogueHit>,
-}
-
-#[derive(Serialize)]
-struct CatalogueSearchResponse {
-    results: Vec<CatalogueQueryResult>,
-}
-
-const MAX_CATALOGUE_QUERIES: usize = 64;
 
 async fn catalogue_search_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogueSearchBody>,
-) -> Result<Json<CatalogueSearchResponse>, (StatusCode, Json<ErrorBody>)> {
-    if body.queries.is_empty() {
-        return Err(err("Catalogue search names no queries"));
-    }
-    if body.queries.len() > MAX_CATALOGUE_QUERIES {
-        return Err(err(
-            "Catalogue search exceeds the documented request cap of 64 queries",
-        ));
-    }
-    for query in &body.queries {
-        for grain in query.grains.iter().flatten() {
-            if wilkes_core::types::CatalogueGrain::parse(grain).is_none() {
-                return Err(err(format!(
-                    "Unknown catalogue grain {grain:?}; expected textbook, course or reference"
-                )));
-            }
-        }
-    }
-    let store = catalogue_store(&state)?;
-    let limit = body.limit;
-    let queries = body.queries;
+) -> Result<
+    Json<wilkes_api::commands::catalogue::CatalogueSearchResponse>,
+    (StatusCode, Json<ErrorBody>),
+> {
+    let dir = catalogue_dir(&state);
+    // Off the async runtime: a batch of 64 queries is 64 FTS scans, and an
+    // executor thread blocked on them is one not serving anything else.
     tokio::task::spawn_blocking(move || {
-        let mut results = Vec::with_capacity(queries.len());
-        for query in queries {
-            // Every name was checked above, so an unparseable one here would
-            // be a bug in that check rather than a caller's mistake; the
-            // filter cannot silently drop one.
-            let grains: Vec<wilkes_core::types::CatalogueGrain> = query
-                .grains
-                .iter()
-                .flatten()
-                .filter_map(|grain| wilkes_core::types::CatalogueGrain::parse(grain))
-                .collect();
-            let hits = store
-                .search(&query.text, &grains, limit)
-                .map_err(|error| format!("Catalogue search failed: {error:#}"))?;
-            results.push(CatalogueQueryResult {
-                key: query.key,
-                hits,
-            });
-        }
-        Ok::<_, String>(CatalogueSearchResponse { results })
+        wilkes_api::commands::catalogue::search(&dir, body.queries, body.limit)
     })
     .await
     .map_err(|error| server_err(format!("Catalogue search task panicked: {error}")))?
     .map(Json)
-    .map_err(server_err)
+    .map_err(catalogue_err)
 }
 
 #[derive(Deserialize)]
@@ -710,96 +652,30 @@ struct CatalogueSyncBody {
     providers: Option<Vec<String>>,
 }
 
-#[derive(Serialize)]
-struct CatalogueSyncOutcome {
-    provider: String,
-    grain: &'static str,
-    /// Present on success. Absent with `error` set means this provider failed
-    /// and the others in the same request did not — a partial sync is reported
-    /// as partial rather than collapsed into one failure.
-    records: Option<usize>,
-    /// What the provider handed over, before deduplication. Both LibreTexts
-    /// and MIT OpenCourseWare repeat ids across a paged fetch, so `offered`
-    /// runs well ahead of `records`; a provider whose gap suddenly widens is
-    /// one whose pagination has changed under us.
-    offered: Option<usize>,
-    duplicates: Option<usize>,
-    unusable: Option<usize>,
-    error: Option<String>,
-}
-
-#[derive(Serialize)]
-struct CatalogueSyncResponse {
-    providers: Vec<CatalogueSyncOutcome>,
-    total_records: i64,
-}
-
 async fn catalogue_sync_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogueSyncBody>,
-) -> Result<Json<CatalogueSyncResponse>, (StatusCode, Json<ErrorBody>)> {
-    let requested = body.providers.unwrap_or_default();
-    let sources = wilkes_core::catalogue::registry();
-    if let Some(unknown) = requested
-        .iter()
-        .find(|name| !sources.iter().any(|source| source.id() == name.as_str()))
-    {
-        return Err(err(format!("Unknown catalogue provider {unknown:?}")));
-    }
-    let mut store = catalogue_store(&state)?;
-    let mut outcomes = Vec::new();
-    for source in sources {
-        if !requested.is_empty() && !requested.iter().any(|name| name == source.id()) {
-            continue;
-        }
-        // A provider that is down must not take the others with it, and must
-        // not be silent about it either: the failure is reported per provider
-        // and the mirror keeps whatever that provider last supplied.
-        match source.fetch_all().await {
-            Ok(records) => match store.replace_provider(source.id(), &records) {
-                Ok(written) => outcomes.push(CatalogueSyncOutcome {
-                    provider: source.id().to_string(),
-                    grain: source.grain().as_str(),
-                    records: Some(written.stored),
-                    offered: Some(written.offered),
-                    duplicates: Some(written.duplicates),
-                    unusable: Some(written.unusable),
-                    error: None,
-                }),
-                Err(error) => {
-                    tracing::warn!(provider = source.id(), "catalogue write failed: {error:#}");
-                    outcomes.push(CatalogueSyncOutcome {
-                        provider: source.id().to_string(),
-                        grain: source.grain().as_str(),
-                        records: None,
-                        offered: None,
-                        duplicates: None,
-                        unusable: None,
-                        error: Some(format!("{error:#}")),
-                    });
-                }
-            },
-            Err(error) => {
-                tracing::warn!(provider = source.id(), "catalogue fetch failed: {error:#}");
-                outcomes.push(CatalogueSyncOutcome {
-                    provider: source.id().to_string(),
-                    grain: source.grain().as_str(),
-                    records: None,
-                    offered: None,
-                    duplicates: None,
-                    unusable: None,
-                    error: Some(format!("{error:#}")),
-                });
-            }
-        }
-    }
-    let total_records = store
-        .total_records()
-        .map_err(|error| server_err(format!("Catalogue count failed: {error:#}")))?;
-    Ok(Json(CatalogueSyncResponse {
-        providers: outcomes,
-        total_records,
-    }))
+) -> Result<
+    Json<wilkes_api::commands::catalogue::CatalogueSyncResponse>,
+    (StatusCode, Json<ErrorBody>),
+> {
+    state
+        .context()
+        .catalogue_sync(body.providers)
+        .await
+        .map(Json)
+        .map_err(catalogue_err)
+}
+
+async fn catalogue_status_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<
+    Json<wilkes_api::commands::catalogue::CatalogueStatusResponse>,
+    (StatusCode, Json<ErrorBody>),
+> {
+    wilkes_api::commands::catalogue::status(&catalogue_dir(&state))
+        .map(Json)
+        .map_err(catalogue_err)
 }
 
 #[derive(Deserialize)]
@@ -810,18 +686,6 @@ struct CatalogueAcquireBody {
     filename: Option<String>,
 }
 
-/// Fetches a candidate's bytes into this workspace's uploads directory.
-///
-/// Uploads rather than a library root because this is Wilkes writing into its
-/// own area: a library root is a place the user put their files, and a route
-/// that drops fetched bytes there would be writing to a directory whose
-/// contents the user believes they control. The import route reads from an
-/// absolute path, so nothing is lost by landing here first.
-///
-/// The download itself — URL scheme check, traversal guard, size cap and
-/// content dedup — is [`wilkes_core::acquire::download_to_root`], the same
-/// function behind the `download` MCP tool. There is one downloader.
-///
 /// Not gated by `ensure_writable`, unlike `/api/upload` into the same
 /// directory. The gate turns away the *user* adding documents to a library
 /// another application owns; this is that application fetching into Wilkes's
@@ -831,42 +695,12 @@ async fn catalogue_acquire_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogueAcquireBody>,
 ) -> Result<Json<wilkes_core::acquire::DownloadResponse>, (StatusCode, Json<ErrorBody>)> {
-    let (_ctx, uploads_dir) = state.workspace_snapshot();
-    tokio::fs::create_dir_all(&uploads_dir)
+    state
+        .context()
+        .catalogue_acquire(body.url, body.filename)
         .await
-        .map_err(|error| server_err(format!("Cannot prepare uploads directory: {error}")))?;
-    wilkes_core::acquire::download_to_root(
-        &uploads_dir,
-        wilkes_core::acquire::DownloadParams {
-            url: body.url,
-            filename: body.filename,
-        },
-    )
-    .await
-    .map(Json)
-    .map_err(err)
-}
-
-#[derive(Serialize)]
-struct CatalogueStatusResponse {
-    providers: Vec<wilkes_core::types::CatalogueProviderStatus>,
-    total_records: i64,
-}
-
-async fn catalogue_status_handler(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<CatalogueStatusResponse>, (StatusCode, Json<ErrorBody>)> {
-    let store = catalogue_store(&state)?;
-    let providers = store
-        .status()
-        .map_err(|error| server_err(format!("Catalogue status failed: {error:#}")))?;
-    let total_records = store
-        .total_records()
-        .map_err(|error| server_err(format!("Catalogue count failed: {error:#}")))?;
-    Ok(Json(CatalogueStatusResponse {
-        providers,
-        total_records,
-    }))
+        .map(Json)
+        .map_err(catalogue_err)
 }
 
 async fn chunks_search_handler(
@@ -2517,9 +2351,10 @@ mod tests {
     }
 
     /// Builds an `AppState` over a throwaway data dir, for handlers that need
-    /// only the workspace's path.
+    /// only the workspace's path. The returned directory owns `uploads`, so a
+    /// test that needs a file on disk can write one into it.
     #[allow(clippy::type_complexity)]
-    fn catalogue_state() -> (tempfile::TempDir, Arc<AppState>) {
+    fn handler_state() -> (tempfile::TempDir, Arc<AppState>) {
         let dir = tempfile::tempdir().unwrap();
         let uploads_dir = dir.path().join("uploads");
         let settings_path = dir.path().join("settings.json");
@@ -2549,20 +2384,31 @@ mod tests {
 
     #[tokio::test]
     async fn catalogue_status_reports_an_unsynced_mirror_rather_than_failing() {
-        let (_dir, state) = catalogue_state();
+        let (_dir, state) = handler_state();
         let response = match catalogue_status_handler(State(state)).await {
             Ok(response) => response,
             Err(error) => panic!("status failed: {}", error.1 .0.error),
         };
         assert_eq!(response.0.total_records, 0);
-        assert!(response.0.providers.is_empty());
+        // Every registered provider is named even before a first sync: a
+        // settings panel has to be able to offer the button for a provider
+        // that holds nothing yet.
+        assert_eq!(
+            response.0.providers.len(),
+            wilkes_core::catalogue::registry().len()
+        );
+        assert!(response
+            .0
+            .providers
+            .iter()
+            .all(|provider| provider.records == 0 && provider.synced_at_ms.is_none()));
     }
 
     #[tokio::test]
     async fn catalogue_search_refuses_an_unknown_grain_by_name() {
-        let (_dir, state) = catalogue_state();
+        let (_dir, state) = handler_state();
         let body = CatalogueSearchBody {
-            queries: vec![CatalogueQuery {
+            queries: vec![wilkes_api::commands::catalogue::CatalogueProbe {
                 key: "k".into(),
                 text: "graph algorithms".into(),
                 grains: Some(vec!["monograph".into()]),
@@ -2583,7 +2429,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalogue_search_refuses_an_empty_batch() {
-        let (_dir, state) = catalogue_state();
+        let (_dir, state) = handler_state();
         let body = CatalogueSearchBody {
             queries: Vec::new(),
             limit: 8,
@@ -2597,10 +2443,10 @@ mod tests {
 
     #[tokio::test]
     async fn catalogue_search_refuses_a_batch_past_the_documented_cap() {
-        let (_dir, state) = catalogue_state();
+        let (_dir, state) = handler_state();
         let body = CatalogueSearchBody {
-            queries: (0..MAX_CATALOGUE_QUERIES + 1)
-                .map(|n| CatalogueQuery {
+            queries: (0..wilkes_api::commands::catalogue::MAX_QUERIES + 1)
+                .map(|n| wilkes_api::commands::catalogue::CatalogueProbe {
                     key: n.to_string(),
                     text: "graph algorithms".into(),
                     grains: None,
@@ -2617,7 +2463,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalogue_sync_refuses_a_provider_it_does_not_have() {
-        let (_dir, state) = catalogue_state();
+        let (_dir, state) = handler_state();
         let body = CatalogueSyncBody {
             providers: Some(vec!["nonexistent".into()]),
         };
@@ -2897,10 +2743,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_preview_handler_text() {
-        let dir = tempfile::tempdir().unwrap();
-        let uploads_dir = dir.path().join("uploads");
-        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
-        let file_path = uploads_dir.join("test.txt");
+        let (dir, state) = handler_state();
+        let file_path = dir.path().join("uploads").join("test.txt");
         tokio::fs::write(&file_path, "preview content")
             .await
             .unwrap();
@@ -2911,7 +2755,7 @@ mod tests {
             text_range: None,
         };
 
-        let res = preview_handler(axum::Json(match_ref)).await;
+        let res = preview_handler(State(state), axum::Json(match_ref)).await;
         assert!(res.is_ok());
     }
 
@@ -3522,7 +3366,7 @@ mod tests {
             origin: SourceOrigin::TextFile { line: 1, col: 1 },
             text_range: None,
         };
-        let res_preview = preview_handler(Json(match_ref)).await;
+        let res_preview = preview_handler(State(state.clone()), Json(match_ref)).await;
         assert!(res_preview.is_ok());
 
         // Test non-existent preview
@@ -3531,7 +3375,7 @@ mod tests {
             origin: SourceOrigin::TextFile { line: 1, col: 1 },
             text_range: None,
         };
-        let res_bad = preview_handler(Json(match_ref_bad)).await;
+        let res_bad = preview_handler(State(state.clone()), Json(match_ref_bad)).await;
         assert!(res_bad.is_err());
 
         // Test search_handler semantic error (returns Ok immediately because SSE)

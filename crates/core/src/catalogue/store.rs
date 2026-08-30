@@ -6,15 +6,137 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use rusqlite::{params, Connection};
 
-use crate::types::{CatalogueGrain, CatalogueHit, CatalogueProviderStatus, CatalogueRecord};
+use crate::types::{
+    CatalogueGrain, CatalogueHit, CatalogueProviderStatus, CatalogueRecall, CatalogueRecord,
+};
 
-const SCHEMA_VERSION: i64 = 1;
+/// v2 rebuilt `catalogue_records` without the grain CHECK constraint; see
+/// [`CatalogueStore::drop_grain_check`].
+const SCHEMA_VERSION: i64 = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Ceiling on one search's returned rows. Recall is meant to be wide but a
 /// caller that asks for everything is asking for the table, and the table is
 /// what `sync` produced — there is a status endpoint for that question.
 pub const MAX_SEARCH_LIMIT: usize = 200;
+
+/// Everything the store needs to exist, stated once so that the initial
+/// creation and the post-rebuild repair cannot drift apart.
+///
+/// The record table and its FTS index are kept in step by triggers rather than
+/// by call sites, so a future writer cannot forget one.
+///
+/// `grain` carries no CHECK constraint. It did in v1, which put the enum's
+/// three variants into the schema: SQLite cannot drop a CHECK in place, so a
+/// fourth grain would have meant a constraint no existing database could be
+/// talked out of. The column's domain belongs to [`CatalogueGrain`] — every
+/// writer reaches this table through `as_str`, and every reader through
+/// `parse` — so the constraint restated a guarantee the type already made,
+/// and charged a migration for it.
+const BASE_SCHEMA: &str = r#"
+            CREATE TABLE IF NOT EXISTS catalogue_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS catalogue_records (
+                rowid        INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider     TEXT NOT NULL,
+                external_id  TEXT NOT NULL,
+                title        TEXT NOT NULL,
+                summary      TEXT NOT NULL DEFAULT '',
+                subject      TEXT NOT NULL DEFAULT '',
+                authors      TEXT NOT NULL DEFAULT '',
+                license      TEXT NOT NULL DEFAULT '',
+                landing_url  TEXT,
+                pdf_url      TEXT,
+                outline_url  TEXT,
+                grain        TEXT NOT NULL,
+                pages        INTEGER,
+                UNIQUE (provider, external_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_catalogue_provider
+                ON catalogue_records(provider);
+            CREATE INDEX IF NOT EXISTS idx_catalogue_grain
+                ON catalogue_records(grain);
+
+            CREATE TABLE IF NOT EXISTS catalogue_sync (
+                provider     TEXT PRIMARY KEY,
+                synced_at_ms INTEGER NOT NULL,
+                records      INTEGER NOT NULL
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS catalogue_fts USING fts5(
+                title, subject, summary,
+                content = 'catalogue_records',
+                content_rowid = 'rowid',
+                tokenize = 'porter unicode61'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS catalogue_ai AFTER INSERT ON catalogue_records BEGIN
+                INSERT INTO catalogue_fts(rowid, title, subject, summary)
+                VALUES (new.rowid, new.title, new.subject, new.summary);
+            END;
+            CREATE TRIGGER IF NOT EXISTS catalogue_ad AFTER DELETE ON catalogue_records BEGIN
+                INSERT INTO catalogue_fts(catalogue_fts, rowid, title, subject, summary)
+                VALUES ('delete', old.rowid, old.title, old.subject, old.summary);
+            END;
+            CREATE TRIGGER IF NOT EXISTS catalogue_au AFTER UPDATE ON catalogue_records BEGIN
+                INSERT INTO catalogue_fts(catalogue_fts, rowid, title, subject, summary)
+                VALUES ('delete', old.rowid, old.title, old.subject, old.summary);
+                INSERT INTO catalogue_fts(rowid, title, subject, summary)
+                VALUES (new.rowid, new.title, new.subject, new.summary);
+            END;
+"#;
+
+/// The scratch table a v1 rebuild copies into: `catalogue_records` without the
+/// grain CHECK. A second statement of the column list, which
+/// `a_rebuilt_table_has_the_shape_a_fresh_one_has` exists to keep honest.
+const REBUILD_TABLE: &str = "
+            CREATE TABLE catalogue_records_rebuilt (
+                rowid        INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider     TEXT NOT NULL,
+                external_id  TEXT NOT NULL,
+                title        TEXT NOT NULL,
+                summary      TEXT NOT NULL DEFAULT '',
+                subject      TEXT NOT NULL DEFAULT '',
+                authors      TEXT NOT NULL DEFAULT '',
+                license      TEXT NOT NULL DEFAULT '',
+                landing_url  TEXT,
+                pdf_url      TEXT,
+                outline_url  TEXT,
+                grain        TEXT NOT NULL,
+                pages        INTEGER,
+                UNIQUE (provider, external_id)
+            );";
+
+/// A `grain` value no variant of [`CatalogueGrain`] covers.
+///
+/// Only reachable from a row this crate did not write, now that the column has
+/// no CHECK behind it. It is an error rather than a default because the
+/// default was `Textbook`: a caller that filtered for textbooks would have
+/// been handed an unknown kind of source and told it was one, which is worse
+/// than the search failing and saying why.
+#[derive(Debug)]
+struct UnknownGrain(String);
+
+impl std::fmt::Display for UnknownGrain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown catalogue grain {:?}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownGrain {}
+
+fn parse_grain(column: usize, text: String) -> rusqlite::Result<CatalogueGrain> {
+    CatalogueGrain::parse(&text).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(UnknownGrain(text)),
+        )
+    })
+}
 
 fn store_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("catalogue.db")
@@ -83,69 +205,64 @@ impl CatalogueStore {
         if current >= SCHEMA_VERSION {
             return Ok(());
         }
-        // The record table and its FTS index are kept in step by triggers
-        // rather than by call sites, so a future writer cannot forget one.
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS catalogue_meta (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS catalogue_records (
-                rowid        INTEGER PRIMARY KEY AUTOINCREMENT,
-                provider     TEXT NOT NULL,
-                external_id  TEXT NOT NULL,
-                title        TEXT NOT NULL,
-                summary      TEXT NOT NULL DEFAULT '',
-                subject      TEXT NOT NULL DEFAULT '',
-                authors      TEXT NOT NULL DEFAULT '',
-                license      TEXT NOT NULL DEFAULT '',
-                landing_url  TEXT,
-                pdf_url      TEXT,
-                outline_url  TEXT,
-                grain        TEXT NOT NULL CHECK (grain IN ('textbook','course','reference')),
-                pages        INTEGER,
-                UNIQUE (provider, external_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_catalogue_provider
-                ON catalogue_records(provider);
-            CREATE INDEX IF NOT EXISTS idx_catalogue_grain
-                ON catalogue_records(grain);
-
-            CREATE TABLE IF NOT EXISTS catalogue_sync (
-                provider     TEXT PRIMARY KEY,
-                synced_at_ms INTEGER NOT NULL,
-                records      INTEGER NOT NULL
-            );
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS catalogue_fts USING fts5(
-                title, subject, summary,
-                content = 'catalogue_records',
-                content_rowid = 'rowid',
-                tokenize = 'porter unicode61'
-            );
-
-            CREATE TRIGGER IF NOT EXISTS catalogue_ai AFTER INSERT ON catalogue_records BEGIN
-                INSERT INTO catalogue_fts(rowid, title, subject, summary)
-                VALUES (new.rowid, new.title, new.subject, new.summary);
-            END;
-            CREATE TRIGGER IF NOT EXISTS catalogue_ad AFTER DELETE ON catalogue_records BEGIN
-                INSERT INTO catalogue_fts(catalogue_fts, rowid, title, subject, summary)
-                VALUES ('delete', old.rowid, old.title, old.subject, old.summary);
-            END;
-            CREATE TRIGGER IF NOT EXISTS catalogue_au AFTER UPDATE ON catalogue_records BEGIN
-                INSERT INTO catalogue_fts(catalogue_fts, rowid, title, subject, summary)
-                VALUES ('delete', old.rowid, old.title, old.subject, old.summary);
-                INSERT INTO catalogue_fts(rowid, title, subject, summary)
-                VALUES (new.rowid, new.title, new.subject, new.summary);
-            END;
-            "#,
-        )?;
+        self.conn.execute_batch(BASE_SCHEMA)?;
+        self.drop_grain_check()?;
         self.conn.execute(
             "INSERT OR REPLACE INTO catalogue_meta (key, value) VALUES ('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
         )?;
+        Ok(())
+    }
+
+    /// Rebuilds `catalogue_records` without v1's grain CHECK constraint.
+    ///
+    /// SQLite cannot drop a CHECK in place, so the constraint has to be left
+    /// behind by a table it is not part of: create, copy, drop, rename. Rowids
+    /// are carried across rather than reassigned because `catalogue_fts` is an
+    /// external-content index keyed by them — renumbering would leave every
+    /// FTS row pointing at some other record, and the index would keep
+    /// answering, wrongly.
+    ///
+    /// Keyed off the stored DDL rather than the version counter, so a database
+    /// whose meta row was lost is repaired rather than trusted, and a database
+    /// already rebuilt is not rebuilt twice.
+    fn drop_grain_check(&self) -> anyhow::Result<()> {
+        let ddl: String = self.conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'catalogue_records'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !ddl.contains("CHECK") {
+            return Ok(());
+        }
+        // The rename must not touch anything else: `catalogue_fts` names its
+        // content table in its own DDL, and letting SQLite reparse the schema
+        // mid-rebuild is how that reference gets rewritten to the scratch name.
+        self.conn.pragma_update(None, "legacy_alter_table", true)?;
+        let rebuild = self.conn.execute_batch(&format!(
+            "BEGIN;
+             {REBUILD_TABLE}
+             INSERT INTO catalogue_records_rebuilt
+                 (rowid, provider, external_id, title, summary, subject, authors,
+                  license, landing_url, pdf_url, outline_url, grain, pages)
+             SELECT rowid, provider, external_id, title, summary, subject, authors,
+                    license, landing_url, pdf_url, outline_url, grain, pages
+               FROM catalogue_records;
+             DROP TABLE catalogue_records;
+             ALTER TABLE catalogue_records_rebuilt RENAME TO catalogue_records;
+             COMMIT;"
+        ));
+        self.conn.pragma_update(None, "legacy_alter_table", false)?;
+        if rebuild.is_err() {
+            // The batch stops at the failing statement, leaving the BEGIN it
+            // opened; without this the connection stays in a transaction and
+            // every later write fails for a reason that names neither this
+            // migration nor the real fault.
+            let _ = self.conn.execute_batch("ROLLBACK;");
+        }
+        rebuild.context("rebuilding catalogue_records without the grain CHECK")?;
+        // `DROP TABLE` took the old table's indexes and triggers with it.
+        self.conn.execute_batch(BASE_SCHEMA)?;
         Ok(())
     }
 
@@ -236,13 +353,19 @@ impl CatalogueStore {
         query: &str,
         grains: &[CatalogueGrain],
         limit: usize,
-    ) -> anyhow::Result<Vec<CatalogueHit>> {
-        let expression = fts_expression(query);
-        if expression.is_empty() {
+    ) -> anyhow::Result<CatalogueRecall> {
+        let terms = query_terms(query);
+        if terms.is_empty() {
             // Not an error: a probe can legitimately reduce to stopwords, and
-            // "no terms survived" is a real answer to give back.
-            return Ok(Vec::new());
+            // "no terms survived" is a real answer to give back — which is why
+            // the terms travel with the hits rather than being inferred from an
+            // empty result that has two quite different causes.
+            return Ok(CatalogueRecall {
+                terms,
+                hits: Vec::new(),
+            });
         }
+        let expression = fts_expression(&query_phrases(query), &terms);
         let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
         // bm25() is negative-better in FTS5; negate so a larger score is a
         // better match and callers do not have to know that.
@@ -279,13 +402,14 @@ impl CatalogueStore {
                     landing_url: row.get(7)?,
                     pdf_url: row.get(8)?,
                     outline_url: row.get(9)?,
-                    grain: CatalogueGrain::parse(&grain_text).unwrap_or(CatalogueGrain::Textbook),
+                    grain: parse_grain(10, grain_text)?,
                     pages: row.get(11)?,
                 },
                 recall_score: row.get(12)?,
             })
         })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let hits = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(CatalogueRecall { terms, hits })
     }
 
     pub fn status(&self) -> anyhow::Result<Vec<CatalogueProviderStatus>> {
@@ -300,7 +424,7 @@ impl CatalogueStore {
             let grain_text: String = row.get(1)?;
             Ok(CatalogueProviderStatus {
                 provider: row.get(0)?,
-                grain: CatalogueGrain::parse(&grain_text).unwrap_or(CatalogueGrain::Textbook),
+                grain: parse_grain(1, grain_text)?,
                 records: row.get(2)?,
                 synced_at_ms: row.get(3)?,
             })
@@ -317,15 +441,12 @@ impl CatalogueStore {
     }
 }
 
-/// Turns free text into an FTS5 MATCH expression.
+/// The terms free text reduces to, in the order they were taken.
 ///
-/// The input is a description written by a caller — prose, punctuation and
-/// all — and FTS5's query language would read `NP-complete` as a NOT and
-/// `"quoted"` as a phrase, so raw text is a syntax error waiting to happen.
-/// Every term is therefore extracted, quoted and OR-ed: OR because this is a
-/// recall stage, where a record matching four of a probe's fifteen terms is
-/// exactly the sort of thing that must survive to be ranked properly later.
-fn fts_expression(query: &str) -> String {
+/// Separate from [`fts_expression`] because the terms are an answer in their
+/// own right: a caller handed an empty result needs to know whether the mirror
+/// held nothing or the query held nothing, and only this function knows.
+fn query_terms(query: &str) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     for raw in query.split(|c: char| !c.is_alphanumeric()) {
         // Character-aware throughout: `chars().count()`, never a byte length.
@@ -344,7 +465,74 @@ fn fts_expression(query: &str) -> String {
         }
     }
     terms
-        .into_iter()
+}
+
+/// The contiguous word runs a query contains, each kept whole as a phrase.
+///
+/// A term of art is not the sum of its terms. `difference in differences`
+/// loses `in` to the stopword list and both remaining words stem to `differ`,
+/// so by the time it reaches FTS5 it is a one-word query for `difference` —
+/// which is why it ranked anthropology courses ahead of the econometrics
+/// course whose blurb says `differences-in-differences` in as many words. The
+/// run keeps the words adjacent and in order, which is the only form in which
+/// that query is distinguishable from a query about difference.
+///
+/// Stopwords stay in: here they are not signal, they are position. Words are
+/// rebuilt from their alphanumeric characters and joined with single spaces,
+/// so a run can carry no character that FTS5 would read as syntax, and the
+/// phrase this produces is tokenized exactly as the indexed text was — which
+/// is what lets the query match `differences-in-differences` across its
+/// hyphens.
+///
+/// Runs are bounded by [`MAX_QUERY_TERMS`], the same budget the terms spend:
+/// a clause longer than that is prose rather than a name, and matching it as a
+/// phrase would cost a positional scan to find nothing.
+fn query_phrases(query: &str) -> Vec<String> {
+    let mut phrases: Vec<String> = Vec::new();
+    let mut budget = MAX_QUERY_TERMS;
+    // Punctuation ends a run; spaces, hyphens and apostrophes are interior to
+    // one, so `difference-in-differences` typed with hyphens is the same run as
+    // the same words typed with spaces.
+    for run in query.split(|c: char| !(c.is_alphanumeric() || c == ' ' || c == '-' || c == '\'')) {
+        let words: Vec<String> = run
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(|word| word.to_lowercase())
+            .collect();
+        // One word is already a term; a phrase of it would say nothing new.
+        if words.len() < 2 || words.len() > budget {
+            continue;
+        }
+        budget -= words.len();
+        phrases.push(words.join(" "));
+    }
+    phrases
+}
+
+/// Turns a query's phrases and terms into an FTS5 MATCH expression.
+///
+/// The input is a description written by a caller — prose, punctuation and
+/// all — and FTS5's query language would read `NP-complete` as a NOT and
+/// `"quoted"` as a phrase, so raw text is a syntax error waiting to happen.
+/// Everything is therefore quoted and OR-ed: OR because this is a recall
+/// stage, where a record matching four of a probe's fifteen terms is exactly
+/// the sort of thing that must survive to be ranked properly later.
+///
+/// The phrases from [`query_phrases`] are OR-ed in alongside the terms rather
+/// than replacing them, so the recall set is unchanged — a record matching a
+/// phrase already matched that phrase's words — and only the order moves. A
+/// record that matched the whole run scores it in addition to each of its
+/// words, which is what lifts the record that names the thing above the
+/// records that merely share a word with it.
+///
+/// This reaches a term of art only where a record spells it out. A concept a
+/// record teaches under other words — `causal inference` in a blurb that says
+/// "instrumental variables" and "program evaluation" — is not reachable from
+/// any lexical expression, and is not what this is for.
+fn fts_expression(phrases: &[String], terms: &[String]) -> String {
+    phrases
+        .iter()
+        .chain(terms.iter())
         .map(|t| format!("\"{t}\""))
         .collect::<Vec<_>>()
         .join(" OR ")
@@ -358,8 +546,8 @@ const STOPWORDS: &[&str] = &[
     "to", "was", "were", "which", "who", "with", "who", "you", "your",
 ];
 
-/// Long probes are welcome; unbounded ones are not. Fifteen terms is well past
-/// what a two-sentence description contributes after stopwords.
+/// Long probes are welcome; unbounded ones are not. Twenty-four terms is well
+/// past what a two-sentence description contributes after stopwords.
 const MAX_QUERY_TERMS: usize = 24;
 
 #[cfg(test)]
@@ -413,12 +601,146 @@ mod tests {
                 &[],
                 5,
             )
-            .expect("search");
+            .expect("search")
+            .hits;
 
         assert_eq!(
             hits.first().map(|h| h.record.title.as_str()),
             Some("Combinatorial Optimization")
         );
+    }
+
+    /// The case the phrase handling exists for, taken from the mirror: MIT
+    /// OpenCourseWare's applied econometrics blurb says
+    /// `differences-in-differences`, and before the run was kept whole this
+    /// query returned `Identity and Difference` and three more like it while
+    /// the econometrics course did not appear at all. Both words stem to
+    /// `differ` and `in` is a stopword, so the terms alone cannot tell the two
+    /// records apart.
+    #[test]
+    fn a_term_of_art_outranks_the_records_that_merely_share_a_word() {
+        let mut store = CatalogueStore::in_memory().expect("store");
+        store
+            .replace_provider(
+                "test",
+                &[
+                    record(
+                        "1",
+                        "Identity and Difference",
+                        "This course explores how identities, whether of individuals or \
+                         groups, are produced, maintained and transformed.",
+                        CatalogueGrain::Course,
+                    ),
+                    record(
+                        "2",
+                        "Psychology of Gender",
+                        "Current research and theory regarding the validity of commonly \
+                         accepted gender differences in many realms.",
+                        CatalogueGrain::Course,
+                    ),
+                    record(
+                        "3",
+                        "Applied Econometrics: Mostly Harmless Big Data",
+                        "This course covers empirical strategies for applied micro research \
+                         questions: regression and matching, instrumental variables, \
+                         differences-in-differences, regression discontinuity designs.",
+                        CatalogueGrain::Course,
+                    ),
+                ],
+            )
+            .expect("replace");
+
+        let hits = store
+            .search("difference in differences", &[], 5)
+            .expect("search")
+            .hits;
+
+        assert_eq!(
+            hits.first().map(|h| h.record.title.as_str()),
+            Some("Applied Econometrics: Mostly Harmless Big Data")
+        );
+        // The others are still recalled: the phrase moves the order, it does
+        // not narrow the set.
+        assert_eq!(hits.len(), 3);
+    }
+
+    /// Hyphens are the provider's choice, not the reader's. `unicode61` splits
+    /// on them, so the words are what has to line up.
+    #[test]
+    fn a_hyphenated_query_and_a_hyphenated_record_meet_in_the_middle() {
+        let mut store = CatalogueStore::in_memory().expect("store");
+        store
+            .replace_provider(
+                "test",
+                &[
+                    record(
+                        "1",
+                        "Differences in Learning",
+                        "How difference shapes the classroom.",
+                        CatalogueGrain::Course,
+                    ),
+                    record(
+                        "2",
+                        "Program Evaluation",
+                        "Panel methods, including differences-in-differences.",
+                        CatalogueGrain::Course,
+                    ),
+                ],
+            )
+            .expect("replace");
+
+        for probe in ["difference-in-differences", "difference in differences"] {
+            let hits = store.search(probe, &[], 5).expect("search").hits;
+            assert_eq!(
+                hits.first().map(|h| h.record.title.as_str()),
+                Some("Program Evaluation"),
+                "probe {probe:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_keeps_its_stopwords_and_stops_at_punctuation() {
+        assert_eq!(
+            query_phrases("difference in differences"),
+            vec!["difference in differences".to_string()]
+        );
+        // A comma ends a run: two names, not one ten-word phrase.
+        assert_eq!(
+            query_phrases("instrumental variables, regression discontinuity"),
+            vec![
+                "instrumental variables".to_string(),
+                "regression discontinuity".to_string()
+            ]
+        );
+        // One word is already a term.
+        assert!(query_phrases("econometrics").is_empty());
+        // Nothing a run can carry is FTS5 syntax.
+        assert_eq!(
+            query_phrases("\"C++ / C#\" AND (x"),
+            Vec::<String>::new(),
+            "single-word runs only"
+        );
+        assert_eq!(
+            query_phrases("NP-complete reductions"),
+            vec!["np complete reductions".to_string()]
+        );
+    }
+
+    /// A blurb-shaped probe spends the same budget the terms do, so a long
+    /// clause cannot turn one search into a dozen positional scans.
+    #[test]
+    fn phrase_runs_are_bounded_by_the_term_budget() {
+        let long = (0..40)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(query_phrases(&long).is_empty());
+
+        let mut probe = long.clone();
+        probe.push_str(", causal inference");
+        // The clause that does not fit is skipped; the one that fits is kept.
+        assert_eq!(query_phrases(&probe), vec!["causal inference".to_string()]);
     }
 
     #[test]
@@ -448,6 +770,7 @@ mod tests {
         assert!(store
             .search("the and of it is", &[], 5)
             .expect("search")
+            .hits
             .is_empty());
     }
 
@@ -479,7 +802,8 @@ mod tests {
                 &[CatalogueGrain::Reference],
                 5,
             )
-            .expect("search");
+            .expect("search")
+            .hits;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record.external_id, "1");
     }
@@ -527,7 +851,8 @@ mod tests {
                 &[CatalogueGrain::Course, CatalogueGrain::Textbook],
                 10,
             )
-            .expect("search");
+            .expect("search")
+            .hits;
         let ids: Vec<&str> = hits.iter().map(|h| h.record.external_id.as_str()).collect();
         assert_eq!(ids.len(), 2, "{ids:?}");
         assert!(ids.contains(&"1") && ids.contains(&"2"), "{ids:?}");
@@ -573,7 +898,10 @@ mod tests {
         assert_eq!(store.total_records().expect("count"), 1);
         // The FTS index must have been withdrawn with the row, not merely the
         // table: a stale posting would surface a record that cannot be fetched.
-        let hits = store.search("graph algorithms", &[], 10).expect("search");
+        let hits = store
+            .search("graph algorithms", &[], 10)
+            .expect("search")
+            .hits;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record.title, "Kept Book");
     }
@@ -616,6 +944,27 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_reports_the_terms_it_was_run_with() {
+        let store = CatalogueStore::in_memory().expect("store");
+        // Two empty results with different causes. Only the terms tell them
+        // apart, which is why they are returned rather than inferred.
+        let nothing_usable = store.search("the and of it", &[], 5).expect("search");
+        assert!(nothing_usable.terms.is_empty());
+        assert!(nothing_usable.hits.is_empty());
+
+        let nothing_matched = store
+            .search("hydrodynamic stability", &[], 5)
+            .expect("search");
+        assert_eq!(nothing_matched.terms, ["hydrodynamic", "stability"]);
+        assert!(nothing_matched.hits.is_empty());
+
+        // A one-character term is dropped, and saying so is the difference
+        // between "we have nothing on C" and "we never looked".
+        let single_letter = store.search("C", &[], 5).expect("search");
+        assert!(single_letter.terms.is_empty());
+    }
+
+    #[test]
     fn status_reports_what_each_provider_holds() {
         let mut store = CatalogueStore::in_memory().expect("store");
         store
@@ -627,5 +976,187 @@ mod tests {
         assert_eq!(status[0].records, 1);
         assert_eq!(status[0].grain, CatalogueGrain::Course);
         assert!(status[0].synced_at_ms.is_some());
+    }
+
+    /// The v1 schema, stated as today's schema plus the constraint v1 had, so
+    /// this fixture cannot drift away from the thing being migrated.
+    fn v1_schema() -> String {
+        let with_check = BASE_SCHEMA.replace(
+            "grain        TEXT NOT NULL,",
+            "grain        TEXT NOT NULL CHECK (grain IN ('textbook','course','reference')),",
+        );
+        assert!(
+            with_check.contains("CHECK"),
+            "v1 fixture lost its constraint"
+        );
+        with_check
+    }
+
+    fn columns(conn: &Connection, table: &str) -> Vec<(String, String, i64)> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("table_info");
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows");
+        rows
+    }
+
+    /// Writes a v1 database with one record in it, and returns its directory.
+    fn v1_database(grain: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = Connection::open(dir.path().join("catalogue.db")).expect("open");
+        conn.execute_batch(&v1_schema()).expect("v1 schema");
+        conn.execute(
+            "INSERT INTO catalogue_records
+                (rowid, provider, external_id, title, summary, subject, authors,
+                 license, landing_url, pdf_url, outline_url, grain, pages)
+             VALUES (7,'test','1','Convex Optimization','Duality and gradient methods.',
+                     'mathematics','Someone','cc-by',NULL,NULL,NULL,?1,400)",
+            [grain],
+        )
+        .expect("insert");
+        conn.execute(
+            "INSERT OR REPLACE INTO catalogue_meta (key, value) VALUES ('schema_version','1')",
+            [],
+        )
+        .expect("version");
+        dir
+    }
+
+    #[test]
+    fn opening_a_v1_database_drops_the_grain_check_and_keeps_the_rows() {
+        let dir = v1_database("textbook");
+        let store = CatalogueStore::open(dir.path()).expect("open");
+
+        let ddl: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='catalogue_records'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("ddl");
+        assert!(!ddl.contains("CHECK"), "{ddl}");
+
+        // The row survived, at the rowid it had. Anything else and the FTS
+        // index — which is keyed by that rowid — would be pointing elsewhere.
+        let (rowid, title): (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT rowid, title FROM catalogue_records WHERE external_id = '1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(rowid, 7);
+        assert_eq!(title, "Convex Optimization");
+
+        // And the index still answers for it, through the rebuilt table.
+        let hits = store
+            .search("duality and gradient methods", &[], 10)
+            .expect("search")
+            .hits;
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].record.external_id, "1");
+    }
+
+    #[test]
+    fn a_migrated_database_accepts_a_grain_the_old_constraint_would_have_refused() {
+        let dir = v1_database("textbook");
+        let store = CatalogueStore::open(dir.path()).expect("open");
+        // The point of the rebuild: the schema no longer holds an opinion the
+        // enum would have to be talked out of.
+        store
+            .conn
+            .execute(
+                "INSERT INTO catalogue_records
+                    (provider, external_id, title, grain)
+                 VALUES ('test','2','Later Grain','monograph')",
+                [],
+            )
+            .expect("a fourth grain must not be refused by the schema");
+    }
+
+    #[test]
+    fn a_rebuilt_table_has_the_shape_a_fresh_one_has() {
+        let migrated_dir = v1_database("course");
+        let migrated = CatalogueStore::open(migrated_dir.path()).expect("open migrated");
+        let fresh_dir = tempfile::tempdir().expect("tempdir");
+        let fresh = CatalogueStore::open(fresh_dir.path()).expect("open fresh");
+        assert_eq!(
+            columns(&migrated.conn, "catalogue_records"),
+            columns(&fresh.conn, "catalogue_records"),
+            "REBUILD_TABLE has drifted from BASE_SCHEMA"
+        );
+        // The triggers and indexes went with the dropped table; they have to
+        // have come back, or writes would stop reaching the index silently.
+        for object in [
+            "catalogue_ai",
+            "catalogue_ad",
+            "catalogue_au",
+            "idx_catalogue_provider",
+        ] {
+            let present: i64 = migrated
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                    [object],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            assert_eq!(present, 1, "{object} did not survive the rebuild");
+        }
+    }
+
+    #[test]
+    fn opening_a_migrated_database_again_is_a_no_op() {
+        let dir = v1_database("reference");
+        drop(CatalogueStore::open(dir.path()).expect("first open"));
+        let store = CatalogueStore::open(dir.path()).expect("second open");
+        assert_eq!(store.total_records().expect("count"), 1);
+        let scratch: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'catalogue_records_rebuilt'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(scratch, 0, "the scratch table outlived the rebuild");
+    }
+
+    #[test]
+    fn an_unknown_grain_is_reported_rather_than_served_as_a_textbook() {
+        // Written after the migration, because v1's CHECK would have refused
+        // it — which is the whole point: with the constraint gone, nothing in
+        // the database turns this row away, so the read path has to.
+        let dir = v1_database("textbook");
+        let store = CatalogueStore::open(dir.path()).expect("open");
+        store
+            .conn
+            .execute(
+                "UPDATE catalogue_records SET grain = 'monograph' WHERE external_id = '1'",
+                [],
+            )
+            .expect("update");
+        let error = store
+            .search("duality and gradient methods", &[], 10)
+            .expect_err("an unknown grain must not be served as a textbook");
+        assert!(
+            format!("{error:#}").contains("monograph"),
+            "the failure must name the grain it could not read: {error:#}"
+        );
+        store
+            .status()
+            .expect_err("status must not launder it either");
     }
 }
