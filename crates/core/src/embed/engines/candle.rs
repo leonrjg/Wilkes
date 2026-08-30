@@ -628,15 +628,22 @@ impl CandleEmbedder {
             LoadedModel::JinaBert(m) => Module::forward(m, &input_ids)?,
             LoadedModel::ModernBert(m) => m.forward(&input_ids, &attention_mask)?,
         };
-        // Force GPU sync so we measure real forward time, not just command submission.
-        let _ = token_embeddings
-            .flatten_all()?
-            .narrow(0, 0, 1)?
-            .to_vec1::<f32>()?;
-        debug!(
-            "[candle]   forward (synced): {:.3}s",
-            t_fwd.elapsed().as_secs_f64()
-        );
+        // Reading one element back forces the device queue to drain, which is
+        // the only way to attribute time to the forward pass rather than to
+        // command submission. It is also a pipeline barrier the production
+        // path has no reason to pay for, so it happens only when someone is
+        // actually reading the number: otherwise pooling and normalization
+        // stay queued and the single required transfer below is the barrier.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let _ = token_embeddings
+                .flatten_all()?
+                .narrow(0, 0, 1)?
+                .to_vec1::<f32>()?;
+            debug!(
+                "[candle]   forward (synced): {:.3}s",
+                t_fwd.elapsed().as_secs_f64()
+            );
+        }
 
         let t_pool = std::time::Instant::now();
         let mask_f32 = attention_mask.to_dtype(self.dtype)?;

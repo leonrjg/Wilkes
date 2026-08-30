@@ -20,7 +20,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use ort::session::{Session, SessionInputValue};
-use ort::value::{Tensor, ValueType};
+use ort::value::{DynValue, Tensor, ValueType};
 
 /// The names Optimum gives the three graphs' tensors. Constants because a
 /// typo in a tensor name is a runtime error deep in a decode loop, and
@@ -260,16 +260,34 @@ impl OnnxVlm {
         );
         let prompt_len = prompt_embeds.len() / hidden;
 
-        let mut past: Vec<(String, Vec<f32>, Vec<i64>)> = Vec::new();
-        for layer in 0..self.shape.layers {
-            for part in ["key", "value"] {
-                past.push((
-                    format!("{PAST_PREFIX}{layer}.{part}"),
-                    Vec::new(),
-                    vec![1, self.shape.kv_heads, 0, self.shape.head_dim],
-                ));
-            }
-        }
+        // The cache is carried as the decoder's own output values, moved
+        // straight back into the next step's inputs. Reading them into Rust
+        // and rebuilding tensors would copy the whole, growing cache twice per
+        // token, which is quadratic in the number of tokens produced; ORT
+        // values are reference-counted handles, so moving them is free.
+        let names: Vec<(String, String)> = (0..self.shape.layers)
+            .flat_map(|layer| {
+                ["key", "value"].map(|part| {
+                    (
+                        format!("{PAST_PREFIX}{layer}.{part}"),
+                        format!("{PRESENT_PREFIX}{layer}.{part}"),
+                    )
+                })
+            })
+            .collect();
+
+        let empty = || -> Result<DynValue> {
+            Ok(Tensor::from_array((
+                vec![1i64, self.shape.kv_heads, 0, self.shape.head_dim],
+                Vec::<f32>::new(),
+            ))
+            .context("could not build an empty key/value cache entry")?
+            .into_dyn())
+        };
+        let mut cache: Vec<DynValue> = names
+            .iter()
+            .map(|_| empty())
+            .collect::<Result<Vec<_>>>()?;
 
         let mut current: Vec<f32> = prompt_embeds.to_vec();
         let mut current_len = prompt_len;
@@ -281,7 +299,7 @@ impl OnnxVlm {
 
             let embeds = Tensor::from_array((
                 vec![1i64, current_len as i64, hidden as i64],
-                current.clone(),
+                std::mem::take(&mut current),
             ))
             .context("could not build the decoder input embeddings")?;
             feed.push((INPUTS_EMBEDS.into(), SessionInputValue::from(embeds)));
@@ -299,42 +317,49 @@ impl OnnxVlm {
                 feed.push((POSITION_IDS.into(), SessionInputValue::from(tensor)));
             }
 
-            for (name, data, shape) in &past {
-                let tensor = Tensor::from_array((shape.clone(), data.clone()))
-                    .context("could not rebuild a key/value cache entry")?;
-                feed.push((name.clone().into(), SessionInputValue::from(tensor)));
+            for ((past, _), value) in names.iter().zip(cache.drain(..)) {
+                feed.push((past.clone().into(), SessionInputValue::from(value)));
             }
 
-            let outputs = self
+            let mut outputs = self
                 .decoder
                 .run(feed)
                 .with_context(|| format!("the decoder failed at step {step}"))?;
 
-            let (logits_shape, logits) = outputs["logits"]
-                .try_extract_tensor::<f32>()
-                .context("the decoder returned logits this build cannot read")?;
-            let vocab = *logits_shape
-                .last()
-                .context("the decoder's logits have no vocabulary dimension")?
-                as usize;
-            anyhow::ensure!(vocab > 0, "the decoder reported an empty vocabulary");
-            let last = &logits[logits.len() - vocab..];
-
-            let (id, logprob) = greedy(last);
+            let (id, logprob) = {
+                let (logits_shape, logits) = outputs["logits"]
+                    .try_extract_tensor::<f32>()
+                    .context("the decoder returned logits this build cannot read")?;
+                let vocab = *logits_shape
+                    .last()
+                    .context("the decoder's logits have no vocabulary dimension")?
+                    as usize;
+                anyhow::ensure!(vocab > 0, "the decoder reported an empty vocabulary");
+                if step == 0 {
+                    // Whether prefill projects every position into the whole
+                    // vocabulary, or only the last one, is a property of the
+                    // export and decides how much of this run is discarded.
+                    tracing::debug!(
+                        prefill_positions = current_len,
+                        logits_shape = ?logits_shape,
+                        logits_values = logits.len(),
+                        "decoder prefill logits"
+                    );
+                }
+                greedy(&logits[logits.len() - vocab..])
+            };
             produced.push(DecodedToken { id, logprob });
             on_token(produced.len());
 
             // Carry `present` back into `past` before the outputs are dropped.
-            let mut next_past = Vec::with_capacity(past.len());
-            for (name, _, _) in &past {
-                let present = format!("{PRESENT_PREFIX}{}", &name[PAST_PREFIX.len()..]);
-                let (shape, data) = outputs[present.as_str()]
-                    .try_extract_tensor::<f32>()
-                    .with_context(|| format!("the decoder did not return {present}"))?;
-                next_past.push((name.clone(), data.to_vec(), shape.iter().copied().collect()));
+            for (past, present) in &names {
+                cache.push(
+                    outputs
+                        .remove(present.as_str())
+                        .with_context(|| format!("the decoder did not return {present} for {past}"))?,
+                );
             }
             drop(outputs);
-            past = next_past;
 
             if stop(id) {
                 break;
