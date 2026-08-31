@@ -25,6 +25,8 @@ import type {
   AddOutcome,
   CitationResult,
   IntegrationStatus,
+  ManifestSummary,
+  ProbeReport,
   MatchRef,
   DocumentMetadata,
   EmbedderCapabilityManifest,
@@ -451,6 +453,39 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw new Error(`openAlexLookup failed: ${res.status}`);
     return res.json() as Promise<OpenAlexWork>;
+  }
+
+  async customIntegrationSummary(manifest: string): Promise<ManifestSummary> {
+    const res = await fetch("/api/integrations/custom/summary", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ manifest }),
+    });
+    if (!res.ok) throw new Error(`customIntegrationSummary failed: ${res.status}`);
+    return res.json() as Promise<ManifestSummary>;
+  }
+
+  async customIntegrationProbe(
+    manifest: string,
+    secrets: Record<string, string>,
+  ): Promise<ProbeReport> {
+    const res = await fetch("/api/integrations/custom/probe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ manifest, secrets }),
+    });
+    if (!res.ok) throw new Error(`customIntegrationProbe failed: ${res.status}`);
+    return res.json() as Promise<ProbeReport>;
+  }
+
+  async customIntegrationStatus(id: string): Promise<IntegrationStatus> {
+    const res = await fetch("/api/integrations/custom/status", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    if (!res.ok) throw new Error(`customIntegrationStatus failed: ${res.status}`);
+    return res.json() as Promise<IntegrationStatus>;
   }
 
   resolveAssetUrl(path: string): string {

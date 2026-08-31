@@ -829,10 +829,74 @@ export interface OpenAlexSettings {
   email: string | null;
 }
 
+/** One provider the user described rather than one Wilkes compiled.
+ *  The manifest is kept as written — it is the document the user edits and
+ *  exports; everything else about the provider is derived from parsing it. */
+export interface CustomIntegrationConfig {
+  id: string;
+  enabled: boolean;
+  /** TOML or JSON manifest source. */
+  manifest: string;
+  /** Values for the secrets the manifest names. Held beside the manifest and
+   *  never inside it, so exporting cannot leak a credential. */
+  secrets: Record<string, string>;
+}
+
 export interface IntegrationsSettings {
   zotero: ZoteroSettings;
   semantic_scholar: SemanticScholarSettings;
   openalex: OpenAlexSettings;
+  custom?: CustomIntegrationConfig[];
+}
+
+/** What a draft manifest declares, shown before anything is saved: importing
+ *  one is an egress decision, so the host it will contact is named up front. */
+export interface ManifestSummary {
+  id: string;
+  name: string;
+  host: string | null;
+  capabilities: string[];
+  required_secrets: string[];
+  /** Empty when valid. Every problem at once, never just the first. */
+  problems: string[];
+}
+
+/** One field of one record a manifest could not map. */
+export interface ProjectionIssue {
+  record: number;
+  field: string;
+  selector: string;
+  problem: string;
+}
+
+/** What one run of a capability produced. A manifest may only be enabled once
+ *  this comes back `ok`. */
+export interface ProbeReport {
+  id: string;
+  capability: string;
+  /** The URL requested, with secret parameter values replaced. */
+  request_url: string;
+  raw_response: string;
+  results: LiteratureSearchResult[];
+  issues: ProjectionIssue[];
+  ok: boolean;
+  error: string | null;
+}
+
+/** Provider-neutral result of an external literature search. */
+export interface LiteratureSearchResult {
+  id: string;
+  doi: string | null;
+  title: string | null;
+  year: number | null;
+  publication_date: string | null;
+  venue: string | null;
+  citation_count: number;
+  is_open_access: boolean;
+  pdf_url: string | null;
+  landing_page_url: string | null;
+  open_access_status: string | null;
+  license: string | null;
 }
 
 export type MetadataSourcePreference = "file" | "zotero" | "semantic_scholar" | "openalex";

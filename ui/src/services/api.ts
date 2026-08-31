@@ -25,6 +25,8 @@ import type {
   AddOutcome,
   CitationResult,
   IntegrationStatus,
+  ManifestSummary,
+  ProbeReport,
   MatchRef,
   DocumentMetadata,
   EmbedderCapabilityManifest,
@@ -146,6 +148,16 @@ export interface SearchApi {
   semanticScholarLookup(doi: string): Promise<SemanticScholarPaper>;
   openAlexStatus(): Promise<IntegrationStatus>;
   openAlexLookup(doi: string): Promise<OpenAlexWork>;
+  /** What a draft manifest declares, including the one host it will contact.
+   *  Offline: nothing is requested and nothing is saved. */
+  customIntegrationSummary(manifest: string): Promise<ManifestSummary>;
+  /** Run a draft manifest's search capability once against the real service
+   *  and report what was mapped, what was not, and why. */
+  customIntegrationProbe(
+    manifest: string,
+    secrets: Record<string, string>,
+  ): Promise<ProbeReport>;
+  customIntegrationStatus(id: string): Promise<IntegrationStatus>;
   /** A URL this application will serve a local file at, whatever the file is:
    *  the PDF a reader loads, and the pictures an HTML document sits beside. */
   resolveAssetUrl(path: string): string;
