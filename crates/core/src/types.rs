@@ -2467,6 +2467,36 @@ pub struct IntegrationsSettings {
     pub semantic_scholar: SemanticScholarSettings,
     #[serde(default)]
     pub openalex: OpenAlexSettings,
+    /// Providers the user described rather than ones Wilkes compiled.
+    ///
+    /// Here, and not in a table of their own, because a provider must reach
+    /// every consumer that already receives settings — the MCP server is
+    /// handed an `IntegrationsSettings` by value and can reach no database —
+    /// and a second configuration channel for the same question is exactly the
+    /// duplication this feature exists to remove.
+    #[serde(default)]
+    pub custom: Vec<CustomIntegrationConfig>,
+}
+
+/// One stored custom integration.
+///
+/// The manifest is kept as the user wrote it, comments and formatting intact,
+/// because it is the document they edit and export; everything else about the
+/// provider is derived from parsing it. `id` is stored alongside so a manifest
+/// that fails to parse can still be named in an error message, and the two are
+/// required to agree when the manifest is saved.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CustomIntegrationConfig {
+    pub id: String,
+    #[serde(default)]
+    pub enabled: bool,
+    /// TOML or JSON manifest source. See
+    /// `wilkes_core::integrations::custom::manifest`.
+    pub manifest: String,
+    /// Values for the secrets the manifest names. Held beside the manifest and
+    /// never inside it, so exporting a manifest cannot leak a credential.
+    #[serde(default)]
+    pub secrets: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

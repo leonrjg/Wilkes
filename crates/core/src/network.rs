@@ -1,9 +1,27 @@
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::RETRY_AFTER;
+use reqwest::header::{CONTENT_LENGTH, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
+
+/// How long a single provider request may take, end to end.
+///
+/// Explicit because `reqwest`'s default is no timeout at all: a provider that
+/// accepts a connection and then never answers would otherwise hold the
+/// request — and, for a search the user is waiting on, the UI — forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap on a single provider response body.
+///
+/// Enforced twice, like `acquire::MAX_DOWNLOAD_BYTES`: against the advertised
+/// `Content-Length` before reading, and against the bytes actually received,
+/// because a server may under-report the header or omit it entirely. A
+/// provider answer is metadata about at most a few hundred records; anything
+/// past this is a misconfigured URL pointed at a bulk dump, and reading it
+/// into memory is the failure, not the symptom of one.
+const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct RetryPolicy {
@@ -24,7 +42,10 @@ impl RetryPolicy {
 
 #[derive(Clone)]
 pub struct ProviderHttpClient {
-    provider: &'static str,
+    /// Owned rather than `&'static str` because a custom integration's name
+    /// comes from a manifest the user wrote at runtime. Built-in providers
+    /// still pass a literal and pay one allocation per client.
+    provider: Arc<str>,
     http: reqwest::Client,
     retry: RetryPolicy,
 }
@@ -37,11 +58,15 @@ pub enum ProviderHttpErrorKind {
     Http,
     Request,
     Decode,
+    /// The body exceeded [`MAX_RESPONSE_BYTES`]. Not `Decode`: nothing was
+    /// wrong with the bytes, there were simply too many of them, and retrying
+    /// would fetch the same too-many again.
+    TooLarge,
 }
 
 #[derive(Debug)]
 pub struct ProviderHttpError {
-    pub provider: &'static str,
+    pub provider: Arc<str>,
     pub kind: ProviderHttpErrorKind,
     pub status: Option<StatusCode>,
     pub message: String,
@@ -64,10 +89,18 @@ impl fmt::Display for ProviderHttpError {
 impl std::error::Error for ProviderHttpError {}
 
 impl ProviderHttpClient {
-    pub fn new(provider: &'static str) -> Self {
+    pub fn new(provider: impl Into<Arc<str>>) -> Self {
         Self {
-            provider,
-            http: reqwest::Client::new(),
+            provider: provider.into(),
+            http: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_else(|error| {
+                    // Only fails when the TLS backend cannot initialise, which
+                    // is fatal for every provider call this client would make.
+                    tracing::error!("provider HTTP client build failed: {error}");
+                    reqwest::Client::new()
+                }),
             retry: RetryPolicy::conservative(),
         }
     }
@@ -92,14 +125,85 @@ impl ProviderHttpClient {
         url: String,
         headers: &[(&str, String)],
     ) -> Result<T, ProviderHttpError> {
-        let response = self.send_with_retry(url, headers).await?;
-        response.json::<T>().await.map_err(|e| ProviderHttpError {
-            provider: self.provider,
+        let body = self.get_bytes(url, headers).await?;
+        serde_json::from_slice::<T>(&body).map_err(|e| ProviderHttpError {
+            provider: self.provider.clone(),
             kind: ProviderHttpErrorKind::Decode,
             status: None,
             message: e.to_string(),
             retry_after: None,
         })
+    }
+
+    /// The raw response body, bounded by [`MAX_RESPONSE_BYTES`].
+    ///
+    /// Public because a custom integration's probe shows the user the bytes a
+    /// service actually returned next to what Wilkes made of them; that is the
+    /// whole point of the probe, and it cannot be done from a decoded `T`.
+    pub async fn get_bytes(
+        &self,
+        url: String,
+        headers: &[(&str, String)],
+    ) -> Result<Vec<u8>, ProviderHttpError> {
+        let response = self.send_with_retry(url, headers).await?;
+        self.read_bounded(response).await
+    }
+
+    /// Read a body, refusing one that is — or claims to be — over the cap.
+    ///
+    /// Streamed rather than `bytes()` so an over-long body is abandoned at the
+    /// chunk that crosses the line. Reading it whole and then measuring it
+    /// would have already done the damage the cap exists to prevent.
+    async fn read_bounded(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<Vec<u8>, ProviderHttpError> {
+        if let Some(advertised) = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
+            if advertised > MAX_RESPONSE_BYTES {
+                return Err(self.too_large(advertised));
+            }
+        }
+
+        let mut response = response;
+        let mut body: Vec<u8> = Vec::new();
+        loop {
+            let chunk = response.chunk().await.map_err(|e| ProviderHttpError {
+                provider: self.provider.clone(),
+                kind: ProviderHttpErrorKind::Request,
+                status: None,
+                message: e.to_string(),
+                retry_after: None,
+            })?;
+            let Some(chunk) = chunk else { break };
+            if body.len() as u64 + chunk.len() as u64 > MAX_RESPONSE_BYTES {
+                return Err(self.too_large(body.len() as u64 + chunk.len() as u64));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    fn too_large(&self, bytes: u64) -> ProviderHttpError {
+        tracing::warn!(
+            provider = %self.provider,
+            bytes,
+            limit = MAX_RESPONSE_BYTES,
+            "provider response exceeds the size cap"
+        );
+        ProviderHttpError {
+            provider: self.provider.clone(),
+            kind: ProviderHttpErrorKind::TooLarge,
+            status: None,
+            message: format!(
+                "response of {bytes} bytes exceeds the {MAX_RESPONSE_BYTES} byte limit"
+            ),
+            retry_after: None,
+        }
     }
 
     async fn send_with_retry(
@@ -133,7 +237,7 @@ impl ProviderHttpClient {
                 Err(error) => {
                     if attempt >= attempts {
                         return Err(ProviderHttpError {
-                            provider: self.provider,
+                            provider: self.provider.clone(),
                             kind: ProviderHttpErrorKind::Request,
                             status: None,
                             message: error.to_string(),
@@ -161,7 +265,7 @@ impl ProviderHttpClient {
     async fn sleep_before_retry(&self, attempt: usize, retry_after: Option<Duration>) {
         let delay = retry_after.unwrap_or_else(|| self.backoff_delay(attempt));
         tracing::debug!(
-            provider = self.provider,
+            provider = %self.provider,
             attempt,
             delay_ms = delay.as_millis(),
             "retrying provider request"
@@ -189,7 +293,7 @@ impl ProviderHttpClient {
             _ => ProviderHttpErrorKind::Http,
         };
         ProviderHttpError {
-            provider: self.provider,
+            provider: self.provider.clone(),
             kind,
             status: Some(status),
             message: body,
