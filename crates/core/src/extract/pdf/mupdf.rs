@@ -1050,6 +1050,74 @@ mod tests {
         assert!((image.bbox.y - 120.0).abs() < 1.0, "{:?}", image.bbox);
     }
 
+    /// The pixels are not stored, so serving a figure means finding it again
+    /// in the document it came from. The ids are positional, so "finding it
+    /// again" is the same walk under the same flags — and the digest recorded
+    /// at extraction is what proves the walk landed on the same picture.
+    #[test]
+    fn a_retained_figure_re_derives_to_the_pixels_that_were_analyzed() {
+        use crate::types::RetainedImage;
+
+        let dir = tempdir().unwrap();
+        let path = write_pdf(dir.path(), "image.pdf", IMAGE_PDF_BASE64);
+        let content = MuPdfBackend::default().extract(&path).expect("extracts");
+        let retained = RetainedImage::of(&content.images[0]);
+        assert!(
+            !retained.image_sha256.is_empty(),
+            "the fixture's image decodes, so it has a digest to check against"
+        );
+
+        let rendered = crate::figure::render_figure(&path, &retained, None).expect("re-derives");
+        assert_eq!(
+            (rendered.source_width, rendered.source_height),
+            (retained.pixel_width, retained.pixel_height),
+            "the same picture, at the size it was analyzed"
+        );
+        assert_eq!(&rendered.png[1..4], b"PNG");
+
+        // A digest that does not match is a refusal, not a fallback: it means
+        // the source and the rendition have come apart, and the wrong picture
+        // is worse than none.
+        let tampered = RetainedImage {
+            image_sha256: "0".repeat(64),
+            ..retained.clone()
+        };
+        let error = crate::figure::render_figure(&path, &tampered, None)
+            .expect_err("a mismatch is refused");
+        assert!(
+            error.to_string().contains("come apart"),
+            "unexpected error: {error}"
+        );
+
+        // An id this document does not draw is the same kind of mistake, and
+        // is reported rather than answered with a neighbouring picture.
+        let absent = RetainedImage {
+            id: "p9-i9".to_string(),
+            ..retained.clone()
+        };
+        assert!(crate::figure::render_figure(&path, &absent, None).is_err());
+    }
+
+    /// Downscaling happens after the digest is checked, so a caller asking for
+    /// a smaller copy still gets one the rendition can vouch for.
+    #[test]
+    fn a_max_edge_shrinks_the_copy_and_not_the_check() {
+        use crate::types::RetainedImage;
+
+        let dir = tempdir().unwrap();
+        let path = write_pdf(dir.path(), "image.pdf", IMAGE_PDF_BASE64);
+        let content = MuPdfBackend::default().extract(&path).expect("extracts");
+        let retained = RetainedImage::of(&content.images[0]);
+
+        let rendered = crate::figure::render_figure(&path, &retained, Some(2)).expect("renders");
+        assert_eq!(rendered.width.max(rendered.height), 2);
+        assert_eq!(
+            (rendered.source_width, rendered.source_height),
+            (retained.pixel_width, retained.pixel_height),
+            "and still reports what it verified"
+        );
+    }
+
     /// The transform is what turns a position inside the image into a
     /// position on the page. Checked at the corners, because a flip that put
     /// the first pixel row at the bottom would still produce a plausible
