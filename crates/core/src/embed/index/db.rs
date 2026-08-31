@@ -11,11 +11,14 @@ use tracing::error;
 
 use crate::consumer::{consumer_error, ConsumerErrorCode};
 use crate::extract::ExtractorRegistry;
+#[cfg(test)]
+use crate::figure::FigureRelation;
+use crate::figure::{self, FigureLink};
 use crate::metadata::cache::FileIdentity;
 use crate::types::{
     BoundingBox, ByteRange, ChunkTopicMember, EmbeddingEngine, FileType, IndexStatus,
-    IndexingConfig, ReadingRegion, RelatedDocument, RetainedExtraction, SourceMap, SourceOrigin,
-    SourceSegment, SupersededArea, RETAINED_EXTRACTION_VERSION,
+    IndexingConfig, ReadingRegion, RelatedDocument, RetainedExtraction, RetainedImage, SourceMap,
+    SourceOrigin, SourceSegment, SupersededArea, RETAINED_EXTRACTION_VERSION,
 };
 use crate::{consumer_bail, consumer_ensure};
 
@@ -1658,6 +1661,142 @@ mod tests {
         assert_eq!(filtered[0].entry.path, canon(&far));
     }
 
+    /// A passage is linked to the pictures drawn in it, by arithmetic over the
+    /// reading and nothing else. The one with no analysis links exactly as the
+    /// described one does, which is the whole point of anchoring every image.
+    #[test]
+    fn figures_link_to_the_passages_they_were_drawn_into() {
+        fn figure(id: &str, anchor: usize, range: Option<(usize, usize)>) -> RetainedImage {
+            RetainedImage {
+                id: id.to_string(),
+                page: 1,
+                origin: crate::types::RegionOrigin::Embedded,
+                bbox: BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                },
+                transform: crate::types::ImageTransform {
+                    a: 1.0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: 1.0,
+                    e: 0.0,
+                    f: 0.0,
+                },
+                pixel_width: 10,
+                pixel_height: 10,
+                image_sha256: format!("{id}-digest"),
+                reading_range: range.map(|(start, end)| ByteRange { start, end }),
+                reading_anchor: Some(anchor),
+                status: crate::types::ImageAnalysisStatus::Complete,
+                has_description: range.is_some(),
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("managed_sources");
+        fs::create_dir_all(&root).unwrap();
+        let document = root.join("document.txt");
+        fs::write(&document, "east north").unwrap();
+        let mut index =
+            SemanticIndex::create(dir.path(), "m", 2, EmbeddingEngine::Candle, Some(&root))
+                .unwrap();
+
+        // Two passages, tiling a ten-byte reading: "east" then "north".
+        let mut first = test_chunk(&document, "east");
+        first.byte_range = ByteRange { start: 0, end: 5 };
+        let mut second = test_chunk(&document, "north");
+        second.byte_range = ByteRange { start: 5, end: 10 };
+
+        let managed = index
+            .write_file_with_recipe(
+                PreparedFile {
+                    retained: RetainedExtraction {
+                        images: Some(vec![
+                            // Drawn inside the first passage, nothing established
+                            // about it — no range, and it links all the same.
+                            figure("p1-i0", 2, None),
+                            // Its enrichment block *is* the second passage.
+                            figure("p1-i1", 5, Some((5, 10))),
+                            // Off the end of both.
+                            figure("p1-i2", 400, None),
+                        ]),
+                        ..Default::default()
+                    },
+                    path: document.clone(),
+                    full_text: "east north".to_string(),
+                    chunks: vec![(first, vec![3.0, 0.0]), (second, vec![0.0, 4.0])],
+                },
+                &ExtractionRecipe::new(100, 0),
+                Some(Path::new("managed_sources/document.txt")),
+                None,
+                true,
+                false,
+                Some("job-figures"),
+            )
+            .unwrap();
+
+        let refs: Vec<ChunkRef> = managed
+            .chunks
+            .iter()
+            .map(|chunk| chunk.chunk_ref.clone())
+            .collect();
+        let linked = index.figures_for_chunk_refs(&refs, 0).unwrap();
+        assert_eq!(linked.len(), 2);
+        assert!(linked.iter().all(|entry| entry.inventory_known));
+
+        let first = &linked[0];
+        assert_eq!(
+            first
+                .figures
+                .iter()
+                .map(|f| (f.image.id.as_str(), f.link.relation))
+                .collect::<Vec<_>>(),
+            vec![
+                ("p1-i0", FigureRelation::DrawnIn),
+                ("p1-i1", FigureRelation::DrawnIn),
+            ],
+            "the undescribed picture drawn inside it, and the one anchored at \
+             its closing edge — a zero-width point on a seam is in both passages"
+        );
+
+        let second = &linked[1];
+        assert_eq!(
+            second
+                .figures
+                .iter()
+                .map(|f| (f.image.id.as_str(), f.link.relation))
+                .collect::<Vec<_>>(),
+            vec![("p1-i1", FigureRelation::Block)],
+            "the passage that *is* an enrichment block says so, rather than \
+             reporting the weaker relation it also satisfies"
+        );
+
+        // The far figure needs a window, and says how far it is when asked.
+        let widened = index.figures_for_chunk_refs(&refs[..1], 500).unwrap();
+        let far = widened[0]
+            .figures
+            .iter()
+            .find(|f| f.image.id == "p1-i2")
+            .expect("in reach of a 500-byte window");
+        assert_eq!(far.link.relation, FigureRelation::Near);
+        assert_eq!(far.link.byte_distance, 395);
+
+        // And the pixels of one of them are addressable by any passage of the
+        // document, without the caller holding a path.
+        let source = index
+            .figure_source(FigureDocument::Chunk(&refs[0]), "p1-i1")
+            .unwrap()
+            .expect("the inventory holds it");
+        assert_eq!(
+            source.managed_snapshot_relative_path.as_deref(),
+            Some("managed_sources/document.txt"),
+            "served from the immutable snapshot, not from wherever the file went"
+        );
+    }
+
     #[test]
     fn managed_refs_resolve_and_aggregate_without_exposing_rowids() {
         let dir = tempdir().unwrap();
@@ -3084,6 +3223,51 @@ pub struct TopicChunkData {
     pub extraction_byte_range: ByteRange,
     pub origin: SourceOrigin,
     pub embedding: Vec<f32>,
+}
+
+/// The figures one passage bears on, and how.
+#[derive(Clone, Debug)]
+pub struct ChunkFigures {
+    pub chunk_ref: ChunkRef,
+    /// Whether this passage's rendition has an image inventory at all.
+    ///
+    /// `false` is *unknown* — a rendition retained before inventories existed
+    /// — and a consumer must not read the empty list beside it as "this
+    /// passage draws nothing". Re-extracting the document is what settles it.
+    pub inventory_known: bool,
+    pub figures: Vec<LinkedFigure>,
+}
+
+/// One figure, with its bearing on the passage that asked.
+#[derive(Clone, Debug)]
+pub struct LinkedFigure {
+    pub image: RetainedImage,
+    pub link: FigureLink,
+}
+
+/// Where a figure's pixels are to be found, for a caller that wants them.
+#[derive(Clone, Debug)]
+pub struct FigureSource {
+    /// The immutable snapshot when the corpus retained one, relative to the
+    /// data directory; the caller resolves it, being the one that knows where
+    /// that is. Preferred over `file_path` because it cannot have been edited
+    /// since the rendition was built.
+    pub managed_snapshot_relative_path: Option<String>,
+    /// The path as indexed. The only address for an ordinary workspace file,
+    /// and the fallback for a managed one imported before snapshots.
+    pub file_path: PathBuf,
+    pub image: RetainedImage,
+}
+
+/// How a caller names the document a figure belongs to.
+///
+/// Two spellings because two consumers exist: a managed consumer holds chunk
+/// refs and no path at all, and the export surface is addressed by root and
+/// path. Both name one file row.
+#[derive(Clone, Copy, Debug)]
+pub enum FigureDocument<'a> {
+    Path(&'a Path),
+    Chunk(&'a ChunkRef),
 }
 
 /// Stable, vector-free passage export used by managed-corpus consumers.
@@ -7192,6 +7376,183 @@ impl SemanticIndex {
             );
         }
         Ok(found)
+    }
+
+    /// The figures each of these passages bears on, strongest relation first
+    /// and nearest first within a relation.
+    ///
+    /// One retained extraction is read per document rather than per passage:
+    /// the passages of one weave are usually the same handful of books, and
+    /// the linking itself is arithmetic over ranges already in hand.
+    ///
+    /// `window` is bytes of slack outside the passage — zero, the default the
+    /// pipeline ships, admits only the figures a passage contains.
+    pub fn figures_for_chunk_refs(
+        &self,
+        refs: &[ChunkRef],
+        window: usize,
+    ) -> anyhow::Result<Vec<ChunkFigures>> {
+        let wanted: HashSet<ChunkRef> = refs.iter().cloned().collect();
+        self.resolve_chunk_refs(&wanted)?;
+
+        const REFS_PER_QUERY: usize = 300;
+        let unique: Vec<ChunkRef> = wanted.into_iter().collect();
+        let mut located: HashMap<ChunkRef, (i64, ByteRange)> = HashMap::with_capacity(unique.len());
+        for batch in unique.chunks(REFS_PER_QUERY) {
+            let placeholders = vec!["?"; batch.len()].join(",");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT chunk_ref, file_id, byte_start, byte_end
+                 FROM chunks WHERE chunk_ref IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(
+                params_from_iter(batch.iter().map(ChunkRef::as_str)),
+                |row| {
+                    Ok((
+                        ChunkRef(row.get(0)?),
+                        row.get::<_, i64>(1)?,
+                        ByteRange {
+                            start: row.get::<_, i64>(2)? as usize,
+                            end: row.get::<_, i64>(3)? as usize,
+                        },
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (chunk_ref, file_id, range) = row?;
+                located.insert(chunk_ref, (file_id, range));
+            }
+        }
+
+        let mut retained_by_file: HashMap<i64, RetainedExtraction> = HashMap::new();
+        let mut out = Vec::with_capacity(refs.len());
+        // In the order asked, and once per ref even if the caller repeated one.
+        for chunk_ref in refs {
+            let Some((file_id, range)) = located.get(chunk_ref) else {
+                continue;
+            };
+            let retained = match retained_by_file.get(file_id) {
+                Some(retained) => retained,
+                None => {
+                    let loaded = self.retained_extraction_for_file(*file_id)?;
+                    retained_by_file.entry(*file_id).or_insert(loaded)
+                }
+            };
+            let mut figures: Vec<LinkedFigure> = retained
+                .images
+                .iter()
+                .flatten()
+                .filter_map(|image| {
+                    figure::link(image, range, window).map(|link| LinkedFigure {
+                        image: image.clone(),
+                        link,
+                    })
+                })
+                .collect();
+            // Strongest relation first, nearest first within one, then by id
+            // so a tie is not decided by hash order.
+            figures.sort_by(|a, b| {
+                a.link
+                    .relation
+                    .cmp(&b.link.relation)
+                    .then(a.link.byte_distance.cmp(&b.link.byte_distance))
+                    .then(a.image.id.cmp(&b.image.id))
+            });
+            out.push(ChunkFigures {
+                chunk_ref: chunk_ref.clone(),
+                inventory_known: retained.images.is_some(),
+                figures,
+            });
+        }
+        Ok(out)
+    }
+
+    /// One document's image inventory, in reading order, with no passage in
+    /// the question. `None` when the index does not hold this file at all —
+    /// which is a different answer from a file whose inventory is unknown.
+    pub fn figures_for_path(
+        &self,
+        path: &Path,
+    ) -> anyhow::Result<Option<(bool, Vec<RetainedImage>)>> {
+        let key = self.path_key_for_known_path(path);
+        let file_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM files WHERE file_path = ?1",
+                params![key.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(file_id) = file_id else {
+            return Ok(None);
+        };
+        let retained = self.retained_extraction_for_file(file_id)?;
+        Ok(Some((
+            retained.images.is_some(),
+            retained.images.unwrap_or_default(),
+        )))
+    }
+
+    /// Where to find the pixels of one figure of one document.
+    ///
+    /// The document is named either by path or by any passage of it, because
+    /// a managed consumer holds chunk refs and never a path. Both resolve to
+    /// the same file row, and the answer says where its bytes are rather than
+    /// reading them: this layer holds the index, not the data directory the
+    /// snapshot sits under.
+    pub fn figure_source(
+        &self,
+        document: FigureDocument<'_>,
+        area_id: &str,
+    ) -> anyhow::Result<Option<FigureSource>> {
+        let file_id = match document {
+            FigureDocument::Path(path) => {
+                let key = self.path_key_for_known_path(path);
+                self.conn
+                    .query_row(
+                        "SELECT id FROM files WHERE file_path = ?1",
+                        params![key.to_string_lossy()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+            }
+            FigureDocument::Chunk(chunk_ref) => self
+                .conn
+                .query_row(
+                    "SELECT file_id FROM chunks WHERE chunk_ref = ?1",
+                    params![chunk_ref.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?,
+        };
+        let Some(file_id) = file_id else {
+            return Ok(None);
+        };
+
+        let Some(image) = self
+            .retained_extraction_for_file(file_id)?
+            .images
+            .unwrap_or_default()
+            .into_iter()
+            .find(|image| image.id == area_id)
+        else {
+            return Ok(None);
+        };
+
+        let (file_path, managed_snapshot_relative_path) = self.conn.query_row(
+            "SELECT file_path, managed_snapshot_relative_path FROM files WHERE id = ?1",
+            params![file_id],
+            |row| {
+                Ok((
+                    PathBuf::from(row.get::<_, String>(0)?),
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )?;
+        Ok(Some(FigureSource {
+            managed_snapshot_relative_path,
+            file_path,
+            image,
+        }))
     }
 
     pub fn managed_chunks_for_refs(

@@ -807,6 +807,126 @@ pub struct FileChunkExport {
     pub chunks: Vec<ExportedChunk>,
 }
 
+// ── Figures ──────────────────────────────────────────────────────────────────
+
+/// One picture a document draws, as a consumer that may want to see it needs
+/// it described: where it is, how big it is, and what it must hash to.
+///
+/// Placement, never the annotation. The transcription and the description are
+/// already in the exported text at the position the page drew the image, and
+/// repeating them here would be a second copy of bytes the consumer already
+/// holds. `has_description` says whether that prose exists without restating
+/// it.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ExportedFigure {
+    /// `p{page}-i{ordinal}`, the id extraction assigned. What the pixel
+    /// endpoint is addressed by.
+    pub area_id: String,
+    pub page: u32,
+    pub origin: wilkes_core::types::RegionOrigin,
+    pub bbox: wilkes_core::types::BoundingBox,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    /// Digest of the decoded pixels. Empty for an image a technical limit
+    /// stopped before it was decoded — which is also an image whose pixels
+    /// cannot be served.
+    pub image_sha256: String,
+    /// Where this figure's enrichment block landed in the reading, when one
+    /// was written.
+    pub reading_range: Option<wilkes_core::types::ByteRange>,
+    /// Where the picture itself sits in the reading. Absent only for a
+    /// rendition extracted before anchors existed.
+    pub reading_anchor: Option<usize>,
+    pub has_description: bool,
+    pub status: wilkes_core::types::ImageAnalysisStatus,
+}
+
+impl From<wilkes_core::types::RetainedImage> for ExportedFigure {
+    fn from(image: wilkes_core::types::RetainedImage) -> Self {
+        Self {
+            area_id: image.id,
+            page: image.page,
+            origin: image.origin,
+            bbox: image.bbox,
+            pixel_width: image.pixel_width,
+            pixel_height: image.pixel_height,
+            image_sha256: image.image_sha256,
+            reading_range: image.reading_range,
+            reading_anchor: image.reading_anchor,
+            has_description: image.has_description,
+            status: image.status,
+        }
+    }
+}
+
+/// One document's pictures, in reading order.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FileFigureExport {
+    pub file_path: PathBuf,
+    /// Whether this rendition has an image inventory at all. `false` means
+    /// *unknown* — it was retained before inventories existed — and an empty
+    /// `figures` beside it must not be read as "this document draws nothing".
+    /// Re-indexing the document settles it.
+    pub inventory_known: bool,
+    pub figures: Vec<ExportedFigure>,
+}
+
+/// One figure, and what it has to do with the passage that asked.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LinkedFigureExport {
+    #[serde(flatten)]
+    pub figure: ExportedFigure,
+    /// `block` — the passage is this figure's enrichment text; `drawn_in` —
+    /// the picture sits inside the passage; `near` — it is outside but within
+    /// the window the request asked for.
+    pub relation: wilkes_core::figure::FigureRelation,
+    /// Bytes between the picture and the passage, zero when it is inside.
+    pub byte_distance: usize,
+}
+
+/// The figures of one passage, strongest relation first.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ChunkFigureExport {
+    pub chunk_ref: String,
+    pub inventory_known: bool,
+    pub figures: Vec<LinkedFigureExport>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ChunkFigureResolution {
+    pub embedding_space_id: Option<String>,
+    pub chunks: Vec<ChunkFigureExport>,
+}
+
+/// How a pixel request names its document.
+#[derive(Clone, Debug)]
+pub enum FigureAddress {
+    /// A library root and a path under it, as the export surface is addressed.
+    File { root: PathBuf, path: PathBuf },
+    /// Any passage of the document, as a managed consumer holds it.
+    Chunk(ChunkRef),
+}
+
+/// One figure's pixels, ready to be served.
+pub struct FigurePixelsExport {
+    pub bytes: Vec<u8>,
+    pub media_type: &'static str,
+    pub width: u32,
+    pub height: u32,
+    /// What the source decoded to before any downscale — the dimensions the
+    /// digest covers.
+    pub source_width: u32,
+    pub source_height: u32,
+    pub image_sha256: String,
+}
+
+/// The largest edge a figure may be asked for, in pixels.
+///
+/// Not a quality judgement: it caps the work one request can ask of a resize
+/// and the bytes one reply can weigh. Every model this feeds reads a picture
+/// far smaller than this.
+pub const MAX_FIGURE_EDGE: u32 = 4096;
+
 /// A document's declared structure, independent of its semantic-index state.
 ///
 /// Unlike [`FileChunkExport`], this deliberately carries the locators the
@@ -3004,6 +3124,192 @@ impl AppContext {
             outline,
             chunks,
         })
+    }
+
+    /// One document's pictures: where each sits, how big it is, and the digest
+    /// its pixels must match. No passage is involved — this is the browse half
+    /// of the figure surface, and `chunk_figures` is the half that links.
+    pub async fn export_file_figures(
+        &self,
+        root: PathBuf,
+        path: PathBuf,
+    ) -> Result<FileFigureExport, String> {
+        self.ensure_no_active_embed_task(
+            "Semantic index is currently being built. Please wait before exporting figures.",
+        )?;
+        let (_, path) = self.export_file_path(root, path, "Figure export").await?;
+
+        let index_arc = self.index.lock().clone();
+        let task_path = path.clone();
+        let (inventory_known, figures) = tokio::task::spawn_blocking(move || {
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+            let index = guard.as_ref().ok_or_else(|| {
+                "Semantic index unavailable. Build or restore the semantic index first.".to_string()
+            })?;
+            index
+                .figures_for_path(&task_path)
+                .map_err(|error| format!("Could not read the figure inventory: {error:#}"))?
+                .ok_or_else(|| {
+                    format!(
+                        "{} is not in this index; nothing can be said about its figures.",
+                        task_path.display()
+                    )
+                })
+        })
+        .await
+        .map_err(|error| format!("Figure export task panicked: {error}"))??;
+
+        Ok(FileFigureExport {
+            file_path: path,
+            inventory_known,
+            figures: figures.into_iter().map(ExportedFigure::from).collect(),
+        })
+    }
+
+    /// The figures these passages bear on.
+    ///
+    /// `window` is bytes of slack outside a passage, and defaults to none: a
+    /// widening is something the caller asks for, and the nearest figure has
+    /// first claim on a budget the caller is spending.
+    pub async fn chunk_figures(
+        &self,
+        refs: Vec<ChunkRef>,
+        window: usize,
+    ) -> Result<ChunkFigureResolution, ConsumerError> {
+        if refs.is_empty() {
+            return Err(ConsumerError::untyped("Figure request names no chunk refs"));
+        }
+        if refs.len() > MAX_RESOLVE_REFS {
+            return Err(ConsumerError::untyped(format!(
+                "Figure request names {} chunk refs; {MAX_RESOLVE_REFS} is the most one request \
+                 may ask for.",
+                refs.len(),
+            )));
+        }
+        let index_arc = self.index.lock().clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+            let index = guard
+                .as_ref()
+                .ok_or_else(|| "Managed index unavailable".to_string())?;
+            let linked = index
+                .figures_for_chunk_refs(&refs, window)
+                .map_err(|error| error.to_string())?;
+            Ok(ChunkFigureResolution {
+                embedding_space_id: Some(
+                    index
+                        .embedding_space_id()
+                        .map_err(|error| error.to_string())?
+                        .0,
+                ),
+                chunks: linked
+                    .into_iter()
+                    .map(|entry| ChunkFigureExport {
+                        chunk_ref: entry.chunk_ref.0,
+                        inventory_known: entry.inventory_known,
+                        figures: entry
+                            .figures
+                            .into_iter()
+                            .map(|linked| LinkedFigureExport {
+                                relation: linked.link.relation,
+                                byte_distance: linked.link.byte_distance,
+                                figure: ExportedFigure::from(linked.image),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+        })
+        .await
+        .map_err(|error| format!("Figure task panicked: {error}"))?
+    }
+
+    /// One figure's pixels, re-derived from the document the rendition was
+    /// extracted from and checked against the digest it recorded.
+    ///
+    /// The retained snapshot is preferred over the indexed path wherever the
+    /// corpus kept one: it is immutable, so it is still the document the
+    /// rendition was built from, which a workspace file on disk may no longer
+    /// be. When neither can be opened, or when what is there hashes to
+    /// something else, the request fails — a figure that is not the one that
+    /// was read is worse than no figure.
+    pub async fn figure_pixels(
+        &self,
+        address: FigureAddress,
+        area_id: String,
+        max_edge: Option<u32>,
+    ) -> Result<FigurePixelsExport, ConsumerError> {
+        if let Some(edge) = max_edge {
+            if edge == 0 || edge > MAX_FIGURE_EDGE {
+                return Err(ConsumerError::untyped(format!(
+                    "max_edge must be between 1 and {MAX_FIGURE_EDGE}; got {edge}"
+                )));
+            }
+        }
+        let address = match address {
+            FigureAddress::File { root, path } => {
+                let (_, path) = self
+                    .export_file_path(root, path, "Figure request")
+                    .await
+                    .map_err(ConsumerError::untyped)?;
+                FigureAddress::File {
+                    root: PathBuf::new(),
+                    path,
+                }
+            }
+            chunk => chunk,
+        };
+
+        let index_arc = self.index.lock().clone();
+        let data_dir = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+            let index = guard
+                .as_ref()
+                .ok_or_else(|| "Semantic index unavailable".to_string())?;
+
+            let document = match &address {
+                FigureAddress::File { path, .. } => {
+                    wilkes_core::embed::index::db::FigureDocument::Path(path.as_path())
+                }
+                FigureAddress::Chunk(chunk_ref) => {
+                    wilkes_core::embed::index::db::FigureDocument::Chunk(chunk_ref)
+                }
+            };
+            let source = index
+                .figure_source(document, &area_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!("This index holds no figure {area_id} for that document.")
+                })?;
+
+            let path = source
+                .managed_snapshot_relative_path
+                .as_ref()
+                .map(|relative| data_dir.join(relative))
+                .filter(|snapshot| snapshot.exists())
+                .unwrap_or(source.file_path);
+
+            let rendered = wilkes_core::figure::render_figure(&path, &source.image, max_edge)
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(FigurePixelsExport {
+                bytes: rendered.png,
+                media_type: "image/png",
+                width: rendered.width,
+                height: rendered.height,
+                source_width: rendered.source_width,
+                source_height: rendered.source_height,
+                image_sha256: source.image.image_sha256,
+            })
+        })
+        .await
+        .map_err(|error| format!("Figure render task panicked: {error}"))?
     }
 
     /// Every document Wilkes serves under one library root, each with the
