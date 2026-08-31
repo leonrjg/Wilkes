@@ -286,6 +286,8 @@ export interface SearchApi {
   ): Promise<() => void>;
 }
 
+export type PathKind = "directory" | "file";
+
 // Desktop: native directory picker.
 // Web: file upload returning a server-side root path.
 export interface SourceApi {
@@ -301,6 +303,8 @@ export interface DesktopSourceApi extends SourceApi {
   readClipboardFiles(): Promise<string[]>;
   moveFile(path: string, targetRoot: string): Promise<string>;
   listDirectories(path: string): Promise<string[]>;
+  /** Classify paths (in the order given) so a drop can route folders and files apart. */
+  pathKinds(paths: string[]): Promise<PathKind[]>;
   createDirectory(parent: string, name: string): Promise<string>;
 }
 

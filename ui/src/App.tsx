@@ -26,7 +26,7 @@ import { activeViewerTab, useViewerStore } from "./stores/useViewerStore";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
 import { api, source, isTauri } from "./services";
 import type { AgentBackend } from "./lib/types";
-import type { DesktopSourceApi, WebSourceApi } from "./services/api";
+import type { DesktopSourceApi, PathKind, WebSourceApi } from "./services/api";
 
 export default function App() {
   useGlobalEvents();
@@ -45,6 +45,7 @@ export default function App() {
   const favorites = useSettingsStore((s) => s.favorites);
   const recentDirs = useSettingsStore((s) => s.recentDirs);
   const setDirectory = useSettingsStore((s) => s.setDirectory);
+  const addRoots = useSettingsStore((s) => s.addRoots);
   const addFavorite = useSettingsStore((s) => s.addFavorite);
   const removeFavorite = useSettingsStore((s) => s.removeFavorite);
   const forgetDirectory = useSettingsStore((s) => s.forgetDirectory);
@@ -114,24 +115,57 @@ export default function App() {
       if (event.payload.type !== "drop") return;
       const paths = event.payload.paths;
       if (paths.length === 0) return;
-      if (!directory) {
-        addToast("Choose a directory before dropping files", { type: "error" });
-        return;
-      }
+      // Roots and imports both write through the workspace manifest, which the
+      // backend refuses to rewrite for a workspace another application owns.
       if (readOnly) {
         addToast("This workspace is read-only", { type: "error" });
         return;
       }
 
+      const desktopSource = source as DesktopSourceApi;
+      let kinds: PathKind[];
       try {
-        const imported = await (source as DesktopSourceApi).importFiles(paths, directory, "move");
-        refreshFileList();
-        addToast(`Imported ${imported.length} file${imported.length === 1 ? "" : "s"}`, {
-          type: "success",
-        });
+        kinds = await desktopSource.pathKinds(paths);
       } catch (e) {
-        console.error("Drop import failed:", e);
-        addToast(e instanceof Error ? e.message : "Import failed", { type: "error" });
+        console.error("Could not inspect dropped paths:", e);
+        addToast(e instanceof Error ? e.message : "Could not read dropped items", {
+          type: "error",
+        });
+        return;
+      }
+
+      const folders = paths.filter((_, i) => kinds[i] === "directory");
+      const files = paths.filter((_, i) => kinds[i] === "file");
+
+      // Files land in the root that was active when the drop happened, never in
+      // a folder the same drop is adding. The backend admits an import only
+      // into the current root, so the import has to run before the dropped
+      // folders are registered and one of them becomes active.
+      if (files.length > 0) {
+        if (!directory) {
+          addToast("Choose a directory before dropping files", { type: "error" });
+        } else {
+          try {
+            const imported = await desktopSource.importFiles(files, directory, "move");
+            refreshFileList();
+            addToast(`Imported ${imported.length} file${imported.length === 1 ? "" : "s"}`, {
+              type: "success",
+            });
+          } catch (e) {
+            console.error("Drop import failed:", e);
+            addToast(e instanceof Error ? e.message : "Import failed", { type: "error" });
+          }
+        }
+      }
+
+      if (folders.length > 0) {
+        addRoots(folders);
+        addToast(
+          folders.length === 1
+            ? `Added "${folders[0].split(/[/\\]/).pop() || folders[0]}" as a root`
+            : `Added ${folders.length} roots`,
+          { type: "success" },
+        );
       }
     }).then((u) => {
       if (disposed) u();
@@ -144,7 +178,7 @@ export default function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [addToast, directory, readOnly, refreshFileList]);
+  }, [addRoots, addToast, directory, readOnly, refreshFileList]);
 
   useEffect(() => {
     if (!isTauri) return;

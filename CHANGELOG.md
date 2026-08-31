@@ -4,6 +4,15 @@
 
 ### Added
 
+- Folders can be dropped onto the window to become library roots. A dropped
+  folder joins the root strip and becomes the active root, as if it had been
+  chosen through Open — previously a dropped folder was refused as an import,
+  and a drop that mixed folders with files imported nothing at all. A mixed drop
+  now does both, with the files landing in the root that was active when the
+  drop happened rather than in a folder the same drop is adding. A read-only
+  workspace still refuses both, since roots and imports are equally the
+  manifest's business.
+
 - A viewer tab's context menu closes documents. Close dismisses the tab that was
   right-clicked — not whichever one happens to be active — and Close All empties
   the tab strip; both sit below the file actions the menu already offered, which

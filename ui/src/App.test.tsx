@@ -7,8 +7,9 @@ import { useSemanticStore } from "./stores/useSemanticStore";
 import { useChatStore } from "./stores/useChatStore";
 import { useBookmarksStore } from "./stores/useBookmarksStore";
 import { useViewerStore } from "./stores/useViewerStore";
+import { useWorkspaceStore } from "./stores/useWorkspaceStore";
 import { ToastProvider } from "./components/Toast";
-import { source } from "./services";
+import { api, source } from "./services";
 
 // Mock services and hooks at top level
 vi.mock("./services", () => ({
@@ -62,16 +63,31 @@ vi.mock("./services", () => ({
     type: "desktop",
     pickDirectory: vi.fn(),
     importFiles: vi.fn(() => Promise.resolve([])),
+    pathKinds: vi.fn(() => Promise.resolve([])),
     readClipboardFiles: vi.fn(() => Promise.resolve([])),
   },
   isTauri: true,
 }));
 
+const dropHandlers: ((event: { payload: { type: string; paths: string[] } }) => unknown)[] = [];
+
 vi.mock("@tauri-apps/api/webview", () => ({
   getCurrentWebview: vi.fn(() => ({
-    onDragDropEvent: vi.fn(() => Promise.resolve(() => {})),
+    onDragDropEvent: vi.fn((handler) => {
+      dropHandlers.push(handler);
+      return Promise.resolve(() => {});
+    }),
   })),
 }));
+
+/** Deliver a native drop to the handler App registered. */
+async function drop(paths: string[]) {
+  const handler = dropHandlers[dropHandlers.length - 1];
+  expect(handler).toBeDefined();
+  await act(async () => {
+    await handler({ payload: { type: "drop", paths } });
+  });
+}
 
 vi.mock("./hooks/useTauriEvents", () => ({ useTauriEvents: vi.fn() }));
 vi.mock("@leonrjg/wilkes-reader", async (importOriginal) => ({
@@ -92,6 +108,7 @@ const viewerSessionActions = {
 describe("App", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    dropHandlers.length = 0;
     localStorage.clear();
     useSettingsStore.setState({
       load: vi.fn().mockResolvedValue(undefined),
@@ -331,6 +348,98 @@ describe("App", () => {
       );
       expect(refreshFileList).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it("adds a dropped folder as a root instead of importing it", async () => {
+    const addRoots = vi.fn();
+    useSettingsStore.setState({ addRoots });
+    vi.mocked(source.pathKinds).mockResolvedValueOnce(["directory"]);
+
+    render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>
+    );
+
+    await drop(["/external/library"]);
+
+    expect(addRoots).toHaveBeenCalledWith(["/external/library"]);
+    expect(source.importFiles).not.toHaveBeenCalled();
+  });
+
+  it("adds a dropped folder as a root when no directory is open yet", async () => {
+    const addRoots = vi.fn();
+    useSettingsStore.setState({ addRoots, directory: "" });
+    vi.mocked(source.pathKinds).mockResolvedValueOnce(["directory"]);
+
+    render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>
+    );
+
+    await drop(["/external/library"]);
+
+    expect(addRoots).toHaveBeenCalledWith(["/external/library"]);
+  });
+
+  it("imports dropped files into the previously active root before adding dropped folders", async () => {
+    const addRoots = vi.fn();
+    const refreshFileList = vi.fn();
+    useSettingsStore.setState({ addRoots, refreshFileList });
+    vi.mocked(source.pathKinds).mockResolvedValueOnce(["file", "directory"]);
+    vi.mocked(source.importFiles).mockResolvedValueOnce(["/test/dir/paper.pdf"]);
+
+    render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>
+    );
+
+    await drop(["/external/paper.pdf", "/external/library"]);
+
+    expect(source.importFiles).toHaveBeenCalledWith(
+      ["/external/paper.pdf"],
+      "/test/dir",
+      "move",
+    );
+    expect(addRoots).toHaveBeenCalledWith(["/external/library"]);
+    expect(vi.mocked(source.importFiles).mock.invocationCallOrder[0]).toBeLessThan(
+      addRoots.mock.invocationCallOrder[0],
+    );
+    expect(refreshFileList).toHaveBeenCalled();
+  });
+
+  it("refuses a drop into a read-only workspace", async () => {
+    const addRoots = vi.fn();
+    useSettingsStore.setState({ addRoots });
+    vi.mocked(api.listWorkspaces).mockResolvedValueOnce({
+      active_workspace_id: "workspace-1",
+      workspaces: [
+        {
+          id: "workspace-1",
+          name: "Default",
+          roots: [],
+          active_root: "/test/dir",
+          read_only: true,
+        },
+      ],
+    } as any);
+
+    await act(async () => {
+      render(
+        <ToastProvider>
+          <App />
+        </ToastProvider>
+      );
+    });
+    await waitFor(() => expect(useWorkspaceStore.getState().workspaces).toHaveLength(1));
+
+    await drop(["/external/library"]);
+
+    expect(source.pathKinds).not.toHaveBeenCalled();
+    expect(addRoots).not.toHaveBeenCalled();
+    expect(source.importFiles).not.toHaveBeenCalled();
   });
 
   it("leaves ordinary text paste alone", async () => {

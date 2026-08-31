@@ -2091,6 +2091,32 @@ async fn list_directories(path: String) -> Result<Vec<String>, String> {
     Ok(directories)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum PathKind {
+    Directory,
+    File,
+}
+
+/// Classify dropped paths so the UI can tell a folder (a candidate root) from a
+/// file (a candidate import) before it commits to either. Symlinks are followed
+/// so a link to a folder classifies as one.
+#[tauri::command]
+async fn path_kinds(paths: Vec<String>) -> Result<Vec<PathKind>, String> {
+    let mut kinds = Vec::with_capacity(paths.len());
+    for path in paths {
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .map_err(|error| format!("Could not inspect {path}: {error}"))?;
+        kinds.push(if metadata.is_dir() {
+            PathKind::Directory
+        } else {
+            PathKind::File
+        });
+    }
+    Ok(kinds)
+}
+
 #[tauri::command]
 async fn get_file_metadata(path: String, app: AppHandle) -> Result<DocumentMetadata, String> {
     get_file_metadata_for_path(app_context(&app), path).await
@@ -2793,6 +2819,7 @@ pub fn run() {
             move_file,
             create_directory,
             list_directories,
+            path_kinds,
             trash_file,
             get_file_metadata,
             get_python_info,
@@ -3232,6 +3259,36 @@ mod tests {
         assert_eq!(renamed, renamed_path.display().to_string());
         assert!(!outside.exists());
         assert_eq!(std::fs::read_to_string(renamed_path).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn test_path_kinds_classifies_folders_and_files() {
+        let dir = tempdir().unwrap();
+        let folder = dir.path().join("library");
+        std::fs::create_dir(&folder).unwrap();
+        let file = dir.path().join("paper.pdf");
+        std::fs::write(&file, "pdf").unwrap();
+
+        let kinds = path_kinds(vec![
+            file.display().to_string(),
+            folder.display().to_string(),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(kinds, vec![PathKind::File, PathKind::Directory]);
+    }
+
+    #[tokio::test]
+    async fn test_path_kinds_reports_a_missing_path() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("gone.pdf");
+
+        let error = path_kinds(vec![missing.display().to_string()])
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("Could not inspect"), "{error}");
     }
 
     #[tokio::test]
