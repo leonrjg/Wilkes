@@ -4343,6 +4343,32 @@ impl AppContext {
             .await
     }
 
+    /// What a draft manifest declares. Takes no settings: a manifest being
+    /// considered has not been saved, and reading it must not depend on
+    /// whether it ever is.
+    pub fn custom_integration_summary(
+        &self,
+        manifest: String,
+    ) -> crate::commands::integrations::custom::ManifestSummary {
+        crate::commands::integrations::custom::custom_integration_summary(manifest)
+    }
+
+    pub async fn custom_integration_probe(
+        &self,
+        manifest: String,
+        secrets: std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<wilkes_core::integrations::custom::ProbeReport> {
+        crate::commands::integrations::custom::custom_integration_probe(manifest, secrets).await
+    }
+
+    pub async fn custom_integration_status(
+        &self,
+        id: String,
+    ) -> anyhow::Result<wilkes_core::types::IntegrationStatus> {
+        let s = self.get_settings().await;
+        crate::commands::integrations::custom::custom_integration_status(s, id).await
+    }
+
     /// Authoritative document metadata: file-based extraction overridden by the
     /// Zotero library record when the file resolves to an item. This is the
     /// single owner of that composition — both the on-open viewer and the

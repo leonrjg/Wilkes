@@ -1696,6 +1696,54 @@ async fn openalex_lookup_handler(
     Ok(Json(work))
 }
 
+#[derive(serde::Deserialize)]
+struct ManifestBody {
+    manifest: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ProbeBody {
+    manifest: String,
+    #[serde(default)]
+    secrets: std::collections::HashMap<String, String>,
+}
+
+#[derive(serde::Deserialize)]
+struct IntegrationIdBody {
+    id: String,
+}
+
+async fn custom_integration_summary_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ManifestBody>,
+) -> Json<wilkes_api::commands::integrations::custom::ManifestSummary> {
+    Json(state.context().custom_integration_summary(body.manifest))
+}
+
+async fn custom_integration_probe_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ProbeBody>,
+) -> Result<Json<wilkes_core::integrations::custom::ProbeReport>, (StatusCode, Json<ErrorBody>)> {
+    let report = state
+        .context()
+        .custom_integration_probe(body.manifest, body.secrets)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(report))
+}
+
+async fn custom_integration_status_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<IntegrationIdBody>,
+) -> Result<Json<IntegrationStatus>, (StatusCode, Json<ErrorBody>)> {
+    let status = state
+        .context()
+        .custom_integration_status(body.id)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(status))
+}
+
 async fn resolve_file_metadata_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<OpenFileBody>,
@@ -2202,6 +2250,18 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/integrations/openalex/lookup",
             post(openalex_lookup_handler),
+        )
+        .route(
+            "/api/integrations/custom/summary",
+            post(custom_integration_summary_handler),
+        )
+        .route(
+            "/api/integrations/custom/probe",
+            post(custom_integration_probe_handler),
+        )
+        .route(
+            "/api/integrations/custom/status",
+            post(custom_integration_status_handler),
         )
         .route("/api/embed/ready", get(is_semantic_ready_handler))
         .route("/api/embed/text", post(embed_text_handler))
