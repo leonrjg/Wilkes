@@ -697,7 +697,10 @@ pub fn analyze(
                 pixel_width,
                 pixel_height,
                 image_sha256: found.digest(),
+                // Both offsets are into a reading that does not exist yet.
+                // `render` writes them, being the one place the text is built.
                 reading_range: None,
+                reading_anchor: None,
                 ocr_regions: Vec::new(),
                 description: None,
                 analyzer_identity: String::new(),

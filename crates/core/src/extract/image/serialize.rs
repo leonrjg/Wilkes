@@ -359,6 +359,7 @@ mod tests {
             pixel_height: 499,
             image_sha256: "digest".into(),
             reading_range: None,
+            reading_anchor: None,
             ocr_regions: regions,
             description: description.map(|description| ImageDescription {
                 description: description.to_string(),

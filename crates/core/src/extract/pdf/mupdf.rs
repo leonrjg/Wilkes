@@ -1044,6 +1044,46 @@ mod tests {
         assert_eq!(diagnostics.native_images_analyzed, 0);
     }
 
+    /// An image nothing was established about still has a place in the
+    /// reading. Discovery is the page's geometry, not a recognizer's opinion,
+    /// so the anchor is written whether or not a byte was — it is what links
+    /// the picture to the passage it was drawn into.
+    #[test]
+    fn an_unanalyzed_image_is_still_anchored_where_the_page_drew_it() {
+        let dir = tempdir().unwrap();
+        let path = write_pdf(dir.path(), "image.pdf", IMAGE_PDF_BASE64);
+
+        let content = MuPdfBackend::default().extract(&path).expect("extracts");
+        let image = &content.images[0];
+
+        assert!(
+            image.reading_range.is_none(),
+            "nothing was written for this image"
+        );
+        let anchor = image
+            .reading_anchor
+            .expect("but the page still drew it somewhere");
+        assert!(
+            anchor <= content.text.len() && content.text.is_char_boundary(anchor),
+            "anchor {anchor} is not a position in a {}-byte reading",
+            content.text.len()
+        );
+
+        let above = content
+            .text
+            .find("Above the picture")
+            .expect("the fixture sets text above the image");
+        let caption = content
+            .text
+            .find("Figure 1: a caption")
+            .expect("and a caption below it");
+        assert!(
+            above < anchor && anchor <= caption,
+            "the anchor should fall between the text above the picture ({above}) \
+             and the caption below it ({caption}), got {anchor}"
+        );
+    }
+
     /// Enrichment is written where the page drew the picture — between the
     /// line above it and the caption below — and not after the text that
     /// looks like a caption, because no caption was looked for.
