@@ -59,8 +59,10 @@ exists, is extracting it:
 #[async_trait]
 pub trait LiteratureSource: Send + Sync {
     fn id(&self) -> &str;
+    fn name(&self) -> &str;
     async fn search(&self, query: &str, limit: usize)
         -> anyhow::Result<Vec<LiteratureSearchResult>>;
+    async fn status(&self, enabled: bool) -> anyhow::Result<IntegrationStatus>;
 }
 ```
 
@@ -129,10 +131,13 @@ name = "Crossref"
 [http]
 base_url = "https://api.crossref.org"
 
-[http.auth]                       # kind = none | header | query
-kind = "header"
+# Identification sent on every request. `value` travels with the manifest;
+# `secret` is only a name, whose value is stored separately — see §7. Exactly
+# one of the two per param.
+[[http.params]]
+location = "header"               # header | query
 name = "Crossref-Plus-API-Token"
-secret_ref = "crossref_token"     # a name, never a value — see §7
+secret = "crossref_token"
 
 [capabilities.health]
 path = "/works/10.1145/3801158"
@@ -153,8 +158,8 @@ pdf_url        = { first_of = ["link[0].URL", "resource.primary.URL"] }
 
 Three rules keep this a description rather than a program:
 
-**Templates are typed substitution, never concatenation.** `{query}`,
-`{limit}`, `{doi}` are the only placeholders; the engine owns percent-encoding,
+**Templates are typed substitution, never concatenation.** `{query}` and
+`{limit}` are the placeholders `search` supplies (`health` supplies none); the engine owns percent-encoding,
 so a manifest author cannot produce an injection and cannot forget to encode.
 An unknown placeholder, or one the capability does not supply, is a save-time
 error. The host and scheme come from `base_url` and are fixed at save time —
@@ -216,14 +221,18 @@ document they edit and share. `update_settings` is the one choke point that
 refuses a manifest it cannot load back, so the registry's load-time drop can
 never happen to something the user was not told about.
 
-**Secrets are referenced, never contained.** `secret_ref` names a value stored
+**Secrets are referenced, never contained.** `secret` names a value stored
 separately (settings/keychain). A manifest is therefore safe to export, paste
 in a bug report, and share; importing one never carries a credential, and a
 secret is only ever sent to the host its own manifest declares.
 
 **Importing is an egress decision.** A manifest is a description of who Wilkes
 will talk to, authored by whoever handed over the file. Import shows the host
-and the capabilities before saving. All traffic goes through
+and the capabilities before saving — `custom_integration_summary`, which reads
+the manifest and touches neither the network nor the settings file. The host is
+pinned twice over: validation refuses a path that does not start with `/`, which
+is what stops `@evil.test/` from being read as userinfo, and `request` re-parses
+the assembled URL and refuses one whose origin has moved. All traffic goes through
 `ProviderHttpClient`, so retry, backoff, `Retry-After`, and rate-limit
 classification are inherited rather than reimplemented — plus a response size
 cap and timeout, which the built-in path should gain at the same time.
