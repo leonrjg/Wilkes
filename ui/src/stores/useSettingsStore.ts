@@ -69,6 +69,7 @@ interface SettingsStore {
   resetForWorkspace: () => void;
   load: () => Promise<void>;
   setDirectory: (dir: string) => void;
+  addRoots: (dirs: string[]) => void;
   addFavorite: (dir: string) => void;
   removeFavorite: (dir: string) => void;
   forgetDirectory: (dir: string) => void;
@@ -181,6 +182,28 @@ export const useSettingsStore = create<SettingsStore>()(
       } else {
         set({ directory: dir, recentDirs: next });
       }
+    },
+
+    /**
+     * Register several directories as library roots in one write, activating
+     * the last of them. `setDirectory` covers the single-root case; this exists
+     * for a drop that carries more than one folder, where per-folder writes
+     * would race each other's `recent_dirs`.
+     */
+    addRoots: (dirs: string[]) => {
+      const fresh = Array.from(new Set(dirs.filter(Boolean)));
+      if (fresh.length === 0) return;
+      const { recentDirs, directory } = get();
+      const next = [
+        ...recentDirs,
+        ...fresh.filter((dir) => !recentDirs.includes(dir)),
+      ].slice(-10);
+      const active = fresh[fresh.length - 1];
+      api.updateSettings({ last_directory: active, recent_dirs: next }).catch(() => {});
+      set({ directory: active, recentDirs: next });
+      // Subscription only fires on value change; refresh explicitly when the
+      // active root is one the workspace already had open.
+      if (active === directory) get().refreshFileList();
     },
 
     addFavorite: (dir: string) => {

@@ -141,6 +141,35 @@ describe("useSettingsStore", () => {
     });
   });
 
+  it("registers several dropped roots in one write and activates the last", async () => {
+    (api.updateSettings as any).mockResolvedValue({});
+    (api.listFiles as any).mockResolvedValue({ files: [], omitted: [] });
+    useSettingsStore.setState({ recentDirs: ["/existing"], directory: "/existing" });
+
+    useSettingsStore.getState().addRoots(["/dropped/one", "/existing", "/dropped/two"]);
+
+    const state = useSettingsStore.getState();
+    expect(state.directory).toBe("/dropped/two");
+    expect(state.recentDirs).toEqual(["/existing", "/dropped/one", "/dropped/two"]);
+    expect(api.updateSettings).toHaveBeenCalledTimes(1);
+    expect(api.updateSettings).toHaveBeenCalledWith({
+      last_directory: "/dropped/two",
+      recent_dirs: ["/existing", "/dropped/one", "/dropped/two"],
+    });
+  });
+
+  it("refreshes the file list when a dropped root is already the active one", async () => {
+    (api.updateSettings as any).mockResolvedValue({});
+    (api.listFiles as any).mockResolvedValue({ files: [], omitted: [] });
+    useSettingsStore.setState({ recentDirs: ["/existing"], directory: "/existing" });
+
+    useSettingsStore.getState().addRoots(["/existing"]);
+    await Promise.resolve();
+
+    expect(useSettingsStore.getState().recentDirs).toEqual(["/existing"]);
+    expect(api.listFiles).toHaveBeenCalled();
+  });
+
   it("should load file list reactively when directory changes", async () => {
     const mockFile = { path: "/dir/file.ts", size_bytes: 10, file_type: "PlainText", extension: "ts" };
     (api.updateSettings as any).mockResolvedValue({});

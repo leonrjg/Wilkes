@@ -70,7 +70,7 @@ import type {
   RecognizerInventory,
 } from "../lib/types";
 import { randomId } from "../lib/types";
-import type { SearchApi, DesktopSourceApi, DataPaths } from "./api";
+import type { SearchApi, DesktopSourceApi, DataPaths, PathKind } from "./api";
 
 export class TauriSearchApi implements SearchApi {
   async getStartupStatus(): Promise<StartupStatus> {
@@ -606,6 +606,10 @@ export class TauriSourceApi implements DesktopSourceApi {
 
   async listDirectories(path: string): Promise<string[]> {
     return invoke<string[]>("list_directories", { path });
+  }
+
+  async pathKinds(paths: string[]): Promise<PathKind[]> {
+    return invoke<PathKind[]>("path_kinds", { paths });
   }
 
   async createDirectory(parent: string, name: string): Promise<string> {
