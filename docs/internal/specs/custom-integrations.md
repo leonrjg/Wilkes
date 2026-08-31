@@ -1,6 +1,7 @@
 # Custom integrations — Design
 
-Status: proposed, nothing implemented
+Status: implemented for `search`, `health`, and the UI. §9's exclusions stand.
+Two decisions changed under implementation and are marked **revised** below.
 Depends on: `core/src/integrations`, `core/src/network::ProviderHttpClient`,
 `Settings.integrations`, `agent/src/mcp.rs::literature_search`
 Premise: the mapping from a service's JSON to our result types is the feature.
@@ -76,8 +77,13 @@ custom providers onto the enum, we have built the second mechanism that
 `IntegrationRegistry::default()` builds a `Vec` of built-ins at construction and
 is never consulted for search or citations. It becomes the single owner:
 
-- Built from built-ins **plus enabled manifests**, rebuilt whenever settings or
-  manifests change, held behind an `RwLock` in `AppContext`.
+- **Revised: derived, not held.** The plan was an `RwLock` in `AppContext`
+  rebuilt on change. Implementation showed that unnecessary and worse: the MCP
+  server is handed an `IntegrationsSettings` *by value* and can reach no shared
+  state, and a registry is a pure function of settings. `from_settings` builds
+  one on demand, so there is no window in which it disagrees with settings and
+  no invalidation to forget. It allocates the same small clients the previous
+  code allocated per request anyway.
 - Indexed by id, not iterated by position.
 - Typed lookups: `literature(id) -> Option<&dyn LiteratureSource>`,
   `citations(id)`, `catalogue(id)`. A provider that declares no search
@@ -199,12 +205,16 @@ of the whole search — that classification lives in one place in the engine.
 
 ## 7. Storage, secrets, trust
 
-**Manifests are documents, so they live like documents.** A
-`custom_integrations` table (`id`, `manifest`, `manifest_version`, `revision`,
-`enabled`, timestamps) next to `smart_collections`, not a field on
-`IntegrationsSettings` — that struct is a fixed record of named built-ins, and
-growing a `Vec` on it would put a user-editable, revisioned, importable
-document inside the app's static configuration.
+**Revised: manifests live in settings, not in a table of their own.** The plan
+was a `custom_integrations` table beside `smart_collections`. That breaks on the
+consumer that matters most: the MCP server receives an `IntegrationsSettings`
+by value and has no database handle, so a table would have needed a second
+channel to reach it — the exact duplication this feature exists to remove.
+`IntegrationsSettings.custom` is a `Vec<CustomIntegrationConfig>`, and the
+manifest is stored as the user wrote it, comments and all, because it is the
+document they edit and share. `update_settings` is the one choke point that
+refuses a manifest it cannot load back, so the registry's load-time drop can
+never happen to something the user was not told about.
 
 **Secrets are referenced, never contained.** `secret_ref` names a value stored
 separately (settings/keychain). A manifest is therefore safe to export, paste
@@ -252,24 +262,45 @@ ids so the agent is told what it may actually name.
 - **Writes.** §7.
 - **Non-JSON responses.** No XML, no HTML scraping. A provider that does not
   serve JSON is a Rust client.
+- **Boolean combination**, found by §10 rather than foreseen. OpenAlex's
+  `is_open_access` is `open_access.is_oa || best_oa_location.is_oa`, and
+  `first_of` is *first present*, not *or*. The divergence is pinned by
+  `divergence_on_a_disjunction` rather than papered over: closing it means a
+  combinator in the vocabulary, which is a decision to take deliberately if a
+  second case appears.
 
 ## 10. Proof that the abstraction is right
 
-Reimplement the *search* capability of OpenAlex and Semantic Scholar as
-manifests and run them against the existing `mockito` fixtures in
-`openalex/client.rs` and `semantic_scholar/client.rs`. If the engine does not
-produce byte-identical `LiteratureSearchResult`s from those exact response
-bodies, the projection vocabulary is wrong and it is cheaper to learn that
-before the UI exists than after. The built-ins stay Rust regardless — they do
-more than search — but their search path is the test case.
+Done, in `custom/mod.rs`'s tests. Both providers' search paths, re-expressed as
+manifests, are run against the same mock server as the Rust clients and asserted
+equal record for record. The vocabulary held everywhere except the one case in
+§9's last bullet, which is exactly what the exercise was for. The built-ins stay
+Rust — they do more than search — but their search path is the test case.
 
 ## 11. Order of work
 
-1. Extract `LiteratureSource`; make `literature_search` a registry lookup.
-   *No new capability yet, and the enum is gone in the same change.*
-2. Make `IntegrationRegistry` runtime state in `AppContext` with typed lookups.
-3. Manifest schema, parser, selector/coercion engine, projection — with §10 as
-   its test suite.
-4. Storage, secret refs, import/export.
-5. Probe command; wire it to enablement.
-6. Schema-driven `IntegrationsPanel`; migrate the three built-in forms onto it.
+1. ~~Extract `LiteratureSource`; make `literature_search` a registry lookup.~~
+   Done; the enum went in the same change.
+2. ~~`IntegrationRegistry` with typed lookups.~~ Done, derived rather than held
+   — see §4.
+3. ~~Manifest schema, parser, selector/coercion engine, projection.~~ Done,
+   with §10 as its test suite.
+4. ~~Storage, secret refs, export.~~ Done — see §7. Export is *copy the
+   manifest*: secrets are stored separately, so the text is already safe to
+   share, and no file dialog is involved.
+5. ~~Probe command; wire it to enablement.~~ Done.
+6. **Not done: schema-driven `IntegrationsPanel`.** Custom integrations render
+   through their own component; Zotero, Semantic Scholar and OpenAlex are still
+   three hand-written forms. The Rust duplication this feature set out to remove
+   is gone, and the TypeScript duplication that §8 also named is not. That is
+   pre-existing duplication left in place, not new duplication introduced — but
+   it is the open half of §8, and the fourth built-in provider will still cost a
+   fourth hand-written form.
+
+## 12. Also changed on the way
+
+`ProviderHttpClient` had no request timeout (reqwest's default is none) and no
+response size cap. Both now exist, the cap enforced against the advertised
+`Content-Length` and again against the bytes actually streamed. The built-in
+providers wanted these anyway; a manifest that can point the client at any path
+its host serves made them required.
