@@ -6,7 +6,7 @@ use mupdf::{DestinationKind, Document, MetadataName, TextPageFlags};
 use tracing::{info, trace, warn};
 
 use crate::extract::image::{
-    self, AnalysisContext, DiscoveredImage, ImageAnalyzer, NativeTextOnPage,
+    self, AnalysisContext, DiscoveredImage, ImageAnalyzer, NativeImage, NativeTextOnPage,
 };
 use crate::types::{
     BoundingBox, DeclaredOutline, ExtractedContent, ExtractedImage, ExtractionDiagnostics,
@@ -706,6 +706,70 @@ fn flush(line: &mut Line, word_chars: &mut String, bbox: &mut Option<BoundingBox
         text: std::mem::take(word_chars),
         bbox: bbox.take(),
     });
+}
+
+/// The pixels of one embedded image, found again in the document it came from.
+///
+/// The ids extraction assigns are positional — `p{page}-i{ordinal}`, where the
+/// ordinal counts image blocks across the document in the order the pages draw
+/// them — so finding one again is the same walk under the same flags, counting
+/// the same blocks. It deliberately reuses [`discover_image`] rather than
+/// reimplementing the decode: an id resolved by one rule and decoded by
+/// another would be a picture nobody could check.
+///
+/// `None` when the walk ends without that id, which means the document is not
+/// the one the rendition was extracted from. The caller has a digest and can
+/// say so; this function does not guess.
+pub fn decode_embedded_image(path: &Path, area_id: &str) -> anyhow::Result<Option<NativeImage>> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?;
+    let doc = Document::open(path_str)?;
+    let page_count = doc.page_count()?;
+
+    let mut ordinal = 0usize;
+    for index in 0..page_count {
+        let page = doc.load_page(index)?;
+        // The same flags discovery used. ACCURATE_BBOXES does not change which
+        // blocks arrive, but PRESERVE_IMAGES decides whether any image blocks
+        // do at all, and the ordinals are a count of them.
+        let text_page =
+            page.to_text_page(TextPageFlags::ACCURATE_BBOXES | TextPageFlags::PRESERVE_IMAGES)?;
+        for block in text_page.blocks() {
+            if block.r#type() != TextBlockType::Image {
+                continue;
+            }
+            let Some(found) = discover_image(&block, index as u32 + 1, ordinal) else {
+                continue;
+            };
+            ordinal += 1;
+            if found.id != area_id {
+                continue;
+            }
+            if let Some(reason) = found.rejected {
+                anyhow::bail!("image {area_id} cannot be decoded: {reason}");
+            }
+            return Ok(found.decoded);
+        }
+    }
+    Ok(None)
+}
+
+/// Rasterize one area of one page, for a region the page typeset rather than
+/// embedded.
+///
+/// There is no block to find for these: the picture is the page's own drawing,
+/// and the bbox recorded at extraction is the whole address. Rendering it again
+/// is what produced the pixels in the first place.
+pub fn render_page_area(path: &Path, page: u32, bbox: &BoundingBox) -> anyhow::Result<NativeImage> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?;
+    let doc = Document::open(path_str)?;
+    anyhow::ensure!(page >= 1, "pages are 1-based; got {page}");
+    let loaded = doc.load_page(page as i32 - 1)?;
+    let (rendered, _) = typeset::render(&loaded, bbox)?;
+    Ok(rendered)
 }
 
 #[cfg(test)]

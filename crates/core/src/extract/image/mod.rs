@@ -137,16 +137,25 @@ pub struct DiscoveredImage {
     pub rejected: Option<String>,
 }
 
+/// The digest of decoded pixels: dimensions then samples, so two images of
+/// the same bytes at different shapes cannot collide.
+///
+/// One function because it is a contract, not a convenience. The annotation
+/// cache is addressed by this value and a re-derived picture is checked
+/// against it, so a second implementation drifting by a byte would look like
+/// every figure in the library having changed.
+pub fn digest_pixels(pixels: &image::RgbImage) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(pixels.width().to_le_bytes());
+    hasher.update(pixels.height().to_le_bytes());
+    hasher.update(pixels.as_raw());
+    format!("{:x}", hasher.finalize())
+}
+
 impl DiscoveredImage {
     pub fn digest(&self) -> String {
         match &self.decoded {
-            Some(decoded) => {
-                let mut hasher = Sha256::new();
-                hasher.update(decoded.pixels.width().to_le_bytes());
-                hasher.update(decoded.pixels.height().to_le_bytes());
-                hasher.update(decoded.pixels.as_raw());
-                format!("{:x}", hasher.finalize())
-            }
+            Some(decoded) => digest_pixels(&decoded.pixels),
             None => String::new(),
         }
     }

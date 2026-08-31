@@ -333,7 +333,7 @@ mod tests {
 
         // Add file to index manually first
         idx.write_file(crate::embed::index::db::PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: file_path.clone(),
             chunks: vec![(
@@ -376,7 +376,7 @@ mod tests {
         std::fs::write(&file_path, "content").unwrap();
 
         idx.write_file(crate::embed::index::db::PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: file_path.clone(),
             chunks: vec![(
@@ -455,7 +455,7 @@ mod tests {
         std::fs::write(&removed_path, "world").unwrap();
 
         idx.write_file(crate::embed::index::db::PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: removed_path.clone(),
             chunks: vec![(
@@ -607,7 +607,7 @@ mod tests {
         let old_path = dir.path().join("old.txt");
         std::fs::write(&old_path, "hello world").unwrap();
         idx.write_file(crate::embed::index::db::PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: old_path.clone(),
             chunks: vec![(
@@ -729,7 +729,7 @@ mod tests {
         let old_file = old_dir.join("paper.txt");
         std::fs::write(&old_file, "hello world").unwrap();
         idx.write_file(crate::embed::index::db::PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: old_file.clone(),
             chunks: vec![(

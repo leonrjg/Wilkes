@@ -979,7 +979,7 @@ pub struct SupersededArea {
 /// the extraction recipe computed, never anything derived at query time, and a
 /// stored shape under another [`RETAINED_EXTRACTION_VERSION`] is refused
 /// rather than guessed at.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RetainedExtraction {
     pub version: String,
     /// Areas whose glyph run the reading replaced.
@@ -1050,6 +1050,20 @@ impl RetainedImage {
             reading_anchor: image.reading_anchor,
             status: image.status.clone(),
             has_description: image.description.is_some(),
+        }
+    }
+}
+
+/// Nothing retained, under the current version — which is what a rendition
+/// that kept nothing looks like, and what an unreadable stored shape falls
+/// back to. `images: None` throughout: "nobody wrote an inventory" is the
+/// honest reading of both, and it is not "this document draws nothing".
+impl Default for RetainedExtraction {
+    fn default() -> Self {
+        Self {
+            version: RETAINED_EXTRACTION_VERSION.to_string(),
+            reading_regions: Vec::new(),
+            images: None,
         }
     }
 }

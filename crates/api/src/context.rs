@@ -7530,7 +7530,7 @@ mod tests {
             std::fs::write(&path, &text).unwrap();
             index
                 .write_file(wilkes_core::embed::index::db::PreparedFile {
-                    regions: Vec::new(),
+                    retained: Default::default(),
                     full_text: String::new(),
                     path: path.clone(),
                     chunks: vec![(
@@ -7700,7 +7700,7 @@ mod tests {
         index
             .write_file_with_recipe(
                 wilkes_core::embed::index::db::PreparedFile {
-                    regions: Vec::new(),
+                    retained: Default::default(),
                     full_text: String::new(),
                     path: document.clone(),
                     chunks,
@@ -7819,7 +7819,7 @@ mod tests {
         .unwrap();
         index
             .write_file(wilkes_core::embed::index::db::PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 full_text: String::new(),
                 path: indexed.clone(),
                 chunks: vec![(
@@ -7898,7 +7898,7 @@ mod tests {
         index
             .write_file_with_recipe(
                 wilkes_core::embed::index::db::PreparedFile {
-                    regions: Vec::new(),
+                    retained: Default::default(),
                     full_text: text.to_string(),
                     path: document.clone(),
                     chunks: vec![
@@ -8049,7 +8049,7 @@ mod tests {
             .collect();
         index
             .write_file(wilkes_core::embed::index::db::PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 full_text: String::new(),
                 path: document.clone(),
                 chunks,
@@ -8057,7 +8057,7 @@ mod tests {
             .unwrap();
         index
             .write_file(wilkes_core::embed::index::db::PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 full_text: String::new(),
                 path: other.clone(),
                 chunks: vec![(
@@ -8174,7 +8174,7 @@ mod tests {
         .collect();
         index
             .write_file(wilkes_core::embed::index::db::PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 full_text: String::new(),
                 path: source.clone(),
                 chunks: source_chunks,
@@ -8187,7 +8187,7 @@ mod tests {
         ] {
             index
                 .write_file(wilkes_core::embed::index::db::PreparedFile {
-                    regions: Vec::new(),
+                    retained: Default::default(),
                     full_text: String::new(),
                     path: path.clone(),
                     chunks: vec![(
@@ -8205,7 +8205,7 @@ mod tests {
         index.activate_root(&stale_root).unwrap();
         index
             .write_file(wilkes_core::embed::index::db::PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 full_text: String::new(),
                 path: stale_match.clone(),
                 chunks: vec![(
@@ -10875,7 +10875,7 @@ exit 0
         .unwrap();
         index
             .write_file(PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 path: pdf.clone(),
                 full_text: "alpha beta gamma".to_string(),
                 chunks: vec![(
@@ -11732,14 +11732,14 @@ exit 0
             origin: SourceOrigin::TextFile { line: 1, col: 1 },
         };
         idx.write_file(wilkes_core::embed::index::db::PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: source.clone(),
             chunks: vec![(chunk(&source, "source"), vec![1.0, 0.0])],
         })
         .unwrap();
         idx.write_file(wilkes_core::embed::index::db::PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: related.clone(),
             chunks: vec![(chunk(&related, "related"), vec![0.9, 0.1])],

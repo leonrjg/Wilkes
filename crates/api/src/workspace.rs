@@ -1996,7 +1996,7 @@ mod tests {
         index
             .write_file_with_recipe(
                 wilkes_core::embed::index::db::PreparedFile {
-                    regions: Vec::new(),
+                    retained: Default::default(),
                     path: path.to_path_buf(),
                     full_text: text.to_string(),
                     chunks: vec![(

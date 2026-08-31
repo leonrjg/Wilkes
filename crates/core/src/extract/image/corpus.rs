@@ -1476,7 +1476,7 @@ fn semantic_search_retrieves_the_enrichment_for_a_question_only_the_picture_answ
     assert!(chunks.len() > 1, "the document is more than one passage");
     index
         .write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: content.text.clone(),
             path: path.clone(),
             chunks: chunks
