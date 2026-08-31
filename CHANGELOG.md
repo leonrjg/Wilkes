@@ -4,6 +4,11 @@
 
 ### Added
 
+- A viewer tab's context menu closes documents. Close dismisses the tab that was
+  right-clicked — not whichever one happens to be active — and Close All empties
+  the tab strip; both sit below the file actions the menu already offered, which
+  every surface still shares.
+
 - HTML files are read rather than inspected. A `.html` or `.htm` document opens
   rendered, with the same source/rendered toggle Markdown has, the same
   remembered choice per document, the same find bar and zoom, and bookmarks,

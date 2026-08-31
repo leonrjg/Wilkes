@@ -116,6 +116,26 @@ describe("ViewerTabs", () => {
     expect(useViewerStore.getState().activeTabId).toBe("three");
   });
 
+  it("closes the right-clicked tab from the context menu", () => {
+    renderTabs();
+
+    fireEvent.contextMenu(screen.getByRole("tab", { name: "two.txt" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Close" }));
+
+    expect(useViewerStore.getState().tabs.map((tab) => tab.id)).toEqual(["one", "three"]);
+    expect(useViewerStore.getState().activeTabId).toBe("one");
+  });
+
+  it("closes every tab from the context menu", () => {
+    renderTabs();
+
+    fireEvent.contextMenu(screen.getByRole("tab", { name: "two.txt" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Close All" }));
+
+    expect(useViewerStore.getState().tabs).toEqual([]);
+    expect(useViewerStore.getState().activeTabId).toBeNull();
+  });
+
   it("pins another viewer tab into the active editor completion scope", () => {
     const editor = useEditorStore.getState();
     editor.ensureBuffer("/docs/one.txt", "Draft");

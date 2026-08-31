@@ -9,7 +9,7 @@ import { useChatStore } from "../stores/useChatStore";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useViewerStore } from "../stores/useViewerStore";
-import { ContextMenu, useContextMenu } from "./ContextMenu";
+import { ContextMenu, useContextMenu, type ContextMenuItem } from "./ContextMenu";
 import { DirectoryTree } from "./DirectoryTree";
 import { fileName } from "./DocumentEntryRow";
 import { useToasts } from "./Toast";
@@ -154,27 +154,43 @@ export function useFileContextMenu({ entryForPath }: UseFileContextMenuOptions =
     }
   };
 
-  const openFileMenu = (event: React.MouseEvent, target: ContextMenuTarget) => {
+  /**
+   * @param extraItems Surface-specific entries appended after the shared ones,
+   *   for actions that only exist where the menu was opened (closing a viewer
+   *   tab, for instance).
+   */
+  const openFileMenu = (
+    event: React.MouseEvent,
+    target: ContextMenuTarget,
+    extraItems: ContextMenuItem[] = [],
+  ) => {
     const settingsState = useSettingsStore.getState();
     const otherRoots = configuredLibraryRoots(settingsState).filter(
       (root) => !pathsEqual(root, dirName(target.path)),
     );
+    const sharedItems = buildFileContextMenuItems({
+      target,
+      api,
+      capabilities: { canOpenInFileManager: isTauri },
+      settings: settingsState.settings,
+      onToast,
+      onRenameRequest: openRenameDialog,
+      availableRoots: otherRoots,
+      onMoveRequest: (path) =>
+        setMoveTarget({ path, root: otherRoots[0] ?? "", roots: otherRoots }),
+      deletionKind: source.deletionKind,
+      onDeleteRequest: handleDeleteRequest,
+    });
     openMenu({
       event,
       target,
-      items: buildFileContextMenuItems({
-        target,
-        api,
-        capabilities: { canOpenInFileManager: isTauri },
-        settings: settingsState.settings,
-        onToast,
-        onRenameRequest: openRenameDialog,
-        availableRoots: otherRoots,
-        onMoveRequest: (path) =>
-          setMoveTarget({ path, root: otherRoots[0] ?? "", roots: otherRoots }),
-        deletionKind: source.deletionKind,
-        onDeleteRequest: handleDeleteRequest,
-      }),
+      items: [
+        ...sharedItems,
+        ...extraItems.map((item, index) => ({
+          ...item,
+          dividerBefore: index === 0 ? sharedItems.length > 0 : item.dividerBefore,
+        })),
+      ],
     });
   };
 

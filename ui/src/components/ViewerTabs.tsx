@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { X } from "react-feather";
+import { X, XSquare } from "react-feather";
 import { useViewerStore } from "../stores/useViewerStore";
 import { fileName } from "./DocumentEntryRow";
 import { useFileContextMenu } from "./FileContextMenu";
@@ -10,6 +10,7 @@ export default function ViewerTabs() {
   const activeTabId = useViewerStore((state) => state.activeTabId);
   const activateTab = useViewerStore((state) => state.activateTab);
   const closeTab = useViewerStore((state) => state.closeTab);
+  const closeAllTabs = useViewerStore((state) => state.clear);
   const { openFileMenu, fileMenu } = useFileContextMenu();
   const tabRefs = useRef(new Map<string, HTMLButtonElement>());
 
@@ -57,11 +58,28 @@ export default function ViewerTabs() {
             <div
               key={tab.id}
               onContextMenu={(event) =>
-                openFileMenu(event, {
-                  kind: "file",
-                  path: tab.path,
-                  open: () => activateTab(tab.id),
-                })}
+                openFileMenu(
+                  event,
+                  {
+                    kind: "file",
+                    path: tab.path,
+                    open: () => activateTab(tab.id),
+                  },
+                  [
+                    {
+                      id: "close-tab",
+                      label: "Close",
+                      icon: X,
+                      run: () => closeAndFocusNeighbor(tab.id, index),
+                    },
+                    {
+                      id: "close-all-tabs",
+                      label: "Close All",
+                      icon: XSquare,
+                      run: () => closeAllTabs(),
+                    },
+                  ],
+                )}
               className={[
                 "group flex h-9 min-w-[8rem] max-w-[14rem] flex-shrink-0 items-center border-r border-t-2 border-[var(--border-main)]",
                 active
