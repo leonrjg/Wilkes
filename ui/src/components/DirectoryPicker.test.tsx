@@ -98,10 +98,12 @@ describe("DirectoryPicker", () => {
     expect(defaultProps.onChange).toHaveBeenCalledWith("/home/user/other");
   });
 
-  it("calls onPickDirectory when Open folder is clicked", () => {
+  // Queried by its visible text rather than its accessible name: the Tooltip
+  // wrapper sets `aria-label` from its own content, so this button announces
+  // as the current directory path and not as "Open".
+  it("calls onPickDirectory when Open is clicked", () => {
     renderWithToasts();
-    const openFolder = screen.getByText("Open folder");
-    fireEvent.click(openFolder);
+    fireEvent.click(screen.getByText("Open"));
     expect(defaultProps.onPickDirectory).toHaveBeenCalled();
   });
 
