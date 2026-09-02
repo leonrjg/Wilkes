@@ -799,6 +799,14 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<RecognizerInventory>;
   }
 
+  async installLayoutDetector(): Promise<void> {
+    const res = await fetch("/api/image-analysis/install-detector", {
+      method: "POST",
+    });
+    if (!res.ok) throw await responseError(res, "installLayoutDetector");
+  }
+
+
   async installImageRecognizer(
     engine: RecognitionEngine,
     modelId: string,

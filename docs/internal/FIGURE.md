@@ -71,8 +71,10 @@ it does not reconstruct complex layouts.
 - ~~Native vector tables and formulas — content MuPDF draws rather than
   embeds.~~ **In scope as of 2026-08-29**; see "Phase 3 — Native vector tables
   and formulas" for what was built and what within it is still deferred.
-  Unruled tables and inline mathematics remain out of scope, and the reasons
-  are in the module rather than here.
+  Unruled tables are found as of 2026-09-01, when a layout detector replaced
+  the rule-stack heuristic, and inline mathematics is routed as of the same
+  day, when regions began owning words rather than lines — see the amendment
+  under "Phase 3".
 - Seal recognition. The sixth task prompt exists; nothing in the corpus
   exercises it, and a prompt nobody measured is not scope.
 - Whole-page VLM document-understanding pipelines.
@@ -1110,10 +1112,153 @@ document already declares the thing a detector would have to infer:
   same recognizer, same per-kind admission, same serialization, same source
   map, same chunk rule.
 
-The detector this section specified is therefore not built and is no longer
-planned for this purpose. It remains the answer for what the typography cannot
-declare: an unruled table, and a document that sets its mathematics in a text
-font. Both are out of scope and stated as such in the module.
+~~The detector this section specified is therefore not built and is no longer
+planned for this purpose.~~
+
+**Built 2026-09-01, and the font and rule heuristics above are removed.** The
+paragraph struck out was wrong, and the case that showed it is worth recording
+because it was invisible from inside the rules.
+
+A reader reported that `(2k^2 + 2k)` on page 17 of a mathematics course book
+copied as `(2k2 + 2k)`. Tracing it: the font rule *did* mark out a region on
+that page, granite-docling read it as prose, and per-kind admission correctly
+refused to put a model's sentence in place of the author's glyphs — so the
+flattened run stayed. PP-DocLayoutV2 on the same page finds no display formula
+at all. It finds three `inline_formula` at 0.85–0.87, which is the truth: the
+mathematics there is inside a sentence. The font rule had fired on a line it
+had no business marking out, and the thing actually broken was unreachable by
+any threshold that rule could express, because its unit is the line.
+
+Across that one book the detector routes 251 display formulas, 62 tables and
+3 charts, and reports **1342 inline formulas it does not route**. The old rule
+reported 418 regions and no gap at all.
+
+What replaced them:
+
+- **PP-DocLayoutV2 as an ONNX graph on the `ort` already in the tree**, pinned
+  to a commit rather than a branch because the class order is the contract.
+  204 MB, ~250 ms a page, one page render and one forward pass. The gating
+  check this document asked for — "the layout detector's opset runs on the
+  `ort` in the tree, and its labels map onto `RegionKind` without a residual
+  class that has nowhere to go" — is met on the first half and deliberately
+  not on the second: 25 classes map to 3 kinds and the rest map to nothing,
+  because only a formula, a table and a chart are worth displacing a page's
+  own glyphs for. The residual is *named and counted* rather than routed.
+- **`typeset.rs` keeps geometry only**: where a detected area sits, which of
+  the page's lines it covers, how to render it. Every constant that was a
+  judgement about content — the math-glyph share, the minimum glyph count, the
+  baseline spread, two gap factors, the rule thickness, width, span and count
+  — is gone with the rules that used them.
+
+The one thing the detector finds and the pipeline cannot yet act on is inline
+mathematics, and the reason is structural rather than a threshold: supersession
+replaces whole *lines*, and an inline formula shares its line with prose.
+Routing one today would mean either losing the sentence around it or reading
+that sentence twice. `layout_regions_not_routed` counts it meanwhile, so the
+gap is a number rather than a silence.
+
+### Amendment, 2026-09-01: two recognizers, and regions that own words
+
+Two reports drove this, and they are different failures.
+
+**`(2k² + 2k)` reads as `(2k2 + 2k)`.** The page raises and shrinks the
+exponent; the text layer records neither. The glyph is *present and flattened*.
+
+**`¬, ∧, ∨, →, and ↔` reads as `¬, ∧ , ∨ , , and .`** MuPDF reports **no
+character at all** where `→` and `↔` are drawn, and PDF.js maps the same glyphs
+to 14.4 points of whitespace. Four lines below, the page draws `A ⋁ B ⇔ B ⋁ A`
+and the reading holds `A⋁B` and `B⋁A` as two fragments with nothing between
+them. The glyph is *absent*. No rule reading the page's geometry recovers it,
+because there is no glyph record to read.
+
+A geometry rule for the first was built and measured — it worked, on six
+producers, and it is gone. It could not touch the second, and the objection to
+it was structural rather than empirical: it was one rule for one of a large
+family of things a text layer loses, and the family has no end. What replaced
+it answers both from the pixels.
+
+#### A formula is not a page
+
+Measured, twice. Ten inline crops through granite-docling: 185 seconds, **none
+admitted**, four decodes running to their 2048-token cap and looping on
+`Powered by TCPDF`. The same crops through Texify — a Donut encoder over an
+mBART decoder, trained on cropped expressions, the ONNX-published model of the
+same class as UniMERNet: correct LaTeX. On page 21 it returns
+`A\lor B\leftrightarrow B\lor A`, recovering the operator the file does not
+name.
+
+So there are two recognizers and the detector picks between them: an area it
+calls a formula goes to `image::texify`, everything else — tables, charts, the
+rasters a document embeds — to the page reader. The route travels on
+`DiscoveredImage::kind`, set when the area is marked out, because deciding it
+from the transcription would be routing after the routing. ~~Neither is
+optional: `build_analyzer` refuses to attach without both, for the same reason
+it refuses without the detector.~~
+
+Amended 2026-09-01. Texify is a row of the recognizer catalogue rather than a
+slot beside it: `RecognizerDescriptor` carries a `RecognizerRole` of `Page` or
+`Formula`, and everything that used to be a second copy of the install,
+inventory and identity paths — `RecognizerCatalogue::formula`, the
+`formula_reader_*` wrappers, `/api/image-analysis/install-formula-reader` and
+its Tauri command — is gone. `dispatch::formula_model` finds the reader by role,
+so nothing outside the arm that owns the checkpoint names it, and the page
+picker filters to `Page` so a formula reader can never be chosen as the page
+recognizer. `build_analyzer` refuses a settings file that names one anyway.
+
+Neither the detector nor the formula reader is required any more. Absent, each
+warns and the reading degrades in a way that is named where the download is
+offered: with no detector nothing a page typesets is marked out, and with no
+formula reader the areas the detector calls formulas go to the page reader —
+which the measurement above says reads almost none of them. Both are in the
+analyzer identity, so a library read without them is re-read when they arrive.
+
+Both also moved out of the host process, along with the invariant that put them
+there — see "no inference in the host process" in `AGENTS.md`. Texify goes
+through `worker_ocr::attach` like the page readers; the detector goes through
+the new `worker_layout::attach`, a `WorkerRole::Layout` and a `"layout"` request
+mode. The recognize worker now holds a bounded map of resident models rather
+than one, because reading a document alternates between all three continuously,
+and worker reuse is bounded by `WorkerRole::process_kind` rather than by the
+role — SBERT embedding is the Python sidecar and everything else the Rust
+binary, which is the only distinction a resident map cannot paper over.
+
+Texify ships **quantized**, which is the opposite of `granite_docling`'s
+finding and for a reason. That model reads a whole page — hundreds of tokens
+where an early error compounds — while a formula is twenty tokens and the
+decode ends before drift accumulates. Measured at int8: `\frac{a+b}{2}<\sqrt{a
+b}`, `\sqrt{n^{2}}=n`, and a four-step derivation with `\Rightarrow` and
+`\left(a-b\right)^{2}<0`, all correct. 321 MB rather than 1.25 GB.
+
+#### A region owns words
+
+The first run of Texify against inline crops returned nonsense, and the crops
+were why: `\sqrt{n}\in\mathrm{N}.T` came from an image that reads **`th √n ∈
+ℕ. T`**, and `\frac{\sin\pi}{\sin\sqrt{n}}` from one holding two lines of
+prose with `√n` in the middle. A region was a set of *lines*, its crop was the
+union of the detector's box and those lines, and an 8-point render margin —
+right for a display formula — reached into the words either side of an inline
+one.
+
+`typeset.rs` now marks out **words**. Three things follow, and they are the
+whole of what made inline mathematics routable:
+
+- **The crop is the words the region replaces**, plus whatever margin fits
+  before the next word. The detector's own box is deliberately not unioned in:
+  it is drawn on an 800x800 render and lands a point or two wide of the ink,
+  which at line granularity fell in the margin and at word granularity is the
+  neighbour.
+- **Supersession splices.** A region owning every word of the lines it touches
+  is written as a block, as before. A region owning part of a line is replaced
+  *in place*, and `serialize::inline_pieces` writes its reading with no label,
+  no line of its own and no terminator — `Page formula:` in the middle of a
+  sentence is Wilkes talking over the document.
+- **`inline_formula` is routed.** It mapped to nothing for as long as
+  supersession replaced whole lines. That was the reason, and the reason is
+  gone.
+
+The detector remains the answer for the two cases the typography could never
+declare, and now actually answers them: an unruled table, and a document that
+sets its mathematics in a text font.
 
 **A region covers the whole expression, not the fragment that seeded it.**
 Found from the first reading this produced. The page draws `y_B = w^{x_B}(mod
@@ -1341,9 +1486,12 @@ Added 2026-08-29, for the prompt work:
   is the first item and it gates the rest: the module was verified for
   spotting only, and a prompt the module cannot drive is a decision to
   reopen, not a bug to work around.
-- The layout detector's opset runs on the `ort` in the tree, and its
+- ~~The layout detector's opset runs on the `ort` in the tree, and its
   labels map onto `RegionKind` without a residual class that has nowhere to
-  go.
+  go.~~ **Checked 2026-09-01.** The opset runs. The labels do *not* map without
+  a residual, and that is the right answer rather than a failure: 25 classes
+  map to 3 kinds, because only a formula, a table and a chart are worth
+  displacing a page's own glyphs for. The residual is named and counted.
 - Formula metrics on the evaluation corpus: ExpRate/CDM-style accuracy plus
   the LaTeX-validity admission check, reported beside the existing character
   error and coordinate accuracy.
@@ -1580,7 +1728,7 @@ amendment specified *downstream of routing* was built for them:
 | --- | --- |
 | **Completed** | `RegionKind` on `ImageOcrRegion` and on `TextProvenance::ImageOcr`; per-kind admission (text on the threshold, formulas on LaTeX validity, tables and charts on being a rectangular Markdown table of at least 2×2); one label per kind, with the exhaustive match that stops a kind reaching the reading unlabelled; the formula-and-table chunk rule; `ADMISSION_RULES_VERSION` in the analyzer identity; the per-kind and unroutable diagnostics; and the recognizer reporting what it could not route rather than dropping it — amended 2026-08-29 to separate a region it *named* as carrying no text, a `<picture>`, from one this build could not name at all, since a document parser answers the first once per figure and the two together are unreadable as one number. |
 | **Partial** | The polygon criterion, unchanged from 2026-08-28. |
-| **Not built** | `parsing-v1`: PaddleOCR-VL's `Formula Recognition:`, `Table Recognition:` and `Chart Recognition:` prompts, and the layout detector that routes regions to them. |
+| **Not built** | `parsing-v1`: PaddleOCR-VL's `Formula Recognition:`, `Table Recognition:` and `Chart Recognition:` prompts. ~~And the layout detector that routes regions to them.~~ The detector is built as of 2026-09-01 — PP-DocLayoutV2 on the pinned `ort`, replacing the font and rule heuristics; see "Phase 3". The prompts are still not built. Formula recognition is built and is a different model — Texify, routed by kind; see "Phase 3". |
 
 Six of the eight criteria added by the amendment now hold, each pinned by a
 test:

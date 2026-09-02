@@ -58,6 +58,7 @@ impl WorkerEmbedder {
             texts: Some(texts.iter().map(|s| s.to_string()).collect()),
             generate: None,
             recognize: None,
+            layout: None,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);

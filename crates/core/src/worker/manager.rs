@@ -426,6 +426,7 @@ mod tests {
             texts: None,
             generate: None,
             recognize: None,
+            layout: None,
         });
 
         manager
@@ -486,6 +487,7 @@ mod tests {
             texts: None,
             generate: None,
             recognize: None,
+            layout: None,
         });
 
         manager

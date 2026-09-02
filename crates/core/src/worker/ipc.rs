@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::extract::image::dispatch::RecognitionEngine;
 use crate::extract::image::ocr::ImageRecognition;
+use crate::extract::image::{LayoutRequest, WireLayoutRegion};
 use crate::extract::image::RecognitionRequest;
 use crate::generate::{
     GenerationEngine, GenerationRequest, GenerationRuntime, GenerationTimings, StopReason,
@@ -17,6 +18,12 @@ pub enum WorkerRole {
     Embed(EmbeddingEngine),
     Generate(GenerationEngine),
     Recognize(RecognitionEngine),
+    /// Marking out what a page holds, which is inference like the rest and so
+    /// lives out here like the rest. Its [`WorkerKind`] is `Recognize`: the
+    /// detector and the recognizers are all resident in the one process that
+    /// reads documents, because a document alternates between them page by
+    /// page and a process per model would restart on every alternation.
+    Layout(RecognitionEngine),
 }
 
 /// What a *manager* is for, without the engine. A manager supervises one role
@@ -29,6 +36,22 @@ pub enum WorkerKind {
     Embed,
     Generate,
     Recognize,
+}
+
+/// Which executable serves a role.
+///
+/// Two processes exist, and which one a request needs is not derivable from
+/// its [`WorkerKind`]: SBERT embedding runs in the Python sidecar while every
+/// other role runs in the Rust worker binary. A manager reuses its worker
+/// across models and engines, so this is what bounds the reuse — a running
+/// sidecar cannot serve a candle request, and no amount of model swapping
+/// inside it would help.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerProcessKind {
+    /// The Python sidecar.
+    Sidecar,
+    /// `wilkes-rust-worker`.
+    WorkerBin,
 }
 
 impl WorkerKind {
@@ -47,7 +70,7 @@ impl WorkerRole {
         match self {
             WorkerRole::Embed(_) => WorkerKind::Embed,
             WorkerRole::Generate(_) => WorkerKind::Generate,
-            WorkerRole::Recognize(_) => WorkerKind::Recognize,
+            WorkerRole::Recognize(_) | WorkerRole::Layout(_) => WorkerKind::Recognize,
         }
     }
 
@@ -60,14 +83,32 @@ impl WorkerRole {
         match self {
             WorkerRole::Embed(engine) => engine.as_str(),
             WorkerRole::Generate(engine) => engine.as_str(),
-            WorkerRole::Recognize(engine) => engine.as_str(),
+            WorkerRole::Recognize(engine) | WorkerRole::Layout(engine) => engine.as_str(),
+        }
+    }
+
+    /// The process that serves this role.
+    ///
+    /// Spelled out per engine rather than defaulted, so adding an engine —
+    /// a Python recognizer served by the same sidecar, say — fails to compile
+    /// here until someone decides which process it belongs in. That decision
+    /// used to live only in `build_command_plan`, which is downstream of the
+    /// point where the manager has already decided whether to reuse a worker.
+    pub fn process_kind(&self) -> WorkerProcessKind {
+        match self {
+            WorkerRole::Embed(EmbeddingEngine::SBERT) => WorkerProcessKind::Sidecar,
+            WorkerRole::Embed(EmbeddingEngine::Candle | EmbeddingEngine::Fastembed) => {
+                WorkerProcessKind::WorkerBin
+            }
+            WorkerRole::Generate(_) => WorkerProcessKind::WorkerBin,
+            WorkerRole::Recognize(_) | WorkerRole::Layout(_) => WorkerProcessKind::WorkerBin,
         }
     }
 
     pub fn embedding_engine(&self) -> Option<EmbeddingEngine> {
         match self {
             WorkerRole::Embed(engine) => Some(*engine),
-            WorkerRole::Generate(_) | WorkerRole::Recognize(_) => None,
+            WorkerRole::Generate(_) | WorkerRole::Recognize(_) | WorkerRole::Layout(_) => None,
         }
     }
 }
@@ -77,6 +118,7 @@ enum TaggedRole {
     Embed(EmbeddingEngine),
     Generate(GenerationEngine),
     Recognize(RecognitionEngine),
+    Layout(RecognitionEngine),
 }
 
 /// Accepts both the tagged form this version writes and the bare engine string
@@ -95,6 +137,7 @@ impl serde::Serialize for WorkerRole {
             WorkerRole::Embed(engine) => TaggedRole::Embed(*engine),
             WorkerRole::Generate(engine) => TaggedRole::Generate(*engine),
             WorkerRole::Recognize(engine) => TaggedRole::Recognize(*engine),
+            WorkerRole::Layout(engine) => TaggedRole::Layout(*engine),
         };
         tagged.serialize(serializer)
     }
@@ -106,6 +149,7 @@ impl<'de> serde::Deserialize<'de> for WorkerRole {
             RoleRepr::Tagged(TaggedRole::Embed(engine)) => WorkerRole::Embed(engine),
             RoleRepr::Tagged(TaggedRole::Generate(engine)) => WorkerRole::Generate(engine),
             RoleRepr::Tagged(TaggedRole::Recognize(engine)) => WorkerRole::Recognize(engine),
+            RoleRepr::Tagged(TaggedRole::Layout(engine)) => WorkerRole::Layout(engine),
             RoleRepr::Legacy(engine) => WorkerRole::Embed(engine),
         })
     }
@@ -147,6 +191,9 @@ pub struct WorkerRequest {
     /// Used by "recognize" mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recognize: Option<RecognitionRequest>,
+    /// Used by "layout" mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<LayoutRequest>,
 }
 
 impl WorkerRequest {
@@ -175,6 +222,10 @@ impl WorkerRequest {
                 request.image_paths.len()
             ))],
         });
+        // One page, and its path is short: nothing to redact, but named here
+        // so a field added to `LayoutRequest` later is a change to this
+        // function rather than a silent gap in it.
+        redacted.layout = self.layout.clone();
         redacted
     }
 }
@@ -220,6 +271,15 @@ pub enum WorkerEvent {
     /// Carries no text: the text is the concatenation of the `Token` events,
     /// and a second copy would only invite the two to disagree.
     Completion { tokens: usize, stop: StopReason },
+    /// The areas the detector marked out on the page of a layout request.
+    /// Emitted before its terminal event.
+    ///
+    /// The wire form, not [`crate::extract::image::LayoutRegion`]: a region's
+    /// `label` is a `&'static str` from the detector's own vocabulary, and a
+    /// label arriving off a pipe has to be resolved back into that vocabulary
+    /// rather than leaked in as an arbitrary string. An unrecognized label is
+    /// an error on the host side, not a region with an unknown class.
+    LayoutRegions(Vec<WireLayoutRegion>),
     /// The text regions of each image of a recognition request, one entry per
     /// image, in the order they were asked for. Emitted before its terminal
     /// event.
@@ -262,6 +322,7 @@ mod tests {
             texts: None,
             generate: None,
             recognize: None,
+            layout: None,
         }
     }
 

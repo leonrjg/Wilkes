@@ -656,14 +656,32 @@ fn otsl_to_markdown(body: &str) -> String {
 // ── The engine ───────────────────────────────────────────────────────────────
 
 pub struct GraniteDocling {
-    model: Mutex<OnnxVlm>,
+    /// One loaded model per page read at once.
+    ///
+    /// A page's read is a long serial decode that fills barely a core: nine
+    /// threads produce a token 11% faster than one does, because each step is
+    /// a pass over the whole decoder's weights and no thread count makes
+    /// memory arrive sooner. Reading one page at a time therefore leaves most
+    /// of the machine idle no matter how the threads are set, and the way to
+    /// use it is more readers rather than wider ones.
+    ///
+    /// Each reader is an independent model with its own key/value cache, so
+    /// they share nothing but the weights on disk, which the runtime maps
+    /// once. A reader is taken by locking it; a batch smaller than the pool
+    /// simply leaves the rest untouched.
+    readers: Vec<Mutex<OnnxVlm>>,
     tokenizer: Tokenizer,
     image_token_id: u32,
     eos_token_id: u32,
 }
 
 impl GraniteDocling {
-    pub fn load(model_dir: &Path, threads: usize) -> Result<Self> {
+    /// Load `readers` copies of the model, each given `threads` threads.
+    ///
+    /// The two numbers are the caller's because they describe the machine
+    /// rather than the model; [`super::dispatch`] is where that policy and
+    /// the measurements behind it live.
+    pub fn load(model_dir: &Path, readers: usize, threads: usize) -> Result<Self> {
         let dir = install_dir(model_dir);
         anyhow::ensure!(
             is_installed(model_dir),
@@ -671,7 +689,13 @@ impl GraniteDocling {
             dir.display()
         );
 
-        let model = OnnxVlm::load(&dir, VISION_GRAPH, EMBED_GRAPH, DECODER_GRAPH, threads)?;
+        anyhow::ensure!(readers > 0, "a recognizer needs at least one reader");
+        let readers = (0..readers)
+            .map(|_| {
+                OnnxVlm::load(&dir, VISION_GRAPH, EMBED_GRAPH, DECODER_GRAPH, threads)
+                    .map(Mutex::new)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("could not read the tokenizer: {e}"))?;
 
@@ -685,16 +709,22 @@ impl GraniteDocling {
                 .map(|v| v as u32)
         };
 
+        tracing::info!(
+            readers = readers.len(),
+            threads,
+            "loaded {MODEL_ID} with {} concurrent reader(s)",
+            readers.len()
+        );
         Ok(Self {
-            model: Mutex::new(model),
+            readers,
             tokenizer,
             image_token_id: id("image_token_id")?,
             eos_token_id: id("eos_token_id")?,
         })
     }
 
-    /// Read one image into elements.
-    fn read(&self, image: &RgbImage) -> Result<ImageRecognition> {
+    /// Read one image into elements, on the reader it was given.
+    fn read(&self, reader: &Mutex<OnnxVlm>, image: &RgbImage) -> Result<ImageRecognition> {
         let (pixels, tiles, rows, cols) = prepare_tiles(image);
         let prompt = prompt_text(rows, cols);
         let encoded = self
@@ -716,8 +746,7 @@ impl GraniteDocling {
             slots.len()
         );
 
-        let mut model = self
-            .model
+        let mut model = reader
             .lock()
             .map_err(|_| anyhow::anyhow!("the recognizer mutex was poisoned"))?;
 
@@ -767,6 +796,61 @@ impl GraniteDocling {
             not_text: unread.not_text,
         })
     }
+}
+
+/// Run `read` over `items` on up to `hands` threads, returning the results in
+/// the order the items were given.
+///
+/// Threads pull from a shared cursor rather than being handed a slice each:
+/// pages differ by an order of magnitude in how many tokens they decode, so a
+/// fixed division would leave most hands idle behind the one that drew the
+/// longest page. `read` is told which hand it is on, which is how each one
+/// reaches its own model.
+///
+/// Order is restored before returning because the caller matches results to
+/// images by position. Returning them in completion order would attach one
+/// page's regions to another page — a silent, plausible-looking wrong answer,
+/// which is the one failure here worth writing a test against.
+///
+/// A batch fails as a batch, and the error returned is the first by position
+/// rather than the first to happen, so a run's outcome does not depend on
+/// which hand lost the race. Hands already mid-item when another fails finish
+/// it; there is nowhere to put a half-read page.
+fn in_parallel<T, R>(
+    items: &[T],
+    hands: usize,
+    read: impl Fn(usize, &T) -> Result<R> + Sync,
+) -> Result<Vec<R>>
+where
+    T: Sync,
+    R: Send,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let next = AtomicUsize::new(0);
+    let mut collected: Vec<(usize, Result<R>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..hands.min(items.len()))
+            .map(|hand| {
+                let (next, read) = (&next, &read);
+                scope.spawn(move || {
+                    let mut mine = Vec::new();
+                    loop {
+                        let nth = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(nth) else {
+                            return mine;
+                        };
+                        mine.push((nth, read(hand, item)));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("a reader thread panicked"))
+            .collect()
+    });
+    collected.sort_by_key(|(nth, _)| *nth);
+    collected.into_iter().map(|(_, result)| result).collect()
 }
 
 /// The end offset, in characters of the decoded stream, of each token.
@@ -840,17 +924,18 @@ impl OcrEngine for GraniteDocling {
         ADMISSION_THRESHOLD
     }
 
+    /// Read the batch across every reader at once.
     fn spot_batch(&self, images: &[RgbImage]) -> Result<Vec<ImageRecognition>> {
-        let mut out = Vec::with_capacity(images.len());
-        for (nth, image) in images.iter().enumerate() {
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        in_parallel(images, self.readers.len(), |hand, image| {
+            let read = self.read(&self.readers[hand], image);
             tracing::info!(
-                "reading image {} of {} with {MODEL_ID}",
-                nth + 1,
+                "read image {} of {} with {MODEL_ID}",
+                done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                 images.len()
             );
-            out.push(self.read(image)?);
-        }
-        Ok(out)
+            read
+        })
     }
 }
 
@@ -862,6 +947,95 @@ mod tests {
     /// thumbnail, for 1088 visual tokens. If this changes, every cached
     /// reading was produced under a different prefill than the next one will
     /// be.
+    /// The failure this exists to prevent: results coming back in completion
+    /// order would attach one page's regions to another page, and every
+    /// region would still look like a perfectly good region.
+    #[test]
+    fn a_batch_comes_back_in_the_order_it_was_given_however_it_finishes() {
+        // Later items finish sooner, so completion order is the reverse of
+        // input order and a missing sort cannot pass by luck.
+        let items: Vec<usize> = (0..24).collect();
+        let out = in_parallel(&items, 4, |_, item| {
+            std::thread::sleep(std::time::Duration::from_millis((24 - *item) as u64));
+            Ok(*item * 10)
+        })
+        .expect("nothing failed");
+        assert_eq!(out, items.iter().map(|i| i * 10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn every_item_is_read_exactly_once_across_the_hands() {
+        let items: Vec<usize> = (0..100).collect();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let out = in_parallel(&items, 3, |_, item| {
+            seen.lock().unwrap().push(*item);
+            Ok(*item)
+        })
+        .expect("nothing failed");
+        let mut seen = seen.into_inner().unwrap();
+        seen.sort_unstable();
+        assert_eq!(seen, items);
+        assert_eq!(out, items);
+    }
+
+    /// A batch smaller than the pool must not spawn hands with nothing to do,
+    /// and a batch of nothing must not spawn any.
+    #[test]
+    fn a_batch_smaller_than_the_pool_uses_only_the_hands_it_needs() {
+        let items = [7usize, 8];
+        let hands = std::sync::Mutex::new(std::collections::HashSet::new());
+        let out = in_parallel(&items, 8, |hand, item| {
+            hands.lock().unwrap().insert(hand);
+            Ok(*item)
+        })
+        .expect("nothing failed");
+        assert_eq!(out, vec![7, 8]);
+        assert!(hands.into_inner().unwrap().len() <= 2);
+        assert!(in_parallel::<usize, usize>(&[], 4, |_, _| unreachable!())
+            .expect("an empty batch is an empty result")
+            .is_empty());
+    }
+
+    /// Which hand loses the race must not decide what the caller is told.
+    #[test]
+    fn the_error_returned_is_the_first_by_position_not_the_first_to_happen() {
+        let items: Vec<usize> = (0..8).collect();
+        let err = in_parallel(&items, 4, |_, item| {
+            // Item 5 fails immediately; item 2 fails late. Position wins.
+            if *item == 5 {
+                anyhow::bail!("late position, early failure");
+            }
+            if *item == 2 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                anyhow::bail!("early position, late failure");
+            }
+            Ok(*item)
+        })
+        .expect_err("the batch failed");
+        assert!(err.to_string().contains("early position"), "{err}");
+    }
+
+    /// Each hand is given its own index, which is how it reaches its own
+    /// model rather than sharing one.
+    #[test]
+    fn each_hand_is_told_which_one_it_is_and_they_are_all_distinct() {
+        let items: Vec<usize> = (0..64).collect();
+        let barrier = std::sync::Barrier::new(4);
+        let hands = std::sync::Mutex::new(Vec::new());
+        in_parallel(&items, 4, |hand, item| {
+            if *item < 4 {
+                // Hold every hand at once, so all four must really exist.
+                barrier.wait();
+                hands.lock().unwrap().push(hand);
+            }
+            Ok(*item)
+        })
+        .expect("nothing failed");
+        let mut hands = hands.into_inner().unwrap();
+        hands.sort_unstable();
+        assert_eq!(hands, vec![0, 1, 2, 3]);
+    }
+
     #[test]
     fn a_portrait_page_tiles_the_way_the_reference_run_did() {
         let (w, h, cols, rows) = tile_grid(1000, 1300);
@@ -1088,7 +1262,8 @@ Expert Systems in Practice</section_header_level_1>\
             panic!("set WILKES_GRANITE_PAGE");
         };
         let image = image::open(&page).expect("the page image opens").to_rgb8();
-        let engine = GraniteDocling::load(Path::new(&model_dir), 4).expect("the recognizer loads");
+        let engine =
+            GraniteDocling::load(Path::new(&model_dir), 1, 4).expect("the recognizer loads");
 
         let started = std::time::Instant::now();
         let regions = engine

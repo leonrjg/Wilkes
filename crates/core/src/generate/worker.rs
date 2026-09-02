@@ -53,6 +53,7 @@ impl WorkerGenerator {
             texts: None,
             generate: Some(req),
             recognize: None,
+            layout: None,
         }
     }
 }

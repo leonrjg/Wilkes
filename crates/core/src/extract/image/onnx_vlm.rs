@@ -34,6 +34,45 @@ const PIXEL_ATTENTION_MASK: &str = "pixel_attention_mask";
 const PAST_PREFIX: &str = "past_key_values.";
 const PRESENT_PREFIX: &str = "present.";
 
+/// How many tiles go through the vision encoder in one run.
+///
+/// The graph takes a whole page's tiles on one axis and will encode all
+/// seventeen in a single call, but its intermediates are sized by that axis:
+/// one call for a full page peaks at 4.9 GB resident. That is what put the
+/// recognizer's process above 8 GB, and what made a second concurrent reader
+/// swap rather than run. Tiles do not attend to each other, so encoding them
+/// in groups is the same arithmetic over a smaller working set — 2.2 GB at
+/// this width, and slightly faster for it.
+///
+/// The width is bounded below by bit-exactness rather than by memory. ONNX
+/// Runtime picks a different matmul kernel for a batch of exactly one, and a
+/// group of one tile moves the features in their last digits. That drift is
+/// ~1e-5 relative and harmless as arithmetic, but it would change the bytes a
+/// reading is recorded under, and so oblige every document already read to be
+/// read again. Three is small enough to matter and, split the way
+/// [`tile_groups`] splits it, never leaves a tile on its own.
+const ENCODE_TILE_GROUP: usize = 3;
+
+/// Split `tiles` into groups of at most [`ENCODE_TILE_GROUP`], as evenly as
+/// the count allows.
+///
+/// Evenly, rather than filling each group before starting the next, for one
+/// reason: greedy filling leaves a remainder, and a remainder of one tile is
+/// the case that changes the features. Seventeen tiles greedily is
+/// `3,3,3,3,3,2`, which is fine, but sixteen is `3,3,3,3,3,1`, which is not —
+/// and the tile count is a property of the page, so the safe split is the one
+/// that cannot produce a singleton for any page.
+fn tile_groups(tiles: usize) -> Vec<usize> {
+    if tiles == 0 {
+        return Vec::new();
+    }
+    let groups = tiles.div_ceil(ENCODE_TILE_GROUP);
+    let (base, wide) = (tiles / groups, tiles % groups);
+    (0..groups)
+        .map(|n| if n < wide { base + 1 } else { base })
+        .collect()
+}
+
 /// What a decoder graph said it wants, read from the graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecoderShape {
@@ -193,13 +232,33 @@ impl OnnxVlm {
     /// `pixels` is `[1, tiles, 3, side, side]` flattened in that order, which
     /// is the rank the exported graph declares — the tile axis is the graph's,
     /// not a batch this code folded away.
+    ///
+    /// The tiles are encoded a few at a time and the results concatenated,
+    /// for the memory reason [`ENCODE_TILE_GROUP`] gives. Callers see one
+    /// call for one page either way: how many runs that becomes is a property
+    /// of the graph's appetite, which is this module's business and not
+    /// theirs.
     pub fn encode_image(&mut self, pixels: &[f32], tiles: usize, side: usize) -> Result<Vec<f32>> {
-        let expected = tiles * 3 * side * side;
+        let per_tile = 3 * side * side;
+        let expected = tiles * per_tile;
         anyhow::ensure!(
             pixels.len() == expected,
             "expected {expected} pixel values for {tiles} {side}x{side} tiles, got {}",
             pixels.len()
         );
+
+        let mut features = Vec::new();
+        let mut done = 0usize;
+        for group in tile_groups(tiles) {
+            let taken = &pixels[done * per_tile..(done + group) * per_tile];
+            features.extend_from_slice(&self.encode_tiles(taken, group, side)?);
+            done += group;
+        }
+        Ok(features)
+    }
+
+    /// One run of the vision graph over `tiles` tiles.
+    fn encode_tiles(&mut self, pixels: &[f32], tiles: usize, side: usize) -> Result<Vec<f32>> {
         let values = Tensor::from_array((
             vec![1i64, tiles as i64, 3, side as i64, side as i64],
             pixels.to_vec(),
@@ -422,6 +481,46 @@ pub fn splice_image_features(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tile_groups_cover_the_page_exactly_and_stay_within_the_width() {
+        for tiles in 0..64 {
+            let groups = tile_groups(tiles);
+            assert_eq!(groups.iter().sum::<usize>(), tiles, "{tiles} tiles");
+            assert!(
+                groups.iter().all(|g| *g <= ENCODE_TILE_GROUP),
+                "{tiles} tiles split as {groups:?}"
+            );
+        }
+    }
+
+    /// The reason the split is balanced rather than greedy. A group of one
+    /// tile is encoded by a different matmul kernel, and the features it
+    /// returns differ in their last digits from the same tile encoded
+    /// alongside others — which would change every reading's bytes.
+    #[test]
+    fn no_page_is_ever_split_so_that_one_tile_is_encoded_alone() {
+        for tiles in 2..256 {
+            let groups = tile_groups(tiles);
+            assert!(
+                groups.iter().all(|g| *g > 1),
+                "{tiles} tiles split as {groups:?}, leaving a tile on its own"
+            );
+        }
+    }
+
+    /// A page tiles 4x4 with a thumbnail. Pinned because it is the shape the
+    /// memory measurement was taken at.
+    #[test]
+    fn a_full_page_encodes_in_six_runs_rather_than_one() {
+        assert_eq!(tile_groups(17), vec![3, 3, 3, 3, 3, 2]);
+    }
+
+    #[test]
+    fn a_page_of_one_tile_is_still_encoded() {
+        assert_eq!(tile_groups(1), vec![1]);
+        assert!(tile_groups(0).is_empty());
+    }
 
     #[test]
     fn greedy_picks_the_largest_and_scores_it_as_a_log_probability() {

@@ -4460,6 +4460,51 @@ impl AppContext {
         wilkes_core::extract::image::recognizer_inventory(engine, model_id)
     }
 
+    /// Download and verify the layout detector, then reconcile the analyzer.
+    ///
+    /// Its own command rather than a case of the recognizer install: there is
+    /// one detector, it is not chosen from a catalogue, and it is required
+    /// whenever image analysis is on — a document read without it contains
+    /// none of the formulas and tables its pages typeset. Reconciled
+    /// afterwards without a condition, because unlike a recognizer there is no
+    /// "the settings name a different one": installing it always changes
+    /// whether the analyzer can attach.
+    ///
+    /// Shares the recognizer's event stream, so a UI that already listens for
+    /// image-analysis progress needs nothing new to show this.
+    #[cfg(feature = "recognize-onnx")]
+    pub async fn install_layout_detector(self: &Arc<Self>) -> anyhow::Result<()> {
+        let (progress_tx, mut progress_rx) = mpsc::channel::<EmbedProgress>(64);
+        let events = Arc::clone(&self.events);
+        let forward = tokio::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                events.emit("image-analysis-progress", serde_json::json!(progress));
+            }
+        });
+        let model_dir = self.model_dir.clone();
+        let installed = tokio::task::spawn_blocking(move || {
+            wilkes_core::extract::image::install_layout_detector(&model_dir, Some(progress_tx))
+        })
+        .await?;
+        let _ = forward.await;
+        if let Err(error) = installed {
+            self.events.emit(
+                "image-analysis-error",
+                serde_json::json!({ "error": format!("{error:#}") }),
+            );
+            return Err(error);
+        }
+        // Only when the feature is on. Installing the detector for a runtime
+        // that is not enriching is a download, and attaching on the strength
+        // of it would turn a download into a configuration change.
+        if self.get_settings().await.image_analysis.enabled {
+            self.load_image_analyzer().await?;
+        }
+        self.events
+            .emit("image-analysis-done", serde_json::json!({}));
+        Ok(())
+    }
+
     /// Download and verify the named recognizer, then attach the analyzer if
     /// the settings already ask for that one.
     ///
@@ -9812,12 +9857,17 @@ mod tests {
         .await
         .unwrap();
         assert!(wilkes_core::extract::image::configured().is_none());
+        // Of the models that have something to download. A recognizer that is
+        // part of the operating system — Apple Vision — has no artifacts and
+        // no footprint, and reports itself installed because it is; asking a
+        // temporary model directory about it would be asking the wrong thing.
         assert!(
             ctx.image_recognizer_catalogue()
                 .models
                 .iter()
+                .filter(|model| model.footprint_bytes > 0)
                 .all(|model| !model.is_cached),
-            "the catalogue is the one answer to what is installed, and nothing is"
+            "the catalogue is the one answer to what is downloaded, and nothing is"
         );
     }
 

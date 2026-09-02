@@ -64,6 +64,7 @@ import type {
   RecognitionEngine,
   RecognizerCatalogue,
   RecognizerInventory,
+  NativeOpenRequest,
 } from "../lib/types";
 
 export interface DataPaths {
@@ -76,6 +77,13 @@ export interface DataPaths {
 // Shared across desktop and web. All methods are identical.
 export interface SearchApi {
   getStartupStatus(): Promise<StartupStatus>;
+  /** Desktop document-window bridge. These are absent from the HTTP surface,
+   * where the operating system cannot launch a local file into the page. */
+  getGlobalSettings?(): Promise<Settings>;
+  previewStandalone?(matchRef: MatchRef): Promise<PreviewData>;
+  getStandaloneFileMetadata?(path: string): Promise<DocumentMetadata>;
+  documentWindowReady?(): Promise<NativeOpenRequest[]>;
+  onNativeOpen?(handler: (request: NativeOpenRequest) => void): Promise<() => void>;
   search(
     query: SearchQuery,
     onResult: (fm: FileMatches) => void,
@@ -234,6 +242,10 @@ export interface SearchApi {
    *  `onImageAnalysisDone`/`onImageAnalysisError`. Installing is not
    *  choosing: the analyzer is only re-attached when the settings already
    *  name this recognizer. */
+  /** Download and verify the layout detector. Reports on the same stream as
+   *  `installImageRecognizer`. No arguments: there is one detector and it is
+   *  not chosen from a catalogue. */
+  installLayoutDetector(): Promise<void>;
   installImageRecognizer(
     engine: RecognitionEngine,
     modelId: string,

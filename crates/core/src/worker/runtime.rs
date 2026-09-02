@@ -169,12 +169,30 @@ fn serialize_request_for_worker(req: &WorkerRequest) -> Result<String, String> {
     serde_json::to_string(req).map_err(|e| format!("Serialize error: {e}"))
 }
 
+/// Whether this request needs a fresh worker process.
+///
+/// What the running process *is*, not which role it last served. A worker
+/// holds a small map of loaded models rather than a single one, so an engine
+/// change within a kind — or a layout request arriving between two
+/// recognition requests — is served by the map and costs at most a model load.
+/// Restarting for that would throw away every other model in the process to
+/// load one, which is exactly the thrash the map exists to avoid: reading a
+/// document alternates page detection, page reading and formula reading
+/// continuously.
+///
+/// Two things still force a restart, and both are properties of the process
+/// rather than of the model. A kind change, because a kind is what a manager
+/// supervises for its whole life and two kinds never share a process. And a
+/// [`WorkerProcessKind`] change, because SBERT embedding runs in the Python
+/// sidecar and everything else in the Rust worker binary — a running sidecar
+/// cannot serve a candle request whatever is in its map.
 fn should_restart_worker(
     active_process: bool,
     active_role: Option<WorkerRole>,
     req_role: WorkerRole,
 ) -> bool {
-    !active_process || active_role != Some(req_role)
+    let serving = |role: WorkerRole| (role.kind(), role.process_kind());
+    !active_process || active_role.map(serving) != Some(serving(req_role))
 }
 
 /// Deliver the cancel signal to whatever worker is active. Takes the slot
@@ -686,6 +704,7 @@ mod tests {
             texts: None,
             generate: None,
             recognize: None,
+            layout: None,
             mode: "generate".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -782,20 +801,78 @@ mod tests {
     }
 
     #[test]
-    fn test_should_restart_worker_uses_active_session_and_role() {
+    fn test_should_restart_worker_uses_active_session_and_kind() {
         let candle = WorkerRole::Embed(EmbeddingEngine::Candle);
         let sbert = WorkerRole::Embed(EmbeddingEngine::SBERT);
         let generate = WorkerRole::Generate(GenerationEngine::Candle);
 
         assert!(should_restart_worker(false, None, candle));
-        assert!(should_restart_worker(true, Some(candle), sbert));
         assert!(!should_restart_worker(true, Some(candle), candle));
+
+        // Same kind and the same binary: served by the worker's model map, at
+        // the cost of a load. Restarting would drop every other model in that
+        // process to load one.
+        let fastembed = WorkerRole::Embed(EmbeddingEngine::Fastembed);
+        assert!(!should_restart_worker(true, Some(candle), fastembed));
+
+        // Same kind, different process: SBERT is the Python sidecar, and no
+        // model swap inside a running candle worker can produce one.
+        assert!(should_restart_worker(true, Some(candle), sbert));
+        assert!(should_restart_worker(true, Some(sbert), candle));
 
         // The reason generation needs its own manager: a shared one would
         // evict a multi-gigabyte model on every alternation.
         assert!(should_restart_worker(true, Some(candle), generate));
         assert!(should_restart_worker(true, Some(generate), candle));
         assert!(!should_restart_worker(true, Some(generate), generate));
+    }
+
+    /// Two engines that run in the same binary are a model swap inside one
+    /// process, not a new process. The worker holds both; nothing is killed.
+    #[tokio::test]
+    async fn test_ensure_worker_reuses_one_process_across_engines_it_can_serve() {
+        let (mut runtime, spawn_calls, _send_calls, shutdown_calls, _tx, _event_rx) =
+            test_runtime();
+        let first = WorkerRequest {
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
+            model: "model-a".to_string(),
+            device: "cpu".to_string(),
+            texts: Some(vec!["hello".to_string()]),
+            generate: None,
+            recognize: None,
+            layout: None,
+            mode: "embed".to_string(),
+            model_dir: std::path::PathBuf::from("data"),
+        };
+        let second = WorkerRequest {
+            role: WorkerRole::Embed(EmbeddingEngine::Fastembed),
+            ..first.clone()
+        };
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+
+        runtime.ensure_worker(&first, &reply_tx).await.unwrap();
+        runtime.ensure_worker(&second, &reply_tx).await.unwrap();
+
+        assert_eq!(spawn_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(shutdown_calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// Detection and recognition alternate page by page within one document.
+    /// They share a kind precisely so that alternation costs nothing: a
+    /// restart here would reload the page reader for every page of the book.
+    #[test]
+    fn test_layout_and_recognition_share_one_worker_process() {
+        use crate::extract::image::dispatch::RecognitionEngine;
+        let recognize = WorkerRole::Recognize(RecognitionEngine::Onnx);
+        let layout = WorkerRole::Layout(RecognitionEngine::Onnx);
+
+        assert!(!should_restart_worker(true, Some(recognize), layout));
+        assert!(!should_restart_worker(true, Some(layout), recognize));
+        assert!(should_restart_worker(
+            true,
+            Some(WorkerRole::Embed(EmbeddingEngine::Candle)),
+            layout
+        ));
     }
 
     #[test]
@@ -807,6 +884,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -852,6 +930,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -942,6 +1021,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -966,6 +1046,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -977,6 +1058,9 @@ mod tests {
         assert_eq!(spawn_calls.load(Ordering::Relaxed), 1);
     }
 
+    /// SBERT runs in the Python sidecar and candle in the Rust worker binary,
+    /// so this switch is a different process and not a different model: the
+    /// map inside the running one cannot serve it whatever it holds.
     #[tokio::test]
     async fn test_ensure_worker_restart_clears_previous_process() {
         let (mut runtime, spawn_calls, _send_calls, shutdown_calls, _tx, _event_rx) =
@@ -988,6 +1072,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1019,6 +1104,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1078,6 +1164,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };

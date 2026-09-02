@@ -1291,6 +1291,31 @@ async fn install_image_recognizer_handler(
         .map_err(|e| server_err(format!("{e:#}")))
 }
 
+/// Download the layout detector. No body: there is one detector and it is not
+/// chosen from a catalogue.
+#[cfg(feature = "recognize-onnx")]
+async fn install_layout_detector_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<bool>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .install_layout_detector()
+        .await
+        .map(|()| Json(true))
+        .map_err(|e| server_err(format!("{e:#}")))
+}
+
+/// The same route in a build with no detector compiled in, so a client gets an
+/// explanation rather than a 404 it would read as a wrong URL.
+#[cfg(not(feature = "recognize-onnx"))]
+async fn install_layout_detector_handler(
+    State(_state): State<Arc<AppState>>,
+) -> Result<Json<bool>, (StatusCode, Json<ErrorBody>)> {
+    Err(server_err(
+        "this build has no layout detector compiled in".to_string(),
+    ))
+}
+
 #[derive(Deserialize)]
 struct ExplainRelatedBody {
     request_id: String,
@@ -2116,6 +2141,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/image-analysis/install",
             post(install_image_recognizer_handler),
+        )
+        .route(
+            "/api/image-analysis/install-detector",
+            post(install_layout_detector_handler),
         )
         .route(
             "/api/generation/explain-related",

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use wilkes_core::embed::dispatch;
 use wilkes_core::extract::image::dispatch as recognize_dispatch;
 use wilkes_core::extract::image::ocr::OcrEngine;
+use wilkes_core::extract::image::{LayoutModel, WireLayoutRegion};
 use wilkes_core::extract::image::worker_ocr;
 use wilkes_core::generate::engines::dispatch as generate_dispatch;
 use wilkes_core::generate::{Generated, Generator};
@@ -13,11 +14,28 @@ use wilkes_core::models::progress::EmbedProgress;
 use wilkes_core::types::{EmbedderModel, GeneratorModel};
 use wilkes_core::worker::ipc::{CancelSignal, WorkerEvent, WorkerRequest, WorkerRole};
 
-/// Identity of whatever model is currently resident.
+/// How many models one worker process keeps resident at once.
 ///
-/// One slot, not one per role: a process only ever serves a single role (the
-/// host runs a separate `WorkerManager` per role), so a second slot would
-/// encode a possibility the topology forbids.
+/// Three, because reading a document needs three at the same time: the layout
+/// detector that marks out what a page holds, the page reader, and the formula
+/// reader for the areas the detector called formulas. They alternate
+/// continuously within a single document, so a process that held one would
+/// spend the run loading and unloading rather than reading.
+///
+/// Bounded rather than open, because a map with no bound is a memory leak that
+/// only shows up on the machine of whoever switches models most. Least
+/// recently used is evicted, which for the reading pass above never evicts
+/// anything and for someone trying recognizers in the settings panel evicts
+/// the one they moved away from.
+const MAX_RESIDENT_MODELS: usize = 3;
+
+/// Identity of one resident model.
+///
+/// A worker holds up to [`MAX_RESIDENT_MODELS`] of these, all of one
+/// [`WorkerKind`](wilkes_core::worker::ipc::WorkerKind) — the host runs a
+/// separate `WorkerManager` per kind, and a process never changes kind. Within
+/// a kind the role, the model and the device all vary, and each combination is
+/// its own entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LoadedModelKey {
     role: WorkerRole,
@@ -44,6 +62,7 @@ enum LoadedPayload {
     Embedder(Arc<dyn wilkes_core::embed::Embedder>),
     Generator(Arc<dyn Generator>),
     Recognizer(Arc<dyn OcrEngine>),
+    LayoutDetector(Arc<dyn LayoutModel>),
 }
 
 struct LoadedModel {
@@ -82,6 +101,16 @@ impl LoadedModel {
             ),
         }
     }
+
+    fn layout_detector(&self) -> anyhow::Result<Arc<dyn LayoutModel>> {
+        match &self.payload {
+            LoadedPayload::LayoutDetector(detector) => Ok(Arc::clone(detector)),
+            other => anyhow::bail!(
+                "worker holds {} but received a layout request",
+                other.what()
+            ),
+        }
+    }
 }
 
 impl LoadedPayload {
@@ -90,6 +119,7 @@ impl LoadedPayload {
             LoadedPayload::Embedder(_) => "an embedder",
             LoadedPayload::Generator(_) => "a generator",
             LoadedPayload::Recognizer(_) => "a recognizer",
+            LoadedPayload::LayoutDetector(_) => "a layout detector",
         }
     }
 }
@@ -108,6 +138,7 @@ enum WorkerLoopAction {
 enum WorkerRequestKind {
     Embed,
     Recognize,
+    Layout,
     Info,
     Generate,
     Unknown(String),
@@ -173,6 +204,19 @@ impl ModelLoader for RealModelLoader {
                 Ok(LoadedModel {
                     key: key.clone(),
                     payload: LoadedPayload::Recognizer(recognizer),
+                    background_task: None,
+                })
+            }
+            // Loaded here and kept resident beside the recognizers: a
+            // document is detected page by page, and reloading the graph per
+            // page would cost more than detecting on it.
+            WorkerRole::Layout(_) => {
+                let detector: Arc<dyn LayoutModel> =
+                    recognize_dispatch::load_layout_detector_local(&key.model, &key.model_dir)?
+                        .into();
+                Ok(LoadedModel {
+                    key: key.clone(),
+                    payload: LoadedPayload::LayoutDetector(detector),
                     background_task: None,
                 })
             }
@@ -248,6 +292,7 @@ fn classify_worker_request(req: &WorkerRequest) -> WorkerRequestKind {
     match req.mode.as_str() {
         "embed" => WorkerRequestKind::Embed,
         "recognize" => WorkerRequestKind::Recognize,
+        "layout" => WorkerRequestKind::Layout,
         "info" => WorkerRequestKind::Info,
         "generate" => WorkerRequestKind::Generate,
         other => WorkerRequestKind::Unknown(other.to_string()),
@@ -260,7 +305,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("[worker] starting up...");
 
-    let mut active_model: Option<LoadedModel> = None;
+    let mut active_model = ResidentModels::default();
     let loader = RealModelLoader;
     let sink = StdoutEventSink;
 
@@ -331,7 +376,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn handle_worker_request(
     req: WorkerRequest,
-    active_model: &mut Option<LoadedModel>,
+    active_model: &mut ResidentModels,
     event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
     loader: &impl ModelLoader,
     cancel_flag: &Arc<AtomicBool>,
@@ -342,6 +387,9 @@ async fn handle_worker_request(
         }
         WorkerRequestKind::Recognize => {
             handle_recognize_plan(req, active_model, event_tx, loader).await?;
+        }
+        WorkerRequestKind::Layout => {
+            handle_layout_plan(req, active_model, event_tx, loader).await?;
         }
         WorkerRequestKind::Info => {
             handle_info_plan(req, active_model, event_tx, loader).await?;
@@ -366,7 +414,7 @@ async fn handle_worker_request(
 /// them.
 async fn handle_recognize_plan(
     req: WorkerRequest,
-    active_model: &mut Option<LoadedModel>,
+    active_model: &mut ResidentModels,
     event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
     loader: &impl ModelLoader,
 ) -> anyhow::Result<()> {
@@ -416,9 +464,65 @@ async fn handle_recognize_plan(
     Ok(())
 }
 
+/// Mark out what one rendered page holds.
+///
+/// One page per request, unlike recognition's whole document. Detection is a
+/// quarter of a second where recognition is minutes, and the host cannot
+/// decide what to render next until it knows what this page held — so the unit
+/// that crosses is the unit the host actually has.
+async fn handle_layout_plan(
+    req: WorkerRequest,
+    active_model: &mut ResidentModels,
+    event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
+    loader: &impl ModelLoader,
+) -> anyhow::Result<()> {
+    let Some(payload) = req.layout.clone() else {
+        let _ = event_tx
+            .send(WorkerEvent::Error(
+                "layout request carries no page".to_string(),
+            ))
+            .await;
+        return Ok(());
+    };
+
+    let page = match worker_ocr::read_staged_image(&payload.image_path) {
+        Ok(page) => page,
+        Err(error) => {
+            let _ = event_tx
+                .send(WorkerEvent::Error(format!("{error:#}")))
+                .await;
+            return Ok(());
+        }
+    };
+
+    let detector = get_or_load(active_model, &req, loader, Some(&event_tx))
+        .await?
+        .layout_detector()?;
+
+    // Off the async executor for the same reason recognition is: this is a
+    // graph execution that holds a core for as long as it takes, and leaving
+    // it on the runtime would stall this process's stdin with it — which is
+    // the pipe a cancel would arrive on.
+    let detected = tokio::task::spawn_blocking(move || detector.detect(&page)).await?;
+
+    match detected {
+        Ok(regions) => {
+            let wire = regions.iter().map(WireLayoutRegion::from_region).collect();
+            let _ = event_tx.send(WorkerEvent::LayoutRegions(wire)).await;
+            let _ = event_tx.send(WorkerEvent::Done).await;
+        }
+        Err(error) => {
+            let _ = event_tx
+                .send(WorkerEvent::Error(format!("detection failed: {error:#}")))
+                .await;
+        }
+    }
+    Ok(())
+}
+
 async fn handle_embed_plan(
     req: WorkerRequest,
-    active_model: &mut Option<LoadedModel>,
+    active_model: &mut ResidentModels,
     event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
     loader: &impl ModelLoader,
 ) -> anyhow::Result<()> {
@@ -443,7 +547,7 @@ async fn handle_embed_plan(
 
 async fn handle_info_plan(
     req: WorkerRequest,
-    active_model: &mut Option<LoadedModel>,
+    active_model: &mut ResidentModels,
     event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
     loader: &impl ModelLoader,
 ) -> anyhow::Result<()> {
@@ -462,7 +566,7 @@ async fn handle_info_plan(
 
 async fn handle_generate_plan(
     req: WorkerRequest,
-    active_model: &mut Option<LoadedModel>,
+    active_model: &mut ResidentModels,
     event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
     loader: &impl ModelLoader,
     cancel_flag: &Arc<AtomicBool>,
@@ -528,43 +632,69 @@ async fn handle_generate_plan(
     Ok(())
 }
 
+/// The models this process holds, most recently used last.
+///
+/// A `Vec` and not a map: it never exceeds [`MAX_RESIDENT_MODELS`], so a linear
+/// scan is cheaper than hashing a key that carries two paths, and the order
+/// *is* the eviction policy rather than something kept alongside it.
+#[derive(Default)]
+struct ResidentModels {
+    loaded: Vec<LoadedModel>,
+}
+
+impl ResidentModels {
+    fn position_of(&self, key: &LoadedModelKey) -> Option<usize> {
+        self.loaded.iter().position(|model| &model.key == key)
+    }
+
+    /// Make room for one more, evicting least-recently-used.
+    fn evict_to_fit(&mut self) {
+        while self.loaded.len() >= MAX_RESIDENT_MODELS {
+            let evicted = self.loaded.remove(0);
+            tracing::info!(
+                "[worker] evicting {} (model: {}, device: {}) to stay within {} resident",
+                evicted.payload.what(),
+                evicted.key.model,
+                evicted.key.device,
+                MAX_RESIDENT_MODELS
+            );
+            if let Some(task) = evicted.background_task {
+                task.abort();
+            }
+        }
+    }
+}
+
 async fn get_or_load<'a>(
-    active: &'a mut Option<LoadedModel>,
+    active: &'a mut ResidentModels,
     req: &WorkerRequest,
     loader: &impl ModelLoader,
     event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
 ) -> anyhow::Result<&'a LoadedModel> {
     let key = LoadedModelKey::from_request(req);
 
-    let reuse = matches!(active.as_ref(), Some(current) if current.key == key);
-    if reuse {
+    if let Some(index) = active.position_of(&key) {
         tracing::info!("[worker] reusing cached model");
-        return Ok(active.as_ref().expect("checked above"));
+        // Moved to the back, so "least recently used" means what it says. The
+        // reading pass keeps all three in play and evicts nothing; this only
+        // decides who goes when somebody switches models.
+        let model = active.loaded.remove(index);
+        active.loaded.push(model);
+        return Ok(active.loaded.last().expect("just pushed"));
     }
 
-    if let Some(current) = active.as_ref() {
-        tracing::info!(
-            "[worker] invalidating cached model (role: {:?} -> {:?}, model: {} -> {}, device: {} -> {}, model_dir: {} -> {})",
-            current.key.role,
-            key.role,
-            current.key.model,
-            key.model,
-            current.key.device,
-            key.device,
-            current.key.model_dir.display(),
-            key.model_dir.display()
-        );
-    }
-
-    tracing::info!("[worker] loading model from scratch");
-    if let Some(current) = active.take() {
-        if let Some(task) = current.background_task {
-            task.abort();
-        }
-    }
+    tracing::info!(
+        "[worker] loading model from scratch (role: {:?}, model: {}, device: {}, model_dir: {})",
+        key.role,
+        key.model,
+        key.device,
+        key.model_dir.display()
+    );
+    active.evict_to_fit();
     let loaded = loader.load(&key, event_tx).await?;
     tracing::info!("[worker] model load succeeded");
-    Ok(active.insert(loaded))
+    active.loaded.push(loaded);
+    Ok(active.loaded.last().expect("just pushed"))
 }
 
 fn emit(event: WorkerEvent) {
@@ -581,6 +711,7 @@ mod tests {
     use wilkes_core::generate::mock::MockGenerator;
     use wilkes_core::generate::{Constraint, GenerationEngine, GenerationRequest, Sampling};
     use wilkes_core::types::EmbeddingEngine;
+    use wilkes_core::extract::image::dispatch::RecognitionEngine;
     use wilkes_core::worker::ipc::WorkerRequest;
 
     struct SuccessLoader;
@@ -599,6 +730,9 @@ mod tests {
                     ])))
                 }
                 WorkerRole::Recognize(_) => LoadedPayload::Recognizer(Arc::new(MockRecognizer)),
+                WorkerRole::Layout(_) => {
+                    LoadedPayload::LayoutDetector(Arc::new(MockLayoutDetector))
+                }
             };
             Ok(LoadedModel {
                 key: key.clone(),
@@ -606,6 +740,36 @@ mod tests {
                 background_task: None,
             })
         }
+    }
+
+    /// Returns one region covering the page, so a test can tell a real round
+    /// trip from a canned reply.
+    struct MockLayoutDetector;
+
+    impl LayoutModel for MockLayoutDetector {
+        fn identity(&self) -> String {
+            "mock-layout".to_string()
+        }
+        fn input_side(&self) -> u32 {
+            64
+        }
+        fn detect(
+            &self,
+            page: &image::RgbImage,
+        ) -> anyhow::Result<Vec<wilkes_core::extract::image::LayoutRegion>> {
+            Ok(vec![wilkes_core::extract::image::LayoutRegion {
+                label: "table",
+                kind: Some(wilkes_core::extract::image::ocr::RegionKind::Table),
+                score: 0.9,
+                bbox: wilkes_core::types::BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: page.width() as f32 / page.width() as f32,
+                    height: 1.0,
+                },
+            }])
+        }
+        fn release(&self) {}
     }
 
     /// Returns, per image, one region whose text names that image's size — so
@@ -663,6 +827,7 @@ mod tests {
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
         }
     }
 
@@ -767,11 +932,13 @@ mod tests {
             WorkerRole::Embed(EmbeddingEngine::Candle),
             dir.path().to_path_buf(),
         );
-        let mut active = Some(LoadedModel {
-            key: LoadedModelKey::from_request(&req),
-            payload: LoadedPayload::Embedder(Arc::new(MockEmbedder::default())),
-            background_task: None,
-        });
+        let mut active = ResidentModels {
+            loaded: vec![LoadedModel {
+                key: LoadedModelKey::from_request(&req),
+                payload: LoadedPayload::Embedder(Arc::new(MockEmbedder::default())),
+                background_task: None,
+            }],
+        };
 
         let loaded = get_or_load(&mut active, &req, &SuccessLoader, None)
             .await
@@ -779,19 +946,25 @@ mod tests {
         assert_eq!(loaded.embedder().unwrap().model_id(), "mock-model");
     }
 
+    /// A model the request does not name is not served from the one that is
+    /// resident. It stays resident — the map has room — but the load for the
+    /// new key is what answers, and a load that fails is an error rather than
+    /// a fallback onto the wrong model.
     #[tokio::test]
-    async fn test_get_or_load_invalidates_on_request_change() {
+    async fn test_get_or_load_does_not_serve_a_different_model() {
         let dir = tempdir().unwrap();
-        let mut active = Some(LoadedModel {
-            key: LoadedModelKey {
-                role: WorkerRole::Embed(EmbeddingEngine::Candle),
-                model: "old-model".to_string(),
-                model_dir: dir.path().to_path_buf(),
-                device: "cpu".to_string(),
-            },
-            payload: LoadedPayload::Embedder(Arc::new(MockEmbedder::default())),
-            background_task: None,
-        });
+        let mut active = ResidentModels {
+            loaded: vec![LoadedModel {
+                key: LoadedModelKey {
+                    role: WorkerRole::Embed(EmbeddingEngine::Candle),
+                    model: "old-model".to_string(),
+                    model_dir: dir.path().to_path_buf(),
+                    device: "cpu".to_string(),
+                },
+                payload: LoadedPayload::Embedder(Arc::new(MockEmbedder::default())),
+                background_task: None,
+            }],
+        };
         let req = request(
             "embed",
             WorkerRole::Embed(EmbeddingEngine::Candle),
@@ -801,37 +974,101 @@ mod tests {
         assert!(get_or_load(&mut active, &req, &FailLoader, None)
             .await
             .is_err());
-        assert!(active.is_none());
     }
 
+    /// Reading a document needs the detector, the page reader and the formula
+    /// reader at once, and alternates between them page by page. All three
+    /// stay resident, and each request is answered by its own model rather
+    /// than by whichever was used last.
     #[tokio::test]
-    async fn a_role_change_invalidates_the_single_cache_slot() {
+    async fn the_three_reading_models_stay_resident_together() {
+        let dir = tempdir().unwrap();
+        let page = request(
+            "recognize",
+            WorkerRole::Recognize(RecognitionEngine::Onnx),
+            dir.path().to_path_buf(),
+        );
+        let mut formula = page.clone();
+        formula.model = "texify".to_string();
+        let mut layout = request(
+            "layout",
+            WorkerRole::Layout(RecognitionEngine::Onnx),
+            dir.path().to_path_buf(),
+        );
+        layout.model = "PP-DocLayoutV2".to_string();
+
+        let mut active = ResidentModels::default();
+        for _ in 0..3 {
+            for req in [&layout, &page, &formula] {
+                get_or_load(&mut active, req, &SuccessLoader, None)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(active.loaded.len(), 3, "a reading pass must not evict");
+        assert!(
+            get_or_load(&mut active, &layout, &FailLoader, None)
+                .await
+                .is_ok(),
+            "the detector was evicted by the readers it alternates with"
+        );
+    }
+
+    /// The map is bounded, so a fourth model displaces the one used longest
+    /// ago rather than growing the process.
+    #[tokio::test]
+    async fn a_fourth_model_evicts_the_least_recently_used() {
+        let dir = tempdir().unwrap();
+        let mut active = ResidentModels::default();
+        let mut requests = Vec::new();
+        for index in 0..MAX_RESIDENT_MODELS + 1 {
+            let mut req = request(
+                "embed",
+                WorkerRole::Embed(EmbeddingEngine::Candle),
+                dir.path().to_path_buf(),
+            );
+            req.model = format!("model-{index}");
+            get_or_load(&mut active, &req, &SuccessLoader, None)
+                .await
+                .unwrap();
+            requests.push(req);
+        }
+
+        assert_eq!(active.loaded.len(), MAX_RESIDENT_MODELS);
+        assert!(active.position_of(&LoadedModelKey::from_request(&requests[0])).is_none());
+        assert!(active
+            .position_of(&LoadedModelKey::from_request(requests.last().unwrap()))
+            .is_some());
+    }
+
+    /// A role change within a kind is still a different model: the accessor
+    /// for the wrong payload names the mismatch rather than panicking.
+    #[tokio::test]
+    async fn the_wrong_accessor_names_the_mismatch() {
         let dir = tempdir().unwrap();
         let embed = request(
             "embed",
             WorkerRole::Embed(EmbeddingEngine::Candle),
             dir.path().to_path_buf(),
         );
-        let mut active = None;
+        let mut active = ResidentModels::default();
         get_or_load(&mut active, &embed, &SuccessLoader, None)
             .await
             .unwrap();
-        assert!(active.as_ref().unwrap().embedder().is_ok());
 
         let generate = generate_request(dir.path());
-        get_or_load(&mut active, &generate, &SuccessLoader, None)
+        let loaded = get_or_load(&mut active, &generate, &SuccessLoader, None)
             .await
             .unwrap();
-        let loaded = active.as_ref().unwrap();
         assert!(loaded.generator().is_ok());
-        // And the wrong accessor names the mismatch rather than panicking.
         assert!(loaded.embedder().is_err());
     }
 
     #[tokio::test]
     async fn test_get_or_load_failure() {
         let dir = tempdir().unwrap();
-        let mut active = None;
+        let mut active = ResidentModels::default();
         let req = request(
             "embed",
             WorkerRole::Embed(EmbeddingEngine::Candle),
@@ -845,7 +1082,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_worker_request_info() {
         let dir = tempdir().unwrap();
-        let mut active = None;
+        let mut active = ResidentModels::default();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let req = request(
             "info",
@@ -867,7 +1104,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_worker_request_embed() {
         let dir = tempdir().unwrap();
-        let mut active = None;
+        let mut active = ResidentModels::default();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let req = request(
             "embed",
@@ -889,7 +1126,7 @@ mod tests {
     #[tokio::test]
     async fn generate_streams_tokens_then_a_completion() {
         let dir = tempdir().unwrap();
-        let mut active = None;
+        let mut active = ResidentModels::default();
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
         handle_worker_request(
@@ -923,7 +1160,7 @@ mod tests {
     #[tokio::test]
     async fn a_raised_cancel_flag_still_ends_with_a_terminal_event() {
         let dir = tempdir().unwrap();
-        let mut active = None;
+        let mut active = ResidentModels::default();
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let cancel = Arc::new(AtomicBool::new(true));
 
@@ -956,7 +1193,7 @@ mod tests {
     #[tokio::test]
     async fn generate_without_a_payload_reports_an_error() {
         let dir = tempdir().unwrap();
-        let mut active = None;
+        let mut active = ResidentModels::default();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let mut req = generate_request(dir.path());
         req.generate = None;
@@ -974,7 +1211,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_worker_request_unknown() {
         let dir = tempdir().unwrap();
-        let mut active = None;
+        let mut active = ResidentModels::default();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let req = request(
             "unknown",
@@ -994,7 +1231,7 @@ mod tests {
     #[tokio::test]
     async fn a_recognize_request_returns_the_regions_of_each_image_it_carried() {
         let dir = tempdir().unwrap();
-        let mut active = None;
+        let mut active = ResidentModels::default();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
 
         // Two images of different sizes, staged the way the host stages them.
@@ -1034,7 +1271,7 @@ mod tests {
     #[tokio::test]
     async fn a_recognize_request_without_images_reports_an_error() {
         let dir = tempdir().unwrap();
-        let mut active = None;
+        let mut active = ResidentModels::default();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let req = request(
             "recognize",
@@ -1055,7 +1292,7 @@ mod tests {
     #[tokio::test]
     async fn a_build_request_is_refused_rather_than_served() {
         let dir = tempdir().unwrap();
-        let mut active = None;
+        let mut active = ResidentModels::default();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let req = request(
             "build",
@@ -1146,7 +1383,7 @@ mod tests {
             }
         }
 
-        let mut active = None;
+        let mut active = ResidentModels::default();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
 
         handle_worker_request(

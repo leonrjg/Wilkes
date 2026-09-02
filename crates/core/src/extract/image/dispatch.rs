@@ -8,12 +8,20 @@
 //! variant and two match arms rather than a new path through the code.
 //!
 //! The split between what needs the weights and what does not is the point of
-//! this module. `load_recognizer_local` needs 1.9 GB and a device and must run
-//! in the worker. `identity` and `admission_threshold` are derived from
+//! this module, and it is the invariant of the whole image-analysis path:
+//! **no model in here executes in the host process.** `load_recognizer_local`
+//! is named `_local` because it loads into whatever process calls it, and the
+//! only caller allowed to is the recognition worker. `identity`,
+//! `inventory`, `installed` and `admission_threshold` are derived from
 //! constants, are needed by the host to write the extraction recipe, and must
 //! never require a model to answer — the recipe describes what the reading was
 //! produced under, and the process that owns the recipe is not the process
 //! holding the weights.
+//!
+//! The reason is the kill path, not tidiness. Reading a corpus is hours of
+//! inference, and the only way to stop inference that has stopped making
+//! progress is to kill the process running it. A model loaded in the host is
+//! one the user can only stop by quitting the application.
 
 use std::path::Path;
 
@@ -37,6 +45,13 @@ pub enum RecognitionEngine {
     /// PaddleOCR-VL under candle, in the recognition worker.
     #[serde(alias = "candle")]
     Candle,
+    /// Apple's Vision framework, in the recognition worker. macOS only, and
+    /// deliberately not the default: it reads lines of text two orders of
+    /// magnitude faster than either model and emits nothing else — no
+    /// formulas, no tables, no figure regions. Choosing it trades the
+    /// structure away, which is a decision and not a speed setting.
+    #[serde(alias = "vision")]
+    Vision,
 }
 
 impl RecognitionEngine {
@@ -44,6 +59,7 @@ impl RecognitionEngine {
         match self {
             RecognitionEngine::Onnx => "onnx",
             RecognitionEngine::Candle => "candle",
+            RecognitionEngine::Vision => "vision",
         }
     }
 
@@ -61,6 +77,16 @@ impl RecognitionEngine {
                     ""
                 }
             }
+            RecognitionEngine::Vision => {
+                #[cfg(all(feature = "recognize-vision", target_os = "macos"))]
+                {
+                    super::vision::MODEL_ID
+                }
+                #[cfg(not(all(feature = "recognize-vision", target_os = "macos")))]
+                {
+                    ""
+                }
+            }
         }
     }
 
@@ -71,6 +97,8 @@ impl RecognitionEngine {
         engines.push(RecognitionEngine::Onnx);
         #[cfg(feature = "candle")]
         engines.push(RecognitionEngine::Candle);
+        #[cfg(all(feature = "recognize-vision", target_os = "macos"))]
+        engines.push(RecognitionEngine::Vision);
         engines
     }
 }
@@ -78,6 +106,25 @@ impl RecognitionEngine {
 /// The model id the shipped recipe names for `engine`.
 pub fn shipped_model_id(engine: RecognitionEngine) -> &'static str {
     engine.default_model()
+}
+
+/// What a recognizer is for.
+///
+/// Both roles are [`OcrEngine`]s and both are dispatched by engine and model
+/// id, so they belong in one catalogue. They are not interchangeable, though:
+/// a page reader handed a crop of one expression comes apart, and a formula
+/// reader emits one whole-crop region and could not read a page. So the role
+/// travels with the descriptor, and a picker that offers page readers filters
+/// on it rather than keeping its own list of which ids are which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecognizerRole {
+    /// Reads a whole page or a whole picture: prose, and whatever else its
+    /// task configuration covers.
+    Page,
+    /// Reads one cropped expression and returns its LaTeX. Spent only on the
+    /// areas the layout detector marked out as formulas.
+    Formula,
 }
 
 /// One recognizer this build can read with, described rather than listed.
@@ -90,6 +137,9 @@ pub fn shipped_model_id(engine: RecognitionEngine) -> &'static str {
 pub struct RecognizerDescriptor {
     pub engine: RecognitionEngine,
     pub model_id: String,
+    /// Which of the two reading jobs this model does. Decides where it is
+    /// offered and what it is spent on; never inferred from the model id.
+    pub role: RecognizerRole,
     pub display_name: String,
     pub description: String,
     /// The recognizer a fresh install reads with — one across the catalogue.
@@ -119,10 +169,34 @@ pub struct RecognizerDescriptor {
 /// build has no PaddleOCR-VL" and "PaddleOCR-VL offers no models" are
 /// different answers, and only the first one may be shown as an engine the
 /// user cannot choose. Deriving the engines from the models collapses them.
+///
+/// `models` holds every recognizer, page readers and the formula reader
+/// alike, each carrying its [`RecognizerRole`]. The formula reader used to sit
+/// in a field of its own here, which made a second model of the same kind a
+/// second field rather than a second row.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct RecognizerCatalogue {
     pub engines: Vec<RecognitionEngine>,
     pub models: Vec<RecognizerDescriptor>,
+    /// The layout detector, which is not a recognizer but is the other half of
+    /// reading a document: it decides which areas a recognizer is spent on.
+    /// In the same answer because a picker that offered the recognizer and
+    /// left the detector to a second call would let a user finish configuring
+    /// and still read no mathematics.
+    ///
+    /// `None` when this build has no detector compiled in.
+    pub detector: Option<InstallableModelStatus>,
+}
+
+/// One model a picker can offer: what it is, and whether it is
+/// here.
+///
+/// Serialize only, like the inventory it carries: this is an answer the host
+/// produces, and nothing reads one back.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InstallableModelStatus {
+    pub inventory: crate::types::RecognizerInventory,
+    pub is_installed: bool,
 }
 
 /// Everything this build can recognize with, default first, then cached.
@@ -134,6 +208,7 @@ pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
     models.push(RecognizerDescriptor {
         engine: RecognitionEngine::Onnx,
         model_id: super::granite_docling::MODEL_ID.to_string(),
+        role: RecognizerRole::Page,
         display_name: "Granite-Docling 258M".to_string(),
         description: "Reads a page in one pass: prose, headings, LaTeX formulas and \
                       tables. Smaller and broader than PaddleOCR-VL."
@@ -153,11 +228,35 @@ pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
         ],
     });
 
+    // A row here rather than a slot of its own. It is an `OcrEngine` under the
+    // same runtime as the page reader above, installed the same way and named
+    // the same way; what makes it different is its role, and the role is a
+    // field. `is_default` is false because nothing defaults to reading pages
+    // with it — the picker filters to `RecognizerRole::Page`.
+    #[cfg(feature = "recognize-onnx")]
+    models.push(RecognizerDescriptor {
+        engine: RecognitionEngine::Onnx,
+        model_id: super::texify::MODEL_ID.to_string(),
+        role: RecognizerRole::Formula,
+        display_name: "Texify".to_string(),
+        description: "Reads one cropped expression back as LaTeX. Spent only on the \
+                      areas the layout detector marks out as formulas, which a page \
+                      reader cannot read."
+            .to_string(),
+        is_default: false,
+        is_engine_default: false,
+        is_cached: super::texify::is_installed(model_dir),
+        footprint_bytes: super::texify::footprint_bytes(),
+        admission_threshold: super::texify::ADMISSION_THRESHOLD,
+        emits: vec![RegionKind::Formula],
+    });
+
     #[cfg(feature = "candle")]
     for checkpoint in super::paddleocr_vl::CHECKPOINTS {
         models.push(RecognizerDescriptor {
             engine: RecognitionEngine::Candle,
             model_id: checkpoint.name.to_string(),
+            role: RecognizerRole::Page,
             display_name: format!("PaddleOCR-VL {}", checkpoint.name),
             description: "Transcribes the text drawn inside a picture, with precise \
                           per-region geometry."
@@ -170,6 +269,26 @@ pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
             emits: vec![RegionKind::Text],
         });
     }
+
+    #[cfg(all(feature = "recognize-vision", target_os = "macos"))]
+    models.push(RecognizerDescriptor {
+        engine: RecognitionEngine::Vision,
+        model_id: super::vision::MODEL_ID.to_string(),
+        role: RecognizerRole::Page,
+        display_name: "Apple Vision".to_string(),
+        description: "Reads lines of text about a hundred times faster than the \
+                      models, using the recognizer built into macOS. Prose only: \
+                      no formulas, no tables, nothing to download."
+            .to_string(),
+        is_default: false,
+        is_engine_default: super::vision::MODEL_ID == RecognitionEngine::Vision.default_model(),
+        // Part of the operating system, so there is nothing to install and
+        // nothing an uninstall could take away.
+        is_cached: super::vision::is_installed(),
+        footprint_bytes: super::vision::footprint_bytes(),
+        admission_threshold: super::vision::ADMISSION_THRESHOLD,
+        emits: vec![RegionKind::Text],
+    });
 
     let _ = model_dir;
     models.sort_by(|a, b| {
@@ -216,13 +335,11 @@ fn descriptor(
 pub fn identity(engine: RecognitionEngine, model_id: &str) -> anyhow::Result<String> {
     match engine {
         #[cfg(feature = "recognize-onnx")]
-        RecognitionEngine::Onnx => {
-            anyhow::ensure!(
-                model_id == super::granite_docling::MODEL_ID,
-                "unknown onnx recognizer '{model_id}'"
-            );
-            Ok(super::granite_docling::identity())
-        }
+        RecognitionEngine::Onnx => match model_id {
+            super::granite_docling::MODEL_ID => Ok(super::granite_docling::identity()),
+            super::texify::MODEL_ID => Ok(super::texify::identity()),
+            other => anyhow::bail!("unknown onnx recognizer '{other}'"),
+        },
         #[cfg(not(feature = "recognize-onnx"))]
         RecognitionEngine::Onnx => {
             let _ = model_id;
@@ -234,6 +351,19 @@ pub fn identity(engine: RecognitionEngine, model_id: &str) -> anyhow::Result<Str
         RecognitionEngine::Candle => {
             let _ = model_id;
             anyhow::bail!("the candle recognizer is not compiled into this build")
+        }
+        #[cfg(all(feature = "recognize-vision", target_os = "macos"))]
+        RecognitionEngine::Vision => {
+            anyhow::ensure!(
+                model_id == super::vision::MODEL_ID,
+                "unknown vision recognizer '{model_id}'"
+            );
+            Ok(super::vision::identity())
+        }
+        #[cfg(not(all(feature = "recognize-vision", target_os = "macos")))]
+        RecognitionEngine::Vision => {
+            let _ = model_id;
+            anyhow::bail!("the vision recognizer is not compiled into this build")
         }
     }
 }
@@ -263,13 +393,70 @@ pub fn installed(
     Ok(descriptor(engine, model_id, model_dir)?.is_cached)
 }
 
+/// What `(engine, model_id)` is for: reading pages, or reading formulas.
+///
+/// From the catalogue, so the answer is the descriptor's own and not a second
+/// table of which ids are which. Asked before a recognizer is attached, which
+/// is where a setting naming the wrong kind of model has to be caught.
+pub fn role(
+    engine: RecognitionEngine,
+    model_id: &str,
+    model_dir: &Path,
+) -> anyhow::Result<RecognizerRole> {
+    Ok(descriptor(engine, model_id, model_dir)?.role)
+}
+
+/// Load the layout detector in the calling process.
+///
+/// Must only be called from a worker subprocess, exactly like
+/// [`load_recognizer_local`] and for exactly the same reason: a detector run
+/// on the extraction thread is a hundred seconds of uninterruptible inference
+/// for a four-hundred-page book. The host reaches it through
+/// [`super::worker_layout::attach`].
+///
+/// The detector is not in [`list_models`] — it is a `LayoutModel` and not an
+/// [`OcrEngine`], so it could never come back from `load_recognizer_local` —
+/// but it is loaded through this module for the same reason everything else
+/// is: nothing outside the arm that owns a checkpoint names it.
+#[cfg(feature = "recognize-onnx")]
+pub fn load_layout_detector_local(
+    model_id: &str,
+    model_dir: &Path,
+) -> anyhow::Result<Box<dyn super::LayoutModel>> {
+    anyhow::ensure!(
+        model_id == super::doclayout::MODEL_ID,
+        "unknown layout detector '{model_id}'"
+    );
+    // One thread short of the machine, like the page reader: the worker serves
+    // one request at a time, and a box fully saturated by detection has
+    // nothing left to render the next page with.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).max(1))
+        .unwrap_or(1);
+    Ok(Box::new(super::doclayout::DocLayout::load(
+        model_dir, threads,
+    )?))
+}
+
+/// The formula recognizer this build ships, or `None` when it ships none.
+///
+/// Found by role rather than by name, so the one place that knows which model
+/// reads formulas is the catalogue row that declares it. A build compiled
+/// without the ONNX recognizer has no such row and therefore no formula
+/// reader, which is a configuration and not an error.
+pub fn formula_model(model_dir: &Path) -> Option<RecognizerDescriptor> {
+    list_models(model_dir)
+        .into_iter()
+        .find(|model| model.role == RecognizerRole::Formula)
+}
+
 /// Load the recognizer in the calling process.
 ///
-/// Must only be called from a worker subprocess. The recognizer is candle
-/// inference against 1.9 GB of weights on whatever accelerator the device
-/// string resolves to, and a fault in it takes down the process it is in —
-/// which is the whole reason recognition is addressed over a worker protocol
-/// rather than called directly.
+/// Must only be called from a worker subprocess — see this module's invariant.
+/// The host reaches every recognizer through [`super::worker_ocr::attach`]
+/// instead, formula readers included: a fault here takes down the process it
+/// is in, and a decode that stops making progress is ended by killing that
+/// process. Neither is survivable in the host.
 pub fn load_recognizer_local(
     engine: RecognitionEngine,
     model_id: &str,
@@ -278,20 +465,27 @@ pub fn load_recognizer_local(
 ) -> anyhow::Result<Box<dyn OcrEngine>> {
     match engine {
         #[cfg(feature = "recognize-onnx")]
-        RecognitionEngine::Onnx => {
-            anyhow::ensure!(
-                model_id == super::granite_docling::MODEL_ID,
-                "unknown onnx recognizer '{model_id}'"
-            );
-            // ONNX Runtime is told how many threads to use rather than which
-            // device: the CPU provider is the only one this recognizer was
-            // measured on, and naming a device it will not honour would be a
-            // setting that reads as a promise.
-            let threads = recognizer_threads(device);
-            Ok(Box::new(super::granite_docling::GraniteDocling::load(
-                model_dir, threads,
-            )?))
-        }
+        RecognitionEngine::Onnx => match model_id {
+            super::granite_docling::MODEL_ID => {
+                // ONNX Runtime is told how the work is laid out rather than
+                // which device: the CPU provider is the only one this
+                // recognizer was measured on, and naming a device it will not
+                // honour would be a setting that reads as a promise.
+                let (readers, threads) = recognizer_layout(device);
+                Ok(Box::new(super::granite_docling::GraniteDocling::load(
+                    model_dir, readers, threads,
+                )?))
+            }
+            // One reader, because a formula crop is one small image and the
+            // decode is a pass over the whole decoder per token: it waits on
+            // memory, not on arithmetic, and a second reader would contend for
+            // the bandwidth the first is already waiting on.
+            super::texify::MODEL_ID => {
+                let (_, threads) = recognizer_layout(device);
+                Ok(Box::new(super::texify::Texify::load(model_dir, threads)?))
+            }
+            other => anyhow::bail!("unknown onnx recognizer '{other}'"),
+        },
         #[cfg(not(feature = "recognize-onnx"))]
         RecognitionEngine::Onnx => {
             let (_, _, _) = (model_id, model_dir, device);
@@ -308,19 +502,71 @@ pub fn load_recognizer_local(
             let (_, _, _) = (model_id, model_dir, device);
             anyhow::bail!("the candle recognizer is not compiled into this build")
         }
+        #[cfg(all(feature = "recognize-vision", target_os = "macos"))]
+        RecognitionEngine::Vision => {
+            anyhow::ensure!(
+                model_id == super::vision::MODEL_ID,
+                "unknown vision recognizer '{model_id}'"
+            );
+            // No model directory and no device: the recognizer is the operating
+            // system's and picks its own hardware. Naming either would be a
+            // setting Wilkes cannot honour.
+            let (_, _) = (model_dir, device);
+            Ok(Box::new(super::vision::AppleVision::load()?))
+        }
+        #[cfg(not(all(feature = "recognize-vision", target_os = "macos")))]
+        RecognitionEngine::Vision => {
+            let (_, _, _) = (model_id, model_dir, device);
+            anyhow::bail!("the vision recognizer is not compiled into this build")
+        }
     }
 }
 
-/// How many threads the ONNX recognizer gets.
+/// How the ONNX recognizer's work is laid out: how many pages it reads at
+/// once, and how many threads each of those readers gets.
 ///
-/// One less than the machine has, so an indexing pass that runs for an hour
-/// does not take the interface down with it, and at least one on a machine
-/// that reports nothing.
+/// Still one less than the machine has in total, so an indexing pass that runs
+/// for an hour does not take the interface down with it. What changed is how
+/// that budget is spent. Giving it all to one reader spends most of it on a
+/// decode that cannot use it: each step is a pass over the whole decoder's
+/// weights, so it waits on memory rather than on arithmetic, and a page read
+/// with nine threads produces a token in 13.8ms against 15.3ms with one.
+/// Nine-tenths of the machine sits idle whatever the thread count is.
+///
+/// Reading two pages at once uses some of that idle capacity. Not all of it:
+/// the readers contend for the same memory bandwidth the single reader was
+/// already waiting on, so the gain is real but bounded. Six pages of a text
+/// page through the whole engine, on a 10-core M4:
+///
+/// | layout | elapsed | peak |
+/// |--------|---------|------|
+/// | 1 x 9  | 47.3s   | 2.9 GB |
+/// | 2 x 4  | 41.7s   | 5.6 GB |
+/// | 3 x 2  | 40.5s   | 8.7 GB |
+/// | 4 x 2  | 41.3s   | 11.0 GB |
+///
+/// [`MAX_READERS`] is two because that is the knee. The second reader buys
+/// 13% for 2.7 GB; the third buys a further 3% for 2.8 GB, and the fourth is
+/// slower than the third while costing more again. Two also keeps the pool's
+/// peak near the 4.9 GB a single reader needed before its tiles were grouped,
+/// which is the footprint this recognizer has already been shown to live in.
+/// A machine with memory to spare gains a little from three, and this is the
+/// one constant to change.
+///
+/// [`THREADS_PER_READER`] is four because a reader keeps improving up to it —
+/// two readers of two threads take 46.1s, of three 42.2s, of four 41.7s —
+/// the page's vision encoding and prefill being the parts that still scale
+/// where the decode does not.
 #[cfg(feature = "recognize-onnx")]
-fn recognizer_threads(_device: &str) -> usize {
-    std::thread::available_parallelism()
+fn recognizer_layout(_device: &str) -> (usize, usize) {
+    const THREADS_PER_READER: usize = 4;
+    const MAX_READERS: usize = 2;
+
+    let budget = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(1).max(1))
-        .unwrap_or(1)
+        .unwrap_or(1);
+    let readers = (budget / THREADS_PER_READER).clamp(1, MAX_READERS);
+    (readers, THREADS_PER_READER)
 }
 
 /// Keep an existing library on the recognizer that produced it.
@@ -369,13 +615,11 @@ pub fn inventory(
 ) -> anyhow::Result<crate::types::RecognizerInventory> {
     match engine {
         #[cfg(feature = "recognize-onnx")]
-        RecognitionEngine::Onnx => {
-            anyhow::ensure!(
-                model_id == super::granite_docling::MODEL_ID,
-                "unknown onnx recognizer '{model_id}'"
-            );
-            Ok(super::granite_docling::inventory())
-        }
+        RecognitionEngine::Onnx => match model_id {
+            super::granite_docling::MODEL_ID => Ok(super::granite_docling::inventory()),
+            super::texify::MODEL_ID => Ok(super::texify::inventory()),
+            other => anyhow::bail!("unknown onnx recognizer '{other}'"),
+        },
         #[cfg(not(feature = "recognize-onnx"))]
         RecognitionEngine::Onnx => {
             let _ = model_id;
@@ -387,6 +631,19 @@ pub fn inventory(
         RecognitionEngine::Candle => {
             let _ = model_id;
             anyhow::bail!("the candle recognizer is not compiled into this build")
+        }
+        #[cfg(all(feature = "recognize-vision", target_os = "macos"))]
+        RecognitionEngine::Vision => {
+            anyhow::ensure!(
+                model_id == super::vision::MODEL_ID,
+                "unknown vision recognizer '{model_id}'"
+            );
+            Ok(super::vision::inventory())
+        }
+        #[cfg(not(all(feature = "recognize-vision", target_os = "macos")))]
+        RecognitionEngine::Vision => {
+            let _ = model_id;
+            anyhow::bail!("the vision recognizer is not compiled into this build")
         }
     }
 }
@@ -400,13 +657,11 @@ pub fn install(
 ) -> anyhow::Result<()> {
     match engine {
         #[cfg(feature = "recognize-onnx")]
-        RecognitionEngine::Onnx => {
-            anyhow::ensure!(
-                model_id == super::granite_docling::MODEL_ID,
-                "unknown onnx recognizer '{model_id}'"
-            );
-            super::granite_docling::install(model_dir, progress)
-        }
+        RecognitionEngine::Onnx => match model_id {
+            super::granite_docling::MODEL_ID => super::granite_docling::install(model_dir, progress),
+            super::texify::MODEL_ID => super::texify::install(model_dir, progress),
+            other => anyhow::bail!("unknown onnx recognizer '{other}'"),
+        },
         #[cfg(not(feature = "recognize-onnx"))]
         RecognitionEngine::Onnx => {
             let (_, _, _) = (model_id, model_dir, progress);
@@ -420,6 +675,14 @@ pub fn install(
         RecognitionEngine::Candle => {
             let (_, _, _) = (model_id, model_dir, progress);
             anyhow::bail!("the candle recognizer is not compiled into this build")
+        }
+        // Installable is a property of the artifacts, and this recognizer has
+        // none. An error rather than a silent success: nothing should ever ask,
+        // because the catalogue reports it cached, and a caller that asks
+        // anyway has a bug that a no-op would hide.
+        RecognitionEngine::Vision => {
+            let (_, _, _) = (model_id, model_dir, progress);
+            anyhow::bail!("the vision recognizer is part of macOS and cannot be installed")
         }
     }
 }
@@ -479,22 +742,49 @@ mod tests {
     fn every_catalogued_recognizer_states_its_cost_threshold_and_kinds() {
         let dir = tempfile::tempdir().unwrap();
         for model in list_models(dir.path()) {
-            assert!(
-                model.footprint_bytes > 0,
-                "{} states no footprint",
-                model.model_id
-            );
-            assert!(
-                model.admission_threshold > 0.0 && model.admission_threshold < 1.0,
-                "{} admits at {}",
-                model.model_id,
-                model.admission_threshold
-            );
+            // Per role, because admission means two different things. A page
+            // reader admits a region on the confidence of its own decode, so
+            // its threshold is an operating point and must be one — a page
+            // reader admitting at zero would put every hallucinated region
+            // into the reading. A formula reader admits on whether the LaTeX
+            // parses, which is a property of the answer and not a score, so it
+            // declares zero and the assertion here is that it declares
+            // *exactly* zero rather than a number nothing consults.
+            match model.role {
+                RecognizerRole::Page => assert!(
+                    model.admission_threshold > 0.0 && model.admission_threshold < 1.0,
+                    "the page reader {} admits at {}",
+                    model.model_id,
+                    model.admission_threshold
+                ),
+                RecognizerRole::Formula => assert_eq!(
+                    model.admission_threshold, 0.0,
+                    "the formula reader {} declares a score threshold, but formulas are \
+                     admitted on whether their LaTeX parses",
+                    model.model_id
+                ),
+            }
             assert!(!model.emits.is_empty(), "{} emits nothing", model.model_id);
-            assert!(
-                !model.is_cached,
-                "nothing is installed in a fresh directory"
-            );
+            // A recognizer either downloads artifacts — so it states their size
+            // and is absent from a directory nothing has been installed into —
+            // or it ships with the operating system, so it has no footprint and
+            // is always present. Those are the only two shapes, and a
+            // recognizer that claimed a footprint while needing no download
+            // would put a number in front of the user that nothing will ever
+            // fetch.
+            if model.footprint_bytes > 0 {
+                assert!(
+                    !model.is_cached,
+                    "{} has artifacts, so a fresh directory cannot hold them",
+                    model.model_id
+                );
+            } else {
+                assert!(
+                    model.is_cached,
+                    "{} states no footprint, so it must need no installing",
+                    model.model_id
+                );
+            }
         }
     }
 

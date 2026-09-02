@@ -3,6 +3,15 @@ name = "wilkes-api"
 version.workspace = true
 edition = "2021"
 
+[features]
+# Forwarded rather than assumed. `context.rs` gates the layout-detector and
+# formula-recognizer installs on this, and a crate that tests a feature it does
+# not declare tests `false` for ever — which is precisely how those two
+# downloads came to compile to their "not compiled in" stubs while the code
+# they refuse to reach was sitting in the binary.
+default = ["recognize-onnx"]
+recognize-onnx = ["wilkes-core/recognize-onnx"]
+
 [dependencies]
 wilkes-core = { path = "../core" }
 wilkes-agent = { path = "../agent" }

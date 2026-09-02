@@ -112,7 +112,11 @@ function isReferencedPdfMatch(candidate: Match, selected: MatchRef): boolean {
   );
 }
 
-export default function PreviewPane() {
+interface PreviewPaneProps {
+  standalone?: boolean;
+}
+
+export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   const activeTab = useViewerStore(activeViewerTab);
   const goBack = useViewerStore((state) => state.goBack);
   const goForward = useViewerStore((state) => state.goForward);
@@ -131,19 +135,23 @@ export default function PreviewPane() {
   const reportTabLoadError = useViewerStore((state) => state.reportTabLoadError);
   const addBookmark = useBookmarksStore((s) => s.add);
   const removeBookmark = useBookmarksStore((s) => s.remove);
-  const bookmarks = useBookmarksStore((s) => s.bookmarks);
+  const workspaceBookmarks = useBookmarksStore((s) => s.bookmarks);
   const setChatActiveDoc = useChatStore((s) => s.setActiveDoc);
   const chatBackendsLoaded = useChatStore((s) => s.backendsLoaded);
   const hasAvailableChatBackend = useChatStore((s) => s.hasAvailableBackend);
   const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
-  const generationReady = useGenerationStore((state) => state.ready);
-  const semanticReady = useSemanticStore((state) => state.readyForCurrentRoot);
-  const searchResults = useSearchStore((state) => state.results);
+  const workspaceGenerationReady = useGenerationStore((state) => state.ready);
+  const workspaceSemanticReady = useSemanticStore((state) => state.readyForCurrentRoot);
+  const workspaceSearchResults = useSearchStore((state) => state.results);
   const listedDoi = useSettingsStore((state) =>
-    selectedMatch
+    !standalone && selectedMatch
       ? state.fileList.find((entry) => entry.path === selectedMatch.path)?.doi ?? null
       : null,
   );
+  const bookmarks = standalone ? [] : workspaceBookmarks;
+  const generationReady = !standalone && workspaceGenerationReady;
+  const semanticReady = !standalone && workspaceSemanticReady;
+  const searchResults = standalone ? [] : workspaceSearchResults;
   const { addToast } = useToasts();
   const pdfAutoZoomTargetPx = useSettingsStore(
     (state) => state.settings?.pdf_auto_zoom_target_px,
@@ -225,6 +233,7 @@ export default function PreviewPane() {
   // Publish that application state directly for external MCP, then separately
   // mirror it into the private chat context when the desktop chat is present.
   useEffect(() => {
+    if (standalone) return;
     if (!selectedMatch) {
       api.setActiveDocument?.(null).catch((error) =>
         console.error("mcp: failed to clear active document", error),
@@ -237,9 +246,10 @@ export default function PreviewPane() {
       console.error("mcp: failed to update active document", error),
     );
     if (isTauri) setChatActiveDoc(selectedMatch.path, page);
-  }, [selectedMatch, setChatActiveDoc]);
+  }, [selectedMatch, setChatActiveDoc, standalone]);
 
   const handleChatPageChange = (page: number) => {
+    if (standalone) return;
     if (selectedMatch) {
       api.setActiveDocument?.(selectedMatch.path, page).catch((error) =>
         console.error("mcp: failed to update active document page", error),
@@ -275,7 +285,7 @@ export default function PreviewPane() {
   if (!activeTab || !selectedMatch) {
     return (
       <div className="flex h-full flex-col bg-[var(--bg-app)] text-[var(--text-dim)]">
-        <ViewerTabs />
+        <ViewerTabs standalone={standalone} />
         <div className="flex flex-1 flex-col items-center justify-center">
           <img
             src="/logo.transparent.png"
@@ -370,7 +380,7 @@ export default function PreviewPane() {
     <SelectionActions
       selection={selection}
       api={api}
-      onAddBookmark={handleAddBookmark}
+      onAddBookmark={standalone ? undefined : handleAddBookmark}
       showChatActions={chatSelectionActionsAvailable}
       onExplain={handleExplainSelection}
       onAsk={handleAskSelection}
@@ -468,7 +478,7 @@ export default function PreviewPane() {
 
   return (
     <div className="flex flex-col h-full min-h-0 overflow-hidden">
-      <ViewerTabs />
+      <ViewerTabs standalone={standalone} />
       {/* Header */}
       <div className="px-3 py-2 border-b border-[var(--border-main)] flex items-center gap-3 flex-shrink-0 bg-[var(--bg-header)]">
         <div className="flex items-center gap-1">
@@ -567,7 +577,7 @@ export default function PreviewPane() {
           </div>
         </div>
 
-        {generationReady && (
+        {!standalone && generationReady && (
           <Tooltip content={sidePanel === "summary" ? "Hide summary" : "Summarize document"}>
             <button
               onClick={() =>
@@ -585,7 +595,7 @@ export default function PreviewPane() {
           </Tooltip>
         )}
 
-        <Tooltip content={sidePanel === "related" ? "Hide related documents" : "Show related documents"}>
+        {!standalone && <Tooltip content={sidePanel === "related" ? "Hide related documents" : "Show related documents"}>
           <button
             onClick={() =>
               setSidePanel((current) => (current === "related" ? null : "related"))
@@ -597,9 +607,9 @@ export default function PreviewPane() {
           >
             <Link2 size={16} />
           </button>
-        </Tooltip>
+        </Tooltip>}
 
-        {currentDoi && (
+        {!standalone && currentDoi && (
           <Tooltip content={sidePanel === "citations" ? "Hide citation graph" : "Show citation graph"}>
             <button
               type="button"
@@ -616,7 +626,7 @@ export default function PreviewPane() {
           </Tooltip>
         )}
 
-        <Tooltip
+        {!standalone && <Tooltip
           content={
             semanticReady
               ? sidePanel === "topics"
@@ -646,7 +656,7 @@ export default function PreviewPane() {
           >
             <Cloud size={16} />
           </button>
-        </Tooltip>
+        </Tooltip>}
 
         {isRenderableFile && (
           <Tooltip content={textView === "rendered" ? `View ${renderedFileLabel} source` : `View rendered ${renderedFileLabel}`}>
@@ -661,7 +671,7 @@ export default function PreviewPane() {
           </Tooltip>
         )}
 
-        {!isPdfFile && displayData && "Text" in displayData && (
+        {!standalone && !isPdfFile && displayData && "Text" in displayData && (
           <Tooltip content={editing ? "Return to document viewer" : "Edit document"}>
             <button
               type="button"
@@ -786,20 +796,20 @@ export default function PreviewPane() {
             ) : null}
           </div>
           </ReaderHostProvider>
-          {sidePanel === "summary" && generationReady && (
+          {!standalone && sidePanel === "summary" && generationReady && (
             <DocumentSummaryPane
               path={selectedMatch.path}
               onClose={() => setSidePanel(null)}
             />
           )}
-          {sidePanel === "related" && (
+          {!standalone && sidePanel === "related" && (
             <RelatedDocumentsPane
               currentPath={selectedMatch.path}
               onOpenDocument={openFile}
               onClose={() => setSidePanel(null)}
             />
           )}
-          {sidePanel === "citations" && currentDoi && (
+          {!standalone && sidePanel === "citations" && currentDoi && (
             <CitationGraphPane
               currentPath={selectedMatch.path}
               doi={currentDoi}
@@ -807,7 +817,7 @@ export default function PreviewPane() {
               onClose={() => setSidePanel(null)}
             />
           )}
-          {sidePanel === "topics" && semanticReady && (
+          {!standalone && sidePanel === "topics" && semanticReady && (
             <DocumentTopicCloudPane
               currentPath={selectedMatch.path}
               onClose={() => setSidePanel(null)}

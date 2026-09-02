@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use ignore::WalkBuilder;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql};
-use tracing::error;
+use tracing::{error, info};
 
 use crate::consumer::{consumer_error, ConsumerErrorCode};
 use crate::extract::ExtractorRegistry;
@@ -2357,6 +2357,167 @@ mod tests {
         assert!(progress_count >= 2);
     }
 
+    /// A recorder that stands in for the two expensive halves of a build, so
+    /// the order they run in is observable without either model.
+    #[derive(Clone, Default)]
+    struct BuildLog(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl BuildLog {
+        fn record(&self, event: impl Into<String>) {
+            self.0.lock().unwrap().push(event.into());
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// An extractor that reads nothing and remembers being asked. A non-empty
+    /// `analyzer_identity` is what makes the build treat its documents as
+    /// carrying figures — the same declaration a real analyzer-bearing
+    /// extractor makes.
+    struct RecordingExtractor {
+        log: BuildLog,
+        analyzer_identity: String,
+    }
+
+    impl crate::extract::ContentExtractor for RecordingExtractor {
+        fn can_handle(&self, path: &std::path::Path, _mime: Option<&str>) -> bool {
+            path.extension().and_then(|e| e.to_str()) == Some("doc")
+        }
+
+        fn image_analyzer_identity(&self) -> &str {
+            &self.analyzer_identity
+        }
+
+        fn release_image_analyzer(&self) {
+            self.log.record("release");
+        }
+
+        fn extract(
+            &self,
+            path: &std::path::Path,
+        ) -> anyhow::Result<crate::types::ExtractedContent> {
+            let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+            self.log.record(format!("read:{name}"));
+            Ok(crate::types::ExtractedContent {
+                text: format!("the text of {name}"),
+                source_map: crate::types::SourceMap {
+                    segments: Vec::new(),
+                },
+                metadata: crate::types::FileMetadata {
+                    path: path.to_path_buf(),
+                    size_bytes: 0,
+                    mime: None,
+                    title: None,
+                    page_count: None,
+                },
+                images: Vec::new(),
+            })
+        }
+
+        fn outline(
+            &self,
+            _path: &std::path::Path,
+        ) -> anyhow::Result<crate::types::DeclaredOutline> {
+            Ok(crate::types::DeclaredOutline::default())
+        }
+    }
+
+    struct RecordingEmbedder(BuildLog);
+
+    impl Embedder for RecordingEmbedder {
+        fn embedding_space_identity(&self) -> crate::embed::EmbeddingSpaceIdentity {
+            crate::embed::EmbeddingSpaceIdentity::for_test(
+                self.engine(),
+                self.model_id(),
+                self.dimension(),
+            )
+        }
+        fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.0.record("embed");
+            Ok(vec![vec![1.0]; texts.len()])
+        }
+        fn model_id(&self) -> &str {
+            "recording"
+        }
+        fn dimension(&self) -> usize {
+            1
+        }
+        fn engine(&self) -> EmbeddingEngine {
+            EmbeddingEngine::Candle
+        }
+    }
+
+    /// Build `paths` with a registry whose extractor records every read, and
+    /// return what happened in order.
+    fn build_recording(analyzer_identity: &str) -> Vec<String> {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let paths: Vec<PathBuf> = ["a", "b"]
+            .iter()
+            .map(|name| {
+                let path = root.join(format!("{name}.doc"));
+                fs::write(&path, "source bytes").unwrap();
+                path
+            })
+            .collect();
+        let data_dir = dir.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+
+        let log = BuildLog::default();
+        let mut registry = ExtractorRegistry::new();
+        registry.register(Box::new(RecordingExtractor {
+            log: log.clone(),
+            analyzer_identity: analyzer_identity.to_string(),
+        }));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        SemanticIndex::build(
+            &data_dir,
+            &root,
+            &paths,
+            &registry,
+            &RecordingEmbedder(log.clone()),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            &IndexingConfig {
+                chunk_size: 100,
+                chunk_overlap: 0,
+                supported_extensions: vec!["doc".to_string()],
+            },
+        )
+        .unwrap();
+        log.events()
+    }
+
+    /// The invariant this build is arranged around: every document is read
+    /// for its figures before anything is embedded, and the recognizer is let
+    /// go at the boundary — so the two models are never both resident, and
+    /// neither sits idle through the other's work waiting to be reaped.
+    #[test]
+    fn recognition_is_a_whole_pass_that_finishes_before_the_first_embedding() {
+        assert_eq!(
+            build_recording("test-analyzer-v1"),
+            vec![
+                "read:a", "read:b",  // the recognition pass, whole
+                "release", // and the recognizer let go at its end
+                "read:a", "read:b", // the embedding pass re-reads from cache
+                "embed",
+            ]
+        );
+    }
+
+    /// The pass is spent only where there is something to recognize. With no
+    /// analyzer configured there are no figures to read, so a document is
+    /// read once and nothing is released — the separation must not cost a
+    /// second read of every file in a library nobody enriched.
+    #[test]
+    fn a_build_with_no_analyzer_reads_each_document_once() {
+        assert_eq!(build_recording(""), vec!["read:a", "read:b", "embed"]);
+    }
+
     #[test]
     fn test_build_reembeds_legacy_rows_without_exact_identity() {
         for missing_text in [None, Some("")] {
@@ -3612,6 +3773,25 @@ impl SemanticIndex {
 
     /// Full build: creates the database at `data_dir`, indexes every path, and
     /// returns the open index.
+    ///
+    /// Three passes, in this order: reuse what is unchanged, read every
+    /// remaining document's figures, then extract and embed. Recognition is a
+    /// pass of its own rather than a step inside the per-file loop because
+    /// the two models it alternated with are large and slow in opposite ways.
+    /// A document whose figures take minutes to read left the embedder idle
+    /// past its timeout, and a batch of embeddings did the same to the
+    /// recognizer, so a corpus of illustrated PDFs paid a model reload per
+    /// alternation while holding both models resident in between. Separated,
+    /// each pass keeps one model loaded, and the recognizer is released
+    /// before the first embedding is asked for.
+    ///
+    /// What makes the second read of a document cheap is the annotation
+    /// cache: the recognition pass fills it, and the extraction the embedding
+    /// pass performs reads the answers back instead of recognizing again. A
+    /// figure whose analysis came back partial is deliberately not cached, so
+    /// that one case can still reach the recognizer during the embedding pass
+    /// — a failure re-tried, not a schedule that quietly went back to
+    /// interleaving.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         data_dir: &Path,
@@ -3647,30 +3827,61 @@ impl SemanticIndex {
         // what else was in the batch, so it keeps the one-file-per-batch
         // grouping it had; regrouping its chunks would change them.
         let batch_target = embedder.preferred_batch_size();
-        let mut queue: Vec<PendingFile> = Vec::new();
-        let mut queued_chunks = 0usize;
 
+        // Progress is counted in units of work, not files, because a document
+        // with figures is visited twice — once to read them and once to
+        // embed the reading — and a bar that counted files would sit still
+        // for the whole of the first visit. Each path costs one unit, plus a
+        // second when its extractor enriches images. Known before any work
+        // starts, so the denominator never moves under the user.
+        let reads_figures = |path: &Path| -> bool {
+            extractors
+                .find(path, None)
+                .is_some_and(|extractor| !extractor.image_analyzer_identity().is_empty())
+        };
+        let total_units: usize = paths
+            .iter()
+            .map(|path| if reads_figures(path) { 2 } else { 1 })
+            .sum();
+        let mut done_units = 0usize;
+        let progress = |done: usize, message: String| {
+            let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
+                files_processed: done,
+                total_files: total_units,
+                message,
+                done: false,
+            }));
+        };
+
+        // ── Pass 1: what is unchanged is reused ─────────────────────────────
+        //
+        // First, so that a document the previous index already read costs
+        // neither a decode nor a place in the recognition pass.
+        let mut pending: Vec<(PathBuf, ExtractionRecipe)> = Vec::new();
         for (i, path) in paths.iter().enumerate() {
+            anyhow::ensure!(
+                !cancel_flag.load(Ordering::Relaxed),
+                "Index build cancelled"
+            );
+            progress(
+                done_units,
+                format!("Checking {} of {}...", i + 1, total_files),
+            );
+
             let extraction_recipe = ExtractionRecipe::for_path(
                 path,
                 extractors,
                 indexing.chunk_size,
                 indexing.chunk_overlap,
             );
-            anyhow::ensure!(
-                !cancel_flag.load(Ordering::Relaxed),
-                "Index build cancelled"
-            );
-            let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
-                files_processed: i,
-                total_files,
-                message: format!("Indexing {} of {}...", i + 1, total_files),
-                done: false,
-            }));
-
             if let Some(source) = reusable.as_ref() {
                 match idx.reuse_unchanged_file_from(source, path, extractors, &extraction_recipe) {
-                    Ok(true) => continue,
+                    // Reused whole: every unit this path was going to cost is
+                    // spent, the recognition one included.
+                    Ok(true) => {
+                        done_units += if reads_figures(path) { 2 } else { 1 };
+                        continue;
+                    }
                     Ok(false) => {}
                     Err(e) => error!(
                         "[SemanticIndex::build] could not reuse {}: {e:#}",
@@ -3678,21 +3889,85 @@ impl SemanticIndex {
                     ),
                 }
             }
+            pending.push((path.clone(), extraction_recipe));
+        }
 
-            let (full_text, chunks, regions) = match Self::extract_chunks(
+        // ── Pass 2: every figure in the corpus, before any embedding ────────
+        let to_recognize: Vec<&PathBuf> = pending
+            .iter()
+            .map(|(path, _)| path)
+            .filter(|path| reads_figures(path))
+            .collect();
+        if !to_recognize.is_empty() {
+            info!(
+                "[SemanticIndex::build] recognition pass over {} document(s)",
+                to_recognize.len()
+            );
+            // Cancellation leaves the loop rather than the function, so that
+            // the release below happens on every exit from this pass.
+            let mut cancelled = false;
+            for (i, path) in to_recognize.iter().enumerate() {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    cancelled = true;
+                    break;
+                }
+                progress(
+                    done_units,
+                    format!("Reading figures in {} of {}...", i + 1, to_recognize.len()),
+                );
+                // The reading itself is dropped. What is kept is the
+                // annotation cache it filled, which pass 3 reads back.
+                if let Err(e) = Self::extract_content(path, extractors) {
+                    error!(
+                        "[SemanticIndex::build] could not read {} for recognition: {e:#}",
+                        path.display()
+                    );
+                }
+                done_units += 1;
+            }
+            // No more images this build: the recognizer's weights go now
+            // rather than at whatever moment its idle timeout arrives, and
+            // the embedding pass has the machine to itself. On the cancelled
+            // path too — an abandoned build must not leave them resident.
+            extractors.release_image_analyzers();
+            anyhow::ensure!(!cancelled, "Index build cancelled");
+        }
+
+        // ── Pass 3: extract and embed ───────────────────────────────────────
+        let mut queue: Vec<PendingFile> = Vec::new();
+        let mut queued_chunks = 0usize;
+        for (i, (path, extraction_recipe)) in pending.iter().enumerate() {
+            anyhow::ensure!(
+                !cancel_flag.load(Ordering::Relaxed),
+                "Index build cancelled"
+            );
+            progress(
+                done_units,
+                format!("Indexing {} of {}...", i + 1, pending.len()),
+            );
+
+            let extracted = Self::extract_chunks(
                 path,
                 extractors,
                 indexing.chunk_size,
                 indexing.chunk_overlap,
-            ) {
+            );
+            done_units += 1;
+            let (full_text, chunks, regions) = match extracted {
                 Ok((text, c, regions)) if !c.is_empty() => (text, c, regions),
-                _ => continue,
+                // A document that yielded no chunk is indexed by nothing;
+                // that is a reading, not a failure.
+                Ok(_) => continue,
+                Err(e) => {
+                    error!("[SemanticIndex::build] skipping {}: {e:#}", path.display());
+                    continue;
+                }
             };
 
             queued_chunks += chunks.len();
             queue.push(PendingFile {
                 path: path.clone(),
-                recipe: extraction_recipe,
+                recipe: extraction_recipe.clone(),
                 full_text,
                 chunks,
                 regions,
@@ -3730,8 +4005,8 @@ impl SemanticIndex {
         );
 
         let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
-            files_processed: total_files,
-            total_files,
+            files_processed: total_units,
+            total_files: total_units,
             message: "Done!".to_string(),
             done: true,
         }));

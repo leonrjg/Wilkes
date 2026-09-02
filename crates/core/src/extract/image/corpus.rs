@@ -673,6 +673,23 @@ fn extract(
     script: Vec<Script>,
     describer: Option<Describer>,
 ) -> (ExtractedContent, crate::types::ExtractionDiagnostics) {
+    // Almost every case below is about what a recognizer does with a picture,
+    // which requires the pictures to reach it. The scope is its own case and
+    // says so by naming itself.
+    extract_scoped(
+        pages,
+        script,
+        describer,
+        crate::types::ImageScope::TypesetAndEmbedded,
+    )
+}
+
+fn extract_scoped(
+    pages: Vec<PageSpec>,
+    script: Vec<Script>,
+    describer: Option<Describer>,
+    scope: crate::types::ImageScope,
+) -> (ExtractedContent, crate::types::ExtractionDiagnostics) {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let path = dir.path().join("case.pdf");
     std::fs::write(&path, build_pdf(pages)).expect("the fixture is written");
@@ -683,12 +700,20 @@ fn extract(
     let content = PdfExtractor::with_image_analyzer(Arc::new(NativeImageAnalyzer::new(
         Box::new(ScriptedOcr::new(script.clone())),
         describer.map(|build| build()),
+        scope,
+        // These fixtures are about what a recognizer does with a picture, not
+        // about what marks pictures out.
+        None,
     )))
     .extract(&path)
     .expect("the fixture extracts");
     let diagnostics = PdfExtractor::with_image_analyzer(Arc::new(NativeImageAnalyzer::new(
         Box::new(ScriptedOcr::new(script)),
         describer.map(|build| build()),
+        scope,
+        // These fixtures are about what a recognizer does with a picture, not
+        // about what marks pictures out.
+        None,
     )))
     .outline(&path)
     .expect("the fixture's outline reads")
@@ -700,6 +725,91 @@ fn extract(
 const MIDDLE: [f32; 8] = [0.25, 0.25, 0.75, 0.25, 0.75, 0.75, 0.25, 0.75];
 
 // ── The corpus ───────────────────────────────────────────────────────────────
+
+/// The default scope does not spend the recognizer on a picture the PDF
+/// embeds. The page still draws it, the reading still knows it is there, and
+/// nothing is claimed about what it contains.
+///
+/// The script fails on the first call, so a recognizer that ran at all would
+/// leave `Partial { failures }` behind and this would not pass by accident.
+#[test]
+fn the_default_scope_withholds_an_embedded_raster_from_the_recognizer() {
+    let (content, diagnostics) = extract_scoped(
+        vec![PageSpec::default()
+            .with_text(20.0, 250.0, "Before the figure")
+            .with_image(ImageSpec::gradient(64, 32))],
+        vec![Script::Fails("the recognizer must not be called")],
+        None,
+        crate::types::ImageScope::TypesetOnly,
+    );
+
+    assert_eq!(content.images.len(), 1, "the page still draws one picture");
+    let image = &content.images[0];
+    let ImageAnalysisStatus::NotRead { reason } = &image.status else {
+        panic!("expected NotRead, got {:?}", image.status);
+    };
+    assert!(
+        reason.contains("typeset"),
+        "the reason names the setting rather than a fault: {reason}"
+    );
+
+    // Never decoded, so there is no digest and no size. An empty digest here
+    // is the truthful record of a picture nobody looked at, not a failure.
+    assert!(image.image_sha256.is_empty(), "the pixels were not read");
+    assert_eq!((image.pixel_width, image.pixel_height), (0, 0));
+    assert!(image.ocr_regions.is_empty());
+    assert!(image.reading_range.is_none());
+
+    assert!(
+        !content.text.contains("Image embedded text:"),
+        "nothing was transcribed into the reading: {:?}",
+        content.text
+    );
+    assert!(
+        content.text.contains("Before the figure"),
+        "and the page's own text is untouched: {:?}",
+        content.text
+    );
+
+    // Found and counted, separately from what a limit rejected: a reader of
+    // the diagnostics can tell a setting from a decoder problem.
+    assert_eq!(diagnostics.native_images_found, 1);
+    assert_eq!(diagnostics.native_images_not_read, 1);
+    assert_eq!(diagnostics.native_images_analyzed, 0);
+    assert_eq!(diagnostics.native_images_skipped_technical_limit, 0);
+    assert_eq!(diagnostics.images_ocr_succeeded, 0);
+    assert_eq!(diagnostics.images_ocr_failed, 0);
+}
+
+/// The same page under the other scope, so the test above is about the scope
+/// and not about the fixture.
+#[test]
+fn the_wider_scope_reads_the_same_embedded_raster() {
+    let (content, diagnostics) = extract_scoped(
+        vec![PageSpec::default()
+            .with_text(20.0, 250.0, "Before the figure")
+            .with_image(ImageSpec::gradient(64, 32))],
+        vec![Script::Reads(vec![(
+            RegionKind::Text,
+            "Knowledge base",
+            0.95,
+            MIDDLE,
+        )])],
+        None,
+        crate::types::ImageScope::TypesetAndEmbedded,
+    );
+
+    assert_eq!(content.images[0].status, ImageAnalysisStatus::Complete);
+    assert!(
+        content
+            .text
+            .contains("Image embedded text: Knowledge base."),
+        "{:?}",
+        content.text
+    );
+    assert_eq!(diagnostics.native_images_analyzed, 1);
+    assert_eq!(diagnostics.native_images_not_read, 0);
+}
 
 /// A figure holding a formula, a table and a chart beside its labels: each
 /// kind reaches the reading under its own label, so a reader and a language
@@ -1561,9 +1671,13 @@ fn a_second_reading_takes_its_annotation_from_the_cache() {
 
     let analyzer = |script| {
         Arc::new(
-            NativeImageAnalyzer::new(Box::new(ScriptedOcr::new(script)), None).with_cache(
-                super::cache::AnnotationCache::open(dir.path()).expect("the cache opens"),
-            ),
+            NativeImageAnalyzer::new(
+                Box::new(ScriptedOcr::new(script)),
+                None,
+                crate::types::ImageScope::TypesetAndEmbedded,
+                None,
+            )
+            .with_cache(super::cache::AnnotationCache::open(dir.path()).expect("the cache opens")),
         )
     };
 

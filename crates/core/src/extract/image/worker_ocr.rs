@@ -135,6 +135,7 @@ impl OcrEngine for WorkerOcr {
             texts: None,
             generate: None,
             recognize: Some(RecognitionRequest { image_paths }),
+            layout: None,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -173,6 +174,17 @@ impl OcrEngine for WorkerOcr {
             regions.len()
         );
         Ok(regions)
+    }
+
+    /// Knock the recognizer down, freeing the weights it holds.
+    ///
+    /// The manager keeps supervising: the next batch spawns a replacement and
+    /// loads again. Entered on the captured handle because this is called
+    /// from the blocking extraction thread, and the shutdown it starts is a
+    /// task.
+    fn release(&self) {
+        let _guard = self.tokio_handle.enter();
+        self.manager.request_shutdown();
     }
 }
 

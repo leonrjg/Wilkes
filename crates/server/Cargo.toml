@@ -11,6 +11,13 @@ path = "src/lib.rs"
 name = "wilkes-server"
 path = "src/main.rs"
 
+[features]
+# Declared but not default: this crate asks for `wilkes-core` without
+# `recognize-onnx`, so its install routes answer with an explanation rather
+# than a 404. Declaring it is what makes that a decision instead of a cfg that
+# silently reads `false`.
+recognize-onnx = ["wilkes-api/recognize-onnx", "wilkes-core/recognize-onnx"]
+
 [dependencies]
 wilkes-api = { path = "../api" }
 wilkes-core = { path = "../core", default-features = false, features = ["fastembed", "candle", "generate"] }

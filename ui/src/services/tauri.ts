@@ -68,6 +68,7 @@ import type {
   RecognitionEngine,
   RecognizerCatalogue,
   RecognizerInventory,
+  NativeOpenRequest,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type { SearchApi, DesktopSourceApi, DataPaths, PathKind } from "./api";
@@ -75,6 +76,26 @@ import type { SearchApi, DesktopSourceApi, DataPaths, PathKind } from "./api";
 export class TauriSearchApi implements SearchApi {
   async getStartupStatus(): Promise<StartupStatus> {
     return invoke<StartupStatus>("get_startup_status");
+  }
+
+  async getGlobalSettings(): Promise<Settings> {
+    return invoke<Settings>("get_global_settings");
+  }
+
+  async previewStandalone(matchRef: MatchRef): Promise<PreviewData> {
+    return invoke<PreviewData>("preview_standalone", { matchRef });
+  }
+
+  async getStandaloneFileMetadata(path: string): Promise<DocumentMetadata> {
+    return invoke<DocumentMetadata>("get_standalone_file_metadata", { path });
+  }
+
+  async documentWindowReady(): Promise<NativeOpenRequest[]> {
+    return invoke<NativeOpenRequest[]>("document_window_ready");
+  }
+
+  async onNativeOpen(handler: (request: NativeOpenRequest) => void): Promise<() => void> {
+    return listen<NativeOpenRequest>("native-open", (event) => handler(event.payload));
   }
 
   async search(
@@ -436,6 +457,11 @@ export class TauriSearchApi implements SearchApi {
       modelId,
     });
   }
+
+  async installLayoutDetector(): Promise<void> {
+    return invoke("install_layout_detector");
+  }
+
 
   async installImageRecognizer(
     engine: RecognitionEngine,

@@ -224,6 +224,47 @@ pub fn enrichment_pieces(image: &ExtractedImage) -> Vec<Piece> {
     pieces
 }
 
+/// What an area the page typeset *inside a line* contributes to the reading.
+///
+/// The region's own text and nothing around it. No label, because `Page
+/// formula:` in the middle of a sentence is Wilkes talking over the document;
+/// no terminator, because the sentence has one; no newline, because the
+/// expression is in the line rather than beside it. What is left is exactly
+/// the bytes that stand in place of the words the page drew there, which is
+/// also what makes them resolvable — every piece here carries a confidence, so
+/// [`reading_regions`] answers for them without a second rule.
+///
+/// Several accepted regions on one area are joined with a space: they were one
+/// expression to the page, and a newline would put a line break inside a
+/// sentence.
+pub fn inline_pieces(image: &ExtractedImage) -> Vec<Piece> {
+    let accepted: Vec<&ImageOcrRegion> = image.accepted_ocr().collect();
+    let mut pieces = Vec::new();
+    for (index, region) in accepted.iter().enumerate() {
+        if index > 0 {
+            pieces.push(Piece {
+                text: " ".to_string(),
+                bbox: image.bbox.clone(),
+                provenance: TextProvenance::ImageOcr {
+                    image_id: image.id.clone(),
+                    confidence: None,
+                    kind: region.kind,
+                },
+            });
+        }
+        pieces.push(Piece {
+            text: region.text.clone(),
+            bbox: polygon_hull(&region.page_polygon, &image.bbox),
+            provenance: TextProvenance::ImageOcr {
+                image_id: image.id.clone(),
+                confidence: Some(region.confidence),
+                kind: region.kind,
+            },
+        });
+    }
+    pieces
+}
+
 /// The stretches of a reading that stand in place of a page's own glyph run.
 ///
 /// The inverse of [`enrichment_pieces`], read back off the finished reading
@@ -259,22 +300,24 @@ pub fn reading_regions(content: &ExtractedContent) -> Vec<ReadingRegion> {
         .segments
         .iter()
         .filter_map(|segment| {
-            let TextProvenance::ImageOcr {
-                image_id,
-                confidence: Some(_),
-                ..
-            } = &segment.provenance
-            else {
-                return None;
-            };
-            let image = typeset.get(image_id.as_str())?;
             let SourceOrigin::PdfPage { page, .. } = &segment.origin else {
                 return None;
             };
+            let (area_id, bbox) = match &segment.provenance {
+                TextProvenance::ImageOcr {
+                    image_id,
+                    confidence: Some(_),
+                    ..
+                } => {
+                    let image = typeset.get(image_id.as_str())?;
+                    (image.id.clone(), image.bbox.clone())
+                }
+                _ => return None,
+            };
             Some(ReadingRegion {
-                area_id: image.id.clone(),
+                area_id,
                 page: *page,
-                bbox: image.bbox.clone(),
+                bbox,
                 text_range: segment.text_range.clone(),
             })
         })

@@ -125,6 +125,19 @@ pub trait OcrEngine: Send + Sync {
     /// An engine that recognizes one image at a time satisfies this by
     /// looping; the point is where the loop lives, not that one exists.
     fn spot_batch(&self, images: &[image::RgbImage]) -> anyhow::Result<Vec<ImageRecognition>>;
+
+    /// Let go of whatever this engine keeps resident, without ending it.
+    ///
+    /// Called when a caller knows it has no more images for a while — the
+    /// index build, which reads every figure in one pass and then embeds for
+    /// as long again. A recognizer that stays loaded through the embedding
+    /// pass holds a second model's worth of memory to answer no questions,
+    /// and an idle timeout reaps it anyway at a moment nobody chose.
+    ///
+    /// Reversible by construction: the next `spot_batch` loads again. An
+    /// engine that runs in this process holds nothing the host can hand back,
+    /// so doing nothing is the honest answer and the default.
+    fn release(&self) {}
 }
 
 /// Parse a spotting response into regions.

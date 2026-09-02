@@ -166,6 +166,7 @@ impl EmbedderInstaller for SBERTInstaller {
             texts: None,
             generate: None,
             recognize: None,
+            layout: None,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);

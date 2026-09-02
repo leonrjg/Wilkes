@@ -124,57 +124,97 @@ fn read_document(path: &Path, analyzer: Option<&dyn ImageAnalyzer>) -> anyhow::R
     // is not done at all when nothing would read the result. Without an
     // analyzer the reading is the page's own glyphs, which is what it has
     // always been.
-    let route_typeset = analyzer.is_some();
+    // What marks out the formulas and tables a page typesets, or nothing.
+    // Asked of the analyzer rather than decided here, and asked once: a
+    // configuration with no detector must not pay a page render per page to
+    // be told nothing, and there is no second way to answer the question —
+    // the font and rule heuristics that used to answer it are gone.
+    let detector = analyzer.and_then(|analyzer| analyzer.layout());
+    // Asked once per document, before a single pixmap is built. An analyzer
+    // that does not read embedded rasters must not be handed a document's
+    // worth of decoded artwork to ignore — the decode is the cost this
+    // question exists to avoid, and it is paid at discovery, not at analysis.
+    //
+    // With no analyzer the rasters are still decoded and digested, because
+    // that is what a reading with no enrichment has always contained: the
+    // images found, counted and identified, and the diagnostics saying the
+    // analysis did not run.
+    let read_embedded = analyzer.is_none_or(|analyzer| analyzer.reads_embedded_images());
     let mut pages = Vec::with_capacity(page_count as usize);
     let mut discovered: Vec<DiscoveredImage> = Vec::new();
     let mut diagnostics = ExtractionDiagnostics::default();
     let mut pending: Vec<typeset::TypesetRegion> = Vec::new();
-    let mut faces: std::collections::BTreeMap<String, usize> = Default::default();
+    // Every class the detector named, whether or not anything routes it. A
+    // class this build reads nothing for is still a fact about the document —
+    // "this page holds forty inline formulas we do not read" and "this page
+    // holds no mathematics" are different, and only one of them is a gap.
+    // Class name to (count, whether anything reads it). The second is taken
+    // from the region rather than re-derived from the name: one place decides
+    // what a class means, and it is the detector's own mapping.
+    let mut detected: std::collections::BTreeMap<&'static str, (u32, bool)> = Default::default();
     for i in 0..page_count as i32 {
         let page = doc.load_page(i)?;
-        let height = page.bounds().map(|bounds| bounds.y1 - bounds.y0)?;
+        let bounds = page.bounds()?;
+        let height = bounds.y1 - bounds.y0;
         // ACCURATE_BBOXES produces tighter per-character quads.
         // PRESERVE_IMAGES adds the page's image blocks to the same block list,
         // in the order the page draws them — which is the only discovery
         // signal this phase needs, and the only thing that establishes where
         // an image sits relative to the text around it.
-        // COLLECT_VECTORS adds the rules the page drew as blocks of their own.
-        // They carry no lines, so nothing but the typeset survey sees them.
-        let mut flags = TextPageFlags::ACCURATE_BBOXES | TextPageFlags::PRESERVE_IMAGES;
-        if route_typeset {
-            flags |= TextPageFlags::COLLECT_VECTORS;
-        }
-        let text_page = page.to_text_page(flags)?;
-        let survey = if route_typeset {
-            typeset::survey(&page, &text_page)
-        } else {
-            typeset::Survey::default()
-        };
+        let text_page =
+            page.to_text_page(TextPageFlags::ACCURATE_BBOXES | TextPageFlags::PRESERVE_IMAGES)?;
         let mut lines = Vec::new();
         pages.push(extract_page_words(
             &text_page,
             (i + 1) as u32,
             height,
             &mut discovered,
-            &survey,
             &mut lines,
+            read_embedded,
         ));
-        for (name, glyphs) in &survey.faces {
-            *faces.entry(name.clone()).or_default() += glyphs;
+
+        let Some(detector) = detector else { continue };
+        // A detection failure is this page's, not the document's: the reading
+        // keeps the page's own glyphs, which is what it would have had anyway,
+        // and the log says which page and why. Bailing would throw away a
+        // whole book over one page that would not rasterize.
+        let found = match typeset::render_page(&page, detector.input_side())
+            .and_then(|render| detector.detect(&render))
+        {
+            Ok(found) => found,
+            Err(error) => {
+                warn!(
+                    "layout detection on page {} of {:?}: {error:#}",
+                    i + 1,
+                    path
+                );
+                diagnostics.layout_pages_failed += 1;
+                continue;
+            }
+        };
+        for region in &found {
+            let entry = detected.entry(region.label).or_insert((0, false));
+            entry.0 += 1;
+            entry.1 = region.kind.is_some();
         }
-        if route_typeset && !survey.is_empty() {
-            pending.extend(typeset::regions((i + 1) as u32, &survey, &lines));
-        }
+        pending.extend(typeset::regions(
+            (i + 1) as u32,
+            &BoundingBox {
+                x: bounds.x0,
+                y: bounds.y0,
+                width: bounds.x1 - bounds.x0,
+                height,
+            },
+            &found,
+            &lines,
+        ));
     }
 
-    if route_typeset {
-        typeset::report_faces(path, &faces);
+    if detector.is_some() {
+        report_detections(path, &detected, &mut diagnostics);
     }
 
-    // Bounded across the document rather than per page: the budget is what a
-    // reader will wait for in total, and a page-by-page bound would spend it
-    // on whichever pages came first regardless.
-    let mut budgeted = typeset::within_budget(pending, &mut diagnostics);
+    let mut budgeted = typeset::counted(pending, &mut diagnostics);
     // One page loaded per page that has regions, and its regions rendered
     // together: loading a page is cheap and doing it per region would still be
     // an avoidable repetition of the parse.
@@ -189,16 +229,17 @@ fn read_document(path: &Path, analyzer: Option<&dyn ImageAnalyzer>) -> anyhow::R
         let page = doc.load_page(page_number as i32 - 1)?;
         let placed = typeset::discover(&page, &budgeted[at..end], &mut discovered);
         for (region, image_index) in budgeted[at..end].iter().zip(placed) {
-            // The lines this region speaks for learn which image will speak
+            // The words this region speaks for learn which image will speak
             // for them. Whether it actually does is settled after recognition,
             // in `sanitize::supersede_typeset_regions`.
-            for (block, line) in &region.lines {
-                if let Some(line) = pages[page_number as usize - 1]
+            for (block, line, word) in &region.words {
+                if let Some(word) = pages[page_number as usize - 1]
                     .blocks
                     .get_mut(*block)
                     .and_then(|block| block.lines.get_mut(*line))
+                    .and_then(|line| line.words.get_mut(*word))
                 {
-                    line.typeset = Some(image_index);
+                    word.typeset = Some(image_index);
                 }
             }
         }
@@ -260,11 +301,10 @@ fn read_document(path: &Path, analyzer: Option<&dyn ImageAnalyzer>) -> anyhow::R
 
     if diagnostics.typeset_regions_found > 0 {
         info!(
-            "typeset regions in {:?}: {} found, {} over the budget and left unread, \
+            "typeset regions in {:?}: {} found and read, \
              {} admitted and now standing in place of the page's own glyphs",
             path,
             diagnostics.typeset_regions_found,
-            diagnostics.typeset_regions_over_budget,
             diagnostics.typeset_regions_superseded_native_text,
         );
     }
@@ -518,14 +558,13 @@ fn extract_page_words(
     page_num: u32,
     height: f32,
     discovered: &mut Vec<DiscoveredImage>,
-    survey: &typeset::Survey,
-    surveyed: &mut Vec<typeset::SurveyedLine>,
+    surveyed: &mut Vec<typeset::WordBox>,
+    read_embedded: bool,
 ) -> Page {
     let mut blocks = Vec::new();
-
     for block in text_page.blocks() {
         if block.r#type() == TextBlockType::Image {
-            if let Some(found) = discover_image(&block, page_num, discovered.len()) {
+            if let Some(found) = discover_image(&block, page_num, discovered.len(), read_embedded) {
                 blocks.push(Block {
                     lines: Vec::new(),
                     image: Some(discovered.len()),
@@ -539,22 +578,9 @@ fn extract_page_words(
             let mut out = Line::default();
             let mut word_chars = String::new();
             let mut bbox: Option<BoundingBox> = None;
-            // The whole line's extent and glyph count, for the typeset survey,
-            // with the size and baseline of each glyph. Taken here rather than
-            // from the words because it is the line the survey measures: a
-            // word box says nothing about the line's ascender and descender,
-            // and a subscript is a property of the run rather than of any word
-            // in it.
-            let mut extent: Option<BoundingBox> = None;
-            let mut glyphs = 0usize;
-            let mut sizes: Vec<f32> = Vec::new();
-            let mut baselines: Vec<f32> = Vec::new();
 
             for ch in line.chars() {
-                let c = match ch.char() {
-                    Some(c) => c,
-                    None => continue,
-                };
+                let Some(c) = ch.char() else { continue };
 
                 if c.is_whitespace() {
                     flush(&mut out, &mut word_chars, &mut bbox);
@@ -563,16 +589,13 @@ fn extract_page_words(
                 }
 
                 word_chars.push(c);
-                sizes.push(ch.size());
-                baselines.push(ch.origin().y);
 
-                // Derive an axis-aligned rect from the character's bounding quad.
+                // An axis-aligned rect from the character's bounding quad.
                 let q = ch.quad();
                 let x1 = q.ul.x.min(q.ll.x);
                 let y1 = q.ul.y.min(q.ur.y);
                 let x2 = q.ur.x.max(q.lr.x);
                 let y2 = q.ll.y.max(q.lr.y);
-
                 if x2 > x1 && y2 > y1 {
                     let next = BoundingBox {
                         x: x1,
@@ -580,12 +603,7 @@ fn extract_page_words(
                         width: x2 - x1,
                         height: y2 - y1,
                     };
-                    glyphs += 1;
-                    extent = Some(match &extent {
-                        Some(existing) => existing.merge(&next),
-                        None => next.clone(),
-                    });
-                    bbox = Some(match bbox {
+                    bbox = Some(match &bbox {
                         Some(existing) => existing.merge(&next),
                         None => next,
                     });
@@ -595,20 +613,19 @@ fn extract_page_words(
             // End of line: flush any trailing word. The line itself becomes a
             // newline when the reading is rendered.
             flush(&mut out, &mut word_chars, &mut bbox);
-            if let Some(extent) = extent {
-                // Addressed by the indices this reading uses, not by MuPDF's:
-                // an image block and an empty block both shift them, and a
-                // region that marked out the wrong line would silently remove
-                // a paragraph.
-                surveyed.push(typeset::surveyed_line(
-                    survey,
-                    blocks.len(),
-                    lines.len(),
-                    extent,
-                    glyphs,
-                    &sizes,
-                    &baselines,
-                ));
+            // Addressed by the indices this reading uses, not by MuPDF's: an
+            // image block and an empty block both shift them, and a region
+            // that marked out the wrong word would silently remove text it
+            // never covered.
+            for (index, out_word) in out.words.iter().enumerate() {
+                if let Some(bbox) = &out_word.bbox {
+                    surveyed.push(typeset::WordBox {
+                        block: blocks.len(),
+                        line: lines.len(),
+                        word: index,
+                        bbox: bbox.clone(),
+                    });
+                }
             }
             lines.push(out);
         }
@@ -624,16 +641,63 @@ fn extract_page_words(
     }
 }
 
+/// Say what the detector found, and count what nothing reads.
+///
+/// At info rather than debug, and always when a detector ran, because the
+/// silence this replaces was the whole of the last failure: a document whose
+/// mathematics went unrecognized read exactly like a document with no
+/// mathematics in it. The class names are the evidence and they are only here.
+fn report_detections(
+    path: &Path,
+    detected: &std::collections::BTreeMap<&'static str, (u32, bool)>,
+    diagnostics: &mut ExtractionDiagnostics,
+) {
+    if detected.is_empty() {
+        return;
+    }
+    let (mut routed, mut unrouted) = (Vec::new(), Vec::new());
+    for (label, (count, is_routed)) in detected {
+        diagnostics.layout_regions_detected += count;
+        if *is_routed {
+            routed.push(format!("{count} {label}"));
+        } else {
+            diagnostics.layout_regions_not_routed += count;
+            unrouted.push(format!("{count} {label}"));
+        }
+    }
+    info!(
+        "layout of {:?}: routed {}; detected and not read {}",
+        path,
+        if routed.is_empty() {
+            "nothing".to_string()
+        } else {
+            routed.join(", ")
+        },
+        if unrouted.is_empty() {
+            "nothing".to_string()
+        } else {
+            unrouted.join(", ")
+        },
+    );
+}
+
 /// Read one native image block: where the page put it, and its pixels.
 ///
 /// Everything mechanical. No caption is looked for, no neighbouring text is
 /// consulted, and nothing decides whether this is a figure — a repeated logo
 /// arrives here exactly as a diagram does, and it is the recognizer finding no
 /// text in it that keeps it out of the reading.
+///
+/// `read_embedded` is the one thing here that is a configuration rather than a
+/// property of the page, and it decides exactly one thing: whether the pixels
+/// are decoded. The block is still found, still placed in the reading order,
+/// and still reported — withholding it from the recognizer is not the same as
+/// pretending the page does not draw it.
 fn discover_image(
     block: &mupdf::TextBlock<'_>,
     page: u32,
     ordinal: usize,
+    read_embedded: bool,
 ) -> Option<DiscoveredImage> {
     let bounds = block.bounds();
     let bbox = BoundingBox {
@@ -661,7 +725,16 @@ fn discover_image(
         transform,
         decoded: None,
         rejected: None,
+        withheld_by_scope: false,
+        // Nothing has classified an embedded raster before it is read. What
+        // is in it is the recognizer's answer, not a routing input.
+        kind: None,
     };
+
+    if !read_embedded {
+        found.withheld_by_scope = true;
+        return Some(found);
+    }
 
     let Some(image) = block.image() else {
         found.rejected = Some("image block carries no image".to_string());
@@ -705,6 +778,7 @@ fn flush(line: &mut Line, word_chars: &mut String, bbox: &mut Option<BoundingBox
     line.push_word(Word {
         text: std::mem::take(word_chars),
         bbox: bbox.take(),
+        typeset: None,
     });
 }
 
@@ -785,11 +859,11 @@ mod tests {
     const MATH_PDF_BASE64: &str = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA0MDAgMzAwXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNSAwIFIgL0YyIDYgMCBSID4+ID4+ID4+CmVuZG9iago0IDAgb2JqCjw8IC9MZW5ndGggMTAwOSA+PgpzdHJlYW0KQlQgL0YxIDExIFRmIDIwIDI1MCBUZCAod2hpY2ggaXMgb2J0YWluZWQgYnkgYml0d2lzZSBhZGRpdGlvbiBvZiBhIGFuZCBiKSBUaiBFVApCVCAvRjIgMTIgVGYgNDAuMCAyMzAuMCBUZCAoYykgVGogRVQKQlQgL0YyIDggVGYgNDcuMCAyMjcuMCBUZCAoaSkgVGogRVQKQlQgL0YyIDEyIFRmIDU0LjAgMjMwLjAgVGQgKD0pIFRqIEVUCkJUIC9GMiAxMiBUZiA2NS4wIDIzMC4wIFRkIChhKSBUaiBFVApCVCAvRjIgOCBUZiA3Mi4wIDIyNy4wIFRkIChpKSBUaiBFVApCVCAvRjIgMTIgVGYgNzkuMCAyMzAuMCBUZCAoKykgVGogRVQKQlQgL0YyIDEyIFRmIDkwLjAgMjMwLjAgVGQgKGIpIFRqIEVUCkJUIC9GMiA4IFRmIDk3LjAgMjI3LjAgVGQgKGkpIFRqIEVUCkJUIC9GMiAxMiBUZiAxMDQuMCAyMzAuMCBUZCAoKykgVGogRVQKQlQgL0YyIDEyIFRmIDExNS4wIDIzMC4wIFRkIChkKSBUaiBFVApCVCAvRjIgOCBUZiAxMjIuMCAyMjcuMCBUZCAoaSkgVGogRVQKQlQgL0YyIDEyIFRmIDEyOS4wIDIzMC4wIFRkICgrKSBUaiBFVApCVCAvRjIgMTIgVGYgMTQwLjAgMjMwLjAgVGQgKGUpIFRqIEVUCkJUIC9GMiA4IFRmIDE0Ny4wIDIyNy4wIFRkIChpKSBUaiBFVApCVCAvRjIgMTIgVGYgMTU0LjAgMjMwLjAgVGQgKCspIFRqIEVUCkJUIC9GMiAxMiBUZiAxNjUuMCAyMzAuMCBUZCAoZikgVGogRVQKQlQgL0YyIDggVGYgMTcyLjAgMjI3LjAgVGQgKGkpIFRqIEVUCkJUIC9GMiAxMiBUZiAxNzkuMCAyMzAuMCBUZCAoKykgVGogRVQKQlQgL0YyIDEyIFRmIDE5MC4wIDIzMC4wIFRkIChnKSBUaiBFVApCVCAvRjIgOCBUZiAxOTcuMCAyMjcuMCBUZCAoaSkgVGogRVQKQlQgL0YyIDEyIFRmIDIwNC4wIDIzMC4wIFRkICgrKSBUaiBFVApCVCAvRjIgMTIgVGYgMjE1LjAgMjMwLjAgVGQgKGgpIFRqIEVUCkJUIC9GMiA4IFRmIDIyMi4wIDIyNy4wIFRkIChpKSBUaiBFVApCVCAvRjEgMTEgVGYgMjAgMjEwIFRkIChhbmQgdGhlIGRpc2N1c3Npb24gY29udGludWVzIGFmdGVyd2FyZHMpIFRqIEVUCmVuZHN0cmVhbQplbmRvYmoKNSAwIG9iago8PCAvVHlwZSAvRm9udCAvU3VidHlwZSAvVHlwZTEgL0Jhc2VGb250IC9IZWx2ZXRpY2EgPj4KZW5kb2JqCjYgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvQ01NSTEwID4+CmVuZG9iagp4cmVmCjAgNwowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1OCAwMDAwMCBuIAowMDAwMDAwMTE1IDAwMDAwIG4gCjAwMDAwMDAyNTEgMDAwMDAgbiAKMDAwMDAwMTMxMSAwMDAwMCBuIAowMDAwMDAxMzgxIDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNyAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKMTQ0OAolJUVPRgo=";
 
     /// What `MATH_PDF_BASE64`'s equation reads as when nothing routes it: the
-    /// subscripts flattened into the line, their size and offset gone, and
-    /// the word spacing left over from where they sat. Not mathematics, and
-    /// not something a consumer can parse back into any — which is the whole
+    /// subscripts flattened into the line, their size and offset gone, and the
+    /// word spacing left over from where they sat. Not mathematics, and not
+    /// something a consumer can parse back into any — which is the whole
     /// reason for the feature these tests cover.
-    const FLATTENED_EQUATION: &str = "c i = a i + bi + di + e i + f i + gi + hi";
+    const NATIVE_EQUATION: &str = "c i = a i + bi + di + e i + f i + gi + hi";
 
     fn write_pdf(dir: &std::path::Path, name: &str, base64: &str) -> std::path::PathBuf {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -1054,6 +1128,13 @@ mod tests {
 
         struct Fixed;
         impl ImageAnalyzer for Fixed {
+            fn layout(&self) -> Option<&dyn crate::extract::image::LayoutModel> {
+                None
+            }
+            fn release(&self) {}
+            fn reads_embedded_images(&self) -> bool {
+                true
+            }
             fn identity(&self) -> String {
                 "fixed-analyzer-v1".to_string()
             }
@@ -1126,6 +1207,13 @@ mod tests {
 
         struct Spotter;
         impl ImageAnalyzer for Spotter {
+            fn layout(&self) -> Option<&dyn crate::extract::image::LayoutModel> {
+                None
+            }
+            fn release(&self) {}
+            fn reads_embedded_images(&self) -> bool {
+                true
+            }
             fn identity(&self) -> String {
                 "spotter-v1".to_string()
             }
@@ -1286,9 +1374,82 @@ mod tests {
     /// assert what *routing* did, which is what these tests are about.
     struct FormulaReader {
         latex: Option<&'static str>,
+        /// What the configured scope would answer. Routing and scope are
+        /// independent — one decides which areas are marked out, the other
+        /// which of them are decoded — and the tests below hold them apart.
+        reads_embedded: bool,
+        /// What marks the areas out. `None` is a runtime with no detector
+        /// installed, which marks out nothing at all.
+        detector: Option<StubLayout>,
+    }
+
+    impl FormulaReader {
+        fn new(latex: Option<&'static str>) -> Self {
+            Self {
+                latex,
+                reads_embedded: true,
+                detector: Some(StubLayout),
+            }
+        }
+    }
+
+    /// A layout detector standing in for one: it marks out a fixed rectangle
+    /// of every page, as a fraction of it.
+    ///
+    /// The whole of what the real detector contributes is *where* to look, and
+    /// a test that ran the real one would be testing PP-DocLayoutV2 rather
+    /// than this pipeline. The rectangle below is the display equation of
+    /// `MATH_PDF_BASE64`, worked out from its content stream: on a 400 x 300
+    /// page the base glyphs sit on a baseline at PDF y 230 at twelve points
+    /// with the subscripts three points under them at eight, so the equation
+    /// occupies roughly y 58..78 measured down from the top, and x 35..235.
+    /// The prose lines — baselines at 250 and 210 — are outside it, so a
+    /// region that swallowed them fails the tests here rather than passing
+    /// them quietly.
+    #[derive(Default)]
+    struct StubLayout;
+
+    impl StubLayout {
+        const LABEL: &'static str = "display_formula";
+    }
+
+    impl crate::extract::image::LayoutModel for StubLayout {
+        fn input_side(&self) -> u32 {
+            800
+        }
+        fn release(&self) {}
+        fn identity(&self) -> String {
+            "stub-layout-v1".to_string()
+        }
+
+        fn detect(
+            &self,
+            _page: &::image::RgbImage,
+        ) -> anyhow::Result<Vec<crate::extract::image::LayoutRegion>> {
+            Ok(vec![crate::extract::image::LayoutRegion {
+                label: Self::LABEL,
+                kind: crate::extract::image::doclayout::kind_of(Self::LABEL),
+                score: 0.95,
+                bbox: BoundingBox {
+                    x: 35.0 / 400.0,
+                    y: 58.0 / 300.0,
+                    width: 200.0 / 400.0,
+                    height: 20.0 / 300.0,
+                },
+            }])
+        }
     }
 
     impl crate::extract::image::ImageAnalyzer for FormulaReader {
+        fn release(&self) {}
+        fn layout(&self) -> Option<&dyn crate::extract::image::LayoutModel> {
+            self.detector
+                .as_ref()
+                .map(|detector| detector as &dyn crate::extract::image::LayoutModel)
+        }
+        fn reads_embedded_images(&self) -> bool {
+            self.reads_embedded
+        }
         fn identity(&self) -> String {
             "formula-reader-v1".to_string()
         }
@@ -1331,9 +1492,9 @@ mod tests {
     fn a_math_font_line_is_read_as_latex_and_replaces_the_glyph_run() {
         let dir = tempdir().unwrap();
         let path = write_pdf(dir.path(), "math.pdf", MATH_PDF_BASE64);
-        let backend = MuPdfBackend::new(Some(Arc::new(FormulaReader {
-            latex: Some("c_i = a_i \\oplus b_i"),
-        })));
+        let backend = MuPdfBackend::new(Some(Arc::new(FormulaReader::new(Some(
+            "c_i = a_i \\oplus b_i",
+        )))));
         let content = backend.extract(&path).expect("extracts");
 
         let typeset: Vec<&ExtractedImage> = content
@@ -1368,10 +1529,19 @@ mod tests {
             content.text
         );
         assert!(
-            !content.text.contains(FLATTENED_EQUATION),
+            !content.text.contains(NATIVE_EQUATION),
             "the glyph run the page drew has left the reading: {:?}",
             content.text
         );
+        // The subscripts left with the line they were on. Two claims on one
+        // glyph run is what supersession exists to prevent, and a reading
+        // surface offered both would have to choose between them.
+        let areas = crate::extract::image::serialize::superseded_areas(
+            &content.text,
+            &crate::extract::image::serialize::reading_regions(&content),
+        );
+        assert_eq!(areas.len(), 1, "one claim on the area, not nine: {areas:?}");
+        assert_eq!(areas[0].text, "c_i = a_i \\oplus b_i");
         assert!(
             content
                 .text
@@ -1399,9 +1569,17 @@ mod tests {
         #[derive(Default)]
         struct Capture {
             seen: Mutex<Vec<(u32, u32, Vec<u32>)>>,
+            detector: StubLayout,
         }
 
         impl crate::extract::image::ImageAnalyzer for Capture {
+            fn release(&self) {}
+            fn layout(&self) -> Option<&dyn crate::extract::image::LayoutModel> {
+                Some(&self.detector)
+            }
+            fn reads_embedded_images(&self) -> bool {
+                true
+            }
             fn identity(&self) -> String {
                 "capture-v1".to_string()
             }
@@ -1480,6 +1658,48 @@ mod tests {
         );
     }
 
+    /// The default scope withholds the embedded rasters and keeps the typeset
+    /// routing, which is the whole point of separating them: the formula the
+    /// page draws is still marked out, rendered and read, because it is not a
+    /// picture the document embedded — it is the only account of that area
+    /// there is.
+    #[test]
+    fn withholding_embedded_rasters_leaves_typeset_routing_running() {
+        let dir = tempdir().unwrap();
+        let path = write_pdf(dir.path(), "math.pdf", MATH_PDF_BASE64);
+        let backend = MuPdfBackend::new(Some(Arc::new(FormulaReader {
+            latex: Some("c_i = a_i \\oplus b_i"),
+            reads_embedded: false,
+            detector: Some(StubLayout),
+        })));
+        let content = backend.extract(&path).expect("extracts");
+
+        assert!(
+            content
+                .images
+                .iter()
+                .any(|image| image.origin == RegionOrigin::Typeset),
+            "the display line is still marked out: {:?}",
+            content
+                .images
+                .iter()
+                .map(|i| (&i.id, i.origin))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            content
+                .text
+                .contains("Page formula: c_i = a_i \\oplus b_i."),
+            "and still read: {:?}",
+            content.text
+        );
+        assert!(
+            !content.text.contains(NATIVE_EQUATION),
+            "and still replaces the glyph run: {:?}",
+            content.text
+        );
+    }
+
     /// A region the recognizer had no admissible answer for keeps the page's
     /// own glyphs. That is what makes a wrongly marked-out region cost time
     /// and no bytes.
@@ -1487,11 +1707,11 @@ mod tests {
     fn a_region_with_no_admitted_reading_leaves_the_page_s_glyphs_alone() {
         let dir = tempdir().unwrap();
         let path = write_pdf(dir.path(), "math.pdf", MATH_PDF_BASE64);
-        let backend = MuPdfBackend::new(Some(Arc::new(FormulaReader { latex: None })));
+        let backend = MuPdfBackend::new(Some(Arc::new(FormulaReader::new(None))));
         let content = backend.extract(&path).expect("extracts");
 
         assert!(
-            content.text.contains(FLATTENED_EQUATION),
+            content.text.contains(NATIVE_EQUATION),
             "the glyph run is still the reading: {:?}",
             content.text
         );
@@ -1506,7 +1726,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_pdf(dir.path(), "math.pdf", MATH_PDF_BASE64);
         let content = MuPdfBackend::default().extract(&path).expect("extracts");
-        assert!(content.text.contains(FLATTENED_EQUATION));
+        assert!(content.text.contains(NATIVE_EQUATION));
         assert!(content.images.is_empty());
 
         let diagnostics = MuPdfBackend::default()
@@ -1524,7 +1744,7 @@ mod tests {
         let path = write_pdf(dir.path(), "math.pdf", MATH_PDF_BASE64);
 
         let read = |latex| {
-            MuPdfBackend::new(Some(Arc::new(FormulaReader { latex })))
+            MuPdfBackend::new(Some(Arc::new(FormulaReader::new(latex))))
                 .outline(&path)
                 .expect("outline reads")
                 .diagnostics

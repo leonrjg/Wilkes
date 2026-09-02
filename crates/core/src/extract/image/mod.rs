@@ -11,6 +11,24 @@
 //!
 //! The stages have one owner each and no fallbacks between them: a recognizer
 //! failure is a visible partial result, never a second engine's turn.
+//!
+//! # No model in this path runs in the host
+//!
+//! The recognizers, the formula reader and the layout detector are all
+//! addressed over the worker protocol — [`worker_ocr::attach`] and
+//! [`worker_layout::attach`] — and none of them is loaded here. What stays in
+//! this process is everything that is not inference: which images exist, where
+//! each region lands on the page, whether it clears admission, whether the
+//! document already draws it as glyphs, what a reading is cached under, and
+//! the recipe the whole thing is recorded under.
+//!
+//! The reason is the kill path. Reading a corpus is hours of inference, and
+//! inference that has stopped making progress can only be stopped by killing
+//! the process running it. A model loaded here would be one the user could
+//! stop only by quitting the application, and a fault in it would take the
+//! application with it. So [`build_analyzer`] is cheap by construction: it
+//! resolves names, opens a cache and attaches proxies, and the first thing to
+//! load a model is a worker serving its first request.
 
 pub mod cache;
 #[cfg(test)]
@@ -18,6 +36,11 @@ mod corpus;
 pub mod describe;
 /// What recognizers exist and how one is addressed, engine by engine.
 pub mod dispatch;
+/// The layout detector: which areas of a page are worth a recognizer call.
+/// Behind `recognize-onnx` because that is the runtime its graph needs — the
+/// same one the ONNX recognizer already uses.
+#[cfg(feature = "recognize-onnx")]
+pub mod doclayout;
 #[cfg(feature = "recognize-onnx")]
 pub mod granite_docling;
 pub mod ocr;
@@ -32,6 +55,12 @@ pub mod onnx_vlm;
 #[cfg(feature = "candle")]
 pub mod paddleocr_vl;
 pub mod serialize;
+#[cfg(feature = "recognize-onnx")]
+pub mod texify;
+#[cfg(all(feature = "recognize-vision", target_os = "macos"))]
+pub mod vision;
+/// The layout detector as the host addresses it, over the worker protocol.
+pub mod worker_layout;
 /// The recognizer as the host addresses it, over the worker protocol.
 pub mod worker_ocr;
 
@@ -43,12 +72,12 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::types::{
-    BoundingBox, ExtractedImage, ExtractionDiagnostics, ImageAnalysisStatus, ImageTransform,
-    OcrAdmission, RegionKind, RegionOrigin,
+    BoundingBox, ExtractedImage, ExtractionDiagnostics, ImageAnalysisStatus, ImageScope,
+    ImageTransform, OcrAdmission, RegionKind, RegionOrigin,
 };
 
 use describe::FigureDescriber;
-use ocr::OcrEngine;
+use ocr::{ImageRecognition, OcrEngine};
 
 /// The images of one document, handed to a recognizer.
 ///
@@ -71,6 +100,70 @@ pub struct RecognitionRequest {
     pub image_paths: Vec<std::path::PathBuf>,
 }
 
+/// One rendered page, staged for the layout detector in the worker.
+///
+/// One page rather than a document's worth. Detection is a quarter of a second
+/// a page against minutes an image for recognition, and the host discovers a
+/// page's typeset areas before it can decide what to render next — so batching
+/// here would mean rendering every page of a document up front and holding
+/// them, to save a hop that costs milliseconds.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct LayoutRequest {
+    pub image_path: std::path::PathBuf,
+}
+
+/// One [`LayoutRegion`] as it crosses the worker pipe.
+///
+/// `label` is a `String` here and a `&'static str` there. The static is the
+/// point of the real type — a label is one of the detector's own classes, and
+/// the diagnostics count them by identity — so the crossing back is a lookup
+/// in that vocabulary, and a label that is not in it is an error rather than a
+/// region nobody can account for.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct WireLayoutRegion {
+    pub label: String,
+    pub score: f32,
+    pub bbox: BoundingBox,
+}
+
+impl WireLayoutRegion {
+    pub fn from_region(region: &LayoutRegion) -> Self {
+        Self {
+            label: region.label.to_string(),
+            score: region.score,
+            bbox: region.bbox.clone(),
+        }
+    }
+
+    /// Resolve back into the detector's vocabulary, or say which label did not
+    /// belong to it.
+    pub fn into_region(self) -> anyhow::Result<LayoutRegion> {
+        #[cfg(feature = "recognize-onnx")]
+        {
+            let label = doclayout::label_of(&self.label).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the layout detector returned the class {:?}, which this build does not know",
+                    self.label
+                )
+            })?;
+            Ok(LayoutRegion {
+                label,
+                kind: doclayout::kind_of(label),
+                score: self.score,
+                bbox: self.bbox,
+            })
+        }
+        #[cfg(not(feature = "recognize-onnx"))]
+        {
+            anyhow::bail!(
+                "a layout region arrived for the class {:?}, but this build has no layout \
+                 detector and therefore no vocabulary to resolve it against",
+                self.label
+            )
+        }
+    }
+}
+
 /// The decoded pixels of one native image block, held only for as long as
 /// analysis needs them.
 ///
@@ -80,6 +173,35 @@ pub struct RecognitionRequest {
 /// digest already answers.
 pub struct NativeImage {
     pub pixels: image::RgbImage,
+}
+
+/// Check one installed artifact against the size and digest its module
+/// declares.
+///
+/// Shared by every model that pins a revision, because "the file on disk is
+/// the file the recipe names" is one question with one answer, and two copies
+/// of it are two chances to check it differently.
+pub(super) fn verify_artifact(
+    path: &std::path::Path,
+    size_bytes: u64,
+    sha256: &str,
+) -> anyhow::Result<()> {
+    let found = std::fs::metadata(path)?.len();
+    anyhow::ensure!(
+        found == size_bytes,
+        "{} is {found} bytes, {size_bytes} expected",
+        path.display()
+    );
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    let digest = format!("{:x}", hasher.finalize());
+    anyhow::ensure!(
+        digest == sha256,
+        "{} hashes to {digest}, {sha256} expected",
+        path.display()
+    );
+    Ok(())
 }
 
 // ── Technical limits ────────────────────────────────────────────────────────
@@ -119,6 +241,58 @@ pub fn technical_limit(width: u32, height: u32) -> Option<String> {
     None
 }
 
+/// One area a layout detector marked out on a page.
+///
+/// Coordinates are fractions of the page — x and width against its width, y
+/// and height against its height, origin top-left — not pixels of whatever
+/// render the detector was shown. The caller chooses the render scale and the
+/// detector must not make that its business.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayoutRegion {
+    /// The detector's own class name, verbatim. Carried beside `kind` because
+    /// several classes map to one kind and one maps to none: "forty inline
+    /// formulas" and "forty display formulas" are different facts about a
+    /// document, and the diagnostics report the class.
+    pub label: &'static str,
+    /// What Wilkes reads this as, or `None` when nothing does.
+    pub kind: Option<RegionKind>,
+    pub score: f32,
+    pub bbox: BoundingBox,
+}
+
+/// Something that can say what a rendered page holds and where.
+///
+/// One method and one answer. Everything about *which* areas are then rendered
+/// and read belongs to the caller, and everything about whether the reading is
+/// admitted belongs to the admission rules — a detector that decided either
+/// would be a second router.
+pub trait LayoutModel: Send + Sync {
+    /// The detector's recipe, as it enters the extraction identity: the graph,
+    /// its revision, the size it is fed and the score it believes.
+    fn identity(&self) -> String;
+
+    /// The square, in pixels, a page must be rendered at to be detected on.
+    ///
+    /// Asked rather than assumed: a detector trained on one input size is
+    /// answering a different question when fed another, and the caller that
+    /// rasterizes the page has no business knowing which model is behind this.
+    fn input_side(&self) -> u32;
+
+    /// Mark out one rendered page. The render must be the size this detector
+    /// declares; it is not this method's job to resize a page for a model that
+    /// was trained on a particular one.
+    fn detect(&self, page: &image::RgbImage) -> anyhow::Result<Vec<LayoutRegion>>;
+
+    /// Let go of whatever this keeps resident, without disabling it.
+    ///
+    /// The same contract as [`OcrEngine::release`] and for the same reason: an
+    /// index build detects on every page of the corpus in one pass and then
+    /// embeds for as long again, and a detection graph resident through a pass
+    /// with no pages for it is megabytes held to save a load. A later `detect`
+    /// works exactly as before, at the cost of that load.
+    fn release(&self);
+}
+
 /// An image found on a page, before analysis: a raster the PDF embeds, or an
 /// area the page typesets that Wilkes rendered so a recognizer could read it.
 pub struct DiscoveredImage {
@@ -135,6 +309,24 @@ pub struct DiscoveredImage {
     /// Set when a technical limit rejected the image before it was decoded, or
     /// when decoding failed.
     pub rejected: Option<String>,
+    /// Set when the configured [`ImageScope`] does not read pictures of this
+    /// origin. The pixels were never asked for, so `decoded` is `None` and
+    /// `digest` answers empty — which is the honest record of a picture
+    /// nobody looked at.
+    ///
+    /// Separate from `rejected` because the two are different facts, and the
+    /// diagnostics count them separately for the same reason.
+    pub withheld_by_scope: bool,
+    /// What the layout detector called this area, for the areas a page
+    /// typesets. `None` for a raster the document embeds, which nothing has
+    /// classified before it is read.
+    ///
+    /// This is what picks the recognizer. A formula and a page are different
+    /// inputs and are read by different models — see
+    /// [`NativeImageAnalyzer::route`] — so the classification has to travel
+    /// with the region rather than be recovered from its transcription, which
+    /// would be a routing decision made after the routing.
+    pub kind: Option<RegionKind>,
 }
 
 impl DiscoveredImage {
@@ -165,6 +357,18 @@ pub struct NativeTextOnPage {
     pub page: u32,
     pub text: String,
     pub bbox: BoundingBox,
+}
+
+/// Which of the two recognizers a region goes to.
+///
+/// Not a fallback pair. A formula with no formula reader is a misconfiguration
+/// and is recorded as one — sending it to the page reader instead would be a
+/// second way to read a formula, producing a reading nobody chose and no
+/// recipe describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    Formula,
+    Page,
 }
 
 /// Everything the analyzer needs that is not the image itself.
@@ -296,12 +500,23 @@ pub fn build_analyzer(
         dispatch::installed(engine, &model_id, model_dir)?,
         "the '{model_id}' recognizer is enabled but not installed"
     );
+    // The catalogue holds formula readers beside page readers, so the setting
+    // can now name one. It is an error rather than a quiet substitution: a
+    // formula reader emits one whole-crop region and would read every page of
+    // the library as a single failed expression, which afterwards is
+    // indistinguishable from a library with no text in its pictures.
+    anyhow::ensure!(
+        dispatch::role(engine, &model_id, model_dir)? == dispatch::RecognizerRole::Page,
+        "'{model_id}' reads formulas, not pages, and cannot be the page recognizer"
+    );
+    let scratch = cache_dir.join("recognition-scratch");
+    let layout = attach_layout_detector(recognizers.clone(), model_dir, &scratch)?;
     let recognizer = worker_ocr::attach(
-        recognizers,
+        recognizers.clone(),
         engine,
         &model_id,
         model_dir.to_path_buf(),
-        cache_dir.join("recognition-scratch"),
+        scratch.clone(),
         settings.device.as_deref().unwrap_or("auto"),
     )
     .context("could not address the image recognizer")?;
@@ -311,9 +526,127 @@ pub fn build_analyzer(
         model => Some(Box::new(ollama::OllamaDescriber::new(ollama_url, model)?)),
     };
 
-    let analyzer = NativeImageAnalyzer::new(recognizer, describer)
-        .with_cache(cache::AnnotationCache::open(cache_dir)?);
-    Ok(Some(Arc::new(analyzer)))
+    let mut analyzer = NativeImageAnalyzer::new(recognizer, describer, settings.scope, layout);
+    if let Some(formula) = attach_formula_reader(
+        recognizers,
+        model_dir,
+        &scratch,
+        settings.device.as_deref().unwrap_or("auto"),
+    )? {
+        analyzer = analyzer.with_formula_reader(formula);
+    }
+    Ok(Some(Arc::new(
+        analyzer.with_cache(cache::AnnotationCache::open(cache_dir)?),
+    )))
+}
+
+/// Address the recognizer for formulas, or `None` when this installation has
+/// none.
+///
+/// Optional, and found by role rather than by name: it is one row of the
+/// recognizer catalogue like the page readers, and a build that ships no such
+/// row or an installation that has not downloaded it is a configuration rather
+/// than an error. Absent, the areas the detector called formulas go to the
+/// page reader — see [`NativeImageAnalyzer::route`] for what that costs.
+///
+/// Attaching is cheap and loads nothing: the weights are loaded by the worker,
+/// on its first crop. Nothing is loaded here because nothing in this path is
+/// ever loaded here — see [`dispatch`]'s invariant.
+#[cfg(feature = "candle")]
+fn attach_formula_reader(
+    recognizers: crate::worker::manager::WorkerManager,
+    model_dir: &std::path::Path,
+    scratch: &std::path::Path,
+    device: &str,
+) -> anyhow::Result<Option<Box<dyn OcrEngine>>> {
+    let Some(model) = dispatch::formula_model(model_dir) else {
+        tracing::info!("this build ships no formula recognizer");
+        return Ok(None);
+    };
+    if !model.is_cached {
+        tracing::warn!(
+            "the formula recognizer '{}' is not installed; the areas the detector marks out \
+             as formulas will go to the page recognizer instead",
+            model.model_id
+        );
+        return Ok(None);
+    }
+    Ok(Some(
+        worker_ocr::attach(
+            recognizers,
+            model.engine,
+            &model.model_id,
+            model_dir.to_path_buf(),
+            scratch.to_path_buf(),
+            device,
+        )
+        .context("could not address the formula recognizer")?,
+    ))
+}
+
+/// Address the layout detector, or `None` when this installation has none.
+///
+/// Optional, like the formula reader and for the same reason: an installation
+/// that has not downloaded it is a configuration, not a failure to start. What
+/// it costs is stated where it is offered, because it cannot be inferred from
+/// the reading afterwards — without a detector nothing a page *typesets* is
+/// marked out, so a document full of mathematics reads exactly like one with
+/// none. Rasters the PDF embeds are unaffected; those are found by the
+/// extractor, not by this.
+///
+/// Attaching is cheap and loads nothing. The graph is loaded by the worker, on
+/// its first page — see [`dispatch`]'s invariant for why not here.
+#[cfg(feature = "candle")]
+fn attach_layout_detector(
+    recognizers: crate::worker::manager::WorkerManager,
+    model_dir: &std::path::Path,
+    scratch: &std::path::Path,
+) -> anyhow::Result<Option<Box<dyn LayoutModel>>> {
+    #[cfg(feature = "recognize-onnx")]
+    {
+        if !doclayout::is_installed(model_dir) {
+            tracing::warn!(
+                "the layout detector is not installed; nothing a page typesets will be \
+                 marked out, so formulas and ruled tables will not be read"
+            );
+            return Ok(None);
+        }
+        Ok(Some(
+            worker_layout::attach(
+                recognizers,
+                model_dir.to_path_buf(),
+                scratch.to_path_buf(),
+            )
+            .context("could not address the layout detector")?,
+        ))
+    }
+    #[cfg(not(feature = "recognize-onnx"))]
+    {
+        let (_, _, _) = (recognizers, model_dir, scratch);
+        tracing::info!("this build has no layout detector compiled in");
+        Ok(None)
+    }
+}
+
+/// What the layout detector is, where it came from, and under what terms.
+#[cfg(feature = "recognize-onnx")]
+pub fn layout_detector_inventory() -> crate::types::RecognizerInventory {
+    doclayout::inventory()
+}
+
+/// Whether the layout detector's artifacts are on disk.
+#[cfg(feature = "recognize-onnx")]
+pub fn layout_detector_installed(model_dir: &std::path::Path) -> bool {
+    doclayout::is_installed(model_dir)
+}
+
+/// Download and verify the layout detector.
+#[cfg(feature = "recognize-onnx")]
+pub fn install_layout_detector(
+    model_dir: &std::path::Path,
+    progress: Option<crate::models::progress::ProgressTx>,
+) -> anyhow::Result<()> {
+    doclayout::install(model_dir, progress)
 }
 
 /// What a recognizer is, where it came from, and under what terms.
@@ -335,6 +668,13 @@ pub fn recognizer_catalogue(data_dir: &std::path::Path) -> dispatch::RecognizerC
     dispatch::RecognizerCatalogue {
         engines: dispatch::RecognitionEngine::supported_engines(),
         models: dispatch::list_models(data_dir),
+        #[cfg(feature = "recognize-onnx")]
+        detector: Some(dispatch::InstallableModelStatus {
+            inventory: doclayout::inventory(),
+            is_installed: doclayout::is_installed(data_dir),
+        }),
+        #[cfg(not(feature = "recognize-onnx"))]
+        detector: None,
     }
 }
 
@@ -362,6 +702,26 @@ pub trait ImageAnalyzer: Send + Sync {
     /// identity verbatim, so anything that changes the bytes must change this.
     fn identity(&self) -> String;
 
+    /// Whether the rasters a PDF embeds are read, as against only the areas
+    /// the page typesets as a formula or a ruled table.
+    ///
+    /// Asked *before* the pixels are decoded, by the backend that would decode
+    /// them, so a picture this analyzer would not read costs neither a decode
+    /// nor a document's worth of resident artwork. Required rather than
+    /// defaulted: an analyzer that did not answer would be one whose cost the
+    /// backend had to guess at, and the guess that is safe for the reading is
+    /// the expensive one.
+    fn reads_embedded_images(&self) -> bool;
+
+    /// The layout detector this analyzer routes with, or `None` when it has
+    /// none and therefore marks out nothing a page typesets.
+    ///
+    /// Asked by the backend before a page is rendered, so a configuration with
+    /// no detector does not pay a render per page to be told nothing. There is
+    /// no second answer here — no font rule, no rule-stack scan — because a
+    /// second way to decide the same question is exactly what this replaced.
+    fn layout(&self) -> Option<&dyn LayoutModel>;
+
     /// Analyze the discovered images of one document, in order.
     fn analyze(
         &self,
@@ -370,6 +730,19 @@ pub trait ImageAnalyzer: Send + Sync {
         context: &AnalysisContext,
         diagnostics: &mut ExtractionDiagnostics,
     );
+
+    /// Let go of whatever this analyzer keeps resident, without disabling it.
+    ///
+    /// The index build reads every figure in the corpus in one pass and then
+    /// embeds for as long again; this is how it says the first pass is over.
+    /// A later `analyze` works exactly as before — what it costs is a reload,
+    /// once, instead of a recognizer resident through a pass that has no
+    /// images for it.
+    ///
+    /// Required rather than defaulted: an analyzer that holds a model out of
+    /// process is the ordinary case, and one that silently kept it would look
+    /// identical to one that had nothing to release.
+    fn release(&self);
 }
 
 /// The analyzer Wilkes runs when one is configured: one recognizer, a
@@ -378,14 +751,76 @@ pub struct NativeImageAnalyzer {
     ocr: Box<dyn OcrEngine>,
     describer: Option<Box<dyn FigureDescriber>>,
     cache: Option<cache::AnnotationCache>,
+    /// Which of a document's pictures this analyzer is spent on. Part of
+    /// [`Self::identity`], because it decides which of them reach the reading
+    /// and two readings taken under different scopes are different readings.
+    scope: ImageScope,
+    /// What marks out the areas a page typesets. In the identity for the same
+    /// reason as the recognizer: it decides which areas are read, and two
+    /// readings routed by different detectors are different readings.
+    layout: Option<Box<dyn LayoutModel>>,
+    /// The recognizer for formulas, which is not the one for pages.
+    ///
+    /// Measured rather than assumed: a page parser handed a crop of one
+    /// expression comes apart — ten inline crops through granite-docling
+    /// produced no admissible region, four of them looping to the token cap —
+    /// while a model trained on cropped expressions reads them. So a formula
+    /// goes to [`texify`] and everything else to the page reader, and both are
+    /// in the identity because both decide what a reading says.
+    formula: Option<Box<dyn OcrEngine>>,
 }
 
 impl NativeImageAnalyzer {
-    pub fn new(ocr: Box<dyn OcrEngine>, describer: Option<Box<dyn FigureDescriber>>) -> Self {
+    /// The scope is a constructor argument rather than a builder step: it
+    /// changes what a reading contains, and a call site that could omit it
+    /// would eventually be one that did.
+    pub fn new(
+        ocr: Box<dyn OcrEngine>,
+        describer: Option<Box<dyn FigureDescriber>>,
+        scope: ImageScope,
+        layout: Option<Box<dyn LayoutModel>>,
+    ) -> Self {
         Self {
             ocr,
             describer,
             cache: None,
+            scope,
+            layout,
+            formula: None,
+        }
+    }
+
+    /// Read the areas the detector called formulas with `formula` instead of
+    /// the page reader.
+    ///
+    /// A builder step rather than a constructor argument because the two are
+    /// not peers: a configuration with no detector marks out no formulas and
+    /// has nothing for this to read. [`dispatch::build_analyzer`] supplies it
+    /// exactly when it supplies a detector.
+    pub fn with_formula_reader(mut self, formula: Box<dyn OcrEngine>) -> Self {
+        self.formula = Some(formula);
+        self
+    }
+
+    /// Which recognizer reads this region.
+    ///
+    /// The detector's own word, never the transcription's: what a region *is*
+    /// was settled when it was marked out, and deciding it again from what
+    /// came back would be routing after the routing.
+    ///
+    /// With no formula reader installed, formulas go to the page reader. That
+    /// is a worse reading and not a silent one — it is in [`Self::identity`],
+    /// so a library read this way is re-read if a formula reader is installed
+    /// later, and it was warned about when the analyzer was built. Measured on
+    /// this repository's corpus, ten inline crops through granite-docling
+    /// yielded no admissible region and four decodes ran to the token cap, so
+    /// what this mostly buys is the cost of trying.
+    fn route(&self, found: &DiscoveredImage) -> Route {
+        match (found.origin, found.kind) {
+            (RegionOrigin::Typeset, Some(RegionKind::Formula)) if self.formula.is_some() => {
+                Route::Formula
+            }
+            _ => Route::Page,
         }
     }
 
@@ -412,16 +847,47 @@ impl NativeImageAnalyzer {
 impl ImageAnalyzer for NativeImageAnalyzer {
     fn identity(&self) -> String {
         format!(
-            "{}+{}+{}+{}+{}+{}",
+            "{}+{}+{}+{}+{}+{}+{}+{}",
             LIMITS_VERSION,
             ocr::MAPPING_VERSION,
             ocr::ADMISSION_RULES_VERSION,
             serialize::SERIALIZATION_VERSION,
+            match self.scope {
+                ImageScope::TypesetOnly => "scope-typeset",
+                ImageScope::TypesetAndEmbedded => "scope-typeset-and-embedded",
+            },
+            self.layout
+                .as_ref()
+                .map_or_else(|| "no-detector".to_string(), |layout| layout.identity()),
             self.ocr.identity(),
             self.describer
                 .as_ref()
                 .map_or_else(|| "no-describer".to_string(), |d| d.identity()),
+        ) + &self.formula.as_ref().map_or_else(
+            || "+no-formula-reader".to_string(),
+            |f| format!("+{}", f.identity()),
         )
+    }
+
+    fn reads_embedded_images(&self) -> bool {
+        matches!(self.scope, ImageScope::TypesetAndEmbedded)
+    }
+
+    fn layout(&self) -> Option<&dyn LayoutModel> {
+        self.layout.as_deref()
+    }
+
+    /// Forwarded to the recognizer, which is the only part of this analyzer
+    /// that holds anything: the cache is files, and a describer is a server
+    /// this process does not own.
+    fn release(&self) {
+        self.ocr.release();
+        if let Some(formula) = &self.formula {
+            formula.release();
+        }
+        if let Some(layout) = &self.layout {
+            layout.release();
+        }
     }
 
     fn analyze(
@@ -441,6 +907,18 @@ impl ImageAnalyzer for NativeImageAnalyzer {
         let mut pending: Vec<usize> = Vec::new();
         for (index, (image, found)) in images.iter_mut().zip(discovered).enumerate() {
             image.analyzer_identity = identity.clone();
+
+            // Asked first, because it is the only one of these that is a
+            // statement about the configuration rather than about the image.
+            if found.withheld_by_scope {
+                let reason = withheld_reason(image.origin);
+                if image.origin == RegionOrigin::Embedded {
+                    diagnostics.native_images_not_read += 1;
+                }
+                debug!("image {} not read: {reason}", image.id);
+                image.status = ImageAnalysisStatus::NotRead { reason };
+                continue;
+            }
 
             if found.decoded.is_none() {
                 let reason = found
@@ -487,52 +965,94 @@ impl ImageAnalyzer for NativeImageAnalyzer {
             return;
         }
 
-        // One call, one wait. The loop that used to be here — ask, wait
-        // minutes, ask again — was work the host could not be stopped in the
-        // middle of, and killing the recognizer only made it ask again for the
-        // next image, spawning a replacement. The recognizer's own loop runs
-        // inside the process that can be killed.
-        let batch: Vec<image::RgbImage> = pending
-            .iter()
-            .map(|index| {
-                discovered[*index]
-                    .decoded
-                    .as_ref()
-                    .expect("a pending image is a decoded one")
-                    .pixels
-                    .clone()
-            })
-            .collect();
-        info!("recognizing {} image(s)", batch.len());
-        let started = std::time::Instant::now();
-        let spotted = self.ocr.spot_batch(&batch);
-        drop(batch);
+        // One call per recognizer, one wait each. The loop that used to be
+        // here — ask, wait minutes, ask again — was work the host could not be
+        // stopped in the middle of, and killing the recognizer only made it
+        // ask again for the next image, spawning a replacement. The
+        // recognizer's own loop runs inside the process that can be killed.
+        //
+        // Two calls rather than one because there are two recognizers, and a
+        // batch is the unit that crosses into one of them. They are kept in
+        // separate lists rather than interleaved so neither model is loaded to
+        // answer nothing.
+        let mut routed: Vec<(usize, Route)> = Vec::with_capacity(pending.len());
+        for index in &pending {
+            routed.push((*index, self.route(&discovered[*index])));
+        }
 
-        // A batch fails as a batch: one recognizer, one request, one outcome.
-        // Every image it covered is a partial result carrying the reason, not
-        // a complete analysis that happened to find nothing — a killed
-        // recognizer must not read as a document whose figures have no text
-        // in them.
-        let spotted = match spotted {
-            Ok(spotted) => {
-                info!(
-                    "recognized {} image(s) in {:.1}s",
-                    spotted.len(),
-                    started.elapsed().as_secs_f32()
-                );
-                Ok(spotted)
+        let mut read: HashMap<usize, std::result::Result<ImageRecognition, String>> =
+            HashMap::with_capacity(routed.len());
+        for route in [Route::Formula, Route::Page] {
+            let group: Vec<usize> = routed
+                .iter()
+                .filter(|(_, r)| *r == route)
+                .map(|(index, _)| *index)
+                .collect();
+            if group.is_empty() {
+                continue;
             }
-            Err(error) => {
-                let reason = format!("{error:#}");
-                warn!(
-                    "recognition failed for {} image(s): {reason}",
-                    pending.len()
-                );
-                Err(reason)
-            }
-        };
+            // `route` only says `Formula` when there is a formula reader, so
+            // this cannot be `None`. Stated as an expectation rather than
+            // handled, because a second answer here would be a second router.
+            let engine: &dyn OcrEngine = match route {
+                Route::Formula => self
+                    .formula
+                    .as_deref()
+                    .expect("route() says Formula only when a formula reader is attached"),
+                Route::Page => self.ocr.as_ref(),
+            };
 
-        for (position, index) in pending.into_iter().enumerate() {
+            let batch: Vec<image::RgbImage> = group
+                .iter()
+                .map(|index| {
+                    discovered[*index]
+                        .decoded
+                        .as_ref()
+                        .expect("a pending image is a decoded one")
+                        .pixels
+                        .clone()
+                })
+                .collect();
+            info!(
+                "recognizing {} {} with {}",
+                batch.len(),
+                match route {
+                    Route::Formula => "formula(s)",
+                    Route::Page => "image(s)",
+                },
+                engine.identity()
+            );
+            let started = std::time::Instant::now();
+            let spotted = engine.spot_batch(&batch);
+            drop(batch);
+
+            // A batch fails as a batch: one recognizer, one request, one
+            // outcome. Every image it covered is a partial result carrying the
+            // reason, not a complete analysis that happened to find nothing —
+            // a killed recognizer must not read as a document whose figures
+            // have no text in them.
+            match spotted {
+                Ok(spotted) => {
+                    info!(
+                        "recognized {} region(s) in {:.1}s",
+                        spotted.len(),
+                        started.elapsed().as_secs_f32()
+                    );
+                    for (index, one) in group.into_iter().zip(spotted) {
+                        read.insert(index, Ok(one));
+                    }
+                }
+                Err(error) => {
+                    let reason = format!("{error:#}");
+                    warn!("recognition failed for {} image(s): {reason}", group.len());
+                    for index in group {
+                        read.insert(index, Err(reason.clone()));
+                    }
+                }
+            }
+        }
+
+        for (index, route) in routed {
             let decoded = discovered[index]
                 .decoded
                 .as_ref()
@@ -544,7 +1064,15 @@ impl ImageAnalyzer for NativeImageAnalyzer {
             }
             let mut failures = Vec::new();
 
-            match spotted.as_ref().map(|all| &all[position]) {
+            let threshold = match route {
+                Route::Formula => self
+                    .formula
+                    .as_ref()
+                    .expect("route() says Formula only when a formula reader is attached")
+                    .admission_threshold(),
+                Route::Page => self.ocr.admission_threshold(),
+            };
+            match read.get(&index).expect("every routed image was answered") {
                 Ok(read) => {
                     diagnostics.images_ocr_succeeded += 1;
                     diagnostics.regions_unroutable += read.unroutable;
@@ -558,7 +1086,7 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                         image.page,
                         image.origin,
                         context,
-                        self.ocr.admission_threshold(),
+                        threshold,
                     );
                 }
                 Err(reason) => {
@@ -603,7 +1131,7 @@ impl ImageAnalyzer for NativeImageAnalyzer {
             // Only a reading the recognizer actually produced is worth
             // keeping. Caching a failure would make one killed batch the
             // permanent answer for every figure it covered.
-            if self.cache.is_some() && spotted.is_ok() {
+            if self.cache.is_some() && read.get(&index).is_some_and(|one| one.is_ok()) {
                 if let Some(cache) = &self.cache {
                     cache.put(
                         &key,
@@ -701,11 +1229,17 @@ pub fn analyze(
                 ocr_regions: Vec::new(),
                 description: None,
                 analyzer_identity: String::new(),
-                status: match &found.rejected {
-                    Some(reason) => ImageAnalysisStatus::SkippedTechnicalLimit {
-                        reason: reason.clone(),
-                    },
-                    None => ImageAnalysisStatus::Complete,
+                status: if found.withheld_by_scope {
+                    ImageAnalysisStatus::NotRead {
+                        reason: withheld_reason(found.origin),
+                    }
+                } else {
+                    match &found.rejected {
+                        Some(reason) => ImageAnalysisStatus::SkippedTechnicalLimit {
+                            reason: reason.clone(),
+                        },
+                        None => ImageAnalysisStatus::Complete,
+                    }
                 },
             }
         })
@@ -720,6 +1254,7 @@ pub fn analyze(
                 if matches!(
                     image.status,
                     ImageAnalysisStatus::SkippedTechnicalLimit { .. }
+                        | ImageAnalysisStatus::NotRead { .. }
                 ) {
                     if image.origin == RegionOrigin::Embedded {
                         diagnostics.native_images_skipped_technical_limit += 1;
@@ -734,13 +1269,14 @@ pub fn analyze(
     }
 
     debug!(
-        "images: {} found, {} analyzed, {} skipped, {} ocr ok, {} ocr failed, \
+        "images: {} found, {} analyzed, {} skipped, {} not read, {} ocr ok, {} ocr failed, \
          {} regions accepted, {} rejected, {} deduplicated; \
          kinds: {} text, {} formula ({} invalid), {} table ({} malformed), \
          {} chart ({} malformed), {} code, {} not text, {} unroutable",
         diagnostics.native_images_found,
         diagnostics.native_images_analyzed,
         diagnostics.native_images_skipped_technical_limit,
+        diagnostics.native_images_not_read,
         diagnostics.images_ocr_succeeded,
         diagnostics.images_ocr_failed,
         diagnostics.ocr_regions_accepted,
@@ -758,6 +1294,20 @@ pub fn analyze(
         diagnostics.regions_unroutable,
     );
     images
+}
+
+/// Why a picture the scope withholds was not read, in the terms the setting
+/// is offered in. One function so the status and the log say the same thing.
+fn withheld_reason(origin: RegionOrigin) -> String {
+    match origin {
+        RegionOrigin::Embedded => {
+            "reading is limited to the formulas and ruled tables the page typesets".to_string()
+        }
+        // Unreachable through the backend, which withholds embedded rasters
+        // only. Stated rather than asserted: a scope that one day withholds
+        // something else should read wrong here, not panic in extraction.
+        RegionOrigin::Typeset => "this configuration does not read typeset regions".to_string(),
+    }
 }
 
 /// Decode one native image block's pixels, or say why not.
@@ -817,8 +1367,14 @@ mod tests {
     fn the_configured_analyzer_can_be_replaced_and_detached() {
         struct Nothing(&'static str);
         impl ImageAnalyzer for Nothing {
+            fn layout(&self) -> Option<&dyn LayoutModel> {
+                None
+            }
             fn identity(&self) -> String {
                 self.0.to_string()
+            }
+            fn reads_embedded_images(&self) -> bool {
+                true
             }
             fn analyze(
                 &self,
@@ -828,6 +1384,7 @@ mod tests {
                 _diagnostics: &mut ExtractionDiagnostics,
             ) {
             }
+            fn release(&self) {}
         }
 
         let restore = configured();
@@ -902,9 +1459,13 @@ mod tests {
             format!("{error:#}").contains("recognizer"),
             "the failure should name what is missing: {error:#}"
         );
+        // Of the recognizers that install anything. One that ships with the
+        // operating system is present in every directory including this one,
+        // and is not evidence that an install leaked into a fresh cache.
         assert!(recognizer_catalogue(dir.path())
             .models
             .iter()
+            .filter(|model| model.footprint_bytes > 0)
             .all(|model| !model.is_cached));
     }
 
@@ -946,10 +1507,28 @@ mod tests {
             }
         }
 
+        /// A detector that only has to be nameable: the identity is what is
+        /// under test, not the detection.
+        struct Detector(&'static str);
+        impl LayoutModel for Detector {
+            fn input_side(&self) -> u32 {
+                800
+            }
+            fn release(&self) {}
+            fn identity(&self) -> String {
+                self.0.to_string()
+            }
+            fn detect(&self, _page: &image::RgbImage) -> anyhow::Result<Vec<LayoutRegion>> {
+                unreachable!("identity only")
+            }
+        }
+
         let analyzer = |model: &'static str, threshold: f32, prompt: &'static str| {
             NativeImageAnalyzer::new(
                 Box::new(Recognizer(model, threshold)),
                 Some(Box::new(Describer(prompt))),
+                ImageScope::TypesetAndEmbedded,
+                Some(Box::new(Detector("detector-v1"))),
             )
             .identity()
         };
@@ -987,8 +1566,48 @@ mod tests {
         // And configuring a describer at all is a different reading from not.
         assert_ne!(
             baseline,
-            NativeImageAnalyzer::new(Box::new(Recognizer("weights-a", 0.6)), None).identity(),
+            NativeImageAnalyzer::new(
+                Box::new(Recognizer("weights-a", 0.6)),
+                None,
+                ImageScope::TypesetAndEmbedded,
+                Some(Box::new(Detector("detector-v1"))),
+            )
+            .identity(),
         );
+
+        // So is withholding the embedded rasters. This is the whole safety of
+        // the setting: a library read under one scope and a library read under
+        // the other are different readings, and the recipe has to say so or
+        // the two would be mixed in one index.
+        let scoped = |scope| {
+            NativeImageAnalyzer::new(
+                Box::new(Recognizer("weights-a", 0.6)),
+                Some(Box::new(Describer("prompt-v1"))),
+                scope,
+                Some(Box::new(Detector("detector-v1"))),
+            )
+            .identity()
+        };
+        assert_ne!(
+            scoped(ImageScope::TypesetOnly),
+            scoped(ImageScope::TypesetAndEmbedded),
+            "scope"
+        );
+
+        // And so is the detector. It decides which areas of a page are read
+        // at all, so two libraries routed by different detectors hold
+        // different readings and the recipe has to say so.
+        let detected = |detector: Option<&'static str>| {
+            NativeImageAnalyzer::new(
+                Box::new(Recognizer("weights-a", 0.6)),
+                Some(Box::new(Describer("prompt-v1"))),
+                ImageScope::TypesetAndEmbedded,
+                detector.map(|name| Box::new(Detector(name)) as Box<dyn LayoutModel>),
+            )
+            .identity()
+        };
+        assert_ne!(detected(Some("detector-v1")), detected(Some("detector-v2")));
+        assert_ne!(detected(Some("detector-v1")), detected(None), "no detector");
     }
     use super::*;
 

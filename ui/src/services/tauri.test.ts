@@ -26,6 +26,38 @@ describe("TauriSearchApi", () => {
     expect(invoke).toHaveBeenCalledWith("get_startup_status");
   });
 
+  it("bridges the standalone document window without workspace commands", async () => {
+    (invoke as any).mockResolvedValueOnce({ theme: "Dark" });
+    await api.getGlobalSettings();
+    expect(invoke).toHaveBeenLastCalledWith("get_global_settings");
+
+    const matchRef = {
+      path: "/outside/paper.pdf",
+      origin: { PdfPage: { page: 1, bbox: null } },
+    } as const;
+    (invoke as any).mockResolvedValueOnce({ Pdf: { page: 1, highlight_bbox: null } });
+    await api.previewStandalone(matchRef);
+    expect(invoke).toHaveBeenLastCalledWith("preview_standalone", { matchRef });
+
+    (invoke as any).mockResolvedValueOnce({ title: "Outside" });
+    await api.getStandaloneFileMetadata(matchRef.path);
+    expect(invoke).toHaveBeenLastCalledWith("get_standalone_file_metadata", {
+      path: matchRef.path,
+    });
+
+    (invoke as any).mockResolvedValueOnce([{ paths: [matchRef.path], errors: [] }]);
+    await api.documentWindowReady();
+    expect(invoke).toHaveBeenLastCalledWith("document_window_ready");
+
+    const handler = vi.fn();
+    (listen as any).mockResolvedValue(() => {});
+    await api.onNativeOpen(handler);
+    expect(listen).toHaveBeenCalledWith("native-open", expect.any(Function));
+    const eventHandler = (listen as any).mock.calls.at(-1)[1];
+    eventHandler({ payload: { paths: [matchRef.path], errors: [] } });
+    expect(handler).toHaveBeenCalledWith({ paths: [matchRef.path], errors: [] });
+  });
+
   it("should call invoke for getSettings", async () => {
     (invoke as any).mockResolvedValue({ theme: "Dark" });
     const settings = await api.getSettings();

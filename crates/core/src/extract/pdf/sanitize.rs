@@ -39,6 +39,15 @@ const BODY_FLOW: Flow = 0;
 pub(super) struct Word {
     pub text: String,
     pub bbox: Option<BoundingBox>,
+    /// The typeset region marked out over this word, as an index into the
+    /// document's images.
+    ///
+    /// Marked at discovery and acted on in [`supersede_typeset_regions`],
+    /// after the recognizer has answered — because until then it is not known
+    /// whether these glyphs are leaving. A region whose reading is refused
+    /// leaves its words exactly where the page put them, which is what makes a
+    /// false positive cost time and no bytes.
+    pub typeset: Option<usize>,
 }
 
 /// One visual line: the whitespace the page put before its first word, then
@@ -50,15 +59,6 @@ pub(super) struct Line {
     pub leading: String,
     pub words: Vec<Word>,
     pub trailing: Vec<String>,
-    /// The typeset region marked out over this line, as an index into the
-    /// document's images.
-    ///
-    /// Marked at discovery and acted on in [`supersede_typeset_regions`],
-    /// after the recognizer has answered — because until then it is not known
-    /// whether these words are leaving. A region whose reading is refused
-    /// leaves its lines exactly where the page put them, which is what makes
-    /// a false positive cost time and no bytes.
-    pub typeset: Option<usize>,
 }
 
 impl Line {
@@ -231,7 +231,7 @@ pub(super) fn sanitize(
 
 // ── Typeset regions ─────────────────────────────────────────────────────────
 
-/// Hand the lines of an admitted typeset region over to that region.
+/// Hand the glyphs of an admitted typeset region over to that region.
 ///
 /// This is the one place the ownership of those bytes is settled, and it
 /// settles it by removing the competing claim rather than by reconciling two.
@@ -240,15 +240,28 @@ pub(super) fn sanitize(
 /// region a recognizer read as LaTeX. Exactly one of them is in the reading
 /// afterwards.
 ///
+/// A region owns *words*, so it can own a whole line or four words in the
+/// middle of one, and the two are written differently:
+///
+/// - **A region that owns every word of the lines it touches is a block.** Its
+///   lines go and an image block is written where the first of them was. That
+///   is a display formula, a table, a chart: the page set it apart and the
+///   reading sets it apart too.
+/// - **A region that owns part of a line is spliced into it.** The words go
+///   and the region stands between the words either side of it, in the
+///   sentence, with the spacing the page had. That is an inline formula, and
+///   writing it as a block would take a sentence apart to insert its own
+///   middle.
+///
 /// The recognizer wins only where it actually said something admissible. A
 /// region whose formula did not parse, whose table came back ragged, or whose
-/// recognition failed outright leaves its lines untouched, and the reading is
-/// what it was before typeset routing existed. That is deliberate: the
-/// failure mode of a wrongly marked-out region is a wasted recognizer call,
-/// never a paragraph replaced by nothing.
+/// recognition failed outright leaves its words untouched, and the reading is
+/// what it was before typeset routing existed. That is deliberate: the failure
+/// mode of a wrongly marked-out region is a wasted recognizer call, never a
+/// paragraph replaced by nothing.
 ///
 /// Run before every other pass here so that what follows sees an image block
-/// where the region is — a formula is not a furniture candidate and not a
+/// where a block region is — a formula is not a furniture candidate and not a
 /// marginalia candidate, and it stops being either by the ordinary rule that
 /// those are decided from words.
 fn supersede_typeset_regions(
@@ -261,16 +274,62 @@ fn supersede_typeset_regions(
             .get(index)
             .is_some_and(|image| image.accepted_ocr().next().is_some())
     };
+
+    // A region whose reading was refused keeps nothing: the mark comes off
+    // first so that every pass after this one, here and in `flatten`, can
+    // trust a mark it finds.
+    for page in pages.iter_mut() {
+        for block in page.blocks.iter_mut() {
+            for line in block.lines.iter_mut() {
+                for word in line.words.iter_mut() {
+                    if word.typeset.is_some_and(|index| !admitted(index)) {
+                        word.typeset = None;
+                    }
+                }
+            }
+        }
+    }
+
+    // Which regions own every word of every line they touch. Asked across the
+    // whole document before anything is rewritten, because a region can span
+    // two of a page's blocks and the answer for one of its lines is not the
+    // answer for the region.
+    let mut whole_line: std::collections::HashMap<usize, bool> = Default::default();
+    for page in pages.iter() {
+        for block in &page.blocks {
+            for line in &block.lines {
+                let marks: std::collections::HashSet<usize> =
+                    line.words.iter().filter_map(|word| word.typeset).collect();
+                for index in marks {
+                    let all = line
+                        .words
+                        .iter()
+                        .all(|word| word.typeset == Some(index) || word.text.trim().is_empty());
+                    let entry = whole_line.entry(index).or_insert(true);
+                    *entry = *entry && all;
+                }
+            }
+        }
+    }
+
     let mut placed: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     for page in pages.iter_mut() {
         let mut rebuilt: Vec<Block> = Vec::new();
-        for block in std::mem::take(&mut page.blocks) {
+        for mut block in std::mem::take(&mut page.blocks) {
             if block.image.is_some() {
                 rebuilt.push(block);
                 continue;
             }
-            // Consecutive lines of one region are one run. A region that
+
+            // Inline first, in place: the line keeps its shape and its
+            // neighbours, and only the run of words the region speaks for is
+            // replaced by a carrier that `flatten` writes the region at.
+            for line in block.lines.iter_mut() {
+                splice_inline(line, &whole_line, &mut placed, diagnostics);
+            }
+
+            // Consecutive lines of one block region are one run. A region that
             // spans two of the page's blocks is still one image, so its block
             // is written where its first line was and the rest simply go.
             let mut pending: Vec<Line> = Vec::new();
@@ -282,8 +341,13 @@ fn supersede_typeset_regions(
                     });
                 }
             };
-            for line in block.lines {
-                match line.typeset.filter(|index| admitted(*index)) {
+            for line in std::mem::take(&mut block.lines) {
+                let owner = line
+                    .words
+                    .iter()
+                    .find_map(|word| word.typeset)
+                    .filter(|index| whole_line.get(index).copied().unwrap_or(false));
+                match owner {
                     Some(index) => {
                         flush(&mut pending, &mut rebuilt);
                         if placed.insert(index) {
@@ -301,6 +365,66 @@ fn supersede_typeset_regions(
         }
         page.blocks = rebuilt;
     }
+}
+
+/// Replace each run of words an inline region owns with a single carrier.
+///
+/// The carrier is the run's first word, emptied of its text and keeping the
+/// region's mark; `flatten` writes the region's reading at it. The whitespace
+/// the page left after the *last* word of the run is kept, so the sentence
+/// reads with the spacing it was set with rather than the spacing of whichever
+/// word happened to come first.
+fn splice_inline(
+    line: &mut Line,
+    whole_line: &std::collections::HashMap<usize, bool>,
+    placed: &mut std::collections::HashSet<usize>,
+    diagnostics: &mut ExtractionDiagnostics,
+) {
+    let inline = |word: &Word| {
+        word.typeset
+            .filter(|index| !whole_line.get(index).copied().unwrap_or(false))
+    };
+    if !line.words.iter().any(|word| inline(word).is_some()) {
+        return;
+    }
+
+    let mut words: Vec<Word> = Vec::with_capacity(line.words.len());
+    let mut trailing: Vec<String> = Vec::with_capacity(line.trailing.len());
+    let mut at = 0usize;
+    while at < line.words.len() {
+        let Some(index) = inline(&line.words[at]) else {
+            words.push(line.words[at].clone());
+            trailing.push(line.trailing[at].clone());
+            at += 1;
+            continue;
+        };
+        let mut end = at;
+        while end + 1 < line.words.len() && inline(&line.words[end + 1]) == Some(index) {
+            end += 1;
+        }
+        let mut carrier = line.words[at].clone();
+        // The hull of the run, so a reading surface resolving these bytes
+        // reaches the whole expression and not its first token.
+        for word in &line.words[at..=end] {
+            carrier.bbox = match (carrier.bbox.take(), word.bbox.as_ref()) {
+                (Some(hull), Some(next)) => Some(hull.merge(next)),
+                (hull, next) => hull.or_else(|| next.cloned()),
+            };
+        }
+        carrier.text = String::new();
+        if placed.insert(index) {
+            diagnostics.typeset_regions_superseded_native_text += 1;
+        } else {
+            // A region already written elsewhere leaves nothing here: two
+            // carriers would put one expression into the reading twice.
+            carrier.typeset = None;
+        }
+        words.push(carrier);
+        trailing.push(line.trailing[end].clone());
+        at = end + 1;
+    }
+    line.words = words;
+    line.trailing = trailing;
 }
 
 // ── Class 2: page furniture ─────────────────────────────────────────────────
@@ -513,6 +637,11 @@ enum Item {
     /// A native image, at the position the page drew it. Renders as its
     /// enrichment block, or as nothing when analysis established nothing.
     Image(usize),
+    /// An area the page typeset *inside* a line — an expression in the middle
+    /// of a sentence. Renders as the region's own reading and nothing else:
+    /// no label, no line of its own, no terminator, because it is not a block
+    /// standing beside the prose but a run of words within it.
+    InlineImage(usize),
 }
 
 fn flatten(pages: &[Page], flows: &[Vec<Flow>]) -> Vec<Item> {
@@ -528,12 +657,18 @@ fn flatten(pages: &[Page], flows: &[Vec<Flow>]) -> Vec<Item> {
                     items.push(Item::Space(c));
                 }
                 for (word, trailing) in line.words.iter().zip(&line.trailing) {
-                    items.push(Item::Word {
-                        text: word.text.clone(),
-                        bbox: word.bbox.clone(),
-                        page: page.number,
-                        flow: *flow,
-                    });
+                    match word.typeset {
+                        // A mark that survived `supersede_typeset_regions` is
+                        // an admitted region on a carrier word, and the
+                        // carrier's own text was emptied when it was made.
+                        Some(index) => items.push(Item::InlineImage(index)),
+                        None => items.push(Item::Word {
+                            text: word.text.clone(),
+                            bbox: word.bbox.clone(),
+                            page: page.number,
+                            flow: *flow,
+                        }),
+                    }
                     for c in trailing.chars() {
                         items.push(Item::Space(c));
                     }
@@ -723,6 +858,35 @@ fn render(items: &[Item], images: &mut [ExtractedImage]) -> Reading {
                     text.push('\n');
                 }
             }
+            Item::InlineImage(index) => {
+                let Some(image) = images.get(*index) else {
+                    continue;
+                };
+                let pieces = serialize::inline_pieces(image);
+                if pieces.is_empty() {
+                    continue;
+                }
+                let start = text.len();
+                for piece in pieces {
+                    let piece_start = text.len();
+                    text.push_str(&piece.text);
+                    segments.push(SourceSegment {
+                        text_range: ByteRange {
+                            start: piece_start,
+                            end: text.len(),
+                        },
+                        origin: SourceOrigin::PdfPage {
+                            page: image.page,
+                            bbox: Some(piece.bbox),
+                        },
+                        provenance: piece.provenance,
+                    });
+                }
+                images[*index].reading_range = Some(ByteRange {
+                    start,
+                    end: text.len(),
+                });
+            }
             Item::Image(index) => {
                 let Some(image) = images.get(*index) else {
                     continue;
@@ -776,6 +940,7 @@ mod tests {
                 width: 6.0 * text.chars().count() as f32,
                 height: 10.0,
             }),
+            typeset: None,
         }
     }
 
@@ -882,7 +1047,9 @@ mod tests {
                 word("below", 140.0, 120.0),
             ]),
         ];
-        lines[1].typeset = Some(0);
+        for word in lines[1].words.iter_mut() {
+            word.typeset = Some(0);
+        }
         Page {
             number: 1,
             height: 800.0,
@@ -924,6 +1091,88 @@ mod tests {
         assert!(above < formula && formula < below, "{:?}", reading.text);
     }
 
+    /// An expression inside a sentence is spliced into it, not lifted out of
+    /// it. The sentence keeps its words and its spacing and gains the
+    /// recognizer's LaTeX where the page drew the expression — writing it as a
+    /// block would take the sentence apart to insert its own middle.
+    #[test]
+    fn an_inline_region_is_spliced_into_the_sentence() {
+        let mut line = line(vec![
+            word("with", 100.0, 200.0),
+            word("√n", 130.0, 200.0),
+            word("∈", 150.0, 200.0),
+            word("ℕ", 165.0, 200.0),
+            word("Thus", 185.0, 200.0),
+        ]);
+        for index in 1..=3 {
+            line.words[index].typeset = Some(0);
+        }
+
+        let mut images = [recognized(true)];
+        let mut diagnostics = ExtractionDiagnostics::default();
+        let reading = sanitize(
+            vec![body_page(1, vec![line])],
+            &mut images,
+            &mut diagnostics,
+        );
+
+        assert_eq!(
+            reading.text.trim(),
+            "with c_i = a_i \\oplus b_i Thus",
+            "{:?}",
+            reading.text
+        );
+        assert!(
+            !reading.text.contains("Page formula:"),
+            "no label inside a sentence: {:?}",
+            reading.text
+        );
+        assert_eq!(diagnostics.typeset_regions_superseded_native_text, 1);
+        assert!(images[0].reading_range.is_some());
+    }
+
+    /// The bytes an inline region wrote resolve to the whole expression, not
+    /// to its first token — a reading surface substitutes what it is given.
+    #[test]
+    fn an_inline_region_resolves_to_the_glyphs_it_replaced() {
+        use crate::extract::image::serialize::{reading_regions, superseded_areas};
+
+        let mut line = line(vec![
+            word("with", 100.0, 200.0),
+            word("√n", 130.0, 200.0),
+            word("∈", 150.0, 200.0),
+            word("Thus", 185.0, 200.0),
+        ]);
+        line.words[1].typeset = Some(0);
+        line.words[2].typeset = Some(0);
+
+        let mut images = [recognized(true)];
+        let mut diagnostics = ExtractionDiagnostics::default();
+        let reading = sanitize(
+            vec![body_page(1, vec![line])],
+            &mut images,
+            &mut diagnostics,
+        );
+        let content = crate::types::ExtractedContent {
+            text: reading.text.clone(),
+            source_map: crate::types::SourceMap {
+                segments: reading.segments.clone(),
+            },
+            metadata: crate::types::FileMetadata {
+                path: "doc.pdf".into(),
+                size_bytes: 0,
+                mime: None,
+                title: None,
+                page_count: None,
+            },
+            images: images.to_vec(),
+        };
+
+        let areas = superseded_areas(&content.text, &reading_regions(&content));
+        assert_eq!(areas.len(), 1, "{areas:?}");
+        assert_eq!(areas[0].text, "c_i = a_i \\oplus b_i");
+    }
+
     /// A region the recognizer had no admissible answer for changes nothing.
     /// That is what makes a wrongly marked-out region cost time and no bytes.
     #[test]
@@ -948,9 +1197,13 @@ mod tests {
     #[test]
     fn a_region_spanning_two_blocks_is_written_once() {
         let mut first = line(vec![word("ci", 100.0, 100.0), word("=", 120.0, 100.0)]);
-        first.typeset = Some(0);
+        for word in first.words.iter_mut() {
+            word.typeset = Some(0);
+        }
         let mut second = line(vec![word("ai", 100.0, 116.0), word("+", 120.0, 116.0)]);
-        second.typeset = Some(0);
+        for word in second.words.iter_mut() {
+            word.typeset = Some(0);
+        }
         let page = Page {
             number: 1,
             height: 800.0,

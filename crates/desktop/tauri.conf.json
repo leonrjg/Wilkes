@@ -19,6 +19,64 @@
       "icons/icon.ico"
     ],
     "externalBin": ["sidecars/wilkes-rust-worker"],
+    "fileAssociations": [
+      {
+        "ext": ["pdf"],
+        "name": "PDF Document",
+        "description": "Portable Document Format",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/pdf"
+      },
+      {
+        "ext": ["txt", "log"],
+        "name": "Text Document",
+        "description": "UTF-8 text document",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "text/plain"
+      },
+      {
+        "ext": ["md", "markdown"],
+        "name": "Markdown Document",
+        "description": "Markdown document",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "text/markdown"
+      },
+      {
+        "ext": ["html", "htm"],
+        "name": "HTML Document",
+        "description": "HTML document",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "text/html"
+      },
+      {
+        "ext": ["csv"],
+        "name": "CSV Document",
+        "description": "Comma-separated values",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "text/csv"
+      },
+      {
+        "ext": ["json", "jsonl"],
+        "name": "JSON Document",
+        "description": "JSON document",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/json"
+      },
+      {
+        "ext": ["xml"],
+        "name": "XML Document",
+        "description": "XML document",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/xml"
+      }
+    ],
     "resources": {
       "../worker/wilkes_python_worker": "wilkes_python_worker",
       "../worker/requirements.txt": "requirements.txt"

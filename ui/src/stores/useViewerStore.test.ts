@@ -11,7 +11,9 @@ import {
 vi.mock("../services", () => ({
   api: {
     preview: vi.fn(),
+    previewStandalone: vi.fn(),
     getFileMetadata: vi.fn(),
+    getStandaloneFileMetadata: vi.fn(),
     resolveFileMetadata: vi.fn(),
   },
 }));
@@ -41,6 +43,7 @@ describe("useViewerStore", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useViewerStore.setState({
+      mode: "workspace",
       tabs: [],
       activeTabId: null,
       sessionHydrated: false,
@@ -61,6 +64,29 @@ describe("useViewerStore", () => {
       { TextFile: { line: 0, col: 0 } },
       { PdfPage: { page: 1, bbox: null } },
     ]);
+  });
+
+  it("keeps standalone documents outside workspace preview, metadata, and persistence", async () => {
+    vi.mocked(api.previewStandalone!).mockResolvedValue(textPreview("outside"));
+    vi.mocked(api.getStandaloneFileMetadata!).mockResolvedValue(metadata);
+
+    useViewerStore.getState().enterStandaloneMode();
+    useViewerStore.getState().openFile("/outside/all-roots/notes.txt");
+
+    await vi.waitFor(() =>
+      expect(activeViewerTab(useViewerStore.getState())?.previewData).toEqual(
+        textPreview("outside"),
+      ),
+    );
+    expect(api.previewStandalone).toHaveBeenCalled();
+    expect(api.preview).not.toHaveBeenCalled();
+    expect(api.getStandaloneFileMetadata).toHaveBeenCalledWith(
+      "/outside/all-roots/notes.txt",
+    );
+    expect(api.getFileMetadata).not.toHaveBeenCalled();
+    expect(localStorage.getItem(VIEWER_SESSION_STORAGE_KEY)).toBeNull();
+
+    await useViewerStore.getState().switchWorkspace("default");
   });
 
   it("creates one tab per path and activates an existing tab on reopen", () => {

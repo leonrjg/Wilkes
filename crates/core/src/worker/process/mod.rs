@@ -1,11 +1,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use super::ipc::{WorkerEvent, WorkerRequest, WorkerRole};
+use super::ipc::{WorkerEvent, WorkerProcessKind, WorkerRequest};
 use super::manager::WorkerPaths;
 use super::python_env::setup_python_env;
-use crate::extract::image::dispatch::RecognitionEngine;
-use crate::types::EmbeddingEngine;
 
 #[cfg(unix)]
 mod unix;
@@ -49,13 +47,13 @@ pub(super) async fn build_command_plan(
     paths: &WorkerPaths,
     req: &WorkerRequest,
 ) -> Result<ProcessCommandPlan, String> {
-    Ok(match req.role {
-        // SBERT is the only engine that runs outside the Rust worker binary
-        // today. The recognition arm below is spelled out rather than left to
-        // the fallthrough so that adding a recognition engine — a Python one,
-        // served by the same sidecar — fails to compile here until someone
-        // decides which process it belongs in.
-        WorkerRole::Embed(EmbeddingEngine::SBERT) => {
+    // Which process, asked once. `WorkerRole::process_kind` is the answer, and
+    // it is the same answer the manager used to decide whether the worker it
+    // already has can serve this request — a second table here is how a
+    // manager comes to reuse a process that cannot run the request it kept it
+    // for.
+    Ok(match req.role.process_kind() {
+        WorkerProcessKind::Sidecar => {
             let python = setup_python_env(paths).await?;
             let cache_root = paths.data_dir.join("huggingface");
             let xdg_cache_root = paths.data_dir.join(".cache");
@@ -79,10 +77,7 @@ pub(super) async fn build_command_plan(
                 xdg_cache_root,
             }
         }
-        WorkerRole::Recognize(RecognitionEngine::Candle) => ProcessCommandPlan::WorkerBin {
-            worker_bin: paths.worker_bin.clone(),
-        },
-        _ => ProcessCommandPlan::WorkerBin {
+        WorkerProcessKind::WorkerBin => ProcessCommandPlan::WorkerBin {
             worker_bin: paths.worker_bin.clone(),
         },
     })
@@ -152,6 +147,8 @@ fn _assert_path(_: &Path) {}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::types::EmbeddingEngine;
+    use crate::worker::ipc::WorkerRole;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicU32;
     use tempfile::tempdir;
@@ -238,6 +235,7 @@ exit 0
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -301,6 +299,7 @@ echo '"Done"'
             texts: None,
             generate: None,
             recognize: None,
+            layout: None,
         };
         let req_json = serde_json::to_string(&req).unwrap();
 
@@ -358,6 +357,7 @@ echo '"Done"'
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -399,6 +399,7 @@ echo '"Done"'
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -447,6 +448,7 @@ exit 0
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -488,6 +490,7 @@ exit 0
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -526,6 +529,7 @@ exit 0
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -597,6 +601,7 @@ exit 0
             texts: Some(vec!["hello".to_string()]),
             generate: None,
             recognize: None,
+            layout: None,
         };
 
         let active_pid = AtomicU32::new(0);

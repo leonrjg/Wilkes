@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import type { SearchApi } from "../services/api";
 import {
   ALL_RECOGNITION_ENGINES,
   type EmbedProgress,
+  type ImageScope,
+  type InstallableModelStatus,
   type RecognitionEngine,
   type RecognizerDescriptor,
   type RecognizerInventory,
@@ -28,16 +30,38 @@ const DEFAULTS = {
   model: null,
   device: null,
   describer_model: "",
+  scope: "typeset_only",
 } as const;
+
+/** What each scope reads, in the terms the choice is actually made in: the
+ *  cost, and what is given up. The second is the honest half — a formula the
+ *  page typesets and a label inside a screenshot are both text a search should
+ *  find, and only one of them is cheap. */
+const SCOPE_OPTIONS: Array<{ value: ImageScope; label: string; blurb: string }> = [
+  {
+    value: "typeset_only",
+    label: "Formulas and tables only",
+    blurb:
+      "Reads the equations and ruled tables the page draws with its own fonts and rules \u2014 the parts whose text does not survive into the reading any other way. A handful per document, so this costs seconds rather than hours. Diagrams, charts and scanned pages are left alone.",
+  },
+  {
+    value: "typeset_and_embedded",
+    label: "Those, and every picture",
+    blurb:
+      "Adds every raster the document embeds: diagrams, charts, screenshots, scanned pages. This is where the time goes \u2014 one recognizer call per picture, and a book can hold hundreds. Worth it for scanned documents, where the picture is the only text there is.",
+  },
+];
 
 const ENGINE_LABELS: Record<RecognitionEngine, string> = {
   Onnx: "ONNX",
   Candle: "Candle",
+  Vision: "Apple Vision",
 };
 
 const ENGINE_BLURBS: Record<RecognitionEngine, string> = {
   Onnx: "ONNX Runtime, in the recognition worker. Reads a whole page in one pass and covers formulas, tables and code as well as prose. Runs on the CPU, on one thread less than the machine has.",
   Candle: "PaddleOCR-VL under candle. Transcribes text with precise per-region geometry, and nothing else. Uses the GPU via Metal (Apple Silicon) if available.",
+  Vision: "The recognizer built into macOS. Reads lines of prose about a hundred times faster than either model, with nothing to download \u2014 but no formulas, no tables and no figure regions. Choosing it trades that structure away.",
 };
 
 /** What ModelCatalog needs, said in the recognizer's own terms. The footprint
@@ -66,11 +90,15 @@ type RecognizerCatalogEntry = RecognizerDescriptor & {
 export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: Props) {
   const analysis = settings.image_analysis ?? DEFAULTS;
   const [supportedEngines, setSupportedEngines] = useState<RecognitionEngine[]>([]);
+  const [detector, setDetector] = useState<InstallableModelStatus | null>(null);
   const [recognizers, setRecognizers] = useState<RecognizerDescriptor[]>([]);
   const [modelFilter, setModelFilter] = useState("");
   const [draftEngine, setDraftEngine] = useState<RecognitionEngine>(analysis.engine);
   const [draftModel, setDraftModel] = useState<string | null>(analysis.model);
   const [inventory, setInventory] = useState<RecognizerInventory | null>(null);
+  const [formulaInventory, setFormulaInventory] = useState<RecognizerInventory | null>(
+    null,
+  );
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -80,10 +108,26 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
     setDescriberModel(analysis.describer_model ?? "");
   }, [analysis.describer_model]);
 
+  // The catalogue holds both roles in one list. Split by the role the backend
+  // declares rather than by a list of ids kept here: the engine picker below
+  // must never offer a formula reader as the page recognizer, and a second
+  // copy of which-is-which is how it eventually would.
+  const pageReaders = useMemo(
+    () => recognizers.filter((model) => model.role === "page"),
+    [recognizers],
+  );
+  // One today. Rendered as a card rather than a picker for that reason — when
+  // there are two, this becomes a list and nothing else changes.
+  const formula = useMemo(
+    () => recognizers.find((model) => model.role === "formula") ?? null,
+    [recognizers],
+  );
+
   const refreshCatalogue = useCallback(async () => {
     const catalogue = await api.imageRecognizerCatalogue();
     setSupportedEngines(catalogue.engines);
     setRecognizers(catalogue.models);
+    setDetector(catalogue.detector);
     return catalogue;
   }, [api]);
 
@@ -95,6 +139,7 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
         if (!mounted) return;
         setSupportedEngines(catalogue.engines);
         setRecognizers(catalogue.models);
+        setDetector(catalogue.detector);
       })
       .catch((cause) => {
         if (mounted) setError(String(cause));
@@ -117,15 +162,16 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
    *  library ends up read under a recognizer nobody chose. */
   const engineDefault = useCallback(
     (engine: RecognitionEngine) =>
-      recognizers.find((model) => model.engine === engine && model.is_engine_default)
+      pageReaders.find((model) => model.engine === engine && model.is_engine_default)
         ?.model_id ?? null,
-    [recognizers],
+    [pageReaders],
   );
 
   const configuredModel = analysis.model ?? engineDefault(analysis.engine);
+
   const effectiveDraftModel = draftModel ?? engineDefault(draftEngine);
 
-  const catalogModels: RecognizerCatalogEntry[] = recognizers
+  const catalogModels: RecognizerCatalogEntry[] = pageReaders
     .filter((model) => model.engine === draftEngine)
     .map((model) => ({
       ...model,
@@ -135,7 +181,7 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
 
   const selected =
     catalogModels.find((model) => model.model_id === effectiveDraftModel) ?? null;
-  const configured = recognizers.find(
+  const configured = pageReaders.find(
     (model) => model.engine === analysis.engine && model.model_id === configuredModel,
   );
   const configuredInstalled = configured?.is_cached ?? false;
@@ -166,6 +212,31 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
       mounted = false;
     };
   }, [api, draftEngine, effectiveDraftModel]);
+
+  // Fetched, not read off the descriptor: the catalogue row says what a model
+  // is and what it costs, and the inventory says under what terms and which
+  // files. The licence is disclosed beside the download button, so it is
+  // fetched whether or not the model is installed.
+  useEffect(() => {
+    if (!formula) {
+      setFormulaInventory(null);
+      return;
+    }
+    let mounted = true;
+    api
+      .imageRecognizerInventory(formula.engine, formula.model_id)
+      .then((next) => {
+        if (mounted) setFormulaInventory(next);
+      })
+      .catch((cause) => {
+        if (!mounted) return;
+        setFormulaInventory(null);
+        console.error("imageRecognizerInventory failed for the formula reader:", cause);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [api, formula]);
 
   // The install has its own event stream, and a settings change can start one
   // too, so the panel listens for backend truth rather than assuming the
@@ -271,6 +342,50 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
     }
   };
 
+  const handleInstallDetector = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.installLayoutDetector();
+      await refreshCatalogue();
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+      setProgress(null);
+    }
+  };
+
+  // The same call the recognizer picker makes. There is no second install
+  // path any more: a formula reader is a catalogue row, and installing one is
+  // installing a recognizer.
+  const handleInstallFormulaReader = async () => {
+    if (!formula) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.installImageRecognizer(formula.engine, formula.model_id);
+      await refreshCatalogue();
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+      setProgress(null);
+    }
+  };
+
+  const handleScope = async (scope: ImageScope) => {
+    if (scope === (analysis.scope ?? DEFAULTS.scope)) return;
+    setBusy(true);
+    try {
+      await patch({ scope });
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const actionLabel = (() => {
     if (busy) return "Working…";
     if (!selected) return "Select a recognizer";
@@ -324,6 +439,182 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
           )}
         </div>
       </section>
+
+      {/* What marks the areas out. Above the engine picker on purpose: a
+          recognizer with nothing to point it at reads no mathematics, and the
+          order of the sections is the order of the decisions. */}
+      {detector && (
+        <section>
+          <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
+            Finding the formulas and tables
+          </h3>
+          <div className="space-y-2 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
+            <p className="text-[10px] italic text-[var(--text-dim)]">
+              An equation a page typesets is not a picture — it is glyphs from
+              a maths font, so the text a document carries for it is already
+              flattened: <span className="font-mono">c_i = a_i ⊕ b_i</span>{" "}
+              arrives as <span className="font-mono">ci = ai ⊕bi</span>. A
+              layout model looks at each page and says which areas are
+              formulas, tables and charts, so those areas can be read back as
+              what they were set as.
+            </p>
+            <p className="text-[10px] italic text-[var(--text-dim)]">
+              Without it nothing a page typesets is marked out, and a document
+              full of mathematics reads exactly like one with none. Pictures
+              the document embeds are still read; it is the formulas and tables
+              the page sets in type that go unnoticed.
+            </p>
+            <div className="flex items-center gap-2 pt-1">
+              <span className="font-mono text-[10px] text-[var(--text-muted)]">
+                {detector.inventory.name}
+              </span>
+              <span className="text-[9px] text-[var(--text-dim)]">
+                {formatModelBytes(detector.inventory.footprint_bytes)}
+              </span>
+              <a
+                href={detector.inventory.license_url}
+                target="_blank"
+                rel="noreferrer"
+                className="text-[9px] text-[var(--accent-blue)] underline"
+              >
+                {detector.inventory.license}
+              </a>
+              {detector.is_installed ? (
+                <span className="ml-auto rounded bg-[var(--bg-active)] px-1.5 py-0.5 text-[9px] uppercase tracking-tighter text-[var(--text-dim)]">
+                  Installed
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void handleInstallDetector()}
+                  className="ml-auto rounded border border-[var(--border-main)] px-2 py-1 text-[10px] text-[var(--text-main)] disabled:opacity-50"
+                >
+                  {busy ? "Working…" : "Download detector"}
+                </button>
+              )}
+            </div>
+            {!detector.is_installed && (
+              <p className="text-[10px] text-[var(--text-dim)]">
+                Not installed — nothing a page typesets will be marked out, so
+                no formula or ruled table is read. Installing it later re-reads
+                the documents that have them.
+              </p>
+            )}
+            <p className="text-[10px] italic text-[var(--text-dim)]">
+              It runs once per page, on this machine, at roughly a quarter of a
+              second a page.
+            </p>
+          </div>
+        </section>
+      )}
+
+      {/* The reader for what the detector finds. Its own section rather than a
+          row in the picker below, because it is not an alternative to the page
+          reader — it runs alongside one, on the areas the detector calls
+          formulas. The picker offers page readers; this offers the other role. */}
+      {formula && (
+        <section>
+          <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
+            Reading the formulas
+          </h3>
+          <div className="space-y-2 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
+            <p className="text-[10px] italic text-[var(--text-dim)]">
+              A model that reads whole pages comes apart on a crop of one
+              expression, so formulas go to a model trained on exactly that and
+              tables and pictures go to the page reader below. It recovers what
+              the page's own text cannot carry at all: where a document draws{" "}
+              <span className="font-mono">A ⋁ B ⇔ B ⋁ A</span>, the font names
+              nothing for the <span className="font-mono">⇔</span> and the
+              operator is simply missing from the text — this reads it back.
+            </p>
+            <div className="flex items-center gap-2 pt-1">
+              <span className="font-mono text-[10px] text-[var(--text-muted)]">
+                {formula.display_name}
+              </span>
+              <span className="text-[9px] text-[var(--text-dim)]">
+                {formatModelBytes(formula.footprint_bytes)}
+              </span>
+              {formulaInventory && (
+                <a
+                  href={formulaInventory.license_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[9px] text-[var(--accent-blue)] underline"
+                >
+                  {formulaInventory.license}
+                </a>
+              )}
+              {formula.is_cached ? (
+                <span className="ml-auto rounded bg-[var(--bg-active)] px-1.5 py-0.5 text-[9px] uppercase tracking-tighter text-[var(--text-dim)]">
+                  Installed
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void handleInstallFormulaReader()}
+                  className="ml-auto rounded border border-[var(--border-main)] px-2 py-1 text-[10px] text-[var(--text-main)] disabled:opacity-50"
+                >
+                  {busy ? "Working…" : "Download formula reader"}
+                </button>
+              )}
+            </div>
+            {!formula.is_cached && (
+              <p className="text-[10px] text-[var(--text-dim)]">
+                Not installed — formulas will go to the page reader instead,
+                which on measurement reads almost none of them. Reading still
+                works, and installing this later re-reads the documents that
+                have formulas in them.
+              </p>
+            )}
+          </div>
+        </section>
+      )}
+
+      {/* Which pictures. Hidden while the feature is off, because it is a
+          question about work that is not being done. It is the setting that
+          decides whether this feature costs seconds or an overnight run, so
+          it sits directly under the toggle rather than among the model
+          options. */}
+      {analysis.enabled && (
+        <section>
+          <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
+            Which pictures
+          </h3>
+          <div className="space-y-2 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
+            {SCOPE_OPTIONS.map((option) => (
+              <label
+                key={option.value}
+                className="flex cursor-pointer items-start gap-2.5"
+              >
+                <input
+                  type="radio"
+                  name="image-scope"
+                  value={option.value}
+                  checked={(analysis.scope ?? DEFAULTS.scope) === option.value}
+                  disabled={busy}
+                  onChange={() => void handleScope(option.value)}
+                  className="mt-0.5 h-3.5 w-3.5 accent-[var(--accent-blue)]"
+                />
+                <span className="flex flex-col gap-0.5">
+                  <span className="text-xs text-[var(--text-main)]">
+                    {option.label}
+                  </span>
+                  <span className="text-[10px] italic text-[var(--text-dim)]">
+                    {option.blurb}
+                  </span>
+                </span>
+              </label>
+            ))}
+            <p className="text-[10px] text-[var(--text-dim)]">
+              Which areas count as a formula or a ruled table is decided by the
+              page's own evidence — the font a run is set in, the rules a table
+              is drawn with — and not by a model guessing at the layout.
+            </p>
+          </div>
+        </section>
+      )}
 
       {/* Engine selection */}
       <section>

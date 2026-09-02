@@ -5,7 +5,11 @@ import { fileName } from "./DocumentEntryRow";
 import { useFileContextMenu } from "./FileContextMenu";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 
-export default function ViewerTabs() {
+interface ViewerTabsProps {
+  standalone?: boolean;
+}
+
+export default function ViewerTabs({ standalone = false }: ViewerTabsProps) {
   const tabs = useViewerStore((state) => state.tabs);
   const activeTabId = useViewerStore((state) => state.activeTabId);
   const activateTab = useViewerStore((state) => state.activateTab);
@@ -57,7 +61,8 @@ export default function ViewerTabs() {
           return (
             <div
               key={tab.id}
-              onContextMenu={(event) =>
+              onContextMenu={(event) => {
+                if (standalone) return;
                 openFileMenu(
                   event,
                   {
@@ -79,7 +84,8 @@ export default function ViewerTabs() {
                       run: () => closeAllTabs(),
                     },
                   ],
-                )}
+                );
+              }}
               className={[
                 "group flex h-9 min-w-[8rem] max-w-[14rem] flex-shrink-0 items-center border-r border-t-2 border-[var(--border-main)]",
                 active

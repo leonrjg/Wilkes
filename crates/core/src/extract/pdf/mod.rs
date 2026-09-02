@@ -22,6 +22,11 @@ pub struct PdfExtractor {
     /// produced without a recognizer is a different reading, and mixing the
     /// two in one index would be exactly the drift the recipe exists to stop.
     analyzer_identity: String,
+    /// The same analyzer the backend enriches with, held here so a caller
+    /// that has finished with images can release it. A second handle to one
+    /// analyzer, not a second analyzer: the backend does the enriching and
+    /// this says when the recognizer behind it may be let go.
+    analyzer: Option<Arc<dyn ImageAnalyzer>>,
 }
 
 impl PdfExtractor {
@@ -32,6 +37,7 @@ impl PdfExtractor {
         Self {
             backend: Box::new(MuPdfBackend::default()),
             analyzer_identity: String::new(),
+            analyzer: None,
         }
     }
 
@@ -43,8 +49,9 @@ impl PdfExtractor {
         // the library the same way a change of model does.
         let analyzer_identity = format!("{}+{}", typeset::ROUTING_VERSION, analyzer.identity());
         Self {
-            backend: Box::new(MuPdfBackend::new(Some(analyzer))),
+            backend: Box::new(MuPdfBackend::new(Some(Arc::clone(&analyzer)))),
             analyzer_identity,
+            analyzer: Some(analyzer),
         }
     }
 }
@@ -58,6 +65,12 @@ impl Default for PdfExtractor {
 impl ContentExtractor for PdfExtractor {
     fn image_analyzer_identity(&self) -> &str {
         &self.analyzer_identity
+    }
+
+    fn release_image_analyzer(&self) {
+        if let Some(analyzer) = &self.analyzer {
+            analyzer.release();
+        }
     }
 
     fn can_handle(&self, path: &Path, _mime: Option<&str>) -> bool {

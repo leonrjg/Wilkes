@@ -13,12 +13,30 @@ candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:to
 # in `default` while `candle` stays in it for the alternative one; a build with
 # neither compiles and reports an empty recognizer catalogue.
 recognize-onnx = ["dep:ort", "dep:tokenizers", "dep:hf-hub", "dep:ureq"]
+# Recognition through Apple's Vision framework. No dependencies and no weights
+# — the recognizer is the operating system's — so this costs a build.rs
+# invocation and nothing else. Out of `default` on purpose: it reads prose only,
+# and a build that shipped it as the default would quietly stop reading
+# formulas and tables. The feature is not gated on the platform here because
+# Cargo features are additive across a workspace; `build.rs` and the module
+# gates decide whether anything is actually compiled.
+recognize-vision = []
 candle-metal = ["candle", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 # CPU BLAS. Opt-in and deliberately NOT implied by candle-metal: candle's
 # accelerate CPU backend bails on f16 matmul, which breaks quantized generation
 # on the CPU fallback path. See docs/internal/specs/generation-engine.md §2.3.
 candle-accelerate = ["candle", "candle-core/accelerate"]
 generate = ["candle", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+
+# The smoke test exercises the Vision shim through the FFI boundary, so it
+# only exists when that shim is compiled. Declared rather than left to fail:
+# `--all-targets` on a default build would otherwise not compile.
+[[example]]
+name = "vision_smoke"
+required-features = ["recognize-vision"]
+
+[build-dependencies]
+cc = "1"
 
 [dependencies]
 grep-matcher = "0.1"
@@ -125,3 +143,19 @@ mockall = "0.13"
 mockito = "1.4"
 base64 = "0.22.1"
 wilkes-core = { path = ".", features = ["test-utils"] }
+
+[[example]]
+name = "inline_probe"
+required-features = ["recognize-onnx"]
+
+[[example]]
+name = "formula_probe"
+required-features = ["recognize-onnx"]
+
+[[example]]
+name = "read_probe"
+required-features = ["recognize-onnx"]
+
+[[example]]
+name = "page_probe"
+required-features = ["recognize-onnx"]

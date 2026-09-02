@@ -12,6 +12,7 @@ import { useSettingsStore } from "./useSettingsStore";
 
 export const VIEWER_SESSION_STORAGE_KEY = "wilkes.viewer-session";
 let activeViewerWorkspaceId = "default";
+let viewerPersistenceEnabled = true;
 const workspaceStorageName = (name: string) =>
   activeViewerWorkspaceId === "default" ? name : `${name}.${activeViewerWorkspaceId}`;
 const VIEWER_SESSION_VERSION = 1;
@@ -44,11 +45,13 @@ interface PersistedViewerState {
 }
 
 interface ViewerStore {
+  mode: "workspace" | "standalone";
   tabs: ViewerTab[];
   activeTabId: string | null;
   sessionHydrated: boolean;
 
   restoreSession: () => Promise<void>;
+  enterStandaloneMode: () => void;
   switchWorkspace: (workspaceId: string) => Promise<void>;
   openMatch: (match: MatchRef) => void;
   openFile: (path: string) => void;
@@ -95,8 +98,21 @@ function errorMessage(error: unknown): string {
 }
 
 function loadPreview(tabId: string, requestId: number, match: MatchRef): void {
-  api
-    .preview(match)
+  const preview = useViewerStore.getState().mode === "standalone"
+    ? api.previewStandalone
+    : api.preview.bind(api);
+  if (!preview) {
+    useViewerStore.setState((state) => ({
+      tabs: replaceTab(state.tabs, tabId, (tab) => ({
+        ...tab,
+        previewData: null,
+        previewLoading: false,
+        previewError: "Standalone document preview is unavailable",
+      })),
+    }));
+    return;
+  }
+  preview(match)
     .then((previewData) => {
       useViewerStore.setState((state) => ({
         tabs: replaceTab(state.tabs, tabId, (tab) =>
@@ -142,6 +158,21 @@ function updateMetadata(
 }
 
 function loadMetadata(tabId: string, path: string): void {
+  if (useViewerStore.getState().mode === "standalone") {
+    const load = api.getStandaloneFileMetadata;
+    if (!load) {
+      updateMetadata(tabId, path, null, "failed");
+      return;
+    }
+    load(path)
+      .then((metadata) => updateMetadata(tabId, path, metadata, "ready"))
+      .catch((error) => {
+        console.error("Standalone metadata fetch failed:", error);
+        updateMetadata(tabId, path, null, "failed");
+      });
+    return;
+  }
+
   const upgradeAuthoritative = () => {
     if (!useSettingsStore.getState().settings?.integrations.zotero.enabled) return;
     api
@@ -331,6 +362,7 @@ const viewerSessionStorage: StateStorage = {
     }
   },
   setItem: (name, value) => {
+    if (!viewerPersistenceEnabled) return;
     try {
       localStorage.setItem(workspaceStorageName(name), value);
     } catch (error) {
@@ -338,6 +370,7 @@ const viewerSessionStorage: StateStorage = {
     }
   },
   removeItem: (name) => {
+    if (!viewerPersistenceEnabled) return;
     try {
       localStorage.removeItem(workspaceStorageName(name));
     } catch (error) {
@@ -351,11 +384,13 @@ let restorePromise: Promise<void> | null = null;
 export const useViewerStore = create<ViewerStore>()(
   persist(
     (set, get) => ({
+      mode: "workspace",
       tabs: [],
       activeTabId: null,
       sessionHydrated: false,
 
       restoreSession: async () => {
+        viewerPersistenceEnabled = true;
         if (get().sessionHydrated) return;
         if (restorePromise) return restorePromise;
         restorePromise = (async () => {
@@ -369,7 +404,18 @@ export const useViewerStore = create<ViewerStore>()(
         return restorePromise;
       },
 
+      enterStandaloneMode: () => {
+        viewerPersistenceEnabled = false;
+        set({
+          mode: "standalone",
+          tabs: [],
+          activeTabId: null,
+          sessionHydrated: true,
+        });
+      },
+
       switchWorkspace: async (workspaceId) => {
+        viewerPersistenceEnabled = true;
         let persisted: unknown = null;
         try {
           const raw = localStorage.getItem(`${VIEWER_SESSION_STORAGE_KEY}.${workspaceId}`);
@@ -380,6 +426,7 @@ export const useViewerStore = create<ViewerStore>()(
         activeViewerWorkspaceId = workspaceId;
         useViewerStore.setState({
           ...restorePersistedState(persisted),
+          mode: "workspace",
           sessionHydrated: true,
         });
         const activeTabId = useViewerStore.getState().activeTabId;

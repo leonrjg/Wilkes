@@ -540,6 +540,11 @@ pub struct ExtractionDiagnostics {
     /// Images a fixed technical limit rejected before any stage.
     #[serde(default)]
     pub native_images_skipped_technical_limit: u32,
+    /// Images the configured [`ImageScope`] withheld from the recognizer.
+    /// Their pixels were never decoded, so nothing recorded about them is a
+    /// claim about what they contain.
+    #[serde(default)]
+    pub native_images_not_read: u32,
     #[serde(default)]
     pub images_ocr_succeeded: u32,
     #[serde(default)]
@@ -619,14 +624,28 @@ pub struct ExtractionDiagnostics {
     // differently and fail differently: an embedded figure that reads as
     // nothing leaves the reading as it was, and a typeset region that reads
     // as nothing leaves the page's own glyph run in place of it.
-    /// Areas the typography marked out as a formula or a ruled table.
+    /// Areas the layout detector marked out on any page, of any class —
+    /// including the classes nothing reads. The denominator for the two
+    /// counters below.
+    #[serde(default)]
+    pub layout_regions_detected: u32,
+    /// Detected areas this build reads nothing for. Not a failure: a heading
+    /// is better read from the page's own glyphs than from a picture of them.
+    /// Counted because one class in it is a real gap — an inline formula is
+    /// found and not routed, because supersession replaces whole lines and an
+    /// inline formula shares its line with prose.
+    #[serde(default)]
+    pub layout_regions_not_routed: u32,
+    /// Pages the detector could not be run on. Their glyph runs stand, which
+    /// is what they would have had anyway; the log says which page and why.
+    #[serde(default)]
+    pub layout_pages_failed: u32,
+    /// Areas the detector marked out that Wilkes routes to a recognizer, and
+    /// that cover at least one of the page's own lines. Every one of them is
+    /// rendered and read — there is no per-document cap, so this is also the
+    /// number of regions the recognizer was asked about.
     #[serde(default)]
     pub typeset_regions_found: u32,
-    /// Regions past the per-document budget, discovered and not rendered.
-    /// Never silently dropped: a bounded run that reports nothing dropped
-    /// reads identically to a document that had no more to find.
-    #[serde(default)]
-    pub typeset_regions_over_budget: u32,
     /// Regions whose reading was admitted, and which therefore stand in the
     /// canonical reading in place of the glyphs the page drew there. The
     /// difference from `typeset_regions_found` is the regions where the page's
@@ -1035,6 +1054,14 @@ pub enum ImageAnalysisStatus {
     Complete,
     /// Not analyzed at all: a technical limit rejected it before any stage.
     SkippedTechnicalLimit { reason: String },
+    /// Not analyzed at all: the configured [`ImageScope`] does not read
+    /// pictures of this origin, so the pixels were never decoded.
+    ///
+    /// Its own variant rather than a technical limit's reason string: nothing
+    /// is wrong with the image, and filing a setting's decision under the
+    /// decoder's casualties would send a reader looking for a fault that does
+    /// not exist.
+    NotRead { reason: String },
     /// At least one stage failed. The message is the failure, not a summary.
     Partial { failures: Vec<String> },
 }
@@ -1519,6 +1546,36 @@ pub struct GenerationSettings {
     pub sampling_overrides: HashMap<GenerationTask, crate::generate::Sampling>,
 }
 
+/// Which of a document's pictures a recognizer is spent on.
+///
+/// Not a quality setting — a cost one. Every raster a PDF embeds costs one
+/// recognizer call, and on a document VLM that is seconds to minutes each.
+/// Most of those rasters are diagrams whose only text is a handful of axis
+/// labels, and a large share of them transcribe to nothing worth indexing.
+/// The areas a page *typesets* as mathematics or as a ruled table are the
+/// opposite case: few per document, and the recognizer is the only way to
+/// read them at all, because the glyph run the page drew there does not
+/// survive into the reading as text.
+///
+/// So the two are separable, and the cheap half is the default. Which areas
+/// are typeset is decided by the page's own evidence — the font a run is set
+/// in, the rules a table is drawn with — in the typeset survey under
+/// [`crate::extract::pdf`], and not by a model. A layout detector, when there
+/// is one, joins that survey rather than replacing this choice: it would
+/// widen what counts as a formula or a table, which is a different question
+/// from whether the embedded rasters are read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageScope {
+    /// The formulas and ruled tables the page draws with fonts and paths, and
+    /// nothing else. The rasters are still found, counted and reported — they
+    /// are simply not decoded and not read.
+    #[default]
+    TypesetOnly,
+    /// Those, and every raster the PDF embeds.
+    TypesetAndEmbedded,
+}
+
 /// Enrichment of the pictures inside a document.
 ///
 /// Off by default, and deliberately not a quiet default-on: turning it on
@@ -1552,6 +1609,17 @@ pub struct ImageAnalysisSettings {
     /// separate model, and it is optional in a way the transcription is not.
     #[serde(default)]
     pub describer_model: String,
+    /// Which of the document's pictures are read. See [`ImageScope`].
+    ///
+    /// Defaulted, and the default withholds the embedded rasters — for a
+    /// settings file written before this field existed as well, which
+    /// therefore moves the extraction recipe and re-reads every document with
+    /// a picture in it. Deliberate, not an oversight: the alternative default
+    /// spends hours of a library's indexing on pictures most of which
+    /// transcribe to nothing, and a setting that only applies to installations
+    /// made after it shipped is a setting with two meanings.
+    #[serde(default)]
+    pub scope: ImageScope,
 }
 
 /// Tasks whose sampling the user may override.

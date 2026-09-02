@@ -69,6 +69,14 @@ export interface StartupStatus {
   blockers: StartupBlocker[];
 }
 
+/** A file-open request authorized by the operating system. Invalid operands
+ * remain visible so a multi-file request is never partially discarded without
+ * explanation. */
+export interface NativeOpenRequest {
+  paths: string[];
+  errors: string[];
+}
+
 export type SearchMode = "Grep" | "Semantic";
 export type SearchScope =
   | { type: "corpus" }
@@ -660,6 +668,13 @@ export interface GenerationSettings {
  *  them, and optionally a description of what they show. Off by default —
  *  turning it on installs a recognizer and re-reads every document that has a
  *  picture in it. */
+/** Which of a document's pictures a recognizer is spent on.
+ *
+ *  `typeset_only` reads the formulas and ruled tables the page draws with
+ *  fonts and paths and leaves the embedded rasters alone; `typeset_and_embedded`
+ *  reads both. Snake case because that is what the backend enum serializes to. */
+export type ImageScope = "typeset_only" | "typeset_and_embedded";
+
 export interface ImageAnalysisSettings {
   enabled: boolean;
   /** Which recognizer reads the pictures. */
@@ -671,6 +686,8 @@ export interface ImageAnalysisSettings {
   /** The Ollama tag figures are described with; empty means transcription
    *  only. The server is `generation.ollama_url`. */
   describer_model: string;
+  /** Which of the document's pictures are read. Defaults to `typeset_only`. */
+  scope: ImageScope;
 }
 
 /** The recognizers Wilkes knows how to address.
@@ -678,15 +695,24 @@ export interface ImageAnalysisSettings {
  *  Capitalised because that is what the backend enum serializes to; it accepts
  *  the lowercase spelling on the way in as well, and the two must not be
  *  allowed to drift into two different answers here. */
-export type RecognitionEngine = "Onnx" | "Candle";
-export const ALL_RECOGNITION_ENGINES: RecognitionEngine[] = ["Onnx", "Candle"];
+export type RecognitionEngine = "Onnx" | "Candle" | "Vision";
+export const ALL_RECOGNITION_ENGINES: RecognitionEngine[] = ["Onnx", "Candle", "Vision"];
 
 /** What one recognizer is, and what choosing it would mean: what it costs to
  *  install, what confidence it admits a region at, and which kinds of region
  *  it produces under the task configuration Wilkes drives it with. */
+export type RecognizerRole = "page" | "formula";
+
 export interface RecognizerDescriptor {
   engine: RecognitionEngine;
   model_id: string;
+  /** Which of the two reading jobs this model does. A page reader transcribes
+   *  a whole page or picture; a formula reader reads one cropped expression
+   *  back as LaTeX and is spent only on the areas the detector marks out as
+   *  formulas. The engine picker offers `page` models only — the two are not
+   *  interchangeable, and choosing one for the other's job would read every
+   *  page of the library as a single failed expression. */
+  role: RecognizerRole;
   display_name: string;
   description: string;
   /** The recognizer a fresh install reads with — one across the catalogue. */
@@ -703,10 +729,26 @@ export interface RecognizerDescriptor {
 
 /** What this Wilkes can recognize with, as one answer. The engines come from
  *  the build, so an engine missing from `engines` is one this build cannot
- *  read with at all — distinct from an engine that simply has no models. */
+ *  read with at all — distinct from an engine that simply has no models.
+ *
+ *  `models` holds every recognizer, page readers and the formula reader alike,
+ *  each carrying its `role`. The formula reader used to be a field of its own
+ *  here, which made a second model of the same kind a second field rather than
+ *  a second row. */
 export interface RecognizerCatalogue {
   engines: RecognitionEngine[];
   models: RecognizerDescriptor[];
+  /** The layout detector — not a recognizer, but the other half of reading a
+   *  document: it decides which areas a recognizer is spent on. Null when
+   *  this build has none compiled in. */
+  detector: InstallableModelStatus | null;
+}
+
+/** One model a picker can offer: what it is, and whether it is
+ *  here. Without it no formula or table a page typesets is marked out. */
+export interface InstallableModelStatus {
+  inventory: RecognizerInventory;
+  is_installed: boolean;
 }
 
 /** One file of the recognizer, as the inventory names it. */

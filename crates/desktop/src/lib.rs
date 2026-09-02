@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -34,6 +35,12 @@ use platform::{
     DesktopStartupPlan, SystemDesktopPlatform, TauriPlatform,
 };
 
+mod native_open;
+
+use native_open::{NativeOpenRequest, NativeOpenState};
+
+struct GlobalSettingsPath(PathBuf);
+
 #[derive(Default)]
 struct DesktopStartupState(std::sync::RwLock<StartupStatus>);
 
@@ -50,6 +57,41 @@ impl DesktopStartupState {
 #[tauri::command]
 fn get_startup_status(app: AppHandle) -> StartupStatus {
     app.state::<Arc<DesktopStartupState>>().status()
+}
+
+#[tauri::command]
+fn document_window_ready(app: AppHandle) -> Vec<NativeOpenRequest> {
+    app.state::<NativeOpenState>().mark_ready_and_drain()
+}
+
+#[tauri::command]
+async fn get_global_settings(app: AppHandle) -> Result<Settings, String> {
+    wilkes_api::commands::settings::get_settings(&app.state::<GlobalSettingsPath>().0)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn preview_standalone(
+    match_ref: wilkes_core::types::MatchRef,
+) -> Result<wilkes_core::types::PreviewData, String> {
+    wilkes_api::commands::preview::preview(match_ref, None)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_standalone_file_metadata(
+    app: AppHandle,
+    path: String,
+) -> Result<DocumentMetadata, String> {
+    let settings =
+        wilkes_api::commands::settings::get_settings(&app.state::<GlobalSettingsPath>().0)
+            .await
+            .map_err(|error| error.to_string())?;
+    wilkes_api::commands::metadata::get_file_metadata(path.into(), settings.supported_extensions)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// The single registration point for feature preflights. A future breaking
@@ -870,6 +912,15 @@ async fn update_settings_with_listeners(
 }
 
 fn handle_exit_event(app_handle: &AppHandle, event: tauri::RunEvent) {
+    #[cfg(target_os = "macos")]
+    if let tauri::RunEvent::Opened { urls } = &event {
+        if let Err(error) =
+            native_open::deliver(app_handle, native_open::request_from_urls(urls.clone()))
+        {
+            error!("native file-open delivery failed: {error}");
+        }
+    }
+
     if matches!(
         event,
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
@@ -2624,6 +2675,27 @@ async fn install_image_recognizer(
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Download the layout detector. Reports on the same event stream as the
+/// recognizer install: image-analysis-progress, image-analysis-done,
+/// image-analysis-error.
+#[cfg(feature = "recognize-onnx")]
+#[tauri::command]
+async fn install_layout_detector(app: AppHandle) -> Result<(), String> {
+    app_context(&app)
+        .install_layout_detector()
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// The same command in a build with no detector compiled in. Present rather
+/// than absent so the UI gets an explanation instead of an unknown-command
+/// error, which reads as a bug in the application.
+#[cfg(not(feature = "recognize-onnx"))]
+#[tauri::command]
+async fn install_layout_detector(_app: AppHandle) -> Result<(), String> {
+    Err("this build has no layout detector compiled in".to_string())
+}
+
 #[tauri::command]
 async fn explain_related_document(
     app: AppHandle,
@@ -2716,8 +2788,20 @@ pub fn run() {
     wilkes_core::logging::init_logging();
 
     let app = tauri::Builder::default()
+        // This must remain the first plugin: on Windows and Linux it owns the
+        // handoff from a second OS "Open With" launch to this process.
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            let request = native_open::request_from_args(
+                args.into_iter().map(OsString::from).collect(),
+                std::path::Path::new(&cwd),
+            );
+            if let Err(error) = native_open::deliver(app, request) {
+                error!("single-instance file-open delivery failed: {error}");
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .manage(NativeOpenState::default())
         .setup(|app| {
             let startup = Arc::new(DesktopStartupState::default());
             app.manage(Arc::clone(&startup));
@@ -2734,6 +2818,7 @@ pub fn run() {
                     return Ok(());
                 }
             };
+            app.manage(GlobalSettingsPath(settings_path.clone()));
 
             let status = match collect_startup_status(&data_dir, &settings_path) {
                 Ok(status) => status,
@@ -2802,10 +2887,22 @@ pub fn run() {
                 }
             });
 
+            let initial_request = native_open::request_from_args(
+                std::env::args_os().collect(),
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            );
+            if let Err(error) = native_open::deliver(&handle, initial_request) {
+                error!("initial file-open delivery failed: {error}");
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_startup_status,
+            document_window_ready,
+            get_global_settings,
+            preview_standalone,
+            get_standalone_file_metadata,
             search,
             cancel_search,
             related_documents,
@@ -2889,6 +2986,7 @@ pub fn run() {
             image_recognizer_catalogue,
             image_recognizer_inventory,
             install_image_recognizer,
+            install_layout_detector,
             explain_related_document,
             summarize_document,
             summarize_search_results,
@@ -2926,6 +3024,44 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    /// The two model downloads are gated on this crate declaring the feature
+    /// its `#[cfg]`s test. It did not, and both commands compiled to the stub
+    /// that tells the user the build has no detector — in a build that had
+    /// one, with the weights already downloadable and the panel already
+    /// offering them. A cfg on an undeclared feature is not a switch, it is
+    /// the constant `false`.
+    #[test]
+    fn the_default_build_offers_the_model_downloads() {
+        assert!(
+            cfg!(feature = "recognize-onnx"),
+            "the desktop build must declare the feature its install commands are gated on"
+        );
+    }
+
+    /// The engine picker offers what this build contains. Vision is out of
+    /// `wilkes-core`'s own default so that a library consumer is not made to
+    /// build an Objective-C shim — but the application that shows the picker
+    /// has to contain what the picker shows, and for a while it did not: the
+    /// entry was there and greyed out on the only platform that has it.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_mac_build_can_actually_recognize_with_vision() {
+        use wilkes_core::extract::image::dispatch::{RecognitionEngine, RecognizerCatalogue};
+        assert!(
+            RecognitionEngine::supported_engines().contains(&RecognitionEngine::Vision),
+            "Vision is offered by the picker, so it must be compiled in"
+        );
+        let catalogue: RecognizerCatalogue =
+            wilkes_core::extract::image::recognizer_catalogue(std::path::Path::new("/nonexistent"));
+        assert!(
+            catalogue
+                .models
+                .iter()
+                .any(|model| model.engine == RecognitionEngine::Vision),
+            "and it must appear in the catalogue the panel renders"
+        );
+    }
+
     use super::*;
     use tempfile::tempdir;
     use wilkes_api::context::EventEmitter;

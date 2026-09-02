@@ -21,6 +21,18 @@ pub trait ContentExtractor: Send + Sync {
         ""
     }
 
+    /// Let go of whatever this extractor's image analyzer keeps resident.
+    ///
+    /// The caller is a pass that has finished with images and is about to
+    /// spend as long again on something else — the index build, which reads
+    /// every figure before it embeds anything. Extraction still works
+    /// afterwards; a later read reloads.
+    ///
+    /// Defaulted for the same reason as the identity above: a format with no
+    /// embedded images holds no analyzer, and having nothing to release is
+    /// the true answer rather than an omission.
+    fn release_image_analyzer(&self) {}
+
     /// The document's declared table of contents, empty when it declares none,
     /// with each entry anchored in the reading `extract` produces.
     ///
@@ -119,6 +131,19 @@ impl ExtractorRegistry {
             .find(|e| e.can_handle(path, mime))
             .map(|e| e.as_ref())
     }
+
+    /// Tell every extractor that enriches images that the images are done for
+    /// now, so the recognizer behind them can be let go.
+    ///
+    /// On the registry rather than reached for through
+    /// [`crate::extract::image::configured`], because a caller holding a
+    /// registry is reading documents *with that registry*, and releasing some
+    /// other process-wide analyzer would be releasing something else.
+    pub fn release_image_analyzers(&self) {
+        for extractor in &self.extractors {
+            extractor.release_image_analyzer();
+        }
+    }
 }
 
 impl Default for ExtractorRegistry {
@@ -197,6 +222,15 @@ mod tests {
 
         struct Named;
         impl image::ImageAnalyzer for Named {
+            fn layout(&self) -> Option<&dyn image::LayoutModel> {
+                None
+            }
+            fn release(&self) {}
+            // A test analyzer reads whatever it is handed; the scope is the
+            // configuration's decision and these fixtures are not testing it.
+            fn reads_embedded_images(&self) -> bool {
+                true
+            }
             fn identity(&self) -> String {
                 "named-analyzer-v1".to_string()
             }
@@ -231,6 +265,15 @@ mod tests {
 
         struct Named(&'static str);
         impl image::ImageAnalyzer for Named {
+            fn layout(&self) -> Option<&dyn image::LayoutModel> {
+                None
+            }
+            fn release(&self) {}
+            // A test analyzer reads whatever it is handed; the scope is the
+            // configuration's decision and these fixtures are not testing it.
+            fn reads_embedded_images(&self) -> bool {
+                true
+            }
             fn identity(&self) -> String {
                 self.0.to_string()
             }

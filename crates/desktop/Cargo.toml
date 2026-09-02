@@ -15,6 +15,20 @@ path = "src/main.rs"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# See the note in `crates/api/Cargo.toml`. This is the build the two model
+# downloads are actually offered from, so this is the crate where the missing
+# declaration was a defect rather than a tidiness problem.
+default = ["recognize-onnx", "recognize-vision"]
+recognize-onnx = ["wilkes-api/recognize-onnx", "wilkes-core/recognize-onnx"]
+# Compiled into the shipped application, though not into `wilkes-core`'s own
+# default: a library consumer should not be made to build an Objective-C shim,
+# but the app that offers the engine picker has to contain the engine it
+# offers. Keeping it out of the build was not the same decision as keeping it
+# out of the default — the default engine is ONNX either way, and the picker
+# greyed Vision out on the one platform that has it.
+recognize-vision = ["wilkes-core/recognize-vision"]
+
 [dependencies]
 wilkes-api = { path = "../api" }
 wilkes-agent = { path = "../agent" }
@@ -32,6 +46,7 @@ uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 tracing = "0.1"
 tauri-plugin-clipboard-manager = "2"
+tauri-plugin-single-instance = "2"
 clipboard-files = "0.1.2"
 trash = "5.2"
 

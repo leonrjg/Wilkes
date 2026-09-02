@@ -768,6 +768,33 @@ describe("PreviewPane", () => {
     expect(api.setActiveDocument).toHaveBeenCalledWith("/docs/active.pdf", 6);
   });
 
+  it("keeps workspace-owned actions and active-document publication out of standalone mode", () => {
+    useGenerationStore.setState({ ready: true });
+    useSemanticStore.setState({ readyForCurrentRoot: true });
+    setViewerState({
+      selectedMatch: {
+        path: "/outside/every-root/paper.pdf",
+        origin: { PdfPage: { page: 1, bbox: null } },
+      } as any,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } },
+      viewerMetadata: {
+        title: "Outside paper",
+        author: null,
+        doi: "10.1000/outside",
+        created_at: null,
+      },
+      viewerMetadataStatus: "ready",
+    });
+
+    render(<PreviewPane standalone />);
+
+    expect(screen.queryByRole("button", { name: "Summarize document" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Show related documents" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Show citation graph" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Show document topics" })).not.toBeInTheDocument();
+    expect(api.setActiveDocument).not.toHaveBeenCalled();
+  });
+
   it("surfaces PDF parse failures and retries with a fresh load attempt", () => {
     const mockMatch = {
       path: "/missing.pdf",
