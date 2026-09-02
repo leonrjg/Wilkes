@@ -153,6 +153,7 @@ describe("IntegrationsPanel", () => {
     const onUpdate = vi.fn();
 
     render(<IntegrationsPanel api={api} settings={settings(false)} onUpdate={onUpdate} />);
+    fireEvent.click(screen.getByRole("tab", { name: /Semantic Scholar/ }));
     fireEvent.click(screen.getByLabelText("Enable Semantic Scholar integration"));
 
     await waitFor(() => {
@@ -193,6 +194,7 @@ describe("IntegrationsPanel", () => {
     const onUpdate = vi.fn();
 
     render(<IntegrationsPanel api={api} settings={settings(false)} onUpdate={onUpdate} />);
+    fireEvent.click(screen.getByRole("tab", { name: /Semantic Scholar/ }));
     fireEvent.click(screen.getByLabelText("Enable Semantic Scholar integration"));
 
     await waitFor(() => {
@@ -224,6 +226,122 @@ describe("IntegrationsPanel", () => {
     }));
   });
 
+  it("shows one provider at a time, and marks the ones that are on", () => {
+    const enabled = settings(true);
+    render(
+      <IntegrationsPanel api={{} as never} settings={enabled} onUpdate={vi.fn()} />,
+    );
+
+    // Every provider is reachable, but only the selected one is rendered:
+    // the panel's length is one provider, not the sum of all of them.
+    expect(screen.getByRole("tab", { name: /Zotero/ })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Semantic Scholar/ })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /OpenAlex/ })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Custom/ })).toBeInTheDocument();
+
+    expect(screen.getByLabelText("Enable Zotero integration")).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Enable OpenAlex integration"),
+    ).not.toBeInTheDocument();
+
+    // Zotero is the enabled one in this fixture, so it alone is marked.
+    expect(screen.getByRole("tab", { name: /Zotero/ })).toContainElement(
+      screen.getByLabelText("enabled"),
+    );
+  });
+
+  it("switches to the fields of whichever provider is selected", () => {
+    render(
+      <IntegrationsPanel
+        api={{} as never}
+        settings={settings(false)}
+        onUpdate={vi.fn()}
+      />,
+    );
+
+    // Zotero's citation-style select belongs to Zotero alone.
+    expect(screen.getByLabelText("Citation style")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: /Semantic Scholar/ }));
+    expect(screen.queryByLabelText("Citation style")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("API key")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: /OpenAlex/ }));
+    expect(screen.queryByLabelText("API key")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Email")).toBeInTheDocument();
+  });
+
+  it("gives manifest-defined providers their own tab", () => {
+    render(
+      <IntegrationsPanel
+        api={{} as never}
+        settings={settings(false)}
+        onUpdate={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: /Custom/ }));
+    expect(screen.getByText("Add integration")).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Enable Zotero integration"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("edits a field of the selected provider without touching the others", () => {
+    const onUpdate = vi.fn();
+    render(
+      <IntegrationsPanel
+        api={{} as never}
+        settings={settings(false)}
+        onUpdate={onUpdate}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: /OpenAlex/ }));
+    fireEvent.change(screen.getByLabelText("Email"), {
+      target: { value: "team@example.com" },
+    });
+
+    expect(onUpdate).toHaveBeenCalledWith({
+      integrations: {
+        zotero: {
+          enabled: false,
+          base_url: "http://127.0.0.1:23119",
+          citation_style: "chicago-note-bibliography",
+        },
+        semantic_scholar: {
+          enabled: false,
+          base_url: "https://api.semanticscholar.org",
+          api_key: null,
+        },
+        openalex: {
+          enabled: false,
+          base_url: "https://api.openalex.org",
+          email: "team@example.com",
+        },
+      },
+    });
+  });
+
+  it("stores an emptied optional field as null, not an empty string", () => {
+    const onUpdate = vi.fn();
+    const withKey = settings(false);
+    withKey.integrations.semantic_scholar.api_key = "secret";
+    render(
+      <IntegrationsPanel api={{} as never} settings={withKey} onUpdate={onUpdate} />,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: /Semantic Scholar/ }));
+    fireEvent.change(screen.getByLabelText("API key"), { target: { value: "" } });
+
+    // `null`, not `""`: the backend's Option<String> means "no API key" and
+    // "an API key that is the empty string" are different, and an empty box is
+    // only ever the first.
+    expect(
+      onUpdate.mock.calls[0][0].integrations.semantic_scholar.api_key,
+    ).toBeNull();
+  });
+
   it("enables OpenAlex only after a ready API check", async () => {
     const api = {
       openAlexStatus: vi.fn().mockResolvedValue({
@@ -237,6 +355,7 @@ describe("IntegrationsPanel", () => {
     const onUpdate = vi.fn();
 
     render(<IntegrationsPanel api={api} settings={settings(false)} onUpdate={onUpdate} />);
+    fireEvent.click(screen.getByRole("tab", { name: /OpenAlex/ }));
     fireEvent.click(screen.getByLabelText("Enable OpenAlex integration"));
 
     await waitFor(() => {

@@ -1,13 +1,9 @@
 import { useState } from "react";
-import type {
-  IntegrationStatus,
-  OpenAlexSettings,
-  SemanticScholarSettings,
-  Settings,
-  ZoteroSettings,
-} from "../lib/types";
+import type { Settings } from "../lib/types";
+import { BUILT_IN_PROVIDERS } from "../lib/integrations/providers";
 import type { SearchApi } from "../services/api";
 import CustomIntegrations from "./CustomIntegrations";
+import ProviderForm from "./ProviderForm";
 
 interface IntegrationsPanelProps {
   api: SearchApi;
@@ -15,369 +11,92 @@ interface IntegrationsPanelProps {
   onUpdate: (patch: Partial<Settings>) => Promise<void> | void;
 }
 
-const DEFAULT_ZOTERO: ZoteroSettings = {
-  enabled: false,
-  base_url: "http://127.0.0.1:23119",
-  citation_style: "chicago-note-bibliography",
-};
+/** The custom tab is not a provider, so it is not a row in the provider table. */
+const CUSTOM_TAB = "custom";
 
-const DEFAULT_SEMANTIC_SCHOLAR: SemanticScholarSettings = {
-  enabled: false,
-  base_url: "https://api.semanticscholar.org",
-  api_key: null,
-};
+/**
+ * The integrations settings, one provider at a time.
+ *
+ * Previously every provider's form was stacked in one scroll, which made the
+ * panel's length the sum of how many providers exist — a shape that only got
+ * worse once a user could add their own. Tabs make it the length of one
+ * provider instead, and give the manifest editor, which is the tallest thing
+ * here by far, somewhere to be without pushing everything else off-screen.
+ */
+export default function IntegrationsPanel({
+  api,
+  settings,
+  onUpdate,
+}: IntegrationsPanelProps) {
+  const [active, setActive] = useState<string>(BUILT_IN_PROVIDERS[0].key);
+  const custom = settings.integrations?.custom ?? [];
 
-const DEFAULT_OPENALEX: OpenAlexSettings = {
-  enabled: false,
-  base_url: "https://api.openalex.org",
-  email: null,
-};
+  const tabs = [
+    ...BUILT_IN_PROVIDERS.map((provider) => ({
+      id: provider.key as string,
+      label: provider.name,
+      // A provider the user has switched on is marked, so the panel says which
+      // ones are live without the user opening each tab to find out.
+      on: Boolean(
+        (settings.integrations?.[provider.key] as { enabled?: boolean } | undefined)
+          ?.enabled,
+      ),
+    })),
+    {
+      id: CUSTOM_TAB,
+      label: "Custom",
+      on: custom.some((config) => config.enabled),
+    },
+  ];
 
-const CITATION_STYLES = [
-  { id: "chicago-note-bibliography", label: "Chicago notes" },
-  { id: "apa", label: "APA" },
-  { id: "ieee", label: "IEEE" },
-  { id: "modern-language-association", label: "MLA" },
-];
-
-export default function IntegrationsPanel({ api, settings, onUpdate }: IntegrationsPanelProps) {
-  const zotero = settings.integrations?.zotero ?? DEFAULT_ZOTERO;
-  const semanticScholar =
-    settings.integrations?.semantic_scholar ?? DEFAULT_SEMANTIC_SCHOLAR;
-  const openAlex = settings.integrations?.openalex ?? DEFAULT_OPENALEX;
-  const [status, setStatus] = useState<IntegrationStatus | null>(null);
-  const [semanticScholarStatus, setSemanticScholarStatus] =
-    useState<IntegrationStatus | null>(null);
-  const [openAlexStatus, setOpenAlexStatus] = useState<IntegrationStatus | null>(null);
-  const [testing, setTesting] = useState(false);
-  const [testingSemanticScholar, setTestingSemanticScholar] = useState(false);
-  const [testingOpenAlex, setTestingOpenAlex] = useState(false);
-
-  const updateZotero = (patch: Partial<ZoteroSettings>) =>
-    onUpdate({
-      integrations: {
-        ...settings.integrations,
-        zotero: {
-          ...zotero,
-          ...patch,
-        },
-      },
-    });
-
-  const updateSemanticScholar = (patch: Partial<SemanticScholarSettings>) =>
-    onUpdate({
-      integrations: {
-        ...settings.integrations,
-        semantic_scholar: {
-          ...semanticScholar,
-          ...patch,
-        },
-      },
-    });
-
-  const updateOpenAlex = (patch: Partial<OpenAlexSettings>) =>
-    onUpdate({
-      integrations: {
-        ...settings.integrations,
-        openalex: {
-          ...openAlex,
-          ...patch,
-        },
-      },
-    });
-
-  const handleEnabledChange = async (enabled: boolean) => {
-    if (!enabled) {
-      await updateZotero({ enabled: false });
-      return;
-    }
-
-    setTesting(true);
-    try {
-      const nextStatus = await api.zoteroStatus();
-      setStatus(nextStatus);
-      if (nextStatus.state === "ready") {
-        await updateZotero({ enabled: true });
-      }
-    } catch (error) {
-      setStatus({
-        id: "zotero",
-        enabled: false,
-        state: "zotero_down",
-        message: error instanceof Error ? error.message : "Zotero local API is not reachable.",
-        version: null,
-      });
-    } finally {
-      setTesting(false);
-    }
-  };
-
-  const testConnection = async () => {
-    setTesting(true);
-    try {
-      setStatus(await api.zoteroStatus());
-    } finally {
-      setTesting(false);
-    }
-  };
-
-  const handleSemanticScholarEnabledChange = async (enabled: boolean) => {
-    if (!enabled) {
-      await updateSemanticScholar({ enabled: false });
-      return;
-    }
-
-    setTestingSemanticScholar(true);
-    try {
-      await updateSemanticScholar({ enabled: true });
-      const nextStatus = await api.semanticScholarStatus();
-      setSemanticScholarStatus(nextStatus);
-      if (!isUsableProviderStatus(nextStatus)) {
-        await updateSemanticScholar({ enabled: false });
-      }
-    } catch (error) {
-      setSemanticScholarStatus({
-        id: "semantic_scholar",
-        enabled: false,
-        state: "remote_api_down",
-        message:
-          error instanceof Error
-            ? error.message
-            : "Semantic Scholar API is not reachable.",
-        version: null,
-      });
-      await updateSemanticScholar({ enabled: false });
-    } finally {
-      setTestingSemanticScholar(false);
-    }
-  };
-
-  const testSemanticScholarConnection = async () => {
-    setTestingSemanticScholar(true);
-    try {
-      setSemanticScholarStatus(await api.semanticScholarStatus());
-    } finally {
-      setTestingSemanticScholar(false);
-    }
-  };
-
-  const handleOpenAlexEnabledChange = async (enabled: boolean) => {
-    if (!enabled) {
-      await updateOpenAlex({ enabled: false });
-      return;
-    }
-
-    setTestingOpenAlex(true);
-    try {
-      await updateOpenAlex({ enabled: true });
-      const nextStatus = await api.openAlexStatus();
-      setOpenAlexStatus(nextStatus);
-      if (!isUsableProviderStatus(nextStatus)) {
-        await updateOpenAlex({ enabled: false });
-      }
-    } catch (error) {
-      setOpenAlexStatus({
-        id: "openalex",
-        enabled: false,
-        state: "remote_api_down",
-        message:
-          error instanceof Error ? error.message : "OpenAlex API is not reachable.",
-        version: null,
-      });
-      await updateOpenAlex({ enabled: false });
-    } finally {
-      setTestingOpenAlex(false);
-    }
-  };
-
-  const testOpenAlexConnection = async () => {
-    setTestingOpenAlex(true);
-    try {
-      setOpenAlexStatus(await api.openAlexStatus());
-    } finally {
-      setTestingOpenAlex(false);
-    }
-  };
+  const activeProvider = BUILT_IN_PROVIDERS.find(
+    (provider) => provider.key === active,
+  );
 
   return (
     <div className="space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300 p-1">
-      <section className="space-y-3">
-        <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2.5 uppercase tracking-wider">
-          Zotero
-        </h3>
-
-        <label className="flex items-center gap-2.5 cursor-pointer group">
-          <input
-            type="checkbox"
-            checked={zotero.enabled}
-            disabled={testing}
-            onChange={(e) => handleEnabledChange(e.target.checked)}
-            className="w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
-          />
-          <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">
-            Enable Zotero integration
-          </span>
-        </label>
-
-        <div className="space-y-1">
-          <label className="text-xs text-[var(--text-muted)]">Local API URL</label>
-          <input
-            type="url"
-            value={zotero.base_url}
-            onChange={(e) => updateZotero({ base_url: e.target.value })}
-            className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
-          />
-        </div>
-
-        <div className="space-y-1">
-          <label className="text-xs text-[var(--text-muted)]">Citation style</label>
-          <select
-            value={zotero.citation_style}
-            onChange={(e) => updateZotero({ citation_style: e.target.value })}
-            className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
-          >
-            {CITATION_STYLES.map((style) => (
-              <option key={style.id} value={style.id}>
-                {style.label}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div className="flex items-center gap-2">
+      <div
+        role="tablist"
+        aria-label="Integrations"
+        className="flex items-center gap-1 border-b border-[var(--border-main)]"
+      >
+        {tabs.map((tab) => (
           <button
+            key={tab.id}
             type="button"
-            onClick={testConnection}
-            disabled={testing}
-            className="px-3 py-1.5 bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white text-[10px] font-bold uppercase tracking-wider rounded transition-colors disabled:opacity-50"
+            role="tab"
+            aria-selected={active === tab.id}
+            onClick={() => setActive(tab.id)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 -mb-px text-xs border-b-2 transition-colors ${
+              active === tab.id
+                ? "border-[var(--accent-blue)] text-[var(--text-main)] font-medium"
+                : "border-transparent text-[var(--text-muted)] hover:text-[var(--text-main)]"
+            }`}
           >
-            {testing ? "Testing" : "Test connection"}
+            {tab.label}
+            {tab.on && (
+              <span
+                aria-label="enabled"
+                className="w-1.5 h-1.5 rounded-full bg-[var(--accent-blue)]"
+              />
+            )}
           </button>
-          {status && (
-            <span className="text-xs text-[var(--text-muted)]">
-              {status.message}
-            </span>
-          )}
-        </div>
-      </section>
+        ))}
+      </div>
 
-      <section className="space-y-3 pt-3 border-t border-[var(--border-main)]">
-        <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2.5 uppercase tracking-wider">
-          Semantic Scholar
-        </h3>
-
-        <label className="flex items-center gap-2.5 cursor-pointer group">
-          <input
-            type="checkbox"
-            checked={semanticScholar.enabled}
-            disabled={testingSemanticScholar}
-            onChange={(e) => handleSemanticScholarEnabledChange(e.target.checked)}
-            className="w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
+      <div role="tabpanel">
+        {activeProvider ? (
+          <ProviderForm
+            key={activeProvider.key}
+            provider={activeProvider}
+            api={api}
+            settings={settings}
+            onUpdate={onUpdate}
           />
-          <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">
-            Enable Semantic Scholar integration
-          </span>
-        </label>
-
-        <div className="space-y-1">
-          <label className="text-xs text-[var(--text-muted)]">API URL</label>
-          <input
-            type="url"
-            value={semanticScholar.base_url}
-            onChange={(e) => updateSemanticScholar({ base_url: e.target.value })}
-            className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
-          />
-        </div>
-
-        <div className="space-y-1">
-          <label className="text-xs text-[var(--text-muted)]">API key</label>
-          <input
-            type="password"
-            value={semanticScholar.api_key ?? ""}
-            onChange={(e) =>
-              updateSemanticScholar({ api_key: e.target.value || null })
-            }
-            className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
-          />
-        </div>
-
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={testSemanticScholarConnection}
-            disabled={testingSemanticScholar}
-            className="px-3 py-1.5 bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white text-[10px] font-bold uppercase tracking-wider rounded transition-colors disabled:opacity-50"
-          >
-            {testingSemanticScholar ? "Testing" : "Test connection"}
-          </button>
-          {semanticScholarStatus && (
-            <span className="text-xs text-[var(--text-muted)]">
-              {semanticScholarStatus.message}
-            </span>
-          )}
-        </div>
-      </section>
-
-      <section className="space-y-3 pt-3 border-t border-[var(--border-main)]">
-        <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2.5 uppercase tracking-wider">
-          OpenAlex
-        </h3>
-
-        <label className="flex items-center gap-2.5 cursor-pointer group">
-          <input
-            type="checkbox"
-            checked={openAlex.enabled}
-            disabled={testingOpenAlex}
-            onChange={(e) => handleOpenAlexEnabledChange(e.target.checked)}
-            className="w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
-          />
-          <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">
-            Enable OpenAlex integration
-          </span>
-        </label>
-
-        <div className="space-y-1">
-          <label className="text-xs text-[var(--text-muted)]">API URL</label>
-          <input
-            type="url"
-            value={openAlex.base_url}
-            onChange={(e) => updateOpenAlex({ base_url: e.target.value })}
-            className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
-          />
-        </div>
-
-        <div className="space-y-1">
-          <label className="text-xs text-[var(--text-muted)]">Email</label>
-          <input
-            type="email"
-            value={openAlex.email ?? ""}
-            onChange={(e) => updateOpenAlex({ email: e.target.value || null })}
-            className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
-          />
-        </div>
-
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={testOpenAlexConnection}
-            disabled={testingOpenAlex}
-            className="px-3 py-1.5 bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white text-[10px] font-bold uppercase tracking-wider rounded transition-colors disabled:opacity-50"
-          >
-            {testingOpenAlex ? "Testing" : "Test connection"}
-          </button>
-          {openAlexStatus && (
-            <span className="text-xs text-[var(--text-muted)]">
-              {openAlexStatus.message}
-            </span>
-          )}
-        </div>
-      </section>
-
-      <CustomIntegrations api={api} settings={settings} onUpdate={onUpdate} />
+        ) : (
+          <CustomIntegrations api={api} settings={settings} onUpdate={onUpdate} />
+        )}
+      </div>
     </div>
   );
-}
-
-function isUsableProviderStatus(status: IntegrationStatus): boolean {
-  return status.state === "ready" || status.state === "rate_limited";
 }

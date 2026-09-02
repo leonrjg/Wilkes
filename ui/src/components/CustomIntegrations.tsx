@@ -6,6 +6,14 @@ import type {
   ProbeReport,
   Settings,
 } from "../lib/types";
+import {
+  BUTTON_CLASS,
+  CHECKBOX_CLASS,
+  ERROR_TEXT_CLASS,
+  FIELD_LABEL_CLASS,
+  GHOST_BUTTON_CLASS,
+  INPUT_CLASS,
+} from "../lib/integrations/styles";
 import type { SearchApi } from "../services/api";
 
 interface CustomIntegrationsProps {
@@ -44,13 +52,6 @@ year = { path = "published.date-parts[0][0]", coerce = "int" }
 citation_count = { path = "is-referenced-by-count", coerce = "int" }
 pdf_url = { first_of = ["link[0].URL", "resource.primary.URL"] }
 `;
-
-const INPUT_CLASS =
-  "w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors";
-const BUTTON_CLASS =
-  "px-3 py-1.5 bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white text-[10px] font-bold uppercase tracking-wider rounded transition-colors disabled:opacity-50";
-const GHOST_BUTTON_CLASS =
-  "px-2.5 py-1 border border-[var(--border-main)] text-[10px] uppercase tracking-wider rounded text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors disabled:opacity-50";
 
 /**
  * Providers the user describes instead of ones Wilkes compiles.
@@ -199,11 +200,7 @@ export default function CustomIntegrations({
   const probeIsClean = report?.ok === true;
 
   return (
-    <section className="space-y-3 pt-3 border-t border-[var(--border-main)]">
-      <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2.5 uppercase tracking-wider">
-        Custom integrations
-      </h3>
-
+    <div className="space-y-3">
       {configured.length === 0 && draft === null && (
         <p className="text-xs text-[var(--text-muted)]">
           Describe a literature service with a manifest and it becomes a search
@@ -223,7 +220,7 @@ export default function CustomIntegrations({
                 checked={config.enabled}
                 disabled={busy}
                 onChange={(e) => setEnabled(config, e.target.checked)}
-                className="w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
+                className={CHECKBOX_CLASS}
               />
               <span className="text-xs text-[var(--text-main)]">{config.id}</span>
               <span className="text-[10px] text-[var(--text-dim)]">
@@ -265,7 +262,7 @@ export default function CustomIntegrations({
       ))}
 
       {saveError && (
-        <p className="text-xs text-[var(--accent-red,#f87171)]">{saveError}</p>
+        <p className={ERROR_TEXT_CLASS}>{saveError}</p>
       )}
 
       {draft === null ? (
@@ -275,7 +272,7 @@ export default function CustomIntegrations({
       ) : (
         <div className="space-y-3 border border-[var(--border-main)] rounded p-2.5">
           <div className="space-y-1">
-            <label className="text-xs text-[var(--text-muted)]" htmlFor="manifest">
+            <label className={FIELD_LABEL_CLASS} htmlFor="manifest">
               Manifest
             </label>
             <textarea
@@ -318,7 +315,7 @@ export default function CustomIntegrations({
               {summary.problems.map((problem) => (
                 <li
                   key={problem}
-                  className="text-xs text-[var(--accent-red,#f87171)]"
+                  className={ERROR_TEXT_CLASS}
                 >
                   {problem}
                 </li>
@@ -341,9 +338,7 @@ export default function CustomIntegrations({
 
               {summary.required_secrets.map((name) => (
                 <div key={name} className="space-y-1">
-                  <label className="text-xs text-[var(--text-muted)]">
-                    Secret: {name}
-                  </label>
+                  <label className={FIELD_LABEL_CLASS}>Secret: {name}</label>
                   <input
                     type="password"
                     aria-label={`Secret ${name}`}
@@ -396,7 +391,7 @@ export default function CustomIntegrations({
           {report && <ProbeReportView report={report} />}
         </div>
       )}
-    </section>
+    </div>
   );
 }
 
@@ -411,11 +406,7 @@ function ProbeReportView({ report }: { report: ProbeReport }) {
   return (
     <div className="space-y-2 border-t border-[var(--border-main)] pt-2.5">
       <p
-        className={`text-xs ${
-          report.ok
-            ? "text-[var(--text-main)]"
-            : "text-[var(--accent-red,#f87171)]"
-        }`}
+        className={report.ok ? "text-xs text-[var(--text-main)]" : ERROR_TEXT_CLASS}
       >
         {report.ok
           ? `Mapped ${report.results.length} record${report.results.length === 1 ? "" : "s"} with nothing left over.`
@@ -434,7 +425,7 @@ function ProbeReportView({ report }: { report: ProbeReport }) {
           {report.issues.map((issue, index) => (
             <li
               key={`${issue.record}-${issue.field}-${index}`}
-              className="text-xs text-[var(--accent-red,#f87171)]"
+              className={ERROR_TEXT_CLASS}
             >
               record {issue.record}, {issue.field}
               {issue.selector ? ` (${issue.selector})` : ""}: {issue.problem}
