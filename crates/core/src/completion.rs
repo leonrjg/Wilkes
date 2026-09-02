@@ -1627,7 +1627,7 @@ R1 R2 R3 F1 F2 F3 F4 F5";
         .unwrap();
         index
             .write_file(PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 path: source_path.clone(),
                 full_text: source_text.to_string(),
                 chunks: vec![(
@@ -1646,7 +1646,7 @@ R1 R2 R3 F1 F2 F3 F4 F5";
             .unwrap();
         index
             .write_file(PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 path: excluded_path.clone(),
                 full_text: excluded_text.to_string(),
                 chunks: vec![(

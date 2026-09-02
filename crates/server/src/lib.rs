@@ -1203,6 +1203,119 @@ async fn export_files_handler(
         .map_err(server_err)
 }
 
+#[derive(Deserialize)]
+struct ExportFiguresBody {
+    root: PathBuf,
+    path: PathBuf,
+    #[serde(default)]
+    scope: ConsumerScope,
+}
+
+/// One document's pictures: where each sits and what its pixels must hash to.
+///
+/// The browse half of the figure surface, addressed exactly as
+/// `/api/export/chunks` is. It says nothing about passages — `/api/chunks/figures`
+/// is the half that links a picture to the text it was drawn into.
+async fn export_figures_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ExportFiguresBody>,
+) -> Result<Json<wilkes_api::context::FileFigureExport>, (StatusCode, Json<ErrorBody>)> {
+    addressable_context(&state, &body.scope)
+        .await?
+        .export_file_figures(body.root, body.path)
+        .await
+        .map(Json)
+        .map_err(server_err)
+}
+
+#[derive(Deserialize)]
+struct ChunkFiguresBody {
+    #[serde(default)]
+    scope: ConsumerScope,
+    chunk_refs: Vec<ChunkRef>,
+    /// Bytes of slack outside a passage within which a figure still counts.
+    ///
+    /// Absent means none, which admits only the figures a passage contains.
+    /// A window is a widening the caller asks for: it reaches the figure
+    /// printed a page over from the prose discussing it, at the price of
+    /// sometimes reaching one the prose never mentions. Hits carry their
+    /// distance so the caller can spend a budget nearest-first.
+    #[serde(default)]
+    window_bytes: usize,
+}
+
+/// The figures these passages bear on, strongest relation first.
+async fn chunk_figures_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ChunkFiguresBody>,
+) -> Result<Json<wilkes_api::context::ChunkFigureResolution>, (StatusCode, Json<ErrorBody>)> {
+    let index = state.consumer_index(&body.scope).await?;
+    index
+        .into_context()
+        .chunk_figures(body.chunk_refs, body.window_bytes)
+        .await
+        .map(Json)
+        .map_err(consumer_err)
+}
+
+#[derive(Deserialize)]
+struct FigureImageBody {
+    #[serde(default)]
+    scope: ConsumerScope,
+    /// The document, named either way a consumer holds it: a library root and
+    /// path, or any passage of it.
+    #[serde(default)]
+    root: Option<PathBuf>,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    chunk_ref: Option<ChunkRef>,
+    /// `p{page}-i{ordinal}`, from the inventory.
+    area_id: String,
+    /// Longest edge to downscale to. Absent serves the picture at the size the
+    /// page draws it — which is the size its digest covers.
+    #[serde(default)]
+    max_edge: Option<u32>,
+}
+
+/// One figure's pixels, re-derived from the document and checked against the
+/// digest the rendition recorded.
+///
+/// PNG bytes rather than a JSON envelope with base64 in it: this is an image,
+/// every client that wants one can read one, and a base64 field would make
+/// every consumer decode a third more bytes than it needed to. The digest and
+/// the dimensions ride on headers so a caller can check what it got without
+/// parsing the picture.
+async fn figure_image_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<FigureImageBody>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let address = match (body.root, body.path, body.chunk_ref) {
+        (Some(root), Some(path), None) => wilkes_api::context::FigureAddress::File { root, path },
+        (None, None, Some(chunk_ref)) => wilkes_api::context::FigureAddress::Chunk(chunk_ref),
+        _ => {
+            return Err(err(
+                "name the document either by root and path or by chunk_ref, and not by both",
+            ))
+        }
+    };
+    let index = state.consumer_index(&body.scope).await?;
+    let rendered = index
+        .into_context()
+        .figure_pixels(address, body.area_id, body.max_edge)
+        .await
+        .map_err(consumer_err)?;
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, rendered.media_type)
+        .header("x-wilkes-image-sha256", rendered.image_sha256)
+        .header("x-wilkes-image-width", rendered.width)
+        .header("x-wilkes-image-height", rendered.height)
+        .header("x-wilkes-image-source-width", rendered.source_width)
+        .header("x-wilkes-image-source-height", rendered.source_height)
+        .body(Body::from(rendered.bytes))
+        .unwrap())
+}
+
 /// The backend half of the gate. The UI gate prevents the request; this one
 /// makes the API honest if something calls it anyway — the server is reachable
 /// without the desktop UI, so neither is redundant with the other.
@@ -1606,6 +1719,54 @@ async fn openalex_lookup_handler(
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(work))
+}
+
+#[derive(serde::Deserialize)]
+struct ManifestBody {
+    manifest: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ProbeBody {
+    manifest: String,
+    #[serde(default)]
+    secrets: std::collections::HashMap<String, String>,
+}
+
+#[derive(serde::Deserialize)]
+struct IntegrationIdBody {
+    id: String,
+}
+
+async fn custom_integration_summary_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ManifestBody>,
+) -> Json<wilkes_api::commands::integrations::custom::ManifestSummary> {
+    Json(state.context().custom_integration_summary(body.manifest))
+}
+
+async fn custom_integration_probe_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ProbeBody>,
+) -> Result<Json<wilkes_core::integrations::custom::ProbeReport>, (StatusCode, Json<ErrorBody>)> {
+    let report = state
+        .context()
+        .custom_integration_probe(body.manifest, body.secrets)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(report))
+}
+
+async fn custom_integration_status_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<IntegrationIdBody>,
+) -> Result<Json<IntegrationStatus>, (StatusCode, Json<ErrorBody>)> {
+    let status = state
+        .context()
+        .custom_integration_status(body.id)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(status))
 }
 
 async fn resolve_file_metadata_handler(
@@ -2115,9 +2276,24 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             "/api/integrations/openalex/lookup",
             post(openalex_lookup_handler),
         )
+        .route(
+            "/api/integrations/custom/summary",
+            post(custom_integration_summary_handler),
+        )
+        .route(
+            "/api/integrations/custom/probe",
+            post(custom_integration_probe_handler),
+        )
+        .route(
+            "/api/integrations/custom/status",
+            post(custom_integration_status_handler),
+        )
         .route("/api/embed/ready", get(is_semantic_ready_handler))
         .route("/api/embed/text", post(embed_text_handler))
         .route("/api/export/chunks", post(export_chunks_handler))
+        .route("/api/export/figures", post(export_figures_handler))
+        .route("/api/chunks/figures", post(chunk_figures_handler))
+        .route("/api/figure", post(figure_image_handler))
         .route("/api/export/outline", post(export_outline_handler))
         .route("/api/export/files", post(export_files_handler))
         .route("/api/generation/ready", get(is_generation_ready_handler))

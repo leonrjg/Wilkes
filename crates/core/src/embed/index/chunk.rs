@@ -346,6 +346,7 @@ mod tests {
                 pixel_height: 50,
                 image_sha256: "digest".into(),
                 reading_range: (start < end).then_some(ByteRange { start, end }),
+                reading_anchor: Some(start),
                 ocr_regions: Vec::new(),
                 description: None,
                 analyzer_identity: "analyzer-v1".into(),

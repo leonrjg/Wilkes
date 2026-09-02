@@ -20,9 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use wilkes_core::acquire::download_to_root;
-use wilkes_core::integrations::{
-    openalex::OpenAlexClient, semantic_scholar::SemanticScholarClient,
-};
+use wilkes_core::integrations::IntegrationRegistry;
 use wilkes_core::types::IntegrationsSettings;
 
 use crate::{
@@ -597,6 +595,26 @@ impl WilkesMcp {
         }
     }
 
+    /// The provider ids a caller may name right now.
+    ///
+    /// Takes a scope the caller has already resolved rather than resolving its
+    /// own: `list_context` holds one, and resolving a second time would send a
+    /// redundant lookup through the workspace catalog on every call.
+    async fn literature_provider_ids(&self, scope: &WorkspaceScope) -> Vec<String> {
+        let settings = match &self.integrations {
+            Some(integrations) => integrations.clone(),
+            None => match scope.search() {
+                Some(search) => search.integrations().await,
+                None => IntegrationsSettings::default(),
+            },
+        };
+        IntegrationRegistry::from_settings(&settings)
+            .enabled_literature_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Literature and provider settings are global rather than per-workspace,
     /// so this deliberately resolves through the active workspace only.
     async fn integrations(&self) -> IntegrationsSettings {
@@ -795,8 +813,10 @@ struct GetRelatedDocumentsParams {
 struct LiteratureSearchParams {
     /// Scholarly works search query.
     query: String,
-    /// Enabled literature provider to use.
-    provider: LiteratureProviderParam,
+    /// Id of an enabled literature provider, as reported by list_context in
+    /// literature_providers. Built-in ids are semantic_scholar and openalex;
+    /// a provider the user defined is named custom:<id>.
+    provider: String,
     /// Maximum works to return (1-100, default 10).
     #[serde(default, deserialize_with = "deserialize_optional_integer")]
     #[schemars(with = "Option<usize>")]
@@ -839,17 +859,10 @@ struct DownloadParams {
     workspace: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum LiteratureProviderParam {
-    SemanticScholar,
-    Openalex,
-}
-
 #[derive(Debug, Serialize)]
 struct LiteratureSearchResponse<T> {
     query: String,
-    provider: LiteratureProviderParam,
+    provider: String,
     results: Vec<T>,
 }
 
@@ -885,6 +898,11 @@ struct ListContextResponse {
     first_files: Vec<String>,
     active_doc: Option<ActiveDocInfo>,
     context_files: Vec<ContextFileInfo>,
+    /// Ids accepted by literature_search right now. Reported here rather than
+    /// baked into that tool's description because which providers exist is a
+    /// fact about the user's settings, and a user-defined one has no id until
+    /// they write it.
+    literature_providers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1058,6 +1076,7 @@ impl WilkesMcp {
         };
         let snapshot = self.context_snapshot(&scope).await;
         let roots = self.library_roots(&scope).await;
+        let literature_providers = self.literature_provider_ids(&scope).await;
         structured(ListContextResponse::from_snapshot(
             snapshot.root,
             snapshot.active_doc,
@@ -1065,6 +1084,7 @@ impl WilkesMcp {
             roots,
             workspaces,
             scope.named(),
+            literature_providers,
         ))
     }
 
@@ -1164,7 +1184,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Search scholarly literature using an enabled external integration. Set provider='semantic_scholar' or provider='openalex'."
+        description = "Search scholarly literature using an enabled external integration. Pass provider as an id from list_context's literature_providers, for example 'openalex', 'semantic_scholar', or a user-defined 'custom:<id>'."
     )]
     async fn literature_search(
         &self,
@@ -1180,50 +1200,24 @@ impl WilkesMcp {
             .limit
             .unwrap_or(DEFAULT_SEARCH_MAX_RESULTS)
             .clamp(1, 100);
-        let integrations = self.integrations().await;
-        match params.provider {
-            LiteratureProviderParam::SemanticScholar => {
-                let settings = &integrations.semantic_scholar;
-                if !settings.enabled {
-                    return CallToolResult::error(vec![ContentBlock::text(
-                        "Semantic Scholar integration is disabled.",
-                    )]);
-                }
-                match SemanticScholarClient::from_settings(settings)
-                    .search(&query, limit)
-                    .await
-                {
-                    Ok(results) => structured(LiteratureSearchResponse {
-                        query,
-                        provider: params.provider,
-                        results,
-                    }),
-                    Err(error) => {
-                        CallToolResult::error(vec![ContentBlock::text(error.to_string())])
-                    }
-                }
+
+        // One lookup replaces what was an arm per provider. Whether the id
+        // names a compiled-in client or a manifest the user wrote is not
+        // something this tool can see, or needs to.
+        let registry = IntegrationRegistry::from_settings(&self.integrations().await);
+        let source = match registry.literature_for_search(&params.provider) {
+            Ok(source) => Arc::clone(source),
+            Err(error) => {
+                return CallToolResult::error(vec![ContentBlock::text(error.to_string())])
             }
-            LiteratureProviderParam::Openalex => {
-                let settings = &integrations.openalex;
-                if !settings.enabled {
-                    return CallToolResult::error(vec![ContentBlock::text(
-                        "OpenAlex integration is disabled.",
-                    )]);
-                }
-                match OpenAlexClient::from_settings(settings)
-                    .search(&query, limit)
-                    .await
-                {
-                    Ok(results) => structured(LiteratureSearchResponse {
-                        query,
-                        provider: params.provider,
-                        results,
-                    }),
-                    Err(error) => {
-                        CallToolResult::error(vec![ContentBlock::text(error.to_string())])
-                    }
-                }
-            }
+        };
+        match source.search(&query, limit).await {
+            Ok(results) => structured(LiteratureSearchResponse {
+                query,
+                provider: params.provider,
+                results,
+            }),
+            Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
         }
     }
 
@@ -1285,6 +1279,7 @@ impl ListContextResponse {
         roots: Vec<PathBuf>,
         workspaces: Vec<WorkspaceDescriptor>,
         requested_workspace: Option<&str>,
+        literature_providers: Vec<String>,
     ) -> Self {
         let workspaces: Vec<WorkspaceInfo> =
             workspaces.into_iter().map(WorkspaceInfo::from).collect();
@@ -1307,6 +1302,7 @@ impl ListContextResponse {
                 .into_iter()
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect(),
+            literature_providers,
             active_doc: active_doc.map(|doc| ActiveDocInfo {
                 path: doc.path,
                 page: doc.page,
@@ -2180,6 +2176,7 @@ mod tests {
             vec![dir.path().to_path_buf()],
             Vec::new(),
             None,
+            Vec::new(),
         );
 
         assert_eq!(response.current_root.as_deref(), dir.path().to_str());

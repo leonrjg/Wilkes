@@ -48,6 +48,7 @@ pub async fn update_settings(path: &Path, patch: serde_json::Value) -> anyhow::R
         }
     }
     current = serde_json::from_value(current_json)?;
+    validate_custom_integrations(&current)?;
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -55,6 +56,31 @@ pub async fn update_settings(path: &Path, patch: serde_json::Value) -> anyhow::R
     tokio::fs::write(path, serde_json::to_string_pretty(&current)?).await?;
 
     Ok(current)
+}
+
+/// Refuse to persist a custom integration that cannot be loaded back.
+///
+/// Here rather than in the command that edits one, because `update_settings`
+/// is the only way anything reaches the settings file: a check anywhere else
+/// would be a check one caller could go around, and the registry would then be
+/// dropping providers at load time for a mistake nobody was told about.
+fn validate_custom_integrations(settings: &Settings) -> anyhow::Result<()> {
+    let mut seen: Vec<&str> = Vec::new();
+    for config in &settings.integrations.custom {
+        wilkes_core::integrations::custom::CustomSource::from_config(config).map_err(|error| {
+            anyhow::anyhow!(
+                "custom integration '{}' cannot be saved: {error}",
+                config.id
+            )
+        })?;
+        anyhow::ensure!(
+            !seen.contains(&config.id.as_str()),
+            "two custom integrations share the id '{}'",
+            config.id
+        );
+        seen.push(&config.id);
+    }
+    Ok(())
 }
 
 /// Read global preferences and overlay the roots owned by one workspace.
@@ -205,6 +231,88 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use wilkes_core::types::{FileDisplayField, FileSortDirection, FileSortKey};
+
+    const VALID_MANIFEST: &str = r#"
+manifest_version = 1
+id = "crossref"
+name = "Crossref"
+[http]
+base_url = "https://api.crossref.org"
+[capabilities.search]
+path = "/works?query.bibliographic={query}&rows={limit}"
+items = "message.items[*]"
+[capabilities.search.fields]
+id = "DOI"
+title = "title[0]"
+"#;
+
+    fn custom_patch(id: &str, manifest: &str) -> serde_json::Value {
+        serde_json::json!({
+            "integrations": {
+                "custom": [{"id": id, "enabled": true, "manifest": manifest, "secrets": {}}]
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_valid_custom_integration_round_trips_through_the_settings_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let saved = update_settings(&path, custom_patch("crossref", VALID_MANIFEST))
+            .await
+            .unwrap();
+        assert_eq!(saved.integrations.custom.len(), 1);
+
+        let reread = get_settings(&path).await.unwrap();
+        assert_eq!(reread.integrations.custom[0].id, "crossref");
+        assert!(reread.integrations.custom[0].enabled);
+    }
+
+    /// Nothing invalid may reach the file. The registry drops a manifest it
+    /// cannot load, so a save that let one through would produce a provider
+    /// that is configured, enabled, and absent.
+    #[tokio::test]
+    async fn an_invalid_custom_integration_is_refused_and_nothing_is_written() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let broken = VALID_MANIFEST.replace(r#"title = "title[0]""#, r#"titel = "title[0]""#);
+        let error = update_settings(&path, custom_patch("crossref", &broken))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot be saved"), "{error}");
+        assert!(!path.exists(), "a refused save must not write the file");
+    }
+
+    #[tokio::test]
+    async fn a_stored_id_that_disagrees_with_the_manifest_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let error = update_settings(&path, custom_patch("elsewhere", VALID_MANIFEST))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not match"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn two_custom_integrations_may_not_share_an_id() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let one = serde_json::json!({"id": "crossref", "enabled": true, "manifest": VALID_MANIFEST, "secrets": {}});
+
+        let error = update_settings(
+            &path,
+            serde_json::json!({"integrations": {"custom": [one.clone(), one]}}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("share the id"), "{error}");
+    }
 
     #[tokio::test]
     async fn test_get_settings_default() {

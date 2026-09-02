@@ -29,6 +29,8 @@ import type {
   AddOutcome,
   CitationResult,
   IntegrationStatus,
+  ManifestSummary,
+  ProbeReport,
   MatchRef,
   DocumentMetadata,
   EmbedderCapabilityManifest,
@@ -301,6 +303,21 @@ export class TauriSearchApi implements SearchApi {
 
   async openAlexStatus(): Promise<IntegrationStatus> {
     return invoke<IntegrationStatus>("openalex_status");
+  }
+
+  async customIntegrationSummary(manifest: string): Promise<ManifestSummary> {
+    return invoke<ManifestSummary>("custom_integration_summary", { manifest });
+  }
+
+  async customIntegrationProbe(
+    manifest: string,
+    secrets: Record<string, string>,
+  ): Promise<ProbeReport> {
+    return invoke<ProbeReport>("custom_integration_probe", { manifest, secrets });
+  }
+
+  async customIntegrationStatus(id: string): Promise<IntegrationStatus> {
+    return invoke<IntegrationStatus>("custom_integration_status", { id });
   }
 
   async openAlexLookup(doi: string): Promise<OpenAlexWork> {

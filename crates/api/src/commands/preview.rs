@@ -210,17 +210,20 @@ mod tests {
             .write_file(PreparedFile {
                 path: path.clone(),
                 full_text: full_text.clone(),
-                regions: vec![ReadingRegion {
-                    area_id: "p1-i0".to_string(),
-                    page: 1,
-                    bbox: BoundingBox {
-                        x: 10.0,
-                        y: 20.0,
-                        width: 300.0,
-                        height: 24.0,
-                    },
-                    text_range: ByteRange { start, end },
-                }],
+                retained: wilkes_core::types::RetainedExtraction {
+                    reading_regions: vec![ReadingRegion {
+                        area_id: "p1-i0".to_string(),
+                        page: 1,
+                        bbox: BoundingBox {
+                            x: 10.0,
+                            y: 20.0,
+                            width: 300.0,
+                            height: 24.0,
+                        },
+                        text_range: ByteRange { start, end },
+                    }],
+                    ..Default::default()
+                },
                 chunks: vec![(
                     Chunk {
                         file_path: path.clone(),

@@ -11,11 +11,14 @@ use tracing::{error, info};
 
 use crate::consumer::{consumer_error, ConsumerErrorCode};
 use crate::extract::ExtractorRegistry;
+#[cfg(test)]
+use crate::figure::FigureRelation;
+use crate::figure::{self, FigureLink};
 use crate::metadata::cache::FileIdentity;
 use crate::types::{
     BoundingBox, ByteRange, ChunkTopicMember, EmbeddingEngine, FileType, IndexStatus,
-    IndexingConfig, ReadingRegion, RelatedDocument, SourceMap, SourceOrigin, SourceSegment,
-    SupersededArea,
+    IndexingConfig, ReadingRegion, RelatedDocument, RetainedExtraction, RetainedImage, SourceMap,
+    SourceOrigin, SourceSegment, SupersededArea, RETAINED_EXTRACTION_VERSION,
 };
 use crate::{consumer_bail, consumer_ensure};
 
@@ -141,7 +144,7 @@ fn recover_interrupted_index_replacement(data_dir: &Path) -> anyhow::Result<()> 
 }
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 fn configure_connection(conn: &Connection, path: &Path) -> anyhow::Result<()> {
     conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
@@ -390,14 +393,14 @@ mod tests {
         let mut idx =
             SemanticIndex::create(root, "m", 1, EmbeddingEngine::Candle, Some(root)).unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             path: legacy_path.clone(),
             full_text: String::new(),
             chunks: vec![(test_chunk(&legacy_path, "legacy body"), vec![1.0])],
         })
         .unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             path: empty_path.clone(),
             full_text: String::new(),
             chunks: Vec::new(),
@@ -476,7 +479,7 @@ mod tests {
         .unwrap();
         index
             .write_file(PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 path: file.clone(),
                 full_text: "legacy body".to_string(),
                 chunks: vec![(test_chunk(&file, "legacy body"), vec![1.0])],
@@ -629,7 +632,7 @@ mod tests {
         let file_path = root.join("test.txt");
         fs::write(&file_path, "hello world\nfoo bar").unwrap();
         let prepared = PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: file_path.clone(),
             chunks: vec![
@@ -701,7 +704,7 @@ mod tests {
         let new = root.join("new.txt");
         fs::write(&old, "hello world").unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: old.clone(),
             chunks: vec![(
@@ -751,7 +754,7 @@ mod tests {
             .write_file(PreparedFile {
                 path: path.clone(),
                 full_text: "x = 1".to_string(),
-                regions: Vec::new(),
+                retained: Default::default(),
                 chunks: vec![(
                     Chunk {
                         file_path: path.clone(),
@@ -766,10 +769,12 @@ mod tests {
                 )],
             })
             .unwrap();
+        // v10 is before either kept anything: no regions table, and no
+        // retained extraction on the file row.
         index
             .conn
             .execute_batch(
-                "DROP TABLE reading_regions;
+                "ALTER TABLE files DROP COLUMN retained_extraction_json;
                  UPDATE meta SET value = '10' WHERE key = 'schema_version';",
             )
             .unwrap();
@@ -780,11 +785,104 @@ mod tests {
             .superseded_areas_for_path(&path)
             .unwrap()
             .is_empty());
-        // And the table is there for the next rendition to write into.
+        // And a file nobody has retained anything for reads as the empty
+        // default rather than failing.
+        let retained = migrated.retained_extraction_for_key("nothing").unwrap();
+        assert!(retained.reading_regions.is_empty());
+        assert!(retained.images.is_none(), "unknown, not none");
+    }
+
+    /// v11 -> v12 carries the rows over rather than dropping them: they are a
+    /// rendition's page positions and cannot be recovered without running a
+    /// recognizer again. What they cannot gain is an image inventory, which is
+    /// why it migrates as `None` — unknown — and not as an empty list.
+    #[test]
+    fn the_v12_migration_folds_the_regions_in_and_leaves_the_inventory_unknown() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut index =
+            SemanticIndex::create(root, "legacy-model", 1, EmbeddingEngine::Candle, Some(root))
+                .unwrap();
+
+        let path = root.join("paper.pdf");
+        fs::write(&path, "pdf bytes").unwrap();
+        let full_text = "Page formula: x = 1".to_string();
+        index
+            .write_file(PreparedFile {
+                path: path.clone(),
+                full_text: full_text.clone(),
+                retained: Default::default(),
+                chunks: vec![(
+                    Chunk {
+                        file_path: path.clone(),
+                        text: full_text.clone(),
+                        byte_range: ByteRange {
+                            start: 0,
+                            end: full_text.len(),
+                        },
+                        origin: SourceOrigin::PdfPage {
+                            page: 1,
+                            bbox: None,
+                        },
+                    },
+                    vec![1.0],
+                )],
+            })
+            .unwrap();
+
+        // Put the store back into v11: the table, one row in it, and the
+        // sidecar column gone.
+        let file_id: i64 = index
+            .conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        index
+            .conn
+            .execute_batch(
+                "CREATE TABLE reading_regions (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    area_id    TEXT    NOT NULL,
+                    ordinal    INTEGER NOT NULL,
+                    page       INTEGER NOT NULL,
+                    bbox_x     REAL    NOT NULL,
+                    bbox_y     REAL    NOT NULL,
+                    bbox_w     REAL    NOT NULL,
+                    bbox_h     REAL    NOT NULL,
+                    byte_start INTEGER NOT NULL,
+                    byte_end   INTEGER NOT NULL
+                 );
+                 ALTER TABLE files DROP COLUMN retained_extraction_json;
+                 UPDATE meta SET value = '11' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        index
+            .conn
+            .execute(
+                "INSERT INTO reading_regions (file_id, area_id, ordinal, page,
+                                              bbox_x, bbox_y, bbox_w, bbox_h,
+                                              byte_start, byte_end)
+                 VALUES (?1, 'p1-i0', 0, 1, 10.0, 20.0, 300.0, 24.0, 0, ?2)",
+                params![file_id, full_text.len() as i64],
+            )
+            .unwrap();
+        drop(index);
+
+        let migrated = SemanticIndex::open(root, "legacy-model", 1).unwrap();
+        let retained = migrated.retained_extraction_for_file(file_id).unwrap();
         assert_eq!(
-            migrated.reading_regions_for_key("nothing").unwrap().len(),
-            0
+            retained.reading_regions.len(),
+            1,
+            "the region survived the fold"
         );
+        assert_eq!(retained.reading_regions[0].area_id, "p1-i0");
+        assert_eq!(retained.reading_regions[0].page, 1);
+        assert!(
+            retained.images.is_none(),
+            "a migrated rendition has no inventory and must not claim it draws nothing"
+        );
+        // The superseded area still resolves against the text it was cut from.
+        assert_eq!(migrated.superseded_areas_for_path(&path).unwrap().len(), 1);
     }
 
     fn formula_region(start: usize, end: usize) -> ReadingRegion {
@@ -816,10 +914,13 @@ mod tests {
         let full_text = "before\nPage formula: y_{B} = w mod q.\nafter".to_string();
         let start = full_text.find("y_{B}").unwrap();
         let end = start + "y_{B} = w mod q".len();
-        let prepared = |regions: Vec<ReadingRegion>| PreparedFile {
+        let prepared = |reading_regions: Vec<ReadingRegion>| PreparedFile {
             path: path.clone(),
             full_text: full_text.clone(),
-            regions,
+            retained: RetainedExtraction {
+                reading_regions,
+                ..Default::default()
+            },
             chunks: vec![(
                 Chunk {
                     file_path: path.clone(),
@@ -867,7 +968,10 @@ mod tests {
         idx.write_file(PreparedFile {
             path: path.clone(),
             full_text: full_text.clone(),
-            regions: vec![formula_region(0, full_text.len())],
+            retained: RetainedExtraction {
+                reading_regions: vec![formula_region(0, full_text.len())],
+                ..Default::default()
+            },
             chunks: vec![(
                 Chunk {
                     file_path: path.clone(),
@@ -906,7 +1010,7 @@ mod tests {
         let path = root.join("doc.txt");
         fs::write(&path, "the quick brown fox").unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             path: path.clone(),
             full_text: "the quick brown fox".to_string(),
             chunks: vec![(
@@ -960,7 +1064,7 @@ mod tests {
         let path = root.join("legacy.txt");
         fs::write(&path, "legacy body").unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             path: path.clone(),
             full_text: "legacy body".to_string(),
             chunks: vec![(
@@ -1002,7 +1106,7 @@ mod tests {
             SemanticIndex::create(dir.path(), "m", 3, EmbeddingEngine::Candle, Some(&root))
                 .unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: path.clone(),
             chunks: vec![
@@ -1080,7 +1184,7 @@ mod tests {
                 .unwrap();
         index
             .write_file(PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 full_text: "source".into(),
                 path: source.clone(),
                 chunks: vec![(test_chunk(&source, "source"), vec![1.0, 0.0])],
@@ -1088,7 +1192,7 @@ mod tests {
             .unwrap();
         index
             .write_file(PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 full_text: "matching".into(),
                 path: matching.clone(),
                 // More than the per-document cap still counts as one document,
@@ -1105,7 +1209,7 @@ mod tests {
             .unwrap();
         index
             .write_file(PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 full_text: "boundary".into(),
                 path: boundary.clone(),
                 chunks: vec![(test_chunk(&boundary, "boundary"), vec![0.8, 0.6])],
@@ -1113,7 +1217,7 @@ mod tests {
             .unwrap();
         index
             .write_file(PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 full_text: "unrelated".into(),
                 path: unrelated.clone(),
                 chunks: vec![(test_chunk(&unrelated, "unrelated"), vec![0.0, 1.0])],
@@ -1122,7 +1226,7 @@ mod tests {
         index.activate_root(&other_root).unwrap();
         index
             .write_file(PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 full_text: "cross root".into(),
                 path: cross_root_match.clone(),
                 chunks: vec![(test_chunk(&cross_root_match, "cross root"), vec![1.0, 0.0])],
@@ -1131,7 +1235,7 @@ mod tests {
         index.activate_root(&stale_root).unwrap();
         index
             .write_file(PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 full_text: "stale".into(),
                 path: stale_match.clone(),
                 chunks: vec![(test_chunk(&stale_match, "stale"), vec![1.0, 0.0])],
@@ -1199,7 +1303,7 @@ mod tests {
         let old_file = old_dir.join("paper.txt");
         fs::write(&old_file, "hello world").unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: old_file.clone(),
             chunks: vec![(
@@ -1355,7 +1459,7 @@ mod tests {
         let path = dir.path().join("test.pdf");
         fs::write(&path, "page content").unwrap();
         let prepared = PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: path.clone(),
             chunks: vec![(
@@ -1404,7 +1508,7 @@ mod tests {
         fs::write(&other_path, "other chunk").unwrap();
 
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: scoped_path.clone(),
             chunks: vec![(
@@ -1419,7 +1523,7 @@ mod tests {
         })
         .unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: other_path.clone(),
             chunks: vec![(
@@ -1497,7 +1601,7 @@ mod tests {
         };
 
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: source.clone(),
             chunks: vec![
@@ -1507,21 +1611,21 @@ mod tests {
         })
         .unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: close.clone(),
             chunks: vec![(chunk(&close, "close"), vec![0.9, 0.1])],
         })
         .unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: far.clone(),
             chunks: vec![(chunk(&far, "far"), vec![0.0, 1.0])],
         })
         .unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: unsupported.clone(),
             chunks: vec![(chunk(&unsupported, "unsupported"), vec![1.0, 0.0])],
@@ -1557,6 +1661,142 @@ mod tests {
         assert_eq!(filtered[0].entry.path, canon(&far));
     }
 
+    /// A passage is linked to the pictures drawn in it, by arithmetic over the
+    /// reading and nothing else. The one with no analysis links exactly as the
+    /// described one does, which is the whole point of anchoring every image.
+    #[test]
+    fn figures_link_to_the_passages_they_were_drawn_into() {
+        fn figure(id: &str, anchor: usize, range: Option<(usize, usize)>) -> RetainedImage {
+            RetainedImage {
+                id: id.to_string(),
+                page: 1,
+                origin: crate::types::RegionOrigin::Embedded,
+                bbox: BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                },
+                transform: crate::types::ImageTransform {
+                    a: 1.0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: 1.0,
+                    e: 0.0,
+                    f: 0.0,
+                },
+                pixel_width: 10,
+                pixel_height: 10,
+                image_sha256: format!("{id}-digest"),
+                reading_range: range.map(|(start, end)| ByteRange { start, end }),
+                reading_anchor: Some(anchor),
+                status: crate::types::ImageAnalysisStatus::Complete,
+                has_description: range.is_some(),
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("managed_sources");
+        fs::create_dir_all(&root).unwrap();
+        let document = root.join("document.txt");
+        fs::write(&document, "east north").unwrap();
+        let mut index =
+            SemanticIndex::create(dir.path(), "m", 2, EmbeddingEngine::Candle, Some(&root))
+                .unwrap();
+
+        // Two passages, tiling a ten-byte reading: "east" then "north".
+        let mut first = test_chunk(&document, "east");
+        first.byte_range = ByteRange { start: 0, end: 5 };
+        let mut second = test_chunk(&document, "north");
+        second.byte_range = ByteRange { start: 5, end: 10 };
+
+        let managed = index
+            .write_file_with_recipe(
+                PreparedFile {
+                    retained: RetainedExtraction {
+                        images: Some(vec![
+                            // Drawn inside the first passage, nothing established
+                            // about it — no range, and it links all the same.
+                            figure("p1-i0", 2, None),
+                            // Its enrichment block *is* the second passage.
+                            figure("p1-i1", 5, Some((5, 10))),
+                            // Off the end of both.
+                            figure("p1-i2", 400, None),
+                        ]),
+                        ..Default::default()
+                    },
+                    path: document.clone(),
+                    full_text: "east north".to_string(),
+                    chunks: vec![(first, vec![3.0, 0.0]), (second, vec![0.0, 4.0])],
+                },
+                &ExtractionRecipe::new(100, 0),
+                Some(Path::new("managed_sources/document.txt")),
+                None,
+                true,
+                false,
+                Some("job-figures"),
+            )
+            .unwrap();
+
+        let refs: Vec<ChunkRef> = managed
+            .chunks
+            .iter()
+            .map(|chunk| chunk.chunk_ref.clone())
+            .collect();
+        let linked = index.figures_for_chunk_refs(&refs, 0).unwrap();
+        assert_eq!(linked.len(), 2);
+        assert!(linked.iter().all(|entry| entry.inventory_known));
+
+        let first = &linked[0];
+        assert_eq!(
+            first
+                .figures
+                .iter()
+                .map(|f| (f.image.id.as_str(), f.link.relation))
+                .collect::<Vec<_>>(),
+            vec![
+                ("p1-i0", FigureRelation::DrawnIn),
+                ("p1-i1", FigureRelation::DrawnIn),
+            ],
+            "the undescribed picture drawn inside it, and the one anchored at \
+             its closing edge — a zero-width point on a seam is in both passages"
+        );
+
+        let second = &linked[1];
+        assert_eq!(
+            second
+                .figures
+                .iter()
+                .map(|f| (f.image.id.as_str(), f.link.relation))
+                .collect::<Vec<_>>(),
+            vec![("p1-i1", FigureRelation::Block)],
+            "the passage that *is* an enrichment block says so, rather than \
+             reporting the weaker relation it also satisfies"
+        );
+
+        // The far figure needs a window, and says how far it is when asked.
+        let widened = index.figures_for_chunk_refs(&refs[..1], 500).unwrap();
+        let far = widened[0]
+            .figures
+            .iter()
+            .find(|f| f.image.id == "p1-i2")
+            .expect("in reach of a 500-byte window");
+        assert_eq!(far.link.relation, FigureRelation::Near);
+        assert_eq!(far.link.byte_distance, 395);
+
+        // And the pixels of one of them are addressable by any passage of the
+        // document, without the caller holding a path.
+        let source = index
+            .figure_source(FigureDocument::Chunk(&refs[0]), "p1-i1")
+            .unwrap()
+            .expect("the inventory holds it");
+        assert_eq!(
+            source.managed_snapshot_relative_path.as_deref(),
+            Some("managed_sources/document.txt"),
+            "served from the immutable snapshot, not from wherever the file went"
+        );
+    }
+
     #[test]
     fn managed_refs_resolve_and_aggregate_without_exposing_rowids() {
         let dir = tempdir().unwrap();
@@ -1571,7 +1811,7 @@ mod tests {
         let managed = index
             .write_file_with_recipe(
                 PreparedFile {
-                    regions: Vec::new(),
+                    retained: Default::default(),
                     path: document.clone(),
                     full_text: "east north".to_string(),
                     chunks: vec![
@@ -1655,7 +1895,7 @@ mod tests {
         canonical
             .write_file_with_recipe(
                 PreparedFile {
-                    regions: Vec::new(),
+                    retained: Default::default(),
                     path: document.clone(),
                     chunks: vec![(test_chunk(&document, "canonical passage"), vec![1.0, 0.0])],
                     full_text: "canonical passage".to_string(),
@@ -1737,7 +1977,7 @@ mod tests {
                 source
                     .write_file_with_recipe(
                         PreparedFile {
-                            regions: Vec::new(),
+                            retained: Default::default(),
                             path: source_path,
                             full_text: "retained body".to_string(),
                             chunks: vec![
@@ -1831,7 +2071,7 @@ mod tests {
         let second = rebuilt
             .write_file_with_recipe(
                 PreparedFile {
-                    regions: Vec::new(),
+                    retained: Default::default(),
                     path: rebuilt_path.clone(),
                     full_text: "retained body".to_string(),
                     chunks: vec![
@@ -1866,7 +2106,7 @@ mod tests {
         let doc = root.join("doc.txt");
         fs::write(&doc, "content").unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: doc.clone(),
             chunks: vec![
@@ -1929,7 +2169,7 @@ mod tests {
         let doc = root.join("doc.txt");
         fs::write(&doc, "content").unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: doc.clone(),
             chunks: vec![(test_chunk(&doc, "only"), vec![1.0, 0.0])],
@@ -1986,7 +2226,7 @@ mod tests {
             fs::write(&path, text).unwrap();
             idx.write_file_with_recipe(
                 PreparedFile {
-                    regions: Vec::new(),
+                    retained: Default::default(),
                     full_text: text.to_string(),
                     path: path.clone(),
                     chunks: vec![(test_chunk(&path, text), vector)],
@@ -2062,7 +2302,7 @@ mod tests {
         )
         .unwrap();
         let prepared = |path: &Path, text: &str| PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: path.to_path_buf(),
             chunks: vec![(
@@ -2118,7 +2358,7 @@ mod tests {
         let path = dir.path().join("mystery.txt");
         fs::write(&path, "mystery").unwrap();
         let prepared = PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: path.clone(),
             chunks: vec![(
@@ -2182,7 +2422,7 @@ mod tests {
         let new = root.join("new.txt");
         fs::write(&old, "stable content").unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: old.clone(),
             chunks: vec![(
@@ -2225,7 +2465,7 @@ mod tests {
         let path = root.join("gone.txt");
         fs::write(&path, "delete me").unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: path.clone(),
             chunks: vec![(
@@ -2264,7 +2504,7 @@ mod tests {
         let path = root.join("changed.txt");
         fs::write(&path, "old").unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: path.clone(),
             chunks: vec![(
@@ -2537,7 +2777,7 @@ mod tests {
             )
             .unwrap();
             idx.write_file(PreparedFile {
-                regions: Vec::new(),
+                retained: Default::default(),
                 path: path.clone(),
                 full_text: "legacy body".to_string(),
                 chunks: vec![(test_chunk(&path, "legacy body"), vec![1.0])],
@@ -2660,14 +2900,14 @@ mod tests {
         )
         .unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             path: stale_path.clone(),
             full_text: "stale body".to_string(),
             chunks: vec![(test_chunk(&stale_path, "stale body"), vec![1.0])],
         })
         .unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             path: changed_path.clone(),
             full_text: "original".to_string(),
             chunks: vec![(test_chunk(&changed_path, "original"), vec![1.0])],
@@ -2820,7 +3060,7 @@ mod tests {
             SemanticIndex::create(dir.path(), "m", 2, EmbeddingEngine::Candle, Some(&root_a))
                 .unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: a.clone(),
             chunks: vec![(
@@ -2831,7 +3071,7 @@ mod tests {
         .unwrap();
         idx.activate_root(&root_b).unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: b.clone(),
             chunks: vec![(test_chunk(&b, "inside requested root"), vec![0.5, 0.5])],
@@ -2871,7 +3111,7 @@ mod tests {
         )
         .unwrap();
         idx.write_file(PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: path.clone(),
             chunks: vec![(test_chunk(&path, "old content"), vec![1.0])],
@@ -3049,7 +3289,7 @@ mod tests {
         let path = dir.path().join("test.txt");
         fs::write(&path, "original").unwrap();
         let original = PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: path.clone(),
             chunks: vec![(
@@ -3065,7 +3305,7 @@ mod tests {
         idx.write_file(original).unwrap();
 
         let replacement = PreparedFile {
-            regions: Vec::new(),
+            retained: Default::default(),
             full_text: String::new(),
             path: path.clone(),
             chunks: vec![(
@@ -3096,7 +3336,7 @@ struct PendingFile {
     recipe: ExtractionRecipe,
     full_text: String,
     chunks: Vec<Chunk>,
-    regions: Vec<ReadingRegion>,
+    retained: RetainedExtraction,
 }
 
 // ── Prepared file (ready to write) ───────────────────────────────────────────
@@ -3109,10 +3349,11 @@ pub struct PreparedFile {
     /// search can scan it without re-extracting the source file. Empty when the
     /// document yielded no text.
     pub full_text: String,
-    /// Where the reading's own areas sit on the page — the stretches that
-    /// replaced a glyph run rather than describing a picture. Ranges into
-    /// `full_text`, which is why the two are only ever written together.
-    pub regions: Vec<ReadingRegion>,
+    /// What this extraction leaves behind for the index to keep: the
+    /// reading's own page areas, and where every picture the pages draw sits.
+    /// Ranges into `full_text`, which is why the two are only ever written
+    /// together.
+    pub retained: RetainedExtraction,
 }
 
 // ── Indexed chunk (query result) ──────────────────────────────────────────────
@@ -3143,6 +3384,51 @@ pub struct TopicChunkData {
     pub extraction_byte_range: ByteRange,
     pub origin: SourceOrigin,
     pub embedding: Vec<f32>,
+}
+
+/// The figures one passage bears on, and how.
+#[derive(Clone, Debug)]
+pub struct ChunkFigures {
+    pub chunk_ref: ChunkRef,
+    /// Whether this passage's rendition has an image inventory at all.
+    ///
+    /// `false` is *unknown* — a rendition retained before inventories existed
+    /// — and a consumer must not read the empty list beside it as "this
+    /// passage draws nothing". Re-extracting the document is what settles it.
+    pub inventory_known: bool,
+    pub figures: Vec<LinkedFigure>,
+}
+
+/// One figure, with its bearing on the passage that asked.
+#[derive(Clone, Debug)]
+pub struct LinkedFigure {
+    pub image: RetainedImage,
+    pub link: FigureLink,
+}
+
+/// Where a figure's pixels are to be found, for a caller that wants them.
+#[derive(Clone, Debug)]
+pub struct FigureSource {
+    /// The immutable snapshot when the corpus retained one, relative to the
+    /// data directory; the caller resolves it, being the one that knows where
+    /// that is. Preferred over `file_path` because it cannot have been edited
+    /// since the rendition was built.
+    pub managed_snapshot_relative_path: Option<String>,
+    /// The path as indexed. The only address for an ordinary workspace file,
+    /// and the fallback for a managed one imported before snapshots.
+    pub file_path: PathBuf,
+    pub image: RetainedImage,
+}
+
+/// How a caller names the document a figure belongs to.
+///
+/// Two spellings because two consumers exist: a managed consumer holds chunk
+/// refs and no path at all, and the export surface is addressed by root and
+/// path. Both name one file row.
+#[derive(Clone, Copy, Debug)]
+pub enum FigureDocument<'a> {
+    Path(&'a Path),
+    Chunk(&'a ChunkRef),
 }
 
 /// Stable, vector-free passage export used by managed-corpus consumers.
@@ -3469,6 +3755,10 @@ impl SemanticIndex {
             Self::migrate_v10_to_v11(&conn)?;
             schema_version = 11;
         }
+        if schema_version == 11 {
+            Self::migrate_v11_to_v12(&conn)?;
+            schema_version = 12;
+        }
         anyhow::ensure!(
             schema_version == SCHEMA_VERSION,
             "Index schema version {} is not supported (expected {}); rebuild the index",
@@ -3578,6 +3868,10 @@ impl SemanticIndex {
         if schema_version == 10 {
             Self::migrate_v10_to_v11(&conn)?;
             schema_version = 11;
+        }
+        if schema_version == 11 {
+            Self::migrate_v11_to_v12(&conn)?;
+            schema_version = 12;
         }
         anyhow::ensure!(
             schema_version == SCHEMA_VERSION,
@@ -3757,7 +4051,7 @@ impl SemanticIndex {
                 path: file.path.clone(),
                 chunks: file.chunks.into_iter().zip(taken).collect(),
                 full_text: file.full_text,
-                regions: file.regions,
+                retained: file.retained,
             };
             if let Err(e) =
                 idx.write_file_with_recipe(prepared, &file.recipe, None, None, false, false, None)
@@ -3953,8 +4247,8 @@ impl SemanticIndex {
                 indexing.chunk_overlap,
             );
             done_units += 1;
-            let (full_text, chunks, regions) = match extracted {
-                Ok((text, c, regions)) if !c.is_empty() => (text, c, regions),
+            let (full_text, chunks, retained) = match extracted {
+                Ok((text, c, retained)) if !c.is_empty() => (text, c, retained),
                 // A document that yielded no chunk is indexed by nothing;
                 // that is a reading, not a failure.
                 Ok(_) => continue,
@@ -3970,7 +4264,7 @@ impl SemanticIndex {
                 recipe: extraction_recipe.clone(),
                 full_text,
                 chunks,
-                regions,
+                retained,
             });
 
             let full = match batch_target {
@@ -4120,7 +4414,8 @@ impl SemanticIndex {
                 embedding_computed_chunks INTEGER,
                 managed_snapshot_relative_path TEXT,
                 original_source_provenance_json TEXT,
-                admission_state TEXT
+                admission_state TEXT,
+                retained_extraction_json TEXT
             );
             CREATE TABLE IF NOT EXISTS indexed_roots (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4159,21 +4454,6 @@ impl SemanticIndex {
                 chunk_ref   TEXT,
                 text_sha256 TEXT
             );
-            CREATE TABLE IF NOT EXISTS reading_regions (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-                area_id    TEXT    NOT NULL,
-                ordinal    INTEGER NOT NULL,
-                page       INTEGER NOT NULL,
-                bbox_x     REAL    NOT NULL,
-                bbox_y     REAL    NOT NULL,
-                bbox_w     REAL    NOT NULL,
-                bbox_h     REAL    NOT NULL,
-                byte_start INTEGER NOT NULL,
-                byte_end   INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_reading_regions_file_id
-                ON reading_regions(file_id);
             CREATE INDEX IF NOT EXISTS idx_files_identity
                 ON files(size_bytes, modified_at_ms);
             CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
@@ -4618,6 +4898,84 @@ impl SemanticIndex {
         Ok(())
     }
 
+    /// v11 -> v12: retain the extraction as one object rather than one table
+    /// per thing extracted.
+    ///
+    /// `reading_regions` was a materialized view of `ExtractedContent` —
+    /// `serialize::reading_regions` computes it — and the image inventory this
+    /// schema now also keeps would have been a second table of the same kind,
+    /// with formula anchors a third. Each costs a migration, a write path, a
+    /// delete and a copy in the adoption loop. One retained object costs a
+    /// serde field.
+    ///
+    /// The rows are carried over rather than dropped: they are a rendition's
+    /// page positions and cannot be recovered without running a recognizer
+    /// again. What migrated rows cannot gain is the image inventory, which is
+    /// why it is `None` here and not an empty list — a document indexed before
+    /// this reads as *unknown*, and re-extracting is what fills it in.
+    fn migrate_v11_to_v12(conn: &Connection) -> anyhow::Result<()> {
+        let has_column = conn
+            .prepare("PRAGMA table_info(files)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "retained_extraction_json");
+        if !has_column {
+            conn.execute_batch("ALTER TABLE files ADD COLUMN retained_extraction_json TEXT;")?;
+        }
+
+        let mut per_file: HashMap<i64, Vec<ReadingRegion>> = HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT file_id, area_id, page, bbox_x, bbox_y, bbox_w, bbox_h,
+                        byte_start, byte_end
+                 FROM reading_regions ORDER BY file_id, ordinal",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    ReadingRegion {
+                        area_id: row.get::<_, String>(1)?,
+                        page: row.get::<_, i64>(2)? as u32,
+                        bbox: BoundingBox {
+                            x: row.get::<_, f64>(3)? as f32,
+                            y: row.get::<_, f64>(4)? as f32,
+                            width: row.get::<_, f64>(5)? as f32,
+                            height: row.get::<_, f64>(6)? as f32,
+                        },
+                        text_range: ByteRange {
+                            start: row.get::<_, i64>(7)? as usize,
+                            end: row.get::<_, i64>(8)? as usize,
+                        },
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (file_id, region) = row?;
+                per_file.entry(file_id).or_default().push(region);
+            }
+        }
+
+        for (file_id, reading_regions) in per_file {
+            let retained = RetainedExtraction {
+                version: RETAINED_EXTRACTION_VERSION.to_string(),
+                reading_regions,
+                images: None,
+            };
+            conn.execute(
+                "UPDATE files SET retained_extraction_json = ?2 WHERE id = ?1",
+                params![file_id, serde_json::to_string(&retained)?],
+            )?;
+        }
+
+        conn.execute_batch("DROP TABLE reading_regions;")?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '12')",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// Extract a file's canonical content without chunking or embedding it.
     fn extract_content(
         path: &Path,
@@ -4656,7 +5014,7 @@ impl SemanticIndex {
         extractors: &ExtractorRegistry,
         chunk_size: usize,
         chunk_overlap: usize,
-    ) -> anyhow::Result<(String, Vec<Chunk>, Vec<ReadingRegion>)> {
+    ) -> anyhow::Result<(String, Vec<Chunk>, RetainedExtraction)> {
         let content = Self::extract_content(path, extractors)?;
         let chunks = chunk_content(&content, path.to_path_buf(), chunk_size, chunk_overlap);
         ensure_chunks_reconstruct(
@@ -4671,8 +5029,8 @@ impl SemanticIndex {
                 path.display()
             )
         })?;
-        let regions = crate::extract::image::serialize::reading_regions(&content);
-        Ok((content.text, chunks, regions))
+        let retained = RetainedExtraction::of(&content);
+        Ok((content.text, chunks, retained))
     }
 
     /// Extract, chunk, and embed a file without holding the index lock.
@@ -4683,14 +5041,14 @@ impl SemanticIndex {
         chunk_size: usize,
         chunk_overlap: usize,
     ) -> anyhow::Result<PreparedFile> {
-        let (full_text, raw_chunks, regions) =
+        let (full_text, raw_chunks, retained) =
             Self::extract_chunks(path, extractors, chunk_size, chunk_overlap)?;
         if raw_chunks.is_empty() {
             return Ok(PreparedFile {
                 path: path.to_path_buf(),
                 chunks: Vec::new(),
                 full_text,
-                regions,
+                retained,
             });
         }
 
@@ -4709,7 +5067,7 @@ impl SemanticIndex {
             path: path.to_path_buf(),
             chunks,
             full_text,
-            regions,
+            retained,
         })
     }
 
@@ -4890,7 +5248,7 @@ impl SemanticIndex {
                 // Copied like the chunks and for the same reason: the source
                 // index read this very rendition, and re-deriving them here
                 // would mean re-extracting the file the reuse exists to avoid.
-                regions: source.reading_regions_for_file(source_file_id)?,
+                retained: source.retained_extraction_for_file(source_file_id)?,
             },
             recipe,
             None,
@@ -5222,47 +5580,36 @@ impl SemanticIndex {
             params![file_id],
         )?;
         tx.execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])?;
-        // The reading's page positions are ranges into the text written in the
-        // same breath as these chunks. Leaving them behind would point the next
-        // rendition's rectangles at somebody else's bytes.
+        // The retained extraction is ranges into the text written in the same
+        // breath as these chunks. Leaving it behind would point the next
+        // rendition's rectangles and anchors at somebody else's bytes.
         tx.execute(
-            "DELETE FROM reading_regions WHERE file_id = ?1",
+            "UPDATE files SET retained_extraction_json = NULL WHERE id = ?1",
             params![file_id],
         )?;
         Ok(())
     }
 
-    /// Insert one file's reading regions, in reading order.
-    fn write_reading_regions_tx(
+    /// Store one file's retained extraction.
+    ///
+    /// Written as its own statement rather than as columns on the file insert
+    /// above, because it belongs to the rendition rather than to the file
+    /// identity, and because the two callers that reuse a rendition hand over
+    /// a stored string they never deserialize.
+    fn write_retained_extraction_tx(
         tx: &rusqlite::Transaction<'_>,
         file_id: i64,
-        regions: &[ReadingRegion],
+        retained: &RetainedExtraction,
     ) -> anyhow::Result<()> {
-        for (ordinal, region) in regions.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO reading_regions (file_id, area_id, ordinal, page,
-                                              bbox_x, bbox_y, bbox_w, bbox_h,
-                                              byte_start, byte_end)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    file_id,
-                    region.area_id,
-                    ordinal as i64,
-                    region.page,
-                    region.bbox.x as f64,
-                    region.bbox.y as f64,
-                    region.bbox.width as f64,
-                    region.bbox.height as f64,
-                    region.text_range.start as i64,
-                    region.text_range.end as i64,
-                ],
-            )?;
-        }
+        tx.execute(
+            "UPDATE files SET retained_extraction_json = ?2 WHERE id = ?1",
+            params![file_id, serde_json::to_string(retained)?],
+        )?;
         Ok(())
     }
 
-    /// One file's stored reading regions, by path key, in reading order.
-    fn reading_regions_for_key(&self, key: &str) -> anyhow::Result<Vec<ReadingRegion>> {
+    /// One file's retained extraction, by path key.
+    fn retained_extraction_for_key(&self, key: &str) -> anyhow::Result<RetainedExtraction> {
         let file_id: Option<i64> = self
             .conn
             .query_row(
@@ -5272,36 +5619,36 @@ impl SemanticIndex {
             )
             .optional()?;
         match file_id {
-            Some(file_id) => self.reading_regions_for_file(file_id),
-            None => Ok(Vec::new()),
+            Some(file_id) => self.retained_extraction_for_file(file_id),
+            None => Ok(RetainedExtraction::default()),
         }
     }
 
-    /// One file's stored reading regions, by row id, in reading order.
+    /// One file's retained extraction, by row id.
+    ///
+    /// A row with nothing stored, and a row whose stored shape is of another
+    /// version, both come back as the default: no regions, and an image
+    /// inventory of `None` — which reads as *unknown*, never as "this document
+    /// draws nothing".
+    fn retained_extraction_for_file(&self, file_id: i64) -> anyhow::Result<RetainedExtraction> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT retained_extraction_json FROM files WHERE id = ?1",
+                params![file_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(json
+            .as_deref()
+            .and_then(RetainedExtraction::parse)
+            .unwrap_or_default())
+    }
+
+    /// One file's reading regions, in reading order.
     fn reading_regions_for_file(&self, file_id: i64) -> anyhow::Result<Vec<ReadingRegion>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT area_id, page, bbox_x, bbox_y, bbox_w, bbox_h, byte_start, byte_end
-             FROM reading_regions WHERE file_id = ?1 ORDER BY ordinal",
-        )?;
-        let regions = stmt
-            .query_map(params![file_id], |row| {
-                Ok(ReadingRegion {
-                    area_id: row.get::<_, String>(0)?,
-                    page: row.get::<_, i64>(1)? as u32,
-                    bbox: BoundingBox {
-                        x: row.get::<_, f64>(2)? as f32,
-                        y: row.get::<_, f64>(3)? as f32,
-                        width: row.get::<_, f64>(4)? as f32,
-                        height: row.get::<_, f64>(5)? as f32,
-                    },
-                    text_range: ByteRange {
-                        start: row.get::<_, i64>(6)? as usize,
-                        end: row.get::<_, i64>(7)? as usize,
-                    },
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(regions)
+        Ok(self.retained_extraction_for_file(file_id)?.reading_regions)
     }
 
     pub fn activate_root(&mut self, root: &Path) -> anyhow::Result<i64> {
@@ -5556,33 +5903,24 @@ impl SemanticIndex {
                 )?;
             }
 
-            // The reading's page positions travel with the text and chunks
-            // they belong to. A merged root that dropped them would serve a
-            // document whose formulas silently went back to being glyph runs.
-            for (ordinal, region) in source
-                .reading_regions_for_file(source_file_id)?
-                .iter()
-                .enumerate()
-            {
-                tx.execute(
-                    "INSERT INTO reading_regions (file_id, area_id, ordinal, page,
-                                                  bbox_x, bbox_y, bbox_w, bbox_h,
-                                                  byte_start, byte_end)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    params![
-                        target_file_id,
-                        region.area_id,
-                        ordinal as i64,
-                        region.page,
-                        region.bbox.x as f64,
-                        region.bbox.y as f64,
-                        region.bbox.width as f64,
-                        region.bbox.height as f64,
-                        region.text_range.start as i64,
-                        region.text_range.end as i64,
-                    ],
-                )?;
-            }
+            // The retained extraction travels with the text and chunks it
+            // belongs to. A merged root that dropped it would serve a document
+            // whose formulas silently went back to being glyph runs and whose
+            // figures stopped existing. Carried as the stored string: this is
+            // the same rendition, so nothing here needs to understand it.
+            let retained: Option<String> = source
+                .conn
+                .query_row(
+                    "SELECT retained_extraction_json FROM files WHERE id = ?1",
+                    params![source_file_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            tx.execute(
+                "UPDATE files SET retained_extraction_json = ?2 WHERE id = ?1",
+                params![target_file_id, retained],
+            )?;
         }
 
         tx.execute(
@@ -6051,10 +6389,10 @@ impl SemanticIndex {
                 params![chunk_id, blob],
             )?;
         }
-        // In the same transaction as the text they index into: a rendition
-        // whose regions were written separately could be read back with one
-        // half of it stale.
-        Self::write_reading_regions_tx(&tx, file_id, &prepared.regions)?;
+        // In the same transaction as the text it indexes into: a rendition
+        // whose retained extraction was written separately could be read back
+        // with one half of it stale.
+        Self::write_retained_extraction_tx(&tx, file_id, &prepared.retained)?;
         if let Some(identity) = semantic_identity.as_ref() {
             if let Some(idempotency_key) = identity.idempotency_key.as_deref() {
                 let existing = tx
@@ -6839,7 +7177,7 @@ impl SemanticIndex {
             // Part of the rendition being reused, exactly like the chunks
             // above: re-deriving them would mean extracting the source again,
             // which is what this whole path exists not to do.
-            regions: self.reading_regions_for_key(&key.to_string_lossy())?,
+            retained: self.retained_extraction_for_key(&key.to_string_lossy())?,
         }))
     }
 
@@ -7270,7 +7608,7 @@ impl SemanticIndex {
             path: target_path.to_path_buf(),
             chunks: prepared_chunks,
             full_text,
-            regions: self.reading_regions_for_file(file_id)?,
+            retained: self.retained_extraction_for_file(file_id)?,
         }))
     }
 
@@ -7313,6 +7651,183 @@ impl SemanticIndex {
             );
         }
         Ok(found)
+    }
+
+    /// The figures each of these passages bears on, strongest relation first
+    /// and nearest first within a relation.
+    ///
+    /// One retained extraction is read per document rather than per passage:
+    /// the passages of one weave are usually the same handful of books, and
+    /// the linking itself is arithmetic over ranges already in hand.
+    ///
+    /// `window` is bytes of slack outside the passage — zero, the default the
+    /// pipeline ships, admits only the figures a passage contains.
+    pub fn figures_for_chunk_refs(
+        &self,
+        refs: &[ChunkRef],
+        window: usize,
+    ) -> anyhow::Result<Vec<ChunkFigures>> {
+        let wanted: HashSet<ChunkRef> = refs.iter().cloned().collect();
+        self.resolve_chunk_refs(&wanted)?;
+
+        const REFS_PER_QUERY: usize = 300;
+        let unique: Vec<ChunkRef> = wanted.into_iter().collect();
+        let mut located: HashMap<ChunkRef, (i64, ByteRange)> = HashMap::with_capacity(unique.len());
+        for batch in unique.chunks(REFS_PER_QUERY) {
+            let placeholders = vec!["?"; batch.len()].join(",");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT chunk_ref, file_id, byte_start, byte_end
+                 FROM chunks WHERE chunk_ref IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(
+                params_from_iter(batch.iter().map(ChunkRef::as_str)),
+                |row| {
+                    Ok((
+                        ChunkRef(row.get(0)?),
+                        row.get::<_, i64>(1)?,
+                        ByteRange {
+                            start: row.get::<_, i64>(2)? as usize,
+                            end: row.get::<_, i64>(3)? as usize,
+                        },
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (chunk_ref, file_id, range) = row?;
+                located.insert(chunk_ref, (file_id, range));
+            }
+        }
+
+        let mut retained_by_file: HashMap<i64, RetainedExtraction> = HashMap::new();
+        let mut out = Vec::with_capacity(refs.len());
+        // In the order asked, and once per ref even if the caller repeated one.
+        for chunk_ref in refs {
+            let Some((file_id, range)) = located.get(chunk_ref) else {
+                continue;
+            };
+            let retained = match retained_by_file.get(file_id) {
+                Some(retained) => retained,
+                None => {
+                    let loaded = self.retained_extraction_for_file(*file_id)?;
+                    retained_by_file.entry(*file_id).or_insert(loaded)
+                }
+            };
+            let mut figures: Vec<LinkedFigure> = retained
+                .images
+                .iter()
+                .flatten()
+                .filter_map(|image| {
+                    figure::link(image, range, window).map(|link| LinkedFigure {
+                        image: image.clone(),
+                        link,
+                    })
+                })
+                .collect();
+            // Strongest relation first, nearest first within one, then by id
+            // so a tie is not decided by hash order.
+            figures.sort_by(|a, b| {
+                a.link
+                    .relation
+                    .cmp(&b.link.relation)
+                    .then(a.link.byte_distance.cmp(&b.link.byte_distance))
+                    .then(a.image.id.cmp(&b.image.id))
+            });
+            out.push(ChunkFigures {
+                chunk_ref: chunk_ref.clone(),
+                inventory_known: retained.images.is_some(),
+                figures,
+            });
+        }
+        Ok(out)
+    }
+
+    /// One document's image inventory, in reading order, with no passage in
+    /// the question. `None` when the index does not hold this file at all —
+    /// which is a different answer from a file whose inventory is unknown.
+    pub fn figures_for_path(
+        &self,
+        path: &Path,
+    ) -> anyhow::Result<Option<(bool, Vec<RetainedImage>)>> {
+        let key = self.path_key_for_known_path(path);
+        let file_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM files WHERE file_path = ?1",
+                params![key.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(file_id) = file_id else {
+            return Ok(None);
+        };
+        let retained = self.retained_extraction_for_file(file_id)?;
+        Ok(Some((
+            retained.images.is_some(),
+            retained.images.unwrap_or_default(),
+        )))
+    }
+
+    /// Where to find the pixels of one figure of one document.
+    ///
+    /// The document is named either by path or by any passage of it, because
+    /// a managed consumer holds chunk refs and never a path. Both resolve to
+    /// the same file row, and the answer says where its bytes are rather than
+    /// reading them: this layer holds the index, not the data directory the
+    /// snapshot sits under.
+    pub fn figure_source(
+        &self,
+        document: FigureDocument<'_>,
+        area_id: &str,
+    ) -> anyhow::Result<Option<FigureSource>> {
+        let file_id = match document {
+            FigureDocument::Path(path) => {
+                let key = self.path_key_for_known_path(path);
+                self.conn
+                    .query_row(
+                        "SELECT id FROM files WHERE file_path = ?1",
+                        params![key.to_string_lossy()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+            }
+            FigureDocument::Chunk(chunk_ref) => self
+                .conn
+                .query_row(
+                    "SELECT file_id FROM chunks WHERE chunk_ref = ?1",
+                    params![chunk_ref.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?,
+        };
+        let Some(file_id) = file_id else {
+            return Ok(None);
+        };
+
+        let Some(image) = self
+            .retained_extraction_for_file(file_id)?
+            .images
+            .unwrap_or_default()
+            .into_iter()
+            .find(|image| image.id == area_id)
+        else {
+            return Ok(None);
+        };
+
+        let (file_path, managed_snapshot_relative_path) = self.conn.query_row(
+            "SELECT file_path, managed_snapshot_relative_path FROM files WHERE id = ?1",
+            params![file_id],
+            |row| {
+                Ok((
+                    PathBuf::from(row.get::<_, String>(0)?),
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )?;
+        Ok(Some(FigureSource {
+            managed_snapshot_relative_path,
+            file_path,
+            image,
+        }))
     }
 
     pub fn managed_chunks_for_refs(
@@ -8445,6 +8960,10 @@ impl SemanticIndex {
         if schema_version == 10 {
             Self::migrate_v10_to_v11(&conn)?;
             schema_version = 11;
+        }
+        if schema_version == 11 {
+            Self::migrate_v11_to_v12(&conn)?;
+            schema_version = 12;
         }
         anyhow::ensure!(
             schema_version == SCHEMA_VERSION,

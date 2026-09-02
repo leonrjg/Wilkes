@@ -15,9 +15,11 @@ use wilkes_api::commands::chat::{
     BackendStatus, ChatActiveDocRecord, ChatContextFileRecord, ChatConversationRecord,
     ChatMessageRecord, ChatReplayContentBlock, ChatReplayToolCall, ChatTurnEnvironmentRecord,
 };
+use wilkes_api::commands::integrations::custom::ManifestSummary;
 use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_api::startup::StartupStatus;
 use wilkes_api::workspace::{WorkspaceManager, WorkspaceState, WorkspaceSummary};
+use wilkes_core::integrations::custom::ProbeReport;
 use wilkes_core::types::{
     AddOutcome, AgentBackend, Bookmark, BookmarkClustersQuery, BookmarkClustersResult,
     ChunkTopicsQuery, ChunkTopicsResult, CitationResult, CollectionValidation, DataPaths,
@@ -336,6 +338,29 @@ async fn openalex_lookup_for_ctx(
     doi: String,
 ) -> Result<OpenAlexWork, String> {
     ctx.openalex_lookup(doi).await.map_err(|e| e.to_string())
+}
+
+fn custom_integration_summary_for_ctx(ctx: Arc<AppContext>, manifest: String) -> ManifestSummary {
+    ctx.custom_integration_summary(manifest)
+}
+
+async fn custom_integration_probe_for_ctx(
+    ctx: Arc<AppContext>,
+    manifest: String,
+    secrets: HashMap<String, String>,
+) -> Result<ProbeReport, String> {
+    ctx.custom_integration_probe(manifest, secrets)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn custom_integration_status_for_ctx(
+    ctx: Arc<AppContext>,
+    id: String,
+) -> Result<IntegrationStatus, String> {
+    ctx.custom_integration_status(id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn resolve_file_metadata_for_ctx(
@@ -2471,6 +2496,28 @@ async fn openalex_lookup(doi: String, app: AppHandle) -> Result<OpenAlexWork, St
 }
 
 #[tauri::command]
+fn custom_integration_summary(manifest: String, app: AppHandle) -> ManifestSummary {
+    custom_integration_summary_for_ctx(app_context(&app), manifest)
+}
+
+#[tauri::command]
+async fn custom_integration_probe(
+    manifest: String,
+    secrets: HashMap<String, String>,
+    app: AppHandle,
+) -> Result<ProbeReport, String> {
+    custom_integration_probe_for_ctx(app_context(&app), manifest, secrets).await
+}
+
+#[tauri::command]
+async fn custom_integration_status(
+    id: String,
+    app: AppHandle,
+) -> Result<IntegrationStatus, String> {
+    custom_integration_status_for_ctx(app_context(&app), id).await
+}
+
+#[tauri::command]
 fn is_semantic_ready(app: AppHandle) -> bool {
     is_semantic_ready_for_ctx(app_context(&app))
 }
@@ -2957,6 +3004,9 @@ pub fn run() {
             semantic_scholar_lookup,
             openalex_status,
             openalex_lookup,
+            custom_integration_summary,
+            custom_integration_probe,
+            custom_integration_status,
             pick_directory,
             download_model,
             build_index,

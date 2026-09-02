@@ -7,6 +7,7 @@ import type {
   ZoteroSettings,
 } from "../lib/types";
 import type { SearchApi } from "../services/api";
+import CustomIntegrations from "./CustomIntegrations";
 
 interface IntegrationsPanelProps {
   api: SearchApi;
@@ -371,6 +372,8 @@ export default function IntegrationsPanel({ api, settings, onUpdate }: Integrati
           )}
         </div>
       </section>
+
+      <CustomIntegrations api={api} settings={settings} onUpdate={onUpdate} />
     </div>
   );
 }

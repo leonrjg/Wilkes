@@ -3,26 +3,30 @@ pub mod model;
 
 use async_trait::async_trait;
 
-use crate::integrations::Integration;
-use crate::types::{IntegrationStatus, Settings};
+use crate::integrations::LiteratureSource;
+use crate::types::{IntegrationStatus, LiteratureSearchResult};
 
 pub use client::SemanticScholarClient;
 
-pub struct SemanticScholarIntegration;
-
 #[async_trait]
-impl Integration for SemanticScholarIntegration {
-    fn id(&self) -> &'static str {
+impl LiteratureSource for SemanticScholarClient {
+    fn id(&self) -> &str {
         "semantic_scholar"
     }
 
-    fn is_enabled(&self, settings: &Settings) -> bool {
-        settings.integrations.semantic_scholar.enabled
+    fn name(&self) -> &str {
+        "Semantic Scholar"
     }
 
-    async fn health_check(&self, settings: &Settings) -> anyhow::Result<IntegrationStatus> {
-        SemanticScholarClient::from_settings(&settings.integrations.semantic_scholar)
-            .status(settings.integrations.semantic_scholar.enabled)
-            .await
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<LiteratureSearchResult>> {
+        SemanticScholarClient::search(self, query, limit).await
+    }
+
+    async fn status(&self, enabled: bool) -> anyhow::Result<IntegrationStatus> {
+        SemanticScholarClient::status(self, enabled).await
     }
 }

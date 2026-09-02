@@ -5,6 +5,7 @@ pub mod consumer;
 pub mod directory_watcher;
 pub mod embed;
 pub mod extract;
+pub mod figure;
 pub mod generate;
 pub mod integrations;
 pub mod logging;

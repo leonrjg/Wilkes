@@ -981,6 +981,132 @@ pub struct SupersededArea {
     pub text: String,
 }
 
+/// What the index keeps of an extraction beyond its text and its chunks.
+///
+/// One retained object rather than one table per kind of thing a page holds.
+/// `reading_regions` was the first of those tables and is folded in here; the
+/// image inventory would have been the second and formula anchors the third,
+/// each costing a migration, a write path, a delete and a copy in the adoption
+/// loop — four places apiece, for facts that arrive together from one
+/// extraction and are read together whole-file.
+///
+/// A new retained item is a `#[serde(default)]` field here, which is the same
+/// evolution mechanism [`ExtractedImage::origin`] and [`ImageOcrRegion::kind`]
+/// already use.
+///
+/// The rule that keeps this from becoming a junk drawer: it holds only what
+/// the extraction recipe computed, never anything derived at query time, and a
+/// stored shape under another [`RETAINED_EXTRACTION_VERSION`] is refused
+/// rather than guessed at.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RetainedExtraction {
+    pub version: String,
+    /// Areas whose glyph run the reading replaced.
+    #[serde(default)]
+    pub reading_regions: Vec<ReadingRegion>,
+    /// Every image the pages draw, as placement records.
+    ///
+    /// `None` is *unknown* — a rendition retained before the inventory
+    /// existed — and is emphatically not `Some(vec![])`, which is a document
+    /// whose pages draw nothing. A consumer that cannot tell those apart
+    /// reports "no figures" for every document indexed last month.
+    #[serde(default)]
+    pub images: Option<Vec<RetainedImage>>,
+}
+
+/// Bumped when the retained shape changes. An entry written under another
+/// version is not read, for the reason `CACHE_FORMAT_VERSION` gives: a field
+/// that moved would be read as a field that means something else.
+pub const RETAINED_EXTRACTION_VERSION: &str = "retained-extraction-v1";
+
+/// One image of one rendition, as the index keeps it: where it is and what it
+/// should hash to.
+///
+/// Placement, not annotation. The transcription and the description are
+/// already in the reading, and their structured form is already in the
+/// annotation cache under a key that is exactly these fields — so a copy here
+/// would be a third store of one fact. What this adds is the part nothing else
+/// holds: that the picture exists, where it sits, and the digest a re-derived
+/// copy of it must match.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RetainedImage {
+    /// `p{page}-i{ordinal}`, as extraction assigned it.
+    pub id: String,
+    pub page: u32,
+    pub origin: RegionOrigin,
+    pub bbox: BoundingBox,
+    pub transform: ImageTransform,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    /// Digest of the decoded RGB pixels. Empty for an image that was never
+    /// decoded, which is what a technical limit leaves behind.
+    pub image_sha256: String,
+    /// Where this image's enrichment block landed, when one was written.
+    pub reading_range: Option<ByteRange>,
+    /// Where the picture sits in the reading. See
+    /// [`ExtractedImage::reading_anchor`] — `None` means the rendition
+    /// predates anchors, not that the image is unplaced.
+    pub reading_anchor: Option<usize>,
+    pub status: ImageAnalysisStatus,
+    /// Whether analysis produced prose about this picture. The prose itself is
+    /// in the reading; this says whether asking for it is worth the trip.
+    pub has_description: bool,
+}
+
+impl RetainedImage {
+    /// The placement record of one extracted image.
+    pub fn of(image: &ExtractedImage) -> Self {
+        Self {
+            id: image.id.clone(),
+            page: image.page,
+            origin: image.origin,
+            bbox: image.bbox.clone(),
+            transform: image.transform,
+            pixel_width: image.pixel_width,
+            pixel_height: image.pixel_height,
+            image_sha256: image.image_sha256.clone(),
+            reading_range: image.reading_range.clone(),
+            reading_anchor: image.reading_anchor,
+            status: image.status.clone(),
+            has_description: image.description.is_some(),
+        }
+    }
+}
+
+/// Nothing retained, under the current version — which is what a rendition
+/// that kept nothing looks like, and what an unreadable stored shape falls
+/// back to. `images: None` throughout: "nobody wrote an inventory" is the
+/// honest reading of both, and it is not "this document draws nothing".
+impl Default for RetainedExtraction {
+    fn default() -> Self {
+        Self {
+            version: RETAINED_EXTRACTION_VERSION.to_string(),
+            reading_regions: Vec::new(),
+            images: None,
+        }
+    }
+}
+
+impl RetainedExtraction {
+    /// What this extraction leaves behind for the index to keep.
+    pub fn of(content: &ExtractedContent) -> Self {
+        Self {
+            version: RETAINED_EXTRACTION_VERSION.to_string(),
+            reading_regions: crate::extract::image::serialize::reading_regions(content),
+            images: Some(content.images.iter().map(RetainedImage::of).collect()),
+        }
+    }
+
+    /// The stored form, or `None` for a shape written under another version.
+    ///
+    /// A refusal rather than a partial read: the whole point of the version is
+    /// that a field which moved would otherwise be read as a different field.
+    pub fn parse(json: &str) -> Option<Self> {
+        let parsed: Self = serde_json::from_str(json).ok()?;
+        (parsed.version == RETAINED_EXTRACTION_VERSION).then_some(parsed)
+    }
+}
+
 /// One region of text the recognizer spotted inside a native image.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImageOcrRegion {
@@ -1095,6 +1221,28 @@ pub struct ExtractedImage {
     /// when nothing was serialized for this image, which is the ordinary case
     /// for a logo the recognizer read no text in.
     pub reading_range: Option<ByteRange>,
+    /// Where the picture *is* in the reading: the zero-width offset between
+    /// the text above it and the text below it, at the position the page drew
+    /// it.
+    ///
+    /// Distinct from [`reading_range`](Self::reading_range), which is where
+    /// this image's enrichment *block* was written and is `None` whenever
+    /// nothing was written. An image nothing was established about still has a
+    /// place in the reading — `flatten` emits every image block in reading
+    /// order, filtered on nothing — and this is that place. It is what links a
+    /// figure to the passage it was drawn into, so a diagram no recognizer
+    /// read is locatable on exactly the same terms as one that was.
+    ///
+    /// Recorded before the newline that opens an enrichment block, so an
+    /// analyzed image anchors at the end of the prose it interrupts while its
+    /// block occupies the bytes after. A consumer testing containment against
+    /// a chunk therefore includes both endpoints: a zero-width point on a
+    /// boundary belongs to the passages on either side of it.
+    ///
+    /// Defaulted on read: a rendition extracted before anchors existed has
+    /// none, which is *unknown*, not "drawn nowhere".
+    #[serde(default)]
+    pub reading_anchor: Option<usize>,
     pub ocr_regions: Vec<ImageOcrRegion>,
     pub description: Option<ImageDescription>,
     /// The analyzer recipe that produced the above — the same string that
@@ -2387,6 +2535,36 @@ pub struct IntegrationsSettings {
     pub semantic_scholar: SemanticScholarSettings,
     #[serde(default)]
     pub openalex: OpenAlexSettings,
+    /// Providers the user described rather than ones Wilkes compiled.
+    ///
+    /// Here, and not in a table of their own, because a provider must reach
+    /// every consumer that already receives settings — the MCP server is
+    /// handed an `IntegrationsSettings` by value and can reach no database —
+    /// and a second configuration channel for the same question is exactly the
+    /// duplication this feature exists to remove.
+    #[serde(default)]
+    pub custom: Vec<CustomIntegrationConfig>,
+}
+
+/// One stored custom integration.
+///
+/// The manifest is kept as the user wrote it, comments and formatting intact,
+/// because it is the document they edit and export; everything else about the
+/// provider is derived from parsing it. `id` is stored alongside so a manifest
+/// that fails to parse can still be named in an error message, and the two are
+/// required to agree when the manifest is saved.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CustomIntegrationConfig {
+    pub id: String,
+    #[serde(default)]
+    pub enabled: bool,
+    /// TOML or JSON manifest source. See
+    /// `wilkes_core::integrations::custom::manifest`.
+    pub manifest: String,
+    /// Values for the secrets the manifest names. Held beside the manifest and
+    /// never inside it, so exporting a manifest cannot leak a credential.
+    #[serde(default)]
+    pub secrets: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

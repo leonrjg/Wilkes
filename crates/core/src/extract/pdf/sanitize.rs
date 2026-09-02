@@ -891,7 +891,17 @@ fn render(items: &[Item], images: &mut [ExtractedImage]) -> Reading {
                 let Some(image) = images.get(*index) else {
                     continue;
                 };
+                // Where the page drew this picture, in the reading being
+                // built. Recorded for every image before anything decides
+                // whether there are bytes to write for it: an image nothing
+                // was established about is still *somewhere*, and this loop is
+                // the only place that knows where. Taken before the newline
+                // below, so an analyzed image anchors at the end of the prose
+                // it interrupts and its block occupies the bytes after.
+                let anchor = text.len();
                 let pieces = serialize::enrichment_pieces(image);
+                let page = image.page;
+                images[*index].reading_anchor = Some(anchor);
                 if pieces.is_empty() {
                     continue;
                 }
@@ -911,7 +921,7 @@ fn render(items: &[Item], images: &mut [ExtractedImage]) -> Reading {
                             end: text.len(),
                         },
                         origin: SourceOrigin::PdfPage {
-                            page: image.page,
+                            page,
                             bbox: Some(piece.bbox),
                         },
                         provenance: piece.provenance,
@@ -1014,6 +1024,7 @@ mod tests {
             pixel_height: 120,
             image_sha256: "digest".into(),
             reading_range: None,
+            reading_anchor: None,
             ocr_regions: vec![ImageOcrRegion {
                 kind: RegionKind::Formula,
                 text: "c_i = a_i \\oplus b_i".into(),

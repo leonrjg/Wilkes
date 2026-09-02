@@ -3,26 +3,30 @@ mod model;
 
 use async_trait::async_trait;
 
-use crate::integrations::Integration;
-use crate::types::{IntegrationStatus, Settings};
+use crate::integrations::LiteratureSource;
+use crate::types::{IntegrationStatus, LiteratureSearchResult};
 
 pub use client::OpenAlexClient;
 
-pub struct OpenAlexIntegration;
-
 #[async_trait]
-impl Integration for OpenAlexIntegration {
-    fn id(&self) -> &'static str {
+impl LiteratureSource for OpenAlexClient {
+    fn id(&self) -> &str {
         "openalex"
     }
 
-    fn is_enabled(&self, settings: &Settings) -> bool {
-        settings.integrations.openalex.enabled
+    fn name(&self) -> &str {
+        "OpenAlex"
     }
 
-    async fn health_check(&self, settings: &Settings) -> anyhow::Result<IntegrationStatus> {
-        OpenAlexClient::from_settings(&settings.integrations.openalex)
-            .status(settings.integrations.openalex.enabled)
-            .await
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<LiteratureSearchResult>> {
+        OpenAlexClient::search(self, query, limit).await
+    }
+
+    async fn status(&self, enabled: bool) -> anyhow::Result<IntegrationStatus> {
+        OpenAlexClient::status(self, enabled).await
     }
 }

@@ -1,5 +1,8 @@
 mod backend;
-mod mupdf;
+/// The MuPDF reading of a document. `pub(crate)` for the two functions that
+/// find a picture again in the file it was extracted from — see
+/// [`crate::figure`], which is the only caller outside this module.
+pub(crate) mod mupdf;
 mod sanitize;
 /// Formulas and ruled tables the page draws rather than embeds.
 mod typeset;

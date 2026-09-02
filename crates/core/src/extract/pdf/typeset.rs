@@ -418,7 +418,10 @@ fn render_scale(bbox: &BoundingBox) -> f32 {
 /// Padding is applied to the pixel rectangle and not to the page rectangle.
 /// Doing it in page space and rounding to pixels afterwards was the same idea
 /// and cost twice the model: see [`pad_to_aspect`].
-fn render(page: &mupdf::Page, bbox: &BoundingBox) -> anyhow::Result<(NativeImage, BoundingBox)> {
+pub(crate) fn render(
+    page: &mupdf::Page,
+    bbox: &BoundingBox,
+) -> anyhow::Result<(NativeImage, BoundingBox)> {
     let scale = render_scale(bbox);
     let scaled = |rect: &BoundingBox| IRect {
         x0: (rect.x * scale).floor() as i32,
