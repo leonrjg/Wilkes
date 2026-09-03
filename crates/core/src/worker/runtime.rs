@@ -12,7 +12,7 @@ use super::ipc::{CancelSignal, WorkerEvent, WorkerRequest, WorkerRole};
 use super::manager::{
     GenerationWorkerStatus, ManagerCommand, ManagerEvent, WorkerPaths, WorkerStatus,
 };
-use super::process::WorkerProcess;
+use super::process::{Stop, WorkerProcess};
 use super::DEFAULT_IDLE_TIMEOUT_SECS;
 
 #[async_trait]
@@ -23,7 +23,7 @@ pub(crate) trait WorkerSession: Send + Sync {
         reply: mpsc::Sender<WorkerEvent>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send>>;
 
-    async fn shutdown(&self, pid_slot: &AtomicU32);
+    async fn shutdown(&self, pid_slot: &AtomicU32, stop: Stop);
 
     /// Ask the worker to stop the request it is currently serving. Only the
     /// generation mode acts on this; every other mode ignores the line.
@@ -68,8 +68,8 @@ impl WorkerSession for WorkerProcess {
         Box::pin(async move { proc.send_request(&req_json, &reply).await })
     }
 
-    async fn shutdown(&self, pid_slot: &AtomicU32) {
-        WorkerProcess::shutdown(self, pid_slot).await;
+    async fn shutdown(&self, pid_slot: &AtomicU32, stop: Stop) {
+        WorkerProcess::shutdown(self, pid_slot, stop).await;
     }
 
     async fn cancel_active_request(&self) -> Result<(), ()> {
@@ -157,6 +157,19 @@ struct WorkerRuntime {
     /// Commands taken off the channel while a request was in flight, held back
     /// until it finished. Only the cancel signal is acted on mid-request.
     deferred: VecDeque<ManagerCommand>,
+    /// Whether the worker this manager last held ended by dying under a
+    /// request, rather than by being stopped on purpose.
+    last_stop_was_a_death: bool,
+    /// How many workers this manager has started to replace one that died
+    /// under a request, since the last deliberate stop.
+    ///
+    /// Zero is the only correct value. A worker is started inside a loop
+    /// exactly when this climbs: the loop's next iteration submits, finds no
+    /// process, and spawns a replacement that reloads the model — which is how
+    /// a cancel comes to be outrun once per iteration. Counted and logged
+    /// rather than merely prevented, because the shape that produces it lives
+    /// in the caller and this is the only place that can see it happening.
+    replacements: u32,
 }
 
 enum NextCommand {
@@ -242,6 +255,8 @@ impl WorkerRuntime {
             active_device: None,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             deferred: VecDeque::new(),
+            last_stop_was_a_death: false,
+            replacements: 0,
         }
     }
 
@@ -283,6 +298,14 @@ impl WorkerRuntime {
             tracing::info!("WorkerManager: Idle timeout reached, killing worker process.");
             self.clear_active_worker().await;
         }
+        self.note_deliberate_stop();
+    }
+
+    /// A stop somebody asked for. It ends the run of replacements, so the
+    /// next start is a first start rather than the next rung of a loop.
+    fn note_deliberate_stop(&mut self) {
+        self.last_stop_was_a_death = false;
+        self.replacements = 0;
     }
 
     async fn handle_command(&mut self, cmd: ManagerCommand) {
@@ -292,6 +315,7 @@ impl WorkerRuntime {
                     tracing::info!("WorkerManager: roof knocking worker process per user request.");
                     self.clear_active_worker().await;
                 }
+                self.note_deliberate_stop();
             }
             ManagerCommand::SetTimeout(secs) => {
                 self.idle_timeout = Duration::from_secs(secs);
@@ -359,6 +383,9 @@ impl WorkerRuntime {
         };
 
         if outcome.is_err() {
+            // Died under the request rather than being stopped: whatever
+            // starts the next one is starting a replacement.
+            self.last_stop_was_a_death = true;
             self.clear_active_worker().await;
         }
     }
@@ -397,8 +424,23 @@ impl WorkerRuntime {
 
         let _ = self.event_tx.send(ManagerEvent::WorkerStarting).await;
 
+        if self.last_stop_was_a_death {
+            self.replacements += 1;
+            tracing::error!(
+                "WorkerManager: starting worker #{} to replace one that died under a request \
+                 (role {:?}, model {:?}). A worker started to replace a killed one is a worker \
+                 started inside a loop: the caller is submitting per item where it should submit \
+                 once, and a cancel will be outrun once per item. See the \"workers are never \
+                 started inside a loop\" invariant in AGENTS.md.",
+                self.replacements,
+                req.role,
+                req.model,
+            );
+        }
+
         match self.spawner.spawn(&self.paths, req, &self.active_pid).await {
             Ok(proc) => {
+                self.last_stop_was_a_death = false;
                 self.active_process = Some(Arc::clone(&proc));
                 *self.active_process_slot.lock().unwrap() = Some(proc);
                 self.active_role = Some(req.role);
@@ -439,7 +481,11 @@ impl WorkerRuntime {
         if let Some(proc) = self.active_process.take() {
             let needs_shutdown = self.active_process_slot.lock().unwrap().take().is_some();
             if needs_shutdown {
-                proc.shutdown(&self.active_pid).await;
+                // Every stop the runtime itself decides on happens between
+                // requests, where the worker is reading its stdin and the
+                // knock is answered. A user cancel does not come through
+                // here; it goes straight at the process.
+                proc.shutdown(&self.active_pid, Stop::RoofKnock).await;
             }
         }
         self.active_role = None;
@@ -531,7 +577,7 @@ mod tests {
             })
         }
 
-        async fn shutdown(&self, _pid_slot: &AtomicU32) {
+        async fn shutdown(&self, _pid_slot: &AtomicU32, _stop: Stop) {
             self.shutdown_calls.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -631,6 +677,83 @@ mod tests {
         )
     }
 
+    fn embed_request(model: &str) -> WorkerRequest {
+        WorkerRequest {
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
+            model: model.to_string(),
+            device: "cpu".to_string(),
+            texts: None,
+            generate: None,
+            recognize: None,
+            layout: None,
+            table: None,
+            mode: "embed".to_string(),
+            model_dir: std::path::PathBuf::from("data"),
+        }
+    }
+
+    /// The counter that names the loop invariant.
+    ///
+    /// A caller submitting per item, whose worker was killed under the first
+    /// item, submits again for the second. The runtime has no process left, so
+    /// it starts one — which is the whole defect, and the thing a cancel has
+    /// to outrun once per item. It has to be visible where it happens: the
+    /// caller cannot see it, and a progress bar reading "Cancelling..." while
+    /// a fresh worker loads its model says nothing about why.
+    #[tokio::test]
+    async fn a_worker_started_to_replace_one_that_died_is_counted() {
+        let (mut runtime, spawn_calls, _send, _shutdown, _tx, _events) = test_runtime();
+        // The session fails its request, which is what a killed worker looks
+        // like from here.
+        runtime.spawner = Arc::new(FakeSpawner {
+            spawn_calls: Arc::clone(&spawn_calls),
+            send_calls: Arc::new(AtomicUsize::new(0)),
+            shutdown_calls: Arc::new(AtomicUsize::new(0)),
+            spawn_should_fail: false,
+            send_should_fail: true,
+        });
+
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        runtime
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+        assert_eq!(spawn_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            runtime.replacements, 0,
+            "the first worker of a run is not a replacement"
+        );
+
+        // The next iteration of the caller's loop.
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        runtime
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+        assert_eq!(
+            spawn_calls.load(Ordering::Relaxed),
+            2,
+            "the second submit had no process and started one"
+        );
+        assert_eq!(
+            runtime.replacements, 1,
+            "starting a worker to replace one that died under a request is the violation"
+        );
+    }
+
+    /// A stop somebody asked for ends the run. The next worker after an idle
+    /// timeout or an explicit shutdown is a first worker, not the next rung of
+    /// a loop, and counting it would cry wolf on every ordinary reuse.
+    #[tokio::test]
+    async fn a_deliberate_stop_ends_the_run_of_replacements() {
+        let (mut runtime, _spawn, _send, _shutdown, _tx, _events) = test_runtime();
+        runtime.last_stop_was_a_death = true;
+        runtime.replacements = 3;
+
+        runtime.handle_command(ManagerCommand::ShutdownWorker).await;
+
+        assert!(!runtime.last_stop_was_a_death);
+        assert_eq!(runtime.replacements, 0);
+    }
+
     /// A session whose request only ends once the worker has been told to
     /// cancel — the shape of a generation stream.
     struct BlockingSession {
@@ -652,7 +775,7 @@ mod tests {
             })
         }
 
-        async fn shutdown(&self, _pid_slot: &AtomicU32) {}
+        async fn shutdown(&self, _pid_slot: &AtomicU32, _stop: Stop) {}
 
         async fn cancel_active_request(&self) -> Result<(), ()> {
             self.cancel_calls.fetch_add(1, Ordering::Relaxed);
@@ -705,6 +828,7 @@ mod tests {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
             mode: "generate".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -841,6 +965,7 @@ mod tests {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -885,6 +1010,7 @@ mod tests {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -931,6 +1057,7 @@ mod tests {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1022,6 +1149,7 @@ mod tests {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1047,6 +1175,7 @@ mod tests {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1073,6 +1202,7 @@ mod tests {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1105,6 +1235,7 @@ mod tests {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1165,6 +1296,7 @@ mod tests {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };

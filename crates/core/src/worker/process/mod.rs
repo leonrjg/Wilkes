@@ -39,6 +39,32 @@ pub(super) enum ProtocolReadOutcome {
 
 pub(super) const ROOF_KNOCK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How much politeness a stop is owed.
+///
+/// [`Stop::RoofKnock`] closes stdin and gives the worker [`ROOF_KNOCK_TIMEOUT`]
+/// to notice and exit: right when the worker is between requests, which is
+/// where the idle timeout, a role change and the end of a pass all stop it.
+///
+/// [`Stop::Now`] kills without the knock, for a caller that knows the worker
+/// will not answer one. A worker in the middle of inference is not reading its
+/// stdin, so the knock is three seconds it was never going to use — which is
+/// most of a cancellation budget, spent before the kill begins. Nothing takes
+/// this path today; cancellation still knocks first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stop {
+    RoofKnock,
+    Now,
+}
+
+impl Stop {
+    pub(super) fn grace(self) -> Option<Duration> {
+        match self {
+            Stop::RoofKnock => Some(ROOF_KNOCK_TIMEOUT),
+            Stop::Now => None,
+        }
+    }
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 #[cfg(any(test, windows))]
 pub(super) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -236,6 +262,7 @@ exit 0
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -252,7 +279,7 @@ exit 0
         }
         assert!(matches!(reply_rx.recv().await.unwrap(), WorkerEvent::Done));
 
-        proc.shutdown(&active_pid).await;
+        proc.shutdown(&active_pid, Stop::RoofKnock).await;
         assert_eq!(active_pid.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
@@ -300,6 +327,7 @@ echo '"Done"'
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
         };
         let req_json = serde_json::to_string(&req).unwrap();
 
@@ -329,7 +357,7 @@ echo '"Done"'
             other => panic!("read the previous request's residue: {other:?}"),
         }
 
-        proc.shutdown(&active_pid).await;
+        proc.shutdown(&active_pid, Stop::RoofKnock).await;
     }
 
     #[tokio::test]
@@ -358,6 +386,7 @@ echo '"Done"'
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -368,9 +397,12 @@ echo '"Done"'
         let req_json = serde_json::to_string(&req).unwrap();
         let res = proc.send_request(&req_json, &reply_tx).await;
         assert!(res.is_err());
+        // `Gone`, not `Error`: the process ended, and the callers that
+        // submit in a loop have to tell that from a failure the worker
+        // reported while still alive. See the loop invariant in AGENTS.md.
         match reply_rx.recv().await.unwrap() {
-            WorkerEvent::Error(msg) => assert!(msg.contains("closed stdout")),
-            other => panic!("expected error, got {other:?}"),
+            WorkerEvent::Gone(msg) => assert!(msg.contains("closed stdout")),
+            other => panic!("expected a gone worker, got {other:?}"),
         }
     }
 
@@ -400,6 +432,7 @@ echo '"Done"'
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -410,9 +443,11 @@ echo '"Done"'
         let req_json = serde_json::to_string(&req).unwrap();
         let res = proc.send_request(&req_json, &reply_tx).await;
         assert!(res.is_err());
+        // A worker whose stdin will not take the request is a worker that is
+        // not going to serve the next one either.
         assert!(matches!(
             reply_rx.recv().await.unwrap(),
-            WorkerEvent::Error(_)
+            WorkerEvent::Gone(_)
         ));
     }
 
@@ -449,6 +484,7 @@ exit 0
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -460,8 +496,8 @@ exit 0
         let res = proc.send_request(&req_json, &reply_tx).await;
         assert!(res.is_err());
         match reply_rx.recv().await.unwrap() {
-            WorkerEvent::Error(msg) => assert!(msg.contains("Failed to read")),
-            other => panic!("expected error, got {other:?}"),
+            WorkerEvent::Gone(msg) => assert!(msg.contains("failed to read")),
+            other => panic!("expected a gone worker, got {other:?}"),
         }
     }
 
@@ -491,13 +527,14 @@ exit 0
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
         };
 
         let active_pid = AtomicU32::new(0);
         let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid)
             .await
             .unwrap();
-        proc.shutdown(&active_pid).await;
+        proc.shutdown(&active_pid, Stop::RoofKnock).await;
         assert_eq!(active_pid.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
@@ -530,6 +567,7 @@ exit 0
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
         };
 
         let active_pid = AtomicU32::new(0);
@@ -602,6 +640,7 @@ exit 0
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
         };
 
         let active_pid = AtomicU32::new(0);

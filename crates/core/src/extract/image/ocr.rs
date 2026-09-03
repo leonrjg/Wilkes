@@ -45,6 +45,34 @@ pub struct SpottedRegion {
     /// Top-left, top-right, bottom-right, bottom-left, each in `0.0..=1.0` of
     /// the image's width and height.
     pub quad: [Point; 4],
+    /// The decode that produced `text` reached its token cap without emitting
+    /// an end-of-sequence token, so `text` is truncated by construction and
+    /// not a reading.
+    ///
+    /// Defaulted so a region built before this field existed reads as
+    /// complete, which is what every decode was until a recognizer's own cap
+    /// was measured against this corpus. Set by the engine, not inferred
+    /// downstream: only the decoder itself knows whether it stopped because
+    /// it was finished or because it was cut off.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Set when this region is a table built from a structure model's grid and
+    /// the page's own glyphs, and carries the facts [`admit`] judges such a
+    /// table on.
+    ///
+    /// `None` for everything else, which is every region a recognizer
+    /// transcribed: those have no grid behind them and no word of the page to
+    /// have left unplaced, so the structural clauses do not apply and a
+    /// defaulted summary would silently apply them anyway. Absent from the wire
+    /// when it is `None`, so a worker that predates the field is unaffected.
+    ///
+    /// It travels *with the region* rather than being recomputed at admission
+    /// because the region is cached: the annotation cache key carries
+    /// [`ADMISSION_RULES_VERSION`], so moving a clause re-decides admission
+    /// from what is stored, and a summary that had to be recomputed from pixels
+    /// would mean re-running the model to change a threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure: Option<super::table_structure::TableFillSummary>,
 }
 
 /// What a recognizer made of one image.
@@ -221,6 +249,15 @@ fn finish(
         text,
         confidence: confidence.clamp(0.0, 1.0),
         quad: [point(0), point(1), point(2), point(3)],
+        // A region only reaches here with a complete quadrilateral — the
+        // caller above drops any run of coordinates shorter than eight,
+        // which is exactly what a decode cut off mid-region leaves behind.
+        // The text preceding a complete quad was fully decoded before the
+        // cap could have ended the stream, so nothing this parser hands back
+        // is truncated by construction.
+        truncated: false,
+        // Spotting transcribes; it fills no grid from the page.
+        structure: None,
     }))
 }
 
@@ -271,7 +308,42 @@ pub const MAPPING_VERSION: &str = "image-mapping-v1";
 /// v2: admission gained the region's origin. A typeset region is refused when
 /// what came back is prose or code, because those bytes would go into the
 /// reading in place of the author's own glyphs.
-pub const ADMISSION_RULES_VERSION: &str = "image-admission-v2";
+///
+/// v3: admission gained the truncated-decode refusal. A reading admitted
+/// under v2 could be a decode that never reached EOS — Texify's `$$…$$`
+/// unwrapping left an unterminated fence behind, and the LaTeX inside still
+/// closed by chance often enough to pass `latex_parses`. Bumped so a stored
+/// annotation from before this rule existed is never re-served as-is: the
+/// cache key carries this constant, so the old entry simply stops being
+/// found and the image is re-recognized under the rule that would have
+/// refused it.
+///
+/// v4: admission gained three clauses for a table built from a structure
+/// model's grid — an empty first row, a word of the page left in no cell, and
+/// a grid too much of which is blank. They do not apply to a table a page
+/// reader transcribed, which carries no grid, and they exist because
+/// [`markdown_table_is_rectangular`] cannot see any of them: a grid shifted one
+/// row off the ink is perfectly rectangular.
+pub const ADMISSION_RULES_VERSION: &str = "image-admission-v4";
+
+/// A table built from a structure model's grid is refused when strictly more
+/// than one in `TABLE_MAX_EMPTY_CELL_DENOMINATOR` of its grid positions holds
+/// no glyph — a third, written as integers so the comparison is exact and a
+/// table sitting on the boundary does not depend on a float.
+///
+/// A third from the 56 table crops of the corpus this was measured on. Of the
+/// 51 grids that came back rectangular, the ones that read correctly reach
+/// 7 empty positions of 32 — 0.219 — at their sparsest, and the one that did
+/// not is 2 of 4, at 0.500. A third sits in that gap, nearer the failure than
+/// the successes so that a genuinely sparse table is not thrown away for being
+/// sparse. What it catches is a grid that is mostly air, which is what a model
+/// proposing rows over blank paper produces.
+///
+/// The other two clauses are not thresholds and have no constant: a first row
+/// with no glyph in it, and a word inside the table's own rectangle that landed
+/// in no cell, are each wrong at one.
+pub const TABLE_MAX_EMPTY_CELL_NUMERATOR: u32 = 1;
+pub const TABLE_MAX_EMPTY_CELL_DENOMINATOR: u32 = 3;
 
 /// Whether a formula's LaTeX parses.
 ///
@@ -460,7 +532,11 @@ pub fn markdown_table_is_rectangular(table: &str) -> bool {
 /// recognizer called this region — and there are two of them, one for each
 /// origin: an embedded picture is refused when the page already draws the
 /// words over it, and a typeset region is refused when what came back is not a
-/// kind worth displacing a glyph run for.
+/// kind worth displacing a glyph run for. A truncated decode is refused next,
+/// ahead of every kind's own rule: whether a formula's LaTeX closes or a
+/// table's rows line up is a question about *content* the decoder finished
+/// producing, and a decode that hit its cap never finished.
+#[allow(clippy::too_many_arguments)]
 fn admit(
     origin: RegionOrigin,
     kind: RegionKind,
@@ -468,6 +544,8 @@ fn admit(
     confidence: f32,
     threshold: f32,
     drawn_natively: bool,
+    truncated: bool,
+    structure: Option<&super::table_structure::TableFillSummary>,
 ) -> OcrAdmission {
     if drawn_natively {
         return OcrAdmission::DeduplicatedAgainstNativeText;
@@ -478,6 +556,9 @@ fn admit(
     // [`RegionKind::supersedes_native_glyphs`].
     if origin == RegionOrigin::Typeset && !kind.supersedes_native_glyphs() {
         return OcrAdmission::DeduplicatedAgainstNativeText;
+    }
+    if truncated {
+        return OcrAdmission::RejectedTruncated;
     }
     match kind {
         RegionKind::Text | RegionKind::Code => {
@@ -495,13 +576,60 @@ fn admit(
             }
         }
         RegionKind::Table | RegionKind::Chart => {
-            if markdown_table_is_rectangular(text) {
-                OcrAdmission::Accepted
-            } else {
-                OcrAdmission::RejectedMalformedTable
+            // Kept, and asked first, for a table from a structure model too.
+            // It is the rule about the *shape of the bytes that enter the
+            // reading* — a header row, its delimiter, and every row the same
+            // width of at least two columns — and nothing about a grid
+            // guarantees that: a one-column grid expands to a one-column
+            // Markdown table, which is a list and not a table, and five of the
+            // 56 measured crops are exactly that. It is also what keeps one
+            // rule deciding this for every engine, which is why it is here and
+            // not inside a parser.
+            if !markdown_table_is_rectangular(text) {
+                return OcrAdmission::RejectedMalformedTable;
+            }
+            // And then the three a rectangle cannot show. Only for a table
+            // whose grid the host filled: a transcription has no grid, no word
+            // it could have failed to place, and nothing here to judge it on.
+            match structure {
+                None => OcrAdmission::Accepted,
+                Some(structure) => admit_filled_table(structure),
             }
         }
     }
+}
+
+/// The three clauses a table built from a structure model's grid answers to,
+/// in the order a reader would want the reason reported.
+///
+/// Each is a different failure of the same model and each is counted apart —
+/// see [`crate::types::ExtractionDiagnostics`]. None of them is a score: what
+/// makes a filled grid wrong is that it does not hold the page's glyphs, and
+/// that is a fact rather than a confidence.
+fn admit_filled_table(structure: &super::table_structure::TableFillSummary) -> OcrAdmission {
+    // A grid whose first row holds nothing is one shifted off the ink: the
+    // model proposed a band of cells above the table. The body below it may
+    // look perfectly plausible, which is exactly why this is refused rather
+    // than admitted with a blank header.
+    if structure.first_row_empty {
+        return OcrAdmission::RejectedEmptyHeaderRow;
+    }
+    // The glyphs are certainly there — the page drew them and the crop was cut
+    // around them — so a word with nowhere to go is a cell the grid does not
+    // have. Admitting it would put this table into the reading *in place of*
+    // the page's own run while losing part of that run.
+    if structure.unassigned_words > 0 {
+        return OcrAdmission::RejectedUnassignedWords;
+    }
+    // Integer arithmetic, so a table exactly on the boundary is decided by the
+    // rule rather than by a float: refused when `empty / cells` is strictly
+    // greater than the fraction the two constants name.
+    if structure.empty_cells * TABLE_MAX_EMPTY_CELL_DENOMINATOR
+        > structure.cells * TABLE_MAX_EMPTY_CELL_NUMERATOR
+    {
+        return OcrAdmission::RejectedSparseTable;
+    }
+    OcrAdmission::Accepted
 }
 
 /// Place each spotted region on the page, and decide whether it enters the
@@ -556,6 +684,8 @@ pub fn place_and_admit(
                 region.confidence,
                 threshold,
                 drawn_natively,
+                region.truncated,
+                region.structure.as_ref(),
             );
             ImageOcrRegion {
                 // Carried, never decided here. What a region contains is the
@@ -594,6 +724,182 @@ pub(super) fn contains(bbox: &BoundingBox, point: &Point) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A table built from a structure model's grid, as the analyzer builds it:
+    /// the Markdown that would enter the reading, and the facts about the fill
+    /// that produced it.
+    fn filled_table(
+        markdown: &str,
+        cells: u32,
+        empty_cells: u32,
+        unassigned_words: u32,
+        first_row_empty: bool,
+    ) -> OcrAdmission {
+        admit(
+            RegionOrigin::Typeset,
+            RegionKind::Table,
+            markdown,
+            // Deliberately below any threshold: a filled table is never
+            // admitted or refused on a score, and a test that passed a
+            // comfortable confidence would not show that.
+            0.0,
+            0.9,
+            false,
+            false,
+            Some(&super::super::table_structure::TableFillSummary {
+                cells,
+                empty_cells,
+                unassigned_words,
+                words_in_box: 0,
+                first_row_empty,
+            }),
+        )
+    }
+
+    /// A clean 2x3 table, filled: the shape every one of the clauses below is
+    /// a departure from.
+    const CLEAN: &str = "| a | b | c |\n| --- | --- | --- |\n| d | e | f |\n";
+
+    /// The ordinary case. Nothing about a table from a grid is admitted on a
+    /// score, and this one carries none.
+    #[test]
+    fn a_filled_table_that_holds_the_pages_glyphs_is_admitted() {
+        assert_eq!(filled_table(CLEAN, 6, 0, 0, false), OcrAdmission::Accepted);
+        // A few blank positions are ordinary — a truth table's leading column
+        // is set once and left empty under it — and stay admitted.
+        assert_eq!(filled_table(CLEAN, 6, 2, 0, false), OcrAdmission::Accepted);
+    }
+
+    /// A first row with no glyph in it is a grid shifted off the ink: the
+    /// model proposed a band of cells above the table. Refused even though the
+    /// Markdown is a perfect rectangle, which is exactly the failure
+    /// `markdown_table_is_rectangular` cannot see.
+    #[test]
+    fn a_filled_table_with_an_empty_first_row_is_refused() {
+        let shifted = "|  |  |  |\n| --- | --- | --- |\n| d | e | f |\n";
+        assert!(markdown_table_is_rectangular(shifted));
+        assert_eq!(
+            filled_table(shifted, 6, 3, 0, true),
+            OcrAdmission::RejectedEmptyHeaderRow
+        );
+    }
+
+    /// A word the page draws inside the table's own rectangle that landed in no
+    /// cell is a column the grid does not have. Admitting the table would put
+    /// it into the reading in place of the page's run while losing that word.
+    #[test]
+    fn a_filled_table_that_left_a_word_unplaced_is_refused() {
+        assert_eq!(
+            filled_table(CLEAN, 6, 0, 1, false),
+            OcrAdmission::RejectedUnassignedWords
+        );
+    }
+
+    /// A grid that is mostly air. The boundary is the rule's own fraction, and
+    /// it is checked on both sides: a table exactly at it is admitted, one past
+    /// it is not.
+    #[test]
+    fn a_filled_table_that_is_mostly_empty_is_refused() {
+        // Exactly a third: admitted, because the rule refuses *more* than that.
+        assert_eq!(filled_table(CLEAN, 6, 2, 0, false), OcrAdmission::Accepted);
+        // One position more.
+        assert_eq!(
+            filled_table(CLEAN, 6, 3, 0, false),
+            OcrAdmission::RejectedSparseTable
+        );
+        // And the shape the corpus actually produced: a 2x2 grid over a caption,
+        // two of four positions blank.
+        assert_eq!(
+            filled_table("| a | b |\n| --- | --- |\n|  |  |\n", 4, 2, 0, false),
+            OcrAdmission::RejectedSparseTable
+        );
+    }
+
+    /// The clauses are ordered so the reason names the worst thing about the
+    /// table, and raggedness — which is a fact about the bytes rather than
+    /// about the fill — is still asked first.
+    #[test]
+    fn a_ragged_filled_table_is_refused_as_malformed_before_anything_else() {
+        // One column: a list, not a table. Five of the 56 measured crops are
+        // exactly this, and this is the clause that catches them.
+        let one_column = "| a |\n| --- |\n| b |\n";
+        assert!(!markdown_table_is_rectangular(one_column));
+        assert_eq!(
+            filled_table(one_column, 2, 1, 1, true),
+            OcrAdmission::RejectedMalformedTable,
+        );
+    }
+
+    /// A structure summary is not consulted for anything but a table. A
+    /// formula carrying one — which nothing produces — must still be admitted
+    /// on whether its LaTeX closes.
+    #[test]
+    fn the_structural_clauses_apply_to_tables_only() {
+        assert_eq!(
+            admit(
+                RegionOrigin::Typeset,
+                RegionKind::Formula,
+                "x^{2}",
+                0.0,
+                0.9,
+                false,
+                false,
+                Some(&super::super::table_structure::TableFillSummary {
+                    cells: 4,
+                    empty_cells: 4,
+                    unassigned_words: 9,
+                    words_in_box: 9,
+                    first_row_empty: true,
+                }),
+            ),
+            OcrAdmission::Accepted
+        );
+    }
+
+    /// A table a page reader transcribed carries no summary, so the structural
+    /// clauses do not apply to it: nothing filled a grid, so nothing could have
+    /// left a word out of one. It is admitted on its shape exactly as before.
+    #[test]
+    fn a_transcribed_table_is_admitted_on_its_shape_alone() {
+        assert_eq!(
+            admit_transcribed(
+                RegionOrigin::Typeset,
+                RegionKind::Table,
+                CLEAN,
+                0.0,
+                0.9,
+                false,
+                false
+            ),
+            OcrAdmission::Accepted
+        );
+    }
+
+    /// [`admit`] for a region a recognizer transcribed — which is every region
+    /// but a table built from a structure model's grid. Those carry a
+    /// [`super::super::table_structure::TableFillSummary`] and are covered by
+    /// their own tests below.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_transcribed(
+        origin: RegionOrigin,
+        kind: RegionKind,
+        text: &str,
+        confidence: f32,
+        threshold: f32,
+        drawn_natively: bool,
+        truncated: bool,
+    ) -> OcrAdmission {
+        admit(
+            origin,
+            kind,
+            text,
+            confidence,
+            threshold,
+            drawn_natively,
+            truncated,
+            None,
+        )
+    }
 
     /// Ids below 1000 stand for the character at that code point offset from
     /// `a`, which is enough to spell words in a test without a tokenizer.
@@ -785,95 +1091,142 @@ mod tests {
     fn each_kind_is_admitted_by_its_own_rule() {
         let table = "| a | b |\n| --- | --- |\n| 1 | 2 |";
         assert_eq!(
-            admit(
+            admit_transcribed(
                 RegionOrigin::Embedded,
                 RegionKind::Text,
                 "Knowledge base",
                 0.9,
                 0.7,
+                false,
                 false
             ),
             OcrAdmission::Accepted
         );
         assert_eq!(
-            admit(
+            admit_transcribed(
                 RegionOrigin::Embedded,
                 RegionKind::Text,
                 "blurred",
                 0.4,
                 0.7,
+                false,
                 false
             ),
             OcrAdmission::RejectedLowConfidence
         );
         assert_eq!(
-            admit(
+            admit_transcribed(
                 RegionOrigin::Embedded,
                 RegionKind::Formula,
                 "E = mc^{2}",
                 0.1,
                 0.7,
+                false,
                 false
             ),
             OcrAdmission::Accepted,
             "a valid formula is not thresholded on confidence"
         );
         assert_eq!(
-            admit(
+            admit_transcribed(
                 RegionOrigin::Embedded,
                 RegionKind::Formula,
                 "\\frac{a}{b",
                 0.99,
                 0.7,
+                false,
                 false
             ),
             OcrAdmission::RejectedInvalidLatex,
             "a confident truncation is still a truncation"
         );
         assert_eq!(
-            admit(
+            admit_transcribed(
                 RegionOrigin::Embedded,
                 RegionKind::Table,
                 table,
                 0.1,
                 0.7,
+                false,
                 false
             ),
             OcrAdmission::Accepted
         );
         assert_eq!(
-            admit(
+            admit_transcribed(
                 RegionOrigin::Embedded,
                 RegionKind::Table,
                 "| a |\n| --- |\n| 1 |",
                 0.99,
                 0.7,
+                false,
                 false
             ),
             OcrAdmission::RejectedMalformedTable
         );
         assert_eq!(
-            admit(
+            admit_transcribed(
                 RegionOrigin::Embedded,
                 RegionKind::Chart,
                 table,
                 0.99,
                 0.7,
+                false,
                 false
             ),
             OcrAdmission::Accepted,
             "a chart is admitted as a table, by the same rule"
         );
         assert_eq!(
-            admit(
+            admit_transcribed(
                 RegionOrigin::Embedded,
                 RegionKind::Chart,
                 "roughly rising",
                 0.99,
                 0.7,
+                false,
                 false
             ),
             OcrAdmission::RejectedMalformedTable
+        );
+    }
+
+    /// A decode that hit its cap is refused whatever the bytes it emitted
+    /// look like — LaTeX that would otherwise parse included. Confidence and
+    /// structural validity both stay silent about this failure; only the
+    /// decoder itself knows it never reached EOS.
+    #[test]
+    fn a_truncated_decode_is_refused_even_when_it_would_otherwise_parse() {
+        assert_eq!(
+            admit_transcribed(
+                RegionOrigin::Embedded,
+                RegionKind::Formula,
+                "E = mc^{2}",
+                0.99,
+                0.7,
+                false,
+                true,
+            ),
+            OcrAdmission::RejectedTruncated,
+            "closed LaTeX from a decode that hit its cap is still not a reading"
+        );
+    }
+
+    /// The flag changes nothing about a decode that actually finished: the
+    /// existing per-kind rules still decide it.
+    #[test]
+    fn a_completed_decode_is_admitted_as_before() {
+        assert_eq!(
+            admit_transcribed(
+                RegionOrigin::Embedded,
+                RegionKind::Formula,
+                "E = mc^{2}",
+                0.99,
+                0.7,
+                false,
+                false,
+            ),
+            OcrAdmission::Accepted
         );
     }
 
@@ -884,7 +1237,15 @@ mod tests {
     fn native_glyphs_outrank_every_kinds_rule() {
         for kind in RegionKind::ALL {
             assert_eq!(
-                admit(RegionOrigin::Embedded, kind, "E = mc^{2}", 0.99, 0.7, true),
+                admit_transcribed(
+                    RegionOrigin::Embedded,
+                    kind,
+                    "E = mc^{2}",
+                    0.99,
+                    0.7,
+                    true,
+                    false
+                ),
                 OcrAdmission::DeduplicatedAgainstNativeText,
                 "{kind:?}"
             );
@@ -898,7 +1259,9 @@ mod tests {
     #[test]
     fn only_a_kind_worth_displacing_glyphs_is_admitted_from_a_typeset_region() {
         let table = "| a | b |\n| --- | --- |\n| 1 | 2 |";
-        let of = |kind, text| admit(RegionOrigin::Typeset, kind, text, 0.99, 0.7, false);
+        let of = |kind, text| {
+            admit_transcribed(RegionOrigin::Typeset, kind, text, 0.99, 0.7, false, false)
+        };
 
         assert_eq!(
             of(RegionKind::Formula, "E = mc^{2}"),
@@ -921,12 +1284,13 @@ mod tests {
     #[test]
     fn the_typeset_rule_does_not_reach_an_embedded_picture() {
         assert_eq!(
-            admit(
+            admit_transcribed(
                 RegionOrigin::Embedded,
                 RegionKind::Text,
                 "Knowledge base",
                 0.99,
                 0.7,
+                false,
                 false
             ),
             OcrAdmission::Accepted
@@ -943,6 +1307,8 @@ mod tests {
             text: "E = mc^{2}".to_string(),
             confidence: 0.2,
             quad: [Point { x: 0.0, y: 0.0 }; 4],
+            truncated: false,
+            structure: None,
         }];
         let placed = place_and_admit(
             spotted,

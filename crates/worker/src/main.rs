@@ -6,8 +6,9 @@ use std::sync::Arc;
 use wilkes_core::embed::dispatch;
 use wilkes_core::extract::image::dispatch as recognize_dispatch;
 use wilkes_core::extract::image::ocr::OcrEngine;
-use wilkes_core::extract::image::{LayoutModel, WireLayoutRegion};
+use wilkes_core::extract::image::table_structure::TableStructure;
 use wilkes_core::extract::image::worker_ocr;
+use wilkes_core::extract::image::{LayoutModel, WireLayoutRegion};
 use wilkes_core::generate::engines::dispatch as generate_dispatch;
 use wilkes_core::generate::{Generated, Generator};
 use wilkes_core::models::progress::EmbedProgress;
@@ -16,18 +17,20 @@ use wilkes_core::worker::ipc::{CancelSignal, WorkerEvent, WorkerRequest, WorkerR
 
 /// How many models one worker process keeps resident at once.
 ///
-/// Three, because reading a document needs three at the same time: the layout
-/// detector that marks out what a page holds, the page reader, and the formula
-/// reader for the areas the detector called formulas. They alternate
-/// continuously within a single document, so a process that held one would
-/// spend the run loading and unloading rather than reading.
+/// Four, because reading a document needs four at the same time: the layout
+/// detector that marks out what a page holds, the page reader, the formula
+/// reader for the areas the detector called formulas, and the table structure
+/// model for the areas it called tables. They alternate continuously within a
+/// single document, so a process that held fewer would spend the run loading
+/// and unloading rather than reading — and the one it evicted would be the one
+/// the next crop needs.
 ///
 /// Bounded rather than open, because a map with no bound is a memory leak that
 /// only shows up on the machine of whoever switches models most. Least
 /// recently used is evicted, which for the reading pass above never evicts
 /// anything and for someone trying recognizers in the settings panel evicts
 /// the one they moved away from.
-const MAX_RESIDENT_MODELS: usize = 3;
+const MAX_RESIDENT_MODELS: usize = 4;
 
 /// Identity of one resident model.
 ///
@@ -63,6 +66,7 @@ enum LoadedPayload {
     Generator(Arc<dyn Generator>),
     Recognizer(Arc<dyn OcrEngine>),
     LayoutDetector(Arc<dyn LayoutModel>),
+    TableStructure(Arc<dyn TableStructure>),
 }
 
 struct LoadedModel {
@@ -111,6 +115,13 @@ impl LoadedModel {
             ),
         }
     }
+
+    fn table_structure(&self) -> anyhow::Result<Arc<dyn TableStructure>> {
+        match &self.payload {
+            LoadedPayload::TableStructure(model) => Ok(Arc::clone(model)),
+            other => anyhow::bail!("worker holds {} but received a table request", other.what()),
+        }
+    }
 }
 
 impl LoadedPayload {
@@ -120,6 +131,7 @@ impl LoadedPayload {
             LoadedPayload::Generator(_) => "a generator",
             LoadedPayload::Recognizer(_) => "a recognizer",
             LoadedPayload::LayoutDetector(_) => "a layout detector",
+            LoadedPayload::TableStructure(_) => "a table structure model",
         }
     }
 }
@@ -139,6 +151,7 @@ enum WorkerRequestKind {
     Embed,
     Recognize,
     Layout,
+    Table,
     Info,
     Generate,
     Unknown(String),
@@ -204,6 +217,21 @@ impl ModelLoader for RealModelLoader {
                 Ok(LoadedModel {
                     key: key.clone(),
                     payload: LoadedPayload::Recognizer(recognizer),
+                    background_task: None,
+                })
+            }
+            // Loaded here and kept resident beside the recognizers, for the
+            // same reason the detector is: a document alternates between them
+            // crop by crop. It is a `_local` loader of its own rather than an
+            // arm of `load_recognizer_local` because it is not an `OcrEngine`
+            // — it answers a grid, not text.
+            WorkerRole::Table(_) => {
+                let model: Arc<dyn TableStructure> =
+                    recognize_dispatch::load_table_structure_local(&key.model, &key.model_dir)?
+                        .into();
+                Ok(LoadedModel {
+                    key: key.clone(),
+                    payload: LoadedPayload::TableStructure(model),
                     background_task: None,
                 })
             }
@@ -293,6 +321,7 @@ fn classify_worker_request(req: &WorkerRequest) -> WorkerRequestKind {
         "embed" => WorkerRequestKind::Embed,
         "recognize" => WorkerRequestKind::Recognize,
         "layout" => WorkerRequestKind::Layout,
+        "table" => WorkerRequestKind::Table,
         "info" => WorkerRequestKind::Info,
         "generate" => WorkerRequestKind::Generate,
         other => WorkerRequestKind::Unknown(other.to_string()),
@@ -391,6 +420,9 @@ async fn handle_worker_request(
         WorkerRequestKind::Layout => {
             handle_layout_plan(req, active_model, event_tx, loader).await?;
         }
+        WorkerRequestKind::Table => {
+            handle_table_plan(req, active_model, event_tx, loader).await?;
+        }
         WorkerRequestKind::Info => {
             handle_info_plan(req, active_model, event_tx, loader).await?;
         }
@@ -464,12 +496,14 @@ async fn handle_recognize_plan(
     Ok(())
 }
 
-/// Mark out what one rendered page holds.
+/// Mark out what a document's rendered pages hold.
 ///
-/// One page per request, unlike recognition's whole document. Detection is a
-/// quarter of a second where recognition is minutes, and the host cannot
-/// decide what to render next until it knows what this page held — so the unit
-/// that crosses is the unit the host actually has.
+/// A whole document per request, as recognition already was. Detection is a
+/// quarter of a second where recognition is minutes, so this is not a
+/// throughput batch — it is the rule that no worker is started inside a loop.
+/// A page-at-a-time request put the host's `Submit` inside its page loop, and
+/// a killed detector was answered by the next iteration spawning a fresh one.
+/// The loop belongs here, on the side the graph is resident on.
 async fn handle_layout_plan(
     req: WorkerRequest,
     active_model: &mut ResidentModels,
@@ -485,16 +519,7 @@ async fn handle_layout_plan(
         return Ok(());
     };
 
-    let page = match worker_ocr::read_staged_image(&payload.image_path) {
-        Ok(page) => page,
-        Err(error) => {
-            let _ = event_tx
-                .send(WorkerEvent::Error(format!("{error:#}")))
-                .await;
-            return Ok(());
-        }
-    };
-
+    let staged = payload.image_paths.clone();
     let detector = get_or_load(active_model, &req, loader, Some(&event_tx))
         .await?
         .layout_detector()?;
@@ -503,17 +528,95 @@ async fn handle_layout_plan(
     // graph execution that holds a core for as long as it takes, and leaving
     // it on the runtime would stall this process's stdin with it — which is
     // the pipe a cancel would arrive on.
-    let detected = tokio::task::spawn_blocking(move || detector.detect(&page)).await?;
+    //
+    // Each staged page is decoded when the detector reaches it and dropped
+    // before the next, so a book costs one page of pixels here as it did in
+    // the host that staged them.
+    let detected = tokio::task::spawn_blocking(move || {
+        let mut read = |index: usize| worker_ocr::read_staged_image(&staged[index]);
+        detector.detect_document(staged.len(), &mut read)
+    })
+    .await?;
 
     match detected {
-        Ok(regions) => {
-            let wire = regions.iter().map(WireLayoutRegion::from_region).collect();
+        Ok(pages) => {
+            let wire: Vec<Vec<WireLayoutRegion>> = pages
+                .iter()
+                .map(|regions| regions.iter().map(WireLayoutRegion::from_region).collect())
+                .collect();
             let _ = event_tx.send(WorkerEvent::LayoutRegions(wire)).await;
             let _ = event_tx.send(WorkerEvent::Done).await;
         }
         Err(error) => {
             let _ = event_tx
                 .send(WorkerEvent::Error(format!("detection failed: {error:#}")))
+                .await;
+        }
+    }
+    Ok(())
+}
+
+/// Read the grid of a document's typeset table crops.
+///
+/// A whole document per request, as recognition and detection already are. A
+/// crop is 23 ms here, so this is emphatically not a throughput batch — it is
+/// the rule that no worker is started inside a loop, and the loop over the
+/// crops runs beside the resident graph where a kill ends it.
+///
+/// What goes back is geometry: cells with a row, a column, their spans and a
+/// box in fractions of the crop. This process never sees a character of the
+/// document — the cells are filled from the page's own text layer by the host,
+/// which is the only side that holds it.
+async fn handle_table_plan(
+    req: WorkerRequest,
+    active_model: &mut ResidentModels,
+    event_tx: tokio::sync::mpsc::Sender<WorkerEvent>,
+    loader: &impl ModelLoader,
+) -> anyhow::Result<()> {
+    let Some(payload) = req.table.clone() else {
+        let _ = event_tx
+            .send(WorkerEvent::Error(
+                "table request carries no crops".to_string(),
+            ))
+            .await;
+        return Ok(());
+    };
+
+    let images = payload
+        .image_paths
+        .iter()
+        .map(|path| worker_ocr::read_staged_image(path))
+        .collect::<anyhow::Result<Vec<_>>>();
+    let images = match images {
+        Ok(images) => images,
+        Err(error) => {
+            let _ = event_tx
+                .send(WorkerEvent::Error(format!("{error:#}")))
+                .await;
+            return Ok(());
+        }
+    };
+
+    let model = get_or_load(active_model, &req, loader, Some(&event_tx))
+        .await?
+        .table_structure()?;
+
+    // Off the async executor for the same reason recognition and detection
+    // are: this is graph execution that holds a core for as long as it takes,
+    // and leaving it on the runtime would stall this process's stdin — which
+    // is the pipe a cancel would arrive on.
+    let grids = tokio::task::spawn_blocking(move || model.read_batch(&images)).await?;
+
+    match grids {
+        Ok(grids) => {
+            let _ = event_tx.send(WorkerEvent::TableStructures(grids)).await;
+            let _ = event_tx.send(WorkerEvent::Done).await;
+        }
+        Err(error) => {
+            let _ = event_tx
+                .send(WorkerEvent::Error(format!(
+                    "table reading failed: {error:#}"
+                )))
                 .await;
         }
     }
@@ -708,10 +811,10 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
     use wilkes_core::embed::MockEmbedder;
+    use wilkes_core::extract::image::dispatch::RecognitionEngine;
     use wilkes_core::generate::mock::MockGenerator;
     use wilkes_core::generate::{Constraint, GenerationEngine, GenerationRequest, Sampling};
     use wilkes_core::types::EmbeddingEngine;
-    use wilkes_core::extract::image::dispatch::RecognitionEngine;
     use wilkes_core::worker::ipc::WorkerRequest;
 
     struct SuccessLoader;
@@ -733,6 +836,7 @@ mod tests {
                 WorkerRole::Layout(_) => {
                     LoadedPayload::LayoutDetector(Arc::new(MockLayoutDetector))
                 }
+                WorkerRole::Table(_) => LoadedPayload::TableStructure(Arc::new(MockTableStructure)),
             };
             Ok(LoadedModel {
                 key: key.clone(),
@@ -740,6 +844,44 @@ mod tests {
                 background_task: None,
             })
         }
+    }
+
+    /// Returns a grid whose one cell carries the crop's own dimensions in its
+    /// spans, so a test can tell a real round trip from a canned reply.
+    struct MockTableStructure;
+
+    impl wilkes_core::extract::image::table_structure::TableStructure for MockTableStructure {
+        fn identity(&self) -> String {
+            "mock-table".to_string()
+        }
+
+        fn read_batch(
+            &self,
+            images: &[image::RgbImage],
+        ) -> anyhow::Result<Vec<wilkes_core::extract::image::table_structure::TableGrid>> {
+            use wilkes_core::extract::image::table_structure::{TableCell, TableGrid};
+            Ok(images
+                .iter()
+                .map(|image| TableGrid {
+                    cells: vec![TableCell {
+                        x0: 0.0,
+                        y0: 0.0,
+                        x1: 1.0,
+                        y1: 1.0,
+                        colspan: image.width() as usize,
+                        rowspan: image.height() as usize,
+                        row: 0,
+                        col: 0,
+                    }],
+                    rows: 1,
+                    cols: 1,
+                    score: 1.0,
+                    truncated: false,
+                })
+                .collect())
+        }
+
+        fn release(&self) {}
     }
 
     /// Returns one region covering the page, so a test can tell a real round
@@ -753,21 +895,26 @@ mod tests {
         fn input_side(&self) -> u32 {
             64
         }
-        fn detect(
+        fn detect_document(
             &self,
-            page: &image::RgbImage,
-        ) -> anyhow::Result<Vec<wilkes_core::extract::image::LayoutRegion>> {
-            Ok(vec![wilkes_core::extract::image::LayoutRegion {
-                label: "table",
-                kind: Some(wilkes_core::extract::image::ocr::RegionKind::Table),
-                score: 0.9,
-                bbox: wilkes_core::types::BoundingBox {
-                    x: 0.0,
-                    y: 0.0,
-                    width: page.width() as f32 / page.width() as f32,
-                    height: 1.0,
-                },
-            }])
+            page_count: usize,
+            _render: &mut dyn FnMut(usize) -> anyhow::Result<image::RgbImage>,
+        ) -> anyhow::Result<Vec<Vec<wilkes_core::extract::image::LayoutRegion>>> {
+            Ok((0..page_count)
+                .map(|_| {
+                    vec![wilkes_core::extract::image::LayoutRegion {
+                        label: "table",
+                        kind: Some(wilkes_core::extract::image::ocr::RegionKind::Table),
+                        score: 0.9,
+                        bbox: wilkes_core::types::BoundingBox {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 1.0,
+                            height: 1.0,
+                        },
+                    }]
+                })
+                .collect())
         }
         fn release(&self) {}
     }
@@ -798,6 +945,8 @@ mod tests {
                             text: format!("{}x{}", image.width(), image.height()),
                             confidence: 0.9,
                             quad: [corner; 4],
+                            truncated: false,
+                            structure: None,
                         },
                     ])
                 })
@@ -828,6 +977,7 @@ mod tests {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
         }
     }
 
@@ -910,6 +1060,18 @@ mod tests {
             classify_worker_request(&embed_request("generate")),
             WorkerRequestKind::Generate
         );
+        assert_eq!(
+            classify_worker_request(&embed_request("layout")),
+            WorkerRequestKind::Layout
+        );
+        assert_eq!(
+            classify_worker_request(&embed_request("table")),
+            WorkerRequestKind::Table
+        );
+        assert_eq!(
+            classify_worker_request(&embed_request("recognize")),
+            WorkerRequestKind::Recognize
+        );
 
         match classify_worker_request(&embed_request("unknown")) {
             WorkerRequestKind::Unknown(value) => assert_eq!(value, "unknown"),
@@ -976,12 +1138,15 @@ mod tests {
             .is_err());
     }
 
-    /// Reading a document needs the detector, the page reader and the formula
-    /// reader at once, and alternates between them page by page. All three
-    /// stay resident, and each request is answered by its own model rather
-    /// than by whichever was used last.
+    /// Reading a document needs the detector, the page reader, the formula
+    /// reader and the table reader at once, and alternates between them page by
+    /// page. All four stay resident, and each request is answered by its own
+    /// model rather than by whichever was used last.
+    ///
+    /// This is what [`MAX_RESIDENT_MODELS`] is for: a bound one short of the
+    /// reading pass would evict, on every page, the model the next crop needs.
     #[tokio::test]
-    async fn the_three_reading_models_stay_resident_together() {
+    async fn the_four_reading_models_stay_resident_together() {
         let dir = tempdir().unwrap();
         let page = request(
             "recognize",
@@ -996,17 +1161,23 @@ mod tests {
             dir.path().to_path_buf(),
         );
         layout.model = "PP-DocLayoutV2".to_string();
+        let mut table = request(
+            "table",
+            WorkerRole::Table(RecognitionEngine::Onnx),
+            dir.path().to_path_buf(),
+        );
+        table.model = "slanet-plus".to_string();
 
         let mut active = ResidentModels::default();
         for _ in 0..3 {
-            for req in [&layout, &page, &formula] {
+            for req in [&layout, &page, &formula, &table] {
                 get_or_load(&mut active, req, &SuccessLoader, None)
                     .await
                     .unwrap();
             }
         }
 
-        assert_eq!(active.loaded.len(), 3, "a reading pass must not evict");
+        assert_eq!(active.loaded.len(), 4, "a reading pass must not evict");
         assert!(
             get_or_load(&mut active, &layout, &FailLoader, None)
                 .await
@@ -1036,7 +1207,9 @@ mod tests {
         }
 
         assert_eq!(active.loaded.len(), MAX_RESIDENT_MODELS);
-        assert!(active.position_of(&LoadedModelKey::from_request(&requests[0])).is_none());
+        assert!(active
+            .position_of(&LoadedModelKey::from_request(&requests[0]))
+            .is_none());
         assert!(active
             .position_of(&LoadedModelKey::from_request(requests.last().unwrap()))
             .is_some());
@@ -1266,6 +1439,77 @@ mod tests {
             other => panic!("expected Regions, got {other:?}"),
         }
         assert!(matches!(rx.recv().await.unwrap(), WorkerEvent::Done));
+    }
+
+    /// The whole hop for a table crop: the host's encoding, the worker's
+    /// decode, the structure model, and the grids coming back over the event
+    /// channel — one per crop, in order.
+    ///
+    /// What does *not* cross is text. The reply is geometry, and the cells are
+    /// filled from the page's own glyphs by the host.
+    #[tokio::test]
+    async fn a_table_request_returns_one_grid_for_each_crop_it_carried() {
+        let dir = tempdir().unwrap();
+        let mut active = ResidentModels::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+
+        let mut image_paths = Vec::new();
+        for (index, (width, height)) in [(11u32, 5u32), (6, 9)].into_iter().enumerate() {
+            let path = dir.path().join(format!("{index}.png"));
+            image::RgbImage::new(width, height)
+                .save_with_format(&path, image::ImageFormat::Png)
+                .unwrap();
+            image_paths.push(path);
+        }
+        let mut req = request(
+            "table",
+            WorkerRole::Table(RecognitionEngine::Onnx),
+            dir.path().to_path_buf(),
+        );
+        req.table = Some(
+            wilkes_core::extract::image::table_structure::TableStructureRequest { image_paths },
+        );
+
+        handle_worker_request(req, &mut active, tx, &SuccessLoader, &no_cancel())
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap() {
+            WorkerEvent::TableStructures(grids) => {
+                // The model reports the dimensions it was handed, so these are
+                // the host's crops and not a canned reply, and they are not
+                // transposed.
+                assert_eq!(grids.len(), 2);
+                assert_eq!(
+                    (grids[0].cells[0].colspan, grids[0].cells[0].rowspan),
+                    (11, 5)
+                );
+                assert_eq!(
+                    (grids[1].cells[0].colspan, grids[1].cells[0].rowspan),
+                    (6, 9)
+                );
+            }
+            other => panic!("expected TableStructures, got {other:?}"),
+        }
+        assert!(matches!(rx.recv().await.unwrap(), WorkerEvent::Done));
+    }
+
+    #[tokio::test]
+    async fn a_table_request_without_crops_reports_an_error() {
+        let dir = tempdir().unwrap();
+        let mut active = ResidentModels::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let req = request(
+            "table",
+            WorkerRole::Table(RecognitionEngine::Onnx),
+            dir.path().to_path_buf(),
+        );
+
+        handle_worker_request(req, &mut active, tx, &SuccessLoader, &no_cancel())
+            .await
+            .unwrap();
+
+        assert!(matches!(rx.recv().await.unwrap(), WorkerEvent::Error(_)));
     }
 
     #[tokio::test]

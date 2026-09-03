@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use mupdf::text_page::TextBlockType;
 use mupdf::{DestinationKind, Document, MetadataName, TextPageFlags};
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::extract::image::{
     self, AnalysisContext, DiscoveredImage, ImageAnalyzer, NativeImage, NativeTextOnPage,
@@ -152,6 +152,18 @@ fn read_document(path: &Path, analyzer: Option<&dyn ImageAnalyzer>) -> anyhow::R
     // from the region rather than re-derived from the name: one place decides
     // what a class means, and it is the detector's own mapping.
     let mut detected: std::collections::BTreeMap<&'static str, (u32, bool)> = Default::default();
+    // Visibility only: where the time before recognition goes. Two stages,
+    // because they are paid for different things — a page render and a
+    // detection per page of the document, and a crop render per region the
+    // detector marked out.
+    let mut text_layer = std::time::Duration::ZERO;
+    let mut render_and_detect = std::time::Duration::ZERO;
+    let mut crop_render = std::time::Duration::ZERO;
+    // What each page's own glyphs said, kept per page so the detector's
+    // regions can be reconciled against the words they sit among once the
+    // whole document has been detected.
+    let mut surveys: Vec<(BoundingBox, typeset::PageSurvey)> =
+        Vec::with_capacity(page_count as usize);
     for i in 0..page_count as i32 {
         let page = doc.load_page(i)?;
         let bounds = page.bounds()?;
@@ -161,53 +173,107 @@ fn read_document(path: &Path, analyzer: Option<&dyn ImageAnalyzer>) -> anyhow::R
         // in the order the page draws them — which is the only discovery
         // signal this phase needs, and the only thing that establishes where
         // an image sits relative to the text around it.
+        let words_started = std::time::Instant::now();
         let text_page =
             page.to_text_page(TextPageFlags::ACCURATE_BBOXES | TextPageFlags::PRESERVE_IMAGES)?;
-        let mut lines = Vec::new();
+        let mut survey = typeset::PageSurvey {
+            words: Vec::new(),
+            drawn: Vec::new(),
+        };
         pages.push(extract_page_words(
             &text_page,
             (i + 1) as u32,
             height,
             &mut discovered,
-            &mut lines,
+            &mut survey,
             read_embedded,
         ));
+        text_layer += words_started.elapsed();
 
-        let Some(detector) = detector else { continue };
-        // A detection failure is this page's, not the document's: the reading
-        // keeps the page's own glyphs, which is what it would have had anyway,
-        // and the log says which page and why. Bailing would throw away a
-        // whole book over one page that would not rasterize.
-        let found = match typeset::render_page(&page, detector.input_side())
-            .and_then(|render| detector.detect(&render))
-        {
-            Ok(found) => found,
-            Err(error) => {
-                warn!(
-                    "layout detection on page {} of {:?}: {error:#}",
-                    i + 1,
-                    path
-                );
-                diagnostics.layout_pages_failed += 1;
-                continue;
-            }
+        let page_box = BoundingBox {
+            x: bounds.x0,
+            y: bounds.y0,
+            width: bounds.x1 - bounds.x0,
+            height,
         };
-        for region in &found {
-            let entry = detected.entry(region.label).or_insert((0, false));
-            entry.0 += 1;
-            entry.1 = region.kind.is_some();
+        surveys.push((page_box, survey));
+    }
+
+    // One detection for the whole document, because a detector reached through
+    // the worker is *started* by this call: putting it in the page loop above
+    // is what let a cancel be outrun, one respawned worker per page.
+    //
+    // The rendering stays here — it is mupdf's, and mupdf is this process's.
+    // What the detector gets is a way to ask for page `n`, pulled one page at
+    // a time so a book never has more than one page of pixels in memory: at
+    // 1600 square that is eight megabytes a page, and a four-hundred-page book
+    // rendered up front would be three gigabytes held to save writing them out
+    // one at a time. Only the detection crosses.
+    //
+    // The cost of pulling is that a page is loaded twice — once above for its
+    // glyphs, once here for its pixels. That is a page-dictionary parse, not a
+    // content-stream run, and it is the cheaper half of the alternative:
+    // holding every page of the document open across both passes. It lands in
+    // the `page render + detection` figure the stage log reports below.
+    if let Some(detector) = detector {
+        let detect_started = std::time::Instant::now();
+        let mut renders_failed = 0u32;
+        let side = detector.input_side();
+        let detected_pages = {
+            let mut render = |index: usize| -> anyhow::Result<::image::RgbImage> {
+                // A render failure is this page's, not the document's: the
+                // reading keeps the page's own glyphs, which is what it would
+                // have had anyway, and the log says which page and why.
+                // Bailing would throw away a whole book over one page that
+                // would not rasterize.
+                let rendered = doc
+                    .load_page(index as i32)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|page| typeset::render_page(&page, side));
+                if let Err(error) = &rendered {
+                    warn!("page render on page {} of {:?}: {error:#}", index + 1, path);
+                    renders_failed += 1;
+                }
+                rendered
+            };
+            detector.detect_document(page_count as usize, &mut render)
+        };
+        diagnostics.layout_pages_failed += renders_failed;
+        render_and_detect += detect_started.elapsed();
+
+        match detected_pages {
+            Ok(per_page) => {
+                debug!(
+                    "{} page(s) detected in {} ms",
+                    per_page.len(),
+                    detect_started.elapsed().as_millis(),
+                );
+                for (index, found) in per_page.into_iter().enumerate() {
+                    let (page_box, survey) = &surveys[index];
+                    for region in &found {
+                        let entry = detected.entry(region.label).or_insert((0, false));
+                        entry.0 += 1;
+                        entry.1 = region.kind.is_some();
+                    }
+                    pending.extend(typeset::regions(
+                        (index + 1) as u32,
+                        page_box,
+                        &found,
+                        survey,
+                    ));
+                }
+            }
+            // One request, one outcome: a detection that failed failed for the
+            // document, and the reading falls back to the pages' own glyphs —
+            // which is what it would have had with no detector at all.
+            Err(error) => {
+                warn!("layout detection on {:?}: {error:#}", path);
+                // Every page went undetected, not just the ones that would not
+                // rasterize. Assigned rather than added to, so the pages
+                // already counted as render failures are not counted twice.
+                diagnostics.layout_pages_failed = page_count;
+            }
         }
-        pending.extend(typeset::regions(
-            (i + 1) as u32,
-            &BoundingBox {
-                x: bounds.x0,
-                y: bounds.y0,
-                width: bounds.x1 - bounds.x0,
-                height,
-            },
-            &found,
-            &lines,
-        ));
     }
 
     if detector.is_some() {
@@ -215,6 +281,12 @@ fn read_document(path: &Path, analyzer: Option<&dyn ImageAnalyzer>) -> anyhow::R
     }
 
     let mut budgeted = typeset::counted(pending, &mut diagnostics);
+    // The regions that speak for no word of their page, and where the page's
+    // own geometry put each of them. Nothing can be marked for these here —
+    // there is no word to mark — so the place travels to
+    // `sanitize::supersede_typeset_regions`, which is where a word is made for
+    // them if their reading is admitted.
+    let mut anchored: Vec<(usize, typeset::Anchor)> = Vec::new();
     // One page loaded per page that has regions, and its regions rendered
     // together: loading a page is cheap and doing it per region would still be
     // an avoidable repetition of the parse.
@@ -227,24 +299,46 @@ fn read_document(path: &Path, analyzer: Option<&dyn ImageAnalyzer>) -> anyhow::R
             .position(|region| region.page != page_number)
             .map_or(budgeted.len(), |offset| at + offset);
         let page = doc.load_page(page_number as i32 - 1)?;
+        let crop_started = std::time::Instant::now();
         let placed = typeset::discover(&page, &budgeted[at..end], &mut discovered);
+        crop_render += crop_started.elapsed();
         for (region, image_index) in budgeted[at..end].iter().zip(placed) {
             // The words this region speaks for learn which image will speak
             // for them. Whether it actually does is settled after recognition,
-            // in `sanitize::supersede_typeset_regions`.
-            for (block, line, word) in &region.words {
-                if let Some(word) = pages[page_number as usize - 1]
-                    .blocks
-                    .get_mut(*block)
-                    .and_then(|block| block.lines.get_mut(*line))
-                    .and_then(|line| line.words.get_mut(*word))
-                {
-                    word.typeset = Some(image_index);
+            // in `sanitize::supersede_typeset_regions` — as is the whole of
+            // the anchored case, which is the same thing with the word made
+            // rather than found.
+            match region.anchor {
+                Some(anchor) => anchored.push((image_index, anchor)),
+                None => {
+                    for (block, line, word) in &region.words {
+                        if let Some(word) = pages[page_number as usize - 1]
+                            .blocks
+                            .get_mut(*block)
+                            .and_then(|block| block.lines.get_mut(*line))
+                            .and_then(|line| line.words.get_mut(*word))
+                        {
+                            word.typeset = Some(image_index);
+                        }
+                    }
                 }
             }
         }
         at = end;
     }
+
+    // Visibility only: the cost of everything that happens before a recognizer
+    // is asked anything, so the recognizers' own reported times can be read
+    // against the rest of the read.
+    info!(
+        "stages of {:?}: text layer {:.1}s over {page_count} page(s), \
+         page render + detection {:.1}s, crop render {:.1}s over {} region(s)",
+        path,
+        text_layer.as_secs_f32(),
+        render_and_detect.as_secs_f32(),
+        crop_render.as_secs_f32(),
+        budgeted.len(),
+    );
 
     let context = AnalysisContext::new(native_words(&pages));
     // Said before the work rather than after it. Analysis is the slow part of
@@ -279,7 +373,7 @@ fn read_document(path: &Path, analyzer: Option<&dyn ImageAnalyzer>) -> anyhow::R
     // end of extraction keeps a document's worth of decoded artwork out of
     // memory while the reading is being built.
     drop(discovered);
-    let reading = sanitize::sanitize(pages, &mut images, &mut diagnostics);
+    let reading = sanitize::sanitize(pages, &mut images, &anchored, &mut diagnostics);
     if diagnostics.ambiguous_column_pages > 0
         || diagnostics.relocated_marginalia_blocks > 0
         || diagnostics.removed_furniture_runs > 0
@@ -301,10 +395,11 @@ fn read_document(path: &Path, analyzer: Option<&dyn ImageAnalyzer>) -> anyhow::R
 
     if diagnostics.typeset_regions_found > 0 {
         info!(
-            "typeset regions in {:?}: {} found and read, \
+            "typeset regions in {:?}: {} found and read ({} over no glyph of the page at all), \
              {} admitted and now standing in place of the page's own glyphs",
             path,
             diagnostics.typeset_regions_found,
+            diagnostics.typeset_regions_anchored,
             diagnostics.typeset_regions_superseded_native_text,
         );
     }
@@ -558,12 +653,22 @@ fn extract_page_words(
     page_num: u32,
     height: f32,
     discovered: &mut Vec<DiscoveredImage>,
-    surveyed: &mut Vec<typeset::WordBox>,
+    surveyed: &mut typeset::PageSurvey,
     read_embedded: bool,
 ) -> Page {
     let mut blocks = Vec::new();
     for block in text_page.blocks() {
         if block.r#type() == TextBlockType::Image {
+            // Where the page draws a picture, whether or not discovery keeps
+            // it: an area a picture occupies is an area the prose does not,
+            // and that is true of a picture whose pixels could not be read.
+            let bounds = block.bounds();
+            surveyed.drawn.push(BoundingBox {
+                x: bounds.x0,
+                y: bounds.y0,
+                width: (bounds.x1 - bounds.x0).max(0.0),
+                height: (bounds.y1 - bounds.y0).max(0.0),
+            });
             if let Some(found) = discover_image(&block, page_num, discovered.len(), read_embedded) {
                 blocks.push(Block {
                     lines: Vec::new(),
@@ -619,7 +724,7 @@ fn extract_page_words(
             // never covered.
             for (index, out_word) in out.words.iter().enumerate() {
                 if let Some(bbox) = &out_word.bbox {
-                    surveyed.push(typeset::WordBox {
+                    surveyed.words.push(typeset::WordBox {
                         block: blocks.len(),
                         line: lines.len(),
                         word: index,
@@ -1600,21 +1705,29 @@ mod tests {
             "stub-layout-v1".to_string()
         }
 
-        fn detect(
+        fn detect_document(
             &self,
-            _page: &::image::RgbImage,
-        ) -> anyhow::Result<Vec<crate::extract::image::LayoutRegion>> {
-            Ok(vec![crate::extract::image::LayoutRegion {
-                label: Self::LABEL,
-                kind: crate::extract::image::doclayout::kind_of(Self::LABEL),
-                score: 0.95,
-                bbox: BoundingBox {
-                    x: 35.0 / 400.0,
-                    y: 58.0 / 300.0,
-                    width: 200.0 / 400.0,
-                    height: 20.0 / 300.0,
-                },
-            }])
+            page_count: usize,
+            render: &mut dyn FnMut(usize) -> anyhow::Result<::image::RgbImage>,
+        ) -> anyhow::Result<Vec<Vec<crate::extract::image::LayoutRegion>>> {
+            Ok((0..page_count)
+                .map(|index| {
+                    // Pulled, so the test exercises the same page-by-page
+                    // render the real detectors ask for.
+                    let _ = render(index);
+                    vec![crate::extract::image::LayoutRegion {
+                        label: Self::LABEL,
+                        kind: crate::extract::image::doclayout::kind_of(Self::LABEL),
+                        score: 0.95,
+                        bbox: BoundingBox {
+                            x: 35.0 / 400.0,
+                            y: 58.0 / 300.0,
+                            width: 200.0 / 400.0,
+                            height: 20.0 / 300.0,
+                        },
+                    }]
+                })
+                .collect())
         }
     }
 

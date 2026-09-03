@@ -216,6 +216,12 @@ impl AppleVision {
                 text: region.text,
                 confidence: region.confidence,
                 quad: quad_from_vision_rect(region.x, region.y, region.w, region.h),
+                // Apple's framework, not an autoregressive decoder run to a
+                // token cap this codebase set — there is no such cap here to
+                // hit.
+                truncated: false,
+                // Lines of text, never a grid filled from the page.
+                structure: None,
             })
             .collect();
 

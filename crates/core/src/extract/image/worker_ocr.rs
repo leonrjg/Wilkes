@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use super::dispatch::{self, RecognitionEngine};
 use super::ocr::{ImageRecognition, OcrEngine};
 use super::RecognitionRequest;
+use crate::worker::fault::WorkerFault;
 use crate::worker::ipc::{WorkerEvent, WorkerRequest, WorkerRole};
 use crate::worker::manager::{ManagerCommand, WorkerManager};
 
@@ -136,6 +137,7 @@ impl OcrEngine for WorkerOcr {
             generate: None,
             recognize: Some(RecognitionRequest { image_paths }),
             layout: None,
+            table: None,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -145,17 +147,17 @@ impl OcrEngine for WorkerOcr {
         };
 
         let regions: Vec<ImageRecognition> = self.tokio_handle.block_on(async move {
-            self.manager
-                .send(cmd)
-                .await
-                .map_err(|error| anyhow::anyhow!("could not reach the recognizer: {error}"))?;
+            self.manager.send(cmd).await.map_err(|error| {
+                WorkerFault::gone(format!("could not reach the recognizer: {error}"))
+            })?;
 
             while let Some(event) = rx.recv().await {
                 match event {
                     WorkerEvent::Regions(regions) => return Ok(regions),
                     WorkerEvent::Error(error) => {
-                        return Err(anyhow::anyhow!("recognizer error: {error}"))
+                        return Err(WorkerFault::reported(format!("recognizer error: {error}")))
                     }
+                    WorkerEvent::Gone(detail) => return Err(WorkerFault::gone(detail)),
                     WorkerEvent::Done => break,
                     _ => {}
                 }
@@ -417,6 +419,10 @@ mod tests {
                 crate::types::Point { x: 0.9, y: 0.4 },
                 crate::types::Point { x: 0.1, y: 0.4 },
             ],
+            // Exercised as `true` here so the round trip also proves this
+            // field, and not only the ones that existed before it.
+            truncated: true,
+            structure: None,
         }];
         let batch = vec![
             ImageRecognition {

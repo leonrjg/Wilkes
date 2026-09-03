@@ -59,6 +59,7 @@ impl WorkerEmbedder {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -68,23 +69,29 @@ impl WorkerEmbedder {
         };
 
         self.tokio_handle.block_on(async move {
-            self.manager
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send command to manager: {e}"))?;
+            self.manager.send(cmd).await.map_err(|e| {
+                crate::worker::fault::WorkerFault::gone(format!(
+                    "failed to send command to manager: {e}"
+                ))
+            })?;
 
             while let Some(event) = rx.recv().await {
                 match event {
                     WorkerEvent::Embeddings(vecs) => return Ok(vecs),
                     WorkerEvent::Error(err) => {
-                        return Err(anyhow::anyhow!("Worker error: {}", err))
+                        return Err(crate::worker::fault::WorkerFault::reported(err))
+                    }
+                    WorkerEvent::Gone(detail) => {
+                        return Err(crate::worker::fault::WorkerFault::gone(detail))
                     }
                     WorkerEvent::Done => break,
                     _ => {}
                 }
             }
-            Err(anyhow::anyhow!(
-                "Worker finished without returning embeddings"
+            // The channel ended without an answer, which means the reply
+            // sender was dropped: the worker is not coming back with these.
+            Err(crate::worker::fault::WorkerFault::gone(
+                "worker finished without returning embeddings",
             ))
         })
     }
@@ -286,10 +293,16 @@ mod tests {
             .await
             .unwrap();
 
+        // The worker answered the request with a failure. That is a
+        // `WorkerFault::reported` — typed, so the build's batch loop can stop
+        // on it without reading the message — and the detail it carries is
+        // still what the worker said.
         assert!(res.is_err());
-        assert!(res
-            .unwrap_err()
-            .to_string()
-            .contains("Worker error: test error"));
+        let error = res.unwrap_err();
+        assert!(error.to_string().contains("test error"));
+        assert_eq!(
+            crate::worker::fault::fault_of(&error),
+            Some(crate::worker::fault::Fault::Reported)
+        );
     }
 }

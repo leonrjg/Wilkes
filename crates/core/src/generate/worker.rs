@@ -54,6 +54,7 @@ impl WorkerGenerator {
             generate: Some(req),
             recognize: None,
             layout: None,
+            table: None,
         }
     }
 }
@@ -78,10 +79,11 @@ impl Generator for WorkerGenerator {
         };
 
         self.tokio_handle.block_on(async move {
-            self.manager
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send command to manager: {e}"))?;
+            self.manager.send(cmd).await.map_err(|e| {
+                crate::worker::fault::WorkerFault::gone(format!(
+                    "failed to send command to manager: {e}"
+                ))
+            })?;
 
             let mut text = String::new();
             let mut cancelled = false;
@@ -126,6 +128,13 @@ impl Generator for WorkerGenerator {
                         // delivered tokens the caller rendered. Returning the
                         // partial text would be indistinguishable from success.
                         return Err(anyhow::anyhow!("Worker error: {err}"));
+                    }
+                    // The process itself ended. Distinct from an error it
+                    // reported, because a caller labelling a list of clusters
+                    // must stop rather than let its next iteration start a
+                    // replacement.
+                    WorkerEvent::Gone(detail) => {
+                        return Err(crate::worker::fault::WorkerFault::gone(detail));
                     }
                     other => {
                         tracing::warn!(

@@ -540,6 +540,12 @@ pub(super) enum Script {
     /// Regions of any kind — what a recognizer that parses a document
     /// returns, rather than one that only transcribes.
     Reads(Vec<(RegionKind, &'static str, f32, [f32; 8])>),
+    /// The same shape as [`Self::Reads`], but every region is marked as a
+    /// decode that hit its token cap — what a recognizer hands back when it
+    /// ran out of budget rather than finishing. Its own variant rather than a
+    /// flag on `Reads`, because every other case in this script is a decode
+    /// that finished and this is the one case that is not.
+    ReadsTruncated(Vec<(RegionKind, &'static str, f32, [f32; 8])>),
     /// A recognition failure. The reading keeps its native text and the result
     /// says it is partial.
     Fails(&'static str),
@@ -582,6 +588,29 @@ impl OcrEngine for ScriptedOcr {
     }
 }
 
+/// `[f32; 8]` — the same flat corner list every `Script` variant is written
+/// in — as Wilkes' own quad.
+fn quad_from(values: &[f32; 8]) -> [Point; 4] {
+    [
+        Point {
+            x: values[0],
+            y: values[1],
+        },
+        Point {
+            x: values[2],
+            y: values[3],
+        },
+        Point {
+            x: values[4],
+            y: values[5],
+        },
+        Point {
+            x: values[6],
+            y: values[7],
+        },
+    ]
+}
+
 impl ScriptedOcr {
     fn spot_one(&self) -> anyhow::Result<Vec<SpottedRegion>> {
         let mut seen = self.seen.lock().expect("the script's lock");
@@ -596,24 +625,20 @@ impl ScriptedOcr {
                     kind: *kind,
                     text: (*text).to_string(),
                     confidence: *confidence,
-                    quad: [
-                        Point {
-                            x: quad[0],
-                            y: quad[1],
-                        },
-                        Point {
-                            x: quad[2],
-                            y: quad[3],
-                        },
-                        Point {
-                            x: quad[4],
-                            y: quad[5],
-                        },
-                        Point {
-                            x: quad[6],
-                            y: quad[7],
-                        },
-                    ],
+                    quad: quad_from(quad),
+                    truncated: false,
+                    structure: None,
+                })
+                .collect()),
+            Some(Script::ReadsTruncated(reads)) => Ok(reads
+                .iter()
+                .map(|(kind, text, confidence, quad)| SpottedRegion {
+                    kind: *kind,
+                    text: (*text).to_string(),
+                    confidence: *confidence,
+                    quad: quad_from(quad),
+                    truncated: true,
+                    structure: None,
                 })
                 .collect()),
             Some(Script::Spots(spots)) => Ok(spots
@@ -622,24 +647,9 @@ impl ScriptedOcr {
                     kind: RegionKind::Text,
                     text: (*text).to_string(),
                     confidence: *confidence,
-                    quad: [
-                        Point {
-                            x: quad[0],
-                            y: quad[1],
-                        },
-                        Point {
-                            x: quad[2],
-                            y: quad[3],
-                        },
-                        Point {
-                            x: quad[4],
-                            y: quad[5],
-                        },
-                        Point {
-                            x: quad[6],
-                            y: quad[7],
-                        },
-                    ],
+                    quad: quad_from(quad),
+                    truncated: false,
+                    structure: None,
                 })
                 .collect()),
         }
@@ -886,6 +896,61 @@ fn a_formula_that_does_not_parse_is_refused_with_its_reason() {
         region.admission,
         crate::types::OcrAdmission::RejectedInvalidLatex
     );
+}
+
+/// A decode that hit its token cap is refused even when the LaTeX it emitted
+/// happens to close — measured on this repository's corpus as Texify's
+/// `$$…$$` unwrapping leaving an unterminated fence behind, with math after it
+/// that still balanced its own braces. Validity cannot see this failure;
+/// only the decoder that ran the cap can, and it is what admits or refuses
+/// the region.
+#[test]
+fn a_truncated_formula_is_refused_even_when_it_would_otherwise_parse() {
+    let (content, diagnostics) = extract(
+        vec![PageSpec::default()
+            .with_text(20.0, 250.0, "Before the figure")
+            .with_image(ImageSpec::gradient(64, 32))],
+        vec![Script::ReadsTruncated(vec![(
+            RegionKind::Formula,
+            "S(q,d) = \\frac{a}{b}",
+            0.99,
+            MIDDLE,
+        )])],
+        None,
+    );
+
+    assert!(!content.text.contains("\\frac{a}{b}"));
+    assert!(!content.text.contains("Image embedded formula:"));
+    assert_eq!(diagnostics.ocr_regions_rejected_truncated, 1);
+    assert_eq!(diagnostics.formulas_rejected_invalid_latex, 0);
+    assert_eq!(diagnostics.formulas_accepted, 0);
+    let region = &content.images[0].ocr_regions[0];
+    assert_eq!(
+        region.admission,
+        crate::types::OcrAdmission::RejectedTruncated
+    );
+}
+
+/// The same closed LaTeX, read by a decode that did finish, is admitted as
+/// before — the flag changes nothing about a reading that completed.
+#[test]
+fn a_completed_formula_reads_as_it_always_did() {
+    let (content, diagnostics) = extract(
+        vec![PageSpec::default()
+            .with_text(20.0, 250.0, "Before the figure")
+            .with_image(ImageSpec::gradient(64, 32))],
+        vec![Script::Reads(vec![(
+            RegionKind::Formula,
+            "S(q,d) = \\frac{a}{b}",
+            0.99,
+            MIDDLE,
+        )])],
+        None,
+    );
+
+    assert!(content.text.contains("\\frac{a}{b}"));
+    assert_eq!(diagnostics.ocr_regions_rejected_truncated, 0);
+    assert_eq!(diagnostics.formulas_accepted, 1);
 }
 
 /// A ragged table is a failed recognition wearing the shape of a result. It

@@ -247,7 +247,8 @@ fn main() -> anyhow::Result<()> {
         .map_err(|reason| anyhow::anyhow!("{reason}"))?
         .pixels;
         detector
-            .detect(&square)?
+            .detect_document(1, &mut |_| Ok(square.clone()))?
+            .remove(0)
             .into_iter()
             .filter(|d| d.label.contains("formula") || d.label == "table")
             .map(|d| {

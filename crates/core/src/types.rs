@@ -555,6 +555,12 @@ pub struct ExtractionDiagnostics {
     pub ocr_regions_rejected_low_confidence: u32,
     #[serde(default)]
     pub ocr_regions_deduplicated_against_native_text: u32,
+    /// Regions refused because the decode that produced them reached its
+    /// token cap without emitting an end-of-sequence token — a decode that
+    /// did not finish, counted apart from a decode that finished and was
+    /// simply wrong.
+    #[serde(default)]
+    pub ocr_regions_rejected_truncated: u32,
 
     // ── What was recognized, by kind ─────────────────────────────────────
     //
@@ -611,6 +617,20 @@ pub struct ExtractionDiagnostics {
     pub tables_accepted: u32,
     #[serde(default)]
     pub tables_rejected_malformed: u32,
+    /// Tables read from the structure model and refused because their first
+    /// row held no glyph, because a word inside their rectangle landed in no
+    /// cell, or because too much of the grid was blank.
+    ///
+    /// Three counters rather than one, for the same reason the kinds above are
+    /// counted apart: a grid shifted off the ink, a grid missing a column and
+    /// a grid that is mostly air are three different failures of the same
+    /// model, and one number covering them would answer none of them.
+    #[serde(default)]
+    pub tables_rejected_empty_header_row: u32,
+    #[serde(default)]
+    pub tables_rejected_unassigned_words: u32,
+    #[serde(default)]
+    pub tables_rejected_sparse: u32,
     #[serde(default)]
     pub charts_accepted: u32,
     #[serde(default)]
@@ -641,15 +661,24 @@ pub struct ExtractionDiagnostics {
     #[serde(default)]
     pub layout_pages_failed: u32,
     /// Areas the detector marked out that Wilkes routes to a recognizer, and
-    /// that cover at least one of the page's own lines. Every one of them is
-    /// rendered and read — there is no per-document cap, so this is also the
-    /// number of regions the recognizer was asked about.
+    /// that the page's reading has a place for. Every one of them is rendered
+    /// and read — there is no per-document cap, so this is also the number of
+    /// regions the recognizer was asked about.
     #[serde(default)]
     pub typeset_regions_found: u32,
+    /// Of those, the ones the page *drew* rather than set: no word of the text
+    /// layer lies under them, so they replace nothing and their reading is
+    /// inserted at the position the page's geometry gives them. A document
+    /// with many of these is one whose mathematics would otherwise be absent
+    /// from the reading altogether rather than merely flattened.
+    #[serde(default)]
+    pub typeset_regions_anchored: u32,
     /// Regions whose reading was admitted, and which therefore stand in the
-    /// canonical reading in place of the glyphs the page drew there. The
-    /// difference from `typeset_regions_found` is the regions where the page's
-    /// own glyphs were kept because the recognizer's answer was refused.
+    /// canonical reading in place of the glyphs the page drew there — or, for
+    /// an anchored region, at the place the page put it. The difference from
+    /// `typeset_regions_found` is the regions whose recognizer answer was
+    /// refused, where the page's own glyphs were kept and nothing was
+    /// inserted.
     #[serde(default)]
     pub typeset_regions_superseded_native_text: u32,
 
@@ -1153,6 +1182,35 @@ pub enum OcrAdmission {
     /// least two rows and two columns. A ragged table is a failed recognition
     /// wearing the shape of a result.
     RejectedMalformedTable,
+    /// The decode that produced this region reached its token cap without
+    /// emitting an end-of-sequence token.
+    ///
+    /// Not a heuristic and not a per-kind rule: a decoder stopped by a cap
+    /// rather than by finishing is not a reading, whatever the bytes it did
+    /// emit happen to look like. This is why it is checked before
+    /// [`Self::RejectedInvalidLatex`]'s own structural check — a truncated
+    /// formula that happens to close is still a decode that did not finish.
+    RejectedTruncated,
+    /// A table read from a structure model whose first row holds no glyph at
+    /// all.
+    ///
+    /// The header is the row every other row is read against, and a grid whose
+    /// first row is empty is one whose rows have been shifted off the ink —
+    /// the model proposed a band of cells above the table. The body may still
+    /// look plausible, which is exactly why this is refused rather than
+    /// admitted with a blank header row.
+    RejectedEmptyHeaderRow,
+    /// A table read from a structure model that left a word of the page
+    /// standing inside its own rectangle in no cell at all.
+    ///
+    /// The glyphs are certainly there — the page drew them, and the crop was
+    /// cut around them — so a word with nowhere to go is a cell the grid does
+    /// not have. Admitting it would put a table into the reading *in place of*
+    /// the page's own run while silently losing part of that run.
+    RejectedUnassignedWords,
+    /// A table read from a structure model where too much of the grid holds no
+    /// glyph. See `ocr::TABLE_MAX_EMPTY_CELL_NUMERATOR`.
+    RejectedSparseTable,
 }
 
 /// A semantic description of what an image shows, generated rather than read.
