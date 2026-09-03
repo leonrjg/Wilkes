@@ -701,17 +701,20 @@ export const ALL_RECOGNITION_ENGINES: RecognitionEngine[] = ["Onnx", "Candle", "
 /** What one recognizer is, and what choosing it would mean: what it costs to
  *  install, what confidence it admits a region at, and which kinds of region
  *  it produces under the task configuration Wilkes drives it with. */
-export type RecognizerRole = "page" | "formula";
+export type RecognizerRole = "page" | "formula" | "table";
 
 export interface RecognizerDescriptor {
   engine: RecognitionEngine;
   model_id: string;
-  /** Which of the two reading jobs this model does. A page reader transcribes
-   *  a whole page or picture; a formula reader reads one cropped expression
-   *  back as LaTeX and is spent only on the areas the detector marks out as
-   *  formulas. The engine picker offers `page` models only — the two are not
-   *  interchangeable, and choosing one for the other's job would read every
-   *  page of the library as a single failed expression. */
+  /** Which of the three reading jobs this model does. A page reader
+   *  transcribes a whole page or picture; a formula reader reads one cropped
+   *  expression back as LaTeX; a table reader answers the *grid* of one cropped
+   *  table and transcribes nothing at all, its cells being filled from the
+   *  page's own glyphs. The last two are spent only on the areas the detector
+   *  marks out for them. The engine picker offers `page` models only — the
+   *  roles are not interchangeable, and choosing one for another's job would
+   *  read every page of the library as a single failed expression or an empty
+   *  grid. */
   role: RecognizerRole;
   display_name: string;
   description: string;

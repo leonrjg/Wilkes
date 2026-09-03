@@ -74,9 +74,26 @@ const TEXIFY = {
   emits: ["formula"],
 };
 
+/// The third role. It transcribes nothing at all — it answers the grid and the
+/// cells are filled from the page's own glyphs — which is why it can no more be
+/// the page recognizer than the formula reader can.
+const SLANET = {
+  engine: "Onnx" as const,
+  model_id: "slanet-plus",
+  role: "table" as const,
+  display_name: "SLANet-plus",
+  description: "Reads the grid of a ruled table the page typesets.",
+  is_default: false,
+  is_engine_default: false,
+  is_cached: false,
+  footprint_bytes: 7_758_305,
+  admission_threshold: 0,
+  emits: ["table"],
+};
+
 const CATALOGUE: RecognizerCatalogue = {
   engines: ["Onnx", "Candle"],
-  models: [GRANITE, PADDLE, TEXIFY],
+  models: [GRANITE, PADDLE, TEXIFY, SLANET],
   detector: DETECTOR,
 };
 
@@ -355,6 +372,42 @@ describe("ImageAnalysisPanel", () => {
           .installImageRecognizer,
       ).toHaveBeenCalledWith(TEXIFY.engine, TEXIFY.model_id),
     );
+  });
+
+  /// The table reader is a catalogue row too, so the same install path serves
+  /// it. Its own section beside the formula reader's, because it runs
+  /// alongside the page reader rather than instead of one.
+  it("installs the table reader through the recognizer install", async () => {
+    panel(SETTINGS);
+
+    await screen.findByText(SLANET.display_name);
+    fireEvent.click(screen.getByRole("button", { name: /download table reader/i }));
+    await waitFor(() =>
+      expect(
+        (api as unknown as { installImageRecognizer: (e: string, m: string) => void })
+          .installImageRecognizer,
+      ).toHaveBeenCalledWith(SLANET.engine, SLANET.model_id),
+    );
+  });
+
+  /// Offered as the page recognizer it would answer an empty grid for every
+  /// page of the library, which afterwards is indistinguishable from a library
+  /// whose pictures hold no text.
+  it("never offers the table reader as the page recognizer", async () => {
+    panel(SETTINGS);
+
+    await screen.findByText(SLANET.display_name);
+    expect(screen.queryByText(SLANET.description)).toBeNull();
+  });
+
+  it("says nothing about installing a table reader that is already here", async () => {
+    withModel(SLANET.model_id, { is_cached: true });
+    panel(SETTINGS);
+
+    await screen.findByText(SLANET.display_name);
+    expect(
+      screen.queryByRole("button", { name: /download table reader/i }),
+    ).toBeNull();
   });
 
   /// A formula reader reads one cropped expression and emits a single

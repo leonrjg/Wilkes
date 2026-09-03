@@ -167,6 +167,7 @@ impl EmbedderInstaller for SBERTInstaller {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
@@ -189,6 +190,14 @@ impl EmbedderInstaller for SBERTInstaller {
                     }
                     WorkerEvent::Error(err) => {
                         return Err(anyhow::anyhow!("Worker error probing model: {}", err))
+                    }
+                    // Named rather than swallowed by the catch-all below: a
+                    // probe whose worker died would otherwise sit here until
+                    // the thirty-second timeout and then report a timeout,
+                    // which says the model was slow rather than that the
+                    // process is gone.
+                    WorkerEvent::Gone(detail) => {
+                        return Err(crate::worker::fault::WorkerFault::gone(detail))
                     }
                     WorkerEvent::Done => break,
                     _ => {}

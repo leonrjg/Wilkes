@@ -5,7 +5,16 @@ mod backend;
 pub(crate) mod mupdf;
 mod sanitize;
 /// Formulas and ruled tables the page draws rather than embeds.
-mod typeset;
+///
+/// `pub` for the three steps a probe must run rather than reimplement —
+/// [`typeset::render_page`], the detector's own rasterization;
+/// [`typeset::regions`] with the [`typeset::PageSurvey`] it claims against and
+/// the [`typeset::TypesetRegion`]s it yields, which is what decides the crops a
+/// recognizer is actually handed; and [`typeset::render`], which is those
+/// crops' own pixels. Everything else stays `pub(super)`: a probe that drew
+/// its own page, or claimed words by its own rule, would be measuring a
+/// pipeline nobody runs.
+pub mod typeset;
 
 use std::path::Path;
 use std::sync::Arc;

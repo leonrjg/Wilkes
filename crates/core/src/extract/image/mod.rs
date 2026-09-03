@@ -55,6 +55,9 @@ pub mod onnx_vlm;
 #[cfg(feature = "candle")]
 pub mod paddleocr_vl;
 pub mod serialize;
+/// Reading a table the page typesets: the grid from a structure model in the
+/// worker, the text from the page in the host.
+pub mod table_structure;
 #[cfg(feature = "recognize-onnx")]
 pub mod texify;
 #[cfg(all(feature = "recognize-vision", target_os = "macos"))]
@@ -100,16 +103,26 @@ pub struct RecognitionRequest {
     pub image_paths: Vec<std::path::PathBuf>,
 }
 
-/// One rendered page, staged for the layout detector in the worker.
+/// Every rendered page of one document, staged for the layout detector in the
+/// worker.
 ///
-/// One page rather than a document's worth. Detection is a quarter of a second
-/// a page against minutes an image for recognition, and the host discovers a
-/// page's typeset areas before it can decide what to render next — so batching
-/// here would mean rendering every page of a document up front and holding
-/// them, to save a hop that costs milliseconds.
+/// A document's pages go in one request, for the same reason a document's
+/// images do: **no worker is ever started inside a loop.** Asking page by page
+/// put the `Submit` inside the host's page loop, so killing the detector ended
+/// one page and the next iteration spawned a replacement — a cancel that a
+/// four-hundred-page book outran four hundred times over, reloading the graph
+/// each time. Detection really is a quarter of a second a page against minutes
+/// an image, so this is not a throughput batch; it is what makes the work
+/// killable. With one request the host waits in exactly one place, and killing
+/// the detector ends the wait.
+///
+/// The pages are still rendered in the host, by the same mupdf that reads
+/// their glyphs. What crosses is the loop, not the rasterizer.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct LayoutRequest {
-    pub image_path: std::path::PathBuf,
+    /// One PNG per page, in page order. The results come back in the same
+    /// order, one group of regions per entry.
+    pub image_paths: Vec<std::path::PathBuf>,
 }
 
 /// One [`LayoutRegion`] as it crosses the worker pipe.
@@ -278,18 +291,38 @@ pub trait LayoutModel: Send + Sync {
     /// rasterizes the page has no business knowing which model is behind this.
     fn input_side(&self) -> u32;
 
-    /// Mark out one rendered page. The render must be the size this detector
-    /// declares; it is not this method's job to resize a page for a model that
-    /// was trained on a particular one.
-    fn detect(&self, page: &image::RgbImage) -> anyhow::Result<Vec<LayoutRegion>>;
+    /// Mark out a whole document, returning one group of regions per page.
+    ///
+    /// A document at a time rather than a page at a time, because a detector
+    /// reached through the worker is *started* by the call: a per-page method
+    /// puts that start inside the caller's page loop, where a killed worker is
+    /// answered by a fresh one on the next iteration. The implementations loop
+    /// the pages themselves, next to the resident graph, where a kill ends the
+    /// loop. See [`LayoutRequest`].
+    ///
+    /// `render` is pulled once per page and its result is not held: a page at
+    /// 1600 square is nearly eight megabytes, and a book's worth of them in
+    /// memory at once would be gigabytes held to avoid writing them out one at
+    /// a time. Each render must be the size this detector declares — it is not
+    /// this method's job to resize a page for a model trained on a particular
+    /// one. A page that will not rasterize is the caller's to log, and comes
+    /// back with no regions, exactly as it did when it was detected on
+    /// individually.
+    ///
+    /// The result has one entry per `page_count`, in page order.
+    fn detect_document(
+        &self,
+        page_count: usize,
+        render: &mut dyn FnMut(usize) -> anyhow::Result<image::RgbImage>,
+    ) -> anyhow::Result<Vec<Vec<LayoutRegion>>>;
 
     /// Let go of whatever this keeps resident, without disabling it.
     ///
     /// The same contract as [`OcrEngine::release`] and for the same reason: an
     /// index build detects on every page of the corpus in one pass and then
     /// embeds for as long again, and a detection graph resident through a pass
-    /// with no pages for it is megabytes held to save a load. A later `detect`
-    /// works exactly as before, at the cost of that load.
+    /// with no pages for it is megabytes held to save a load. A later
+    /// `detect_document` works exactly as before, at the cost of that load.
     fn release(&self);
 }
 
@@ -368,15 +401,21 @@ pub struct NativeTextOnPage {
     pub bbox: BoundingBox,
 }
 
-/// Which of the two recognizers a region goes to.
+/// Which reader a region goes to.
 ///
-/// Not a fallback pair. A formula with no formula reader is a misconfiguration
-/// and is recorded as one — sending it to the page reader instead would be a
-/// second way to read a formula, producing a reading nobody chose and no
-/// recipe describes.
+/// Not a fallback set. A formula or a table read by the page reader because
+/// its own reader is absent is a *configured* outcome, named in
+/// [`NativeImageAnalyzer::identity`] and warned about when the analyzer was
+/// built — never a silent second attempt after the first failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Route {
     Formula,
+    /// A table the page typesets, read as a grid by the structure model and
+    /// filled from the page's own glyphs by this process. Charts do not come
+    /// here: there is a text layer under a ruled table and there is not one
+    /// under a plotted curve, so a chart goes to the page reader as it always
+    /// has.
+    Table,
     Page,
 }
 
@@ -399,6 +438,19 @@ impl AnalysisContext {
         Self {
             native_text: by_page,
         }
+    }
+
+    /// Every word the page draws on `page`, in the order the reading takes
+    /// them, with the text as the document set it.
+    ///
+    /// The comparison form below folds case and strips punctuation, which is
+    /// right for "does the page already say this" and wrong for "what does this
+    /// cell contain" — a table filled from the folded form would put
+    /// `knowledge base` into the reading where the page set `Knowledge base.`.
+    /// So the raw words are handed out here, and the folding stays where the
+    /// question that needs it is asked.
+    pub fn words_on_page(&self, page: u32) -> &[NativeTextOnPage] {
+        self.native_text.get(&page).map_or(&[], Vec::as_slice)
     }
 
     /// The words the page draws inside `bbox`, joined in reading order and
@@ -537,12 +589,15 @@ pub fn build_analyzer(
 
     let mut analyzer = NativeImageAnalyzer::new(recognizer, describer, settings.scope, layout);
     if let Some(formula) = attach_formula_reader(
-        recognizers,
+        recognizers.clone(),
         model_dir,
         &scratch,
         settings.device.as_deref().unwrap_or("auto"),
     )? {
         analyzer = analyzer.with_formula_reader(formula);
+    }
+    if let Some(table) = attach_table_reader(recognizers, model_dir, &scratch)? {
+        analyzer = analyzer.with_table_reader(table);
     }
     Ok(Some(Arc::new(
         analyzer.with_cache(cache::AnnotationCache::open(cache_dir)?),
@@ -593,6 +648,48 @@ fn attach_formula_reader(
     ))
 }
 
+/// Address the reader for the grid of a typeset table, or `None` when this
+/// installation has none.
+///
+/// Optional and found by role, exactly as the formula reader is. Absent, the
+/// areas the detector calls tables go to the page reader — which is what they
+/// did before this model existed, and what it costs is stated here because it
+/// cannot be inferred from the reading afterwards: measured on one 168-page
+/// textbook, the page reader spent 411.7 s on 56 table crops and 35 of them
+/// came back as prose that admission threw away against the page's own glyphs.
+///
+/// No device: the graph runs on ONNX Runtime's CPU provider, the only one it
+/// was measured on. Attaching is cheap and loads nothing.
+#[cfg(feature = "candle")]
+fn attach_table_reader(
+    recognizers: crate::worker::manager::WorkerManager,
+    model_dir: &std::path::Path,
+    scratch: &std::path::Path,
+) -> anyhow::Result<Option<Box<dyn table_structure::TableStructure>>> {
+    let Some(model) = dispatch::table_model(model_dir) else {
+        tracing::info!("this build ships no table structure model");
+        return Ok(None);
+    };
+    if !model.is_cached {
+        tracing::warn!(
+            "the table structure model '{}' is not installed; the areas the detector marks \
+             out as tables will go to the page recognizer instead",
+            model.model_id
+        );
+        return Ok(None);
+    }
+    Ok(Some(
+        table_structure::attach(
+            recognizers,
+            model.engine,
+            &model.model_id,
+            model_dir.to_path_buf(),
+            scratch.to_path_buf(),
+        )
+        .context("could not address the table structure model")?,
+    ))
+}
+
 /// Address the layout detector, or `None` when this installation has none.
 ///
 /// Optional, like the formula reader and for the same reason: an installation
@@ -621,12 +718,8 @@ fn attach_layout_detector(
             return Ok(None);
         }
         Ok(Some(
-            worker_layout::attach(
-                recognizers,
-                model_dir.to_path_buf(),
-                scratch.to_path_buf(),
-            )
-            .context("could not address the layout detector")?,
+            worker_layout::attach(recognizers, model_dir.to_path_buf(), scratch.to_path_buf())
+                .context("could not address the layout detector")?,
         ))
     }
     #[cfg(not(feature = "recognize-onnx"))]
@@ -777,6 +870,17 @@ pub struct NativeImageAnalyzer {
     /// goes to [`texify`] and everything else to the page reader, and both are
     /// in the identity because both decide what a reading says.
     formula: Option<Box<dyn OcrEngine>>,
+    /// The reader for the grid of a table the page typesets, which is not a
+    /// recognizer at all: it returns geometry, and the cells are filled from
+    /// the page's own text layer by this process.
+    ///
+    /// **The invariant it holds: a typeset table's structure comes from the
+    /// structure model and its text from the page. No model transcribes glyphs
+    /// the page already holds.** Measured on one 168-page textbook, the page
+    /// reader spent 411.7 s on 56 table crops to admit 21 of them; the
+    /// structure model spends 23 ms a crop and the page's own glyphs are
+    /// already correct. In the identity because it decides what a reading says.
+    table: Option<Box<dyn table_structure::TableStructure>>,
 }
 
 impl NativeImageAnalyzer {
@@ -796,6 +900,7 @@ impl NativeImageAnalyzer {
             scope,
             layout,
             formula: None,
+            table: None,
         }
     }
 
@@ -808,6 +913,18 @@ impl NativeImageAnalyzer {
     /// exactly when it supplies a detector.
     pub fn with_formula_reader(mut self, formula: Box<dyn OcrEngine>) -> Self {
         self.formula = Some(formula);
+        self
+    }
+
+    /// Read the areas the detector called tables as a grid with `table`,
+    /// filling its cells from the page's own glyphs, instead of transcribing
+    /// them with the page reader.
+    ///
+    /// A builder step for the same reason [`Self::with_formula_reader`] is: a
+    /// configuration with no detector marks out no tables and has nothing for
+    /// this to read.
+    pub fn with_table_reader(mut self, table: Box<dyn table_structure::TableStructure>) -> Self {
+        self.table = Some(table);
         self
     }
 
@@ -829,6 +946,17 @@ impl NativeImageAnalyzer {
             (RegionOrigin::Typeset, Some(RegionKind::Formula)) if self.formula.is_some() => {
                 Route::Formula
             }
+            // Typeset only. An embedded raster the detector called a table has
+            // no text layer under it to fill a grid from, so the structure
+            // model would answer a grid of empty cells; it goes to the page
+            // reader, which transcribes.
+            //
+            // A *chart* goes to the page reader too, and always did. The same
+            // reason: what a plotted curve says is not written under it as
+            // glyphs, so there is nothing for a grid to hold.
+            (RegionOrigin::Typeset, Some(RegionKind::Table)) if self.table.is_some() => {
+                Route::Table
+            }
             _ => Route::Page,
         }
     }
@@ -838,6 +966,87 @@ impl NativeImageAnalyzer {
     pub fn with_cache(mut self, cache: cache::AnnotationCache) -> Self {
         self.cache = Some(cache);
         self
+    }
+
+    /// What the reader for `route` is, for the log. Every route has one and
+    /// the string is the reader's own, so a line in the log names the model
+    /// that produced the regions under it rather than a label kept beside it.
+    fn reader_identity(&self, route: Route) -> String {
+        match route {
+            Route::Formula => self
+                .formula
+                .as_ref()
+                .expect("route() says Formula only when a formula reader is attached")
+                .identity(),
+            Route::Table => self
+                .table
+                .as_ref()
+                .expect("route() says Table only when a table reader is attached")
+                .identity(),
+            Route::Page => self.ocr.identity(),
+        }
+    }
+
+    /// Turn one crop's grid into the region that will be placed and admitted,
+    /// by putting the page's own words into its cells.
+    ///
+    /// This is the half of the table path that runs in the host, and it runs
+    /// here because the host is what holds the page: `found.bbox` is the page
+    /// rectangle the crop's canvas covers, and `context` holds every word the
+    /// page draws with the box it drew it in. Neither is inference, and neither
+    /// ever crossed the pipe — **no model transcribes glyphs the page already
+    /// holds.**
+    ///
+    /// One region covering the whole crop, exactly as the formula reader
+    /// produces: this model does not delimit within the crop, and inventing a
+    /// tighter polygon would be a claim about where the ink is that nothing
+    /// measured.
+    fn fill_table(
+        &self,
+        found: &DiscoveredImage,
+        grid: table_structure::TableGrid,
+        context: &AnalysisContext,
+    ) -> std::result::Result<ImageRecognition, String> {
+        // No grid at all is a real answer — the model was shown a crop and
+        // found no table in it — and it is the same answer a page reader gives
+        // for a picture with no text: nothing to read, counted rather than
+        // recorded as a failure. The page's own glyph run stays.
+        if grid.rows == 0 || grid.cols == 0 {
+            return Ok(ImageRecognition {
+                regions: Vec::new(),
+                unroutable: 0,
+                not_text: 1,
+            });
+        }
+        let filled =
+            table_structure::fill_from_page(&grid, &found.bbox, context.words_on_page(found.page))
+                .map_err(|error| format!("{error:#}"))?;
+        debug!(
+            "filled table {}: {}x{} from {} word(s) of page {}, {} empty cell(s), \
+             {} unassigned",
+            found.id,
+            grid.rows,
+            grid.cols,
+            filled.summary.words_in_box,
+            found.page,
+            filled.summary.empty_cells,
+            filled.summary.unassigned_words,
+        );
+        Ok(ImageRecognition::from_regions(vec![ocr::SpottedRegion {
+            kind: RegionKind::Table,
+            text: filled.markdown,
+            // The structure decode's own mean per-step maximum. Carried so it
+            // is answerable afterwards; nothing admits a table on it.
+            confidence: grid.score,
+            quad: [
+                crate::types::Point { x: 0.0, y: 0.0 },
+                crate::types::Point { x: 1.0, y: 0.0 },
+                crate::types::Point { x: 1.0, y: 1.0 },
+                crate::types::Point { x: 0.0, y: 1.0 },
+            ],
+            truncated: grid.truncated,
+            structure: Some(filled.summary),
+        }]))
     }
 
     fn cache_key(&self, image: &ExtractedImage) -> cache::AnnotationKey {
@@ -875,6 +1084,14 @@ impl ImageAnalyzer for NativeImageAnalyzer {
         ) + &self.formula.as_ref().map_or_else(
             || "+no-formula-reader".to_string(),
             |f| format!("+{}", f.identity()),
+        ) + &self.table.as_ref().map_or_else(
+            // Both halves of the answer are in here: with no table reader a
+            // typeset table goes to the page reader, and that is a different
+            // reading of the same document. So a library read one way is
+            // re-read when the other is installed — which is what this string
+            // is for, and it is what the annotation cache key follows.
+            || "+no-table-reader".to_string(),
+            |t| format!("+{}", t.identity()),
         )
     }
 
@@ -893,6 +1110,9 @@ impl ImageAnalyzer for NativeImageAnalyzer {
         self.ocr.release();
         if let Some(formula) = &self.formula {
             formula.release();
+        }
+        if let Some(table) = &self.table {
+            table.release();
         }
         if let Some(layout) = &self.layout {
             layout.release();
@@ -980,10 +1200,9 @@ impl ImageAnalyzer for NativeImageAnalyzer {
         // ask again for the next image, spawning a replacement. The
         // recognizer's own loop runs inside the process that can be killed.
         //
-        // Two calls rather than one because there are two recognizers, and a
-        // batch is the unit that crosses into one of them. They are kept in
-        // separate lists rather than interleaved so neither model is loaded to
-        // answer nothing.
+        // One call per reader rather than one overall, because a batch is the
+        // unit that crosses into one of them. They are kept in separate lists
+        // rather than interleaved so no model is loaded to answer nothing.
         let mut routed: Vec<(usize, Route)> = Vec::with_capacity(pending.len());
         for index in &pending {
             routed.push((*index, self.route(&discovered[*index])));
@@ -991,7 +1210,18 @@ impl ImageAnalyzer for NativeImageAnalyzer {
 
         let mut read: HashMap<usize, std::result::Result<ImageRecognition, String>> =
             HashMap::with_capacity(routed.len());
-        for route in [Route::Formula, Route::Page] {
+        // Set when a group's recognizer turned out to be gone. The routes are
+        // a loop over two recognizers that share one worker process, so
+        // carrying on to the second after the first found the process dead is
+        // what *starts a replacement* — a full model load, and a cancel the
+        // document outruns once more. The loop ends instead, and the images
+        // the abandoned route would have covered are answered below with the
+        // same reason.
+        let mut worker_gone: Option<String> = None;
+        for route in [Route::Formula, Route::Table, Route::Page] {
+            if worker_gone.is_some() {
+                break;
+            }
             let group: Vec<usize> = routed
                 .iter()
                 .filter(|(_, r)| *r == route)
@@ -1000,16 +1230,6 @@ impl ImageAnalyzer for NativeImageAnalyzer {
             if group.is_empty() {
                 continue;
             }
-            // `route` only says `Formula` when there is a formula reader, so
-            // this cannot be `None`. Stated as an expectation rather than
-            // handled, because a second answer here would be a second router.
-            let engine: &dyn OcrEngine = match route {
-                Route::Formula => self
-                    .formula
-                    .as_deref()
-                    .expect("route() says Formula only when a formula reader is attached"),
-                Route::Page => self.ocr.as_ref(),
-            };
 
             let batch: Vec<image::RgbImage> = group
                 .iter()
@@ -1027,37 +1247,93 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                 batch.len(),
                 match route {
                     Route::Formula => "formula(s)",
+                    Route::Table => "typeset table(s)",
                     Route::Page => "image(s)",
                 },
-                engine.identity()
+                self.reader_identity(route)
             );
             let started = std::time::Instant::now();
-            let spotted = engine.spot_batch(&batch);
+            // One shape for every route, so the failure handling below is one
+            // piece of code: the outer result is the *call*, which fails as a
+            // batch, and the inner one is this crop's own outcome. Only the
+            // table route can have an inner failure — filling a grid from the
+            // page can find the page's word list and its boxes disagreeing,
+            // which is that crop's error and not the batch's.
+            let outcome: anyhow::Result<Vec<std::result::Result<ImageRecognition, String>>> =
+                match route {
+                    Route::Table => self
+                        .table
+                        .as_deref()
+                        .expect("route() says Table only when a table reader is attached")
+                        .read_batch(&batch)
+                        .map(|grids| {
+                            group
+                                .iter()
+                                .zip(grids)
+                                .map(|(index, grid)| {
+                                    self.fill_table(&discovered[*index], grid, context)
+                                })
+                                .collect()
+                        }),
+                    // `route` only says `Formula` when there is a formula
+                    // reader, so this cannot be `None`. Stated as an
+                    // expectation rather than handled, because a second answer
+                    // here would be a second router.
+                    Route::Formula => self
+                        .formula
+                        .as_deref()
+                        .expect("route() says Formula only when a formula reader is attached")
+                        .spot_batch(&batch)
+                        .map(|spotted| spotted.into_iter().map(Ok).collect()),
+                    Route::Page => self
+                        .ocr
+                        .spot_batch(&batch)
+                        .map(|spotted| spotted.into_iter().map(Ok).collect()),
+                };
             drop(batch);
 
-            // A batch fails as a batch: one recognizer, one request, one
-            // outcome. Every image it covered is a partial result carrying the
-            // reason, not a complete analysis that happened to find nothing —
-            // a killed recognizer must not read as a document whose figures
-            // have no text in them.
-            match spotted {
+            // A batch fails as a batch: one reader, one request, one outcome.
+            // Every image it covered is a partial result carrying the reason,
+            // not a complete analysis that happened to find nothing — a killed
+            // recognizer must not read as a document whose figures have no text
+            // in them.
+            match outcome {
                 Ok(spotted) => {
                     info!(
                         "recognized {} region(s) in {:.1}s",
-                        spotted.len(),
+                        spotted.iter().filter(|one| one.is_ok()).count(),
                         started.elapsed().as_secs_f32()
                     );
                     for (index, one) in group.into_iter().zip(spotted) {
-                        read.insert(index, Ok(one));
+                        read.insert(index, one);
                     }
                 }
                 Err(error) => {
                     let reason = format!("{error:#}");
-                    warn!("recognition failed for {} image(s): {reason}", group.len());
+                    if crate::worker::fault::is_worker_gone(&error) {
+                        warn!(
+                            "recognition abandoned for {} image(s): the reader is gone \
+                             ({reason})",
+                            group.len()
+                        );
+                        worker_gone = Some(reason.clone());
+                    } else {
+                        warn!("recognition failed for {} image(s): {reason}", group.len());
+                    }
                     for index in group {
                         read.insert(index, Err(reason.clone()));
                     }
                 }
+            }
+        }
+
+        // The route that never ran. Its images are answered rather than left
+        // absent: a partial result carrying the reason, which is what a killed
+        // recognizer's images are, and what the reading below expects to find
+        // for every image it routed.
+        if let Some(reason) = worker_gone {
+            for (index, _) in &routed {
+                read.entry(*index).or_insert_with(|| Err(reason.clone()));
             }
         }
 
@@ -1078,6 +1354,11 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                     .formula
                     .as_ref()
                     .expect("route() says Formula only when a formula reader is attached")
+                    .admission_threshold(),
+                Route::Table => self
+                    .table
+                    .as_ref()
+                    .expect("route() says Table only when a table reader is attached")
                     .admission_threshold(),
                 Route::Page => self.ocr.admission_threshold(),
             };
@@ -1185,6 +1466,14 @@ fn count_regions(image: &ExtractedImage, diagnostics: &mut ExtractionDiagnostics
                 RegionKind::Chart => diagnostics.charts_rejected_malformed += 1,
                 _ => diagnostics.tables_rejected_malformed += 1,
             },
+            OcrAdmission::RejectedTruncated => diagnostics.ocr_regions_rejected_truncated += 1,
+            OcrAdmission::RejectedEmptyHeaderRow => {
+                diagnostics.tables_rejected_empty_header_row += 1
+            }
+            OcrAdmission::RejectedUnassignedWords => {
+                diagnostics.tables_rejected_unassigned_words += 1
+            }
+            OcrAdmission::RejectedSparseTable => diagnostics.tables_rejected_sparse += 1,
         }
 
         if region.admission == OcrAdmission::Accepted {
@@ -1282,8 +1571,9 @@ pub fn analyze(
 
     debug!(
         "images: {} found, {} analyzed, {} skipped, {} not read, {} ocr ok, {} ocr failed, \
-         {} regions accepted, {} rejected, {} deduplicated; \
-         kinds: {} text, {} formula ({} invalid), {} table ({} malformed), \
+         {} regions accepted, {} rejected, {} deduplicated, {} truncated; \
+         kinds: {} text, {} formula ({} invalid), \
+         {} table ({} malformed, {} empty header row, {} unassigned words, {} sparse), \
          {} chart ({} malformed), {} code, {} not text, {} unroutable",
         diagnostics.native_images_found,
         diagnostics.native_images_analyzed,
@@ -1294,11 +1584,15 @@ pub fn analyze(
         diagnostics.ocr_regions_accepted,
         diagnostics.ocr_regions_rejected_low_confidence,
         diagnostics.ocr_regions_deduplicated_against_native_text,
+        diagnostics.ocr_regions_rejected_truncated,
         diagnostics.regions_routed_text,
         diagnostics.regions_routed_formula,
         diagnostics.formulas_rejected_invalid_latex,
         diagnostics.regions_routed_table,
         diagnostics.tables_rejected_malformed,
+        diagnostics.tables_rejected_empty_header_row,
+        diagnostics.tables_rejected_unassigned_words,
+        diagnostics.tables_rejected_sparse,
         diagnostics.regions_routed_chart,
         diagnostics.charts_rejected_malformed,
         diagnostics.regions_routed_code,
@@ -1530,7 +1824,11 @@ mod tests {
             fn identity(&self) -> String {
                 self.0.to_string()
             }
-            fn detect(&self, _page: &image::RgbImage) -> anyhow::Result<Vec<LayoutRegion>> {
+            fn detect_document(
+                &self,
+                _page_count: usize,
+                _render: &mut dyn FnMut(usize) -> anyhow::Result<image::RgbImage>,
+            ) -> anyhow::Result<Vec<Vec<LayoutRegion>>> {
                 unreachable!("identity only")
             }
         }
@@ -1620,6 +1918,126 @@ mod tests {
         };
         assert_ne!(detected(Some("detector-v1")), detected(Some("detector-v2")));
         assert_ne!(detected(Some("detector-v1")), detected(None), "no detector");
+
+        // And so is the table reader. With one attached, a typeset table is a
+        // grid filled from the page's own glyphs; without one it is the page
+        // reader's transcription of a picture of that table. Two readings, so
+        // two recipes — which is what re-reads a library when the model is
+        // installed, and what the annotation cache key follows.
+        let tabled = |table: Option<&'static str>| {
+            let analyzer = NativeImageAnalyzer::new(
+                Box::new(Recognizer("weights-a", 0.6)),
+                Some(Box::new(Describer("prompt-v1"))),
+                ImageScope::TypesetAndEmbedded,
+                Some(Box::new(Detector("detector-v1"))),
+            );
+            match table {
+                Some(name) => analyzer.with_table_reader(Box::new(TableReader(name))),
+                None => analyzer,
+            }
+            .identity()
+        };
+        assert_ne!(tabled(Some("slanet-a")), tabled(Some("slanet-b")), "table");
+        assert_ne!(tabled(Some("slanet-a")), tabled(None), "no table reader");
+    }
+
+    /// A table reader that reads nothing, for the routing and identity tests.
+    struct TableReader(&'static str);
+
+    impl table_structure::TableStructure for TableReader {
+        fn identity(&self) -> String {
+            self.0.to_string()
+        }
+        fn read_batch(
+            &self,
+            _images: &[image::RgbImage],
+        ) -> anyhow::Result<Vec<table_structure::TableGrid>> {
+            unreachable!("routing and identity only")
+        }
+        fn release(&self) {}
+    }
+
+    /// A page reader that reads nothing, for the routing test.
+    struct SilentReader;
+
+    impl ocr::OcrEngine for SilentReader {
+        fn identity(&self) -> String {
+            "silent".to_string()
+        }
+        fn admission_threshold(&self) -> f32 {
+            0.5
+        }
+        fn spot_batch(&self, images: &[image::RgbImage]) -> anyhow::Result<Vec<ImageRecognition>> {
+            Ok(images.iter().map(|_| ImageRecognition::default()).collect())
+        }
+    }
+
+    /// Which reader a region goes to, over every combination that decides it.
+    ///
+    /// The four claims: a typeset table goes to the table reader when one is
+    /// attached and to the page reader when none is; a *chart* goes to the page
+    /// reader either way, because there is no text layer under a plotted curve
+    /// for a grid to hold; and an embedded raster the detector called a table
+    /// goes to the page reader, because there is no text layer under it either.
+    #[test]
+    fn a_typeset_table_goes_to_the_table_reader_and_a_chart_never_does() {
+        let found = |origin, kind| DiscoveredImage {
+            id: "p1-v0".to_string(),
+            page: 1,
+            origin,
+            bbox: BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            transform: ImageTransform {
+                a: 10.0,
+                b: 0.0,
+                c: 0.0,
+                d: 10.0,
+                e: 0.0,
+                f: 0.0,
+            },
+            decoded: None,
+            rejected: None,
+            withheld_by_scope: false,
+            kind: Some(kind),
+        };
+        let bare = NativeImageAnalyzer::new(
+            Box::new(SilentReader),
+            None,
+            ImageScope::TypesetAndEmbedded,
+            None,
+        );
+        let with_table = NativeImageAnalyzer::new(
+            Box::new(SilentReader),
+            None,
+            ImageScope::TypesetAndEmbedded,
+            None,
+        )
+        .with_table_reader(Box::new(TableReader("slanet")));
+
+        assert_eq!(
+            with_table.route(&found(RegionOrigin::Typeset, RegionKind::Table)),
+            Route::Table
+        );
+        assert_eq!(
+            bare.route(&found(RegionOrigin::Typeset, RegionKind::Table)),
+            Route::Page,
+            "with no table reader a typeset table goes where it always did"
+        );
+        assert_eq!(
+            with_table.route(&found(RegionOrigin::Typeset, RegionKind::Chart)),
+            Route::Page,
+            "a chart draws its values rather than setting them; there is nothing for a grid \
+             to hold"
+        );
+        assert_eq!(
+            with_table.route(&found(RegionOrigin::Embedded, RegionKind::Table)),
+            Route::Page,
+            "an embedded raster has no text layer under it to fill a grid from"
+        );
     }
     use super::*;
 
@@ -1675,5 +2093,58 @@ mod tests {
     #[test]
     fn a_short_pixmap_is_an_error_rather_than_a_partial_image() {
         assert!(decode(4, 4, 3, 12, &[0; 8]).is_err());
+    }
+
+    /// A region refused for being truncated is counted under its own reason —
+    /// not folded into low-confidence or malformed-table, which are different
+    /// facts about a different kind of failure.
+    #[test]
+    fn a_truncated_rejection_is_counted_in_diagnostics() {
+        let mut diagnostics = ExtractionDiagnostics::default();
+        let image = ExtractedImage {
+            id: "p1-i1".to_string(),
+            page: 1,
+            origin: RegionOrigin::Embedded,
+            bbox: BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            transform: ImageTransform {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                e: 0.0,
+                f: 0.0,
+            },
+            pixel_width: 10,
+            pixel_height: 10,
+            image_sha256: "digest".to_string(),
+            reading_range: None,
+            reading_anchor: None,
+            ocr_regions: vec![crate::types::ImageOcrRegion {
+                kind: RegionKind::Formula,
+                text: "$$\\mathrm{~j~}".to_string(),
+                confidence: 0.99,
+                polygon_within_image: Vec::new(),
+                page_polygon: Vec::new(),
+                admission: OcrAdmission::RejectedTruncated,
+            }],
+            description: None,
+            analyzer_identity: "test".to_string(),
+            status: ImageAnalysisStatus::Complete,
+        };
+
+        count_regions(&image, &mut diagnostics);
+
+        assert_eq!(diagnostics.ocr_regions_rejected_truncated, 1);
+        assert_eq!(diagnostics.regions_routed_formula, 1);
+        assert_eq!(
+            diagnostics.formulas_accepted, 0,
+            "a truncated reading never counts as an accepted formula"
+        );
+        assert_eq!(diagnostics.formulas_rejected_invalid_latex, 0);
     }
 }

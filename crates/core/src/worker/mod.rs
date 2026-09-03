@@ -1,4 +1,5 @@
 pub mod embedder;
+pub mod fault;
 pub mod ipc;
 pub mod manager;
 mod process;

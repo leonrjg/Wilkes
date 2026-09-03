@@ -3264,19 +3264,37 @@ mod tests {
         assert_eq!(idx.status().total_chunks, 0);
     }
 
+    /// Fatality is a property of the error's type, not of how its message
+    /// happens to be worded. The predicate used to match message prefixes, so
+    /// a reworded log line could quietly demote a dead worker to a skipped
+    /// batch — and a skipped batch is followed by another submit, which with
+    /// no process left starts one.
     #[test]
     fn test_is_fatal_embedder_error_detects_worker_failures() {
-        assert!(SemanticIndex::is_fatal_embedder_error(&anyhow::anyhow!(
-            "Worker error: failed to spawn"
+        use crate::worker::fault::WorkerFault;
+        use anyhow::Context;
+
+        assert!(SemanticIndex::is_fatal_embedder_error(&WorkerFault::gone(
+            "worker process closed stdout unexpectedly"
         )));
-        assert!(SemanticIndex::is_fatal_embedder_error(&anyhow::anyhow!(
-            "Failed to send command to manager: closed"
-        )));
-        assert!(SemanticIndex::is_fatal_embedder_error(&anyhow::anyhow!(
-            "Worker finished without returning embeddings"
-        )));
+        assert!(SemanticIndex::is_fatal_embedder_error(
+            &WorkerFault::reported("could not load the model")
+        ));
+        // Recognised through whatever context the layers in between stacked
+        // on it, because by the time the build sees it there is always some.
+        assert!(SemanticIndex::is_fatal_embedder_error(
+            &Err::<(), _>(WorkerFault::gone("closed stdout"))
+                .context("embedding a batch of 64 chunks")
+                .unwrap_err()
+        ));
+        // A failure of this batch, not of the embedder: the next batch is
+        // worth attempting and no process has to be started to attempt it.
         assert!(!SemanticIndex::is_fatal_embedder_error(&anyhow::anyhow!(
             "dimension mismatch"
+        )));
+        // A message that reads like the old prefixes is not, by itself, fatal.
+        assert!(!SemanticIndex::is_fatal_embedder_error(&anyhow::anyhow!(
+            "Worker error: something a local embedder said"
         )));
     }
 
@@ -3527,11 +3545,25 @@ pub struct SemanticIndex {
 }
 
 impl SemanticIndex {
+    /// Whether this failure ends the build rather than skipping a batch.
+    ///
+    /// A dead worker does. The batch loop below is the one place in the build
+    /// that submits repeatedly, and a batch it skipped would be followed by
+    /// another submit — which, with no process left, *starts one*. That is a
+    /// worker started inside a loop, and it is how a cancel comes to need one
+    /// kill per batch instead of one.
+    ///
+    /// Asked of the error's own type. It used to be asked by matching the
+    /// first characters of the message, which meant every rewording of an
+    /// unrelated log line was a chance to turn a fatal error into a skipped
+    /// batch, silently.
+    ///
+    /// Both fault kinds, not just a gone worker. A worker that answered with a
+    /// failure will answer the next batch the same way — a model that would
+    /// not load does not load on the second attempt either — and a build that
+    /// skipped every batch would finish reporting success over an empty index.
     fn is_fatal_embedder_error(err: &anyhow::Error) -> bool {
-        let msg = err.to_string();
-        msg.starts_with("Worker error:")
-            || msg.starts_with("Failed to send command to manager:")
-            || msg.starts_with("Worker finished without returning embeddings")
+        crate::worker::fault::is_worker_fault(err)
     }
 
     pub fn embedding_metadata(&self) -> anyhow::Result<IndexEmbeddingMetadata> {

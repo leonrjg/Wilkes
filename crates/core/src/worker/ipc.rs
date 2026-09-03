@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use crate::extract::image::dispatch::RecognitionEngine;
 use crate::extract::image::ocr::ImageRecognition;
-use crate::extract::image::{LayoutRequest, WireLayoutRegion};
+use crate::extract::image::table_structure::{TableGrid, TableStructureRequest};
 use crate::extract::image::RecognitionRequest;
+use crate::extract::image::{LayoutRequest, WireLayoutRegion};
 use crate::generate::{
     GenerationEngine, GenerationRequest, GenerationRuntime, GenerationTimings, StopReason,
 };
@@ -24,6 +25,12 @@ pub enum WorkerRole {
     /// reads documents, because a document alternates between them page by
     /// page and a process per model would restart on every alternation.
     Layout(RecognitionEngine),
+    /// Reading the grid of a table the page typesets. Its [`WorkerKind`] is
+    /// `Recognize` for the same reason [`WorkerRole::Layout`]'s is: a document
+    /// alternates between the detector, the page reader, the formula reader and
+    /// this one crop by crop, and a process per model would restart on every
+    /// alternation.
+    Table(RecognitionEngine),
 }
 
 /// What a *manager* is for, without the engine. A manager supervises one role
@@ -70,7 +77,9 @@ impl WorkerRole {
         match self {
             WorkerRole::Embed(_) => WorkerKind::Embed,
             WorkerRole::Generate(_) => WorkerKind::Generate,
-            WorkerRole::Recognize(_) | WorkerRole::Layout(_) => WorkerKind::Recognize,
+            WorkerRole::Recognize(_) | WorkerRole::Layout(_) | WorkerRole::Table(_) => {
+                WorkerKind::Recognize
+            }
         }
     }
 
@@ -83,7 +92,9 @@ impl WorkerRole {
         match self {
             WorkerRole::Embed(engine) => engine.as_str(),
             WorkerRole::Generate(engine) => engine.as_str(),
-            WorkerRole::Recognize(engine) | WorkerRole::Layout(engine) => engine.as_str(),
+            WorkerRole::Recognize(engine)
+            | WorkerRole::Layout(engine)
+            | WorkerRole::Table(engine) => engine.as_str(),
         }
     }
 
@@ -101,14 +112,19 @@ impl WorkerRole {
                 WorkerProcessKind::WorkerBin
             }
             WorkerRole::Generate(_) => WorkerProcessKind::WorkerBin,
-            WorkerRole::Recognize(_) | WorkerRole::Layout(_) => WorkerProcessKind::WorkerBin,
+            WorkerRole::Recognize(_) | WorkerRole::Layout(_) | WorkerRole::Table(_) => {
+                WorkerProcessKind::WorkerBin
+            }
         }
     }
 
     pub fn embedding_engine(&self) -> Option<EmbeddingEngine> {
         match self {
             WorkerRole::Embed(engine) => Some(*engine),
-            WorkerRole::Generate(_) | WorkerRole::Recognize(_) | WorkerRole::Layout(_) => None,
+            WorkerRole::Generate(_)
+            | WorkerRole::Recognize(_)
+            | WorkerRole::Layout(_)
+            | WorkerRole::Table(_) => None,
         }
     }
 }
@@ -119,6 +135,7 @@ enum TaggedRole {
     Generate(GenerationEngine),
     Recognize(RecognitionEngine),
     Layout(RecognitionEngine),
+    Table(RecognitionEngine),
 }
 
 /// Accepts both the tagged form this version writes and the bare engine string
@@ -138,6 +155,7 @@ impl serde::Serialize for WorkerRole {
             WorkerRole::Generate(engine) => TaggedRole::Generate(*engine),
             WorkerRole::Recognize(engine) => TaggedRole::Recognize(*engine),
             WorkerRole::Layout(engine) => TaggedRole::Layout(*engine),
+            WorkerRole::Table(engine) => TaggedRole::Table(*engine),
         };
         tagged.serialize(serializer)
     }
@@ -150,6 +168,7 @@ impl<'de> serde::Deserialize<'de> for WorkerRole {
             RoleRepr::Tagged(TaggedRole::Generate(engine)) => WorkerRole::Generate(engine),
             RoleRepr::Tagged(TaggedRole::Recognize(engine)) => WorkerRole::Recognize(engine),
             RoleRepr::Tagged(TaggedRole::Layout(engine)) => WorkerRole::Layout(engine),
+            RoleRepr::Tagged(TaggedRole::Table(engine)) => WorkerRole::Table(engine),
             RoleRepr::Legacy(engine) => WorkerRole::Embed(engine),
         })
     }
@@ -194,6 +213,9 @@ pub struct WorkerRequest {
     /// Used by "layout" mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<LayoutRequest>,
+    /// Used by "table" mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<TableStructureRequest>,
 }
 
 impl WorkerRequest {
@@ -226,6 +248,15 @@ impl WorkerRequest {
         // so a field added to `LayoutRequest` later is a change to this
         // function rather than a silent gap in it.
         redacted.layout = self.layout.clone();
+        // Counted rather than dropped, exactly as the images above are: a
+        // request that carries no crop is a different request and a real error,
+        // and the log must not make the two look alike.
+        redacted.table = self.table.as_ref().map(|request| TableStructureRequest {
+            image_paths: vec![std::path::PathBuf::from(format!(
+                "<{} crop(s)>",
+                request.image_paths.len()
+            ))],
+        });
         redacted
     }
 }
@@ -279,7 +310,18 @@ pub enum WorkerEvent {
     /// label arriving off a pipe has to be resolved back into that vocabulary
     /// rather than leaked in as an arbitrary string. An unrecognized label is
     /// an error on the host side, not a region with an unknown class.
-    LayoutRegions(Vec<WireLayoutRegion>),
+    /// One group of regions per page of the request, in page order — the
+    /// whole document's detection, because that is the unit that crosses.
+    LayoutRegions(Vec<Vec<WireLayoutRegion>>),
+    /// The grid of each table crop of a table request, one entry per crop, in
+    /// the order they were asked for. Emitted before its terminal event.
+    ///
+    /// Geometry only — cells with a row, a column, their spans and a box in
+    /// fractions of the crop. What each cell *says* is decided by the host from
+    /// the page's own glyphs, because that is extraction rather than inference
+    /// and the host is what holds the page. No model transcribes glyphs the
+    /// page already holds; see [`crate::extract::image::table_structure`].
+    TableStructures(Vec<TableGrid>),
     /// The text regions of each image of a recognition request, one entry per
     /// image, in the order they were asked for. Emitted before its terminal
     /// event.
@@ -293,6 +335,18 @@ pub enum WorkerEvent {
     Done,
     /// Index build failed.
     Error(String),
+    /// The worker process is gone: it died, or its pipes broke, under the
+    /// request that was in flight.
+    ///
+    /// Synthesized by the host when the pipe breaks — a worker never sends
+    /// this — and distinct from [`WorkerEvent::Error`] because the two mean
+    /// opposite things to a caller in a loop. An `Error` is this item's
+    /// failure and the next item is worth attempting. A `Gone` is the caller's
+    /// worker having been killed, usually by the user cancelling, and
+    /// attempting the next item is what *starts a replacement worker* — the
+    /// thing that lets a cancel be outrun once per iteration. Every loop that
+    /// submits treats this as terminal.
+    Gone(String),
 }
 
 impl WorkerEvent {
@@ -301,7 +355,10 @@ impl WorkerEvent {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            WorkerEvent::Done | WorkerEvent::Error(_) | WorkerEvent::Completion { .. }
+            WorkerEvent::Done
+                | WorkerEvent::Error(_)
+                | WorkerEvent::Gone(_)
+                | WorkerEvent::Completion { .. }
         )
     }
 }
@@ -323,6 +380,7 @@ mod tests {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
         }
     }
 
@@ -424,11 +482,76 @@ mod tests {
             WorkerRole::Embed(EmbeddingEngine::Candle),
             WorkerRole::Embed(EmbeddingEngine::SBERT),
             WorkerRole::Generate(GenerationEngine::Candle),
+            WorkerRole::Recognize(RecognitionEngine::Onnx),
+            WorkerRole::Layout(RecognitionEngine::Onnx),
+            // The newest role, and the one a worker binary from before it
+            // would not know: a round trip that lost it would route a table
+            // crop to whatever `Legacy` decoded to.
+            WorkerRole::Table(RecognitionEngine::Onnx),
         ] {
             let json = serde_json::to_string(&role).unwrap();
             let back: WorkerRole = serde_json::from_str(&json).unwrap();
             assert_eq!(role, back, "round trip failed for {json}");
         }
+    }
+
+    /// A table request crosses as its own mode with its own payload, and the
+    /// grids come back as geometry. Nothing of the document's text is on either
+    /// side of this hop — see `extract::image::table_structure` for why.
+    #[test]
+    fn table_requests_round_trip_and_their_crops_stay_out_of_the_log() {
+        use crate::extract::image::table_structure::{TableCell, TableGrid, TableStructureRequest};
+
+        let mut req = sample_request();
+        req.mode = "table".to_string();
+        req.role = WorkerRole::Table(RecognitionEngine::Onnx);
+        req.table = Some(TableStructureRequest {
+            image_paths: (0..6)
+                .map(|n| PathBuf::from(format!("/scratch/secret-document-{n}.png")))
+                .collect(),
+        });
+
+        let json = serde_json::to_string(&req).unwrap();
+        let de: WorkerRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.role, WorkerRole::Table(RecognitionEngine::Onnx));
+        assert_eq!(de.table.unwrap().image_paths.len(), 6);
+
+        let logged = serde_json::to_string(&req.redacted_for_log()).unwrap();
+        assert!(!logged.contains("secret-document"), "{logged}");
+        assert!(logged.contains("6 crop(s)"), "{logged}");
+
+        let grids = vec![TableGrid {
+            cells: vec![TableCell {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 0.5,
+                y1: 1.0,
+                colspan: 1,
+                rowspan: 2,
+                row: 0,
+                col: 0,
+            }],
+            rows: 2,
+            cols: 1,
+            score: 0.5,
+            truncated: false,
+        }];
+        let wire = serde_json::to_string(&WorkerEvent::TableStructures(grids.clone())).unwrap();
+        match serde_json::from_str::<WorkerEvent>(&wire).unwrap() {
+            WorkerEvent::TableStructures(back) => assert_eq!(back, grids),
+            other => panic!("expected TableStructures, got {other:?}"),
+        }
+    }
+
+    /// A request that predates the table field still parses: absence is what a
+    /// mixed-version host and worker exchange, and it means "no crops", not a
+    /// parse failure.
+    #[test]
+    fn a_request_without_the_table_field_parses_as_carrying_no_crops() {
+        let mut json = serde_json::to_value(sample_request()).unwrap();
+        json.as_object_mut().unwrap().remove("table");
+        let de: WorkerRequest = serde_json::from_value(json).unwrap();
+        assert!(de.table.is_none());
     }
 
     #[test]

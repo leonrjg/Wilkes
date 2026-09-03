@@ -110,12 +110,13 @@ pub fn shipped_model_id(engine: RecognitionEngine) -> &'static str {
 
 /// What a recognizer is for.
 ///
-/// Both roles are [`OcrEngine`]s and both are dispatched by engine and model
-/// id, so they belong in one catalogue. They are not interchangeable, though:
-/// a page reader handed a crop of one expression comes apart, and a formula
-/// reader emits one whole-crop region and could not read a page. So the role
-/// travels with the descriptor, and a picker that offers page readers filters
-/// on it rather than keeping its own list of which ids are which.
+/// Every role is dispatched by engine and model id, is installed the same way
+/// and is named the same way, so they belong in one catalogue. They are not
+/// interchangeable: a page reader handed a crop of one expression comes apart,
+/// a formula reader emits one whole-crop region and could not read a page, and
+/// a table reader emits no text at all. So the role travels with the
+/// descriptor, and a picker that offers page readers filters on it rather than
+/// keeping its own list of which ids are which.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecognizerRole {
@@ -125,6 +126,17 @@ pub enum RecognizerRole {
     /// Reads one cropped expression and returns its LaTeX. Spent only on the
     /// areas the layout detector marked out as formulas.
     Formula,
+    /// Reads the *grid* of one cropped table and returns geometry: cells with
+    /// a row, a column, their spans, and a box. It transcribes nothing — the
+    /// cells' text is taken from the page's own glyphs by the host — so it is
+    /// not an [`OcrEngine`] at all, and it is in this catalogue because it is
+    /// installed, offered, versioned and spent exactly like one.
+    ///
+    /// Spent only on the areas the detector marked out as tables, and only for
+    /// the areas a page *typesets*: there is no text layer under an embedded
+    /// raster to fill a grid from. Charts go to the page reader as they always
+    /// have.
+    Table,
 }
 
 /// One recognizer this build can read with, described rather than listed.
@@ -251,6 +263,29 @@ pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
         emits: vec![RegionKind::Formula],
     });
 
+    // The third role, and a row here for the same reason the formula reader is
+    // one: it is installed, pinned, versioned and spent like the others, and
+    // what makes it different is its role. `is_default` is false because
+    // nothing defaults to reading pages with it — the picker filters to
+    // `RecognizerRole::Page`.
+    #[cfg(feature = "recognize-onnx")]
+    models.push(RecognizerDescriptor {
+        engine: RecognitionEngine::Onnx,
+        model_id: super::table_structure::MODEL_ID.to_string(),
+        role: RecognizerRole::Table,
+        display_name: "SLANet-plus".to_string(),
+        description: "Reads the grid of a ruled table the page typesets — rows, columns \
+                      and merged cells — and the cells are then filled from the page's own \
+                      text. Nothing transcribes glyphs the document already holds."
+            .to_string(),
+        is_default: false,
+        is_engine_default: false,
+        is_cached: super::table_structure::is_installed(model_dir),
+        footprint_bytes: super::table_structure::footprint_bytes(),
+        admission_threshold: super::table_structure::ADMISSION_THRESHOLD,
+        emits: vec![RegionKind::Table],
+    });
+
     #[cfg(feature = "candle")]
     for checkpoint in super::paddleocr_vl::CHECKPOINTS {
         models.push(RecognizerDescriptor {
@@ -338,6 +373,7 @@ pub fn identity(engine: RecognitionEngine, model_id: &str) -> anyhow::Result<Str
         RecognitionEngine::Onnx => match model_id {
             super::granite_docling::MODEL_ID => Ok(super::granite_docling::identity()),
             super::texify::MODEL_ID => Ok(super::texify::identity()),
+            super::table_structure::MODEL_ID => Ok(super::table_structure::identity()),
             other => anyhow::bail!("unknown onnx recognizer '{other}'"),
         },
         #[cfg(not(feature = "recognize-onnx"))]
@@ -450,6 +486,46 @@ pub fn formula_model(model_dir: &Path) -> Option<RecognizerDescriptor> {
         .find(|model| model.role == RecognizerRole::Formula)
 }
 
+/// The table structure model this build ships, or `None` when it ships none.
+///
+/// Found by role, exactly as [`formula_model`] is, and for the same reason: the
+/// one place that knows which model reads tables is the catalogue row that
+/// declares it. A build with no such row, or an installation that has not
+/// downloaded it, is a configuration and not an error — the areas the detector
+/// calls tables go to the page reader, which is what they did before this model
+/// existed. See [`super::NativeImageAnalyzer::route`].
+pub fn table_model(model_dir: &Path) -> Option<RecognizerDescriptor> {
+    list_models(model_dir)
+        .into_iter()
+        .find(|model| model.role == RecognizerRole::Table)
+}
+
+/// Load the table structure model in the calling process.
+///
+/// Must only be called from a worker subprocess, exactly like
+/// [`load_recognizer_local`] and [`load_layout_detector_local`], and for
+/// exactly the same reason. The host reaches it through
+/// [`super::table_structure::attach`].
+///
+/// It is not in the same loader as the recognizers because it is not an
+/// [`OcrEngine`]: it answers a grid, not text. It is in this module for the
+/// reason everything else is — nothing outside the arm that owns a checkpoint
+/// names it.
+#[cfg(feature = "recognize-onnx")]
+pub fn load_table_structure_local(
+    model_id: &str,
+    model_dir: &Path,
+) -> anyhow::Result<Box<dyn super::table_structure::TableStructure>> {
+    anyhow::ensure!(
+        model_id == super::table_structure::MODEL_ID,
+        "unknown table reader '{model_id}'"
+    );
+    let (_, threads) = recognizer_layout(RecognizerRole::Table, "cpu");
+    Ok(Box::new(super::table_structure::SlanetPlus::load(
+        model_dir, threads,
+    )?))
+}
+
 /// Load the recognizer in the calling process.
 ///
 /// Must only be called from a worker subprocess — see this module's invariant.
@@ -471,18 +547,25 @@ pub fn load_recognizer_local(
                 // which device: the CPU provider is the only one this
                 // recognizer was measured on, and naming a device it will not
                 // honour would be a setting that reads as a promise.
-                let (readers, threads) = recognizer_layout(device);
+                let (readers, threads) = recognizer_layout(RecognizerRole::Page, device);
                 Ok(Box::new(super::granite_docling::GraniteDocling::load(
                     model_dir, readers, threads,
                 )?))
             }
-            // One reader, because a formula crop is one small image and the
-            // decode is a pass over the whole decoder per token: it waits on
-            // memory, not on arithmetic, and a second reader would contend for
-            // the bandwidth the first is already waiting on.
+            // Laid out on the same principle as the page reader and not on
+            // the same numbers: a formula crop's decode waits on memory rather
+            // than on arithmetic too, so the machine one reader leaves idle is
+            // used by more readers and not by wider ones — but a formula
+            // reader is a fifth of a page reader's footprint, so the count
+            // where that stops paying is a different count. This arm used to
+            // take the threads and drop the reader count on the floor, which
+            // made every document's crops one serial queue; see
+            // [`recognizer_layout`]'s second table for what that cost.
             super::texify::MODEL_ID => {
-                let (_, threads) = recognizer_layout(device);
-                Ok(Box::new(super::texify::Texify::load(model_dir, threads)?))
+                let (readers, threads) = recognizer_layout(RecognizerRole::Formula, device);
+                Ok(Box::new(super::texify::Texify::load(
+                    model_dir, readers, threads,
+                )?))
             }
             other => anyhow::bail!("unknown onnx recognizer '{other}'"),
         },
@@ -522,7 +605,7 @@ pub fn load_recognizer_local(
     }
 }
 
-/// How the ONNX recognizer's work is laid out: how many pages it reads at
+/// How an ONNX recognizer's work is laid out: how many images it reads at
 /// once, and how many threads each of those readers gets.
 ///
 /// Still one less than the machine has in total, so an indexing pass that runs
@@ -533,10 +616,13 @@ pub fn load_recognizer_local(
 /// with nine threads produces a token in 13.8ms against 15.3ms with one.
 /// Nine-tenths of the machine sits idle whatever the thread count is.
 ///
-/// Reading two pages at once uses some of that idle capacity. Not all of it:
-/// the readers contend for the same memory bandwidth the single reader was
-/// already waiting on, so the gain is real but bounded. Six pages of a text
-/// page through the whole engine, on a 10-core M4:
+/// Reading several images at once uses some of that idle capacity. Not all of
+/// it: the readers contend for the same memory bandwidth the single reader was
+/// already waiting on, so the gain is real but bounded.
+///
+/// ## The page reader
+///
+/// Six pages of a text page through the whole engine, on a 10-core M4:
 ///
 /// | layout | elapsed | peak |
 /// |--------|---------|------|
@@ -545,28 +631,74 @@ pub fn load_recognizer_local(
 /// | 3 x 2  | 40.5s   | 8.7 GB |
 /// | 4 x 2  | 41.3s   | 11.0 GB |
 ///
-/// [`MAX_READERS`] is two because that is the knee. The second reader buys
-/// 13% for 2.7 GB; the third buys a further 3% for 2.8 GB, and the fourth is
-/// slower than the third while costing more again. Two also keeps the pool's
-/// peak near the 4.9 GB a single reader needed before its tiles were grouped,
-/// which is the footprint this recognizer has already been shown to live in.
-/// A machine with memory to spare gains a little from three, and this is the
-/// one constant to change.
+/// Two readers is the knee. The second buys 13% for 2.7 GB; the third buys a
+/// further 3% for 2.8 GB, and the fourth is slower than the third while
+/// costing more again. Two also keeps the pool's peak near the 4.9 GB a single
+/// reader needed before its tiles were grouped, which is the footprint this
+/// recognizer has already been shown to live in.
 ///
-/// [`THREADS_PER_READER`] is four because a reader keeps improving up to it —
-/// two readers of two threads take 46.1s, of three 42.2s, of four 41.7s —
-/// the page's vision encoding and prefill being the parts that still scale
-/// where the decode does not.
+/// Four threads because a reader keeps improving up to it — two readers of two
+/// threads take 46.1s, of three 42.2s, of four 41.7s — the page's vision
+/// encoding and prefill being the parts that still scale where the decode does
+/// not.
+///
+/// ## The formula reader
+///
+/// Not the same numbers, and this function used to give it the page reader's
+/// and then throw the reader count away: `load_recognizer_local` took the
+/// threads, ignored the readers, and every document's crops went through one
+/// reader in a single queue. What that cost, over the 124 crops the five
+/// heaviest pages of the `formula_recall` fixture produce, handed to
+/// [`super::texify::Texify`] in one call on the same 10-core M4:
+///
+/// | layout | wall | ms/crop | ms/page | cores | peak |
+/// |--------|------|---------|---------|-------|------|
+/// | 1 x 4  | 31.5s | 254 | 6296 | 3.14 | 1.3 GB |
+/// | 2 x 4  | 21.0s | 170 | 4204 | 5.94 | 2.3 GB |
+/// | 3 x 4  | 17.8s | 144 | 3568 | 8.61 | 3.3 GB |
+/// | 3 x 3  | 18.6s | 150 | 3727 | 7.37 | 3.3 GB |
+///
+/// A crop is a 543 MB reader and a page is a 2.9 GB one, so the memory knee
+/// that stopped the page reader at two is nowhere near here: three formula
+/// readers cost 3.3 GB, which is less than *one* page reader and two. That is
+/// the whole of why the two roles are laid out differently, and it is a fact
+/// about the checkpoints rather than about recognition, so it is stated here
+/// and not discovered again at each call site.
+///
+/// Three readers of three threads and not three of four, though the latter is
+/// 4.5% quicker: four apiece is twelve threads against a budget of nine, and
+/// at 8.61 effective cores of ten it spends the margin this function exists to
+/// keep. Three of three is exactly the budget, is 41% quicker than the single
+/// reader production was actually running, and leaves 2.6 cores.
+///
+/// `pub` so a probe that claims to read a document under the production
+/// configuration runs the numbers production runs rather than a pair typed
+/// beside them. Nothing under `src/` outside this module calls it.
 #[cfg(feature = "recognize-onnx")]
-fn recognizer_layout(_device: &str) -> (usize, usize) {
-    const THREADS_PER_READER: usize = 4;
-    const MAX_READERS: usize = 2;
+pub fn recognizer_layout(role: RecognizerRole, _device: &str) -> (usize, usize) {
+    // Per role, because the two checkpoints have their knees in different
+    // places — see the two tables above. Not per model id: what decides this
+    // is what the model is *for*, and a second formula reader would want the
+    // formula reader's shape rather than a row of its own.
+    let (threads_per_reader, max_readers) = match role {
+        RecognizerRole::Page => (4, 2),
+        RecognizerRole::Formula => (3, 3),
+        // One reader, at the thread count the 56 crops of the measured
+        // textbook were timed at. There is no second reader here because there
+        // is nothing for it to save: a crop is 23 ms, a whole book's tables are
+        // 1.3 s, and the graph is 7.4 MB against the formula reader's 543 —
+        // the knee both tables above are looking for is nowhere near a model
+        // this size. Four threads and not fewer because four is what was
+        // measured; eight was measured too and answered in the same time, so
+        // the graph does not use them either way.
+        RecognizerRole::Table => (4, 1),
+    };
 
     let budget = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(1).max(1))
         .unwrap_or(1);
-    let readers = (budget / THREADS_PER_READER).clamp(1, MAX_READERS);
-    (readers, THREADS_PER_READER)
+    let readers = (budget / threads_per_reader).clamp(1, max_readers);
+    (readers, threads_per_reader)
 }
 
 /// Keep an existing library on the recognizer that produced it.
@@ -618,6 +750,7 @@ pub fn inventory(
         RecognitionEngine::Onnx => match model_id {
             super::granite_docling::MODEL_ID => Ok(super::granite_docling::inventory()),
             super::texify::MODEL_ID => Ok(super::texify::inventory()),
+            super::table_structure::MODEL_ID => Ok(super::table_structure::inventory()),
             other => anyhow::bail!("unknown onnx recognizer '{other}'"),
         },
         #[cfg(not(feature = "recognize-onnx"))]
@@ -658,8 +791,13 @@ pub fn install(
     match engine {
         #[cfg(feature = "recognize-onnx")]
         RecognitionEngine::Onnx => match model_id {
-            super::granite_docling::MODEL_ID => super::granite_docling::install(model_dir, progress),
+            super::granite_docling::MODEL_ID => {
+                super::granite_docling::install(model_dir, progress)
+            }
             super::texify::MODEL_ID => super::texify::install(model_dir, progress),
+            super::table_structure::MODEL_ID => {
+                super::table_structure::install(model_dir, progress)
+            }
             other => anyhow::bail!("unknown onnx recognizer '{other}'"),
         },
         #[cfg(not(feature = "recognize-onnx"))]
@@ -757,10 +895,14 @@ mod tests {
                     model.model_id,
                     model.admission_threshold
                 ),
-                RecognizerRole::Formula => assert_eq!(
+                // A formula is admitted on whether its LaTeX parses and a table
+                // on whether its grid holds the page's glyphs. Both are
+                // properties of the answer rather than scores, so both declare
+                // zero, and the assertion is that they declare *exactly* zero
+                // rather than a number nothing consults.
+                RecognizerRole::Formula | RecognizerRole::Table => assert_eq!(
                     model.admission_threshold, 0.0,
-                    "the formula reader {} declares a score threshold, but formulas are \
-                     admitted on whether their LaTeX parses",
+                    "{} declares a score threshold, but its kind is not admitted on one",
                     model.model_id
                 ),
             }
@@ -904,6 +1046,125 @@ mod tests {
             &mut explicit
         ));
         assert_eq!(explicit.engine, RecognitionEngine::Onnx);
+    }
+
+    /// Both roles get more than one reader on a machine with the cores for
+    /// them, and each gets its own shape. The formula reader's count is the
+    /// one this asserts hardest: it was computed and then discarded at the
+    /// call site, so every document's crops went through one reader, and a
+    /// layout function that answers correctly while nobody uses the answer is
+    /// exactly what that looked like.
+    #[cfg(feature = "recognize-onnx")]
+    #[test]
+    fn each_role_is_laid_out_for_its_own_footprint() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let (page_readers, page_threads) = recognizer_layout(RecognizerRole::Page, "cpu");
+        let (formula_readers, formula_threads) = recognizer_layout(RecognizerRole::Formula, "cpu");
+
+        // Whatever the machine, a reader is a reader and the budget is never
+        // spent below one.
+        assert!(page_readers >= 1 && formula_readers >= 1);
+        assert!(page_threads >= 1 && formula_threads >= 1);
+        // And it is never spent above it: the interface keeps a thread.
+        let budget = cores.saturating_sub(1).max(1);
+        assert!(
+            page_readers * page_threads <= budget.max(page_threads),
+            "the page reader wants {page_readers}x{page_threads} of a {budget}-thread budget"
+        );
+        assert!(
+            formula_readers * formula_threads <= budget.max(formula_threads),
+            "the formula reader wants {formula_readers}x{formula_threads} of a \
+             {budget}-thread budget"
+        );
+
+        // The roles are laid out differently, which is the whole reason this
+        // function takes a role. On a machine too small to run more than one
+        // reader of either they collapse to the same answer, and that is not a
+        // failure — so the claim is made only where there is room.
+        if budget >= 9 {
+            assert_eq!((page_readers, page_threads), (2, 4));
+            assert_eq!(
+                (formula_readers, formula_threads),
+                (3, 3),
+                "the formula reader reads three crops at once; one is what the bug was"
+            );
+            // One reader on purpose, and asserted so a copy of the formula
+            // reader's shape cannot drift in here: a 7.4 MB graph at 23 ms a
+            // crop has nothing for a second copy to save.
+            assert_eq!(
+                recognizer_layout(RecognizerRole::Table, "cpu"),
+                (1, 4),
+                "the table reader is one reader; its whole cost is a second a book"
+            );
+        }
+    }
+
+    /// The table reader is a row of this catalogue like the others: it answers
+    /// identity, inventory and installedness from constants, with no graph
+    /// loaded and nothing on disk, and it is found by role rather than by name.
+    #[cfg(feature = "recognize-onnx")]
+    #[test]
+    fn the_table_reader_is_a_catalogue_row_answerable_without_its_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = table_model(dir.path()).expect("this build ships a table structure model");
+        assert_eq!(model.role, RecognizerRole::Table);
+        assert_eq!(model.model_id, super::super::table_structure::MODEL_ID);
+        assert_eq!(model.emits, vec![super::super::ocr::RegionKind::Table]);
+        // Nothing defaults to reading pages with it, and the picker filters to
+        // `Page`: a build where this were true would offer a model that emits
+        // no prose as the page recognizer.
+        assert!(!model.is_default && !model.is_engine_default);
+        assert!(!model.is_cached, "a fresh directory holds no graph");
+
+        let id = identity(model.engine, &model.model_id).unwrap();
+        assert_eq!(id, super::super::table_structure::identity());
+        assert!(id.contains(super::super::table_structure::MODEL_ID), "{id}");
+        assert_eq!(
+            inventory(model.engine, &model.model_id).unwrap().name,
+            super::super::table_structure::MODEL_ID
+        );
+        assert!(!installed(model.engine, &model.model_id, dir.path()).unwrap());
+
+        // And once the file the recipe names is where the recipe names it.
+        let install_dir = super::super::table_structure::install_dir(dir.path());
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::write(
+            install_dir.join(super::super::table_structure::GRAPH),
+            b"a graph",
+        )
+        .unwrap();
+        assert!(installed(model.engine, &model.model_id, dir.path()).unwrap());
+        assert!(table_model(dir.path()).unwrap().is_cached);
+    }
+
+    /// Each role is offered exactly once and none of them is offered as
+    /// another. The picker filters on this, so a table reader that answered to
+    /// `Page` would be selectable as the page recognizer and would read every
+    /// page of the library as an empty grid.
+    #[cfg(feature = "recognize-onnx")]
+    #[test]
+    fn the_three_roles_are_offered_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = list_models(dir.path());
+        for role in [RecognizerRole::Formula, RecognizerRole::Table] {
+            assert_eq!(
+                models.iter().filter(|model| model.role == role).count(),
+                1,
+                "{role:?} is not offered exactly once"
+            );
+        }
+        assert!(
+            models
+                .iter()
+                .any(|model| model.role == RecognizerRole::Page && model.is_default),
+            "the default recognizer reads pages"
+        );
+        assert_ne!(
+            formula_model(dir.path()).unwrap().model_id,
+            table_model(dir.path()).unwrap().model_id
+        );
     }
 
     /// An unknown model id is refused rather than answered with the default,

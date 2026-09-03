@@ -18,12 +18,15 @@
 //! dictionary or a language assumption, and each failing towards today's
 //! behaviour rather than towards a guess.
 
+use tracing::debug;
+
 use crate::types::{
     BoundingBox, ByteRange, ExtractedImage, ExtractionDiagnostics, SourceOrigin, SourceSegment,
     TextProvenance,
 };
 
 use crate::extract::image::serialize;
+use crate::extract::pdf::typeset::Anchor;
 
 /// The flow a line belongs to. Body text is one flow for the whole document —
 /// it continues across block and page boundaries, which is what lets a word
@@ -47,6 +50,12 @@ pub(super) struct Word {
     /// whether these glyphs are leaving. A region whose reading is refused
     /// leaves its words exactly where the page put them, which is what makes a
     /// false positive cost time and no bytes.
+    ///
+    /// A word with no text and a mark is a *carrier*: it stands for a region
+    /// and for no glyphs of the page. One is inserted for every admitted
+    /// region that covers no word at all — an expression the page drew as
+    /// paths — so that from there on the reading has exactly one way to say
+    /// where a region goes, which is a marked word.
     pub typeset: Option<usize>,
 }
 
@@ -215,13 +224,19 @@ const BODY_COLUMN_SHARE: f32 = 0.6;
 /// image's enrichment occupies in the reading — filled here because here is
 /// where the text is written, and a range computed anywhere else would be a
 /// claim about bytes rather than the bytes themselves.
+///
+/// `anchored` names the typeset regions that cover no word of the page, with
+/// the place the page's own geometry gave each of them. They have no glyphs to
+/// be marked on, so the mark is put on a word made for them — see
+/// [`supersede_typeset_regions`].
 pub(super) fn sanitize(
     mut pages: Vec<Page>,
     images: &mut [ExtractedImage],
+    anchored: &[(usize, Anchor)],
     diagnostics: &mut ExtractionDiagnostics,
 ) -> Reading {
     diagnostics.pages = pages.len() as u32;
-    supersede_typeset_regions(&mut pages, images, diagnostics);
+    supersede_typeset_regions(&mut pages, images, anchored, diagnostics);
     remove_page_furniture(&mut pages, diagnostics);
     let flows = relocate_marginalia(&mut pages, diagnostics);
     let mut items = flatten(&pages, &flows);
@@ -240,8 +255,17 @@ pub(super) fn sanitize(
 /// region a recognizer read as LaTeX. Exactly one of them is in the reading
 /// afterwards.
 ///
-/// A region owns *words*, so it can own a whole line or four words in the
-/// middle of one, and the two are written differently:
+/// A region owns *words* — and a region that covers none of the page's own is
+/// given one here, empty of text and carrying its mark, at the place
+/// `typeset::anchor_after` read off the page. That is the whole of the special
+/// case: an expression the page drew as paths has no glyph run to replace, so
+/// a word is put where the reading passes it, and every line below this one
+/// treats it exactly as it treats a word the page drew. Inserting only for an
+/// *admitted* region is not a special case either — it is the same promise a
+/// refused region that owns words keeps, that the page is left as it was.
+///
+/// So a region can own a whole line, or four words in the middle of one, or
+/// one word that was not there before, and the two ways they are written are:
 ///
 /// - **A region that owns every word of the lines it touches is a block.** Its
 ///   lines go and an image block is written where the first of them was. That
@@ -267,6 +291,7 @@ pub(super) fn sanitize(
 fn supersede_typeset_regions(
     pages: &mut [Page],
     images: &[ExtractedImage],
+    anchored: &[(usize, Anchor)],
     diagnostics: &mut ExtractionDiagnostics,
 ) {
     let admitted = |index: usize| {
@@ -290,6 +315,102 @@ fn supersede_typeset_regions(
         }
     }
 
+    // And a region that covers no word of the page gets one, for the same
+    // reason and by the same test: everything below here reads marks off
+    // words, so an expression the page drew as paths is given a word to be
+    // marked on rather than a second way of saying where a region goes.
+    //
+    // Applied last position first, so an insertion never moves the position of
+    // one not yet applied. Two regions anchored to the same word are ordered
+    // by where the page draws them, so a reader meets them in that order: an
+    // inline one stands on the anchor's own line and a block one below it, so
+    // inline comes first; along a line the reading runs left to right, and
+    // down a page it runs top to bottom. Ordering both by height would put two
+    // expressions drawn side by side in the order of their *baselines*, which
+    // for a tall one beside a short one is not the order they are read in.
+    let mut carried: Vec<(usize, Anchor, &ExtractedImage)> = anchored
+        .iter()
+        .filter(|(index, _)| admitted(*index))
+        .filter_map(|(index, anchor)| images.get(*index).map(|image| (*index, *anchor, image)))
+        .collect();
+    carried.sort_by(|(_, a, left), (_, b, right)| {
+        (left.page, a.after, !a.inline)
+            .cmp(&(right.page, b.after, !b.inline))
+            .then_with(|| {
+                // Equal this far means the same anchor and the same kind, so
+                // one of the two orders below is the reading's own.
+                if a.inline {
+                    left.bbox
+                        .x
+                        .total_cmp(&right.bbox.x)
+                        .then(left.bbox.y.total_cmp(&right.bbox.y))
+                } else {
+                    left.bbox
+                        .y
+                        .total_cmp(&right.bbox.y)
+                        .then(left.bbox.x.total_cmp(&right.bbox.x))
+                }
+            })
+    });
+    for (index, anchor, image) in carried.into_iter().rev() {
+        let carrier = Word {
+            text: String::new(),
+            bbox: Some(image.bbox.clone()),
+            typeset: Some(index),
+        };
+        let Some(page) = pages.iter_mut().find(|page| page.number == image.page) else {
+            debug!(
+                "typeset region {} is anchored to page {}, which this reading does not hold",
+                image.id, image.page
+            );
+            continue;
+        };
+        let Some((block, line, word)) = anchor.after else {
+            // Nothing on the page precedes it.
+            page.blocks.insert(
+                0,
+                Block {
+                    lines: vec![line_of(carrier)],
+                    image: None,
+                },
+            );
+            continue;
+        };
+        let target = page
+            .blocks
+            .get_mut(block)
+            .filter(|block| block.image.is_none())
+            .and_then(|block| (line < block.lines.len()).then_some(block));
+        let Some(target) = target else {
+            debug!(
+                "typeset region {} is anchored after block {block} line {line} of page {}, \
+                 which holds no such line",
+                image.id, image.page
+            );
+            continue;
+        };
+        if !anchor.inline {
+            target.lines.insert(line + 1, line_of(carrier));
+            continue;
+        }
+        let at = &mut target.lines[line];
+        if word >= at.words.len() {
+            debug!(
+                "typeset region {} is anchored after word {word} of a line holding {}",
+                image.id,
+                at.words.len()
+            );
+            continue;
+        }
+        // The carrier takes the whitespace the page left after the word it
+        // follows, and a single space is written between the two: the page
+        // drew nothing there to copy, and a run of LaTeX abutting the word
+        // before it is one token to every consumer of the reading.
+        let trailing = std::mem::replace(&mut at.trailing[word], " ".to_string());
+        at.words.insert(word + 1, carrier);
+        at.trailing.insert(word + 1, trailing);
+    }
+
     // Which regions own every word of every line they touch. Asked across the
     // whole document before anything is rewritten, because a region can span
     // two of a page's blocks and the answer for one of its lines is not the
@@ -301,10 +422,14 @@ fn supersede_typeset_regions(
                 let marks: std::collections::HashSet<usize> =
                     line.words.iter().filter_map(|word| word.typeset).collect();
                 for index in marks {
-                    let all = line
-                        .words
-                        .iter()
-                        .all(|word| word.typeset == Some(index) || word.text.trim().is_empty());
+                    // A word with nothing in it is not evidence either way —
+                    // unless it carries *another* region, in which case this
+                    // line holds two things and taking it away whole would
+                    // take the second with it.
+                    let all = line.words.iter().all(|word| {
+                        word.typeset == Some(index)
+                            || (word.typeset.is_none() && word.text.trim().is_empty())
+                    });
                     let entry = whole_line.entry(index).or_insert(true);
                     *entry = *entry && all;
                 }
@@ -365,6 +490,13 @@ fn supersede_typeset_regions(
         }
         page.blocks = rebuilt;
     }
+}
+
+/// One word standing alone on a line of its own.
+fn line_of(word: Word) -> Line {
+    let mut line = Line::default();
+    line.push_word(word);
+    line
 }
 
 /// Replace each run of words an inline region owns with a single carrier.
@@ -977,7 +1109,7 @@ mod tests {
 
     fn read(pages: Vec<Page>) -> (String, ExtractionDiagnostics) {
         let mut diagnostics = ExtractionDiagnostics::default();
-        let reading = sanitize(pages, &mut [], &mut diagnostics);
+        let reading = sanitize(pages, &mut [], &[], &mut diagnostics);
         (reading.text, diagnostics)
     }
 
@@ -1078,6 +1210,7 @@ mod tests {
         let reading = sanitize(
             vec![page_with_a_formula_in_the_middle()],
             &mut images,
+            &[],
             &mut diagnostics,
         );
 
@@ -1124,6 +1257,7 @@ mod tests {
         let reading = sanitize(
             vec![body_page(1, vec![line])],
             &mut images,
+            &[],
             &mut diagnostics,
         );
 
@@ -1140,6 +1274,164 @@ mod tests {
         );
         assert_eq!(diagnostics.typeset_regions_superseded_native_text, 1);
         assert!(images[0].reading_range.is_some());
+    }
+
+    // ── Regions that replace nothing ─────────────────────────────────────
+    //
+    // The page drew the expression as paths, so the text layer holds no word
+    // for the region to be marked on. One is made for it, at the place
+    // `typeset::anchor_after` read off the page, and from there the reading
+    // treats it as it treats any other marked word.
+
+    fn after(block: usize, line: usize, word: usize, inline: bool) -> Anchor {
+        Anchor {
+            after: Some((block, line, word)),
+            inline,
+        }
+    }
+
+    /// An expression drawn between two words of a sentence is read between
+    /// them, with a space either side — not appended to the page, and not
+    /// given a line of its own inside the sentence.
+    #[test]
+    fn a_region_over_no_glyphs_lands_between_the_words_it_was_drawn_between() {
+        let mut images = [recognized(true)];
+        let mut diagnostics = ExtractionDiagnostics::default();
+        let sentence = line(vec![word("with", 100.0, 200.0), word("Thus", 185.0, 200.0)]);
+        let reading = sanitize(
+            vec![body_page(1, vec![sentence])],
+            &mut images,
+            &[(0, after(0, 0, 0, true))],
+            &mut diagnostics,
+        );
+
+        assert_eq!(
+            reading.text.trim(),
+            "with c_i = a_i \\oplus b_i Thus",
+            "{:?}",
+            reading.text
+        );
+        assert!(
+            !reading.text.contains("Page formula:"),
+            "no label inside a sentence: {:?}",
+            reading.text
+        );
+        assert_eq!(diagnostics.typeset_regions_superseded_native_text, 1);
+        assert!(images[0].reading_range.is_some());
+    }
+
+    /// Two drawn side by side after one word are read left to right, whatever
+    /// height the page set them at. A tall expression beside a short one sits
+    /// higher on the page and is still the second thing read.
+    #[test]
+    fn two_regions_over_no_glyphs_after_one_word_are_read_left_to_right() {
+        let at = |latex: &str, x: f32, y: f32| {
+            let mut image = recognized(true);
+            image.ocr_regions[0].text = latex.to_string();
+            image.bbox = BoundingBox {
+                x,
+                y,
+                width: 20.0,
+                height: 10.0,
+            };
+            image
+        };
+        // The left one drawn lower, so ordering by height alone reverses them.
+        let mut images = [at("x_{L}", 120.0, 205.0), at("x_{R}", 200.0, 190.0)];
+        let mut diagnostics = ExtractionDiagnostics::default();
+        let sentence = line(vec![word("with", 100.0, 200.0), word("Thus", 185.0, 200.0)]);
+        let reading = sanitize(
+            vec![body_page(1, vec![sentence])],
+            &mut images,
+            &[(0, after(0, 0, 0, true)), (1, after(0, 0, 0, true))],
+            &mut diagnostics,
+        );
+
+        let left = reading.text.find("x_{L}").expect("the left expression");
+        let right = reading.text.find("x_{R}").expect("the right expression");
+        assert!(left < right, "{:?}", reading.text);
+        assert_eq!(diagnostics.typeset_regions_superseded_native_text, 2);
+    }
+
+    /// One drawn below a paragraph takes a line of its own after that
+    /// paragraph's last word, which is what a display expression is.
+    #[test]
+    fn a_region_over_no_glyphs_below_a_paragraph_lands_after_its_last_word() {
+        let mut images = [recognized(true)];
+        let mut diagnostics = ExtractionDiagnostics::default();
+        let paragraph = line(vec![word("prose", 100.0, 80.0), word("above", 140.0, 80.0)]);
+        let reading = sanitize(
+            vec![body_page(1, vec![paragraph])],
+            &mut images,
+            &[(0, after(0, 0, 1, false))],
+            &mut diagnostics,
+        );
+
+        let prose = reading.text.find("prose above").expect("the paragraph");
+        let formula = reading
+            .text
+            .find("Page formula: c_i = a_i \\oplus b_i.")
+            .unwrap_or_else(|| panic!("the formula: {:?}", reading.text));
+        assert!(prose < formula, "{:?}", reading.text);
+        assert_eq!(diagnostics.typeset_regions_superseded_native_text, 1);
+    }
+
+    /// A page whose text layer holds nothing at all — every word of it drawn
+    /// rather than set — reads its regions from the head of the page.
+    #[test]
+    fn a_region_on_a_page_with_no_words_lands_at_its_start() {
+        let mut images = [recognized(true)];
+        let mut diagnostics = ExtractionDiagnostics::default();
+        let page = Page {
+            number: 1,
+            height: 800.0,
+            blocks: Vec::new(),
+        };
+        let reading = sanitize(
+            vec![page],
+            &mut images,
+            &[(
+                0,
+                Anchor {
+                    after: None,
+                    inline: false,
+                },
+            )],
+            &mut diagnostics,
+        );
+
+        assert_eq!(
+            reading.text.trim(),
+            "Page formula: c_i = a_i \\oplus b_i.",
+            "{:?}",
+            reading.text
+        );
+        assert!(images[0].reading_range.is_some());
+    }
+
+    /// A refused one inserts nothing at all. The page had no glyphs there to
+    /// keep, so "the reading is what it was" means byte for byte what it was.
+    #[test]
+    fn a_refused_region_over_no_glyphs_inserts_nothing() {
+        let mut images = [recognized(false)];
+        let mut diagnostics = ExtractionDiagnostics::default();
+        let sentence = line(vec![word("with", 100.0, 200.0), word("Thus", 185.0, 200.0)]);
+        let reading = sanitize(
+            vec![body_page(1, vec![sentence.clone()])],
+            &mut images,
+            &[(0, after(0, 0, 0, true))],
+            &mut diagnostics,
+        );
+
+        let untouched = sanitize(
+            vec![body_page(1, vec![sentence])],
+            &mut [],
+            &[],
+            &mut ExtractionDiagnostics::default(),
+        );
+        assert_eq!(reading.text, untouched.text, "{:?}", reading.text);
+        assert_eq!(diagnostics.typeset_regions_superseded_native_text, 0);
+        assert!(images[0].reading_range.is_none());
     }
 
     /// The bytes an inline region wrote resolve to the whole expression, not
@@ -1162,6 +1454,7 @@ mod tests {
         let reading = sanitize(
             vec![body_page(1, vec![line])],
             &mut images,
+            &[],
             &mut diagnostics,
         );
         let content = crate::types::ExtractedContent {
@@ -1193,6 +1486,7 @@ mod tests {
         let reading = sanitize(
             vec![page_with_a_formula_in_the_middle()],
             &mut images,
+            &[],
             &mut diagnostics,
         );
 
@@ -1232,7 +1526,7 @@ mod tests {
 
         let mut images = [recognized(true)];
         let mut diagnostics = ExtractionDiagnostics::default();
-        let reading = sanitize(vec![page], &mut images, &mut diagnostics);
+        let reading = sanitize(vec![page], &mut images, &[], &mut diagnostics);
 
         assert_eq!(
             reading.text.matches("Page formula:").count(),
@@ -1454,7 +1748,7 @@ mod tests {
             ],
         };
         let mut diagnostics = ExtractionDiagnostics::default();
-        let reading = sanitize(vec![page], &mut [], &mut diagnostics);
+        let reading = sanitize(vec![page], &mut [], &[], &mut diagnostics);
 
         let aside = bbox_at(&reading, "Serialization");
         assert_eq!((aside.x, aside.y), (20.0, 100.0));
@@ -1544,7 +1838,7 @@ mod tests {
             body_page(2, vec![line(vec![word("delta", 100.0, 100.0)])]),
         ];
         let mut diagnostics = ExtractionDiagnostics::default();
-        let reading = sanitize(pages, &mut [], &mut diagnostics);
+        let reading = sanitize(pages, &mut [], &[], &mut diagnostics);
 
         let mut covered = vec![false; reading.text.len()];
         let mut previous_end = 0;

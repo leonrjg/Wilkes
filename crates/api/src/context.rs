@@ -1662,9 +1662,16 @@ impl AppContext {
 
                 let label = match generated {
                     Ok(Ok(label)) => label,
-                    // Every failure path leaves the label absent and logs: a
-                    // missing label is not something the user asked for.
+                    // A cluster that would not label is that cluster's
+                    // failure, and the next one is worth attempting. A gone
+                    // worker is not: the next iteration would *start* one,
+                    // which is how a cancel comes to need one kill per
+                    // cluster. See the loop invariant in AGENTS.md.
                     Ok(Err(e)) => {
+                        if wilkes_core::worker::fault::is_worker_gone(&e) {
+                            info!("Stopping cluster labelling: the generator is gone ({e:#})");
+                            break;
+                        }
                         warn!("Could not label cluster {key}: {e:#}");
                         continue;
                     }
@@ -3648,6 +3655,15 @@ impl AppContext {
                 let label = match generated {
                     Ok(Ok(label)) => label,
                     Ok(Err(error)) => {
+                        // The worker being gone ends the loop on its own,
+                        // whether or not anyone raised the flag: the next
+                        // iteration would start a replacement.
+                        if wilkes_core::worker::fault::is_worker_gone(&error) {
+                            info!(
+                                "Stopping chunk-topic labelling: the generator is gone ({error:#})"
+                            );
+                            break;
+                        }
                         if cancel_flag.load(Ordering::Relaxed) {
                             break;
                         }
@@ -6858,16 +6874,25 @@ impl AppContext {
 
     pub async fn cancel_embed(&self) {
         info!("AppContext::cancel_embed: requested");
-        info!("AppContext::cancel_embed: killing every worker immediately");
-        self.kill_all_workers();
         let Some(task) = self.embed_task.lock().take() else {
             info!("AppContext::cancel_embed: no active task");
+            self.kill_all_workers();
             return;
         };
 
+        // The flag is raised *before* the workers die, and that order is the
+        // whole point. A killed worker surfaces as an error on whatever the
+        // build was waiting for; the build then reaches its next
+        // between-document check. Raising the flag afterwards leaves a window
+        // in which that check reads false, the next document starts, and its
+        // first request spawns a replacement worker — a cancel undone by the
+        // very thing it did.
         self.embed_cancel_in_progress.store(true, Ordering::Release);
         task.cancel_flag.store(true, Ordering::Relaxed);
         task.cancel.cancel();
+
+        info!("AppContext::cancel_embed: killing every worker immediately");
+        self.kill_all_workers();
 
         match task.operation {
             EmbedOperation::Build => {

@@ -725,6 +725,10 @@ impl GraniteDocling {
 
     /// Read one image into elements, on the reader it was given.
     fn read(&self, reader: &Mutex<OnnxVlm>, image: &RgbImage) -> Result<ImageRecognition> {
+        // Visibility only: what one crop cost, in the terms that explain the
+        // cost — the prefill it bought with its tiling and the tokens it then
+        // decoded. At debug, so a production run is as quiet as it was.
+        let started = std::time::Instant::now();
         let (pixels, tiles, rows, cols) = prepare_tiles(image);
         let prompt = prompt_text(rows, cols);
         let encoded = self
@@ -732,6 +736,7 @@ impl GraniteDocling {
             .encode(prompt, false)
             .map_err(|e| anyhow::anyhow!("could not encode the prompt: {e}"))?;
         let ids = encoded.get_ids();
+        let prompt_tokens = ids.len();
 
         let slots: Vec<usize> = ids
             .iter()
@@ -787,6 +792,15 @@ impl GraniteDocling {
         let char_ends = token_char_ends(&self.tokenizer, &ids)?;
 
         let (elements, unread) = parse_doctags(&stream);
+        tracing::debug!(
+            "{MODEL_ID} decode: {}x{} px, {tiles} tile(s) {rows}x{cols}, {prompt_tokens} prompt \
+             token(s), {} emitted token(s), {} element(s), {} ms",
+            image.width(),
+            image.height(),
+            ids.len(),
+            elements.len(),
+            started.elapsed().as_millis(),
+        );
         Ok(ImageRecognition {
             regions: elements
                 .into_iter()
@@ -816,7 +830,7 @@ impl GraniteDocling {
 /// rather than the first to happen, so a run's outcome does not depend on
 /// which hand lost the race. Hands already mid-item when another fails finish
 /// it; there is nowhere to put a half-read page.
-fn in_parallel<T, R>(
+pub(super) fn in_parallel<T, R>(
     items: &[T],
     hands: usize,
     read: impl Fn(usize, &T) -> Result<R> + Sync,
@@ -912,6 +926,18 @@ fn to_region(element: Element, char_ends: &[usize], logprobs: &[f32]) -> Option<
         // quadrilateral, and the corners are that box's, in the same order
         // the other recognizer emits them.
         quad: [at(x0, y0), at(x1, y0), at(x1, y1), at(x0, y1)],
+        // Never truncated by construction: `parse_doctags` only ever builds
+        // an `Element` from a `<tag>…</tag>` pair it found *both* halves of.
+        // A decode that hit its cap mid-element leaves that element without
+        // its closing tag, and the parser drops it — with everything after
+        // it — rather than handing back a partial body. So the one signal
+        // Texify needs wired through here would never fire: nothing that
+        // reaches `to_region` was cut off by the cap that produced it.
+        truncated: false,
+        // A page reader transcribes; it fills no grid from the page, so there
+        // is nothing here for the structural table clauses to judge. See
+        // `SpottedRegion::structure`.
+        structure: None,
     })
 }
 
@@ -928,11 +954,27 @@ impl OcrEngine for GraniteDocling {
     fn spot_batch(&self, images: &[RgbImage]) -> Result<Vec<ImageRecognition>> {
         let done = std::sync::atomic::AtomicUsize::new(0);
         in_parallel(images, self.readers.len(), |hand, image| {
+            let started = std::time::Instant::now();
             let read = self.read(&self.readers[hand], image);
             tracing::info!(
                 "read image {} of {} with {MODEL_ID}",
                 done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                 images.len()
+            );
+            // Visibility only: which item of the batch that was, so a call's
+            // cost can be attributed to the crop it read. The position is the
+            // item's own place in the slice, which is the order the caller
+            // matches results back in.
+            tracing::debug!(
+                "{MODEL_ID} batch item #{} of {}: {}x{} px, {} ms",
+                images
+                    .iter()
+                    .position(|other| std::ptr::eq(other, image))
+                    .map_or(-1i64, |at| at as i64),
+                images.len(),
+                image.width(),
+                image.height(),
+                started.elapsed().as_millis(),
             );
             read
         })

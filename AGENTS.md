@@ -41,5 +41,48 @@ does not extend to work that is not inference — mupdf rendering, image decode,
 chunking and index writing stay in the host by design; see `WorkerRequest`'s
 own doc comment for why.
 
+## Invariant: workers are never started inside a loop
+
+A worker is started by submitting to a manager that has no live process. So
+every host loop that submits per item is a loop that starts workers, and the
+only question is when.
+
+**Why.** Cancelling is killing — there is no cooperative token in the
+extraction path, by design, because the only way to stop inference that has
+stopped making progress is to kill the process running it. A kill ends exactly
+one in-flight request. If the caller was looping, its next iteration submits
+again, finds no process, and spawns a replacement that reloads the model. The
+user pressed cancel once; the work needs to be killed once per item. Layout
+detection was asked page by page, so cancelling a four-hundred-page book meant
+four hundred kills and four hundred ONNX loads, and the progress bar sat at
+"Cancelling..." indefinitely with a freshly-started worker in the log.
+
+**How to hold it.**
+- **The unit that crosses the pipe is the unit the loop was over.** A
+  document's pages go out in one `LayoutRequest`, its crops in one
+  `RecognitionRequest`. The loop then runs in the worker, next to the resident
+  model, where killing the process ends it. Rendering, decoding and staging
+  stay in the host — what moves across is the loop, not the rasterizer.
+- **Where a loop genuinely cannot be moved, it must end rather than restart.**
+  Embedding batches exist to bound peak memory and cannot become one request;
+  the batch loop stops instead. That is what `worker::fault` is for: a
+  `WorkerFault::gone` says the process ended, and every loop that submits
+  treats it as terminal rather than as this item's failure. Never answer this
+  question by matching an error message.
+- **Raise the build's cancel flag before killing the workers**, never after.
+  The kill surfaces as an error on whatever the build was waiting for; if the
+  flag is not up by the time the build reaches its next between-document check,
+  the next document starts and its first request spawns a replacement.
+
+**Enforcement.** `WorkerRuntime` counts every worker it starts to replace one
+that died under a request, and logs an error naming this invariant on the
+first. Zero is the only correct count. A violation is loud in the log rather
+than silent in a progress bar.
+
+**Boundary.** This is about *starting* processes, not about how much work
+crosses. A loop inside a worker over a resident model — `DocLayout::detect_document`
+over a document's pages, `vision::spot_batch` over its images — is where a loop
+belongs, and is not a violation.
+
 ## Rust Guidelines
 - Never index or slice strings by byte offset; always use character-aware method. Byte indexing (&s[..n]) is only safe when you can prove the offset is a char boundary, which is almost never true for arbitrary runtime strings.

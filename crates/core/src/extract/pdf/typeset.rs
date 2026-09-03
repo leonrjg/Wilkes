@@ -39,17 +39,35 @@
 //! render it for the recognizer. Nothing in this module decides what an area
 //! *contains*.
 //!
+//! ## A region need not stand on any glyph
+//!
+//! Two kinds of page draw the same expression. One sets it in glyphs, and the
+//! text layer holds a flattened run this module marks out and hands to a
+//! recognizer to replace. The other draws it as vector paths — a browser
+//! printing MathJax does this, and the mathematics textbooks in the corpus are
+//! printed that way — and the text layer holds *nothing* there. Those are
+//! precisely the expressions a reading most needs a recognizer for: without
+//! one the reading has a hole where the mathematics was, and no run of glyphs
+//! marks the place.
+//!
+//! So a region is not required to cover a word. One that does replaces the
+//! words it covers; one that covers none replaces nothing and is written into
+//! the reading *after* an [`Anchor`] taken from the page's own geometry — the
+//! last word the reading passes before it reaches that area. Both are the same
+//! thing said once: a region's reading goes where the page put the region.
+//!
 //! ## Everything it finds still fails safe
 //!
 //! A region marked out here is only a decision to *spend a recognizer call*.
 //! Whether its answer replaces the page's glyphs is settled afterwards by the
 //! same admission rules every other region meets — a formula on whether its
 //! LaTeX closes, a table on whether it is rectangular. A false positive costs
-//! time and changes no bytes: the region is refused and the glyph run the page
-//! drew stays exactly where it was.
+//! time and changes no bytes: the region is refused, and the glyph run the
+//! page drew stays exactly where it was — or, for a region that replaced no
+//! glyphs, nothing is inserted at all.
 
 use mupdf::{Colorspace, Device, IRect, Matrix};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::extract::image::{self, DiscoveredImage, LayoutRegion, NativeImage};
 use crate::types::{BoundingBox, ImageTransform, RegionKind, RegionOrigin};
@@ -64,8 +82,11 @@ use crate::types::{BoundingBox, ImageTransform, RegionKind, RegionOrigin};
 ///
 /// v7 is the layout detector replacing the font and rule heuristics. v8 marks
 /// out *words* rather than lines, which both tightens every crop to the glyphs
-/// it replaces and makes an expression inside a sentence routable at all.
-pub(super) const ROUTING_VERSION: &str = "typeset-routing-v8";
+/// it replaces and makes an expression inside a sentence routable at all. v9
+/// keeps a region that covers no word at all — an expression the page drew as
+/// paths — and anchors its reading into the page's own reading order, where v8
+/// dropped it for having no glyph run to replace.
+pub(super) const ROUTING_VERSION: &str = "typeset-routing-v9";
 
 /// How much of a page word must fall inside a detected area for the area to
 /// speak for that word.
@@ -77,6 +98,17 @@ pub(super) const ROUTING_VERSION: &str = "typeset-routing-v8";
 /// its edge is not. The alternative, requiring total containment, loses the
 /// last word of every region whose box the detector drew a point tight.
 const WORD_INSIDE_SHARE: f32 = 0.5;
+
+/// How much of the shorter of two vertical spans a word and a region must
+/// share to be standing on one line of the page.
+///
+/// The same majority as [`WORD_INSIDE_SHARE`] and for the same reason, asked
+/// of a different thing: not "is this word part of this area" but "does the
+/// reading pass this word on its way along the line the area sits in". A
+/// display expression set between two paragraphs grazes the descenders of the
+/// line above it and is not on that line; an expression inside a sentence
+/// shares nearly the whole of it.
+const LINE_SHARE: f32 = 0.5;
 
 /// White space left around a region when it is rendered, in points.
 ///
@@ -127,8 +159,13 @@ const MAX_ASPECT: f32 = 4.0;
 /// formula's box, grown by the render margin, reached into the words either
 /// side of it, and the recognizer was handed `th √n ∈ ℕ. T` and read the prose
 /// as mathematics.
+///
+/// `pub` for the same reason [`regions`] is: what a formula crop actually
+/// contains is decided by which of these it claims, and a probe that answered
+/// that against its own claiming rule would be measuring a pipeline nobody
+/// runs.
 #[derive(Clone, Debug)]
-pub(super) struct WordBox {
+pub struct WordBox {
     /// Index of the block this word belongs to, in the page's block list.
     pub block: usize,
     /// Index of the line within that block.
@@ -148,9 +185,48 @@ impl WordBox {
     }
 }
 
+/// What one page's text layer holds, as [`regions`] needs it: the words it
+/// draws, and where it draws a picture.
+///
+/// One struct rather than two arguments because the two answer one question —
+/// what is already on this page and already spoken for — and a caller that
+/// surveyed the words without the pictures would route a formula that is part
+/// of a figure into the prose beside it.
+pub struct PageSurvey {
+    /// Every word the page draws, in the order the reading takes them.
+    pub words: Vec<WordBox>,
+    /// Where the page draws a picture, in page points. An area the recognizer
+    /// would be handed twice otherwise: the picture is discovered and read as
+    /// itself, and a formula the detector found *inside* it has no place in
+    /// the prose around it.
+    pub drawn: Vec<BoundingBox>,
+}
+
+/// Where the reading of a region that replaces no words of the page goes.
+///
+/// The page's own geometry answers, and it answers in one rule: after the last
+/// word the reading passes before it reaches this area. See [`anchor_after`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Anchor {
+    /// The word this region follows, as `(block, line, word)` — or `None` when
+    /// nothing on the page precedes it, which is the head of the page.
+    pub after: Option<(usize, usize, usize)>,
+    /// Whether the area shares its line with words of the page — an
+    /// expression inside a sentence, written into the reading beside that
+    /// word — or stands alone on its line, which is a display expression
+    /// between two paragraphs and takes a line of its own below that word.
+    ///
+    /// Not the same question as "is [`Self::after`] on the area's own line".
+    /// A sentence that wraps so that the expression begins the new line has
+    /// nothing to its left to follow, so it follows the line above; it is
+    /// still inside a sentence, and giving it a line of its own would put a
+    /// labelled block in the middle of one.
+    pub inline: bool,
+}
+
 /// One area of one page to render and read, and the words it stands in place
 /// of.
-pub(super) struct TypesetRegion {
+pub struct TypesetRegion {
     pub page: u32,
     /// What the detector called this area. Carried through to discovery, where
     /// it decides which recognizer reads the region — a formula and a page are
@@ -161,7 +237,15 @@ pub(super) struct TypesetRegion {
     /// The page's own words this region covers, as `(block, line, word)`.
     /// These are the page's glyphs, and they leave the reading only if the
     /// recognizer's answer for this region is admitted.
+    ///
+    /// Empty for an expression the page drew as paths: the text layer holds
+    /// nothing under it, so there is nothing to replace and [`Self::anchor`]
+    /// says where its reading is written instead.
     pub words: Vec<(usize, usize, usize)>,
+    /// Where the reading goes when this region replaces nothing. `Some` when
+    /// and only when [`Self::words`] is empty — the words say it otherwise,
+    /// and two answers to one question is what this keeps out.
+    pub anchor: Option<Anchor>,
 }
 
 /// Turn one page's detections into the regions that will be rendered and read.
@@ -174,25 +258,34 @@ pub(super) struct TypesetRegion {
 ///    [`crate::extract::image::doclayout::kind_of`] — and rendering those
 ///    would be a recognizer call whose answer is discarded by rule.
 /// 2. The remaining boxes are put into page coordinates and matched to the
-///    page's own lines by containment.
-/// 3. An area covering no line *of its own* is dropped. Not because it is
-///    wrong — the detector may well have found a picture the page draws — but
-///    because there is no glyph run for its reading to stand in place of, and
-///    this path's whole contract is that a typeset region replaces one.
+///    page's own words by containment.
+/// 3. An area covering no word takes an [`Anchor`] instead — it is an
+///    expression the page drew rather than set, and the reading is where it
+///    belongs even though there is no glyph run for it to displace. It is
+///    dropped only when something already speaks for that area: a picture the
+///    page draws, or a larger region already kept. A formula inside a figure
+///    is part of that figure, and one inside a table is read by the table.
 ///
-/// A line belongs to at most one region. The detector's classes nest — a
-/// display formula inside a table, a formula number beside one — and two
-/// regions claiming the same glyph run would mean one of them reading a line
-/// that has already left the document with the other. Largest first, so the
-/// enclosing structure owns what it encloses: a formula inside a table cell is
-/// better read as part of the table than as a formula the table then reads
-/// again.
-pub(super) fn regions(
+/// A word belongs to at most one region, and so does an area. The detector's
+/// classes nest — a display formula inside a table, a formula number beside
+/// one — and two regions claiming the same glyph run would mean one of them
+/// reading a line that has already left the document with the other. Largest
+/// first, so the enclosing structure owns what it encloses: a formula inside a
+/// table cell is better read as part of the table than as a formula the table
+/// then reads again.
+///
+/// `pub` so a probe can measure what reaches the recognizer rather than what
+/// the detector proposed. The two are not the same number — a detection whose
+/// every word another detection already claimed is dropped right here — and a
+/// probe that scored `decode`'s output alone would report a gain this stage
+/// then takes back. Nothing outside the backend calls it to extract with.
+pub fn regions(
     page: u32,
     bounds: &BoundingBox,
     detections: &[LayoutRegion],
-    words: &[WordBox],
+    survey: &PageSurvey,
 ) -> Vec<TypesetRegion> {
+    let words = &survey.words;
     let mut order: Vec<&LayoutRegion> = detections
         .iter()
         .filter(|detection| detection.kind.is_some())
@@ -207,6 +300,12 @@ pub(super) fn regions(
     });
 
     let mut claimed = vec![false; words.len()];
+    // The areas of this page already spoken for: the pictures it draws, and
+    // every region kept below. Only a region that claims no word is asked
+    // about it — one that claims words has already taken them from every other
+    // region, and this is that same claim made where there are no words to
+    // make it with.
+    let mut occupied: Vec<BoundingBox> = survey.drawn.clone();
     let mut found = Vec::new();
     for detection in order {
         let area = BoundingBox {
@@ -223,39 +322,139 @@ pub(super) fn regions(
             })
             .map(|(index, _)| index)
             .collect();
-        if owned.is_empty() {
-            continue;
-        }
-        for index in &owned {
-            claimed[*index] = true;
-        }
         // The area the recognizer sees is the union of the words it speaks
         // for, and no more.
         //
         // The detector's own box is deliberately *not* unioned in. It is drawn
-        // on an 800x800 render of the page and lands a point or two wide of
-        // the ink either side; at line granularity that slack fell in the
-        // margin and cost nothing, and at word granularity it is the
-        // neighbouring word. What the region replaces is these words, so what
-        // it shows is these words.
-        let hull = owned
-            .iter()
-            .map(|index| words[*index].bbox.clone())
-            .reduce(|hull, bbox| union(&hull, &bbox))
-            .expect("a region owns at least one word");
+        // on a square render of the page — whatever side the detector asked
+        // for — and lands a point or two wide of the ink either side, more so
+        // for a box the detector assembled from two tiles; at line granularity
+        // that slack fell in the margin and cost nothing, and at word
+        // granularity it is the neighbouring word. What the region replaces is
+        // these words, so what it shows is these words.
+        //
+        // A region that replaces no words is the one case where the detector's
+        // box is what gets rendered, because it is the only evidence there is:
+        // the page drew that expression as paths and the text layer says
+        // nothing at all about where it sits. The margin still gives way
+        // rather than reach into a word the region does not own, so the slack
+        // costs at worst a few points of paper.
+        let (hull, anchor) = match owned.first() {
+            Some(_) => (
+                owned
+                    .iter()
+                    .map(|index| words[*index].bbox.clone())
+                    .reduce(|hull, bbox| union(&hull, &bbox))
+                    .expect("a non-empty claim has a first word"),
+                None,
+            ),
+            None => {
+                if occupied
+                    .iter()
+                    .any(|taken| share_inside(&area, taken) >= WORD_INSIDE_SHARE)
+                {
+                    debug!(
+                        "page {page}: a {} at {:.0},{:.0} covers no word of the page and sits \
+                         inside an area already spoken for — dropped",
+                        detection.label, area.x, area.y
+                    );
+                    continue;
+                }
+                (area.clone(), Some(anchor_after(&area, words)))
+            }
+        };
+        for index in &owned {
+            claimed[*index] = true;
+        }
+        let bbox = with_margin_clear_of(&hull, words, &owned);
+        occupied.push(bbox.clone());
         found.push(TypesetRegion {
             page,
             kind: detection
                 .kind
                 .expect("kind-less detections were filtered out"),
-            bbox: with_margin_clear_of(&hull, words, &owned),
+            bbox,
             words: owned
                 .iter()
                 .map(|index| (words[*index].block, words[*index].line, words[*index].word))
                 .collect(),
+            anchor,
         });
     }
     found
+}
+
+/// Where in the page's reading an area that covers no word of it belongs.
+///
+/// Two questions of the page's own geometry, and nothing else. *Does anything
+/// stand on this area's line?* — that says whether the area is an expression
+/// inside a sentence or one the page set apart. And *what does the reading
+/// meet last before this?* — that says where it goes.
+///
+/// - An area that **shares its line** with at least one word is inline: it is
+///   part of a sentence, and its reading belongs in that sentence with no line
+///   or label of its own. It follows the last word of that line ending to its
+///   left; where every word of the line is to its *right* — a wrapped sentence
+///   that begins with the expression — it follows the last word of the line
+///   above, still inline, because the thing after it is prose that continues.
+/// - An area that shares its line with **nothing** is a block: the page set it
+///   between two paragraphs. It follows the last word of the nearest line
+///   above and takes a line of its own below it.
+/// - With no line above either, nothing on the page precedes the area — a page
+///   whose text layer holds no words at all, or an area above every word it
+///   does hold — and it belongs at the head of the page.
+///
+/// Not a fallback chain: `inline` is answered once, by whether the area has
+/// company on its line, and the position is the last word the reading passes,
+/// looked for on that line and then on the lines above it.
+fn anchor_after(area: &BoundingBox, words: &[WordBox]) -> Anchor {
+    let bottom = area.y + area.height;
+    // Standing on one line of the page: sharing at least half the shorter of
+    // the two vertical spans, which is what claims a word for a region too.
+    let shares_line = |word: &&WordBox| {
+        let overlap = word.bottom().min(bottom) - word.bbox.y.max(area.y);
+        overlap > 0.0 && overlap >= LINE_SHARE * word.bbox.height.min(area.height)
+    };
+    let on_this_line: Vec<&WordBox> = words.iter().filter(shares_line).collect();
+    let inline = !on_this_line.is_empty();
+
+    if let Some(word) = on_this_line
+        .iter()
+        .filter(|word| word.right() <= area.x)
+        .max_by_key(|word| (word.block, word.line, word.word))
+    {
+        return Anchor {
+            after: Some((word.block, word.line, word.word)),
+            inline: true,
+        };
+    }
+
+    // The nearest line above, by where the page drew it. Ties broken by the
+    // reading's own order, so two lines set at the same height do not resolve
+    // differently depending on which the survey reached first.
+    let Some(nearest) = words
+        .iter()
+        .filter(|word| word.bottom() <= area.y)
+        .max_by(|a, b| {
+            a.bottom()
+                .total_cmp(&b.bottom())
+                .then((a.block, a.line, a.word).cmp(&(b.block, b.line, b.word)))
+        })
+    else {
+        return Anchor {
+            after: None,
+            inline: false,
+        };
+    };
+    let last = words
+        .iter()
+        .filter(|word| (word.block, word.line) == (nearest.block, nearest.line))
+        .max_by_key(|word| word.word)
+        .expect("the line a word stands on holds that word");
+    Anchor {
+        after: Some((last.block, last.line, last.word)),
+        inline,
+    }
 }
 
 /// How much of `word` falls inside `area`, as a share of the word's own area.
@@ -292,7 +491,12 @@ fn union(a: &BoundingBox, b: &BoundingBox) -> BoundingBox {
 /// differently from its training is a model answering a different question.
 /// The map back to page points is therefore two independent scales, and it is
 /// done by [`regions`] from the page's own bounds.
-pub(super) fn render_page(page: &mupdf::Page, side: u32) -> anyhow::Result<::image::RgbImage> {
+///
+/// `side` is whatever the detector's `input_side` asked for and is not assumed
+/// to be the size of the square its graph is fed: the detector may want more
+/// page than that and cut it up itself, and cutting it up here would be
+/// inference geometry in the host.
+pub fn render_page(page: &mupdf::Page, side: u32) -> anyhow::Result<::image::RgbImage> {
     let bounds = page.bounds()?;
     let (width, height) = (bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
     anyhow::ensure!(
@@ -395,6 +599,13 @@ pub(super) fn counted(
     diagnostics: &mut crate::types::ExtractionDiagnostics,
 ) -> Vec<TypesetRegion> {
     diagnostics.typeset_regions_found = regions.len() as u32;
+    // How many of them the page drew rather than set. Counted because the two
+    // fail differently: a region that replaces a glyph run leaves the reading
+    // no worse than it was if its answer is refused, and one that replaces
+    // nothing is the only thing standing between the reading and a hole where
+    // the mathematics was.
+    diagnostics.typeset_regions_anchored =
+        regions.iter().filter(|r| r.anchor.is_some()).count() as u32;
     regions
 }
 
@@ -418,7 +629,12 @@ fn render_scale(bbox: &BoundingBox) -> f32 {
 /// Padding is applied to the pixel rectangle and not to the page rectangle.
 /// Doing it in page space and rounding to pixels afterwards was the same idea
 /// and cost twice the model: see [`pad_to_aspect`].
-pub(crate) fn render(
+///
+/// `pub` for the same reason [`regions`] is: the pixels a recognizer answers
+/// about are these pixels — this scale, this margin, this aspect padding —
+/// and a probe that drew its own crop would be measuring a recognizer nobody
+/// runs. It is what `formula_probe`'s hand-written copy of it was.
+pub fn render(
     page: &mupdf::Page,
     bbox: &BoundingBox,
 ) -> anyhow::Result<(NativeImage, BoundingBox)> {
@@ -534,6 +750,26 @@ pub(super) fn discover(
                 (None, region.bbox.clone(), Some(format!("{error:#}")))
             }
         };
+        // Visibility only: what this crop is, before any recognizer sees it —
+        // its class, the page area it covers, the pixels that area became, and
+        // how many of the page's own words it stands in place of. At debug.
+        debug!(
+            "typeset crop {id}: {:?}, {:.1}x{:.1} pt at ({:.1},{:.1}) → {}x{} px, \
+             {} word(s) claimed{}",
+            region.kind,
+            region.bbox.width,
+            region.bbox.height,
+            region.bbox.x,
+            region.bbox.y,
+            decoded.as_ref().map_or(0, |one| one.pixels.width()),
+            decoded.as_ref().map_or(0, |one| one.pixels.height()),
+            region.words.len(),
+            if region.anchor.is_some() {
+                ", anchored"
+            } else {
+                ""
+            },
+        );
         placed.push(discovered.len());
         discovered.push(DiscoveredImage {
             id,
@@ -554,9 +790,9 @@ pub(super) fn discover(
             decoded,
             rejected,
             // A typeset region only exists because something is going to read
-            // it: the detector marked it out, it covers a line of the page's
-            // own, and the page was rendered for it. There is no scope under
-            // which one is withheld.
+            // it: the detector marked it out, the page's reading has a place
+            // for it, and the page was rendered for it. There is no scope
+            // under which one is withheld.
             withheld_by_scope: false,
             kind: Some(region.kind),
         });
@@ -588,6 +824,14 @@ mod tests {
     fn nth(mut boxed: WordBox, index: usize) -> WordBox {
         boxed.word = index;
         boxed
+    }
+
+    /// A page whose text layer holds these words and draws nothing.
+    fn survey(words: Vec<WordBox>) -> PageSurvey {
+        PageSurvey {
+            words,
+            drawn: Vec::new(),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -628,7 +872,7 @@ mod tests {
             3,
             &page_bounds(),
             &[detected(Some(RegionKind::Formula), 0.1, 0.24, 0.6, 0.03)],
-            &lines,
+            &survey(lines),
         );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].page, 3);
@@ -684,7 +928,7 @@ mod tests {
                 42.0 / 600.0,
                 12.0 / 800.0,
             )],
-            &lines,
+            &survey(lines),
         );
 
         assert_eq!(found.len(), 1);
@@ -710,21 +954,169 @@ mod tests {
             1,
             &page_bounds(),
             &[detected(None, 0.1, 0.24, 0.6, 0.03)],
-            &lines
+            &survey(lines)
         )
         .is_empty());
     }
 
-    /// A detected area with no glyph run under it has nothing to stand in
-    /// place of, which is this path's whole contract.
+    // ── An area with no glyph run under it ──────────────────────────────────
+    //
+    // The page drew the expression as paths, so there is nothing to replace.
+    // It is still read, and the page's own geometry says where its reading
+    // goes.
+
+    /// The detection at 0.24 x 800 = 192 lands between two words of one line,
+    /// and follows the one on its left.
     #[test]
-    fn a_detection_over_no_line_is_dropped() {
-        let lines = vec![word(0, 0, 100.0, 700.0, 300.0, 12.0)];
+    fn an_area_over_no_glyphs_is_anchored_inside_the_line_it_stands_in() {
+        let lines = vec![
+            nth(word(0, 0, 20.0, 195.0, 30.0, 12.0), 0),
+            nth(word(0, 0, 430.0, 195.0, 30.0, 12.0), 1),
+        ];
+        let found = regions(
+            1,
+            &page_bounds(),
+            &[detected(Some(RegionKind::Formula), 0.1, 0.24, 0.6, 0.03)],
+            &survey(lines),
+        );
+        assert_eq!(found.len(), 1, "an area with no words under it is read");
+        assert!(found[0].words.is_empty(), "it replaces nothing");
+        assert_eq!(
+            found[0].anchor,
+            Some(Anchor {
+                after: Some((0, 0, 0)),
+                inline: true,
+            })
+        );
+    }
+
+    /// With nothing on its own line, it follows the last word of the nearest
+    /// line above and takes a line of its own — a display expression between
+    /// two paragraphs.
+    #[test]
+    fn an_area_below_a_paragraph_follows_that_paragraphs_last_word() {
+        let lines = vec![
+            nth(word(0, 0, 100.0, 150.0, 30.0, 12.0), 0),
+            nth(word(0, 1, 100.0, 170.0, 30.0, 12.0), 0),
+            nth(word(0, 1, 200.0, 170.0, 30.0, 12.0), 1),
+        ];
+        let found = regions(
+            1,
+            &page_bounds(),
+            &[detected(Some(RegionKind::Formula), 0.1, 0.24, 0.6, 0.03)],
+            &survey(lines),
+        );
+        assert_eq!(
+            found[0].anchor,
+            Some(Anchor {
+                after: Some((0, 1, 1)),
+                inline: false,
+            })
+        );
+    }
+
+    /// A wrapped sentence that resumes with a drawn expression puts that
+    /// expression at the *start* of its line, with prose continuing to the
+    /// right of it. Nothing on the line ends to its left, so it follows the
+    /// line above — but it is inside a sentence, and a line of its own would
+    /// be a labelled block in the middle of one.
+    #[test]
+    fn an_area_beginning_a_line_prose_continues_is_inline() {
+        let lines = vec![
+            nth(word(0, 0, 100.0, 150.0, 30.0, 12.0), 0),
+            nth(word(0, 0, 200.0, 150.0, 30.0, 12.0), 1),
+            // The sentence continuing to the right of the expression, on the
+            // expression's own line.
+            nth(word(0, 1, 430.0, 195.0, 30.0, 12.0), 0),
+        ];
+        let found = regions(
+            1,
+            &page_bounds(),
+            &[detected(Some(RegionKind::Formula), 0.1, 0.24, 0.6, 0.03)],
+            &survey(lines),
+        );
+        assert_eq!(
+            found[0].anchor,
+            Some(Anchor {
+                after: Some((0, 0, 1)),
+                inline: true,
+            }),
+            "it follows the line above and stays in the sentence"
+        );
+    }
+
+    /// One set between two paragraphs shares its line with nothing, and that
+    /// is what makes it a block rather than the absence of a word to its left.
+    #[test]
+    fn an_area_alone_on_its_line_between_two_paragraphs_is_a_block() {
+        let lines = vec![
+            nth(word(0, 0, 100.0, 150.0, 30.0, 12.0), 0),
+            nth(word(0, 0, 200.0, 150.0, 30.0, 12.0), 1),
+            // The paragraph below it, well clear of the area's own band.
+            nth(word(0, 1, 100.0, 240.0, 30.0, 12.0), 0),
+        ];
+        let found = regions(
+            1,
+            &page_bounds(),
+            &[detected(Some(RegionKind::Formula), 0.1, 0.24, 0.6, 0.03)],
+            &survey(lines),
+        );
+        assert_eq!(
+            found[0].anchor,
+            Some(Anchor {
+                after: Some((0, 0, 1)),
+                inline: false,
+            })
+        );
+    }
+
+    /// A page whose text layer holds nothing at all — every word of it drawn
+    /// rather than set — puts its first region at the head of the page. The
+    /// crop is the detector's own box, because that is the only evidence of
+    /// where the expression is.
+    #[test]
+    fn an_area_on_a_page_with_no_words_is_anchored_at_its_head() {
+        let found = regions(
+            1,
+            &page_bounds(),
+            &[detected(Some(RegionKind::Formula), 0.1, 0.24, 0.6, 0.03)],
+            &survey(Vec::new()),
+        );
+        assert_eq!(
+            found[0].anchor,
+            Some(Anchor {
+                after: None,
+                inline: false,
+            })
+        );
+        assert_eq!(found[0].bbox.x, 60.0 - MARGIN_POINTS, "{:?}", found[0].bbox);
+        assert_eq!(
+            found[0].bbox.width,
+            360.0 + 2.0 * MARGIN_POINTS,
+            "{:?}",
+            found[0].bbox
+        );
+    }
+
+    /// An expression inside a picture the page draws belongs to that picture,
+    /// which is discovered and read as itself. Anchoring it would splice a
+    /// figure's mathematics into the prose beside the figure.
+    #[test]
+    fn an_area_inside_a_picture_the_page_draws_is_dropped() {
+        let survey = PageSurvey {
+            words: Vec::new(),
+            drawn: vec![BoundingBox {
+                x: 50.0,
+                y: 180.0,
+                width: 400.0,
+                height: 60.0,
+            }],
+        };
         assert!(regions(
             1,
             &page_bounds(),
             &[detected(Some(RegionKind::Formula), 0.1, 0.24, 0.6, 0.03)],
-            &lines,
+            &survey,
         )
         .is_empty());
     }
@@ -744,7 +1136,7 @@ mod tests {
             1,
             &page_bounds(),
             &[detected(Some(RegionKind::Formula), 0.1, 0.24, 0.6, 0.03)],
-            &lines,
+            &survey(lines),
         );
         assert_eq!(found[0].words, vec![(0, 0, 0)], "the grazed line stays");
     }
@@ -761,7 +1153,7 @@ mod tests {
             1,
             &page_bounds(),
             &[detected(Some(RegionKind::Formula), 0.1, 0.24, 0.6, 0.03)],
-            &lines,
+            &survey(lines),
         );
         let right = found[0].bbox.x + found[0].bbox.width;
         assert!(right >= 520.0, "the region reaches the line's end: {right}");
@@ -778,7 +1170,7 @@ mod tests {
             1,
             &page_bounds(),
             &[detected(Some(RegionKind::Formula), 0.1, 0.24, 0.6, 0.05)],
-            &lines,
+            &survey(lines),
         );
         assert_eq!(found[0].words, vec![(0, 0, 0), (0, 1, 0)]);
     }
@@ -811,7 +1203,7 @@ mod tests {
             vec![table.clone(), formula.clone()],
             vec![formula.clone(), table.clone()],
         ] {
-            let found = regions(1, &page_bounds(), &order, &lines);
+            let found = regions(1, &page_bounds(), &order, &survey(lines.clone()));
             assert_eq!(found.len(), 1, "the enclosed region is not also read");
             assert_eq!(found[0].words, vec![(0, 0, 0), (0, 1, 0)]);
         }
@@ -832,7 +1224,7 @@ mod tests {
                 detected(Some(RegionKind::Formula), 0.1, 0.24, 0.6, 0.03),
                 detected(Some(RegionKind::Formula), 0.1, 0.615, 0.6, 0.03),
             ],
-            &lines,
+            &survey(lines),
         );
         assert_eq!(found.len(), 2);
     }
@@ -981,6 +1373,7 @@ mod tests {
                 height: 1.0,
             },
             words: Vec::new(),
+            anchor: None,
         };
         let mut diagnostics = crate::types::ExtractionDiagnostics::default();
         let kept = counted((0..417).map(|_| region()).collect(), &mut diagnostics);

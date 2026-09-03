@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use crate::generate::{GenerationRuntime, GenerationTimings};
 
 use super::ipc::{WorkerEvent, WorkerKind, WorkerRequest};
+use super::process::Stop;
 use super::runtime::{supervised_manager_loop, ActiveProcessSlot};
 use super::DEFAULT_IDLE_TIMEOUT_SECS;
 
@@ -217,11 +218,30 @@ impl WorkerManager {
         let _ = self.try_send(ManagerCommand::CancelActiveRequest);
     }
 
+    /// Stop the worker between requests, giving it the roof knock.
+    ///
+    /// What a caller uses when it is *done* with the worker — the end of a
+    /// recognition pass, a model it no longer needs resident. The worker is
+    /// not mid-inference, so it notices the closed stdin and exits.
     pub fn request_shutdown(&self) {
+        self.stop(Stop::RoofKnock);
+    }
+
+    /// Kill the worker now, without waiting for it to agree.
+    ///
+    /// For a caller that knows the worker is mid-inference and so is not
+    /// reading the stdin a knock arrives on. No caller takes this path today —
+    /// cancellation goes through [`Self::request_shutdown`] like everything
+    /// else — so a worker being cancelled still gets its grace period.
+    pub fn kill_now(&self) {
+        self.stop(Stop::Now);
+    }
+
+    fn stop(&self, stop: Stop) {
         if let Some(proc) = self.active_process.lock().unwrap().take() {
             let active_pid = Arc::clone(&self.active_pid);
             tokio::spawn(async move {
-                proc.shutdown(&active_pid).await;
+                proc.shutdown(&active_pid, stop).await;
             });
         }
         let _ = self.try_send(ManagerCommand::ShutdownWorker);
@@ -427,6 +447,7 @@ mod tests {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
         });
 
         manager
@@ -488,6 +509,7 @@ mod tests {
             generate: None,
             recognize: None,
             layout: None,
+            table: None,
         });
 
         manager

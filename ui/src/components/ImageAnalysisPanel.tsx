@@ -9,6 +9,7 @@ import {
   type RecognitionEngine,
   type RecognizerDescriptor,
   type RecognizerInventory,
+  type RecognizerRole,
   type Settings,
 } from "../lib/types";
 import ModelCatalog, { formatModelBytes } from "./ModelCatalog";
@@ -64,6 +65,64 @@ const ENGINE_BLURBS: Record<RecognitionEngine, string> = {
   Vision: "The recognizer built into macOS. Reads lines of prose about a hundred times faster than either model, with nothing to download \u2014 but no formulas, no tables and no figure regions. Choosing it trades that structure away.",
 };
 
+/** The readers that are not the page recognizer, in the order they are shown.
+ *
+ *  Each is a card rather than a row in the picker below, because none of them
+ *  is an *alternative* to the page reader — they run alongside one, on the
+ *  areas the detector marked out for them. Which model fills each card is the
+ *  `role` the backend declares on its catalogue row, never a list of ids kept
+ *  here: a second copy of which-is-which is how a formula reader eventually
+ *  gets offered as the page recognizer.
+ *
+ *  One table rather than one hand-written section apiece, so a third role is a
+ *  row here and the card stays a single piece of markup. */
+const HELPER_READERS: Array<{
+  role: RecognizerRole;
+  heading: string;
+  blurb: React.ReactNode;
+  button: string;
+  /** What is lost while it is not installed. Said where the download is
+   *  offered, because it cannot be inferred from the reading afterwards. */
+  absent: string;
+}> = [
+  {
+    role: "formula",
+    heading: "Reading the formulas",
+    blurb: (
+      <>
+        A model that reads whole pages comes apart on a crop of one expression,
+        so formulas go to a model trained on exactly that and pictures go to the
+        page reader below. It recovers what the page's own text cannot carry at
+        all: where a document draws{" "}
+        <span className="font-mono">A ⋁ B ⇔ B ⋁ A</span>, the font names nothing
+        for the <span className="font-mono">⇔</span> and the operator is simply
+        missing from the text — this reads it back.
+      </>
+    ),
+    button: "Download formula reader",
+    absent:
+      "Not installed — formulas will go to the page reader instead, which on measurement reads almost none of them. Reading still works, and installing this later re-reads the documents that have formulas in them.",
+  },
+  {
+    role: "table",
+    heading: "Reading the tables",
+    blurb: (
+      <>
+        A ruled table the page typesets already holds its text as real glyphs;
+        what is missing is only which cell each word sits in. So this model is
+        asked for the <em>grid</em> — rows, columns and merged cells — and the
+        cells are filled from the page's own text. Nothing transcribes glyphs
+        the document already has. Measured on a 168-page textbook: 23 ms a table
+        against the page reader's 7.4 s, and more than twice as many tables
+        admitted.
+      </>
+    ),
+    button: "Download table reader",
+    absent:
+      "Not installed — ruled tables will go to the page reader instead, which on measurement re-typed a third of them correctly and returned prose for the rest. Reading still works, and installing this later re-reads the documents that have tables in them.",
+  },
+];
+
 /** What ModelCatalog needs, said in the recognizer's own terms. The footprint
  *  *is* the download, and the engine's own default is the recommendation when
  *  it is not the catalogue-wide one. */
@@ -96,9 +155,9 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
   const [draftEngine, setDraftEngine] = useState<RecognitionEngine>(analysis.engine);
   const [draftModel, setDraftModel] = useState<string | null>(analysis.model);
   const [inventory, setInventory] = useState<RecognizerInventory | null>(null);
-  const [formulaInventory, setFormulaInventory] = useState<RecognizerInventory | null>(
-    null,
-  );
+  const [helperInventory, setHelperInventory] = useState<
+    Partial<Record<RecognizerRole, RecognizerInventory>>
+  >({});
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -116,10 +175,15 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
     () => recognizers.filter((model) => model.role === "page"),
     [recognizers],
   );
-  // One today. Rendered as a card rather than a picker for that reason — when
-  // there are two, this becomes a list and nothing else changes.
-  const formula = useMemo(
-    () => recognizers.find((model) => model.role === "formula") ?? null,
+  // The cards above the picker, one per role in HELPER_READERS that this build
+  // actually ships. A role with no catalogue row is a build that cannot read
+  // that kind at all, and it is simply absent rather than shown as broken.
+  const helpers = useMemo(
+    () =>
+      HELPER_READERS.flatMap((copy) => {
+        const model = recognizers.find((entry) => entry.role === copy.role);
+        return model ? [{ copy, model }] : [];
+      }),
     [recognizers],
   );
 
@@ -218,25 +282,26 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
   // files. The licence is disclosed beside the download button, so it is
   // fetched whether or not the model is installed.
   useEffect(() => {
-    if (!formula) {
-      setFormulaInventory(null);
-      return;
-    }
     let mounted = true;
-    api
-      .imageRecognizerInventory(formula.engine, formula.model_id)
-      .then((next) => {
-        if (mounted) setFormulaInventory(next);
-      })
-      .catch((cause) => {
-        if (!mounted) return;
-        setFormulaInventory(null);
-        console.error("imageRecognizerInventory failed for the formula reader:", cause);
-      });
+    setHelperInventory({});
+    for (const { copy, model } of helpers) {
+      api
+        .imageRecognizerInventory(model.engine, model.model_id)
+        .then((next) => {
+          if (mounted) setHelperInventory((prev) => ({ ...prev, [copy.role]: next }));
+        })
+        .catch((cause) => {
+          if (!mounted) return;
+          console.error(
+            `imageRecognizerInventory failed for the ${copy.role} reader:`,
+            cause,
+          );
+        });
+    }
     return () => {
       mounted = false;
     };
-  }, [api, formula]);
+  }, [api, helpers]);
 
   // The install has its own event stream, and a settings change can start one
   // too, so the panel listens for backend truth rather than assuming the
@@ -357,14 +422,13 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
   };
 
   // The same call the recognizer picker makes. There is no second install
-  // path any more: a formula reader is a catalogue row, and installing one is
-  // installing a recognizer.
-  const handleInstallFormulaReader = async () => {
-    if (!formula) return;
+  // path: a formula reader and a table reader are catalogue rows, and
+  // installing one is installing a recognizer.
+  const handleInstallHelper = async (model: RecognizerDescriptor) => {
     setBusy(true);
     setError(null);
     try {
-      await api.installImageRecognizer(formula.engine, formula.model_id);
+      await api.installImageRecognizer(model.engine, model.model_id);
       await refreshCatalogue();
     } catch (cause) {
       setError(String(cause));
@@ -509,43 +573,36 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
         </section>
       )}
 
-      {/* The reader for what the detector finds. Its own section rather than a
-          row in the picker below, because it is not an alternative to the page
-          reader — it runs alongside one, on the areas the detector calls
-          formulas. The picker offers page readers; this offers the other role. */}
-      {formula && (
-        <section>
+      {/* The readers for what the detector finds. Their own sections rather
+          than rows in the picker below, because neither is an alternative to
+          the page reader — each runs alongside one, on the areas the detector
+          marks out for it. The picker offers page readers; these offer the
+          other roles. */}
+      {helpers.map(({ copy, model }) => (
+        <section key={copy.role}>
           <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-            Reading the formulas
+            {copy.heading}
           </h3>
           <div className="space-y-2 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
-            <p className="text-[10px] italic text-[var(--text-dim)]">
-              A model that reads whole pages comes apart on a crop of one
-              expression, so formulas go to a model trained on exactly that and
-              tables and pictures go to the page reader below. It recovers what
-              the page's own text cannot carry at all: where a document draws{" "}
-              <span className="font-mono">A ⋁ B ⇔ B ⋁ A</span>, the font names
-              nothing for the <span className="font-mono">⇔</span> and the
-              operator is simply missing from the text — this reads it back.
-            </p>
+            <p className="text-[10px] italic text-[var(--text-dim)]">{copy.blurb}</p>
             <div className="flex items-center gap-2 pt-1">
               <span className="font-mono text-[10px] text-[var(--text-muted)]">
-                {formula.display_name}
+                {model.display_name}
               </span>
               <span className="text-[9px] text-[var(--text-dim)]">
-                {formatModelBytes(formula.footprint_bytes)}
+                {formatModelBytes(model.footprint_bytes)}
               </span>
-              {formulaInventory && (
+              {helperInventory[copy.role] && (
                 <a
-                  href={formulaInventory.license_url}
+                  href={helperInventory[copy.role]!.license_url}
                   target="_blank"
                   rel="noreferrer"
                   className="text-[9px] text-[var(--accent-blue)] underline"
                 >
-                  {formulaInventory.license}
+                  {helperInventory[copy.role]!.license}
                 </a>
               )}
-              {formula.is_cached ? (
+              {model.is_cached ? (
                 <span className="ml-auto rounded bg-[var(--bg-active)] px-1.5 py-0.5 text-[9px] uppercase tracking-tighter text-[var(--text-dim)]">
                   Installed
                 </span>
@@ -553,24 +610,19 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
                 <button
                   type="button"
                   disabled={busy}
-                  onClick={() => void handleInstallFormulaReader()}
+                  onClick={() => void handleInstallHelper(model)}
                   className="ml-auto rounded border border-[var(--border-main)] px-2 py-1 text-[10px] text-[var(--text-main)] disabled:opacity-50"
                 >
-                  {busy ? "Working…" : "Download formula reader"}
+                  {busy ? "Working…" : copy.button}
                 </button>
               )}
             </div>
-            {!formula.is_cached && (
-              <p className="text-[10px] text-[var(--text-dim)]">
-                Not installed — formulas will go to the page reader instead,
-                which on measurement reads almost none of them. Reading still
-                works, and installing this later re-reads the documents that
-                have formulas in them.
-              </p>
+            {!model.is_cached && (
+              <p className="text-[10px] text-[var(--text-dim)]">{copy.absent}</p>
             )}
           </div>
         </section>
-      )}
+      ))}
 
       {/* Which pictures. Hidden while the feature is off, because it is a
           question about work that is not being done. It is the setting that

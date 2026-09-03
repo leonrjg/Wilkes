@@ -180,7 +180,9 @@ fn main() -> anyhow::Result<()> {
             .map_err(|reason| anyhow::anyhow!("page did not decode: {reason}"))?
             .pixels
         };
-        let found = detector.detect(&square)?;
+        let found = detector
+            .detect_document(1, &mut |_| Ok(square.clone()))?
+            .remove(0);
 
         let mut crops = Vec::new();
         let mut about = Vec::new();

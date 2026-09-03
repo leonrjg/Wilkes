@@ -1137,7 +1137,10 @@ What replaced them:
 
 - **PP-DocLayoutV2 as an ONNX graph on the `ort` already in the tree**, pinned
   to a commit rather than a branch because the class order is the contract.
-  204 MB, ~250 ms a page, one page render and one forward pass. The gating
+  204 MB. One page render and one forward pass at ~250 ms a page as first
+  built; since the formula tiles, one 1600 px render and five 800 px forward
+  passes — a whole-page pass downsampled from it, plus four tiles of it read
+  for the two formula classes only — at ~1,140 ms a page. The gating
   check this document asked for — "the layout detector's opset runs on the
   `ort` in the tree, and its labels map onto `RegionKind` without a residual
   class that has nowhere to go" — is met on the first half and deliberately
@@ -1227,7 +1230,25 @@ finding and for a reason. That model reads a whole page — hundreds of tokens
 where an early error compounds — while a formula is twenty tokens and the
 decode ends before drift accumulates. Measured at int8: `\frac{a+b}{2}<\sqrt{a
 b}`, `\sqrt{n^{2}}=n`, and a four-step derivation with `\Rightarrow` and
-`\left(a-b\right)^{2}<0`, all correct. 321 MB rather than 1.25 GB.
+`\left(a-b\right)^{2}<0`, all correct. 543 MB rather than 2.14 GB.
+
+Amended 2026-09-02. The decode carries a **key/value cache**, and the set is
+four artifacts rather than three: `decoder_model_quantized.onnx` runs step 0
+and returns the whole `present.*` cache, `decoder_with_past_model_quantized.onnx`
+runs every step after. The self-attention half grows a position a step and is
+fed straight back; the cross-attention half — the encoder's 196 positions
+projected into eight layers — is computed once and handed back unchanged, which
+is where most of the saving is. `CacheShape::discover` reads both graphs at
+load and refuses an export they do not agree about; there is no uncached loop
+left to fall back to. Measured over the fixture's five most heavily labelled
+pages, at four intra-op threads on a 10-core M4: 31.4 ms a step and 1292 ms a
+crop became 4.35 ms and 299 ms, and a math-heavy page fell from 19.0 s to
+7.5 s, the decoder's share of it from 76% to 40%. It is not free: the two
+graphs are dynamically quantized over different tensors, 14 readings of the
+fixture's 124 crops differ between them, and the recipe names the decoder graph
+so a library read under the old one is re-read. The encoder is now the largest
+stage of a math-heavy page at 44%, which is the next measurement and a
+different one.
 
 #### A region owns words
 
@@ -1244,9 +1265,10 @@ whole of what made inline mathematics routable:
 
 - **The crop is the words the region replaces**, plus whatever margin fits
   before the next word. The detector's own box is deliberately not unioned in:
-  it is drawn on an 800x800 render and lands a point or two wide of the ink,
-  which at line granularity fell in the margin and at word granularity is the
-  neighbour.
+  it is drawn on a square render of the page — 1600x1600 since the formula
+  tiles, and for a box assembled from two of them, the union of two such — and
+  lands a point or two wide of the ink, which at line granularity fell in the
+  margin and at word granularity is the neighbour.
 - **Supersession splices.** A region owning every word of the lines it touches
   is written as a block, as before. A region owning part of a line is replaced
   *in place*, and `serialize::inline_pieces` writes its reading with no label,
@@ -1259,6 +1281,68 @@ whole of what made inline mathematics routable:
 The detector remains the answer for the two cases the typography could never
 declare, and now actually answers them: an unruled table, and a document that
 sets its mathematics in a text font.
+
+#### A region need not own words
+
+Measured on the 28-page `formula_recall` fixture under the production recipe:
+the detector proposed 497 of the 555 needs_recognizer labels (90%) and only
+404 (73%) reached a crop. **83 of the 93 lost were lost because no page word
+lies under the label at all.** Those pages draw their mathematics as vector
+paths — Chrome printing MathJax does this, and it is most of the mathematics
+in the corpus — so the text layer holds nothing there, and a region with no
+words was dropped for having no glyph run to replace.
+
+That is the wrong way round. An expression the page *sets* is at worst
+flattened in the reading; an expression the page *draws* is simply absent, and
+those are the ones a recognizer is for. So the contract is now:
+
+- **A region's reading goes where the page put the region.** One that covers
+  words replaces them. One that covers none replaces nothing and is written
+  after an **anchor**: the last word the reading passes before it reaches that
+  area — a word on its own line ending to its left, else the last word of the
+  nearest line above, else the head of the page. `typeset::anchor_after` is
+  the whole of that rule and it reads only geometry.
+- **Whether it is inline is a separate question, and also geometry.** A region
+  *shares its line* when some page word overlaps it by at least half the
+  shorter of the two vertical spans — the same majority a region claims a word
+  by. One that shares its line is inside a sentence and is spliced into it;
+  one that shares its line with nothing was set apart by the page and takes a
+  line of its own. The two are not the same as "is there a word to its left":
+  a sentence that wraps so that the expression *begins* the new line has
+  nothing on its line to its left, follows the line above, and is still inside
+  a sentence. Asking only the leftward question put a labelled block in the
+  middle of a wrapped sentence, which is the one placement defect the first
+  end-to-end read of this turned up.
+- **It is one mechanism, not two.** `sanitize::supersede_typeset_regions`
+  reads marks off words and always has. A region with no words to mark is
+  given one — a *carrier*: no text, the region's mark, the region's box,
+  inserted at the anchor — and from that line on it is a marked word like any
+  other. Whether it is written as a block or spliced into a sentence is the
+  same whole-line question asked of every region. Two carriers sharing one
+  anchor are inserted in the reading's own order: inline before block, left to
+  right along a line, top to bottom down the page.
+- **A refused one inserts nothing.** The insertion happens after admission,
+  so the promise that a wrongly marked-out region costs time and no bytes
+  holds for a region that had no bytes to take.
+- **An area already spoken for is dropped, not anchored.** A picture the page
+  draws, or a larger region already kept, owns what is inside it — a formula
+  inside a figure is part of that figure, and one inside a table is read by
+  the table. That is the same nesting rule that gives words to the largest box
+  first, applied where there are no words to give.
+
+Measured on the same fixture, before and after, over the 555 labels:
+
+```text
+                     reaches Texify        cleanly        crops/page
+800 px, whole page   347 → 431 (63→78%)   275 → 348      12.6 → 15.6
+1600 px, whole page  376 → 453 (68→82%)   296 → 366      13.8 → 16.8
+1600 px + four tiles 404 → 488 (73→88%)   322 → 393      15.0 → 18.3
+```
+
+The wordless losses fall 83 → 7 under the tiled recipe and the whole loss
+column falls 94 → 12, for 3.3 more crops a page — about a second more Texify
+per page. What is left is six labels a crop overlaps but does not hold half
+of, and seven the page draws inside an area something else already reads.
 
 **A region covers the whole expression, not the fragment that seeded it.**
 Found from the first reading this produced. The page draws `y_B = w^{x_B}(mod
@@ -1419,6 +1503,12 @@ exactly like a document that had nothing more to find.
   or a failed recognition leaves the page's own glyphs untouched. The failure
   mode of a wrongly marked-out region is a wasted recognizer call, never a
   paragraph replaced by nothing.
+
+  **A region that displaces nothing is inserted by the same rule.** Where the
+  page drew the expression rather than setting it there are no glyphs to
+  suppress, and the region's reading is written at the position the page's own
+  geometry gives it — see "A region need not own words" above. Same place,
+  same admission gate, same failure mode: a refused region inserts nothing.
 
 ### Not on the path
 

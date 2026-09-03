@@ -6,8 +6,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use super::{
-    apply_command_plan, build_command_plan, parse_worker_stdout_line, ProtocolReadOutcome,
-    ROOF_KNOCK_TIMEOUT,
+    apply_command_plan, build_command_plan, parse_worker_stdout_line, ProtocolReadOutcome, Stop,
 };
 use crate::worker::ipc::{WorkerEvent, WorkerRequest};
 use crate::worker::manager::WorkerPaths;
@@ -206,18 +205,28 @@ impl WorkerProcess {
         })
     }
 
-    pub(crate) async fn shutdown(&self, pid_slot: &AtomicU32) {
+    pub(crate) async fn shutdown(&self, pid_slot: &AtomicU32, stop: Stop) {
         let child = Arc::clone(&self.child);
         let stdin = Arc::clone(&self.stdin);
         let result = tokio::task::spawn_blocking(move || {
             drop(stdin.lock().unwrap().take());
             let mut inner = child.lock().unwrap();
             let pid = inner.child.id();
+            let Some(grace) = stop.grace() else {
+                tracing::info!(
+                    "WorkerProcess::shutdown: killing pid {pid} tree without a grace period"
+                );
+                terminate_job_tree(&inner.job, pid, "cancel");
+                let _ = inner
+                    .child
+                    .wait()
+                    .map_err(|e| format!("Failed to reap worker after kill: {e}"))?;
+                return Ok(());
+            };
             tracing::info!(
-                "WorkerProcess::shutdown: sent EOF to pid {pid}; waiting up to {:?} for graceful exit",
-                ROOF_KNOCK_TIMEOUT
+                "WorkerProcess::shutdown: sent EOF to pid {pid}; waiting up to {grace:?} for graceful exit"
             );
-            match wait_for_process_exit(&mut inner.child, ROOF_KNOCK_TIMEOUT) {
+            match wait_for_process_exit(&mut inner.child, grace) {
                 Ok(true) => {
                     tracing::info!(
                         "WorkerProcess::shutdown: pid {pid} exited during grace period"
@@ -293,8 +302,8 @@ impl WorkerProcess {
             }
 
             if !success {
-                let _ = reply.blocking_send(WorkerEvent::Error(
-                    "Failed to write to worker stdin".to_string(),
+                let _ = reply.blocking_send(WorkerEvent::Gone(
+                    "failed to write to worker stdin".to_string(),
                 ));
                 return Err(());
             }
@@ -305,8 +314,8 @@ impl WorkerProcess {
                 line.clear();
                 match stdout.read_line(&mut line) {
                     Ok(0) => {
-                        let _ = reply.blocking_send(WorkerEvent::Error(
-                            "Worker process closed stdout unexpectedly".to_string(),
+                        let _ = reply.blocking_send(WorkerEvent::Gone(
+                            "worker process closed stdout unexpectedly".to_string(),
                         ));
                         return Err(());
                     }
@@ -328,8 +337,8 @@ impl WorkerProcess {
                         }
                         ProtocolReadOutcome::IgnoreNonProtocolLine => {}
                         ProtocolReadOutcome::ClosedStdout => {
-                            let _ = reply.blocking_send(WorkerEvent::Error(
-                                "Worker process closed stdout unexpectedly".to_string(),
+                            let _ = reply.blocking_send(WorkerEvent::Gone(
+                                "worker process closed stdout unexpectedly".to_string(),
                             ));
                             return Err(());
                         }
@@ -338,8 +347,8 @@ impl WorkerProcess {
                         }
                     },
                     Err(e) => {
-                        let _ = reply.blocking_send(WorkerEvent::Error(format!(
-                            "Failed to read from worker: {e}"
+                        let _ = reply.blocking_send(WorkerEvent::Gone(format!(
+                            "failed to read from worker: {e}"
                         )));
                         return Err(());
                     }
@@ -353,8 +362,8 @@ impl WorkerProcess {
             Err(e) => {
                 tracing::warn!("WorkerProcess::send_request thread join failed: {e}");
                 let _ = reply_outer
-                    .send(WorkerEvent::Error(
-                        "Worker request thread failed unexpectedly".to_string(),
+                    .send(WorkerEvent::Gone(
+                        "worker request thread failed unexpectedly".to_string(),
                     ))
                     .await;
                 Err(())
