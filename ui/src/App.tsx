@@ -17,7 +17,7 @@ import { useContextMenu, ContextMenu } from "./components/ContextMenu";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useBookmarksStore } from "./stores/useBookmarksStore";
-import { useChatStore } from "./stores/useChatStore";
+import { useChatSession, useChatStore } from "./stores/useChatStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useTopicsStore } from "./stores/useTopicsStore";
 import { useCatalogueStore } from "./stores/useCatalogueStore";
@@ -68,7 +68,7 @@ export default function App() {
   const chatPaneOpening = useChatStore((s) => s.paneOpening);
   const toggleChatPane = useChatStore((s) => s.togglePane);
   const openChatPane = useChatStore((s) => s.openPane);
-  const loadChatBackends = useChatStore((s) => s.loadBackends);
+  const loadChatBackends = useChatSession((s) => s.loadBackends);
   const { menu: chatBackendMenu, openMenu: openChatBackendMenu, closeMenu: closeChatBackendMenu } =
     useContextMenu<null>();
 
@@ -384,7 +384,7 @@ export default function App() {
                 await loadChatBackends().catch((error) => {
                   console.error("chat: failed to load backends", error);
                 });
-                const chatBackends = useChatStore.getState().backends;
+                const chatBackends = useChatSession.getState().backends;
                 openChatBackendMenu({
                   event,
                   target: null,

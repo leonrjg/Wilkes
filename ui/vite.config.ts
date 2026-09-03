@@ -10,17 +10,23 @@ import { pdfjsAssets } from "@leonrjg/wilkes-reader/vite";
 // and the dev server refuses to serve pdf.js' worker from there. Derived rather
 // than hard-coded so it holds wherever the package is linked from, and inert
 // once it is installed from a tag and lives under node_modules.
-const readerRoot = dirname(
-  createRequire(import.meta.url).resolve("@leonrjg/wilkes-reader/package.json"),
-);
+const require_ = createRequire(import.meta.url);
+const readerRoot = dirname(require_.resolve("@leonrjg/wilkes-reader/package.json"));
+// The chat is a sibling checkout, linked rather than installed, and the same
+// rule applies to reading its stylesheet off disk.
+const chatRoot = dirname(require_.resolve("@leonrjg/wilkes-chat/package.json"));
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), pdfjsAssets()],
+  // A linked package brings its own node_modules, and a second copy of React
+  // means a second hook dispatcher -- which fails as `useCallback` of null the
+  // first time a component from it renders, nowhere near the cause.
+  resolve: { dedupe: ["react", "react-dom", "zustand"] },
   clearScreen: false,
   server: {
     port: 5173,
     strictPort: true,
-    fs: { allow: [".", readerRoot] },
+    fs: { allow: [".", readerRoot, chatRoot] },
     watch: {
       ignored: ["**/src-tauri/**"],
     },

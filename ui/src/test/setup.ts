@@ -118,3 +118,11 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   save: vi.fn(),
   ask: vi.fn().mockResolvedValue(true),
 }));
+
+// jsdom has no layout, so `scrollIntoView` does not exist at all. The chat
+// pane calls it on every render that adds a message, and without this the
+// first assertion in any test that mounts it is drowned by an unrelated
+// TypeError.
+if (!Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = () => {};
+}
