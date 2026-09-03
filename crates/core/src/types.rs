@@ -2392,16 +2392,15 @@ pub struct Settings {
     pub pdf_auto_zoom_target_px: f64,
     /// Preferred agent backend for the "Ask the documents" chat pane. The
     /// in-pane selector and header dropdown may switch a session to a
-    /// different backend transiently, but this Settings field is the single
-    /// persisted default (see docs/chat-agent-integration-spec.md §7.10).
+    /// different backend transiently; this field is the single persisted
+    /// default, and Settings is its only writer.
     #[serde(default, deserialize_with = "deserialize_chat_backend_setting")]
     pub chat_backend: AgentBackend,
     /// Per-backend chat config defaults applied to newly started sessions.
     /// Written whenever the user changes a config option in the chat pane, so
-    /// each backend restores its last model/thought level/mode on a new chat
-    /// (see docs/chat-agent-integration-spec.md §7.10). Distinct from a
-    /// conversation's own `config_values` snapshot, which restores *that*
-    /// conversation on reopen.
+    /// each backend restores its last model/thought level/mode on a new chat.
+    /// Distinct from a conversation's own `config_values` snapshot, which
+    /// restores *that* conversation on reopen.
     #[serde(default)]
     pub chat_config: Vec<ChatBackendConfig>,
     /// User-authored instructions prepended to every chat turn. Kept in the

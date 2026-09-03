@@ -1,6 +1,6 @@
 //! Builds the block of text Wilkes prepends to every `session/prompt`.
 //!
-//! This is the mandatory half of context injection (spec §6.1): the agent is
+//! This is the mandatory half of context injection: the agent is
 //! never relied on to call a tool to discover the current file, because that
 //! would put a required invariant behind the model's discretion.
 
@@ -45,7 +45,8 @@ pub struct ContextFile {
     pub added_this_turn: bool,
 }
 
-/// The document currently open in `PreviewPane`, pushed via `chat_set_active_doc`.
+/// The document open in `PreviewPane`, as the window reported it with the
+/// last call it made.
 #[derive(Clone, Debug)]
 pub struct ActiveDoc {
     pub path: String,
