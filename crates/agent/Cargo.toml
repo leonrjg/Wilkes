@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 wilkes-core = { path = "../core" }
+wilkes-chat = { path = "../../../wilkes-chat/crates/wilkes-chat" }
 agent-client-protocol = "1.0.1"
 anyhow = "1"
 thiserror = "2"

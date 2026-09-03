@@ -14,6 +14,7 @@ recognize-onnx = ["wilkes-core/recognize-onnx"]
 
 [dependencies]
 wilkes-core = { path = "../core" }
+wilkes-chat = { path = "../../../wilkes-chat/crates/wilkes-chat" }
 wilkes-agent = { path = "../agent" }
 anyhow = "1"
 tracing = "0.1"
