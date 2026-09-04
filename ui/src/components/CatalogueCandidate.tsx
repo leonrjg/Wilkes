@@ -2,7 +2,7 @@ import { Check, Download, ExternalLink } from "react-feather";
 import type { CatalogueHit } from "../lib/types";
 import { api } from "../services";
 import { useCatalogueAdd } from "../hooks/useCatalogueAdd";
-import { useCatalogueStore } from "../stores/useCatalogueStore";
+import { hitKey, useCatalogueStore } from "../stores/useCatalogueStore";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 
 function formatBytes(bytes: number): string {
@@ -48,17 +48,27 @@ export default function CatalogueCandidate({ hit, compact = false }: Props) {
   const download = useCatalogueStore((s) =>
     hit.pdf_url === null ? undefined : s.downloads[hit.pdf_url],
   );
+  // A course reports its own two-stage progress; the byte stream above cannot
+  // say which of forty documents it belongs to.
+  const courseProgress = useCatalogueStore((s) =>
+    hit.landing_url === null ? undefined : s.courseProgress[hit.landing_url],
+  );
+  const course = useCatalogueStore((s) => s.courses[hitKey(hit)]);
   const link = hit.landing_url ?? hit.outline_url;
 
-  // A record the provider does not serve whole cannot be added, and says so
-  // rather than offering a button that would fail on click.
-  const acquirable = hit.pdf_url !== null;
+  // What adding would do was decided in core, from the provider that published
+  // the record. A record nothing can fetch says so rather than offering a
+  // button that would fail on click.
+  const isCourse = hit.acquisition === "course";
+  const acquirable = hit.acquisition !== "none";
 
   const addTitle = readOnly
     ? "This workspace is read-only"
     : needsDirectory
       ? "Choose a directory before adding documents"
-      : "Fetch this document and add it to the current directory";
+      : isCourse
+        ? "Fetch every document this course publishes, with a generated syllabus, into the current directory"
+        : "Fetch this document and add it to the current directory";
 
   return (
     <div className="flex items-start justify-between gap-3 py-2">
@@ -80,7 +90,44 @@ export default function CatalogueCandidate({ hit, compact = false }: Props) {
             {hit.summary}
           </p>
         )}
-        {adding && download !== undefined && (
+        {adding && isCourse && courseProgress !== undefined && (
+          <div className="flex flex-col gap-1 pt-0.5">
+            <span className="text-[10px] text-[var(--text-dim)]">
+              {courseProgress.stage === "manifest"
+                ? `Reading the course${courseProgress.total !== null ? ` — ${courseProgress.done} of ${courseProgress.total}` : ""}`
+                : `Document ${courseProgress.done}${courseProgress.total !== null ? ` of ${courseProgress.total}` : ""}`}
+            </span>
+            {courseProgress.total !== null && courseProgress.total > 0 && (
+              <div
+                role="progressbar"
+                aria-label={`Fetching ${hit.title}`}
+                aria-valuemin={0}
+                aria-valuemax={courseProgress.total}
+                aria-valuenow={courseProgress.done}
+                className="h-0.5 w-full overflow-hidden rounded bg-[var(--bg-app)]"
+              >
+                <div
+                  className="h-full bg-[var(--accent-blue)] transition-[width] duration-200"
+                  style={{
+                    width: `${Math.min(100, Math.round((courseProgress.done / courseProgress.total) * 100))}%`,
+                  }}
+                />
+              </div>
+            )}
+          </div>
+        )}
+        {added && course !== undefined && (
+          /* What a course actually turned out to be. A gap in the sequence has
+             a reason, and saying "4 audiovisual" is how a reader learns the
+             lectures they cannot find were never documents. */
+          <span className="text-[10px] text-[var(--text-dim)]">
+            {course.documents.length} document
+            {course.documents.length === 1 ? "" : "s"} and a syllabus
+            {course.skipped.length > 0 && `, ${course.skipped.length} skipped`}
+            {course.failures.length > 0 && `, ${course.failures.length} failed`}
+          </span>
+        )}
+        {adding && !isCourse && download !== undefined && (
           <div className="flex flex-col gap-1 pt-0.5">
             <span className="text-[10px] text-[var(--text-dim)]">
               {download.total_bytes !== null
@@ -113,6 +160,12 @@ export default function CatalogueCandidate({ hit, compact = false }: Props) {
           <span className="text-[10px] text-[var(--text-dim)]">
             This catalogue does not publish a downloadable copy — open it to read
             it where it lives.
+          </span>
+        )}
+        {isCourse && !adding && !added && (
+          <span className="text-[10px] text-[var(--text-dim)]">
+            A course, not a file: adding fetches its documents and writes a
+            syllabus from the pages OCW publishes only on the web.
           </span>
         )}
       </div>
@@ -156,7 +209,7 @@ export default function CatalogueCandidate({ hit, compact = false }: Props) {
                 <span aria-label="Downloading">…</span>
               ) : (
                 <>
-                  <Download size={11} /> Add
+                  <Download size={11} /> {isCourse ? "Add course" : "Add"}
                 </>
               )}
             </button>

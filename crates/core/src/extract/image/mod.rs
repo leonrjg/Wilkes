@@ -337,6 +337,24 @@ pub struct DiscoveredImage {
     /// rename.
     pub origin: RegionOrigin,
     pub bbox: BoundingBox,
+    /// The page rectangle the crop's pixels actually *show*, which is not
+    /// always the rectangle they cover.
+    ///
+    /// [`crate::extract::pdf::typeset::render`] pads a lopsided region out to
+    /// an aspect bound and clips the page to the region, so the pad is white
+    /// paper rather than more of the page: a table 450 points wide and 40 tall
+    /// is drawn on a canvas 112 points tall, and the 36 points above and below
+    /// it are blank even though the page sets prose there. `bbox` is that
+    /// canvas — it is what a cell's fractions map onto — and this is the part
+    /// of it the page was drawn into.
+    ///
+    /// The two are the same rectangle for an embedded raster, which is not
+    /// rendered at all, and for a region the render did not have to pad. They
+    /// are carried apart because "where does this cell sit on the page" and
+    /// "which of the page's words does this crop show" are different
+    /// questions, and answering the second with the canvas hands a table the
+    /// words of the paragraph above it — words its pixels never contained.
+    pub drawn: BoundingBox,
     pub transform: ImageTransform,
     pub decoded: Option<NativeImage>,
     /// Set when a technical limit rejected the image before it was decoded, or
@@ -1018,9 +1036,17 @@ impl NativeImageAnalyzer {
                 not_text: 1,
             });
         }
-        let filled =
-            table_structure::fill_from_page(&grid, &found.bbox, context.words_on_page(found.page))
-                .map_err(|error| format!("{error:#}"))?;
+        // `bbox` maps the cells onto the page; `drawn` says which of the
+        // page's words this crop actually shows. They differ by whatever the
+        // render's aspect pad added, and that pad is white — see
+        // [`DiscoveredImage::drawn`].
+        let filled = table_structure::fill_from_page(
+            &grid,
+            &found.bbox,
+            &found.drawn,
+            context.words_on_page(found.page),
+        )
+        .map_err(|error| format!("{error:#}"))?;
         debug!(
             "filled table {}: {}x{} from {} word(s) of page {}, {} empty cell(s), \
              {} unassigned",
@@ -1986,6 +2012,12 @@ mod tests {
             page: 1,
             origin,
             bbox: BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            drawn: BoundingBox {
                 x: 0.0,
                 y: 0.0,
                 width: 10.0,

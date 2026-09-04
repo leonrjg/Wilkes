@@ -27,6 +27,7 @@
 //! knows, which is not a fact about documents and is not something Wilkes
 //! holds. The caller re-ranks. This narrows.
 
+pub mod ocw;
 pub mod providers;
 pub mod store;
 

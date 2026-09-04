@@ -10,7 +10,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::network::ProviderHttpClient;
-use crate::types::{CatalogueFetchProgress, CatalogueGrain, CatalogueRecord};
+use crate::types::{CatalogueAcquisition, CatalogueFetchProgress, CatalogueGrain, CatalogueRecord};
 
 /// Where a provider says how far through its catalogue it has got.
 ///
@@ -74,6 +74,25 @@ pub trait CatalogueSource: Send + Sync {
     /// `progress` is told after each request completes. A provider that serves
     /// its catalogue whole reports once; a paged one reports per page.
     async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>>;
+}
+
+/// How a stored record can be fetched.
+///
+/// Lives here because the answer depends on which provider published it, and
+/// this file is where providers are declared. A consumer deciding this for
+/// itself — by testing the provider id in a UI, say — would be a second copy
+/// of that knowledge, and the copy would go stale the first time a fifth
+/// catalogue was registered.
+pub fn acquisition(record: &CatalogueRecord) -> CatalogueAcquisition {
+    if record.pdf_url.is_some() {
+        return CatalogueAcquisition::File;
+    }
+    // A course is assembled from its manifest, which hangs off the landing
+    // page; without one there is nothing to walk.
+    if record.provider == MitOpenCourseWare::ID && record.landing_url.is_some() {
+        return CatalogueAcquisition::Course;
+    }
+    CatalogueAcquisition::None
 }
 
 /// Every catalogue this build knows.
@@ -387,6 +406,10 @@ impl Default for MitOpenCourseWare {
 }
 
 impl MitOpenCourseWare {
+    /// Named once so the registry, the provider and [`acquisition`] cannot
+    /// drift apart over a string literal.
+    pub const ID: &'static str = "mit_ocw";
+
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -416,6 +439,12 @@ struct MitCourse {
     url: Option<String>,
     #[serde(default)]
     topics: Vec<MitTopic>,
+    /// Whether MIT states the course is openly licensed. Read rather than
+    /// assumed: the licence decides whether a record may be offered for
+    /// acquisition at all, and a constant in this file would be Wilkes
+    /// asserting a fact about someone else's terms.
+    #[serde(default)]
+    license_cc: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -427,7 +456,7 @@ struct MitTopic {
 #[async_trait]
 impl CatalogueSource for MitOpenCourseWare {
     fn id(&self) -> &'static str {
-        "mit_ocw"
+        Self::ID
     }
 
     fn grain(&self) -> CatalogueGrain {
@@ -438,10 +467,16 @@ impl CatalogueSource for MitOpenCourseWare {
         let mut out: Vec<CatalogueRecord> = Vec::new();
         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
         let mut dry = 0usize;
+        let mut refused = 0usize;
         for page in 0..MAX_PAGES {
             let offset = page * 100;
+            // `offered_by=ocw` is not a nicety. The unfiltered endpoint serves
+            // all of MIT Learn — 2,948 courses against OCW's 2,589 — so
+            // without it this provider mirrors MIT xPRO and Professional
+            // Education too, and files paid, non-open courses under an id
+            // that says OpenCourseWare and a licence that says CC.
             let url = format!(
-                "{}/api/v1/courses/?limit=100&offset={offset}",
+                "{}/api/v1/courses/?limit=100&offset={offset}&offered_by=ocw",
                 self.base_url
             );
             let body: MitPage = self.http.get_json(url, &[]).await?;
@@ -451,6 +486,20 @@ impl CatalogueSource for MitOpenCourseWare {
             let before = seen.len();
             for course in body.results {
                 if !seen.insert(course.id) {
+                    continue;
+                }
+                // Not defaulted either way. `true` is the only value that
+                // licenses an acquisition, and every one of the 2,589 courses
+                // behind `offered_by=ocw` reports it; `false` or absent means
+                // this record is not what the filter promised, and offering it
+                // as CC would be inventing a term of use.
+                if course.license_cc != Some(true) {
+                    refused += 1;
+                    tracing::warn!(
+                        course = course.id,
+                        license_cc = ?course.license_cc,
+                        "MIT OpenCourseWare record refused: not stated as openly licensed"
+                    );
                     continue;
                 }
                 out.push(CatalogueRecord {
@@ -465,6 +514,8 @@ impl CatalogueSource for MitOpenCourseWare {
                         .collect::<Vec<_>>()
                         .join(", "),
                     authors: "MIT".into(),
+                    // Uniform across OCW and now only written for a
+                    // record that said so above.
                     license: "cc-by-nc-sa".into(),
                     landing_url: course.url.clone(),
                     pdf_url: None,
@@ -482,6 +533,16 @@ impl CatalogueSource for MitOpenCourseWare {
             } else {
                 dry = 0;
             }
+        }
+        if refused > 0 {
+            // Loud rather than silent: with the filter in place this should be
+            // zero, so a non-zero count means the endpoint's own idea of what
+            // `offered_by=ocw` covers has changed.
+            tracing::warn!(
+                refused,
+                stored = out.len(),
+                "MIT OpenCourseWare records refused for want of a stated open licence"
+            );
         }
         Ok(out)
     }

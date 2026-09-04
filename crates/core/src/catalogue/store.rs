@@ -390,21 +390,23 @@ impl CatalogueStore {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params![expression, accepted, limit as i64], |row| {
             let grain_text: String = row.get(10)?;
+            let record = CatalogueRecord {
+                provider: row.get(0)?,
+                external_id: row.get(1)?,
+                title: row.get(2)?,
+                summary: row.get(3)?,
+                subject: row.get(4)?,
+                authors: row.get(5)?,
+                license: row.get(6)?,
+                landing_url: row.get(7)?,
+                pdf_url: row.get(8)?,
+                outline_url: row.get(9)?,
+                grain: parse_grain(10, grain_text)?,
+                pages: row.get(11)?,
+            };
             Ok(CatalogueHit {
-                record: CatalogueRecord {
-                    provider: row.get(0)?,
-                    external_id: row.get(1)?,
-                    title: row.get(2)?,
-                    summary: row.get(3)?,
-                    subject: row.get(4)?,
-                    authors: row.get(5)?,
-                    license: row.get(6)?,
-                    landing_url: row.get(7)?,
-                    pdf_url: row.get(8)?,
-                    outline_url: row.get(9)?,
-                    grain: parse_grain(10, grain_text)?,
-                    pages: row.get(11)?,
-                },
+                acquisition: super::providers::acquisition(&record),
+                record,
                 recall_score: row.get(12)?,
             })
         })?;

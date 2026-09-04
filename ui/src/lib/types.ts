@@ -1164,8 +1164,15 @@ export interface CatalogueRecord {
 /** A record matched against a probe, with the recall score that surfaced it.
  *  BM25 over title, subject and summary — explicitly not a ranking of which
  *  record is the better thing to read. */
+/** What adding a record would do. Derived in core from the provider that
+ *  published it, not from the provider id here: a UI that decided this for
+ *  itself would be a second copy of the registry, and would offer the wrong
+ *  button the first time a new catalogue was added. */
+export type CatalogueAcquisition = "file" | "course" | "none";
+
 export interface CatalogueHit extends CatalogueRecord {
   recall_score: number;
+  acquisition: CatalogueAcquisition;
 }
 
 /** One probe's answer. `terms` is what the query reduced to after stopword and
@@ -1239,6 +1246,60 @@ export interface CatalogueDownloadProgress {
   received_bytes: number;
   total_bytes: number | null;
   done: boolean;
+}
+
+/** Which half of a course acquisition a report belongs to. Reading the
+ *  manifest is dozens of small JSON requests before a single byte of any
+ *  document is fetched, so a UI showing only the document counter would have
+ *  nothing to show for the first half of the wait. */
+export type CatalogueCourseStage = "manifest" | "documents";
+
+/** How far acquiring one course has got. `total` is absent only until
+ *  `content_map.json` lands, since the number of entries is that file's
+ *  answer and not something that can be assumed ahead of it. */
+export interface CatalogueCourseProgress {
+  course_url: string;
+  stage: CatalogueCourseStage;
+  done: number;
+  total: number | null;
+  current: string | null;
+}
+
+/** One document of a course that was fetched. */
+export interface CourseDocument {
+  filename: string;
+  path: string;
+  bytes: number;
+  already_present: boolean;
+}
+
+/** One document that was wanted and not got. Kept apart from `skipped`: a skip
+ *  is this build declining a resource it understands, a failure is one it
+ *  asked for and did not receive. */
+export interface CourseFailure {
+  filename: string;
+  url: string;
+  error: string;
+}
+
+/** One resource this build declined, with the reason — `audiovisual`,
+ *  `not a PDF (...)`, or metadata too incomplete to classify. */
+export interface CourseSkip {
+  title: string;
+  reason: string;
+}
+
+/** What acquiring one course produced. `document` is the generated Markdown
+ *  file carrying the syllabus, calendar and reading list, which OCW publishes
+ *  only as web pages and which is the only place a course's ordering lives. */
+export interface CatalogueCourse {
+  course_url: string;
+  title: string;
+  directory: string;
+  document: string;
+  documents: CourseDocument[];
+  failures: CourseFailure[];
+  skipped: CourseSkip[];
 }
 
 /** Where a fetched candidate landed. `already_present` means the exact bytes

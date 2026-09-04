@@ -2822,6 +2822,25 @@ pub struct CatalogueRecord {
     pub pages: Option<i64>,
 }
 
+/// How a record can be fetched, if it can be.
+///
+/// Derived from the record rather than stored on it: it is a fact about which
+/// provider published it and what that provider serves, and a column would be
+/// a second copy of the registry that could disagree with the registry.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogueAcquisition {
+    /// One URL, one file. The ordinary case, and what `pdf_url` means.
+    File,
+    /// Many files and a course document assembled from the provider's own
+    /// pages. A course is not served whole at any URL, which is exactly why
+    /// its `pdf_url` is absent and why offering it the file button would be
+    /// offering a click that could only fail.
+    Course,
+    /// Discovery only: this record can be read where it lives and nowhere else.
+    None,
+}
+
 /// One catalogue record matched against a text query, with the *recall* score
 /// that surfaced it.
 ///
@@ -2835,6 +2854,10 @@ pub struct CatalogueHit {
     #[serde(flatten)]
     pub record: CatalogueRecord,
     pub recall_score: f64,
+    /// What clicking "add" on this record would do. Computed here so a caller
+    /// does not have to re-derive it from the provider id, which is how one
+    /// consumer comes to offer a button another does not.
+    pub acquisition: CatalogueAcquisition,
 }
 
 /// One query's recall, with the terms it was actually run with.
@@ -2865,6 +2888,39 @@ pub struct CatalogueFetchProgress {
     /// whole, one per page for a paged one.
     pub pages: usize,
     pub records: usize,
+}
+
+/// How far acquiring one course has got.
+///
+/// Two counters rather than one because the two halves fail differently and
+/// take different lengths of time: reading the manifest is a few dozen small
+/// JSON requests that either work or leave nothing to download, and fetching
+/// the documents is minutes of bytes. A caller shown only "3 of 22" during
+/// the second half would have nothing at all to show during the first.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CatalogueCourseProgress {
+    /// The course being acquired, as it was asked for.
+    pub course_url: String,
+    pub stage: CatalogueCourseStage,
+    /// Manifest entries read, or documents written, depending on `stage`.
+    pub done: usize,
+    /// How many there are in total, once that is known. Absent while reading
+    /// the manifest, because the number of entries is the manifest's first
+    /// answer and not something that can be assumed before it arrives.
+    pub total: Option<usize>,
+    /// What is being read or written right now, for a caller that wants to
+    /// name it rather than only count it.
+    pub current: Option<String>,
+}
+
+/// Which half of a course acquisition a report belongs to.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogueCourseStage {
+    /// Walking `content_map.json` and the `data.json` it names.
+    Manifest,
+    /// Fetching the documents the manifest turned out to name.
+    Documents,
 }
 
 /// Per-provider state of the local catalogue mirror.

@@ -4,6 +4,8 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import type {
   CatalogueDownload,
+  CatalogueCourse,
+  CatalogueCourseProgress,
   CatalogueDownloadProgress,
   CatalogueFetchProgress,
   CatalogueProbe,
@@ -457,6 +459,18 @@ export class TauriSearchApi implements SearchApi {
     handler: (progress: CatalogueDownloadProgress) => void,
   ): Promise<() => void> {
     return listen<CatalogueDownloadProgress>("catalogue-download-progress", (e) =>
+      handler(e.payload),
+    );
+  }
+
+  async catalogueAcquireCourse(courseUrl: string): Promise<CatalogueCourse> {
+    return invoke<CatalogueCourse>("catalogue_acquire_course", { courseUrl });
+  }
+
+  async onCatalogueCourseProgress(
+    handler: (progress: CatalogueCourseProgress) => void,
+  ): Promise<() => void> {
+    return listen<CatalogueCourseProgress>("catalogue-course-progress", (e) =>
       handler(e.payload),
     );
   }

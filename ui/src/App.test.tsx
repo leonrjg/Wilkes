@@ -23,6 +23,7 @@ vi.mock("./services", () => ({
     onBookmarkClusterLabelled: vi.fn(() => Promise.resolve(() => {})),
     onChunkTopicLabelled: vi.fn(() => Promise.resolve(() => {})),
     onCatalogueDownloadProgress: vi.fn(() => Promise.resolve(() => {})),
+    onCatalogueCourseProgress: vi.fn(() => Promise.resolve(() => {})),
     onCatalogueSyncProgress: vi.fn(() => Promise.resolve(() => {})),
     listWorkspaces: vi.fn(() => Promise.resolve({
       active_workspace_id: "workspace-1",

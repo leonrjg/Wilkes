@@ -776,6 +776,11 @@ pub(super) fn discover(
             page: region.page,
             origin: RegionOrigin::Typeset,
             bbox: covered.clone(),
+            // The region, not the canvas: the clip above is `scaled(bbox)`, so
+            // whatever the aspect pad added is white paper and the page's
+            // words there were never drawn into these pixels. See
+            // [`DiscoveredImage::drawn`].
+            drawn: region.bbox.clone(),
             // The render maps the unit square onto exactly the page rectangle
             // it drew, upright and unrotated, because that is how it was
             // asked for.

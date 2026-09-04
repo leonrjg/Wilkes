@@ -1878,6 +1878,23 @@ async fn catalogue_acquire(
         .map_err(catalogue_failed)
 }
 
+/// Fetches a whole MIT OpenCourseWare course — its PDFs plus a generated
+/// Markdown document carrying the syllabus, calendar and reading list that
+/// OCW publishes only as web pages — into a directory of its own under
+/// uploads. The walk and the per-document counter arrive on
+/// `catalogue-course-progress`, each document's bytes on
+/// `catalogue-download-progress`.
+#[tauri::command]
+async fn catalogue_acquire_course(
+    app: AppHandle,
+    course_url: String,
+) -> Result<wilkes_api::commands::catalogue::CatalogueCourseResponse, String> {
+    app_context(&app)
+        .catalogue_acquire_course(course_url)
+        .await
+        .map_err(catalogue_failed)
+}
+
 /// Every recognizer this build can read with, and the engines it compiled in.
 #[tauri::command]
 async fn image_recognizer_catalogue(
@@ -2237,6 +2254,7 @@ pub fn run() {
             catalogue_search,
             catalogue_sync,
             catalogue_acquire,
+            catalogue_acquire_course,
             image_recognizer_catalogue,
             image_recognizer_inventory,
             install_image_recognizer,

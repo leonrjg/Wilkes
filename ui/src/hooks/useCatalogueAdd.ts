@@ -30,6 +30,7 @@ export function useCatalogueAdd() {
   const refreshFileList = useSettingsStore((s) => s.refreshFileList);
   const readOnly = useActiveWorkspaceReadOnly();
   const acquire = useCatalogueStore((s) => s.acquire);
+  const acquireCourse = useCatalogueStore((s) => s.acquireCourse);
   const acquiring = useCatalogueStore((s) => s.acquiring);
   const acquired = useCatalogueStore((s) => s.acquired);
 
@@ -38,20 +39,39 @@ export function useCatalogueAdd() {
   const needsDirectory = source.type === "desktop" && !directory;
   const canAdd = !readOnly && !needsDirectory;
 
+  /** The second step, shared by both kinds of candidate: whatever was staged
+   *  in uploads is imported into the library root, or — on the web build,
+   *  where uploads *is* the root — the root is simply pointed at it. */
+  const install = useCallback(
+    async (staged: string[]): Promise<void> => {
+      if (source.type === "desktop") {
+        await (source as DesktopSourceApi).importFiles(staged, directory, "move");
+      } else if (!directory && staged.length > 0) {
+        setDirectory(parentDirectory(staged[0]));
+      }
+      await refreshFileList();
+    },
+    [directory, setDirectory, refreshFileList],
+  );
+
   const add = useCallback(
     async (hit: CatalogueHit): Promise<string | null> => {
       if (!canAdd) return null;
+      // A course is many files and a document describing them; a textbook is
+      // one file. Which of the two this is was decided in core and travels on
+      // the hit, so this does not test the provider id to find out.
+      if (hit.acquisition === "course") {
+        const staged = await acquireCourse(hit);
+        if (staged === null) return null;
+        await install(staged);
+        return staged[0] ?? null;
+      }
       const staged = await acquire(hit);
       if (staged === null) return null;
-      if (source.type === "desktop") {
-        await (source as DesktopSourceApi).importFiles([staged], directory, "move");
-      } else if (!directory) {
-        setDirectory(parentDirectory(staged));
-      }
-      await refreshFileList();
+      await install([staged]);
       return staged;
     },
-    [canAdd, acquire, directory, setDirectory, refreshFileList],
+    [canAdd, acquire, acquireCourse, install],
   );
 
   return {

@@ -482,7 +482,7 @@ fn main() -> anyhow::Result<()> {
                 .read_batch(std::slice::from_ref(&pixels))?
                 .pop()
                 .expect("one crop in, one grid out");
-            let filled = table_structure::fill_from_page(&grid, &covered, &words)?;
+            let filled = table_structure::fill_from_page(&grid, &covered, &bbox, &words)?;
             ms.push(started.elapsed().as_secs_f64() * 1000.0);
             kept = Some((grid, filled));
         }

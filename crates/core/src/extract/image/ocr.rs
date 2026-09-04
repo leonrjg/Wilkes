@@ -66,11 +66,19 @@ pub struct SpottedRegion {
     /// defaulted summary would silently apply them anyway. Absent from the wire
     /// when it is `None`, so a worker that predates the field is unaffected.
     ///
-    /// It travels *with the region* rather than being recomputed at admission
-    /// because the region is cached: the annotation cache key carries
-    /// [`ADMISSION_RULES_VERSION`], so moving a clause re-decides admission
-    /// from what is stored, and a summary that had to be recomputed from pixels
-    /// would mean re-running the model to change a threshold.
+    /// It travels *with the region* because the fill and the admission happen
+    /// in two different places: the analyzer puts the page's words into the
+    /// grid, and [`place_and_admit`] decides afterwards whether the result may
+    /// stand in place of those words. A summary recomputed at the second place
+    /// would mean holding the grid and the page's words until then, or asking
+    /// the model again — and a rule that had to re-run a model to be applied is
+    /// a rule nobody would move.
+    ///
+    /// It is not what a cached reading is re-decided from. The annotation cache
+    /// stores [`crate::types::ImageOcrRegion`]s, whose verdict is already
+    /// settled, and its key carries [`ADMISSION_RULES_VERSION`] — so moving a
+    /// clause does not re-judge the stored entry, it stops the entry from being
+    /// found and the crop is read again under the new rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structure: Option<super::table_structure::TableFillSummary>,
 }

@@ -20,6 +20,7 @@ export function useGlobalEvents() {
     let clusterLabelUnlisten: (() => void) | undefined;
     let topicLabelUnlisten: (() => void) | undefined;
     let catalogueDownloadUnlisten: (() => void) | undefined;
+    let catalogueCourseUnlisten: (() => void) | undefined;
     let mounted = true;
 
     const closeReindexToast = () => {
@@ -65,6 +66,20 @@ export function useGlobalEvents() {
         u();
       } else {
         catalogueDownloadUnlisten = u;
+      }
+    });
+
+    // Its own stream, for the same reason the download stream is one: a course
+    // is a manifest walk and then dozens of documents, and the byte reports
+    // cannot say which document they belong to.
+    api.onCatalogueCourseProgress((progress) => {
+      if (!mounted) return;
+      useCatalogueStore.getState().noteCourseProgress(progress);
+    }).then((u) => {
+      if (!mounted) {
+        u();
+      } else {
+        catalogueCourseUnlisten = u;
       }
     });
 
@@ -136,6 +151,7 @@ export function useGlobalEvents() {
       if (clusterLabelUnlisten) clusterLabelUnlisten();
       if (topicLabelUnlisten) topicLabelUnlisten();
       if (catalogueDownloadUnlisten) catalogueDownloadUnlisten();
+      if (catalogueCourseUnlisten) catalogueCourseUnlisten();
     };
   }, [addToast, removeToast]);
 }

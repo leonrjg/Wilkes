@@ -1,6 +1,8 @@
 import { create } from "zustand";
 import { api } from "../services";
 import type {
+  CatalogueCourse,
+  CatalogueCourseProgress,
   CatalogueDownloadProgress,
   CatalogueGrain,
   CatalogueHit,
@@ -39,13 +41,25 @@ interface CatalogueStore {
    *  being added at once, and a single figure would be attributed to whichever
    *  row happened to render. */
   downloads: Record<string, CatalogueDownloadProgress>;
+  /** How far each course acquisition has got, keyed by the course URL. A
+   *  course is dozens of manifest reads and then dozens of downloads, and the
+   *  byte stream above cannot say which of them it is reporting. */
+  courseProgress: Record<string, CatalogueCourseProgress>;
+  /** What each acquired course produced, per hit key: the directory, the
+   *  generated document, and what was refused. Kept so a row can say "14
+   *  documents, 4 videos skipped" instead of only "added". */
+  courses: Record<string, CatalogueCourse>;
   noteDownloadProgress: (progress: CatalogueDownloadProgress) => void;
+  noteCourseProgress: (progress: CatalogueCourseProgress) => void;
   openPane: () => void;
   closePane: () => void;
   setQuery: (query: string) => void;
   toggleGrain: (grain: CatalogueGrain) => void;
   search: (query: string) => Promise<void>;
   acquire: (hit: CatalogueHit) => Promise<string | null>;
+  /** Fetches a whole course. Returns the paths to import — the generated
+   *  document first, because it is the thing that makes the rest a course. */
+  acquireCourse: (hit: CatalogueHit) => Promise<string[] | null>;
   reset: () => void;
 }
 
@@ -64,10 +78,17 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
   acquired: {},
   acquiring: null,
   downloads: {},
+  courseProgress: {},
+  courses: {},
 
   noteDownloadProgress: (progress) =>
     set((state) => ({
       downloads: { ...state.downloads, [progress.url]: progress },
+    })),
+
+  noteCourseProgress: (progress) =>
+    set((state) => ({
+      courseProgress: { ...state.courseProgress, [progress.course_url]: progress },
     })),
 
   openPane: () => set({ paneOpen: true }),
@@ -136,6 +157,38 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
     }
   },
 
+  acquireCourse: async (hit) => {
+    const courseUrl = hit.landing_url;
+    if (hit.acquisition !== "course" || courseUrl === null) return null;
+    const key = hitKey(hit);
+    set({ acquiring: key, error: null });
+    try {
+      const course = await api.catalogueAcquireCourse(courseUrl);
+      set((state) => {
+        const { [courseUrl]: _finished, ...courseProgress } = state.courseProgress;
+        return {
+          acquiring: null,
+          courseProgress,
+          courses: { ...state.courses, [key]: course },
+          acquired: { ...state.acquired, [key]: course.directory },
+        };
+      });
+      // The generated document leads: it holds the syllabus and the reading
+      // list, and it is what turns the rest of the list into a course.
+      return [course.document, ...course.documents.map((d) => d.path)];
+    } catch (e: any) {
+      set((state) => {
+        const { [courseUrl]: _abandoned, ...courseProgress } = state.courseProgress;
+        return {
+          acquiring: null,
+          courseProgress,
+          error: e?.toString?.() ?? "Could not fetch that course",
+        };
+      });
+      return null;
+    }
+  },
+
   reset: () =>
     set({
       query: "",
@@ -145,5 +198,7 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       acquired: {},
       acquiring: null,
       downloads: {},
+      courseProgress: {},
+      courses: {},
     }),
 }));

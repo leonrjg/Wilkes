@@ -101,12 +101,18 @@ pub const ADMISSION_THRESHOLD: f32 = 0.0;
 /// What the recipe records about a table this model's grid produced.
 ///
 /// Every knob that changes the bytes: the graph and where it came from, the
-/// square and the channel order it is fed in, and the fact that spans are
-/// expanded across the grid positions they cover rather than written once. The
-/// last is not the model's — it is [`to_markdown`]'s, and it decides what a
-/// merged header cell reads as in every column but the first.
+/// square and the channel order it is fed in, the fact that spans are expanded
+/// across the grid positions they cover rather than written once, and which
+/// rectangle decides whether a word of the page belongs to this table. The
+/// last two are not the model's — they are [`to_markdown`]'s and
+/// [`fill_from_page`]'s — and each decides what enters the reading: the one
+/// what a merged header cell reads as in every column but the first, the other
+/// whether a wide table is admitted at all.
 pub fn identity() -> String {
-    format!("ort-2.0.0-rc.13+{MODEL_ID}+RapidAI/RapidTable+{SIDE}px-bgr-imagenet+spans-expanded")
+    format!(
+        "ort-2.0.0-rc.13+{MODEL_ID}+RapidAI/RapidTable+{SIDE}px-bgr-imagenet+spans-expanded\
+         +words-in-drawn-area"
+    )
 }
 
 pub fn footprint_bytes() -> u64 {
@@ -415,17 +421,29 @@ pub struct FilledTable {
     pub summary: TableFillSummary,
 }
 
-/// Put every word the page draws inside `covered` into the cell it falls in,
-/// and build the table.
+/// Put every word the crop shows into the cell it falls in, and build the
+/// table.
+///
+/// Two rectangles, because they answer two questions.
 ///
 /// `covered` is the page rectangle the crop's canvas covers — the one
-/// `typeset::render` hands back and `DiscoveredImage::bbox` carries — so the
-/// map from a cell's fractions to a point of the page is exact rather than an
-/// approximation of the render scale.
+/// `typeset::render` hands back and [`super::DiscoveredImage::bbox`] carries —
+/// so the map from a cell's fractions to a point of the page is exact rather
+/// than an approximation of the render scale.
+///
+/// `drawn` is the part of that canvas the page was actually drawn into, which
+/// [`super::DiscoveredImage::drawn`] carries. The render pads a lopsided
+/// region out to an aspect bound and clips the page to the region, so a wide
+/// short table arrives on a canvas with white bands above and below it. The
+/// page sets prose in those bands; the crop does not show it, and the
+/// structure model was never given it. Membership is decided on `drawn` for
+/// exactly that reason — a word the model could not see is not a word it
+/// failed to place, and counting it as one refuses a table that read
+/// perfectly.
 ///
 /// Words are taken in the survey's own order, which is the page's reading
 /// order, so a cell holding three words holds them in the order the page sets
-/// them. A word inside the rectangle that no cell claimed is counted: it is the
+/// them. A word the crop shows that no cell claimed is counted: it is the
 /// proxy for a structure the model missed, because the glyphs are certainly
 /// there and the grid had nowhere to put them.
 ///
@@ -437,6 +455,7 @@ pub struct FilledTable {
 pub fn fill_from_page(
     grid: &TableGrid,
     covered: &BoundingBox,
+    drawn: &BoundingBox,
     words: &[NativeTextOnPage],
 ) -> anyhow::Result<FilledTable> {
     let boxes: Vec<(f32, f32, f32, f32)> = grid
@@ -461,10 +480,12 @@ pub fn fill_from_page(
     for word in words {
         let cx = word.bbox.x + word.bbox.width / 2.0;
         let cy = word.bbox.y + word.bbox.height / 2.0;
-        let in_table = cx >= covered.x
-            && cx <= covered.x + covered.width
-            && cy >= covered.y
-            && cy <= covered.y + covered.height;
+        // `drawn`, not `covered`: the aspect pad is white paper, and a word
+        // the page sets there is not in this crop at all.
+        let in_table = cx >= drawn.x
+            && cx <= drawn.x + drawn.width
+            && cy >= drawn.y
+            && cy <= drawn.y + drawn.height;
         if !in_table {
             continue;
         }
@@ -1273,7 +1294,7 @@ mod tests {
             word(3, "c", 320.0, 528.0, 4.0, 4.0),
             word(3, "d", 380.0, 528.0, 4.0, 4.0),
         ];
-        let filled = fill_from_page(&grid, &covered, &words).unwrap();
+        let filled = fill_from_page(&grid, &covered, &covered, &words).unwrap();
         assert_eq!(filled.markdown, "| a | b |\n| --- | --- |\n| c | d |\n");
         assert_eq!(filled.summary.words_in_box, 4);
         assert_eq!(filled.summary.unassigned_words, 0);
@@ -1303,7 +1324,7 @@ mod tests {
             word(1, "in", 2.0, 5.0, 1.0, 1.0),
             word(1, "out", 500.0, 500.0, 1.0, 1.0),
         ];
-        let filled = fill_from_page(&grid, &covered, &words).unwrap();
+        let filled = fill_from_page(&grid, &covered, &covered, &words).unwrap();
         assert_eq!(filled.summary.words_in_box, 1);
         assert!(filled.markdown.contains("in"));
         assert!(!filled.markdown.contains("out"));
@@ -1349,8 +1370,13 @@ mod tests {
             width: 100.0,
             height: 100.0,
         };
-        let filled =
-            fill_from_page(&grid, &covered, &[word(1, "tight", 74.0, 24.0, 2.0, 2.0)]).unwrap();
+        let filled = fill_from_page(
+            &grid,
+            &covered,
+            &covered,
+            &[word(1, "tight", 74.0, 24.0, 2.0, 2.0)],
+        )
+        .unwrap();
         // The word went to the nested cell, which the expansion writes at
         // (0,1) — over the span, which claims that position too but is written
         // first.
@@ -1385,6 +1411,7 @@ mod tests {
         let filled = fill_from_page(
             &grid,
             &covered,
+            &covered,
             &[
                 word(1, "left", 10.0, 5.0, 2.0, 2.0),
                 word(1, "right", 90.0, 5.0, 2.0, 2.0),
@@ -1413,10 +1440,73 @@ mod tests {
             width: 10.0,
             height: 10.0,
         };
-        let error = fill_from_page(&grid, &covered, &[word(7, "  ", 5.0, 5.0, 1.0, 1.0)])
-            .unwrap_err()
-            .to_string();
+        let error = fill_from_page(
+            &grid,
+            &covered,
+            &covered,
+            &[word(7, "  ", 5.0, 5.0, 1.0, 1.0)],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("page 7"), "{error}");
+    }
+
+    /// The white band `typeset::render` pads a wide crop out with is not part
+    /// of the table.
+    ///
+    /// A table 100 points wide and 10 tall is drawn on a canvas 25 points tall
+    /// — the aspect bound — and the page sets prose in the 7.5 points above
+    /// and below it that the clip left blank. Those words are not in the crop,
+    /// the structure model was never shown them, and counting them as words it
+    /// failed to place refuses a table that read perfectly.
+    #[test]
+    fn words_in_the_white_pad_around_a_wide_crop_are_not_this_table_s() {
+        let grid = TableGrid {
+            cells: vec![
+                cell(0, 0, 2, 2),
+                cell(0, 1, 2, 2),
+                cell(1, 0, 2, 2),
+                cell(1, 1, 2, 2),
+            ],
+            rows: 2,
+            cols: 2,
+            score: 1.0,
+            truncated: false,
+        };
+        // The canvas, and the part of it the page was drawn into.
+        let covered = BoundingBox {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 25.0,
+        };
+        let drawn = BoundingBox {
+            x: 0.0,
+            y: 7.5,
+            width: 100.0,
+            height: 10.0,
+        };
+        let words = vec![
+            // The caption above the table and the paragraph below it, both
+            // inside the canvas and both clipped out of the pixels.
+            word(1, "Table", 20.0, 3.0, 4.0, 2.0),
+            word(1, "afterwards", 20.0, 21.0, 4.0, 2.0),
+            // And the table's own four words.
+            word(1, "a", 20.0, 9.0, 2.0, 2.0),
+            word(1, "b", 70.0, 9.0, 2.0, 2.0),
+            word(1, "c", 20.0, 15.0, 2.0, 2.0),
+            word(1, "d", 70.0, 15.0, 2.0, 2.0),
+        ];
+        let filled = fill_from_page(&grid, &covered, &drawn, &words).unwrap();
+        assert_eq!(filled.summary.words_in_box, 4, "{}", filled.markdown);
+        assert_eq!(
+            filled.summary.unassigned_words, 0,
+            "the pad's words are not words the grid failed to place"
+        );
+        assert_eq!(filled.markdown, "| a | b |\n| --- | --- |\n| c | d |\n");
+        // Which is what `ocr::admit_filled_table` refuses a table on; its own
+        // tests cover the verdict, this covers the fact it reads.
+        assert_eq!(filled.summary.empty_cells, 0);
     }
 
     // ── The Markdown ─────────────────────────────────────────────────────────
@@ -1455,6 +1545,7 @@ mod tests {
         let filled = fill_from_page(
             &grid,
             &covered,
+            &covered,
             &[
                 word(1, "Head", 50.0, 25.0, 2.0, 2.0),
                 word(1, "a", 25.0, 75.0, 2.0, 2.0),
@@ -1491,6 +1582,7 @@ mod tests {
         let filled = fill_from_page(
             &grid,
             &covered,
+            &covered,
             &[
                 word(1, "a|b", 5.0, 2.0, 1.0, 1.0),
                 word(1, "c", 5.0, 7.0, 1.0, 1.0),
@@ -1504,17 +1596,13 @@ mod tests {
     /// delimiter with nothing above it.
     #[test]
     fn an_empty_grid_produces_no_table() {
-        let filled = fill_from_page(
-            &TableGrid::default(),
-            &BoundingBox {
-                x: 0.0,
-                y: 0.0,
-                width: 1.0,
-                height: 1.0,
-            },
-            &[],
-        )
-        .unwrap();
+        let unit = BoundingBox {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let filled = fill_from_page(&TableGrid::default(), &unit, &unit, &[]).unwrap();
         assert!(filled.markdown.is_empty());
         assert!(filled.summary.first_row_empty);
     }

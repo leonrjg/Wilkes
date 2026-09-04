@@ -397,7 +397,7 @@ export default function SettingsModal({
 
   return (
     <div className={`fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4${isOpen ? "" : " hidden"}`}>
-      <div className="bg-[var(--bg-app)] border border-[var(--border-main)] rounded-xl shadow-2xl w-full max-w-2xl h-[800px] max-h-[90vh] flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200">
+      <div className="bg-[var(--bg-app)] border border-[var(--border-main)] rounded-xl shadow-2xl w-full max-w-3xl h-[800px] max-h-[90vh] flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200">
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-[var(--border-main)]">
           <h2 className="text-base font-semibold text-[var(--text-main)] flex items-center gap-2">
             <span className="text-[var(--text-dim)] text-lg"><Tool /></span> Settings
@@ -412,8 +412,8 @@ export default function SettingsModal({
 
         <div className="flex flex-1 overflow-hidden">
           {/* Sidebar */}
-          <div className="w-40 border-r border-[var(--border-main)] bg-[var(--bg-sidebar)] p-2 flex flex-col gap-3">
-            <div className="flex flex-col gap-0.5">
+          <div className="w-40 shrink-0 border-r border-[var(--border-main)] bg-[var(--bg-sidebar)] p-2 flex flex-col gap-3 overflow-y-auto">
+            <div className="flex flex-col gap-0.5 shrink-0">
               <TabButton id="general" label="General" />
               <TabButton id="extensions" label="File extensions" />
               <TabButton id="integrations" label="Integrations" />
@@ -431,8 +431,8 @@ export default function SettingsModal({
               )}
             </div>
 
-            <div className="flex flex-col gap-0.5">
-              <span className="px-3 py-1 text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Semantic Search</span>
+            <div className="flex flex-col gap-0.5 shrink-0">
+              <span className="px-3 py-1 text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Semantic</span>
               <TabButton
                 id="semantic-models"
                 label="Models"
@@ -442,7 +442,7 @@ export default function SettingsModal({
               <TabButton id="semantic-chunking" label="Chunking" indent />
             </div>
 
-            <div className="flex flex-col gap-0.5">
+            <div className="flex flex-col gap-0.5 shrink-0">
               <span className="px-3 py-1 text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Generation</span>
               {isTauri && <TabButton id="generation-chat" label="Chat" indent />}
               <TabButton
@@ -453,7 +453,7 @@ export default function SettingsModal({
               />
             </div>
 
-            <div className="flex flex-col gap-0.5">
+            <div className="flex flex-col gap-0.5 shrink-0">
               <span className="px-3 py-1 text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Extraction</span>
               <TabButton
                 id="extraction-images"
@@ -463,12 +463,17 @@ export default function SettingsModal({
               />
             </div>
 
-            <div className="flex flex-col gap-0.5">
+            <div className="flex flex-col gap-0.5 shrink-0">
               <span className="px-3 py-1 text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Advanced</span>
               <TabButton id="data" label="Data" indent />
               <TabButton id="workers" label="Workers" indent />
               <TabButton id="logs" label="Logs" indent />
-              <TabButton id="technical" label="Settings (JSON)" indent />
+              <TabButton
+                id="technical"
+                label="Raw config"
+                accessibleLabel="Raw settings JSON"
+                indent
+              />
             </div>
           </div>
 
