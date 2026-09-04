@@ -703,6 +703,30 @@ async fn catalogue_acquire_handler(
         .map_err(catalogue_err)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogueCourseBody {
+    course_url: String,
+}
+
+/// Fetches a whole course into its own directory under uploads. Ungated for
+/// the same reason `catalogue_acquire_handler` is: this is Wilkes writing into
+/// its own staging area, not the user writing into a library root.
+async fn catalogue_acquire_course_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CatalogueCourseBody>,
+) -> Result<
+    Json<wilkes_api::commands::catalogue::CatalogueCourseResponse>,
+    (StatusCode, Json<ErrorBody>),
+> {
+    state
+        .context()
+        .catalogue_acquire_course(body.course_url)
+        .await
+        .map(Json)
+        .map_err(catalogue_err)
+}
+
 async fn chunks_search_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ChunksSearchBody>,
@@ -2213,6 +2237,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/catalogue/sync", post(catalogue_sync_handler))
         .route("/api/catalogue/status", get(catalogue_status_handler))
         .route("/api/catalogue/acquire", post(catalogue_acquire_handler))
+        .route(
+            "/api/catalogue/acquire-course",
+            post(catalogue_acquire_course_handler),
+        )
         .route("/api/corpora/backup", post(managed_backup_handler))
         .route("/api/corpora/restore", post(managed_restore_handler))
         .route("/api/bookmarks", get(list_bookmarks_handler))

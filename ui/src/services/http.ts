@@ -1,5 +1,7 @@
 import type {
   CatalogueDownload,
+  CatalogueCourse,
+  CatalogueCourseProgress,
   CatalogueDownloadProgress,
   CatalogueFetchProgress,
   CatalogueProbe,
@@ -816,6 +818,25 @@ export class HttpSearchApi implements SearchApi {
     const listener = (e: any) => handler(JSON.parse(e.data));
     es.addEventListener("catalogue-download-progress", listener);
     return () => this.releaseEventSource("catalogue-download-progress", listener);
+  }
+
+  async catalogueAcquireCourse(courseUrl: string): Promise<CatalogueCourse> {
+    const res = await fetch("/api/catalogue/acquire-course", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ course_url: courseUrl }),
+    });
+    if (!res.ok) throw await responseError(res, "catalogueAcquireCourse");
+    return res.json() as Promise<CatalogueCourse>;
+  }
+
+  async onCatalogueCourseProgress(
+    handler: (progress: CatalogueCourseProgress) => void,
+  ): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("catalogue-course-progress", listener);
+    return () => this.releaseEventSource("catalogue-course-progress", listener);
   }
 
   async imageRecognizerCatalogue(): Promise<RecognizerCatalogue> {

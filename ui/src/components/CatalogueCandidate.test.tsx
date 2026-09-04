@@ -37,6 +37,22 @@ const HIT: CatalogueHit = {
   grain: "textbook",
   pages: 412,
   recall_score: 8.5,
+  acquisition: "file",
+};
+
+/// An MIT OpenCourseWare course: no `pdf_url`, because a course is not served
+/// whole at any URL, and `acquisition: "course"` saying so explicitly rather
+/// than leaving the row to infer it from the provider id.
+const COURSE: CatalogueHit = {
+  ...HIT,
+  provider: "mit_ocw",
+  external_id: "3308",
+  title: "Water Quality Control",
+  landing_url: "https://ocw.mit.edu/courses/1-77-water-quality-spring-2006/",
+  pdf_url: null,
+  grain: "course",
+  pages: null,
+  acquisition: "course",
 };
 
 const acquire = api.catalogueAcquire as unknown as ReturnType<typeof vi.fn>;
@@ -77,14 +93,80 @@ describe("CatalogueCandidate", () => {
     expect(await screen.findByText("Added")).toBeTruthy();
   });
 
-  /// `pdf_url` is optional and often absent: discovery and admission are not
-  /// the same thing, and a button that fails on click is worse than no button.
-  it("offers no Add for a record the provider does not serve whole", () => {
-    render(<CatalogueCandidate hit={{ ...HIT, pdf_url: null }} />);
+  /// Discovery and admission are not the same thing, and a button that fails
+  /// on click is worse than no button.
+  it("offers no Add for a record nothing can fetch", () => {
+    render(<CatalogueCandidate hit={{ ...HIT, pdf_url: null, acquisition: "none" }} />);
     expect(screen.queryByLabelText(/Add Combinatorial Optimization/)).toBeNull();
     expect(screen.getByText(/does not publish a downloadable copy/i)).toBeTruthy();
     // The landing page is still offered: it is discoverable, just not fetchable.
     expect(screen.getByLabelText(/Open Combinatorial Optimization/)).toBeTruthy();
+  });
+
+  /// A course has no `pdf_url` and is still acquirable — the old rule, which
+  /// read acquirability off `pdf_url`, would have hidden the button entirely.
+  it("offers a course its own button and says what adding one does", () => {
+    render(<CatalogueCandidate hit={COURSE} />);
+    expect(screen.getByLabelText(/Add Water Quality Control to library/)).toBeTruthy();
+    expect(screen.getByText(/Add course/)).toBeTruthy();
+    expect(screen.getByText(/A course, not a file/i)).toBeTruthy();
+  });
+
+  /// Reading the manifest happens before a single document byte moves, and on
+  /// a large course it is most of a minute. A row showing only the document
+  /// counter would sit blank through all of it.
+  it("counts the manifest walk and then the documents", () => {
+    render(<CatalogueCandidate hit={COURSE} />);
+    act(() => {
+      useCatalogueStore.setState({ acquiring: "mit_ocw:3308" });
+      useCatalogueStore.getState().noteCourseProgress({
+        course_url: COURSE.landing_url as string,
+        stage: "manifest",
+        done: 7,
+        total: 31,
+        current: "Lecture 1",
+      });
+    });
+    expect(screen.getByText(/Reading the course — 7 of 31/)).toBeTruthy();
+    act(() => {
+      useCatalogueStore.getState().noteCourseProgress({
+        course_url: COURSE.landing_url as string,
+        stage: "documents",
+        done: 3,
+        total: 20,
+        current: "chapter1lecture.pdf",
+      });
+    });
+    expect(screen.getByText(/Document 3 of 20/)).toBeTruthy();
+  });
+
+  /// A course arrives incomplete by design — its videos are not documents —
+  /// so the row has to account for what is missing, not just say "added".
+  it("reports what a finished course turned out to be", () => {
+    render(<CatalogueCandidate hit={COURSE} />);
+    act(() => {
+      useCatalogueStore.setState({
+        acquired: { "mit_ocw:3308": "/uploads/1-77-water-quality-spring-2006" },
+        courses: {
+          "mit_ocw:3308": {
+            course_url: COURSE.landing_url as string,
+            title: "Water Quality Control",
+            directory: "/uploads/1-77-water-quality-spring-2006",
+            document: "/uploads/1-77-water-quality-spring-2006/1-77.md",
+            documents: [
+              { filename: "a.pdf", path: "/u/a.pdf", bytes: 1, already_present: false },
+              { filename: "b.pdf", path: "/u/b.pdf", bytes: 2, already_present: false },
+            ],
+            failures: [],
+            skipped: [
+              { title: "Lecture 1 video", reason: "audiovisual" },
+              { title: "Lecture 2 video", reason: "audiovisual" },
+            ],
+          },
+        },
+      });
+    });
+    expect(screen.getByText(/2 documents and a syllabus, 2 skipped/)).toBeTruthy();
   });
 
   /// The desktop webview ignores a plain `target="_blank"`, so the open action

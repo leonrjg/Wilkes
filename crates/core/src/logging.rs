@@ -5,6 +5,23 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter, Layer};
 
 const MAX_LOG_LINES: usize = 1000;
 
+/// What is logged when `RUST_LOG` says nothing.
+///
+/// `ort=warn` because ONNX Runtime's own logger is bridged into `tracing` at
+/// its C++ INFO level, and that level is not a level anyone reading this
+/// application's log asked for: one `Session::run` over a graph with a
+/// control-flow node prints a full `Session Options { .. }` dump for every
+/// subgraph it initialises, and every arena growth prints three lines. A
+/// single recognizer probe over six crops wrote 1742 ORT lines against 6 of
+/// Wilkes'. [`MAX_LOG_LINES`] is 1000, so at INFO the in-app log is *only*
+/// ever ONNX Runtime — the line that would say which document is being read,
+/// or that a worker died, is evicted before anyone can read it.
+///
+/// Warnings and errors from ORT still come through, which is the part of its
+/// output that is about this application rather than about its own internals.
+/// `RUST_LOG=ort=info` puts it back for anyone debugging the runtime itself.
+const DEFAULT_FILTER: &str = "info,hf_hub=warn,ort=warn";
+
 static LOG_BUFFER: LazyLock<Mutex<VecDeque<String>>> =
     LazyLock::new(|| Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES)));
 
@@ -58,7 +75,7 @@ pub fn init_logging() {
         .with_thread_names(false);
 
     let filter_layer = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info,hf_hub=warn"))
+        .or_else(|_| EnvFilter::try_new(DEFAULT_FILTER))
         .unwrap();
 
     tracing_subscriber::registry()
@@ -84,7 +101,7 @@ pub fn init_logging_stderr() {
         .with_thread_names(false);
 
     let filter_layer = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info,hf_hub=warn"))
+        .or_else(|_| EnvFilter::try_new(DEFAULT_FILTER))
         .unwrap();
 
     tracing_subscriber::registry()

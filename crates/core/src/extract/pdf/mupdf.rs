@@ -826,6 +826,9 @@ fn discover_image(
         id: id.clone(),
         page,
         origin: RegionOrigin::Embedded,
+        // An embedded raster is not rendered onto a canvas of Wilkes' making,
+        // so what it covers and what it shows are one rectangle.
+        drawn: bbox.clone(),
         bbox,
         transform,
         decoded: None,

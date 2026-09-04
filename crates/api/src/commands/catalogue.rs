@@ -13,10 +13,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use wilkes_core::acquire::{download_to_root, DownloadParams, DownloadProgress, DownloadResponse};
+use wilkes_core::catalogue::ocw;
 use wilkes_core::catalogue::providers::FetchReporter;
 use wilkes_core::catalogue::{registry, CatalogueStore};
+use wilkes_core::network::ProviderHttpClient;
 use wilkes_core::types::{
-    CatalogueFetchProgress, CatalogueGrain, CatalogueHit, CatalogueProviderStatus,
+    CatalogueCourseProgress, CatalogueCourseStage, CatalogueFetchProgress, CatalogueGrain,
+    CatalogueHit, CatalogueProviderStatus,
 };
 
 use crate::context::{AppContext, EventEmitter};
@@ -26,6 +29,11 @@ use crate::context::{AppContext, EventEmitter};
 /// terminal event of its own to leave it.
 pub const SYNC_PROGRESS_EVENT: &str = "catalogue-sync-progress";
 pub const DOWNLOAD_PROGRESS_EVENT: &str = "catalogue-download-progress";
+/// A course is many downloads and a manifest walk before them, so it has a
+/// stream of its own. Sharing `catalogue-download-progress` would leave a UI
+/// counting bytes with no way to say which of forty documents it was on, and
+/// no terminal event for the course as a whole.
+pub const COURSE_PROGRESS_EVENT: &str = "catalogue-course-progress";
 
 /// How many reports may queue before the fetch stops waiting for a listener.
 /// Reporting is lossy on purpose; see [`FetchReporter::page`].
@@ -120,6 +128,50 @@ pub struct CatalogueSyncOutcome {
 pub struct CatalogueSyncResponse {
     pub providers: Vec<CatalogueSyncOutcome>,
     pub total_records: i64,
+}
+
+/// One document of a course that was fetched.
+#[derive(Clone, Debug, Serialize)]
+pub struct CourseDocument {
+    pub filename: String,
+    pub path: String,
+    pub bytes: usize,
+    /// True when the identical bytes were already in the course directory, so
+    /// re-acquiring a course is a cheap no-op rather than a wall of refusals.
+    pub already_present: bool,
+}
+
+/// One document that could not be fetched, named with the reason.
+///
+/// A separate list from `skipped`: a skip is this build declining a resource
+/// it understands and does not want, a failure is a document it wanted and did
+/// not get. Collapsing them would let a broken link read as a policy decision.
+#[derive(Clone, Debug, Serialize)]
+pub struct CourseFailure {
+    pub filename: String,
+    pub url: String,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CourseSkip {
+    pub title: String,
+    pub reason: String,
+}
+
+/// What acquiring one course produced.
+#[derive(Clone, Debug, Serialize)]
+pub struct CatalogueCourseResponse {
+    pub course_url: String,
+    pub title: String,
+    /// The directory under uploads holding the whole course.
+    pub directory: String,
+    /// The generated Markdown document: the syllabus, the calendar, the
+    /// reading list and an index of everything beside it.
+    pub document: String,
+    pub documents: Vec<CourseDocument>,
+    pub failures: Vec<CourseFailure>,
+    pub skipped: Vec<CourseSkip>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -339,6 +391,121 @@ pub async fn acquire(
         })
 }
 
+/// Fetches one MIT OpenCourseWare course: its documents, and a generated
+/// Markdown file describing them.
+///
+/// A course record has no `pdf_url` because a course is not a file, so this is
+/// a second *expander* rather than a second downloader — the bytes still go
+/// through [`download_to_root`], once per document, into a directory named
+/// after the course. Giving each course its own directory is what makes the
+/// per-document names usable: a dozen courses each publish something called
+/// `lecture5.pdf`, and `download_to_root` refuses same-name-different-content
+/// by design, so a flat uploads directory would fail partway through the
+/// second course a user asked for.
+///
+/// Failure is per document. One dead link out of forty is reported in
+/// `failures` and costs nothing else; only an unreadable manifest — where
+/// there is no course to speak of — fails the call.
+pub async fn acquire_course(
+    uploads_dir: &Path,
+    course_url: String,
+    course_progress: Option<mpsc::Sender<CatalogueCourseProgress>>,
+    download_progress: Option<mpsc::Sender<DownloadProgress>>,
+) -> Result<CatalogueCourseResponse, CatalogueError> {
+    let http = ProviderHttpClient::new("MIT OpenCourseWare");
+    let manifest = ocw::read_course(&http, &course_url, course_progress.as_ref())
+        .await
+        .map_err(|error| {
+            tracing::warn!(course = %course_url, "OCW course manifest unreadable: {error:#}");
+            CatalogueError::Request(format!("Could not read that course: {error:#}"))
+        })?;
+
+    let directory = uploads_dir.join(&manifest.slug);
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .map_err(|error| {
+            CatalogueError::Failed(format!("Cannot prepare course directory: {error}"))
+        })?;
+
+    // Written before the documents, so a course whose fetches are cancelled
+    // partway still leaves behind the thing that says what it was.
+    let document_name = format!("{}.md", manifest.slug);
+    let document_path = directory.join(&document_name);
+    tokio::fs::write(&document_path, ocw::course_document(&manifest))
+        .await
+        .map_err(|error| {
+            CatalogueError::Failed(format!("Cannot write the course document: {error}"))
+        })?;
+
+    let total = manifest.files.len();
+    let mut documents = Vec::new();
+    let mut failures = Vec::new();
+    for (index, file) in manifest.files.iter().enumerate() {
+        if let Some(tx) = &course_progress {
+            let _ = tx.try_send(CatalogueCourseProgress {
+                course_url: manifest.course_url.clone(),
+                stage: CatalogueCourseStage::Documents,
+                done: index,
+                total: Some(total),
+                current: Some(file.filename.clone()),
+            });
+        }
+        let params = DownloadParams {
+            url: file.url.clone(),
+            filename: Some(file.filename.clone()),
+        };
+        match download_to_root(&directory, params, download_progress.clone()).await {
+            Ok(response) => documents.push(CourseDocument {
+                filename: file.filename.clone(),
+                path: response.path,
+                bytes: response.bytes,
+                already_present: response.already_present,
+            }),
+            Err(message) => {
+                tracing::warn!(url = %file.url, "course document failed: {message}");
+                failures.push(CourseFailure {
+                    filename: file.filename.clone(),
+                    url: file.url.clone(),
+                    error: message,
+                });
+            }
+        }
+    }
+    if let Some(tx) = &course_progress {
+        let _ = tx.try_send(CatalogueCourseProgress {
+            course_url: manifest.course_url.clone(),
+            stage: CatalogueCourseStage::Documents,
+            done: total,
+            total: Some(total),
+            current: None,
+        });
+    }
+    tracing::info!(
+        course = %manifest.course_url,
+        documents = documents.len(),
+        failed = failures.len(),
+        skipped = manifest.skipped.len(),
+        "course acquired"
+    );
+
+    Ok(CatalogueCourseResponse {
+        course_url: manifest.course_url,
+        title: manifest.title,
+        directory: directory.display().to_string(),
+        document: document_path.display().to_string(),
+        documents,
+        failures,
+        skipped: manifest
+            .skipped
+            .into_iter()
+            .map(|skip| CourseSkip {
+                title: skip.title,
+                reason: skip.reason,
+            })
+            .collect(),
+    })
+}
+
 /// Forwards progress to the shell's event stream until the sender is dropped.
 ///
 /// A task rather than a callback because the fetch and the emitter belong to
@@ -369,6 +536,24 @@ impl AppContext {
     ) -> Result<CatalogueSyncResponse, CatalogueError> {
         let tx = forward::<CatalogueFetchProgress>(self.emitter(), SYNC_PROGRESS_EVENT);
         sync(&self.catalogue_dir, providers, Some(tx)).await
+    }
+
+    /// Fetches a whole course, reporting the walk and the documents on
+    /// `catalogue-course-progress` and each document's bytes on
+    /// `catalogue-download-progress`.
+    pub async fn catalogue_acquire_course(
+        &self,
+        course_url: String,
+    ) -> Result<CatalogueCourseResponse, CatalogueError> {
+        let course = forward::<CatalogueCourseProgress>(self.emitter(), COURSE_PROGRESS_EVENT);
+        let bytes = forward::<DownloadProgress>(self.emitter(), DOWNLOAD_PROGRESS_EVENT);
+        acquire_course(
+            &self.data_dir.join("uploads"),
+            course_url,
+            Some(course),
+            Some(bytes),
+        )
+        .await
     }
 
     /// Fetches a candidate, reporting bytes on `catalogue-download-progress`.

@@ -359,7 +359,7 @@ describe("SettingsModal", () => {
     await act(async () => {
       render(<SettingsModal {...defaultProps} />);
     });
-    fireEvent.click(screen.getByText("Settings (JSON)"));
+    fireEvent.click(screen.getByText("Raw config"));
     const applyBtn = screen.getByText("Apply Changes");
     mockApi.updateSettings.mockResolvedValue(undefined);
     await act(async () => {

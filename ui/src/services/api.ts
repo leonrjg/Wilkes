@@ -6,6 +6,8 @@ import type {
   Bookmark,
   BookmarkClustersQuery,
   CatalogueDownload,
+  CatalogueCourse,
+  CatalogueCourseProgress,
   CatalogueDownloadProgress,
   CatalogueFetchProgress,
   CatalogueProbe,
@@ -201,9 +203,20 @@ export interface SearchApi {
   onCatalogueSyncProgress(
     handler: (progress: CatalogueFetchProgress) => void,
   ): Promise<() => void>;
+  /** Fetches a whole course — every PDF it publishes plus a generated Markdown
+   *  document holding the syllabus, calendar and reading list — into a
+   *  directory of its own under uploads. A course has no single `pdf_url`
+   *  because a course is not a file, which is why this is its own call. */
+  catalogueAcquireCourse(courseUrl: string): Promise<CatalogueCourse>;
   /** Bytes of a document being acquired, as they arrive. */
   onCatalogueDownloadProgress(
     handler: (progress: CatalogueDownloadProgress) => void,
+  ): Promise<() => void>;
+  /** How far a course acquisition has got: the manifest walk, then the
+   *  documents. Separate from the byte stream above, which cannot say which
+   *  of forty documents it is reporting. */
+  onCatalogueCourseProgress(
+    handler: (progress: CatalogueCourseProgress) => void,
   ): Promise<() => void>;
 
   // ── Worker Management ────────────────────────────────────────────────────────

@@ -328,6 +328,10 @@ admitted by what makes *that* kind wrong:
 - **Table** is admitted on structure: the parse must yield a rectangular
   table of at least two rows and two columns, every row the same width. A
   ragged table is a failed recognition wearing the shape of a result.
+  Amended 2026-09-02: a table the page *typesets* is no longer transcribed at
+  all — its grid comes from a structure model and its cells from the page's own
+  glyphs — and it answers three further clauses a rectangle cannot show. See
+  "Amendment, 2026-09-02".
 - **Chart** is admitted as a table, by the same rule, and is labeled
   distinctly in the reading — a chart transcribed to rows is a
   *reconstruction*, not a quotation, and must not be presented as one.
@@ -886,6 +890,9 @@ formulas_accepted
 formulas_rejected_invalid_latex
 tables_accepted
 tables_rejected_malformed
+tables_rejected_empty_header_row
+tables_rejected_unassigned_words
+tables_rejected_sparse
 charts_accepted
 charts_rejected_malformed
 images_description_succeeded
@@ -1475,6 +1482,82 @@ line, and an inline formula shares its line with prose — and a per-document
 budget caps how many regions one reading may spend. What the budget drops is
 counted and logged, because a bounded run that reports nothing dropped reads
 exactly like a document that had nothing more to find.
+
+### Amendment, 2026-09-02: a typeset table's text comes from the page
+
+**The invariant: a typeset table's structure comes from the structure model and
+its text from the page. No model transcribes glyphs the page already holds.**
+
+Every `table` area the detector marked out went to granite-docling-258M, which
+reads the crop as if it were a page. Measured on the 56 table and chart crops of
+a 168-page textbook: 411.7 s, and 21 admitted tables. The other 35 calls came
+back as prose that admission threw away against the page's own glyphs — 7.4 s a
+crop to learn, most of the time, that the crop was not a table after all.
+
+The mistake was the question. The glyphs of a ruled table a page *typesets* are
+already in the file, already correct; what is missing is only which cell each
+word sits in. So the model is asked for the grid and nothing else. SLANet-plus
+— a 7.4 MB ONNX export RapidAI publishes in RapidTable, pinned by URL and
+SHA-256 because it is not on the HuggingFace hub — answers `<tr>`, `<td`,
+`colspan`, `rowspan` and a box per cell, and the host puts the page's own words
+into those boxes by geometry. On the same 56 crops: **23 ms a crop, 51
+rectangular grids against 21 admitted, and better column structure in 10 cases
+against 1.**
+
+`RecognizerRole` gains `Table` beside `Page` and `Formula`, and everything
+follows from the role exactly as it did for Texify: one catalogue row, one
+install path, one identity in the recipe, `dispatch::table_model` finding it by
+role, and the page picker still filtering to `Page`. It is not an `OcrEngine` —
+it returns geometry, not text — so it has its own trait and its own `_local`
+loader, and the recognize worker holds four resident models rather than three.
+
+**What crosses the pipe is geometry.** The model runs in the recognition worker
+like every other model in this path; the fill runs in the host, because the host
+is what holds the page's words and the rectangle the crop covers, and neither is
+inference. A `TableGrid` of cells with a row, a column, their spans and a box in
+fractions of the crop is the whole of the reply. Nothing on the worker side of
+that pipe ever sees a character of the document.
+
+**Charts still go to the page reader**, and always did. The same reason: what a
+plotted curve says is not written under it as glyphs, so there is nothing for a
+grid to hold. So does an embedded raster the detector calls a table — there is
+no text layer under it either.
+
+**A grid needs its own admission**, because `markdown_table_is_rectangular`
+cannot see the ways a grid goes wrong: a grid shifted one row off the ink is a
+perfect rectangle. Three clauses, versioned by `image-admission-v4`, each
+counted apart in the diagnostics:
+
+- an **empty first row** — the model proposed a band of cells above the table;
+- **a word the crop shows in no cell at all** — the glyphs are certainly there,
+  so a word with nowhere to go is a column the grid does not have. *The crop
+  shows*, not *the canvas covers*: `render` pads a lopsided region out to the
+  aspect bound and clips the page to the region, so a wide table arrives with
+  white bands above and below it. `DiscoveredImage` carries both rectangles —
+  `bbox` is the canvas a cell's fractions map onto, `drawn` is the part of it
+  the page was painted into — and this clause reads the second. Deciding it on
+  the canvas refused wide tables for the caption above them, which the
+  structure model was never shown;
+- **more than a third of the grid positions blank**. From the 56-crop data: of
+  the 51 grids that came back rectangular, the ones that read correctly reach
+  7 empty of 32 at their sparsest, and the one that did not is 2 of 4. A third
+  sits in that gap.
+
+`markdown_table_is_rectangular` is kept and asked first. It is the rule about
+the *shape of the bytes that enter the reading*, it decides this for every
+engine rather than for this one, and nothing about a grid guarantees it: a
+one-column grid expands to a one-column Markdown table, which is a list, and
+five of the 56 crops are exactly that.
+
+Over the 56, admission is **47 accepted, 9 refused** — five as ragged
+one-column lists, three for an unplaced word, one for an empty first row.
+
+Re-measured 2026-09-03 after the unplaced-word clause was corrected to read
+the *drawn* rectangle rather than the canvas: the same 47 accepted and 9
+refused, the same three crops refused for an unplaced word (p60-v0, p61-v0,
+p147-v0). No table on this book had words in its render padding, so the
+correction changed nothing here; it matters for a wide table with a caption
+or a paragraph inside the padded canvas.
 
 ### Decisions taken now
 
