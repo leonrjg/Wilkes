@@ -5,6 +5,12 @@ resolver = "2"
 [workspace.package]
 version = "0.9.5"
 
+# The chat, pinned once. Three crates depend on it, and with a git dependency
+# the tag *is* the version -- three copies of it would be three places to miss
+# when it moves.
+[workspace.dependencies]
+wilkes-chat = { git = "https://github.com/leonrjg/wilkes-chat", tag = "v0.1.0" }
+
 # Cargo's stock `dev` is unoptimized and carries full debug info for every
 # dependency, which is most of what target/debug weighs. This does not touch
 # `just dev` — that runs `tauri dev --release` — but it does reach

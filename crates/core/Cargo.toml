@@ -39,7 +39,7 @@ required-features = ["recognize-vision"]
 cc = "1"
 
 [dependencies]
-wilkes-chat = { path = "../../../wilkes-chat/crates/wilkes-chat" }
+wilkes-chat = { workspace = true }
 grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
