@@ -1,2 +1,9 @@
 [env]
 MACOSX_DEPLOYMENT_TARGET = { value = "10.15", force = true }
+
+# Cargo's bundled libgit2 fails to authenticate against a *public* GitHub repo
+# when a credential helper offers it something it cannot use, and the chat is a
+# git dependency. The git CLI has no such trouble -- it is what `git clone`
+# uses -- so hand the fetch to it.
+[net]
+git-fetch-with-cli = true

@@ -12,15 +12,17 @@ import { pdfjsAssets } from "@leonrjg/wilkes-reader/vite";
 // once it is installed from a tag and lives under node_modules.
 const require_ = createRequire(import.meta.url);
 const readerRoot = dirname(require_.resolve("@leonrjg/wilkes-reader/package.json"));
-// The chat is a sibling checkout, linked rather than installed, and the same
-// rule applies to reading its stylesheet off disk.
+// The same, for the chat's stylesheet.
 const chatRoot = dirname(require_.resolve("@leonrjg/wilkes-chat/package.json"));
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), pdfjsAssets()],
-  // A linked package brings its own node_modules, and a second copy of React
-  // means a second hook dispatcher -- which fails as `useCallback` of null the
-  // first time a component from it renders, nowhere near the cause.
+  // Installing from a tag hoists the packages' peers into this root and this
+  // does nothing. It earns its place the moment someone links a sibling
+  // checkout to work on both at once: a linked package brings its own
+  // node_modules, and a second copy of React means a second hook dispatcher --
+  // which fails as `useCallback` of null the first time a component from it
+  // renders, nowhere near the cause.
   resolve: { dedupe: ["react", "react-dom", "zustand"] },
   clearScreen: false,
   server: {
