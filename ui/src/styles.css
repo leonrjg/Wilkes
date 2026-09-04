@@ -5,6 +5,10 @@
 /* The readers' stylesheet, ahead of this file's own `:root` so the tokens
    below override its defaults. */
 @import "@leonrjg/wilkes-reader/reader.css";
+/* The chat's stylesheet, likewise ahead of `:root`. It styles itself from
+   custom properties rather than utility classes, so Wilkes restyles it by
+   redefining tokens (see `.wilkes-chat` below) instead of forking its markup. */
+@import "@leonrjg/wilkes-chat/chat.css";
 
 html,
 body,
@@ -172,4 +176,27 @@ body,
   display: block;
   overflow-x: auto;
   white-space: nowrap;
+}
+
+/* The chat pane, in Wilkes's palette.
+   Every value here is one of this file's own tokens, so the pane follows the
+   light/dark switch above without knowing that either exists. */
+.wilkes-chat {
+  --wilkes-chat-bg: var(--bg-sidebar);
+  --wilkes-chat-bg-raised: var(--bg-active);
+  --wilkes-chat-bg-bubble: var(--bg-app);
+  --wilkes-chat-bg-user: var(--accent-blue-muted);
+  --wilkes-chat-border: var(--border-main);
+  --wilkes-chat-text: var(--text-main);
+  --wilkes-chat-text-muted: var(--text-muted);
+  --wilkes-chat-text-dim: var(--text-dim);
+  --wilkes-chat-accent: var(--accent-blue);
+  --wilkes-chat-accent-text: #fff;
+  --wilkes-chat-danger: var(--text-error, #dc2626);
+  --wilkes-chat-added: #16a34a;
+  --wilkes-chat-removed: var(--text-error, #dc2626);
+  --wilkes-chat-radius: 4px;
+  --wilkes-chat-font-size: 12px;
+  --wilkes-chat-font-size-small: 10px;
+  border-left: 1px solid var(--border-main);
 }

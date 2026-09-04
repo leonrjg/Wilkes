@@ -27,7 +27,7 @@ use crate::{
     context::{ActiveDoc, ContextFile},
     reader,
     search::{SearchService, WorkspaceCatalog, WorkspaceDescriptor},
-    session::ContextStateHandle,
+    host::ContextStateHandle,
 };
 
 const DEFAULT_TEXT_CHAR_LIMIT: usize = 24_000;
@@ -47,7 +47,7 @@ const WORKSPACE_DOCUMENT_PATH_REQUIRED: &str =
     "The active document belongs to the workspace open in Wilkes, not the workspace this call names; pass path explicitly.";
 
 /// Names of the read-only tools this server exposes. Shared with the permission
-/// boundary in `session.rs` so calls to Wilkes's *own* MCP server are
+/// boundary in `host.rs` so calls to Wilkes's *own* MCP server are
 /// auto-allowed without ever prompting the user (they are the Q&A pane's own
 /// internal plumbing). Mutating tools such as `download` must not be added here,
 /// so the agent's normal permission flow remains in effect.
@@ -518,7 +518,7 @@ impl WilkesMcp {
         }
     }
 
-    async fn context_snapshot(&self, scope: &WorkspaceScope) -> crate::session::ContextSnapshot {
+    async fn context_snapshot(&self, scope: &WorkspaceScope) -> crate::host::ContextSnapshot {
         match &self.context {
             // A named workspace overrides the chat's own root: the caller asked
             // about that library, not the one this conversation opened in.
@@ -529,7 +529,7 @@ impl WilkesMcp {
                     Some(search) => search.default_root().await,
                     None => None,
                 };
-                crate::session::ContextSnapshot {
+                crate::host::ContextSnapshot {
                     root: crate::context::root_context(root.as_deref()),
                     ..snapshot
                 }
@@ -539,11 +539,10 @@ impl WilkesMcp {
                     Some(search) => search.default_root().await,
                     None => None,
                 };
-                crate::session::ContextSnapshot {
+                crate::host::ContextSnapshot {
                     active_doc: context.active_document(),
                     context_files: Vec::new(),
                     root: crate::context::root_context(root.as_deref()),
-                    branch_history: None,
                 }
             }
         }

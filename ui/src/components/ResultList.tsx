@@ -25,7 +25,7 @@ import { useFileContextMenu } from "./FileContextMenu";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { useSearchStore } from "../stores/useSearchStore";
 import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
-import { useChatStore } from "../stores/useChatStore";
+import { useChatSession, useChatStore } from "../stores/useChatStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useResearchStore } from "../stores/useResearchStore";
 import { useGenerationStore } from "../stores/useGenerationStore";
@@ -414,7 +414,7 @@ export default function ResultList({
   const selectedMatch = useViewerStore((state) => activeViewerTab(state)?.match ?? null);
   const { addToast } = useToasts();
   const generationReady = useGenerationStore((s) => s.ready);
-  const hasAvailableChatBackend = useChatStore((s) => s.hasAvailableBackend);
+  const hasAvailableChatBackend = useChatSession((s) => s.hasAvailableBackend);
   const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
   const selectTopic = useTopicsStore((s) => s.selectTopic);
 

@@ -2392,16 +2392,15 @@ pub struct Settings {
     pub pdf_auto_zoom_target_px: f64,
     /// Preferred agent backend for the "Ask the documents" chat pane. The
     /// in-pane selector and header dropdown may switch a session to a
-    /// different backend transiently, but this Settings field is the single
-    /// persisted default (see docs/chat-agent-integration-spec.md §7.10).
+    /// different backend transiently; this field is the single persisted
+    /// default, and Settings is its only writer.
     #[serde(default, deserialize_with = "deserialize_chat_backend_setting")]
     pub chat_backend: AgentBackend,
     /// Per-backend chat config defaults applied to newly started sessions.
     /// Written whenever the user changes a config option in the chat pane, so
-    /// each backend restores its last model/thought level/mode on a new chat
-    /// (see docs/chat-agent-integration-spec.md §7.10). Distinct from a
-    /// conversation's own `config_values` snapshot, which restores *that*
-    /// conversation on reopen.
+    /// each backend restores its last model/thought level/mode on a new chat.
+    /// Distinct from a conversation's own `config_values` snapshot, which
+    /// restores *that* conversation on reopen.
     #[serde(default)]
     pub chat_config: Vec<ChatBackendConfig>,
     /// User-authored instructions prepended to every chat turn. Kept in the
@@ -2501,35 +2500,14 @@ where
     }
 }
 
-/// Which CLI the "Ask the documents" chat pane drives over ACP. The launch
-/// command is the only per-backend difference (see `wilkes_agent::launch_spec`);
-/// everything else -- context injection, permission boundary, transport -- is
-/// shared (docs/chat-agent-integration-spec.md §5).
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
-pub enum AgentBackend {
-    #[default]
-    ClaudeCode,
-    Codex,
-    Nanocoder,
-}
-
-/// One resolved ACP session config selection (e.g. `model` = `sonnet`). The
-/// canonical shape for persisting config, shared by the per-conversation
-/// snapshot and the per-backend default below.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ChatConfigValue {
-    pub id: String,
-    pub value: String,
-}
-
-/// The chat config (model, thought level, mode, ...) last chosen for a given
-/// backend, persisted so a *new* chat with that backend restores it instead of
-/// falling back to the agent's own defaults.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ChatBackendConfig {
-    pub backend: AgentBackend,
-    pub values: Vec<ChatConfigValue>,
-}
+/// Which CLI answers, and the shapes a chat's configuration is persisted in.
+///
+/// Defined by `wilkes-chat` and re-exported here rather than declared again.
+/// They are the chat's own vocabulary -- the enum names the adapters that
+/// crate has been checked against, and `ChatConfigValue` is what its store
+/// writes -- so a copy here would be a second definition of the same thing,
+/// agreeing only for as long as someone kept editing both.
+pub use wilkes_chat::{AgentBackend, ChatBackendConfig, ChatConfigValue};
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

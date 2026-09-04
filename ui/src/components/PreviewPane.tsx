@@ -20,7 +20,7 @@ import {
 import { readTextViewMode, saveTextViewMode } from "./textViewMode";
 import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
-import { useChatStore } from "../stores/useChatStore";
+import { useChatSession, useChatStore } from "../stores/useChatStore";
 import { api, isTauri } from "../services";
 import type { BoundingBox, DocumentMetadata, Match, MatchRef } from "../lib/types";
 import { buildExternalLinks } from "../lib/externalLinks";
@@ -137,8 +137,8 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   const removeBookmark = useBookmarksStore((s) => s.remove);
   const workspaceBookmarks = useBookmarksStore((s) => s.bookmarks);
   const setChatActiveDoc = useChatStore((s) => s.setActiveDoc);
-  const chatBackendsLoaded = useChatStore((s) => s.backendsLoaded);
-  const hasAvailableChatBackend = useChatStore((s) => s.hasAvailableBackend);
+  const chatBackendsLoaded = useChatSession((s) => s.backendsLoaded);
+  const hasAvailableChatBackend = useChatSession((s) => s.hasAvailableBackend);
   const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
   const workspaceGenerationReady = useGenerationStore((state) => state.ready);
   const workspaceSemanticReady = useSemanticStore((state) => state.readyForCurrentRoot);

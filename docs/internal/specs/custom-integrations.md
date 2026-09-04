@@ -246,13 +246,32 @@ existing scheme, size, and duplicate checks. Zotero's write surface
 ## 8. The UI stops being hand-written per provider
 
 Fixing the Rust duplication and leaving `IntegrationsPanel.tsx` with one
-bespoke form per provider would move the cost, not remove it. So a provider —
-built in or custom — publishes its config schema (`enabled`, `base_url`, and
-its own typed fields: `api_key` secret, `email` string, a `citation_style`
-enum), and one component renders any of them. Custom integrations add exactly
-two things to that panel: an import/edit surface for the manifest, and a Probe
-button showing §6's side-by-side result. The status row is the same row the
-built-ins use.
+bespoke form per provider would move the cost, not remove it. So a built-in
+provider is a row in `ui/src/lib/integrations/providers.ts` — its fields and
+their kinds (`url`, a nullable `password`, a `select` over citation styles),
+how to check it, what to say when it cannot be reached — and `ProviderForm`
+renders any row. The fourth provider is four lines in that table and nothing
+anywhere else.
+
+Manifest-defined providers are deliberately *not* rows in it. Their fields are
+not known until a user writes them, which is the whole point of them, so they
+are described by their manifest and rendered by `CustomIntegrations`.
+
+**The panel is tabbed, not stacked.** Form-after-form made the panel's length
+the sum of how many providers exist — a shape that only got worse once a user
+could add their own, and worst of all for the manifest editor, which is the
+tallest thing in the panel by far. One tab per provider plus one for Custom
+makes it the length of one provider. A tab carries a dot when that provider is
+switched on, so the panel still says which ones are live without the user
+opening each one to find out.
+
+**One enable rule, not three.** The old forms disagreed: Zotero checked its
+status before enabling and required exactly `ready`, while the two remote
+providers enabled first, checked, and reverted if the result was unusable, and
+accepted `rate_limited` too. The observable outcomes matched, so the surviving
+rule is the simpler one — check, then enable only if usable, with
+`rate_limited` usable everywhere. Zotero's local API has no rate limit and its
+client never returns that state, so unifying costs Zotero nothing.
 
 MCP's `literature_search` loses its enum: `provider` becomes a string validated
 against the registry, and the tool description is generated from the enabled
@@ -298,13 +317,11 @@ Rust — they do more than search — but their search path is the test case.
    manifest*: secrets are stored separately, so the text is already safe to
    share, and no file dialog is involved.
 5. ~~Probe command; wire it to enablement.~~ Done.
-6. **Not done: schema-driven `IntegrationsPanel`.** Custom integrations render
-   through their own component; Zotero, Semantic Scholar and OpenAlex are still
-   three hand-written forms. The Rust duplication this feature set out to remove
-   is gone, and the TypeScript duplication that §8 also named is not. That is
-   pre-existing duplication left in place, not new duplication introduced — but
-   it is the open half of §8, and the fourth built-in provider will still cost a
-   fourth hand-written form.
+6. ~~Schema-driven `IntegrationsPanel`; migrate the three built-in forms onto
+   it.~~ Done, and the panel is tabbed rather than stacked — see §8. Both
+   halves of the duplication this feature set out to remove are now gone: a new
+   provider is a row in a Rust registry and a row in a TypeScript table, and no
+   new form anywhere.
 
 ## 12. Also changed on the way
 
