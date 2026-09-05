@@ -15,6 +15,7 @@ use wilkes_api::commands::integrations::custom::ManifestSummary;
 use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_api::startup::StartupStatus;
 use wilkes_api::workspace::{WorkspaceManager, WorkspaceState, WorkspaceSummary};
+use wilkes_core::embed::index::IndexActivity;
 use wilkes_core::integrations::custom::ProbeReport;
 use wilkes_core::types::{
     AddOutcome, Bookmark, BookmarkClustersQuery, BookmarkClustersResult, ChunkTopicsQuery,
@@ -421,6 +422,36 @@ async fn build_index_for_ctx(
         selected.model.model_id()
     );
     Arc::clone(&ctx).start_build_index(root, selected).await
+}
+
+/// What the most recent indexing job for `root` did, document by document.
+async fn index_activity_for_ctx(
+    ctx: Arc<AppContext>,
+    root: String,
+) -> Result<IndexActivity, String> {
+    ctx.index_activity(PathBuf::from(root)).await
+}
+
+/// Index the documents the last job for `root` never reached.
+async fn continue_index_job_for_ctx(
+    ctx: Arc<AppContext>,
+    root: String,
+    selected: SelectedEmbedder,
+) -> Result<(), String> {
+    info!("desktop::continue_index_job_for_ctx: root={root}");
+    Arc::clone(&ctx).continue_index_job(root, selected).await
+}
+
+/// Re-attempt the documents the last job for `root` failed on. Never automatic:
+/// a document that broke the reader breaks it again, and a continuation that
+/// swept failures up with it would re-attempt the same one forever.
+async fn retry_failed_documents_for_ctx(
+    ctx: Arc<AppContext>,
+    root: String,
+    selected: SelectedEmbedder,
+) -> Result<(), String> {
+    info!("desktop::retry_failed_documents_for_ctx: root={root}");
+    Arc::clone(&ctx).retry_failed_documents(root, selected).await
 }
 
 /// What this build can embed with, as one answer.
@@ -1744,6 +1775,29 @@ async fn build_index(
 }
 
 #[tauri::command]
+async fn index_activity(app: AppHandle, root: String) -> Result<IndexActivity, String> {
+    index_activity_for_ctx(app_context(&app), root).await
+}
+
+#[tauri::command]
+async fn continue_index_job(
+    root: String,
+    selected: SelectedEmbedder,
+    app: AppHandle,
+) -> Result<(), String> {
+    continue_index_job_for_ctx(app_context(&app), root, selected).await
+}
+
+#[tauri::command]
+async fn retry_failed_documents(
+    root: String,
+    selected: SelectedEmbedder,
+    app: AppHandle,
+) -> Result<(), String> {
+    retry_failed_documents_for_ctx(app_context(&app), root, selected).await
+}
+
+#[tauri::command]
 async fn embedder_capabilities(app: AppHandle) -> Result<EmbedderCapabilityManifest, String> {
     embedder_capabilities_for_ctx(app_context(&app)).await
 }
@@ -2231,6 +2285,9 @@ pub fn run() {
             pick_directory,
             download_model,
             build_index,
+            index_activity,
+            continue_index_job,
+            retry_failed_documents,
             embedder_capabilities,
             get_model_size,
             cancel_embed,

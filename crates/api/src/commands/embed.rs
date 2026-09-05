@@ -3,7 +3,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use ignore::WalkBuilder;
-use wilkes_core::embed::index::SemanticIndex;
+use wilkes_core::embed::index::db::{BuildOptions, BuildScope};
+use wilkes_core::embed::index::{BuildReporter, SemanticIndex};
 use wilkes_core::embed::installer::EmbedderInstaller;
 use wilkes_core::embed::Embedder;
 use wilkes_core::models::progress::ProgressTx;
@@ -19,11 +20,40 @@ pub struct BuildIndexOptions {
     pub model_dir: PathBuf,
     /// Where the index is written. One per workspace.
     pub index_dir: PathBuf,
-    pub tx: ProgressTx,
+    /// How the build names what it is doing, to the interface and to the job
+    /// journal. It carries the progress channel the model download also uses.
+    pub reporter: BuildReporter,
     pub cancel_flag: Arc<AtomicBool>,
+    /// The documents this build is over, and whether they are the whole root.
+    ///
+    /// They are decided by the caller rather than discovered here because the
+    /// caller is what records the job, and a job whose scope is discovered
+    /// somewhere else cannot say what is left until it has already finished
+    /// finding out.
+    pub documents: Vec<PathBuf>,
+    pub scope: BuildScope,
     pub chunk_size: usize,
     pub chunk_overlap: usize,
     pub supported_extensions: Vec<String>,
+}
+
+/// Every indexable file under `root`, in walk order.
+///
+/// This is a build's scope when the user asked for the whole root, and it is
+/// taken before the model is fetched so that the activity view can name the
+/// corpus while the download is still running.
+pub fn collect_indexable_paths(root: &Path, supported_extensions: &[String]) -> Vec<PathBuf> {
+    WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .build()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path().is_file()
+                && wilkes_core::types::FileType::detect(e.path(), supported_extensions).is_some()
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect()
 }
 
 /// Download and install the model into the installation-wide model cache.
@@ -59,29 +89,23 @@ pub async fn build_index_with_embedder(
     );
     let embedder_clone = Arc::clone(&embedder);
 
-    let paths: Vec<PathBuf> = WalkBuilder::new(&root)
-        .hidden(false)
-        .git_ignore(true)
-        .build()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().is_file()
-                && wilkes_core::types::FileType::detect(e.path(), &options.supported_extensions)
-                    .is_some()
-        })
-        .map(|e| e.path().to_path_buf())
-        .collect();
+    let paths = options.documents;
     tracing::info!(
-        "build_index_with_embedder: collected {} candidate files",
-        paths.len()
+        "build_index_with_embedder: {} document(s) in scope ({:?})",
+        paths.len(),
+        options.scope
     );
 
-    let index_dir = options.index_dir.clone();
+    let index_dir = options.index_dir;
     let root_clone = root.clone();
     let indexing = wilkes_core::types::IndexingConfig {
         chunk_size: options.chunk_size,
         chunk_overlap: options.chunk_overlap,
-        supported_extensions: options.supported_extensions.clone(),
+        supported_extensions: options.supported_extensions,
+    };
+    let build_options = match options.scope {
+        BuildScope::WholeRoot => BuildOptions::new(options.reporter, options.cancel_flag),
+        BuildScope::Subset => BuildOptions::over_subset(options.reporter, options.cancel_flag),
     };
 
     tokio::task::spawn_blocking(move || {
@@ -94,8 +118,7 @@ pub async fn build_index_with_embedder(
             &paths,
             &registry,
             embedder_clone.as_ref(),
-            options.tx,
-            options.cancel_flag,
+            build_options,
             &indexing,
         )?;
         tracing::info!("build_index_with_embedder: SemanticIndex::build done");
@@ -155,7 +178,7 @@ pub async fn build_index_with_installer(
 ) -> anyhow::Result<Arc<dyn Embedder>> {
     // Ensure model is ready (probes dimension for SBERT, no-op for others if already cached)
     installer
-        .install(&options.model_dir, options.tx.clone())
+        .install(&options.model_dir, options.reporter.progress_tx())
         .await?;
 
     let embedder = installer.build(&options.model_dir)?;
@@ -292,14 +315,18 @@ mod tests {
         let embedder = Arc::new(TestEmbedder);
         let (tx, _rx) = tokio::sync::mpsc::channel(10);
         let supported_extensions = vec!["txt".to_string()];
+        let documents = collect_indexable_paths(&root, &supported_extensions);
+        assert_eq!(documents.len(), 1, "the walk is the caller's now");
 
         let options = BuildIndexOptions {
             manager: None,
             device: None,
             model_dir: model_dir.clone(),
             index_dir: index_dir.clone(),
-            tx,
+            reporter: BuildReporter::without_journal(tx),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            documents,
+            scope: BuildScope::WholeRoot,
             chunk_size: 600,
             chunk_overlap: 128,
             supported_extensions,
@@ -341,8 +368,10 @@ mod tests {
             device: None,
             model_dir: model_dir.clone(),
             index_dir: index_dir.clone(),
-            tx,
+            reporter: BuildReporter::without_journal(tx),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            documents: collect_indexable_paths(&root, &["txt".to_string()]),
+            scope: BuildScope::WholeRoot,
             chunk_size: 600,
             chunk_overlap: 128,
             supported_extensions: vec!["txt".to_string()],
@@ -366,8 +395,10 @@ mod tests {
             device: None,
             model_dir: dir.path().to_path_buf(),
             index_dir: dir.path().to_path_buf(),
-            tx,
+            reporter: BuildReporter::without_journal(tx),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            documents: Vec::new(),
+            scope: BuildScope::WholeRoot,
             chunk_size: 100,
             chunk_overlap: 10,
             supported_extensions: vec![],

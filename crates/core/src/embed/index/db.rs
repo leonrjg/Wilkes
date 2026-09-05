@@ -31,7 +31,7 @@ use crate::embed::{
     ChunkRef, DocumentSnapshotId, EmbeddingSpaceId, EmbeddingSpaceIdentity, ExtractionRecipe,
     IndexEmbeddingMetadata, RenditionId,
 };
-use crate::models::progress::{EmbedProgress, IndexBuildProgress, ProgressTx};
+use super::job::{BuildReporter, DocumentOutcome, DocumentStage};
 
 fn system_time_ms(value: SystemTime) -> Option<i64> {
     value
@@ -2758,8 +2758,7 @@ mod tests {
             &[root.join("test.txt")],
             &registry,
             &MockEmbedder,
-            tx,
-            Arc::new(AtomicBool::new(false)),
+            BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
             &indexing,
         )
         .unwrap();
@@ -2897,8 +2896,7 @@ mod tests {
             &paths,
             &registry,
             &RecordingEmbedder(log.clone()),
-            tx,
-            Arc::new(AtomicBool::new(false)),
+            BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
             &IndexingConfig {
                 chunk_size: 100,
                 chunk_overlap: 0,
@@ -2974,8 +2972,7 @@ mod tests {
                 std::slice::from_ref(&path),
                 &registry,
                 &embedder,
-                tx,
-                Arc::new(AtomicBool::new(false)),
+                BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
                 &txt_indexing(),
             )
             .unwrap();
@@ -3015,8 +3012,7 @@ mod tests {
                 std::slice::from_ref(&path),
                 &registry,
                 &CountingEmbedder::new(),
-                tx,
-                Arc::new(AtomicBool::new(false)),
+                BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
                 &txt_indexing(),
             )
             .unwrap()
@@ -3148,8 +3144,7 @@ mod tests {
             &[root_a.join("a.txt")],
             &registry,
             &embedder,
-            tx.clone(),
-            Arc::new(AtomicBool::new(false)),
+            BuildOptions::new(BuildReporter::without_journal(tx.clone()), Arc::new(AtomicBool::new(false))),
             &indexing,
         )
         .unwrap();
@@ -3159,8 +3154,7 @@ mod tests {
             &[root_b.join("b.txt")],
             &registry,
             &embedder,
-            tx,
-            Arc::new(AtomicBool::new(false)),
+            BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
             &indexing,
         )
         .unwrap();
@@ -3190,8 +3184,7 @@ mod tests {
             std::slice::from_ref(&shared),
             &registry,
             &embedder,
-            tx.clone(),
-            Arc::new(AtomicBool::new(false)),
+            BuildOptions::new(BuildReporter::without_journal(tx.clone()), Arc::new(AtomicBool::new(false))),
             &indexing,
         )
         .unwrap();
@@ -3204,8 +3197,7 @@ mod tests {
             std::slice::from_ref(&shared),
             &registry,
             &embedder,
-            tx,
-            Arc::new(AtomicBool::new(false)),
+            BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
             &indexing,
         )
         .unwrap();
@@ -3304,8 +3296,7 @@ mod tests {
             std::slice::from_ref(&path),
             &registry,
             &embedder,
-            tx,
-            cancelled,
+            BuildOptions::new(BuildReporter::without_journal(tx), cancelled),
             &indexing,
         );
         let err = match result {
@@ -3321,6 +3312,169 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk_text, "old content");
+    }
+
+    /// An embedder that raises a cancel flag once it has embedded `after`
+    /// batches, so a build can be stopped mid-corpus at a known point.
+    struct CancelAfter {
+        cancel: Arc<AtomicBool>,
+        after: usize,
+        calls: AtomicUsize,
+    }
+
+    impl Embedder for CancelAfter {
+        fn embedding_space_identity(&self) -> crate::embed::EmbeddingSpaceIdentity {
+            crate::embed::EmbeddingSpaceIdentity::for_test(
+                self.engine(),
+                self.model_id(),
+                self.dimension(),
+            )
+        }
+        fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) + 1 >= self.after {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+            Ok(texts.iter().map(|_| vec![1.0]).collect())
+        }
+        // One file per batch, so "stopped after the first document" is a thing
+        // this test can actually arrange.
+        fn preferred_batch_size(&self) -> Option<usize> {
+            Some(1)
+        }
+        fn model_id(&self) -> &str {
+            "counting"
+        }
+        fn dimension(&self) -> usize {
+            1
+        }
+        fn engine(&self) -> EmbeddingEngine {
+            EmbeddingEngine::Candle
+        }
+    }
+
+    /// The whole point of publishing an interrupted build.
+    ///
+    /// A build stopped part-way used to lose everything it had read, because
+    /// the temporary database it fills was deleted rather than merged. Now it
+    /// is merged additively: what finished is searchable, and the documents the
+    /// build never reached are neither indexed nor destroyed.
+    #[test]
+    fn a_stopped_build_saves_the_documents_it_finished() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        // Named so the walk order below is the order they are written.
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(root.join(name), format!("content of {name}")).unwrap();
+        }
+        let paths: Vec<PathBuf> = ["a.txt", "b.txt", "c.txt"]
+            .iter()
+            .map(|n| root.join(n))
+            .collect();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let embedder = CancelAfter {
+            cancel: Arc::clone(&cancel),
+            after: 1,
+            calls: AtomicUsize::new(0),
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+
+        let result = SemanticIndex::build(
+            &data_dir,
+            &root,
+            &paths,
+            &ExtractorRegistry::new(),
+            &embedder,
+            BuildOptions::new(BuildReporter::without_journal(tx), Arc::clone(&cancel)),
+            &txt_indexing(),
+        );
+        let err = match result {
+            Ok(_) => panic!("a stopped build reports that it was stopped"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("cancelled"), "{err:#}");
+
+        // The one document it got through is in the index, and searchable.
+        let idx = SemanticIndex::open(&data_dir, "counting", 1).unwrap();
+        assert_eq!(
+            idx.status_for_root(Some(&root)).indexed_files,
+            1,
+            "the document the build finished before it was stopped is saved"
+        );
+        let hits = idx
+            .query_scoped(&[1.0], 10, SemanticQueryScope::Root(&root))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file_path, canon(&paths[0]));
+
+        // And the build is not claimed to have happened.
+        assert!(
+            idx.status_for_root(Some(&root)).built_at.is_none(),
+            "a stopped build must not stamp the index as built"
+        );
+    }
+
+    /// The other half of the same guarantee: continuing over what is left adds
+    /// to the root rather than replacing it, so the first run's work survives
+    /// the second run that never looked at it.
+    #[test]
+    fn continuing_over_the_remaining_documents_keeps_what_was_already_saved() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(root.join(name), format!("content of {name}")).unwrap();
+        }
+        let paths: Vec<PathBuf> = ["a.txt", "b.txt", "c.txt"]
+            .iter()
+            .map(|n| root.join(n))
+            .collect();
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stopped = SemanticIndex::build(
+            &data_dir,
+            &root,
+            &paths,
+            &ExtractorRegistry::new(),
+            &CancelAfter {
+                cancel: Arc::clone(&cancel),
+                after: 1,
+                calls: AtomicUsize::new(0),
+            },
+            BuildOptions::new(
+                BuildReporter::without_journal(tx.clone()),
+                Arc::clone(&cancel),
+            ),
+            &txt_indexing(),
+        );
+        assert!(stopped.is_err());
+
+        // Continue over only what was never reached. A whole-root merge here
+        // would drop `a.txt` from the root, because this build never saw it.
+        let embedder = CountingEmbedder::new();
+        let resumed = SemanticIndex::build(
+            &data_dir,
+            &root,
+            &paths[1..],
+            &ExtractorRegistry::new(),
+            &embedder,
+            BuildOptions::over_subset(
+                BuildReporter::without_journal(tx),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            &txt_indexing(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resumed.status_for_root(Some(&root)).indexed_files,
+            3,
+            "the first run's document is still in the root after the second"
+        );
     }
 
     #[test]
@@ -3343,8 +3497,7 @@ mod tests {
             std::slice::from_ref(&shared),
             &registry,
             &embedder,
-            tx.clone(),
-            Arc::new(AtomicBool::new(false)),
+            BuildOptions::new(BuildReporter::without_journal(tx.clone()), Arc::new(AtomicBool::new(false))),
             &indexing,
         )
         .unwrap();
@@ -3356,8 +3509,7 @@ mod tests {
             std::slice::from_ref(&shared),
             &registry,
             &embedder,
-            tx.clone(),
-            Arc::new(AtomicBool::new(true)),
+            BuildOptions::new(BuildReporter::without_journal(tx.clone()), Arc::new(AtomicBool::new(true))),
             &indexing,
         );
         assert!(cancelled.is_err());
@@ -3374,8 +3526,7 @@ mod tests {
             std::slice::from_ref(&shared),
             &registry,
             &embedder,
-            tx,
-            Arc::new(AtomicBool::new(false)),
+            BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
             &indexing,
         )
         .unwrap();
@@ -3432,8 +3583,7 @@ mod tests {
             &[root.join("test.txt")],
             &registry,
             &WrongDimEmbedder,
-            tx,
-            Arc::new(AtomicBool::new(false)),
+            BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
             &indexing,
         )
         .unwrap();
@@ -3518,6 +3668,82 @@ mod tests {
         let results = idx.query(&[1.0], 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk_text, "original");
+    }
+}
+
+// ── How a build is driven and observed ───────────────────────────────────────
+
+/// What a build's path list is, relative to the root it is building.
+///
+/// This is not a preference. It decides whether the root's membership after
+/// the build is *replaced by* what the build produced or *added to* it, and
+/// getting that wrong either strands documents outside the root or deletes
+/// coverage the build never looked at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildScope {
+    /// Every indexable file under the root. Reaching the end of this list means
+    /// the root contains exactly what the build produced, so anything not in it
+    /// is gone from disk and should go from the root too.
+    WholeRoot,
+    /// A chosen subset — the documents a previous job never reached, or the
+    /// ones the user asked to retry. The build knows nothing about the rest of
+    /// the root, so it must not speak for them.
+    Subset,
+}
+
+/// One document's settled verdict, as [`BuildReporter::settle_batch`] takes it.
+type SettledDocument = (PathBuf, DocumentOutcome, Option<String>, Option<i64>);
+
+/// Why a batch did not finish.
+enum BatchStop {
+    /// The build is being stopped. The batch's documents were killed, not
+    /// broken, and are left unfinished for a continuation to pick up.
+    Stopped,
+    /// The batch was attempted and failed. Its documents are settled as failed
+    /// and the error ends the build.
+    Failed(anyhow::Error),
+}
+
+/// Whether a merge may speak for the whole root or only for what it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootMembership {
+    /// The source holds the root's entire membership; drop what it omits.
+    Authoritative,
+    /// The source holds part of it; leave everything else as it was.
+    Additive,
+}
+
+/// How a build reports itself, and how it is stopped.
+pub struct BuildOptions {
+    /// The one channel through which the build names documents and stages.
+    pub reporter: BuildReporter,
+    /// Raised to stop the build. Checked between documents; the workers are
+    /// killed separately, and the kill is what ends work already in flight.
+    pub cancel_flag: Arc<AtomicBool>,
+    pub scope: BuildScope,
+}
+
+impl BuildOptions {
+    /// A build over every indexable file under the root.
+    pub fn new(reporter: BuildReporter, cancel_flag: Arc<AtomicBool>) -> Self {
+        Self {
+            reporter,
+            cancel_flag,
+            scope: BuildScope::WholeRoot,
+        }
+    }
+
+    /// A build over a chosen subset of the root's documents.
+    pub fn over_subset(reporter: BuildReporter, cancel_flag: Arc<AtomicBool>) -> Self {
+        Self {
+            reporter,
+            cancel_flag,
+            scope: BuildScope::Subset,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel_flag.load(Ordering::Relaxed)
     }
 }
 
@@ -4214,14 +4440,33 @@ impl SemanticIndex {
     /// so by naming every file in it — a group is what was attempted, and
     /// reporting anything narrower would claim a per-file attempt that did not
     /// happen.
+    ///
+    /// Returns one settled outcome per file in the queue. It returns them
+    /// rather than logging them because this is the only place that knows
+    /// which files of a batch were written and which were skipped, and a
+    /// skipped file that is only logged is a hole in the corpus that nothing
+    /// can later name.
     fn embed_and_write(
         idx: &mut Self,
         embedder: &dyn Embedder,
         queue: Vec<PendingFile>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<SettledDocument>> {
         if queue.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let batch_failed = |queue: &[PendingFile], detail: String| -> Vec<SettledDocument> {
+            queue
+                .iter()
+                .map(|file| {
+                    (
+                        file.path.clone(),
+                        DocumentOutcome::Failed,
+                        Some(detail.clone()),
+                        None,
+                    )
+                })
+                .collect()
+        };
         let texts: Vec<&str> = queue
             .iter()
             .flat_map(|file| file.chunks.iter().map(|c| c.text.as_str()))
@@ -4248,7 +4493,7 @@ impl SemanticIndex {
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
-                return Ok(());
+                return Ok(batch_failed(&queue, format!("{e:#}")));
             }
         };
         if embeddings.len() != total {
@@ -4258,11 +4503,19 @@ impl SemanticIndex {
                 queue.len(),
                 embeddings.len()
             );
-            return Ok(());
+            return Ok(batch_failed(
+                &queue,
+                format!(
+                    "the embedder returned {} embeddings for {total} chunks",
+                    embeddings.len()
+                ),
+            ));
         }
 
+        let mut settled = Vec::with_capacity(queue.len());
         let mut embeddings = embeddings.into_iter();
         for file in queue {
+            let chunk_count = file.chunks.len() as i64;
             let taken: Vec<Vec<f32>> = embeddings.by_ref().take(file.chunks.len()).collect();
             let prepared = PreparedFile {
                 path: file.path.clone(),
@@ -4270,16 +4523,80 @@ impl SemanticIndex {
                 full_text: file.full_text,
                 retained: file.retained,
             };
-            if let Err(e) =
-                idx.write_file_with_recipe(prepared, &file.recipe, None, None, false, false, None)
+            match idx.write_file_with_recipe(prepared, &file.recipe, None, None, false, false, None)
             {
-                error!(
-                    "[SemanticIndex::build] skipping {}: failed to write index entry: {e:#}",
-                    file.path.display()
-                );
+                Ok(_) => settled.push((
+                    file.path,
+                    DocumentOutcome::Indexed,
+                    None,
+                    Some(chunk_count),
+                )),
+                Err(e) => {
+                    error!(
+                        "[SemanticIndex::build] skipping {}: failed to write index entry: {e:#}",
+                        file.path.display()
+                    );
+                    settled.push((
+                        file.path,
+                        DocumentOutcome::Failed,
+                        Some(format!("{e:#}")),
+                        None,
+                    ));
+                }
             }
         }
-        Ok(())
+        Ok(settled)
+    }
+
+    /// Embed and write one batch, and settle every document in it.
+    ///
+    /// Splitting this from [`Self::embed_and_write`] keeps one decision in one
+    /// place: whether a batch that raised was *defeated* or *ended*. They look
+    /// alike from inside the embedder and mean opposite things to the user.
+    fn flush_batch(
+        idx: &mut Self,
+        embedder: &dyn Embedder,
+        queue: Vec<PendingFile>,
+        options: &BuildOptions,
+        done_units: usize,
+        total_units: usize,
+    ) -> Result<(), BatchStop> {
+        if queue.is_empty() {
+            return Ok(());
+        }
+        let paths: Vec<PathBuf> = queue.iter().map(|file| file.path.clone()).collect();
+        match Self::embed_and_write(idx, embedder, queue) {
+            Ok(settled) => {
+                options
+                    .reporter
+                    .settle_batch(&settled, done_units, total_units);
+                Ok(())
+            }
+            Err(e) => {
+                // A raised cancel flag and a killed worker say the same thing:
+                // this batch was ended, not defeated. Its documents stay
+                // unfinished, so a continuation picks them up rather than a
+                // retry being offered for a failure that never happened — and
+                // the loop stops here rather than submitting again, which would
+                // find no process and start one.
+                if options.cancelled() || crate::worker::fault::is_worker_gone(&e) {
+                    info!(
+                        "[SemanticIndex::build] embedding batch of {} document(s) ended: {e:#}",
+                        paths.len()
+                    );
+                    return Err(BatchStop::Stopped);
+                }
+                let detail = format!("{e:#}");
+                let settled: Vec<SettledDocument> = paths
+                    .into_iter()
+                    .map(|path| (path, DocumentOutcome::Failed, Some(detail.clone()), None))
+                    .collect();
+                options
+                    .reporter
+                    .settle_batch(&settled, done_units, total_units);
+                Err(BatchStop::Failed(e))
+            }
+        }
     }
 
     /// Full build: creates the database at `data_dir`, indexes every path, and
@@ -4303,19 +4620,35 @@ impl SemanticIndex {
     /// that one case can still reach the recognizer during the embedding pass
     /// — a failure re-tried, not a schedule that quietly went back to
     /// interleaving.
-    #[allow(clippy::too_many_arguments)]
+    /// # Stopping
+    ///
+    /// Cancellation is a kill: the caller raises `options.cancel_flag` and then
+    /// kills the workers, and the kill is what ends inference already running.
+    /// This function's part is to notice between documents and stop asking for
+    /// more — never to retry, and never to submit again after the flag is up,
+    /// which would find no process and start one.
+    ///
+    /// # What a stopped build leaves behind
+    ///
+    /// Everything it finished. A build fills a temporary database and publishes
+    /// it at the end, and this used to mean that stopping threw away every
+    /// document read so far — a four-hundred-page book re-read from page one
+    /// because the user paused overnight. The temporary database is still the
+    /// write boundary; what changed is that an interrupted build publishes it
+    /// *additively*, so the documents it completed are saved and the ones it
+    /// never reached keep whatever coverage they already had. The job journal,
+    /// not the index, is what records that the root is only partly rebuilt.
     pub fn build(
         data_dir: &Path,
         root_path: &Path,
         paths: &[PathBuf],
         extractors: &ExtractorRegistry,
         embedder: &dyn Embedder,
-        tx: ProgressTx,
-        cancel_flag: Arc<AtomicBool>,
+        options: BuildOptions,
         indexing: &IndexingConfig,
     ) -> anyhow::Result<Self> {
         let start_time = Instant::now();
-        let total_files = paths.len();
+        let reporter = &options.reporter;
 
         let final_path = db_path(data_dir);
         let tmp_path = data_dir.join("semantic_index.db.tmp");
@@ -4355,29 +4688,23 @@ impl SemanticIndex {
             .map(|path| if reads_figures(path) { 2 } else { 1 })
             .sum();
         let mut done_units = 0usize;
-        let progress = |done: usize, message: String| {
-            let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
-                files_processed: done,
-                total_files: total_units,
-                message,
-                done: false,
-            }));
-        };
+
+        // Cancellation leaves each pass rather than the function, because the
+        // work already done has to be published on the way out. `stopped` is
+        // raised once and never lowered; every pass checks it before starting.
+        let mut stopped = false;
 
         // ── Pass 1: what is unchanged is reused ─────────────────────────────
         //
         // First, so that a document the previous index already read costs
         // neither a decode nor a place in the recognition pass.
         let mut pending: Vec<(PathBuf, ExtractionRecipe)> = Vec::new();
-        for (i, path) in paths.iter().enumerate() {
-            anyhow::ensure!(
-                !cancel_flag.load(Ordering::Relaxed),
-                "Index build cancelled"
-            );
-            progress(
-                done_units,
-                format!("Checking {} of {}...", i + 1, total_files),
-            );
+        for path in paths.iter() {
+            if options.cancelled() {
+                stopped = true;
+                break;
+            }
+            reporter.stage(path, DocumentStage::Checking, done_units, total_units);
 
             let extraction_recipe = ExtractionRecipe::for_path(
                 path,
@@ -4391,9 +4718,20 @@ impl SemanticIndex {
                     // spent, the recognition one included.
                     Ok(true) => {
                         done_units += if reads_figures(path) { 2 } else { 1 };
+                        reporter.settle(
+                            path,
+                            DocumentOutcome::Reused,
+                            None,
+                            None,
+                            done_units,
+                            total_units,
+                        );
                         continue;
                     }
                     Ok(false) => {}
+                    // A reuse that could not be decided is not a failure of the
+                    // document: it falls through and is read from scratch, and
+                    // its real outcome is whatever that reading produces.
                     Err(e) => error!(
                         "[SemanticIndex::build] could not reuse {}: {e:#}",
                         path.display()
@@ -4409,25 +4747,23 @@ impl SemanticIndex {
             .map(|(path, _)| path)
             .filter(|path| reads_figures(path))
             .collect();
-        if !to_recognize.is_empty() {
+        if !stopped && !to_recognize.is_empty() {
             info!(
                 "[SemanticIndex::build] recognition pass over {} document(s)",
                 to_recognize.len()
             );
-            // Cancellation leaves the loop rather than the function, so that
-            // the release below happens on every exit from this pass.
-            let mut cancelled = false;
-            for (i, path) in to_recognize.iter().enumerate() {
-                if cancel_flag.load(Ordering::Relaxed) {
-                    cancelled = true;
+            for path in to_recognize.iter() {
+                if options.cancelled() {
+                    stopped = true;
                     break;
                 }
-                progress(
-                    done_units,
-                    format!("Reading figures in {} of {}...", i + 1, to_recognize.len()),
-                );
+                reporter.stage(path, DocumentStage::ReadingFigures, done_units, total_units);
                 // The reading itself is dropped. What is kept is the
                 // annotation cache it filled, which pass 3 reads back.
+                //
+                // A document whose figures could not be read is not settled
+                // here: it still goes on to pass 3, where it is read without
+                // them, and that reading is its outcome.
                 if let Err(e) = Self::extract_content(path, extractors) {
                     error!(
                         "[SemanticIndex::build] could not read {} for recognition: {e:#}",
@@ -4441,69 +4777,128 @@ impl SemanticIndex {
             // the embedding pass has the machine to itself. On the cancelled
             // path too — an abandoned build must not leave them resident.
             extractors.release_image_analyzers();
-            anyhow::ensure!(!cancelled, "Index build cancelled");
         }
 
         // ── Pass 3: extract and embed ───────────────────────────────────────
+        //
+        // `flush` settles a whole batch at once, because embedding is asked for
+        // a batch at a time and a document's outcome is not known until the
+        // call it was part of returns.
         let mut queue: Vec<PendingFile> = Vec::new();
         let mut queued_chunks = 0usize;
-        for (i, (path, extraction_recipe)) in pending.iter().enumerate() {
-            anyhow::ensure!(
-                !cancel_flag.load(Ordering::Relaxed),
-                "Index build cancelled"
-            );
-            progress(
-                done_units,
-                format!("Indexing {} of {}...", i + 1, pending.len()),
-            );
-
-            let extracted = Self::extract_chunks(
-                path,
-                extractors,
-                indexing.chunk_size,
-                indexing.chunk_overlap,
-            );
-            done_units += 1;
-            let (full_text, chunks, retained) = match extracted {
-                Ok((text, c, retained)) if !c.is_empty() => (text, c, retained),
-                // A document that yielded no chunk is indexed by nothing;
-                // that is a reading, not a failure.
-                Ok(_) => continue,
-                Err(e) => {
-                    error!("[SemanticIndex::build] skipping {}: {e:#}", path.display());
-                    continue;
+        let mut embed_failure: Option<anyhow::Error> = None;
+        if !stopped {
+            for (path, extraction_recipe) in pending.iter() {
+                if options.cancelled() {
+                    stopped = true;
+                    break;
                 }
-            };
+                reporter.stage(path, DocumentStage::Extracting, done_units, total_units);
 
-            queued_chunks += chunks.len();
-            queue.push(PendingFile {
-                path: path.clone(),
-                recipe: extraction_recipe.clone(),
-                full_text,
-                chunks,
-                retained,
-            });
-
-            let full = match batch_target {
-                Some(target) => queued_chunks >= target,
-                None => true,
-            };
-            if full {
-                anyhow::ensure!(
-                    !cancel_flag.load(Ordering::Relaxed),
-                    "Index build cancelled"
+                let extracted = Self::extract_chunks(
+                    path,
+                    extractors,
+                    indexing.chunk_size,
+                    indexing.chunk_overlap,
                 );
-                Self::embed_and_write(&mut idx, embedder, std::mem::take(&mut queue))?;
-                queued_chunks = 0;
+                done_units += 1;
+                let (full_text, chunks, retained) = match extracted {
+                    Ok((text, c, retained)) if !c.is_empty() => (text, c, retained),
+                    // A document that yielded no chunk is indexed by nothing;
+                    // that is a reading, not a failure.
+                    Ok(_) => {
+                        reporter.settle(
+                            path,
+                            DocumentOutcome::Empty,
+                            None,
+                            Some(0),
+                            done_units,
+                            total_units,
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        error!("[SemanticIndex::build] skipping {}: {e:#}", path.display());
+                        reporter.settle(
+                            path,
+                            DocumentOutcome::Failed,
+                            Some(&format!("{e:#}")),
+                            None,
+                            done_units,
+                            total_units,
+                        );
+                        continue;
+                    }
+                };
+
+                queued_chunks += chunks.len();
+                queue.push(PendingFile {
+                    path: path.clone(),
+                    recipe: extraction_recipe.clone(),
+                    full_text,
+                    chunks,
+                    retained,
+                });
+                reporter.stage(path, DocumentStage::Embedding, done_units, total_units);
+
+                let full = match batch_target {
+                    Some(target) => queued_chunks >= target,
+                    None => true,
+                };
+                if full {
+                    if options.cancelled() {
+                        stopped = true;
+                        break;
+                    }
+                    match Self::flush_batch(
+                        &mut idx,
+                        embedder,
+                        std::mem::take(&mut queue),
+                        &options,
+                        done_units,
+                        total_units,
+                    ) {
+                        Ok(()) => queued_chunks = 0,
+                        Err(BatchStop::Stopped) => {
+                            stopped = true;
+                            break;
+                        }
+                        Err(BatchStop::Failed(e)) => {
+                            embed_failure = Some(e);
+                            break;
+                        }
+                    }
+                }
             }
         }
-        if !queue.is_empty() {
-            anyhow::ensure!(
-                !cancel_flag.load(Ordering::Relaxed),
-                "Index build cancelled"
-            );
-            Self::embed_and_write(&mut idx, embedder, queue)?;
+        if !stopped && embed_failure.is_none() && !queue.is_empty() {
+            if options.cancelled() {
+                stopped = true;
+            } else {
+                match Self::flush_batch(
+                    &mut idx,
+                    embedder,
+                    queue,
+                    &options,
+                    done_units,
+                    total_units,
+                ) {
+                    Ok(()) => {}
+                    Err(BatchStop::Stopped) => stopped = true,
+                    Err(BatchStop::Failed(e)) => embed_failure = Some(e),
+                }
+            }
         }
+
+        // A build that did not reach the end of its list cannot speak for the
+        // documents it never looked at, and neither can one that was only ever
+        // given part of the root.
+        let membership = if stopped || embed_failure.is_some() || options.scope == BuildScope::Subset
+        {
+            RootMembership::Additive
+        } else {
+            RootMembership::Authoritative
+        };
 
         idx.finish_active_root_build()?;
         idx.validate_embedding_space(&embedding_identity)?;
@@ -4515,12 +4910,26 @@ impl SemanticIndex {
             "Temporary semantic index failed integrity check: {integrity}"
         );
 
-        let _ = tx.blocking_send(EmbedProgress::Build(IndexBuildProgress {
-            files_processed: total_units,
-            total_files: total_units,
-            message: "Done!".to_string(),
-            done: true,
-        }));
+        // Publishing nothing is not publishing. A build stopped before it
+        // completed its first document has an empty temporary database, and the
+        // replacement path below would rename that emptiness over a working
+        // index. There is also nothing to add, so there is nothing to do.
+        if membership == RootMembership::Additive
+            && idx.status_for_root(Some(root_path)).indexed_files == 0
+        {
+            drop(idx);
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp-wal"));
+            let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp-shm"));
+            if let Some(e) = embed_failure {
+                return Err(e);
+            }
+            anyhow::bail!("Index build cancelled");
+        }
+
+        if !stopped && embed_failure.is_none() {
+            reporter.finished(total_units);
+        }
 
         if let Some(source) = reusable.as_ref() {
             source
@@ -4531,7 +4940,7 @@ impl SemanticIndex {
 
         let mut live = match Self::open_exact(data_dir, &embedding_identity) {
             Ok(mut live) => {
-                live.merge_root_from(&idx, root_path)?;
+                live.merge_root_from(&idx, root_path, membership)?;
                 drop(idx);
                 let _ = std::fs::remove_file(&tmp_path);
                 let _ = std::fs::remove_file(data_dir.join("semantic_index.db.tmp-wal"));
@@ -4574,6 +4983,15 @@ impl SemanticIndex {
             }
         };
         live.activate_root(root_path)?;
+
+        // The work is saved either way; what is not claimed either way is that
+        // the corpus was built. `built_at` says a build ran to the end of its
+        // list, and a stopped one did not.
+        if let Some(e) = embed_failure {
+            return Err(e);
+        }
+        anyhow::ensure!(!stopped, "Index build cancelled");
+
         live.record_build_completion(start_time.elapsed())?;
         Ok(live)
     }
@@ -5944,7 +6362,21 @@ impl SemanticIndex {
         Ok(())
     }
 
-    fn merge_root_from(&mut self, source: &SemanticIndex, root: &Path) -> anyhow::Result<()> {
+    /// Copy `root`'s coverage out of `source` into this index.
+    ///
+    /// `membership` decides what happens to documents `source` does not carry.
+    /// [`RootMembership::Authoritative`] drops them, which is how a completed
+    /// whole-root build removes documents that have left the disk.
+    /// [`RootMembership::Additive`] keeps them, which is the only correct
+    /// reading when the source is a stopped or partial build: it looked at some
+    /// of the root, and silence about the rest is not a claim that the rest is
+    /// gone.
+    fn merge_root_from(
+        &mut self,
+        source: &SemanticIndex,
+        root: &Path,
+        membership: RootMembership,
+    ) -> anyhow::Result<()> {
         consumer_ensure!(
             self.embedding_space_id()? == source.embedding_space_id()?,
             ConsumerErrorCode::EmbeddingSpaceMismatch,
@@ -5989,10 +6421,12 @@ impl SemanticIndex {
             .collect::<Result<Vec<_>, _>>()?;
 
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM root_files WHERE root_id = ?1",
-            params![target_root_id],
-        )?;
+        if membership == RootMembership::Authoritative {
+            tx.execute(
+                "DELETE FROM root_files WHERE root_id = ?1",
+                params![target_root_id],
+            )?;
+        }
 
         for (
             source_file_id,

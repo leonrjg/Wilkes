@@ -245,6 +245,27 @@ impl JobSummary {
     }
 }
 
+/// One root's indexing activity: what is happening, what happened, and what
+/// happened before that.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexActivity {
+    pub root: PathBuf,
+    /// The running job, or the most recent one to have ended. `None` when this
+    /// root has never been indexed by this workspace.
+    pub job: Option<JobSummary>,
+    /// A bounded slice of `job`'s documents, failures and unfinished ones
+    /// first. `job.counts` is the whole truth about how many there are.
+    pub documents: Vec<JobDocument>,
+    /// How many documents `documents` was allowed to carry, so a reader can
+    /// tell a short list from a truncated one.
+    pub document_limit: usize,
+    /// Earlier jobs for this root, newest first.
+    pub history: Vec<JobSummary>,
+}
+
+/// A `jobs` row as read, before its document counts are gathered.
+type SummaryRow = (i64, String, i64, Option<i64>, String, Option<String>, i64);
+
 /// The journal. One connection, opened once per workspace and held for the life
 /// of the context.
 pub struct IndexJobJournal {
@@ -511,7 +532,7 @@ impl IndexJobJournal {
         })
     }
 
-    fn summary_from_row(&self, row: (i64, String, i64, Option<i64>, String, Option<String>, i64)) -> anyhow::Result<JobSummary> {
+    fn summary_from_row(&self, row: SummaryRow) -> anyhow::Result<JobSummary> {
         let (id, root, started_at_ms, ended_at_ms, state, detail, total_documents) = row;
         Ok(JobSummary {
             id,
@@ -528,7 +549,7 @@ impl IndexJobJournal {
     const SUMMARY_COLUMNS: &'static str =
         "id, root, started_at_ms, ended_at_ms, state, detail, total_documents";
 
-    fn read_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, String, i64, Option<i64>, String, Option<String>, i64)> {
+    fn read_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SummaryRow> {
         Ok((
             row.get(0)?,
             row.get(1)?,
@@ -645,6 +666,46 @@ impl IndexJobJournal {
         Ok(rows)
     }
 
+    /// Everything one root's activity view shows: the current or most recent
+    /// job, a bounded slice of its documents, and the jobs before it.
+    ///
+    /// Assembled here, in one query set against one connection, rather than by
+    /// the caller making three calls that could each see a different moment of
+    /// a running build.
+    pub fn activity_for_root(
+        &self,
+        root: &Path,
+        document_limit: usize,
+    ) -> anyhow::Result<IndexActivity> {
+        let job = self.latest_for_root(root)?;
+        let documents = match job.as_ref() {
+            Some(job) => self.documents(job.id, None, document_limit)?,
+            None => Vec::new(),
+        };
+        let sql = format!(
+            "SELECT {} FROM jobs WHERE root = ?1 ORDER BY started_at_ms DESC, id DESC LIMIT ?2",
+            Self::SUMMARY_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                params![Self::key(root), HISTORY_PER_ROOT as i64],
+                Self::read_summary_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let history = rows
+            .into_iter()
+            .map(|row| self.summary_from_row(row))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(IndexActivity {
+            root: root.to_path_buf(),
+            job,
+            documents,
+            document_limit,
+            history,
+        })
+    }
+
     /// Forget every job for a root. Used when its index coverage is deleted:
     /// a job history describing an index that no longer exists is a report
     /// about nothing.
@@ -659,6 +720,195 @@ impl IndexJobJournal {
         self.conn.execute("DELETE FROM jobs", [])?;
         Ok(())
     }
+}
+
+// ── Reporting ────────────────────────────────────────────────────────────────
+
+/// The one place an index build says anything about a document.
+///
+/// A build has two audiences: the interface, which wants to know now, and the
+/// next process to open this workspace, which wants to know later. They are the
+/// same facts, so they are not two mechanisms — they are one write and one
+/// notification, in that order, behind one call. Writing first is what makes
+/// the notification droppable: a listener that missed it, or was not there,
+/// reads the journal.
+///
+/// A reporter with no journal ([`Self::without_journal`]) still reports to the
+/// channel. That is for callers with nothing to resume — the tests, and any
+/// build not run on a user's behalf.
+pub struct BuildReporter {
+    tx: crate::models::progress::ProgressTx,
+    sink: Option<JobSink>,
+}
+
+/// The journal half of a reporter: which journal, and which job in it.
+struct JobSink {
+    journal: std::sync::Arc<std::sync::Mutex<IndexJobJournal>>,
+    job_id: i64,
+}
+
+impl BuildReporter {
+    /// Report to the channel and to `job_id` in `journal`.
+    pub fn journalled(
+        tx: crate::models::progress::ProgressTx,
+        journal: std::sync::Arc<std::sync::Mutex<IndexJobJournal>>,
+        job_id: i64,
+    ) -> Self {
+        Self {
+            tx,
+            sink: Some(JobSink { journal, job_id }),
+        }
+    }
+
+    /// Report to the channel only. Nothing is resumable afterwards.
+    pub fn without_journal(tx: crate::models::progress::ProgressTx) -> Self {
+        Self { tx, sink: None }
+    }
+
+    /// The job being reported into, when there is one.
+    pub fn job_id(&self) -> Option<i64> {
+        self.sink.as_ref().map(|sink| sink.job_id)
+    }
+
+    /// The channel this reports on, for the one part of a build that is not
+    /// about a document: the model download that may precede it.
+    pub fn progress_tx(&self) -> crate::models::progress::ProgressTx {
+        self.tx.clone()
+    }
+
+    /// Run `f` against the journal, logging rather than propagating a failure.
+    ///
+    /// A journal write that fails must not fail the build: the build's job is
+    /// to index the corpus, and losing the ability to describe that later is
+    /// not a reason to stop doing it. It is logged at error level, never
+    /// swallowed silently, because a journal that has stopped recording is
+    /// exactly the condition that would otherwise be discovered as an empty
+    /// activity view with no explanation.
+    fn with_journal<F>(&self, what: &str, f: F)
+    where
+        F: FnOnce(&mut IndexJobJournal, i64) -> anyhow::Result<()>,
+    {
+        let Some(sink) = self.sink.as_ref() else {
+            return;
+        };
+        match sink.journal.lock() {
+            Ok(mut journal) => {
+                if let Err(e) = f(&mut journal, sink.job_id) {
+                    tracing::error!("[BuildReporter] {what} could not be journalled: {e:#}");
+                }
+            }
+            Err(poisoned) => {
+                tracing::error!(
+                    "[BuildReporter] {what} could not be journalled: the job journal lock is \
+                     poisoned by an earlier panic"
+                );
+                // The mutex guards a SQLite connection, not an invariant a
+                // panic could have half-broken, so the guard is recoverable.
+                let mut journal = poisoned.into_inner();
+                if let Err(e) = f(&mut journal, sink.job_id) {
+                    tracing::error!("[BuildReporter] {what} could not be journalled: {e:#}");
+                }
+            }
+        }
+    }
+
+    fn emit(&self, progress: IndexBuildEvent<'_>) {
+        let _ = self
+            .tx
+            .blocking_send(crate::models::progress::EmbedProgress::Build(
+                crate::models::progress::IndexBuildProgress {
+                    files_processed: progress.done_units,
+                    total_files: progress.total_units,
+                    job_id: self.job_id(),
+                    document: progress.path.map(|p| p.to_string_lossy().into_owned()),
+                    stage: progress.stage,
+                    outcome: progress.outcome,
+                    done: progress.done,
+                },
+            ));
+    }
+
+    /// A document has entered `stage`.
+    pub fn stage(&self, path: &Path, stage: DocumentStage, done_units: usize, total_units: usize) {
+        self.with_journal("stage", |journal, job_id| {
+            journal.note_stage(job_id, path, stage)
+        });
+        self.emit(IndexBuildEvent {
+            path: Some(path),
+            stage: Some(stage),
+            outcome: None,
+            done_units,
+            total_units,
+            done: false,
+        });
+    }
+
+    /// A document is finished with.
+    pub fn settle(
+        &self,
+        path: &Path,
+        outcome: DocumentOutcome,
+        error: Option<&str>,
+        chunks: Option<i64>,
+        done_units: usize,
+        total_units: usize,
+    ) {
+        self.with_journal("outcome", |journal, job_id| {
+            journal.note_outcome(job_id, path, outcome, error, chunks)
+        });
+        self.emit(IndexBuildEvent {
+            path: Some(path),
+            stage: None,
+            outcome: Some(outcome),
+            done_units,
+            total_units,
+            done: false,
+        });
+    }
+
+    /// A whole embedding batch is finished with, in one transaction.
+    pub fn settle_batch(
+        &self,
+        entries: &[(PathBuf, DocumentOutcome, Option<String>, Option<i64>)],
+        done_units: usize,
+        total_units: usize,
+    ) {
+        self.with_journal("batch outcome", |journal, job_id| {
+            journal.note_outcomes(job_id, entries)
+        });
+        for (path, outcome, _, _) in entries {
+            self.emit(IndexBuildEvent {
+                path: Some(path),
+                stage: None,
+                outcome: Some(*outcome),
+                done_units,
+                total_units,
+                done: false,
+            });
+        }
+    }
+
+    /// The build reached the end of its list.
+    pub fn finished(&self, total_units: usize) {
+        self.emit(IndexBuildEvent {
+            path: None,
+            stage: None,
+            outcome: None,
+            done_units: total_units,
+            total_units,
+            done: true,
+        });
+    }
+}
+
+/// The arguments of one emission, named so the call sites read as sentences.
+struct IndexBuildEvent<'a> {
+    path: Option<&'a Path>,
+    stage: Option<DocumentStage>,
+    outcome: Option<DocumentOutcome>,
+    done_units: usize,
+    total_units: usize,
+    done: bool,
 }
 
 #[cfg(test)]

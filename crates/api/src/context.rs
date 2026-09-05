@@ -44,6 +44,10 @@ use wilkes_core::integrations::zotero::model::ZoteroItem;
 use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::metadata::doi::find_dois;
+use wilkes_core::embed::index::db::BuildScope;
+use wilkes_core::embed::index::{
+    BuildReporter, DocumentOutcome, IndexActivity, IndexJobJournal, JobState,
+};
 use wilkes_core::models::progress::EmbedProgress;
 use wilkes_core::types::{
     Bookmark, BookmarkCluster, BookmarkClustersQuery, BookmarkClustersResult, ChunkTopic,
@@ -187,6 +191,14 @@ impl EmbedOperation {
     }
 }
 
+/// How many of a job's documents the activity view is given at a time.
+///
+/// A corpus can hold a hundred thousand files and none of that is a list anyone
+/// scrolls; the job's counts say how many there are, and the rows shown are the
+/// ones that need attention or are moving. Failures and unfinished documents
+/// sort first, so the bound never hides them behind a wall of successes.
+const ACTIVITY_DOCUMENT_LIMIT: usize = 500;
+
 #[derive(Clone, Debug)]
 struct BuildIndexPlan {
     root_path: PathBuf,
@@ -194,6 +206,11 @@ struct BuildIndexPlan {
     chunk_size: usize,
     chunk_overlap: usize,
     supported_extensions: Vec<String>,
+    /// The documents this build is over. `None` means every indexable file
+    /// under the root, walked when the build starts; `Some` is a chosen subset
+    /// — the documents a stopped job never reached, or the ones the user asked
+    /// to retry.
+    documents: Option<Vec<PathBuf>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1107,6 +1124,10 @@ pub struct AppContext {
     /// Persistent cache of extracted document metadata, opened lazily. Shared
     /// with the index watcher so renames re-key rather than re-extract.
     metadata_cache: PLMutex<Option<Arc<Mutex<MetadataCache>>>>,
+    /// The durable record of what each indexing job did with each document,
+    /// opened on first use. Its own database beside the index, because a build
+    /// publishes by replacing the index file.
+    job_journal: PLMutex<Option<Arc<Mutex<IndexJobJournal>>>>,
     research_store: PLMutex<Option<Arc<Mutex<ResearchStore>>>>,
     directory_watcher: PLMutex<Option<DirectoryWatcher>>,
     embed_task: PLMutex<Option<EmbedTaskHandle>>,
@@ -1220,6 +1241,7 @@ impl AppContext {
             embedder: PLMutex::new(None),
             index: PLMutex::new(Arc::new(Mutex::new(None))),
             metadata_cache: PLMutex::new(None),
+            job_journal: PLMutex::new(None),
             research_store: PLMutex::new(None),
             directory_watcher: PLMutex::new(None),
             embed_task: PLMutex::new(None),
@@ -6704,14 +6726,33 @@ impl AppContext {
         root: String,
         selected: SelectedEmbedder,
     ) -> Result<(), String> {
+        self.start_build_index_over(root, selected, None).await
+    }
+
+    /// Build `root`, over every indexable file under it or over `documents`.
+    ///
+    /// One entry point for all three ways a build starts — the user asking for
+    /// the directory, continuing a stopped job, retrying its failures — because
+    /// they differ only in which documents are in scope, and having each of
+    /// them own a copy of the cancellation and journalling lifecycle is how one
+    /// of the copies ends up not raising the cancel flag before killing.
+    pub async fn start_build_index_over(
+        self: Arc<Self>,
+        root: String,
+        selected: SelectedEmbedder,
+        documents: Option<Vec<PathBuf>>,
+    ) -> Result<(), String> {
         self.ensure_writable().map_err(|error| error.to_string())?;
         info!(
-            "AppContext::start_build_index: root={}, engine={}, model={}",
+            "AppContext::start_build_index: root={}, engine={}, model={}, documents={}",
             root,
             selected.engine.as_str(),
-            selected.model.model_id()
+            selected.model.model_id(),
+            documents
+                .as_ref()
+                .map_or_else(|| "whole root".to_string(), |d| d.len().to_string())
         );
-        let plan = match self.prepare_build_index(&root, &selected).await {
+        let plan = match self.prepare_build_index(&root, &selected, documents).await {
             Ok(plan) => plan,
             Err(err) => {
                 info!("AppContext::start_build_index: prepare failed: {err}");
@@ -6779,6 +6820,7 @@ impl AppContext {
         &self,
         root: &str,
         selected: &SelectedEmbedder,
+        documents: Option<Vec<PathBuf>>,
     ) -> Result<BuildIndexPlan, String> {
         if self.embed_task_is_running() {
             return Err("A build is already in progress.".into());
@@ -6799,7 +6841,114 @@ impl AppContext {
             chunk_size: settings.semantic.chunk_size,
             chunk_overlap: settings.semantic.chunk_overlap,
             supported_extensions: settings.supported_extensions.clone(),
+            documents,
         })
+    }
+
+    /// The workspace's index job journal, opened on first use.
+    ///
+    /// Opening is also when jobs left `Running` by a process that no longer
+    /// exists are adopted as interrupted. That is done here rather than in a
+    /// startup hook because this is the first moment in the process at which it
+    /// is knowably true, and because a hook is something a new entry point can
+    /// forget to call.
+    pub(crate) fn job_journal(&self) -> anyhow::Result<Arc<Mutex<IndexJobJournal>>> {
+        let mut guard = self.job_journal.lock();
+        if let Some(journal) = guard.as_ref() {
+            return Ok(Arc::clone(journal));
+        }
+        let journal = IndexJobJournal::open(&self.data_dir)?;
+        match journal.adopt_orphaned_jobs() {
+            Ok(0) => {}
+            Ok(adopted) => warn!(
+                "[AppContext] {adopted} index job(s) were left running by a process that is gone; \
+                 they are now reported as interrupted"
+            ),
+            Err(e) => error!("[AppContext] could not adopt orphaned index jobs: {e:#}"),
+        }
+        let journal = Arc::new(Mutex::new(journal));
+        *guard = Some(Arc::clone(&journal));
+        Ok(journal)
+    }
+
+    /// What the most recent indexing job for `root` did, document by document.
+    pub async fn index_activity(&self, root: PathBuf) -> Result<IndexActivity, String> {
+        let journal = self.job_journal().map_err(|e| format!("{e:#}"))?;
+        let journal = journal.lock().map_err(|_| {
+            "The index job journal is unavailable after an earlier panic".to_string()
+        })?;
+        journal
+            .activity_for_root(&root, ACTIVITY_DOCUMENT_LIMIT)
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    /// The documents of `root`'s most recent job that ended with `outcome`.
+    fn job_documents_with_outcome(
+        &self,
+        root: &Path,
+        outcome: DocumentOutcome,
+    ) -> Result<Vec<PathBuf>, String> {
+        let journal = self.job_journal().map_err(|e| format!("{e:#}"))?;
+        let journal = journal.lock().map_err(|_| {
+            "The index job journal is unavailable after an earlier panic".to_string()
+        })?;
+        let Some(job) = journal
+            .latest_for_root(root)
+            .map_err(|e| format!("{e:#}"))?
+        else {
+            return Err(format!(
+                "No indexing job has been recorded for {}",
+                root.display()
+            ));
+        };
+        journal
+            .paths_with_outcome(job.id, outcome)
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    /// Index the documents the last job for `root` never reached.
+    ///
+    /// Failed documents are deliberately not included. A continuation is for
+    /// work that was interrupted; re-attempting work that was attempted and
+    /// broke is [`Self::retry_failed_documents`], and the difference matters
+    /// because a corpus with one unreadable file would otherwise re-attempt it
+    /// on every continuation forever.
+    pub async fn continue_index_job(
+        self: Arc<Self>,
+        root: String,
+        selected: SelectedEmbedder,
+    ) -> Result<(), String> {
+        let root_path = PathBuf::from(&root);
+        let documents =
+            self.job_documents_with_outcome(&root_path, DocumentOutcome::Pending)?;
+        if documents.is_empty() {
+            return Err("There is no remaining work for this directory.".into());
+        }
+        info!(
+            "AppContext::continue_index_job: {} document(s) left for {root}",
+            documents.len()
+        );
+        self.start_build_index_over(root, selected, Some(documents))
+            .await
+    }
+
+    /// Re-attempt the documents the last job for `root` failed on.
+    pub async fn retry_failed_documents(
+        self: Arc<Self>,
+        root: String,
+        selected: SelectedEmbedder,
+    ) -> Result<(), String> {
+        let root_path = PathBuf::from(&root);
+        let documents = self.job_documents_with_outcome(&root_path, DocumentOutcome::Failed)?;
+        if documents.is_empty() {
+            return Err("No documents failed in this directory's last indexing job.".into());
+        }
+        info!(
+            "AppContext::retry_failed_documents: retrying {} document(s) for {root}",
+            documents.len()
+        );
+        self.start_build_index_over(root, selected, Some(documents))
+            .await
     }
 
     async fn prepare_download_model(
@@ -6828,24 +6977,117 @@ impl AppContext {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_index_options(
         manager: WorkerManager,
         model_dir: PathBuf,
         index_dir: PathBuf,
         plan: &BuildIndexPlan,
-        progress_tx: tokio::sync::mpsc::Sender<EmbedProgress>,
+        reporter: BuildReporter,
         cancel_flag: Arc<AtomicBool>,
+        documents: Vec<PathBuf>,
+        scope: BuildScope,
     ) -> crate::commands::embed::BuildIndexOptions {
         crate::commands::embed::BuildIndexOptions {
             manager: Some(manager),
             device: Some(plan.device.clone()),
             model_dir,
             index_dir,
-            tx: progress_tx,
+            reporter,
             cancel_flag,
+            documents,
+            scope,
             chunk_size: plan.chunk_size,
             chunk_overlap: plan.chunk_overlap,
             supported_extensions: plan.supported_extensions.clone(),
+        }
+    }
+
+    /// Open a job for this build, or report that it will not be resumable.
+    ///
+    /// A journal that cannot be opened does not stop the build: indexing the
+    /// corpus is the job, and losing the ability to describe it afterwards is
+    /// not a reason to refuse. It is logged loudly, because an activity view
+    /// that is empty for no visible reason is the failure this would otherwise
+    /// present as.
+    fn begin_job(
+        &self,
+        root: &Path,
+        documents: &[PathBuf],
+    ) -> Option<(Arc<Mutex<IndexJobJournal>>, i64)> {
+        let journal = match self.job_journal() {
+            Ok(journal) => journal,
+            Err(e) => {
+                error!(
+                    "[AppContext] the index job journal could not be opened; this build will not \
+                     be resumable: {e:#}"
+                );
+                return None;
+            }
+        };
+        let job_id = {
+            let mut guard = match journal.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match guard.begin(root, documents) {
+                Ok(job_id) => job_id,
+                Err(e) => {
+                    error!(
+                        "[AppContext] the index job could not be recorded; this build will not be \
+                         resumable: {e:#}"
+                    );
+                    return None;
+                }
+            }
+        };
+        Some((journal, job_id))
+    }
+
+    /// Close a job in whatever state it ended.
+    fn end_job(
+        &self,
+        job: &Option<(Arc<Mutex<IndexJobJournal>>, i64)>,
+        state: JobState,
+        detail: Option<&str>,
+    ) {
+        let Some((journal, job_id)) = job else {
+            return;
+        };
+        let guard = match journal.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // An empty detail string is how a cancellation is signalled to the
+        // interface elsewhere; it is not an explanation, so it is not stored.
+        let detail = detail.filter(|d| !d.is_empty());
+        if let Err(e) = guard.finish(*job_id, state, detail) {
+            error!(
+                "[AppContext] index job {job_id} could not be closed as {}: {e:#}",
+                state.as_str()
+            );
+        }
+    }
+
+    /// Drop the job history for a root, or for the whole workspace.
+    fn forget_jobs(&self, root: Option<&Path>) {
+        let journal = match self.job_journal() {
+            Ok(journal) => journal,
+            Err(e) => {
+                error!("[AppContext] could not open the index job journal to clear it: {e:#}");
+                return;
+            }
+        };
+        let guard = match journal.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let cleared = match root {
+            Some(root) => guard.forget_root(root),
+            None => guard.forget_all(),
+        };
+        if let Err(e) = cleared {
+            error!("[AppContext] could not clear the index job history: {e:#}");
         }
     }
 
@@ -7002,13 +7244,45 @@ impl AppContext {
                 terminal: None,
             };
 
+            // The scope is settled, and recorded, before a byte of the model is
+            // fetched. A job whose document list is only known once the build
+            // is under way cannot say what is left until it has already
+            // finished finding out.
+            let (documents, scope) = match plan.documents.clone() {
+                Some(documents) => (documents, BuildScope::Subset),
+                None => {
+                    let root = plan.root_path.clone();
+                    let extensions = plan.supported_extensions.clone();
+                    let walked = tokio::task::spawn_blocking(move || {
+                        crate::commands::embed::collect_indexable_paths(&root, &extensions)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    (walked, BuildScope::WholeRoot)
+                }
+            };
+            info!(
+                "AppContext::spawn_build_index_task: {} document(s) in scope",
+                documents.len()
+            );
+
+            let job = ctx.begin_job(&plan.root_path, &documents);
+            let reporter = match job.clone() {
+                Some((journal, job_id)) => {
+                    BuildReporter::journalled(progress_tx, journal, job_id)
+                }
+                None => BuildReporter::without_journal(progress_tx),
+            };
+
             let options = Self::build_index_options(
                 manager.clone(),
                 model_dir,
                 data_dir.clone(),
                 &plan,
-                progress_tx,
+                reporter,
                 Arc::clone(&cancel_flag),
+                documents,
+                scope,
             );
             let build_fut = crate::commands::embed::build_index(
                 plan.root_path.clone(),
@@ -7037,26 +7311,32 @@ impl AppContext {
                             Ok(embedder) => {
                                 if cancel_flag.load(Ordering::Relaxed) {
                                     Self::cleanup_partial_index_files(&data_dir);
+                                    ctx.end_job(&job, JobState::Cancelled, None);
                                     terminal_event.terminal = Some(TerminalEvent::Cancelled);
                                     ctx.emit_embed_error("Build", "");
                                 } else if let Err(err) = ctx
                                     .finish_build_index(&plan, &selected, &data_dir, embedder)
                                     .await
                                 {
+                                    ctx.end_job(&job, JobState::Failed, Some(&err));
                                     terminal_event.terminal = Some(TerminalEvent::Cancelled);
                                     ctx.emit_embed_error("Build", err);
                                 } else {
+                                    ctx.end_job(&job, JobState::Completed, None);
                                     terminal_event.terminal = Some(TerminalEvent::Done);
                                 }
                             }
                             Err(e) => {
                                 if cancel_flag.load(Ordering::Relaxed) {
                                     Self::cleanup_partial_index_files(&data_dir);
+                                    ctx.end_job(&job, JobState::Cancelled, None);
                                     terminal_event.terminal = Some(TerminalEvent::Cancelled);
                                     ctx.emit_embed_error("Build", "");
                                 } else {
+                                    let detail = format!("{e:#}");
+                                    ctx.end_job(&job, JobState::Failed, Some(&detail));
                                     terminal_event.terminal = Some(TerminalEvent::Cancelled);
-                                    ctx.emit_embed_error("Build", format!("{e:#}"));
+                                    ctx.emit_embed_error("Build", detail);
                                 }
                             }
                         }
@@ -7231,8 +7511,13 @@ impl AppContext {
         self.ensure_writable().map_err(anyhow::Error::msg)?;
         self.cancel_all_completions();
         self.invalidate_topic_tree_cache();
+        // The job history goes with the coverage it describes. A report about
+        // documents this workspace no longer has an index for is a report about
+        // nothing, and it would offer to continue work into an index that has
+        // been deleted underneath it.
         if let Some(root) = root {
             crate::commands::embed::delete_index(&self.data_dir, Some(root.clone())).await?;
+            self.forget_jobs(Some(&root));
             let index_arc = self.index.lock().clone();
             if let Ok(mut guard) = index_arc.lock() {
                 if let Some(idx) = guard.as_mut() {
@@ -7243,6 +7528,7 @@ impl AppContext {
             *self.index.lock() = Arc::new(Mutex::new(None));
             *self.embedder.lock() = None;
             crate::commands::embed::delete_index(&self.data_dir, None).await?;
+            self.forget_jobs(None);
             self.update_semantic_settings(|s| SemanticSettings {
                 index_path: None,
                 ..s
@@ -9929,7 +10215,7 @@ mod tests {
 
         let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
         let plan = ctx
-            .prepare_build_index(&root.to_string_lossy(), &selected)
+            .prepare_build_index(&root.to_string_lossy(), &selected, None)
             .await
             .unwrap();
 
@@ -9963,7 +10249,7 @@ mod tests {
 
         let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
         let err = ctx
-            .prepare_build_index("/tmp", &selected)
+            .prepare_build_index("/tmp", &selected, None)
             .await
             .unwrap_err();
 
@@ -9976,7 +10262,7 @@ mod tests {
         let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
 
         let missing = ctx
-            .prepare_build_index("/definitely/missing/path", &selected)
+            .prepare_build_index("/definitely/missing/path", &selected, None)
             .await
             .unwrap_err();
         assert!(missing.contains("Index root not found"));
@@ -9985,14 +10271,14 @@ mod tests {
         let file_path = file_dir.path().join("not_a_dir");
         std::fs::write(&file_path, "hello").unwrap();
         let not_dir = ctx
-            .prepare_build_index(&file_path.to_string_lossy(), &selected)
+            .prepare_build_index(&file_path.to_string_lossy(), &selected, None)
             .await
             .unwrap_err();
         assert!(not_dir.contains("not a directory"));
 
         let empty_dir = tempdir().unwrap();
         let empty = ctx
-            .prepare_build_index(&empty_dir.path().to_string_lossy(), &selected)
+            .prepare_build_index(&empty_dir.path().to_string_lossy(), &selected, None)
             .await
             .unwrap_err();
         assert!(empty.contains("No supported files found"));
@@ -10033,6 +10319,7 @@ mod tests {
             chunk_size: 123,
             chunk_overlap: 45,
             supported_extensions: vec!["rs".to_string(), "txt".to_string()],
+            documents: None,
         };
         let (tx, _rx) = mpsc::channel(1);
         let options = AppContext::build_index_options(
@@ -10051,8 +10338,10 @@ mod tests {
             dir.path().join("models"),
             dir.path().to_path_buf(),
             &plan,
-            tx,
+            BuildReporter::without_journal(tx),
             Arc::new(AtomicBool::new(false)),
+            vec![dir.path().join("root/a.txt")],
+            BuildScope::WholeRoot,
         );
 
         assert_eq!(options.device.as_deref(), Some("cpu"));
@@ -10061,6 +10350,8 @@ mod tests {
         assert_eq!(options.chunk_size, 123);
         assert_eq!(options.chunk_overlap, 45);
         assert_eq!(options.supported_extensions, vec!["rs", "txt"]);
+        assert_eq!(options.documents, vec![dir.path().join("root/a.txt")]);
+        assert_eq!(options.scope, BuildScope::WholeRoot);
 
         for suffix in [".tmp", ".tmp-wal", ".tmp-shm"] {
             std::fs::write(dir.path().join(format!("semantic_index.db{suffix}")), "x").unwrap();
@@ -10090,7 +10381,10 @@ mod tests {
         let progress = EmbedProgress::Build(wilkes_core::models::progress::IndexBuildProgress {
             files_processed: 1,
             total_files: 2,
-            message: "building".to_string(),
+            job_id: None,
+            document: None,
+            stage: None,
+            outcome: None,
             done: false,
         });
         ctx.emit_progress_event(&progress);
@@ -10805,6 +11099,7 @@ mod tests {
             chunk_size: 64,
             chunk_overlap: 8,
             supported_extensions: vec!["txt".to_string()],
+            documents: None,
         };
         let selected = SelectedEmbedder {
             engine: EmbeddingEngine::Candle,
@@ -10897,6 +11192,7 @@ mod tests {
             chunk_size: 64,
             chunk_overlap: 8,
             supported_extensions: vec!["txt".to_string()],
+            documents: None,
         };
         let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
         let cancel = CancellationToken::new();
@@ -10966,6 +11262,7 @@ exit 0
             chunk_size: 64,
             chunk_overlap: 8,
             supported_extensions: vec!["txt".to_string()],
+            documents: None,
         };
         let selected = SelectedEmbedder {
             engine: EmbeddingEngine::Fastembed,
@@ -11260,7 +11557,7 @@ exit 0
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         let err = ctx
-            .prepare_build_index(&root.to_string_lossy(), &selected)
+            .prepare_build_index(&root.to_string_lossy(), &selected, None)
             .await
             .unwrap_err();
         assert_eq!(err, "A build is already in progress.");
@@ -13286,6 +13583,7 @@ exit 0
             .prepare_build_index(
                 file_path.to_str().unwrap(),
                 &SelectedEmbedder::default_for(EmbeddingEngine::Candle),
+                None,
             )
             .await
             .unwrap_err();

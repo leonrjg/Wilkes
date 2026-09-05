@@ -2104,6 +2104,51 @@ struct BuildBody {
     selected: SelectedEmbedder,
 }
 
+#[derive(Deserialize)]
+struct ActivityQuery {
+    root: String,
+}
+
+async fn index_activity_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ActivityQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let root = confine_to_uploads(&params.root, &uploads_dir)?;
+    let activity = ctx.index_activity(root).await.map_err(server_err)?;
+    Ok(Json(activity))
+}
+
+/// Index the documents the last job for this root never reached.
+async fn continue_index_job_handler(
+    State(state): State<Arc<AppState>>,
+    Json(mut body): Json<BuildBody>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    body.root = confine_to_uploads(&body.root, &uploads_dir)?
+        .to_string_lossy()
+        .into_owned();
+    ctx.continue_index_job(body.root, body.selected)
+        .await
+        .map_err(server_err)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Re-attempt the documents the last job for this root failed on.
+async fn retry_failed_documents_handler(
+    State(state): State<Arc<AppState>>,
+    Json(mut body): Json<BuildBody>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    body.root = confine_to_uploads(&body.root, &uploads_dir)?
+        .to_string_lossy()
+        .into_owned();
+    ctx.retry_failed_documents(body.root, body.selected)
+        .await
+        .map_err(server_err)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
 async fn build_index_handler(
     State(state): State<Arc<AppState>>,
     Json(mut body): Json<BuildBody>,
@@ -2403,6 +2448,9 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/embed/status", get(get_index_status_handler))
         .route("/api/embed/download", post(download_model_handler))
         .route("/api/embed/build", post(build_index_handler))
+        .route("/api/embed/activity", get(index_activity_handler))
+        .route("/api/embed/continue", post(continue_index_job_handler))
+        .route("/api/embed/retry-failed", post(retry_failed_documents_handler))
         .route("/api/embed/index", delete(delete_index_handler))
         .route("/api/embed/cancel", delete(cancel_embed_handler))
         // Worker
