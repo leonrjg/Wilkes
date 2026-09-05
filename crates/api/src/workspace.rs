@@ -1275,7 +1275,7 @@ impl WorkspaceManager {
         &self,
         corpus_id: &str,
         projection_workspace_id: &str,
-        source_workspace: Option<&Arc<AppContext>>,
+        source_workspace: Option<Arc<AppContext>>,
     ) -> anyhow::Result<()> {
         let child = self.context_for(projection_workspace_id).await?;
         child
@@ -1307,7 +1307,7 @@ impl WorkspaceManager {
                         "kind": "managed_corpus_projection",
                         "canonical_corpus_id": corpus_id,
                     }),
-                    source_workspace,
+                    source_workspace.as_ref(),
                 )
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -1330,7 +1330,7 @@ impl WorkspaceManager {
     pub async fn catch_up_corpus(
         &self,
         corpus_id: &str,
-        source_workspace: Option<&Arc<AppContext>>,
+        source_workspace: Option<Arc<AppContext>>,
     ) -> anyhow::Result<Vec<(String, String)>> {
         let status = self.managed_workspace_status(corpus_id).await?;
         let mut failures = Vec::new();
@@ -1339,7 +1339,7 @@ impl WorkspaceManager {
                 continue;
             }
             if let Err(error) = self
-                .catch_up_projection(corpus_id, &space.workspace_id, source_workspace)
+                .catch_up_projection(corpus_id, &space.workspace_id, source_workspace.clone())
                 .await
             {
                 failures.push((space.embedding_space_id.clone(), format!("{error:#}")));

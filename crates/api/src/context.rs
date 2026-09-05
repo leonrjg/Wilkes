@@ -2242,7 +2242,15 @@ impl AppContext {
             settings.semantic.chunk_overlap,
         );
 
-        if let Some(existing) = {
+        // Bound to a `let` before the `if let`, not inlined into it. A block
+        // used as an `if let` scrutinee lives until the end of the whole `if
+        // let` statement, so the index lock guard inside it would still be
+        // held across the `.await` below — and a guard that reaches an await
+        // makes the future non-Send, which surfaces a route at a time as
+        // "handler does not implement Handler". `managed_export` became async
+        // when the outline read moved to the blocking pool; this is what that
+        // move requires of its callers.
+        let existing = {
             let index_arc = self.index.lock().clone();
             let guard = index_arc
                 .lock()
@@ -2252,7 +2260,8 @@ impl AppContext {
                 .ok_or_else(|| "Managed index unavailable".to_string())?
                 .managed_document_for_import_key(&idempotency_key, &source_sha256, &recipe.id())
                 .map_err(|error| error.to_string())?
-        } {
+        };
+        if let Some(existing) = existing {
             return Self::managed_export(
                 corpus_id,
                 existing,
@@ -2263,7 +2272,15 @@ impl AppContext {
             .await;
         }
 
-        if let Some(existing) = {
+        // Bound to a `let` before the `if let`, not inlined into it. A block
+        // used as an `if let` scrutinee lives until the end of the whole `if
+        // let` statement, so the index lock guard inside it would still be
+        // held across the `.await` below — and a guard that reaches an await
+        // makes the future non-Send, which surfaces a route at a time as
+        // "handler does not implement Handler". `managed_export` became async
+        // when the outline read moved to the blocking pool; this is what that
+        // move requires of its callers.
+        let existing = {
             let index_arc = self.index.lock().clone();
             let mut guard = index_arc
                 .lock()
@@ -2280,7 +2297,8 @@ impl AppContext {
                     .map_err(|error| error.to_string())?;
             }
             existing
-        } {
+        };
+        if let Some(existing) = existing {
             return Self::managed_export(
                 corpus_id,
                 existing,
@@ -2388,6 +2406,60 @@ impl AppContext {
     /// rendition. The immutable source, extracted text, chunk boundaries, and
     /// stable refs remain owned by `canonical`; this context computes only its
     /// model-specific vectors and projection rows.
+    /// Vectors this workspace's index can lend for the given chunk texts.
+    ///
+    /// Synchronous on purpose, and separate from its async caller for the same
+    /// reason: it holds the index lock, and a lock guard that reaches an
+    /// `.await` makes the whole future non-Send. Confining it here means the
+    /// guard cannot outlive the lookup no matter what the caller does after.
+    ///
+    /// Space equality is checked, and it is the only thing checked. That is
+    /// what a vector's readability actually turns on — same engine, same
+    /// model, same width — and after the identity cut it is the whole of what
+    /// a space id says. Anything that cannot be answered is answered as
+    /// "nothing to adopt", said out loud, and the caller embeds instead.
+    fn adoptable_vectors(
+        &self,
+        expected: &wilkes_core::embed::identity::EmbeddingSpaceIdentity,
+        text_hashes: &[String],
+        label: &str,
+    ) -> std::collections::HashMap<String, Vec<f32>> {
+        let index_arc = self.index.lock().clone();
+        let guard = match index_arc.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::warn!("{label} index lock was poisoned; embedding instead");
+                return std::collections::HashMap::new();
+            }
+        };
+        let Some(index) = guard.as_ref() else {
+            return std::collections::HashMap::new();
+        };
+        match index.embedding_space_id() {
+            Ok(space) if space == expected.id() => {
+                match index.vectors_for_text_hashes(text_hashes) {
+                    Ok(found) => found,
+                    Err(error) => {
+                        tracing::warn!("could not read vectors from {label}: {error:#}");
+                        std::collections::HashMap::new()
+                    }
+                }
+            }
+            Ok(space) => {
+                tracing::debug!(
+                    "{label} is space {} and this projection is {}; nothing to adopt",
+                    space.as_str(),
+                    expected.id().as_str()
+                );
+                std::collections::HashMap::new()
+            }
+            Err(error) => {
+                tracing::debug!("{label} names no embedding space, so nothing to adopt: {error}");
+                std::collections::HashMap::new()
+            }
+        }
+    }
+
     pub async fn import_managed_projection(
         self: &Arc<Self>,
         corpus_id: String,
@@ -2431,7 +2503,15 @@ impl AppContext {
                 .map_err(|error| error.to_string())?
         };
 
-        if let Some(existing) = {
+        // Bound to a `let` before the `if let`, not inlined into it. A block
+        // used as an `if let` scrutinee lives until the end of the whole `if
+        // let` statement, so the index lock guard inside it would still be
+        // held across the `.await` below — and a guard that reaches an await
+        // makes the future non-Send, which surfaces a route at a time as
+        // "handler does not implement Handler". `managed_export` became async
+        // when the outline read moved to the blocking pool; this is what that
+        // move requires of its callers.
+        let existing = {
             let index_arc = self.index.lock().clone();
             let guard = index_arc
                 .lock()
@@ -2441,7 +2521,8 @@ impl AppContext {
                 .ok_or_else(|| "Managed index unavailable".to_string())?
                 .managed_document_for_import_key(&idempotency_key, &source_sha256, &recipe.id())
                 .map_err(|error| error.to_string())?
-        } {
+        };
+        if let Some(existing) = existing {
             return Self::managed_export(
                 corpus_id,
                 existing,
@@ -2515,40 +2596,10 @@ impl AppContext {
             ("this space", Some(self)),
         ] {
             let Some(candidate) = candidate else { continue };
-            let index_arc = candidate.index.lock().clone();
-            let guard = match index_arc.lock() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    tracing::warn!("{label} index lock was poisoned; embedding instead");
-                    continue;
-                }
-            };
-            let Some(index) = guard.as_ref() else {
-                continue;
-            };
-            match index.embedding_space_id() {
-                Ok(space) if space == expected_identity.id() => {
-                    match index.vectors_for_text_hashes(&text_hashes) {
-                        Ok(found) => {
-                            for (hash, embedding) in found {
-                                adopted.entry(hash).or_insert(embedding);
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!("could not read vectors from {label}: {error:#}")
-                        }
-                    }
-                }
-                Ok(space) => tracing::debug!(
-                    "{label} is space {} and this projection is {}; nothing to adopt",
-                    space.as_str(),
-                    expected_identity.id().as_str()
-                ),
-                Err(error) => {
-                    tracing::debug!(
-                        "{label} names no embedding space, so nothing to adopt: {error}"
-                    )
-                }
+            for (hash, embedding) in
+                candidate.adoptable_vectors(&expected_identity, &text_hashes, label)
+            {
+                adopted.entry(hash).or_insert(embedding);
             }
         }
 
