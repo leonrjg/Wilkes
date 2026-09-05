@@ -84,5 +84,64 @@ crosses. A loop inside a worker over a resident model — `DocLayout::detect_doc
 over a document's pages, `vision::spot_batch` over its images — is where a loop
 belongs, and is not a violation.
 
+## Invariant: every document an indexing job touches has one durable verdict
+
+For every document in an indexing job, exactly one durable record says what the
+job did with it, and that record outlives the process that wrote it.
+
+**Why.** Reading a corpus is hours, and hours are long enough to be interrupted
+— cancelled, crashed, quit. A build used to report itself through an mpsc
+channel carrying a counter and a formatted sentence, and that sentence was the
+only place a document's name ever appeared; closing the window erased it. A
+document that failed to extract was logged and skipped, so the corpus finished
+with a hole in it and nothing said which document was missing or why. And the
+work itself was thrown away: the temporary database a build fills was deleted
+rather than published, so pausing a four-hundred-page corpus overnight meant
+starting again at page one.
+
+**Ownership.** The semantic index owns *whether a document is indexed and with
+what content*. `IndexJobJournal` owns *what a job attempted and what became of
+each attempt* — which is a different question, and one an index cannot answer:
+it has no row for a document that failed, none for one that yielded no text, and
+none for one the job never reached. Those three are what "needs attention" and
+"what is left" are made of. `DocumentOutcome::Indexed` is a fact about the job,
+not a second assertion that the index contains it; where they could disagree the
+index is right.
+
+**How to hold it.**
+- **One reporter, one order.** Everything a build says about a document goes
+  through `BuildReporter`, which writes the journal and *then* notifies the
+  interface. The event is a notification carrying a copy; a listener that missed
+  it reads the journal and loses nothing. Never add a second channel for a
+  document's state, and never accumulate one in the interface.
+- **A stopped build publishes what it finished.** `RootMembership::Authoritative`
+  is only for a build that reached the end of a whole-root list; it may drop the
+  documents it omits, which is how a completed build removes files that left the
+  disk. Anything else — stopped, or run over a chosen subset — is `Additive` and
+  speaks only for what it carries.
+- **Ended is not defeated.** A batch that raises while the cancel flag is up, or
+  whose worker is gone, leaves its documents unfinished for a continuation. Never
+  settle them as failed: that manufactures failures the user is then invited to
+  retry. And the loop ends there rather than submitting again, per the invariant
+  above.
+- **A continuation inherits the verdicts it is not repeating.** Its scope is what
+  is left, so a job built from that scope alone would contain no failures, and
+  the document that broke the reader would stop being reported and stop being
+  retryable. It carries the previous job's settled rows for every path outside
+  its own scope — verdicts, with their errors, never work.
+- **Retrying is a separate act.** Continuing is over `Pending`; retrying is over
+  `Failed`. A continuation that swept failures up would re-attempt the file that
+  breaks the reader on every continuation, forever.
+- **The journal is not the build's business.** A journal that cannot be opened or
+  written is logged at error level and the build proceeds: indexing the corpus is
+  the job, and losing the ability to describe it afterwards is not a reason to
+  refuse. It is never swallowed silently, because an activity view that is empty
+  for no visible reason is what that would present as.
+
+**Boundary.** This is about indexing *jobs* — the host-driven builds a user
+starts, continues or retries. The directory watcher's incremental updates are not
+jobs: nobody waits on them, there is nothing to resume, and they have no scope to
+record.
+
 ## Rust Guidelines
 - Never index or slice strings by byte offset; always use character-aware method. Byte indexing (&s[..n]) is only safe when you can prove the offset is a char boundary, which is almost never true for arbitrary runtime strings.

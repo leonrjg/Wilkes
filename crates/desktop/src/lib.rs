@@ -2678,6 +2678,36 @@ mod tests {
     }
 
     #[tokio::test]
+    /// The activity view answers for a directory nobody has indexed rather
+    /// than failing: a workspace's first look at it is the common case.
+    async fn test_index_activity_for_ctx_reports_an_unindexed_root() {
+        let (dir, ctx) = test_ctx();
+        let activity = index_activity_for_ctx(ctx, dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert!(activity.job.is_none());
+        assert!(activity.documents.is_empty());
+    }
+
+    #[tokio::test]
+    /// Neither action starts a build for a directory with no recorded job.
+    async fn test_continue_and_retry_for_ctx_refuse_without_a_job() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().to_string_lossy().into_owned();
+        let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
+
+        let err = continue_index_job_for_ctx(Arc::clone(&ctx), root.clone(), selected.clone())
+            .await
+            .unwrap_err();
+        assert!(err.contains("No indexing job has been recorded"), "{err}");
+
+        let err = retry_failed_documents_for_ctx(ctx, root, selected)
+            .await
+            .unwrap_err();
+        assert!(err.contains("No indexing job has been recorded"), "{err}");
+    }
+
+    #[tokio::test]
     async fn test_build_index_for_ctx_missing_root() {
         let (_dir, ctx) = test_ctx();
         let err = build_index_for_ctx(

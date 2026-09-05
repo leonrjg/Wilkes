@@ -3477,6 +3477,60 @@ mod tests {
         );
     }
 
+    /// A retry in which every document fails again adds nothing to the index —
+    /// which looks, from the temporary database, exactly like a build that was
+    /// cancelled before its first document. It must not be reported as one.
+    #[test]
+    fn a_subset_build_that_adds_nothing_is_not_reported_as_cancelled() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let good = root.join("good.txt");
+        fs::write(&good, "readable").unwrap();
+
+        // An index to add to, holding the document that did work.
+        SemanticIndex::build(
+            &data_dir,
+            &root,
+            std::slice::from_ref(&good),
+            &ExtractorRegistry::new(),
+            &CountingEmbedder::new(),
+            BuildOptions::new(
+                BuildReporter::without_journal(tokio::sync::mpsc::channel(16).0),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            &txt_indexing(),
+        )
+        .unwrap();
+
+        // Retry a document that cannot be read: nothing is added.
+        let unreadable = root.join("unreadable.txt");
+        fs::write(&unreadable, [0xff, 0xfe, 0xfd]).unwrap();
+        let retried = SemanticIndex::build(
+            &data_dir,
+            &root,
+            std::slice::from_ref(&unreadable),
+            &ExtractorRegistry::new(),
+            &CountingEmbedder::new(),
+            BuildOptions::over_subset(
+                BuildReporter::without_journal(tokio::sync::mpsc::channel(16).0),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            &txt_indexing(),
+        );
+
+        let idx = match retried {
+            Ok(idx) => idx,
+            Err(e) => panic!("a retry that adds nothing is not a cancellation: {e:#}"),
+        };
+        assert_eq!(
+            idx.status_for_root(Some(&root)).indexed_files,
+            1,
+            "the document indexed earlier is untouched"
+        );
+    }
+
     #[test]
     fn test_cancelled_overlapping_root_retries_without_reembedding() {
         let dir = tempdir().unwrap();
@@ -4910,10 +4964,15 @@ impl SemanticIndex {
             "Temporary semantic index failed integrity check: {integrity}"
         );
 
-        // Publishing nothing is not publishing. A build stopped before it
-        // completed its first document has an empty temporary database, and the
-        // replacement path below would rename that emptiness over a working
-        // index. There is also nothing to add, so there is nothing to do.
+        // Publishing nothing is not publishing. A build that finished no
+        // document has an empty temporary database, and the replacement path
+        // below would rename that emptiness over a working index. There is also
+        // nothing to add, so there is nothing to do.
+        //
+        // Nothing to publish is not itself a verdict on the build. It is how a
+        // cancel before the first document looks, and equally how a retry looks
+        // when every document failed again — and those must not be reported as
+        // each other.
         if membership == RootMembership::Additive
             && idx.status_for_root(Some(root_path)).indexed_files == 0
         {
@@ -4924,7 +4983,16 @@ impl SemanticIndex {
             if let Some(e) = embed_failure {
                 return Err(e);
             }
-            anyhow::bail!("Index build cancelled");
+            anyhow::ensure!(!stopped, "Index build cancelled");
+            // The build ran to the end of its list and added nothing — every
+            // document in scope failed, or yielded no text. The index it was
+            // adding to, unchanged, is the answer; the journal is what says
+            // what became of the documents.
+            reporter.finished(total_units);
+            let mut live = Self::open_exact(data_dir, &embedding_identity)?;
+            live.activate_root(root_path)?;
+            live.record_build_completion(start_time.elapsed())?;
+            return Ok(live);
         }
 
         if !stopped && embed_failure.is_none() {

@@ -4,6 +4,38 @@
 
 ### Added
 
+- Long indexing runs have an activity view, under Settings › Activity. It names
+  the document being read and the stage it is at, how much is already saved, and
+  which documents need attention — with the reader's own error kept verbatim
+  beside each one. A document that failed to extract used to be logged and
+  skipped, so the corpus finished with a hole in it and nothing said which
+  document was missing or why. Worker diagnostics live beneath the job, where
+  they belong once the question has narrowed to which model is holding a
+  document up.
+
+  The view is the same whether it watched the whole run or was opened for the
+  first time after a restart, because it reads a durable record rather than
+  accumulating events. An indexing run left unfinished by a crash or a quit is
+  reported as interrupted the next time the workspace opens.
+
+- Stopping an index build now keeps the documents it finished, and offers to
+  continue with the rest. A build fills a temporary database and publishes it at
+  the end, so cancelling one used to throw away everything it had read — pause a
+  four-hundred-page corpus overnight and it started again at page one. An
+  interrupted build is now published for the documents it completed, and
+  continuing runs only over the ones it never reached.
+
+  Retrying the documents that failed is its own action, never part of
+  continuing: a file that breaks the reader breaks it again, and a continuation
+  that swept failures up would re-attempt it forever without ever saying so. A
+  continuation carries the earlier run's verdicts forward, so a failure found an
+  hour ago is still reported and still retryable after the work resumes.
+
+  Cancelling still means the work stops. The cancel flag is raised before the
+  workers are killed, and a batch ended by that kill leaves its documents
+  unfinished for a continuation rather than being recorded as failures that
+  never happened.
+
 - Search considers wording and meaning together. The Semantic checkbox is now
   Combined, and with it on a query runs both lanes over the same catalog: the
   exact lane finds the query text as written, the semantic lane finds passages
