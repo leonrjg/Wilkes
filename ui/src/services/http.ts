@@ -751,6 +751,13 @@ export class HttpSearchApi implements SearchApi {
     return () => this.releaseEventSource("file-list-changed", listener);
   }
 
+  async onResearchStateUpdated(handler: () => void): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = () => handler();
+    es.addEventListener("research-state-updated", listener);
+    return () => this.releaseEventSource("research-state-updated", listener);
+  }
+
   async onFileMetadataUpdated(
     handler: (updates: FileMetadataUpdate[]) => void,
   ): Promise<() => void> {

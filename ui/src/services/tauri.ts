@@ -642,6 +642,10 @@ export class TauriSearchApi implements SearchApi {
     return listen<FileListChanged>("file-list-changed", (e) => handler(e.payload));
   }
 
+  async onResearchStateUpdated(handler: () => void): Promise<() => void> {
+    return listen("research-state-updated", () => handler());
+  }
+
   async onFileMetadataUpdated(
     handler: (updates: FileMetadataUpdate[]) => void,
   ): Promise<() => void> {

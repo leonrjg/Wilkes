@@ -1,3 +1,4 @@
+import { useResearchStore } from "../stores/useResearchStore";
 import { useEffect, useRef } from "react";
 import { useToasts } from "../components/Toast";
 import { api } from "../services";
@@ -16,6 +17,7 @@ export function useGlobalEvents() {
   useEffect(() => {
     let managerUnlisten: (() => void) | undefined;
     let fileListUnlisten: (() => void) | undefined;
+    let researchUnlisten: (() => void) | undefined;
     let metadataUnlisten: (() => void) | undefined;
     let clusterLabelUnlisten: (() => void) | undefined;
     let topicLabelUnlisten: (() => void) | undefined;
@@ -97,6 +99,16 @@ export function useGlobalEvents() {
       }
     });
 
+    api.onResearchStateUpdated(() => {
+      if (!mounted) return;
+      // An MCP edit has no initiating screen to refresh these projections.
+      void Promise.all([
+        useBookmarksStore.getState().load(),
+        useResearchStore.getState().load(),
+        useSettingsStore.getState().refreshFileList(),
+      ]).catch((error) => addToast(`Could not refresh the library: ${error}`, { type: "error" }));
+    }).then((u) => { if (mounted) researchUnlisten = u; else u(); });
+
     api.onFileMetadataUpdated((updates) => {
       if (!mounted) return;
       useSettingsStore.getState().applyMetadataUpdates(updates);
@@ -147,6 +159,7 @@ export function useGlobalEvents() {
       mounted = false;
       if (managerUnlisten) managerUnlisten();
       if (fileListUnlisten) fileListUnlisten();
+      if (researchUnlisten) researchUnlisten();
       if (metadataUnlisten) metadataUnlisten();
       if (clusterLabelUnlisten) clusterLabelUnlisten();
       if (topicLabelUnlisten) topicLabelUnlisten();

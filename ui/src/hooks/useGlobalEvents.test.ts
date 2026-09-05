@@ -1,3 +1,4 @@
+import { useResearchStore } from "../stores/useResearchStore";
 import { renderHook, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { useGlobalEvents } from "./useGlobalEvents";
@@ -12,6 +13,7 @@ vi.mock("../services", () => ({
   api: {
     onManagerEvent: vi.fn().mockResolvedValue(vi.fn()),
     onFileListChanged: vi.fn().mockResolvedValue(vi.fn()),
+    onResearchStateUpdated: vi.fn().mockResolvedValue(vi.fn()),
     onFileMetadataUpdated: vi.fn().mockResolvedValue(vi.fn()),
     onBookmarkClusterLabelled: vi.fn().mockResolvedValue(vi.fn()),
     onChunkTopicLabelled: vi.fn().mockResolvedValue(vi.fn()),
@@ -67,6 +69,21 @@ describe("useGlobalEvents", () => {
     });
     (useBookmarksStore.getState as any).mockReturnValue({ load: loadBookmarks });
     useSearchStore.setState({ resultContext: null });
+  });
+
+  it("refreshes library views after a remote research edit and unsubscribes", async () => {
+    let handler!: () => void;
+    const stop = vi.fn();
+    vi.mocked(api.onResearchStateUpdated).mockImplementation(async (h) => { handler = h; return stop; });
+    const loadResearch = vi.spyOn(useResearchStore.getState(), "load").mockResolvedValue();
+    const { unmount } = renderHook(() => useGlobalEvents());
+    await act(async () => { handler(); });
+    expect(loadBookmarks).toHaveBeenCalled();
+    expect(loadResearch).toHaveBeenCalled();
+    expect(refreshFileList).toHaveBeenCalled();
+    unmount();
+    expect(stop).toHaveBeenCalledOnce();
+    loadResearch.mockRestore();
   });
 
   it("handles WorkerStarting event", async () => {

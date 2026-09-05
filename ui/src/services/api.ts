@@ -327,6 +327,7 @@ export interface SearchApi {
   onEmbedError(handler: (err: EmbedError) => void): Promise<() => void>;
   onManagerEvent(handler: (event: string) => void): Promise<() => void>;
   onFileListChanged(handler: (event: FileListChanged) => void): Promise<() => void>;
+  onResearchStateUpdated(handler: () => void): Promise<() => void>;
   onFileMetadataUpdated(
     handler: (updates: FileMetadataUpdate[]) => void,
   ): Promise<() => void>;

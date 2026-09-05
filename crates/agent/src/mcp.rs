@@ -219,29 +219,53 @@ pub async fn start_external(
 /// endpoint is loopback-only at the protocol boundary (Host and Origin),
 /// even when the outer API has a more permissive CORS policy.
 pub fn api_router(workspaces: Arc<dyn WorkspaceCatalog>) -> Router {
-    let service = mcp_service(McpContext::Library(ExternalMcpContext::default()),
-        PathBuf::new(), Some(workspaces), None,
+    let service = mcp_service(
+        McpContext::Library(ExternalMcpContext::default()),
+        PathBuf::new(),
+        Some(workspaces),
+        None,
         rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
-            .with_stateful_mode(false).with_json_response(true).with_sse_keep_alive(None));
-    Router::new().nest_service("/mcp", service)
-        .layer(middleware::from_fn(|request: Request, next: Next| async move {
-            if request.headers().contains_key("origin") {
-                return Err(StatusCode::FORBIDDEN);
-            }
-            Ok(next.run(request).await)
-        }))
+            .with_stateful_mode(false)
+            .with_json_response(true)
+            .with_sse_keep_alive(None),
+    );
+    Router::new()
+        .nest_service("/mcp", service)
+        .layer(middleware::from_fn(
+            |request: Request, next: Next| async move {
+                if request.headers().contains_key("origin") {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+                Ok(next.run(request).await)
+            },
+        ))
 }
 
 type McpService = rmcp::transport::streamable_http_server::StreamableHttpService<
-    WilkesMcp, rmcp::transport::streamable_http_server::session::local::LocalSessionManager>;
+    WilkesMcp,
+    rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+>;
 
-fn mcp_service(context: McpContext, cwd: PathBuf, workspaces: Option<Arc<dyn WorkspaceCatalog>>,
+fn mcp_service(
+    context: McpContext,
+    cwd: PathBuf,
+    workspaces: Option<Arc<dyn WorkspaceCatalog>>,
     integrations: Option<IntegrationsSettings>,
-    config: rmcp::transport::streamable_http_server::StreamableHttpServerConfig) -> McpService {
-    McpService::new(move || Ok(WilkesMcp::new(context.clone(),cwd.clone(),workspaces.clone(),integrations.clone())),
-        Default::default(),config)
+    config: rmcp::transport::streamable_http_server::StreamableHttpServerConfig,
+) -> McpService {
+    McpService::new(
+        move || {
+            Ok(WilkesMcp::new(
+                context.clone(),
+                cwd.clone(),
+                workspaces.clone(),
+                integrations.clone(),
+            ))
+        },
+        Default::default(),
+        config,
+    )
 }
-
 #[derive(Clone, Copy, Debug)]
 enum HostValidation {
     LoopbackOnly,
@@ -1105,35 +1129,54 @@ struct EditLibraryParams {
 
 #[tool_router]
 impl WilkesMcp {
-    #[tool(description = "Read bookmarks (quotes and notes), tags, or recent search_history from a workspace. Offset is zero-based and limit is 1..500 (default 50). Search history covers the most recent 1000 entries. Use list_smart_collections for collections.")]
-    async fn read_library(&self, Parameters(params): Parameters<ReadLibraryParams>) -> CallToolResult {
+    #[tool(
+        description = "Read bookmarks (quotes and notes), tags, or recent search_history from a workspace. Offset is zero-based and limit is 1..500 (default 50). Search history covers the most recent 1000 entries. Use list_smart_collections for collections."
+    )]
+    async fn read_library(
+        &self,
+        Parameters(params): Parameters<ReadLibraryParams>,
+    ) -> CallToolResult {
         let result: Result<serde_json::Value,String> = async {
-            let limit=params.limit.unwrap_or(50);
-            if !(1..=500).contains(&limit) { return Err("limit must be 1..500".into()); }
-            let scope=self.scope(params.workspace.as_deref()).await?;
-            let value=scope.require_search("No research library is available")?.read_library(params.kind).await?;
-            let entries=value.as_array().ok_or("Research library returned an invalid list")?;
-            let items:Vec<_>=entries.iter().skip(params.offset).take(limit).collect();
-            let next=params.offset.saturating_add(items.len());
-            Ok(serde_json::json!({"items":items,"total":entries.len(),"next_offset":if next<entries.len(){Some(next)}else{None}}))
-        }.await;
-        match result {Ok(value)=>structured(value),Err(message)=>CallToolResult::error(vec![ContentBlock::text(message)])}
+        let limit=params.limit.unwrap_or(50);
+        if !(1..=500).contains(&limit) { return Err("limit must be 1..500".into()); }
+        let scope=self.scope(params.workspace.as_deref()).await?;
+        let value=scope.require_search("No research library is available")?.read_library(params.kind).await?;
+        let entries=value.as_array().ok_or("Research library returned an invalid list")?;
+        let items:Vec<_>=entries.iter().skip(params.offset).take(limit).collect();
+        let next=params.offset.saturating_add(items.len());
+        Ok(serde_json::json!({"items":items,"total":entries.len(),"next_offset":if next<entries.len(){Some(next)}else{None}}))
+    }.await;
+        match result {
+            Ok(value) => structured(value),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        }
     }
 
-    #[tool(description = "Edit the user's Wilkes research library: add/update/remove bookmarks; create/update/delete tags and smart collections; tag documents; rename a file while preserving its index and research links; refresh document metadata. Use only for user-requested changes. Paths must resolve inside the named workspace's library roots. Managed read_only workspaces refuse every edit. Existing files are never overwritten. Bookmark page/line numbers are 1-based. Collection expressions use Wilkes's existing CEL filter schema.")]
-    async fn edit_library(&self, Parameters(mut params): Parameters<EditLibraryParams>) -> CallToolResult {
+    #[tool(
+        description = "Edit the user's Wilkes research library: add/update/remove bookmarks; create/update/delete tags and smart collections; tag documents; rename a file while preserving its index and research links; refresh document metadata. Use only for user-requested changes. Paths must resolve inside the named workspace's library roots. Managed read_only workspaces refuse every edit. Existing files are never overwritten. Bookmark page/line numbers are 1-based. Collection expressions use Wilkes's existing CEL filter schema."
+    )]
+    async fn edit_library(
+        &self,
+        Parameters(mut params): Parameters<EditLibraryParams>,
+    ) -> CallToolResult {
         let result:Result<serde_json::Value,String> = async {
-            let scope=self.scope(params.workspace.as_deref()).await?;
-            if scope.is_read_only() {return Err("MANAGED_WORKSPACE_PROTECTED: this workspace is owned by another application and can only be read".into());}
-            let roots=self.library_roots(&scope).await;
-            for path in params.edit.paths_mut() {
-                let canonical=path.canonicalize().map_err(|e|format!("{}: {e}",path.display()))?;
-                if !is_within_roots(&canonical,&roots) {return Err(format!("{} is outside this workspace's library roots",path.display()));}
-                *path=canonical;
-            }
-            scope.require_search("No research library is available")?.edit_library(params.edit).await
-        }.await;
-        match result {Ok(value)=>structured(value),Err(message)=>CallToolResult::error(vec![ContentBlock::text(message)])}
+        let scope=self.scope(params.workspace.as_deref()).await?;
+        if scope.is_read_only() {return Err("MANAGED_WORKSPACE_PROTECTED: this workspace is owned by another application and can only be read".into());}
+        if let crate::library::LibraryEdit::RenameFile {path,..} = &params.edit {
+            if !path.is_file() { return Err("rename_file requires a document file, not a library root or directory".into()); }
+        }
+        let roots=self.library_roots(&scope).await;
+        for path in params.edit.paths_mut() {
+            let canonical=path.canonicalize().map_err(|e|format!("{}: {e}",path.display()))?;
+            if !is_within_roots(&canonical,&roots) {return Err(format!("{} is outside this workspace's library roots",path.display()));}
+            *path=canonical;
+        }
+        scope.require_search("No research library is available")?.edit_library(params.edit).await
+    }.await;
+        match result {
+            Ok(value) => structured(value),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        }
     }
 
     #[tool(
@@ -2030,6 +2073,7 @@ mod tests {
     };
 
     struct FakeSearch {
+        read_only: bool,
         last_query: Mutex<Option<SearchQuery>>,
         last_related_query: Mutex<Option<RelatedDocumentsQuery>>,
         default_root: Option<PathBuf>,
@@ -2317,6 +2361,14 @@ mod tests {
 
     #[async_trait]
     impl SearchService for FakeSearch {
+        fn is_read_only(&self) -> bool { self.read_only }
+        async fn edit_library(self: Arc<Self>, edit: crate::library::LibraryEdit) -> Result<serde_json::Value, String> {
+            Ok(serde_json::to_value(edit).unwrap())
+        }
+        async fn read_library(self: Arc<Self>, _kind: crate::library::LibraryKind) -> Result<serde_json::Value,String> {
+            Ok(serde_json::json!([{"id":"one"},{"id":"two"}]))
+        }
+
         async fn default_root(self: Arc<Self>) -> Option<PathBuf> {
             self.default_root.clone()
         }
@@ -2443,6 +2495,7 @@ mod tests {
 
     fn fake_search_with_root(root: PathBuf) -> Arc<FakeSearch> {
         Arc::new(FakeSearch {
+            read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
             default_root: Some(root.clone()),
@@ -3201,6 +3254,7 @@ mod tests {
         let context = ContextStateHandle::default();
         context.set_search_root(Some(current_root.to_string_lossy().into_owned()));
         let search = Arc::new(FakeSearch {
+            read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
             default_root: Some(current_root.clone()),
@@ -3574,6 +3628,7 @@ mod tests {
         let root = dir.path().join("library");
         let active = root.join("paper.md");
         let service = Arc::new(FakeSearch {
+            read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
             default_root: None,
@@ -3619,6 +3674,7 @@ mod tests {
         let default_root = dir.path().join("active-root");
         let live_root = dir.path().join("live-ui-root");
         let service = Arc::new(FakeSearch {
+            read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
             default_root: Some(default_root.clone()),
@@ -3744,6 +3800,7 @@ mod tests {
                 .into_owned(),
         ));
         let service = Arc::new(FakeSearch {
+            read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
             default_root: Some(dir.path().join("active-root")),
@@ -4057,4 +4114,142 @@ mod tests {
         assert_eq!(response.matches[0].author.as_deref(), Some("Bo"));
         assert_eq!(response.matches[0].doi.as_deref(), Some("10.1/hit"));
     }
+    #[tokio::test]
+    async fn research_edits_are_workspace_scoped_and_reject_protected_workspaces() {
+        let root = tempdir().unwrap();
+        let mut service = fake_search_with_root(root.path().into());
+        Arc::get_mut(&mut service).unwrap().read_only = true;
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(single_workspace(service)),
+            None,
+        );
+        let reply = mcp
+            .edit_library(Parameters(EditLibraryParams {
+                workspace: None,
+                edit: crate::library::LibraryEdit::CreateTag {
+                    name: "test".into(),
+                    color: None,
+                },
+            }))
+            .await;
+        assert_eq!(reply.is_error, Some(true));
+        assert!(serde_json::to_string(&reply)
+            .unwrap()
+            .contains("MANAGED_WORKSPACE_PROTECTED"));
+    }
+
+    #[tokio::test]
+    async fn research_edits_confine_canonical_paths_and_refuse_root_renames() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let file = root.path().join("notes.md");
+        std::fs::write(&file, "notes").unwrap();
+        let other = outside.path().join("outside.md");
+        std::fs::write(&other, "outside").unwrap();
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(single_workspace(fake_search_with_root(root.path().into()))),
+            None,
+        );
+        let edit = |path: PathBuf| EditLibraryParams {
+            workspace: None,
+            edit: crate::library::LibraryEdit::RenameFile {
+                path,
+                new_name: "new.md".into(),
+            },
+        };
+        let accepted = mcp.edit_library(Parameters(edit(file.clone()))).await;
+        assert_ne!(accepted.is_error, Some(true));
+        assert_eq!(
+            accepted.structured_content.unwrap()["path"],
+            file.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            mcp.edit_library(Parameters(edit(other.clone())))
+                .await
+                .is_error,
+            Some(true)
+        );
+        assert_eq!(
+            mcp.edit_library(Parameters(edit(root.path().into())))
+                .await
+                .is_error,
+            Some(true)
+        );
+        #[cfg(unix)]
+        {
+            let link = root.path().join("link.md");
+            std::os::unix::fs::symlink(&other, &link).unwrap();
+            assert_eq!(
+                mcp.edit_library(Parameters(edit(link))).await.is_error,
+                Some(true)
+            );
+        }
+        assert!(file.exists());
+        assert!(other.exists());
+    }
+
+    #[tokio::test]
+    async fn research_reads_page_without_losing_the_total() {
+        let root = tempdir().unwrap();
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(single_workspace(fake_search_with_root(root.path().into()))),
+            None,
+        );
+        let reply = mcp
+            .read_library(Parameters(ReadLibraryParams {
+                kind: crate::library::LibraryKind::Tags,
+                workspace: None,
+                offset: 1,
+                limit: Some(1),
+            }))
+            .await
+            .structured_content
+            .unwrap();
+        assert_eq!(reply["items"][0]["id"], "two");
+        assert_eq!(reply["total"], 2);
+        assert!(reply["next_offset"].is_null());
+    }
+
+    #[tokio::test]
+    async fn shared_api_mcp_initializes_and_rejects_browser_origins() {
+        use axum::body::{to_bytes, Body};
+        use tower::ServiceExt;
+        let root = tempdir().unwrap();
+        let router = api_router(single_workspace(fake_search_with_root(root.path().into())));
+        let request = |origin: bool| {
+            let mut builder = axum::http::Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", "127.0.0.1")
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json");
+            if origin {
+                builder = builder.header("origin", "https://example.com");
+            }
+            builder.body(Body::from(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"eos","version":"test"}}}).to_string())).unwrap()
+        };
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(request(true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let reply = router.oneshot(request(false)).await.unwrap();
+        assert_eq!(reply.status(), StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(reply.into_body(), 100000).await.unwrap()).unwrap();
+        assert_eq!(json["result"]["serverInfo"]["name"], "wilkes");
+    }
+
+
 }

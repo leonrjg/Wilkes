@@ -96,7 +96,10 @@ pub trait EventEmitter: Send + Sync + 'static {
 
 #[async_trait::async_trait]
 impl wilkes_agent::search::SearchService for AppContext {
-    async fn read_library(self: Arc<Self>, kind: wilkes_agent::library::LibraryKind) -> Result<serde_json::Value, String> {
+    async fn read_library(
+        self: Arc<Self>,
+        kind: wilkes_agent::library::LibraryKind,
+    ) -> Result<serde_json::Value, String> {
         use wilkes_agent::library::LibraryKind;
         let result: anyhow::Result<serde_json::Value> = async {
             Ok(match kind {
@@ -104,40 +107,94 @@ impl wilkes_agent::search::SearchService for AppContext {
                 LibraryKind::Tags => serde_json::to_value(self.list_tags()?)?,
                 LibraryKind::SearchHistory => serde_json::to_value(self.list_search_log(1000)?)?,
             })
-        }.await;
-        result.map_err(|e|format!("{e:#}"))
+        }
+        .await;
+        result.map_err(|e| format!("{e:#}"))
     }
 
-    async fn edit_library(self: Arc<Self>, edit: wilkes_agent::library::LibraryEdit) -> Result<serde_json::Value, String> {
+    async fn edit_library(
+        self: Arc<Self>,
+        edit: wilkes_agent::library::LibraryEdit,
+    ) -> Result<serde_json::Value, String> {
         use wilkes_agent::library::LibraryEdit as Edit;
         use wilkes_core::types::*;
         // Enforced here as well as at MCP: no adapter can write into an
         // application-managed corpus through the research-library interface.
-        self.ensure_writable().map_err(|e|e.to_string())?;
+        self.ensure_writable().map_err(|e| e.to_string())?;
         let result: anyhow::Result<serde_json::Value> = async {
             let value = match edit {
-                Edit::AddBookmark {path,location,quote,note} => serde_json::to_value(self.add_bookmark(NewBookmark {
-                    path,origin:location.into_origin().map_err(anyhow::Error::msg)?,quote,note,text_range:None,rects:vec![]
-                }).await?)?,
-                Edit::UpdateBookmarkNote {id,note} => serde_json::to_value(self.update_bookmark_note(&id,note).await?)?,
-                Edit::RemoveBookmark {id} => { self.remove_bookmark(&id).await?; serde_json::json!({"removed":id}) },
-                Edit::CreateTag {name,color} => serde_json::to_value(self.create_tag(NewTag {name,color})?)?,
-                Edit::UpdateTag {id,name,color} => serde_json::to_value(self.update_tag(&id,UpdateTag {name,color})?)?,
-                Edit::DeleteTag {id} => {self.delete_tag(&id)?;serde_json::json!({"removed":id})},
-                Edit::TagDocuments {paths,add_tag_ids,remove_tag_ids} => {
-                    self.update_document_tags(DocumentTagUpdate {paths,add_tag_ids,remove_tag_ids})?;
+                Edit::AddBookmark {
+                    path,
+                    location,
+                    quote,
+                    note,
+                } => serde_json::to_value(
+                    self.add_bookmark(NewBookmark {
+                        path,
+                        origin: location.into_origin().map_err(anyhow::Error::msg)?,
+                        quote,
+                        note,
+                        text_range: None,
+                        rects: vec![],
+                    })
+                    .await?,
+                )?,
+                Edit::UpdateBookmarkNote { id, note } => {
+                    serde_json::to_value(self.update_bookmark_note(&id, note).await?)?
+                }
+                Edit::RemoveBookmark { id } => {
+                    self.remove_bookmark(&id).await?;
+                    serde_json::json!({"removed":id})
+                }
+                Edit::CreateTag { name, color } => {
+                    serde_json::to_value(self.create_tag(NewTag { name, color })?)?
+                }
+                Edit::UpdateTag { id, name, color } => {
+                    serde_json::to_value(self.update_tag(&id, UpdateTag { name, color })?)?
+                }
+                Edit::DeleteTag { id } => {
+                    self.delete_tag(&id)?;
+                    serde_json::json!({"removed":id})
+                }
+                Edit::TagDocuments {
+                    paths,
+                    add_tag_ids,
+                    remove_tag_ids,
+                } => {
+                    self.update_document_tags(DocumentTagUpdate {
+                        paths,
+                        add_tag_ids,
+                        remove_tag_ids,
+                    })?;
                     serde_json::json!({"updated":true})
-                },
-                Edit::CreateCollection {name,expression} => serde_json::to_value(self.create_collection(NewSmartCollection {name,expression})?)?,
-                Edit::UpdateCollection {id,name,expression} => serde_json::to_value(self.update_collection(&id,UpdateSmartCollection {name,expression})?)?,
-                Edit::DeleteCollection {id} => {self.delete_collection(&id)?;serde_json::json!({"removed":id})},
-                Edit::RenameFile {path,new_name} => serde_json::json!({"path":self.rename_file(path,new_name).await?}),
-                Edit::RefreshMetadata {path} => serde_json::to_value(self.resolve_file_metadata(path).await?)?,
+                }
+                Edit::CreateCollection { name, expression } => serde_json::to_value(
+                    self.create_collection(NewSmartCollection { name, expression })?,
+                )?,
+                Edit::UpdateCollection {
+                    id,
+                    name,
+                    expression,
+                } => serde_json::to_value(
+                    self.update_collection(&id, UpdateSmartCollection { name, expression })?,
+                )?,
+                Edit::DeleteCollection { id } => {
+                    self.delete_collection(&id)?;
+                    serde_json::json!({"removed":id})
+                }
+                Edit::RenameFile { path, new_name } => {
+                    serde_json::json!({"path":self.rename_file(path,new_name).await?})
+                }
+                Edit::RefreshMetadata { path } => {
+                    serde_json::to_value(self.resolve_file_metadata(path).await?)?
+                }
             };
-            self.events.emit("research-state-updated",serde_json::json!({"kind":"mcp"}));
+            self.events
+                .emit("research-state-updated", serde_json::json!({"kind":"mcp"}));
             Ok(value)
-        }.await;
-        result.map_err(|e|format!("{e:#}"))
+        }
+        .await;
+        result.map_err(|e| format!("{e:#}"))
     }
 
     async fn default_root(self: Arc<Self>) -> Option<PathBuf> {
@@ -14017,4 +14074,107 @@ exit 0
         ctx.clear_restore_state_settings().await;
         assert!(!ctx.settings().await.semantic.enabled);
     }
+    #[tokio::test]
+    async fn mcp_library_edits_round_trip_through_the_existing_research_store() {
+        use wilkes_agent::{
+            library::{LibraryEdit as Edit, LibraryKind, Location},
+            search::SearchService,
+        };
+        let dir = tempdir().unwrap();
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().into(),
+            dir.path().join("settings.json"),
+            WorkerPaths {
+                python_path: "p".into(),
+                python_package_dir: "pkg".into(),
+                requirements_path: "r".into(),
+                venv_dir: "v".into(),
+                worker_bin: "w".into(),
+                data_dir: dir.path().into(),
+            },
+            Arc::new(MockEmitter {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+        let tag = ctx
+            .clone()
+            .edit_library(Edit::CreateTag {
+                name: "Read next".into(),
+                color: None,
+            })
+            .await
+            .unwrap();
+        let tags = ctx.clone().read_library(LibraryKind::Tags).await.unwrap();
+        assert_eq!(tags[0]["id"], tag["id"]);
+        let collection = ctx
+            .clone()
+            .edit_library(Edit::CreateCollection {
+                name: "Everything".into(),
+                expression: "true".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.list_collections().unwrap()[0].id,
+            collection["id"].as_str().unwrap()
+        );
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "A passage worth keeping").unwrap();
+        let bookmark = ctx
+            .clone()
+            .edit_library(Edit::AddBookmark {
+                path: path.clone(),
+                location: Location::Text { line: 1, col: 0 },
+                quote: "A passage worth keeping".into(),
+                note: None,
+            })
+            .await
+            .unwrap();
+        ctx.clone()
+            .edit_library(Edit::UpdateBookmarkNote {
+                id: bookmark["id"].as_str().unwrap().into(),
+                note: Some("Review this".into()),
+            })
+            .await
+            .unwrap();
+        let renamed = ctx
+            .clone()
+            .edit_library(Edit::RenameFile {
+                path,
+                new_name: "renamed.md".into(),
+            })
+            .await
+            .unwrap();
+        assert!(std::path::Path::new(renamed["path"].as_str().unwrap()).is_file());
+        let bookmarks = ctx
+            .clone()
+            .read_library(LibraryKind::Bookmarks)
+            .await
+            .unwrap();
+        assert_eq!(bookmarks[0]["note"], "Review this");
+        assert_eq!(bookmarks[0]["path"], renamed["path"]);
+        ctx.clone()
+            .edit_library(Edit::RemoveBookmark {
+                id: bookmark["id"].as_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+        ctx.clone()
+            .edit_library(Edit::DeleteTag {
+                id: tag["id"].as_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+        ctx.clone()
+            .edit_library(Edit::DeleteCollection {
+                id: collection["id"].as_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+        assert!(ctx.list_bookmarks().await.unwrap().is_empty());
+        assert!(ctx.list_tags().unwrap().is_empty());
+        assert!(ctx.list_collections().unwrap().is_empty());
+    }
+
+
 }

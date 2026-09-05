@@ -670,7 +670,7 @@ impl ResearchStore {
             if let Some(target_id) = target_id.filter(|id| id != &old_id) {
                 tx.execute(
                     "INSERT OR IGNORE INTO document_tags(document_id,tag_id,created_at_ms)
-                     SELECT ?1,tag_id,created_at_ms FROM document_tags WHERE document_id=?2",
+                 SELECT ?1,tag_id,created_at_ms FROM document_tags WHERE document_id=?2",
                     params![old_id, target_id],
                 )?;
                 tx.execute("DELETE FROM document_refs WHERE id=?1", [target_id])?;
@@ -681,6 +681,31 @@ impl ResearchStore {
             )?;
         }
         Self::rekey_descendant_paths(&tx, &old_path, &new_path)?;
+        // Bookmarks keep their own source path, including for documents never
+        // indexed or tagged. Preserve their identity and annotations on rename.
+        let bookmarks: Vec<Bookmark> = {
+            let mut stmt = tx.prepare("SELECT payload_json FROM bookmarks")?;
+            let payloads = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            payloads
+                .into_iter()
+                .map(|payload| serde_json::from_str(&payload))
+                .collect::<Result<_, _>>()?
+        };
+        for mut bookmark in bookmarks {
+            if let Ok(relative) = bookmark.path.strip_prefix(old) {
+                bookmark.path = if relative.as_os_str().is_empty() {
+                    new.to_path_buf()
+                } else {
+                    new.join(relative)
+                };
+                tx.execute(
+                    "UPDATE bookmarks SET payload_json=?2 WHERE id=?1",
+                    params![bookmark.id, serde_json::to_string(&bookmark)?],
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
