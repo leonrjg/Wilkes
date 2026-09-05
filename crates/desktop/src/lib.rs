@@ -5,23 +5,23 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use chat::ChatManager;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
-use chat::ChatManager;
 use wilkes_api::commands::integrations::custom::ManifestSummary;
 use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_api::startup::StartupStatus;
 use wilkes_api::workspace::{WorkspaceManager, WorkspaceState, WorkspaceSummary};
 use wilkes_core::integrations::custom::ProbeReport;
 use wilkes_core::types::{
-    AddOutcome, Bookmark, BookmarkClustersQuery, BookmarkClustersResult,
-    ChunkTopicsQuery, ChunkTopicsResult, CitationResult, CollectionValidation, DataPaths,
-    DocumentMetadata, DocumentTagUpdate, EmbedderCapabilityManifest, EmbeddingEngine,
-    ExternalMcpSettings, FileListResponse, HttpApiSettings, IndexStatus, IntegrationStatus,
-    NewBookmark, NewSmartCollection, NewTag, OpenAlexWork, SearchLogEntry, SelectedEmbedder,
+    AddOutcome, Bookmark, BookmarkClustersQuery, BookmarkClustersResult, ChunkTopicsQuery,
+    ChunkTopicsResult, CitationResult, CollectionValidation, DataPaths, DocumentMetadata,
+    DocumentTagUpdate, EmbedderCapabilityManifest, EmbeddingEngine, ExternalMcpSettings,
+    FileListResponse, HttpApiSettings, IndexStatus, IntegrationStatus, NewBookmark,
+    NewSmartCollection, NewTag, OpenAlexWork, SearchLogEntry, SelectedEmbedder,
     SemanticScholarPaper, Settings, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::worker::manager::WorkerStatus;

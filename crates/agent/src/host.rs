@@ -237,7 +237,10 @@ impl ContextStateHandle {
 #[cfg(test)]
 impl ContextStateHandle {
     pub(crate) fn set_search_root(&self, root: Option<String>) {
-        self.apply(HostContext { search_root: root, ..self.current() });
+        self.apply(HostContext {
+            search_root: root,
+            ..self.current()
+        });
     }
 
     pub(crate) fn set_active_doc(&self, path: Option<String>, page: Option<u32>) {
@@ -465,14 +468,23 @@ mod tests {
             search_root: Some("/library".into()),
             active_doc: None,
             context_files: vec![
-                HostContextFile { path: "/a.pdf".into(), pages: Some(3) },
-                HostContextFile { path: "/b.pdf".into(), pages: None },
+                HostContextFile {
+                    path: "/a.pdf".into(),
+                    pages: Some(3),
+                },
+                HostContextFile {
+                    path: "/b.pdf".into(),
+                    pages: None,
+                },
             ],
         });
         handle.apply(HostContext {
             search_root: Some("/library".into()),
             active_doc: None,
-            context_files: vec![HostContextFile { path: "/b.pdf".into(), pages: None }],
+            context_files: vec![HostContextFile {
+                path: "/b.pdf".into(),
+                pages: None,
+            }],
         });
 
         assert_eq!(handle.context_paths(), vec!["/b.pdf".to_string()]);
@@ -484,7 +496,10 @@ mod tests {
         // the window never has to remember what it last sent.
         let handle = ContextStateHandle::default();
         handle.apply(HostContext {
-            context_files: vec![HostContextFile { path: "/a.pdf".into(), pages: None }],
+            context_files: vec![HostContextFile {
+                path: "/a.pdf".into(),
+                pages: None,
+            }],
             ..HostContext::default()
         });
 
@@ -492,7 +507,10 @@ mod tests {
         assert!(snapshot.context_files[0].added_this_turn);
 
         handle.apply(HostContext {
-            context_files: vec![HostContextFile { path: "/a.pdf".into(), pages: None }],
+            context_files: vec![HostContextFile {
+                path: "/a.pdf".into(),
+                pages: None,
+            }],
             ..HostContext::default()
         });
         let (_, snapshot) = handle.prepare_turn();
@@ -506,8 +524,14 @@ mod tests {
         let handle = ContextStateHandle::default();
         let sent = HostContext {
             search_root: Some("/library".into()),
-            active_doc: Some(HostActiveDoc { path: "/a.pdf".into(), page: Some(4) }),
-            context_files: vec![HostContextFile { path: "/a.pdf".into(), pages: Some(9) }],
+            active_doc: Some(HostActiveDoc {
+                path: "/a.pdf".into(),
+                page: Some(4),
+            }),
+            context_files: vec![HostContextFile {
+                path: "/a.pdf".into(),
+                pages: Some(9),
+            }],
         };
         handle.apply(sent.clone());
 
@@ -600,7 +624,10 @@ mod tests {
     fn a_tool_that_merely_mentions_searching_is_not_wilkes_own() {
         // The auto-allow is the one place a permission prompt is skipped, so
         // matching has to be on the server's own names and nothing looser.
-        assert!(!is_wilkes_mcp_call(&tool_call(Some("Search the web"), None)));
+        assert!(!is_wilkes_mcp_call(&tool_call(
+            Some("Search the web"),
+            None
+        )));
         assert!(!is_wilkes_mcp_call(&tool_call(Some("other.search"), None)));
     }
 
@@ -609,6 +636,9 @@ mod tests {
         // `download` is a mutating tool on the same server. It must go to the
         // user like anything else that changes the disk.
         assert!(!crate::mcp::WILKES_MCP_TOOL_NAMES.contains(&"download"));
-        assert!(!is_wilkes_mcp_call(&tool_call(Some("wilkes.download"), None)));
+        assert!(!is_wilkes_mcp_call(&tool_call(
+            Some("wilkes.download"),
+            None
+        )));
     }
 }

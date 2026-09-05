@@ -284,9 +284,11 @@ pub async fn chat_start(
     wilkes.apply(host.unwrap_or_default());
 
     let session = Arc::new(spawned.session);
-    let stored =
-        wilkes_api::commands::chat::config_for_backend(&ctx.get_settings().await.chat_config, backend)
-            .to_vec();
+    let stored = wilkes_api::commands::chat::config_for_backend(
+        &ctx.get_settings().await.chat_config,
+        backend,
+    )
+    .to_vec();
     let config_options = apply_settings(&ctx, &session, &stored).await;
     let backend_session_id = session.backend_session_id().to_string();
 
@@ -320,13 +322,10 @@ pub async fn chat_open_conversation(
     let record = wilkes_api::commands::chat::get_conversation(&ctx.data_dir, &conversation_id)
         .map_err(|e| format!("{e:#}"))?;
     let integrations = ctx.get_settings().await.integrations;
-    let (spawned, wilkes) = wilkes_api::commands::chat::open(
-        &record,
-        Some(workspace_manager(&app)),
-        integrations,
-    )
-    .await
-    .map_err(|e| format!("{e:#}"))?;
+    let (spawned, wilkes) =
+        wilkes_api::commands::chat::open(&record, Some(workspace_manager(&app)), integrations)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
     wilkes.apply(host.unwrap_or_default());
 
     let session = Arc::new(spawned.session);
@@ -592,9 +591,10 @@ pub async fn chat_send(
                 std::mem::replace(&mut *pending, false)
             };
             if carried {
-                if let Err(e) =
-                    wilkes_api::commands::chat::mark_branch_history_seeded(&data_dir, conversation_id)
-                {
+                if let Err(e) = wilkes_api::commands::chat::mark_branch_history_seeded(
+                    &data_dir,
+                    conversation_id,
+                ) {
                     error!("chat: could not mark the branch history as handed over: {e:#}");
                 }
             }

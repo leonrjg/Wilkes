@@ -217,13 +217,7 @@ mod tests {
                 added_this_turn: true,
             },
         ];
-        let block = build_context_block(
-            false,
-            &RootContext::default(),
-            Some(&doc),
-            &files,
-            None,
-        );
+        let block = build_context_block(false, &RootContext::default(), Some(&doc), &files, None);
         assert!(block.contains("Open document: /tmp/paper.pdf (page 12)"));
         assert!(block.contains("/tmp/paper.pdf  (40 pages)"));
         assert!(block.contains("/tmp/appendix.pdf  (8 pages)  <- added this turn"));
@@ -240,13 +234,8 @@ mod tests {
             truncated: true,
         };
 
-        let block = build_context_block(
-            false,
-            &RootContext::default(),
-            Some(&doc),
-            &[],
-            Some(&text),
-        );
+        let block =
+            build_context_block(false, &RootContext::default(), Some(&doc), &[], Some(&text));
 
         assert!(block.contains("<wilkes-active-document-text truncated=\"true\">"));
         assert!(block.contains("IO programming here means input/output handling."));
@@ -285,6 +274,4 @@ mod tests {
         assert!(block.contains("c.txt"));
         assert!(!block.contains("d.txt"));
     }
-
-
 }

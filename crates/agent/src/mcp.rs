@@ -25,9 +25,9 @@ use wilkes_core::types::IntegrationsSettings;
 
 use crate::{
     context::{ActiveDoc, ContextFile},
+    host::ContextStateHandle,
     reader,
     search::{SearchService, WorkspaceCatalog, WorkspaceDescriptor},
-    host::ContextStateHandle,
 };
 
 const DEFAULT_TEXT_CHAR_LIMIT: usize = 24_000;
