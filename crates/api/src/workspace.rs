@@ -1116,12 +1116,30 @@ impl WorkspaceManager {
                         "semantic configuration is absent",
                     )
                 })?;
+                // Extraction only. The canonical corpus owns chunking, which
+                // is fixed when it is created because every `chunk_ref` in
+                // every consumer's graph derives from it — that is the one
+                // thing here nobody can recompute, so it is the one thing
+                // still refused.
+                //
+                // The embedder used to be compared too, and never updated, so
+                // this endpoint refused for the life of the corpus any request
+                // naming a different model. A consumer that sent its live
+                // setting — which is the only setting it has — could not
+                // ingest again, and the remedy it was pointed at could not
+                // help, because the canonical corpus's embedder is not what
+                // serves it. It no longer embeds at all; its projections do,
+                // and `PUT /api/corpora/spaces` is where a model is chosen.
                 consumer_ensure!(
-                    configured.selected == request.embedding
-                        && configured.chunk_size == request.chunk_size
+                    configured.chunk_size == request.chunk_size
                         && configured.chunk_overlap == request.chunk_overlap,
                     ConsumerErrorCode::ManagedWorkspaceConfigurationMismatch,
-                    "existing corpus uses a different embedding or extraction configuration",
+                    "existing corpus was chunked at {}/{} and cannot be re-chunked; \
+                     requested {}/{}",
+                    configured.chunk_size,
+                    configured.chunk_overlap,
+                    request.chunk_size,
+                    request.chunk_overlap,
                 );
                 manifest.id
             } else {
@@ -1574,15 +1592,34 @@ impl WorkspaceManager {
             .as_ref()
             .map(|(_, _, _, generation)| generation.clone())
             .unwrap_or_else(|| wilkes_core::embed::identity::sha256_bytes(&[]));
-        let ready = stored_identity.as_ref().is_some_and(|identity| {
-            identity.engine == semantic.selected.engine
-                && identity.model_id == semantic.selected.model.model_id()
-                && identity.dimension == semantic.selected.dimension
-        }) && completeness.1 == completeness.2;
-        // A corpus with no index has no coordinate system yet. Reporting one
-        // derived from the manifest would advertise an id that no index will
-        // ever carry, so callers get nothing to echo back until vectors exist.
-        let identity = stored_identity;
+        // The canonical corpus is not a coordinate system.
+        //
+        // It owns retained sources, extraction, chunking and stable passage
+        // identity; its projections own vectors, one model each. So its
+        // readiness is about membership — is the index open, are the admitted
+        // documents chunked — and never about coordinates, which it no longer
+        // computes. Measuring it by `required == embedded` would hold it
+        // permanently unready, since embedded is now zero by design.
+        //
+        // And it reports no space. It used to publish one derived from
+        // `semantic.selected`, a field fixed when the corpus was created and
+        // reachable from no setting afterwards, which is how a store came to
+        // pin a space it could not change and a model it never chose.
+        let is_canonical = parent_corpus_id.is_none();
+        let ready = if is_canonical {
+            stored_identity.is_some()
+        } else {
+            stored_identity.as_ref().is_some_and(|identity| {
+                identity.engine == semantic.selected.engine
+                    && identity.model_id == semantic.selected.model.model_id()
+                    && identity.dimension == semantic.selected.dimension
+            }) && completeness.1 == completeness.2
+        };
+        // A projection with no index has no coordinate system yet. Reporting
+        // one derived from the manifest would advertise an id that no index
+        // will ever carry, so callers get nothing to echo back until vectors
+        // exist — and the canonical has none to advertise at all.
+        let identity = if is_canonical { None } else { stored_identity };
         fn directory_bytes(path: &Path) -> u64 {
             let mut bytes = 0;
             let mut pending = vec![path.to_path_buf()];
@@ -1641,7 +1678,14 @@ impl WorkspaceManager {
             .id(),
             ready,
             indexed_documents: completeness.0,
-            indexed_chunks: completeness.2,
+            // The canonical corpus indexes chunks and embeds none of them, so
+            // these two part company there rather than being the same number
+            // under two names.
+            indexed_chunks: if is_canonical {
+                completeness.1
+            } else {
+                completeness.2
+            },
             required_chunks: completeness.1,
             embedded_chunks: completeness.2,
             reused_chunks: embedding_work.0,

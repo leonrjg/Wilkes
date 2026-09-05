@@ -148,7 +148,9 @@ impl SearchHandle {
 ///
 /// For `SearchMode::Grep`: `embedder` is ignored. When `grep_use_index` is
 /// enabled, `index` supplies stored PDF text and individual unavailable files
-/// fall back to live extraction.
+/// are read live for the glyphs they typeset — see
+/// [`wilkes_core::extract::exact_search_registry`] for why a search's own read
+/// never enriches.
 /// For `SearchMode::Semantic`: both must be `Some`, otherwise the search returns
 /// an immediate error. The desktop validates presence before calling.
 #[allow(clippy::too_many_arguments)]
@@ -167,7 +169,13 @@ pub fn start_search(
     let (tx, rx) = mpsc::channel::<FileMatches>(64);
 
     let worker = tokio::task::spawn_blocking(move || {
-        let registry = wilkes_core::extract::production_registry();
+        // Glyphs only, and deliberately not the process's configured analyzer:
+        // a search reads renditions, it does not produce them. The semantic
+        // provider ignores this registry entirely, so what is built here is
+        // exactly the exact-search live read of a PDF the index cannot serve —
+        // once per document, from inside a loop over the corpus, which is why
+        // it must not be a read that reaches a model.
+        let registry = wilkes_core::extract::exact_search_registry();
 
         let provider: Box<dyn SearchProvider> = match query.mode {
             SearchMode::Semantic => match (embedder, index) {

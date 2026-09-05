@@ -520,6 +520,12 @@ impl AnalysisContext {
 /// analysis did not run.
 static CONFIGURED_ANALYZER: RwLock<Option<Arc<dyn ImageAnalyzer>>> = RwLock::new(None);
 
+/// Held by every test that moves [`CONFIGURED_ANALYZER`], because the analyzer
+/// is process-wide and the test binary is one process: two such tests running
+/// on two threads would each be asserting about the other's analyzer.
+#[cfg(test)]
+pub(crate) static CONFIGURED_ANALYZER_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Install this process's analyzer, replacing whatever it was.
 pub fn configure(analyzer: Option<Arc<dyn ImageAnalyzer>>) {
     let named = analyzer.as_ref().map(|analyzer| analyzer.identity());
@@ -1721,6 +1727,9 @@ mod tests {
             fn release(&self) {}
         }
 
+        let _serialized = super::CONFIGURED_ANALYZER_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let restore = configured();
         configure(Some(Arc::new(Nothing("first"))));
         assert_eq!(configured().map(|a| a.identity()).as_deref(), Some("first"));

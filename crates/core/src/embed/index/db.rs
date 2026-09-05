@@ -5222,6 +5222,39 @@ impl SemanticIndex {
         })
     }
 
+    /// Extract and chunk a file without embedding it.
+    ///
+    /// The canonical managed corpus owns retained sources, extraction,
+    /// chunking and stable passage identity — and, since the projections
+    /// landed, no coordinate system. Its chunks are what every space projects
+    /// from and what every `chunk_ref` is derived from; its vectors were read
+    /// by nothing once a store served a projection, and were computed on every
+    /// import anyway. A corpus created under one model went on loading that
+    /// model forever, because the canonical embedder is fixed at creation.
+    ///
+    /// So the canonical import stops asking for one. The chunks come back with
+    /// empty vectors and [`Self::write_file_with_recipe`] stores no `vec_chunks`
+    /// row for them, which is what "the canonical corpus holds no vectors"
+    /// means in the schema.
+    pub fn prepare_file_without_vectors(
+        path: &Path,
+        extractors: &ExtractorRegistry,
+        chunk_size: usize,
+        chunk_overlap: usize,
+    ) -> anyhow::Result<PreparedFile> {
+        let (full_text, raw_chunks, retained) =
+            Self::extract_chunks(path, extractors, chunk_size, chunk_overlap)?;
+        Ok(PreparedFile {
+            path: path.to_path_buf(),
+            chunks: raw_chunks
+                .into_iter()
+                .map(|chunk| (chunk, Vec::new()))
+                .collect(),
+            full_text,
+            retained,
+        })
+    }
+
     /// Copy an unchanged file's chunks and embeddings from another compatible
     /// index. Returns `false` when reuse is unsafe so the caller can embed it.
     fn reuse_unchanged_file_from(
@@ -6534,6 +6567,15 @@ impl SemanticIndex {
                 ],
             )?;
             let chunk_id = tx.last_insert_rowid();
+            // No vector, no row. The canonical managed corpus writes its
+            // chunks this way: it owns passages and their identity, and no
+            // coordinate system, so there is nothing to store here and a
+            // zero-length blob would not fit a `float[dimension]` column
+            // anyway. A projection supplies the coordinates for these very
+            // chunks, matched back by `chunk_ref`.
+            if embedding.is_empty() {
+                continue;
+            }
             let blob = f32_slice_to_bytes(&embedding);
             tx.execute(
                 "INSERT INTO vec_chunks(rowid, embedding) VALUES (?1, ?2)",

@@ -50,21 +50,56 @@ pub trait ContentExtractor: Send + Sync {
 /// The extractors Wilkes reads documents with, and the only place that says
 /// what they are.
 ///
-/// Every production consumer of a rendition — indexing, watcher updates,
-/// exact-search fallback, MCP reads, summaries, export — goes through a
-/// registry built here, with the process's one configured analyzer
-/// ([`image::configure`]). Assembling a registry at a call site is how two
-/// consumers come to disagree about what a document says: one enriches its
-/// images and one does not, and both write their answer into the same index
-/// under recipes that differ. There is no parameter here for the same reason
-/// — a caller that could pass a different analyzer would eventually be one
-/// that did.
+/// Every consumer that *produces* a rendition — indexing, watcher updates,
+/// MCP reads, summaries, export — goes through a registry built here, with
+/// the process's one configured analyzer ([`image::configure`]). Assembling a
+/// registry at a call site is how two consumers come to disagree about what a
+/// document says: one enriches its images and one does not, and both write
+/// their answer into the same index under recipes that differ. There is no
+/// parameter here for the same reason — a caller that could pass a different
+/// analyzer would eventually be one that did.
+///
+/// Exact search is not one of them, and reads with
+/// [`exact_search_registry`] instead; the two callers are separated there
+/// rather than here, so this stays the only place that names the configured
+/// analyzer.
 pub fn production_registry() -> ExtractorRegistry {
     let mut registry = ExtractorRegistry::new();
     registry.register(match image::configured() {
         Some(analyzer) => Box::new(pdf::PdfExtractor::with_image_analyzer(analyzer)),
         None => Box::new(pdf::PdfExtractor::new()),
     });
+    registry
+}
+
+/// The extractors exact search reads a PDF with when the index cannot serve
+/// it: the page's own glyphs, and no enrichment, whatever the process's
+/// configured analyzer is.
+///
+/// **Why not [`production_registry`].** Enriching a page means detecting its
+/// layout and recognizing the areas that detection marks out — a document's
+/// worth of inference, minutes for a textbook. Exact search asked for that
+/// once per document it could not serve from the index, from inside the
+/// `rayon` loop over the corpus in [`crate::search::grep`], and so a search
+/// over a library whose index was narrower than the search's scope became an
+/// enrichment pass wearing a search's clothes: the log filled with
+/// PP-DocLayoutV2, and the search did not return.
+///
+/// That loop is also the shape the worker invariant forbids: a host loop that
+/// submits per item is a loop that starts a worker per item, and a cancel
+/// kills exactly one of them. The unit here cannot be moved into the worker —
+/// the loop is over the corpus, not over one document's pages — so the only
+/// way to hold the invariant is for a search to submit nothing at all.
+///
+/// **What it costs.** A PDF the index does not hold is searched for the text
+/// it typesets, not for text that exists only inside its pictures. That is
+/// the reading [`pdf::PdfExtractor::new`] documents, the count of files that
+/// took it is `live_pdf_fallbacks` in the search outcome, and the way to
+/// search a picture's text is to index the file — which is what the index is
+/// for.
+pub fn exact_search_registry() -> ExtractorRegistry {
+    let mut registry = ExtractorRegistry::new();
+    registry.register(Box::new(pdf::PdfExtractor::new()));
     registry
 }
 
@@ -217,6 +252,11 @@ mod tests {
     /// from re-extracting its whole library.
     #[test]
     fn the_registry_reports_the_analyzer_its_extractors_enrich_with() {
+        // Reads the process-wide analyzer, so it takes the same guard as the
+        // tests that move it.
+        let _serialized = image::CONFIGURED_ANALYZER_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let plain = production_registry();
         assert_eq!(plain.image_analyzer_identity(), "");
 
@@ -253,6 +293,61 @@ mod tests {
         let identity = enriched.image_analyzer_identity();
         assert!(identity.contains("named-analyzer-v1"), "{identity}");
         assert!(identity.contains("typeset-routing"), "{identity}");
+    }
+
+    /// A search reads renditions; it does not produce them. With an analyzer
+    /// configured the two registries have to disagree — the production one
+    /// enriches, the search one reads glyphs — and the difference is only
+    /// visible while an analyzer is configured, which is why this test
+    /// installs one.
+    ///
+    /// The regression it stands against: exact search built its live PDF read
+    /// from `production_registry`, so a search over documents the index could
+    /// not serve ran layout detection and recognition once per document, from
+    /// inside the loop over the corpus.
+    #[test]
+    fn exact_search_reads_glyphs_while_production_enriches() {
+        struct Enriching;
+        impl image::ImageAnalyzer for Enriching {
+            fn layout(&self) -> Option<&dyn image::LayoutModel> {
+                None
+            }
+            fn release(&self) {}
+            fn reads_embedded_images(&self) -> bool {
+                true
+            }
+            fn identity(&self) -> String {
+                "enriching-analyzer-v1".to_string()
+            }
+            fn analyze(
+                &self,
+                _images: &mut [crate::types::ExtractedImage],
+                _discovered: &[image::DiscoveredImage],
+                _context: &image::AnalysisContext,
+                _diagnostics: &mut crate::types::ExtractionDiagnostics,
+            ) {
+            }
+        }
+
+        let _serialized = image::CONFIGURED_ANALYZER_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let restore = image::configured();
+        image::configure(Some(std::sync::Arc::new(Enriching)));
+
+        let production = production_registry().image_analyzer_identity().to_string();
+        let search = exact_search_registry().image_analyzer_identity().to_string();
+
+        image::configure(restore);
+
+        assert!(
+            production.contains("enriching-analyzer-v1"),
+            "the production registry must enrich with the configured analyzer: {production}"
+        );
+        assert_eq!(
+            search, "",
+            "an exact search must not reach the configured analyzer"
+        );
     }
 
     /// Installing an analyzer changes the recipe, which is what forces

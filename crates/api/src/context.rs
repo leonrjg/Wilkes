@@ -2332,31 +2332,40 @@ impl AppContext {
         };
 
         let reused = adopted.is_some();
-        let prepared = if let Some(prepared) = adopted {
+        // Extracted, never embedded. The canonical corpus owns passages and
+        // their identity; the coordinates for them belong to its projections,
+        // and each one computes its own. Asking for an embedder here meant
+        // every import loaded the model the corpus was *created* under —
+        // frozen at creation, unreachable from settings — and embedded every
+        // chunk into an index that nothing reads once a store serves a
+        // projection. Two model loads and two passes per document, one of them
+        // for no reader.
+        //
+        // A whole-file adoption is still taken when one is offered: it brings
+        // the rendition, which is the expensive half and the half this corpus
+        // actually owns. Whatever vectors ride along with it are simply not
+        // stored.
+        let prepared = if let Some(mut prepared) = adopted {
+            for (_, vector) in prepared.chunks.iter_mut() {
+                vector.clear();
+            }
             prepared
         } else {
-            let embedder = self.embedder.lock().clone().ok_or_else(|| {
-                ConsumerError::new(
-                    ConsumerErrorCode::ManagedWorkspaceNotFound,
-                    "managed embedder is unavailable",
-                )
-            })?;
             let snapshot_for_task = snapshot_path.clone();
             let chunk_size = settings.semantic.chunk_size;
             let chunk_overlap = settings.semantic.chunk_overlap;
             tokio::task::spawn_blocking(move || {
                 let extractors = wilkes_core::extract::production_registry();
-                SemanticIndex::prepare_file(
+                SemanticIndex::prepare_file_without_vectors(
                     &snapshot_for_task,
                     &extractors,
-                    embedder.as_ref(),
                     chunk_size,
                     chunk_overlap,
                 )
             })
             .await
             .map_err(|error| format!("Managed extraction task panicked: {error}"))?
-            .map_err(|error| format!("Could not extract/embed managed snapshot: {error:#}"))?
+            .map_err(|error| format!("Could not extract managed snapshot: {error:#}"))?
         };
         let expected_chunks = prepared.chunks.len();
         if expected_chunks == 0 {
