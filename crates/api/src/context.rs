@@ -2831,18 +2831,23 @@ impl AppContext {
             }
         }
 
-        let missing: Vec<&str> = prepared
+        // Owned, because the embedding runs on the blocking pool and cannot
+        // borrow `prepared`. `Embedder` is a blocking trait — the worker-backed
+        // implementation waits on its subprocess by blocking the calling
+        // thread — so an async caller has to leave the runtime thread first.
+        let missing: Vec<String> = prepared
             .chunks
             .iter()
             .zip(&text_hashes)
             .filter(|(_, hash)| !adopted.contains_key(*hash))
-            .map(|((chunk, _), _)| chunk.text.as_str())
+            .map(|((chunk, _), _)| chunk.text.clone())
             .collect();
+        let missing_count = missing.len();
         tracing::info!(
             "projection import: {} of {} chunks adopted, {} to embed",
-            prepared.chunks.len() - missing.len(),
+            prepared.chunks.len() - missing_count,
             prepared.chunks.len(),
-            missing.len()
+            missing_count
         );
         let mut computed = if missing.is_empty() {
             Vec::new()
@@ -2853,17 +2858,21 @@ impl AppContext {
                     "managed embedder is unavailable",
                 )
             })?;
-            embedder
-                .embed_passages(&missing)
-                .map_err(|error| format!("Could not embed canonical rendition: {error:#}"))?
+            tokio::task::spawn_blocking(move || {
+                let refs: Vec<&str> = missing.iter().map(String::as_str).collect();
+                embedder.embed_passages(&refs)
+            })
+            .await
+            .map_err(|error| format!("Canonical rendition embedding task panicked: {error}"))?
+            .map_err(|error| format!("Could not embed canonical rendition: {error:#}"))?
         };
-        if computed.len() != missing.len() {
+        if computed.len() != missing_count {
             return Err(ConsumerError::new(
                 ConsumerErrorCode::DocumentIndexIncomplete,
                 format!(
                     "embedder returned {} vectors for {} chunks it was asked to embed",
                     computed.len(),
-                    missing.len()
+                    missing_count
                 ),
             ));
         }
