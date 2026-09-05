@@ -35,7 +35,7 @@
 //! operation whose interruption it exists to describe. So it is its own file,
 //! `index_jobs.db`, next to the index and never swapped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -340,7 +340,42 @@ impl IndexJobJournal {
     /// job's scope, and a scope discovered incrementally could not answer "what
     /// is left" until it had already finished finding out.
     pub fn begin(&mut self, root: &Path, paths: &[PathBuf]) -> anyhow::Result<i64> {
+        self.begin_continuing(root, paths, None)
+    }
+
+    /// Record a job about to start over `paths`, carrying forward the verdicts
+    /// of `continues` for every document not in that list.
+    ///
+    /// A continuation is the same piece of work resuming, so it has to inherit
+    /// what the previous run already decided. Without this, continuing an
+    /// interrupted build over its unread documents would produce a job whose
+    /// scope contained no failures — and the document that broke the reader an
+    /// hour ago would quietly stop being reported, stop being retryable, and
+    /// leave a hole in the corpus that nothing named.
+    ///
+    /// The inherited rows are verdicts, not work: they are already settled and
+    /// the build is never handed them.
+    pub fn begin_continuing(
+        &mut self,
+        root: &Path,
+        paths: &[PathBuf],
+        continues: Option<i64>,
+    ) -> anyhow::Result<i64> {
+        let inherited: Vec<JobDocument> = match continues {
+            Some(previous) => {
+                let in_scope: HashSet<String> = paths.iter().map(|p| Self::key(p)).collect();
+                self.documents(previous, None, usize::MAX)?
+                    .into_iter()
+                    .filter(|doc| {
+                        doc.outcome.is_terminal() && !in_scope.contains(&Self::key(&doc.path))
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+
         let now = Self::now_ms();
+        let total = paths.len() + inherited.len();
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO jobs (root, started_at_ms, ended_at_ms, state, detail, total_documents)
@@ -349,7 +384,7 @@ impl IndexJobJournal {
                 Self::key(root),
                 now,
                 JobState::Running.as_str(),
-                paths.len() as i64
+                total as i64
             ],
         )?;
         let job_id = tx.last_insert_rowid();
@@ -360,16 +395,32 @@ impl IndexJobJournal {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO job_documents
                      (job_id, path, stage, outcome, error, chunks, position, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
+            // The scope leads, because it is what the build will visit and in
+            // what order.
             for (position, path) in paths.iter().enumerate() {
                 stmt.execute(params![
                     job_id,
                     Self::key(path),
                     DocumentStage::Queued.as_str(),
                     DocumentOutcome::Pending.as_str(),
+                    None::<String>,
+                    None::<i64>,
                     position as i64,
                     now
+                ])?;
+            }
+            for (offset, doc) in inherited.iter().enumerate() {
+                stmt.execute(params![
+                    job_id,
+                    Self::key(&doc.path),
+                    doc.stage.as_str(),
+                    doc.outcome.as_str(),
+                    doc.error.as_deref(),
+                    doc.chunks,
+                    (paths.len() + offset) as i64,
+                    doc.updated_at_ms
                 ])?;
             }
         }
@@ -624,6 +675,10 @@ impl IndexJobJournal {
                        position ASC LIMIT ?2",
         );
         let mut stmt = self.conn.prepare(&sql)?;
+        // `usize::MAX` is a legitimate ask -- a continuation inherits the whole
+        // of the previous job -- and saturating here keeps that from arriving
+        // at SQLite as a negative literal that happens to mean "no limit".
+        let limit = limit.min(i64::MAX as usize) as i64;
         let read = |row: &rusqlite::Row<'_>| -> rusqlite::Result<JobDocument> {
             Ok(JobDocument {
                 path: PathBuf::from(row.get::<_, String>(0)?),
@@ -636,10 +691,10 @@ impl IndexJobJournal {
         };
         let rows = match outcome {
             Some(outcome) => stmt
-                .query_map(params![job_id, limit as i64, outcome.as_str()], read)?
+                .query_map(params![job_id, limit, outcome.as_str()], read)?
                 .collect::<Result<Vec<_>, _>>()?,
             None => stmt
-                .query_map(params![job_id, limit as i64], read)?
+                .query_map(params![job_id, limit], read)?
                 .collect::<Result<Vec<_>, _>>()?,
         };
         Ok(rows)
@@ -1031,6 +1086,118 @@ mod tests {
             .paths_with_outcome(summary.id, DocumentOutcome::Failed)
             .unwrap();
         assert_eq!(failed, vec![all[1].clone()]);
+    }
+
+    /// Continuing must not lose the failure the previous run found.
+    ///
+    /// The continuation's scope is the unread documents, so a job built from
+    /// that scope alone would contain no failures at all — and the document
+    /// that broke the reader would silently stop being reported and stop being
+    /// retryable, leaving a hole in the corpus that nothing named.
+    #[test]
+    fn a_continuation_inherits_the_verdicts_of_the_job_it_continues() {
+        let dir = tempdir().unwrap();
+        let mut journal = IndexJobJournal::open(dir.path()).unwrap();
+        let root = PathBuf::from("/corpus");
+        let all = paths(&["/corpus/saved", "/corpus/broke", "/corpus/never"]);
+
+        let first = journal.begin(&root, &all).unwrap();
+        journal
+            .note_outcome(first, &all[0], DocumentOutcome::Indexed, None, Some(4))
+            .unwrap();
+        journal
+            .note_outcome(first, &all[1], DocumentOutcome::Failed, Some("no reader"), None)
+            .unwrap();
+        journal.finish(first, JobState::Cancelled, None).unwrap();
+
+        // Continue over what was never reached.
+        let second = journal
+            .begin_continuing(&root, &all[2..], Some(first))
+            .unwrap();
+
+        let summary = journal.job(second).unwrap().unwrap();
+        assert_eq!(
+            summary.total_documents, 3,
+            "the continuation still describes the whole corpus"
+        );
+        assert_eq!(summary.counts.pending, 1, "only the unread one is work");
+        assert_eq!(summary.counts.indexed, 1, "the saved one is carried, not redone");
+        assert_eq!(summary.counts.failed, 1, "and so is the failure");
+
+        // The failure is still retryable, from the new job.
+        let failed = journal
+            .paths_with_outcome(second, DocumentOutcome::Failed)
+            .unwrap();
+        assert_eq!(failed, vec![all[1].clone()]);
+        let carried = journal
+            .documents(second, Some(DocumentOutcome::Failed), 10)
+            .unwrap();
+        assert_eq!(
+            carried[0].error.as_deref(),
+            Some("no reader"),
+            "the error is carried with it, not just the verdict"
+        );
+
+        // And the continuation is not handed the documents it inherited.
+        let work = journal
+            .paths_with_outcome(second, DocumentOutcome::Pending)
+            .unwrap();
+        assert_eq!(work, vec![all[2].clone()]);
+    }
+
+    /// A retry's scope *is* the failed set, so those documents are work again
+    /// rather than inherited verdicts.
+    #[test]
+    fn a_retry_makes_the_failed_documents_work_again() {
+        let dir = tempdir().unwrap();
+        let mut journal = IndexJobJournal::open(dir.path()).unwrap();
+        let root = PathBuf::from("/corpus");
+        let all = paths(&["/corpus/saved", "/corpus/broke"]);
+
+        let first = journal.begin(&root, &all).unwrap();
+        journal
+            .note_outcome(first, &all[0], DocumentOutcome::Indexed, None, Some(2))
+            .unwrap();
+        journal
+            .note_outcome(first, &all[1], DocumentOutcome::Failed, Some("boom"), None)
+            .unwrap();
+        journal.finish(first, JobState::Completed, None).unwrap();
+
+        let retry = journal
+            .begin_continuing(&root, &all[1..], Some(first))
+            .unwrap();
+
+        let summary = journal.job(retry).unwrap().unwrap();
+        assert_eq!(summary.counts.failed, 0, "the failure is being re-attempted");
+        assert_eq!(summary.counts.pending, 1);
+        assert_eq!(summary.counts.indexed, 1, "the rest is still accounted for");
+        assert_eq!(summary.total_documents, 2);
+    }
+
+    /// An unfinished document of the previous job is never inherited as a
+    /// verdict: it had none. If it is not in the new scope it is simply not
+    /// this job's business.
+    #[test]
+    fn a_continuation_inherits_verdicts_only() {
+        let dir = tempdir().unwrap();
+        let mut journal = IndexJobJournal::open(dir.path()).unwrap();
+        let root = PathBuf::from("/corpus");
+        let all = paths(&["/corpus/a", "/corpus/b", "/corpus/c"]);
+
+        let first = journal.begin(&root, &all).unwrap();
+        journal
+            .note_outcome(first, &all[0], DocumentOutcome::Reused, None, None)
+            .unwrap();
+        journal.finish(first, JobState::Interrupted, None).unwrap();
+
+        // Continue over only one of the two unread documents.
+        let second = journal
+            .begin_continuing(&root, &all[1..2], Some(first))
+            .unwrap();
+        let summary = journal.job(second).unwrap().unwrap();
+        assert_eq!(summary.total_documents, 2, "one reused verdict, one document");
+        assert_eq!(summary.counts.reused, 1);
+        assert_eq!(summary.counts.pending, 1);
     }
 
     #[test]

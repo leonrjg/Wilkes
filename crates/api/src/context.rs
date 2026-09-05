@@ -199,6 +199,14 @@ impl EmbedOperation {
 /// sort first, so the bound never hides them behind a wall of successes.
 const ACTIVITY_DOCUMENT_LIMIT: usize = 500;
 
+/// The documents a build is over, and the job whose verdicts it carries on
+/// from. The two travel together because a scope narrower than the root is
+/// always narrower *because* an earlier job already settled the rest.
+struct JobScope {
+    documents: Vec<PathBuf>,
+    continues: Option<i64>,
+}
+
 #[derive(Clone, Debug)]
 struct BuildIndexPlan {
     root_path: PathBuf,
@@ -211,6 +219,9 @@ struct BuildIndexPlan {
     /// — the documents a stopped job never reached, or the ones the user asked
     /// to retry.
     documents: Option<Vec<PathBuf>>,
+    /// The job this one continues, whose verdicts it inherits for every
+    /// document outside its own scope.
+    continues: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -6740,7 +6751,7 @@ impl AppContext {
         self: Arc<Self>,
         root: String,
         selected: SelectedEmbedder,
-        documents: Option<Vec<PathBuf>>,
+        documents: Option<JobScope>,
     ) -> Result<(), String> {
         self.ensure_writable().map_err(|error| error.to_string())?;
         info!(
@@ -6750,7 +6761,7 @@ impl AppContext {
             selected.model.model_id(),
             documents
                 .as_ref()
-                .map_or_else(|| "whole root".to_string(), |d| d.len().to_string())
+                .map_or_else(|| "whole root".to_string(), |s| s.documents.len().to_string())
         );
         let plan = match self.prepare_build_index(&root, &selected, documents).await {
             Ok(plan) => plan,
@@ -6820,7 +6831,7 @@ impl AppContext {
         &self,
         root: &str,
         selected: &SelectedEmbedder,
-        documents: Option<Vec<PathBuf>>,
+        documents: Option<JobScope>,
     ) -> Result<BuildIndexPlan, String> {
         if self.embed_task_is_running() {
             return Err("A build is already in progress.".into());
@@ -6841,7 +6852,8 @@ impl AppContext {
             chunk_size: settings.semantic.chunk_size,
             chunk_overlap: settings.semantic.chunk_overlap,
             supported_extensions: settings.supported_extensions.clone(),
-            documents,
+            documents: documents.as_ref().map(|scope| scope.documents.clone()),
+            continues: documents.and_then(|scope| scope.continues),
         })
     }
 
@@ -6882,12 +6894,13 @@ impl AppContext {
             .map_err(|e| format!("{e:#}"))
     }
 
-    /// The documents of `root`'s most recent job that ended with `outcome`.
+    /// The documents of `root`'s most recent job that ended with `outcome`,
+    /// together with the job they came from.
     fn job_documents_with_outcome(
         &self,
         root: &Path,
         outcome: DocumentOutcome,
-    ) -> Result<Vec<PathBuf>, String> {
+    ) -> Result<JobScope, String> {
         let journal = self.job_journal().map_err(|e| format!("{e:#}"))?;
         let journal = journal.lock().map_err(|_| {
             "The index job journal is unavailable after an earlier panic".to_string()
@@ -6901,9 +6914,13 @@ impl AppContext {
                 root.display()
             ));
         };
-        journal
+        let documents = journal
             .paths_with_outcome(job.id, outcome)
-            .map_err(|e| format!("{e:#}"))
+            .map_err(|e| format!("{e:#}"))?;
+        Ok(JobScope {
+            documents,
+            continues: Some(job.id),
+        })
     }
 
     /// Index the documents the last job for `root` never reached.
@@ -6919,16 +6936,15 @@ impl AppContext {
         selected: SelectedEmbedder,
     ) -> Result<(), String> {
         let root_path = PathBuf::from(&root);
-        let documents =
-            self.job_documents_with_outcome(&root_path, DocumentOutcome::Pending)?;
-        if documents.is_empty() {
+        let scope = self.job_documents_with_outcome(&root_path, DocumentOutcome::Pending)?;
+        if scope.documents.is_empty() {
             return Err("There is no remaining work for this directory.".into());
         }
         info!(
             "AppContext::continue_index_job: {} document(s) left for {root}",
-            documents.len()
+            scope.documents.len()
         );
-        self.start_build_index_over(root, selected, Some(documents))
+        self.start_build_index_over(root, selected, Some(scope))
             .await
     }
 
@@ -6939,15 +6955,15 @@ impl AppContext {
         selected: SelectedEmbedder,
     ) -> Result<(), String> {
         let root_path = PathBuf::from(&root);
-        let documents = self.job_documents_with_outcome(&root_path, DocumentOutcome::Failed)?;
-        if documents.is_empty() {
+        let scope = self.job_documents_with_outcome(&root_path, DocumentOutcome::Failed)?;
+        if scope.documents.is_empty() {
             return Err("No documents failed in this directory's last indexing job.".into());
         }
         info!(
             "AppContext::retry_failed_documents: retrying {} document(s) for {root}",
-            documents.len()
+            scope.documents.len()
         );
-        self.start_build_index_over(root, selected, Some(documents))
+        self.start_build_index_over(root, selected, Some(scope))
             .await
     }
 
@@ -7014,6 +7030,7 @@ impl AppContext {
         &self,
         root: &Path,
         documents: &[PathBuf],
+        continues: Option<i64>,
     ) -> Option<(Arc<Mutex<IndexJobJournal>>, i64)> {
         let journal = match self.job_journal() {
             Ok(journal) => journal,
@@ -7030,7 +7047,7 @@ impl AppContext {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            match guard.begin(root, documents) {
+            match guard.begin_continuing(root, documents, continues) {
                 Ok(job_id) => job_id,
                 Err(e) => {
                     error!(
@@ -7266,7 +7283,7 @@ impl AppContext {
                 documents.len()
             );
 
-            let job = ctx.begin_job(&plan.root_path, &documents);
+            let job = ctx.begin_job(&plan.root_path, &documents, plan.continues);
             let reporter = match job.clone() {
                 Some((journal, job_id)) => {
                     BuildReporter::journalled(progress_tx, journal, job_id)
@@ -10220,7 +10237,11 @@ mod tests {
         let remaining = ctx
             .job_documents_with_outcome(&root, DocumentOutcome::Pending)
             .unwrap();
-        assert_eq!(remaining, vec![never]);
+        assert_eq!(remaining.documents, vec![never]);
+        assert!(
+            remaining.continues.is_some(),
+            "a continuation names the job it carries on from"
+        );
     }
 
     /// Retrying is its own set, and its own act.
@@ -10233,7 +10254,8 @@ mod tests {
         let failed = ctx
             .job_documents_with_outcome(&root, DocumentOutcome::Failed)
             .unwrap();
-        assert_eq!(failed, vec![broke]);
+        assert_eq!(failed.documents, vec![broke]);
+        assert!(failed.continues.is_some());
     }
 
     /// The activity view reports the work that was saved, the failure with its
@@ -10488,6 +10510,7 @@ mod tests {
             chunk_overlap: 45,
             supported_extensions: vec!["rs".to_string(), "txt".to_string()],
             documents: None,
+            continues: None,
         };
         let (tx, _rx) = mpsc::channel(1);
         let options = AppContext::build_index_options(
@@ -11268,6 +11291,7 @@ mod tests {
             chunk_overlap: 8,
             supported_extensions: vec!["txt".to_string()],
             documents: None,
+            continues: None,
         };
         let selected = SelectedEmbedder {
             engine: EmbeddingEngine::Candle,
@@ -11361,6 +11385,7 @@ mod tests {
             chunk_overlap: 8,
             supported_extensions: vec!["txt".to_string()],
             documents: None,
+            continues: None,
         };
         let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
         let cancel = CancellationToken::new();
@@ -11431,6 +11456,7 @@ exit 0
             chunk_overlap: 8,
             supported_extensions: vec!["txt".to_string()],
             documents: None,
+            continues: None,
         };
         let selected = SelectedEmbedder {
             engine: EmbeddingEngine::Fastembed,
