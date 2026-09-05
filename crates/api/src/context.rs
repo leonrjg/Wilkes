@@ -3227,6 +3227,13 @@ impl AppContext {
     /// snapshot is gone would answer a question nobody asked — the original
     /// may have been edited since, and bytes that no longer match the
     /// rendition are worse than an error, because they look like an answer.
+    ///
+    /// Call this on the **canonical corpus** context, never on one reached
+    /// through an embedding pin. A pin routes to the space's workspace, and a
+    /// secondary space is a projection whose file rows carry no retained path
+    /// at all — it holds the canonical rendition re-embedded, not a second
+    /// import. Asking it for a document's bytes is asking a coordinate system
+    /// what a book says.
     pub async fn managed_document_snapshot(
         &self,
         snapshot_id: String,

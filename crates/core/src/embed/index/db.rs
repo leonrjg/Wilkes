@@ -2187,7 +2187,7 @@ mod tests {
             Some(&canonical_root),
         )
         .unwrap();
-        canonical
+        let imported = canonical
             .write_file_with_recipe(
                 PreparedFile {
                     retained: Default::default(),
@@ -2244,6 +2244,29 @@ mod tests {
             projection.query(&[0.0, 1.0], 1).unwrap()[0].chunk_text,
             "canonical passage",
             "the projection stores its own vectors over canonical chunks"
+        );
+
+        // The corpus retains the document; the projection retains coordinates
+        // for it and no bytes at all. Both indexes know the same snapshot id,
+        // so the id cannot be what tells them apart — only asking the right
+        // one does. A consumer's snapshot read must therefore be addressed by
+        // corpus and never routed by an embedding pin, which is what sends it
+        // here, to the index that correctly answers that it has nothing.
+        let snapshot = imported.snapshot_id.as_str();
+        assert!(
+            canonical
+                .managed_snapshot_source(snapshot)
+                .unwrap()
+                .is_some(),
+            "the corpus retained the document it imported"
+        );
+        assert!(
+            projection
+                .managed_snapshot_source(snapshot)
+                .unwrap()
+                .is_none(),
+            "a projection is the canonical rendition re-embedded, not a second \
+             copy of the book"
         );
     }
 

@@ -5,8 +5,12 @@
 ### Added
 
 - An application that imported a document into a managed corpus can now read
-  its bytes back, with `POST /api/corpora/documents/snapshot` and the
-  `snapshot_id` the import reply carried. The corpus already retained an
+  its bytes back, with `POST /api/corpora/documents/snapshot`, the `corpus_id`,
+  and the `snapshot_id` the import reply carried. Addressed by corpus, the way
+  the import it mirrors is, and deliberately without an embedding pin: a pin
+  routes to its space's own workspace, and a secondary space is a projection
+  holding the canonical rendition re-embedded, with no retained source of its
+  own. A corpus retains the document; a coordinate system does not. The corpus already retained an
   immutable copy of every source it imported; until now nothing served it, so a
   consumer wanting the document it had itself registered had to keep the
   original path and open it directly. That works only while the consumer and
