@@ -43,6 +43,21 @@ describe("FileTree", () => {
     });
   });
 
+  it("does not draw a row for the root itself", () => {
+    render(
+      <FileTree
+        root="/library"
+        files={[file("/library/articles/paper.txt")]}
+        movable={false}
+        onMove={vi.fn()}
+        renderFile={(entry) => <span>{entry.path.split("/").pop()}</span>}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: /folder library/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Collapse folder articles" })).toBeInTheDocument();
+  });
+
   it("starts expanded, collapses folders, and moves a dragged file into the dropped-on folder", () => {
     const onMove = vi.fn().mockResolvedValue(undefined);
     render(
@@ -73,9 +88,10 @@ describe("FileTree", () => {
     };
     fireEvent.dragStart(screen.getByText("paper.txt"), { dataTransfer });
     expect(values.get(FILE_TREE_DRAG_TYPE)).toBe("/library/articles/paper.txt");
-    const root = screen.getByRole("button", { name: "Collapse folder library" });
+    // The root has no row of its own, so its drop target is the tree container.
+    const root = screen.getByRole("tree");
     fireEvent.dragEnter(root, { dataTransfer });
-    expect(screen.getByText("Drop here")).toBeInTheDocument();
+    expect(root.className).toContain("ring-[var(--accent-blue)]");
     fireEvent.drop(root, {
       dataTransfer,
     });

@@ -180,7 +180,7 @@ describe("ResultList", () => {
     });
     renderWithToasts();
 
-    const target = screen.getByRole("button", { name: "Expand folder target" });
+    const target = screen.getByRole("button", { name: "Collapse folder target" });
     const dragged = screen.getByRole("button", { name: /file\.txt/i });
     expect(dragged).toHaveAttribute("draggable", "true");
     mockListFiles.mockClear();

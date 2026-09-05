@@ -231,9 +231,66 @@ export default function FileTree({
     },
   });
 
+  // Drag-and-drop for one folder, applied to the folder's own tree item and, for
+  // the root — which has no row of its own — to the tree container.
+  const dropHandlers = (folderPath: string) => movable ? {
+    onDragEnter: (event: React.DragEvent<HTMLElement>) => {
+      if (!draggedPathRef.current) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setActiveDropTarget(folderPath);
+      // Revealing a closed destination on hover makes its eventual parent
+      // unambiguous and lets the user continue into a deeper folder.
+      setCollapsed((current) => {
+        if (!current.has(folderPath)) return current;
+        const next = new Set(current);
+        next.delete(folderPath);
+        return next;
+      });
+    },
+    onDragOver: (event: React.DragEvent<HTMLElement>) => {
+      if (!draggedPathRef.current) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.dataTransfer.dropEffect = pathsEqual(
+        parentPath(draggedPathRef.current),
+        folderPath,
+      ) ? "none" : "move";
+      if (dropTargetRef.current !== folderPath) setActiveDropTarget(folderPath);
+    },
+    onDragLeave: (event: React.DragEvent<HTMLElement>) => {
+      event.stopPropagation();
+      if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+        if (dropTargetRef.current === folderPath) setActiveDropTarget(null);
+      }
+    },
+    onDrop: (event: React.DragEvent<HTMLElement>) => {
+      if (!draggedPathRef.current) return;
+      event.preventDefault();
+      event.stopPropagation();
+      dispatchMove(folderPath);
+      finishDrag();
+    },
+  } : {};
+
+  const renderChildren = (folder: FileFolder, depth: number): React.ReactNode => (
+    <>
+      {folder.folders.map((child) => renderFolder(child, depth))}
+      {folder.files.map((entry) => (
+        <li
+          key={entry.path}
+          role="treeitem"
+          className={draggedPath === entry.path ? "opacity-45" : ""}
+          style={{ paddingLeft: `${depth * 14}px` }}
+        >
+          {renderFile(entry, dragProps(entry))}
+        </li>
+      ))}
+    </>
+  );
+
   const renderFolder = (folder: FileFolder, depth: number): React.ReactNode => {
     const open = expandAll || !collapsed.has(folder.path);
-    const canDrop = movable;
     const activeTarget = dropTarget === folder.path;
     const alreadyHere = activeTarget && !!draggedPath && pathsEqual(
       parentPath(draggedPath),
@@ -245,43 +302,7 @@ export default function FileTree({
         role="treeitem"
         aria-expanded={open}
         data-file-tree-folder-path={folder.path}
-        onDragEnter={canDrop ? (event) => {
-          if (!draggedPathRef.current) return;
-          event.preventDefault();
-          event.stopPropagation();
-          setActiveDropTarget(folder.path);
-          // Revealing a closed destination on hover makes its eventual parent
-          // unambiguous and lets the user continue into a deeper folder.
-          setCollapsed((current) => {
-            if (!current.has(folder.path)) return current;
-            const next = new Set(current);
-            next.delete(folder.path);
-            return next;
-          });
-        } : undefined}
-        onDragOver={canDrop ? (event) => {
-          if (!draggedPathRef.current) return;
-          event.preventDefault();
-          event.stopPropagation();
-          event.dataTransfer.dropEffect = pathsEqual(
-            parentPath(draggedPathRef.current),
-            folder.path,
-          ) ? "none" : "move";
-          if (dropTargetRef.current !== folder.path) setActiveDropTarget(folder.path);
-        } : undefined}
-        onDragLeave={canDrop ? (event) => {
-          event.stopPropagation();
-          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
-            if (dropTargetRef.current === folder.path) setActiveDropTarget(null);
-          }
-        } : undefined}
-        onDrop={canDrop ? (event) => {
-          if (!draggedPathRef.current) return;
-          event.preventDefault();
-          event.stopPropagation();
-          dispatchMove(folder.path);
-          finishDrag();
-        } : undefined}
+        {...dropHandlers(folder.path)}
       >
         <button
           type="button"
@@ -310,28 +331,33 @@ export default function FileTree({
             </span>
           )}
         </button>
-        {open && (
-          <ul role="group">
-            {folder.folders.map((child) => renderFolder(child, depth + 1))}
-            {folder.files.map((entry) => (
-              <li
-                key={entry.path}
-                role="treeitem"
-                className={draggedPath === entry.path ? "opacity-45" : ""}
-                style={{ paddingLeft: `${(depth + 1) * 14}px` }}
-              >
-                {renderFile(entry, dragProps(entry))}
-              </li>
-            ))}
-          </ul>
-        )}
+        {open && <ul role="group">{renderChildren(folder, depth + 1)}</ul>}
       </li>
     );
   };
 
+  // The root itself is not drawn: its name is already shown by the sidebar, and
+  // a row for it would only add a level of indentation to everything below.
+  // Its drop target is the tree container, so a file can still be moved out to
+  // the top level by dropping it on the empty space around the entries.
+  const rootIsTarget = dropTarget === tree.path;
+  const rootAlreadyHere = rootIsTarget && !!draggedPath && pathsEqual(
+    parentPath(draggedPath),
+    tree.path,
+  );
   return (
-    <ul role="tree" aria-label="Files and folders" className="py-0.5">
-      {renderFolder(tree, 0)}
+    <ul
+      role="tree"
+      aria-label="Files and folders"
+      data-file-tree-folder-path={tree.path}
+      className={`min-h-full py-0.5 ${
+        rootIsTarget && !rootAlreadyHere
+          ? "rounded ring-2 ring-inset ring-[var(--accent-blue)]"
+          : ""
+      }`}
+      {...dropHandlers(tree.path)}
+    >
+      {renderChildren(tree, 0)}
     </ul>
   );
 }
