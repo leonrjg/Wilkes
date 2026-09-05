@@ -9,7 +9,7 @@ version = "0.9.5"
 # the tag *is* the version -- three copies of it would be three places to miss
 # when it moves.
 [workspace.dependencies]
-wilkes-chat = { git = "https://github.com/leonrjg/wilkes-chat", tag = "v0.1.1" }
+wilkes-chat = { git = "https://github.com/leonrjg/wilkes-chat", tag = "v0.1.2" }
 
 # Cargo's stock `dev` is unoptimized and carries full debug info for every
 # dependency, which is most of what target/debug weighs. This does not touch
