@@ -25,6 +25,42 @@ fn registry() -> ExtractorRegistry {
     registry
 }
 
+/// Read `path` on a thread of this module's own, never on the caller's.
+///
+/// A reading reaches the layout detector and the recognizers through their
+/// worker proxies, and a proxy waits for its subprocess by blocking on the
+/// tokio handle it was built with. `Handle::block_on` panics when the thread
+/// it is called on is one the runtime is driving, so extraction carries a
+/// requirement its signature does not state: it does not run inside an async
+/// task. Elsewhere in the application that is met by `spawn_blocking` at the
+/// call site.
+///
+/// Here it cannot be. Every caller of this module is a synchronous `ChatHost`
+/// method -- `read_text_file` answering an `fs/read_text_file` request,
+/// `context_block` assembling a prompt -- which the ACP session calls from
+/// inside its own async handler. There is nothing there to await. So the hop
+/// is owned here instead, once, on the way in, and every path through this
+/// module has it: the read happens on a thread the runtime does not drive and
+/// the caller waits for it.
+///
+/// Scoped, so `path` is borrowed rather than cloned and the join is the
+/// scope's own. A panic inside the read is re-raised on the caller's thread
+/// rather than turned into an error, so it stays the panic it was.
+fn extract(path: &Path) -> anyhow::Result<ExtractedContent> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let registry = registry();
+                let extractor = registry
+                    .find(path, None)
+                    .ok_or_else(|| anyhow::anyhow!("no PDF extractor registered"))?;
+                extractor.extract(path)
+            })
+            .join()
+    })
+    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+}
+
 /// Extract `path`'s text, optionally scoped to a single PDF page and/or a
 /// `fs/read_text_file`-style 1-based line window.
 ///
@@ -50,11 +86,7 @@ pub fn read_text_range(
     let started_at = Instant::now();
     let pdf = is_pdf(path);
     let text = if pdf {
-        let registry = registry();
-        let extractor = registry
-            .find(path, None)
-            .ok_or_else(|| anyhow::anyhow!("no PDF extractor registered"))?;
-        let content = extractor.extract(path)?;
+        let content = extract(path)?;
         match page_range {
             Some((start, end)) => page_range_text(&content, start, end),
             None => content.text,
@@ -89,11 +121,7 @@ pub fn read_active_excerpt(
     max_chars: usize,
 ) -> anyhow::Result<TextExcerpt> {
     let text = if is_pdf(path) {
-        let registry = registry();
-        let extractor = registry
-            .find(path, None)
-            .ok_or_else(|| anyhow::anyhow!("no PDF extractor registered"))?;
-        let content = extractor.extract(path)?;
+        let content = extract(path)?;
         match page {
             Some(page) => page_text_strict(&content, page).unwrap_or_default(),
             None => content.text,

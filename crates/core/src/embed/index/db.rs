@@ -427,7 +427,8 @@ mod tests {
 
         assert_eq!(stored_text(&legacy_path), None);
         assert_eq!(stored_text(&empty_path), Some(String::new()));
-        assert!(idx.embedding_metadata().unwrap().exact_identity.is_none());
+        // Kept, where it used to be filtered away for naming no artifacts.
+        assert!(idx.embedding_metadata().unwrap().exact_identity.is_some());
         assert_eq!(
             idx.conn
                 .query_row(
@@ -443,21 +444,115 @@ mod tests {
         );
     }
 
+    /// Vectors are reusable by content, across indexes that share a space.
+    ///
+    /// This is the reuse the managed corpus was missing: a library the user
+    /// had already indexed under the very model a projection needed, and the
+    /// projection re-embedded every passage anyway. The lookup is by text
+    /// hash, which is the direct evidence — the extraction recipe was a proxy
+    /// for it, and one that differed for reasons that had nothing to do with
+    /// whether the text came out the same.
     #[test]
-    fn creating_an_index_with_an_unresolved_identity_is_refused() {
+    fn vectors_are_adoptable_by_text_across_indexes_in_one_space() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("shared.txt");
+        fs::write(&file, "shared body").unwrap();
+
+        let identity = EmbeddingSpaceIdentity::with_artifact_revision(
+            EmbeddingEngine::Candle,
+            "model",
+            1,
+            "artifact-sha256:one".to_string(),
+        );
+        let mut source = SemanticIndex::create_exact(root, &identity, Some(root)).unwrap();
+        // The recipe-carrying write, which is what every real build uses. The
+        // bare `write_file` records no chunk identity, so its rows carry no
+        // text hash and nothing can be adopted from them.
+        source
+            .write_file_with_recipe(
+                PreparedFile {
+                    retained: Default::default(),
+                    path: file.clone(),
+                    full_text: "shared body".to_string(),
+                    chunks: vec![
+                        (test_chunk(&file, "shared body"), vec![0.5]),
+                        (test_chunk(&file, "another passage"), vec![0.25]),
+                    ],
+                },
+                &ExtractionRecipe::new(100, 0),
+                None,
+                None,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+
+        let wanted = vec![
+            sha256_bytes(b"shared body"),
+            sha256_bytes(b"another passage"),
+            sha256_bytes(b"never embedded anywhere"),
+        ];
+        let found = source.vectors_for_text_hashes(&wanted).unwrap();
+
+        assert_eq!(found.get(&wanted[0]), Some(&vec![0.5]));
+        assert_eq!(found.get(&wanted[1]), Some(&vec![0.25]));
+        // A miss is absent, not an error: the caller embeds what it did not
+        // find, so a partial hit is a partial saving.
+        assert!(!found.contains_key(&wanted[2]));
+        assert_eq!(found.len(), 2);
+
+        // An index built by a different install of the same model is the same
+        // space, so its vectors are readable here. This is the case the old
+        // identity refused: same engine, same model, same width, different
+        // fingerprint.
+        let elsewhere = EmbeddingSpaceIdentity::with_artifact_revision(
+            EmbeddingEngine::Candle,
+            "model",
+            1,
+            "unresolved-runtime-cache-not-materialized".to_string(),
+        );
+        assert_eq!(identity.id(), elsewhere.id());
+        source.validate_embedding_space(&elsewhere).unwrap();
+
+        assert!(source.vectors_for_text_hashes(&[]).unwrap().is_empty());
+    }
+
+    /// An unresolved artifact revision is recorded, not refused.
+    ///
+    /// It names provenance the runtime could not fingerprint — SBERT keeps its
+    /// weights outside the cache root this reads — and provenance does not
+    /// decide whether an index can be read. Refusing meant such an engine
+    /// could not build an index at all, which is a large price for a field
+    /// nothing compares any more.
+    #[test]
+    fn creating_an_index_with_an_unresolved_identity_records_it() {
         let dir = tempdir().unwrap();
         let unresolved =
             EmbeddingSpaceIdentity::for_runtime(EmbeddingEngine::Candle, "placeholder-model", 1);
-        let error = SemanticIndex::create_exact(dir.path(), &unresolved, None)
-            .err()
-            .expect("an unresolved identity must be refused");
-        assert!(
-            error.to_string().contains("UNRESOLVED_EMBEDDING_SPACE"),
-            "unexpected error: {error:#}"
+        let index = SemanticIndex::create_exact(dir.path(), &unresolved, None)
+            .expect("an unresolved identity is recorded, not refused");
+        assert!(db_path(dir.path()).exists());
+
+        // Recorded verbatim, so a reader can still see what it was.
+        let recorded = index
+            .embedding_metadata()
+            .unwrap()
+            .exact_identity
+            .expect("the identity is kept");
+        assert!(!recorded.is_resolved());
+        assert_eq!(recorded.artifact_revision, unresolved.artifact_revision);
+
+        // And it is the same space as the resolved runtime for that model:
+        // same engine, same model, same width.
+        let resolved = EmbeddingSpaceIdentity::with_artifact_revision(
+            EmbeddingEngine::Candle,
+            "placeholder-model",
+            1,
+            "artifact-sha256:whatever".to_string(),
         );
-        // Refused before anything is written, so no half-built index is left
-        // for the next open to adopt.
-        assert!(!db_path(dir.path()).exists());
+        index.validate_embedding_space(&resolved).unwrap();
     }
 
     #[test]
@@ -513,17 +608,32 @@ mod tests {
         assert_eq!(metadata.engine, EmbeddingEngine::Candle);
         assert_eq!(metadata.model_id, "legacy-model");
         assert_eq!(metadata.dimension, 1);
-        assert!(metadata.exact_identity.is_none());
+        assert!(metadata.exact_identity.is_some());
         assert_eq!(migrated.query(&[1.0], 1).unwrap().len(), 1);
 
+        // The legacy index named the model but not the artifacts, which used
+        // to make it locally readable and managed-unusable at once — two
+        // verdicts about one index, from two functions. There is one now, and
+        // it says the same model at the same width is the same space.
         let current = EmbeddingSpaceIdentity::with_artifact_revision(
             EmbeddingEngine::Candle,
             "legacy-model",
             1,
             "artifact-sha256:current".to_string(),
         );
-        migrated.validate_local_embedding_space(&current).unwrap();
-        assert!(migrated.validate_embedding_space(&current).is_err());
+        migrated.validate_embedding_space(&current).unwrap();
+
+        // A different width is still a different space, and still refused.
+        let wider = EmbeddingSpaceIdentity::with_artifact_revision(
+            EmbeddingEngine::Candle,
+            "legacy-model",
+            2,
+            "artifact-sha256:current".to_string(),
+        );
+        assert!(migrated.validate_embedding_space(&wider).is_err());
+
+        // Whole-file adoption still needs the source hash to match; that is
+        // structure, not coordinates, and nothing here relaxed it.
         assert!(migrated
             .verified_file_for_adoption(
                 "unused",
@@ -3592,30 +3702,23 @@ impl SemanticIndex {
         expected: &EmbeddingSpaceIdentity,
     ) -> anyhow::Result<()> {
         let actual = self.embedding_space_identity()?;
+        // Ids, not the whole struct. The id is the comparability key — engine,
+        // model, width — and comparing structs made every provenance field a
+        // veto: an index and a runtime naming the same model at the same width
+        // were declared different spaces because one recorded a different
+        // model-cache fingerprint. That is the check this file had two of.
         consumer_ensure!(
-            &actual == expected,
+            actual.id() == expected.id(),
             ConsumerErrorCode::EmbeddingSpaceMismatch,
-            "index={}, runtime={}",
+            "index={} ({} {} @{}), runtime={} ({} {} @{})",
             actual.id().as_str(),
+            actual.engine.as_str(),
+            actual.model_id,
+            actual.dimension,
             expected.id().as_str(),
-        );
-        Ok(())
-    }
-
-    /// Validate an index for ordinary Wilkes semantic search. Exact indexes
-    /// still require a full identity match; migrated legacy indexes retain the
-    /// historical engine/model/dimension compatibility rule without thereby
-    /// becoming eligible for managed-corpus vector reuse.
-    pub fn validate_local_embedding_space(
-        &self,
-        expected: &EmbeddingSpaceIdentity,
-    ) -> anyhow::Result<()> {
-        let metadata = self.embedding_metadata()?;
-        consumer_ensure!(
-            metadata.is_locally_compatible_with(expected),
-            ConsumerErrorCode::EmbeddingSpaceMismatch,
-            "index metadata is incompatible with runtime {}",
-            expected.id().as_str(),
+            expected.engine.as_str(),
+            expected.model_id,
+            expected.dimension,
         );
         Ok(())
     }
@@ -3740,6 +3843,16 @@ impl SemanticIndex {
             has_files_table,
             "Index uses legacy schema (no files table); rebuild the index"
         );
+        // Content-addressed vector lookup reads this, and an index built
+        // before it existed would otherwise scan every chunk on every import.
+        // Not a schema version: an index is not identity, and creating it
+        // costs nothing where it is already there.
+        if let Err(error) = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_text_sha256
+                 ON chunks(text_sha256) WHERE text_sha256 IS NOT NULL;",
+        ) {
+            tracing::debug!("could not ensure the chunk text index: {error}");
+        }
 
         let mut schema_version: i64 = conn
             .query_row(
@@ -3953,15 +4066,20 @@ impl SemanticIndex {
         embedding_identity: &EmbeddingSpaceIdentity,
         root_path: Option<&Path>,
     ) -> anyhow::Result<Self> {
-        // An index records its identity as exact evidence. A placeholder
-        // revision names the model but not the artifacts, so no reader can
-        // reproduce it — refuse to write one rather than publish an index that
-        // only the process that built it can open.
-        anyhow::ensure!(
-            embedding_identity.is_resolved(),
-            "UNRESOLVED_EMBEDDING_SPACE: refusing to create an index with artifact revision '{}'",
-            embedding_identity.artifact_revision
-        );
+        // An unresolved artifact revision is recorded, not refused. It names
+        // provenance the runtime could not fingerprint — SBERT keeps its
+        // weights outside this cache root — and provenance no longer decides
+        // whether an index can be read: the space id is engine, model and
+        // width, all three of which are known here. Refusing meant an engine
+        // whose weights live elsewhere could not build an index at all.
+        if !embedding_identity.is_resolved() {
+            tracing::debug!(
+                "creating an index with unresolved artifact revision '{}' for {} {}",
+                embedding_identity.artifact_revision,
+                embedding_identity.engine.as_str(),
+                embedding_identity.model_id
+            );
+        }
         load_sqlite_vec();
 
         if let Some(parent) = path.parent() {
@@ -4489,6 +4607,8 @@ impl SemanticIndex {
             CREATE INDEX IF NOT EXISTS idx_files_identity
                 ON files(size_bytes, modified_at_ms);
             CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_text_sha256
+                ON chunks(text_sha256) WHERE text_sha256 IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_files_rendition_id
                 ON files(rendition_id) WHERE rendition_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_chunks_chunk_ref
@@ -4848,8 +4968,7 @@ impl SemanticIndex {
             .optional()?;
         let exact_identity = old_identity_json
             .map(|json| serde_json::from_str::<EmbeddingSpaceIdentity>(&json))
-            .transpose()?
-            .filter(EmbeddingSpaceIdentity::is_resolved);
+            .transpose()?;
         if let Some(identity) = exact_identity.as_ref() {
             anyhow::ensure!(
                 identity.engine == engine
@@ -6488,7 +6607,7 @@ impl SemanticIndex {
         chunk_size: usize,
         chunk_overlap: usize,
     ) -> anyhow::Result<()> {
-        self.validate_local_embedding_space(&embedder.embedding_space_identity())?;
+        self.validate_embedding_space(&embedder.embedding_space_identity())?;
         let prepared = Self::prepare_file(path, extractors, embedder, chunk_size, chunk_overlap)?;
         self.write_file_with_recipe(
             prepared,
@@ -7499,6 +7618,75 @@ impl SemanticIndex {
     /// Materialize an exactly verified whole rendition for copying into a
     /// different index. The returned vectors are owned values; the target will
     /// allocate fresh rowids and never depend on this index's lifecycle.
+    /// Vectors this index already holds for the given chunk texts, by hash.
+    ///
+    /// An embedding is a pure function of its text and its model, so a chunk
+    /// carrying the same text in the same space carries the same vector
+    /// wherever it was computed. That makes the text hash *direct* evidence
+    /// for reuse, where the extraction recipe was only ever a proxy for it —
+    /// and a poor one in both directions. Two recipes that agree do not
+    /// guarantee identical text: an extractor whose behaviour changes without
+    /// a version bump slips straight through. Two that differ may have
+    /// produced identical text anyway, and today that costs a full re-embed.
+    ///
+    /// Deliberately says nothing about chunk structure. The caller keeps its
+    /// own chunks — their ordinals, their byte ranges, their `chunk_ref`s —
+    /// and takes only the coordinates. That is what makes this safe to read
+    /// across workspaces: nothing a citation points at comes from here.
+    ///
+    /// Misses are simply absent from the map. A caller embeds what it did not
+    /// find, so a partial hit is a partial saving rather than a failure.
+    pub fn vectors_for_text_hashes(
+        &self,
+        wanted: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<f32>>> {
+        let mut found = std::collections::HashMap::new();
+        if wanted.is_empty() {
+            return Ok(found);
+        }
+        // Chunked to stay under SQLite's bound-variable limit on every build.
+        for batch in wanted.chunks(400) {
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT c.text_sha256, v.embedding
+                   FROM chunks c JOIN vec_chunks v ON v.rowid = c.id
+                  WHERE c.text_sha256 IN ({placeholders})"
+            ))?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+                    Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (hash, blob) in rows {
+                let Some(hash) = hash else { continue };
+                if found.contains_key(&hash) {
+                    continue;
+                }
+                let embedding = f32_slice_from_bytes(&blob)?;
+                // A stored vector of the wrong width or with a non-finite
+                // component is not adoptable. Logged rather than dropped in
+                // silence: it means this index disagrees with its own
+                // recorded dimension, which nothing else would report.
+                if embedding.len() != self.dimension {
+                    tracing::warn!(
+                        "chunk {hash} holds a {}-wide vector in a {}-wide index; not adopting it",
+                        embedding.len(),
+                        self.dimension
+                    );
+                    continue;
+                }
+                if embedding.iter().any(|value| !value.is_finite()) {
+                    tracing::warn!("chunk {hash} holds a non-finite vector; not adopting it");
+                    continue;
+                }
+                found.insert(hash, embedding);
+            }
+        }
+        Ok(found)
+    }
+
     pub fn verified_file_for_adoption(
         &self,
         source_sha256: &str,

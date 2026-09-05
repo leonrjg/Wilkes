@@ -43,10 +43,13 @@ pub struct EmbeddingSpaceIdentity {
     pub identity_schema_version: u32,
     pub engine: EmbeddingEngine,
     pub model_id: String,
-    /// Versioned artifact identity. Engines whose public model selector is an
-    /// immutable catalog entry use that entry plus Wilkes' runtime epoch. If an
-    /// engine later permits mutable revisions, its Embedder implementation must
-    /// override `embedding_space_identity` with the resolved revision/digest.
+    /// Which artifacts produced these vectors, where the runtime could tell.
+    ///
+    /// Recorded provenance, not identity: [`Self::id`] does not hash it, so it
+    /// never decides whether two vectors may be compared. Show it, log it,
+    /// compare it when diagnosing a surprise — do not refuse over it. An
+    /// engine that cannot fingerprint its weights records an unresolved
+    /// marker rather than inventing a value.
     pub artifact_revision: String,
     pub dimension: usize,
     pub passage_input_recipe: String,
@@ -97,17 +100,6 @@ impl IndexEmbeddingMetadata {
             );
         }
         Ok(())
-    }
-
-    pub fn is_locally_compatible_with(&self, runtime: &EmbeddingSpaceIdentity) -> bool {
-        match &self.exact_identity {
-            Some(exact) => exact == runtime,
-            None => {
-                self.engine == runtime.engine
-                    && self.model_id == runtime.model_id
-                    && self.dimension == runtime.dimension
-            }
-        }
     }
 }
 
@@ -166,15 +158,48 @@ impl EmbeddingSpaceIdentity {
         }
     }
 
+    /// The fields that decide whether two vectors may be compared, and
+    /// nothing else.
+    ///
+    /// A space id answers one question — can a vector from over there be read
+    /// against a vector from over here — and only the engine, the model and
+    /// the width bear on it. Everything else this struct records is
+    /// provenance: worth knowing, worth showing, and not worth refusing over.
+    ///
+    /// It used to hash the whole struct. That made `artifact_revision` — a
+    /// content fingerprint of a model cache, or an `installation-epoch` UUID
+    /// when the cache had not materialized — decide whether two indexes of the
+    /// same model at the same width could share a vector. They could not,
+    /// across a reinstall or a second machine, and nothing said why: the id is
+    /// a hash, so a mismatch names no field. `identity_schema_version` was in
+    /// there too, which made every future schema bump a scheduled invalidation
+    /// of every index on disk.
+    ///
+    /// The input and pooling recipes came out with them. They are constants
+    /// that have never varied, so they only ever added ways to differ.
+    ///
+    /// What this gives up: weights swapped under an unchanged model name are
+    /// no longer detected, and vectors from before the swap read as
+    /// comparable. What it buys is that reuse works at all — across machines,
+    /// across reinstalls, across every index already on disk. Vectors are a
+    /// cache; the cost of a wrong one is a worse neighbour, recomputable at
+    /// will, and never a change to anything a citation points at.
     pub fn id(&self) -> EmbeddingSpaceId {
-        EmbeddingSpaceId(tagged_hash("space", &canonical_json(self)))
+        EmbeddingSpaceId(tagged_hash(
+            "space",
+            &canonical_json(&serde_json::json!({
+                "engine": self.engine,
+                "model_id": self.model_id,
+                "dimension": self.dimension,
+            })),
+        ))
     }
 }
 
 /// Fingerprint the resolved model snapshot, including tokenizer, auxiliary
-/// prefixes, and pooling configuration. If an engine has not materialized its
-/// cache yet, use a persisted installation epoch; once files appear, the next
-/// runtime gets their content fingerprint and refuses the old index.
+/// prefixes, and pooling configuration, when the weights are under this cache
+/// root. When they are not, say so: the answer is provenance, and an unknown
+/// provenance is reported as unknown rather than stood in for.
 pub fn artifact_revision_for_cache(
     cache_root: &std::path::Path,
     repo_id: &str,
@@ -208,25 +233,20 @@ pub fn artifact_revision_for_cache(
         return Ok(format!("artifact-sha256:{}", hex_digest(digest.finalize())));
     }
 
-    let epochs = cache_root.join("embedding-identity-epochs");
-    std::fs::create_dir_all(&epochs)?;
-    let epoch_path = epochs.join(format!("{}.txt", sha256_bytes(repo_id.as_bytes())));
-    let epoch = if epoch_path.exists() {
-        std::fs::read_to_string(&epoch_path)?
-    } else {
-        let epoch = uuid::Uuid::new_v4().to_string();
-        let temporary = epoch_path.with_extension("tmp");
-        std::fs::write(&temporary, &epoch)?;
-        match std::fs::rename(&temporary, &epoch_path) {
-            Ok(()) => epoch,
-            Err(_error) if epoch_path.exists() => {
-                let _ = std::fs::remove_file(temporary);
-                std::fs::read_to_string(&epoch_path)?
-            }
-            Err(error) => return Err(error.into()),
-        }
-    };
-    Ok(format!("installation-epoch:{}", epoch.trim()))
+    // An engine whose weights are not under this cache root — SBERT keeps its
+    // own venv — has no fingerprint to give, and says so. It used to mint a
+    // random UUID and persist it as an "installation epoch", which read as
+    // evidence, differed on every machine and every reinstall, and was hashed
+    // into the space id: a value invented to stand for "unknown" that then
+    // decided vectors were incomparable. Provenance may be unknown. It may not
+    // be fabricated.
+    tracing::debug!(
+        "no model artifacts under {} for {repo_id}; recording an unresolved artifact revision",
+        cache_root.display()
+    );
+    Ok(format!(
+        "{UNRESOLVED_ARTIFACT_REVISION_PREFIX}cache-not-materialized"
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,17 +470,18 @@ mod tests {
         );
     }
 
+    /// Legacy metadata still round-trips with no exact identity.
+    ///
+    /// What it no longer carries is a *second* compatibility rule.
+    /// `is_locally_compatible_with` existed so a legacy index could be read
+    /// locally on an engine/model/dimension match while being refused for
+    /// managed reuse on a full-struct match — two verdicts about one index,
+    /// which is how an index came to be usable and unusable at the same time.
+    /// `validate_embedding_space` now compares space ids, which *is* the
+    /// engine/model/dimension rule, so there is one verdict and this is gone.
     #[test]
-    fn legacy_metadata_allows_local_tuple_match_without_claiming_exact_identity() {
-        let runtime = EmbeddingSpaceIdentity::with_artifact_revision(
-            EmbeddingEngine::Candle,
-            "model",
-            384,
-            "artifact-sha256:current".to_string(),
-        );
+    fn legacy_metadata_round_trips_without_claiming_exact_identity() {
         let legacy = IndexEmbeddingMetadata::legacy(EmbeddingEngine::Candle, "model", 384);
-
-        assert!(legacy.is_locally_compatible_with(&runtime));
         assert!(legacy.exact_identity.is_none());
         let json = serde_json::to_value(&legacy).unwrap();
         assert!(json["exact_identity"].is_null());
@@ -468,28 +489,6 @@ mod tests {
             serde_json::from_value::<IndexEmbeddingMetadata>(json).unwrap(),
             legacy
         );
-        assert!(
-            !IndexEmbeddingMetadata::legacy(EmbeddingEngine::Fastembed, "model", 384)
-                .is_locally_compatible_with(&runtime)
-        );
-    }
-
-    #[test]
-    fn exact_metadata_requires_the_full_runtime_identity_even_for_local_use() {
-        let recorded = EmbeddingSpaceIdentity::with_artifact_revision(
-            EmbeddingEngine::Candle,
-            "model",
-            384,
-            "artifact-sha256:old".to_string(),
-        );
-        let current = EmbeddingSpaceIdentity::with_artifact_revision(
-            EmbeddingEngine::Candle,
-            "model",
-            384,
-            "artifact-sha256:new".to_string(),
-        );
-
-        assert!(!IndexEmbeddingMetadata::exact(recorded).is_locally_compatible_with(&current));
     }
 
     #[test]
@@ -508,12 +507,75 @@ mod tests {
         assert_ne!(chunk_ref(&rendition, 0), chunk_ref(&rendition, 1));
     }
 
+    /// A space id answers whether two vectors may be compared, so it moves
+    /// only when that answer moves.
     #[test]
-    fn artifact_revision_tracks_cache_content_and_missing_cache_epoch_is_stable() {
+    fn provenance_does_not_decide_comparability() {
+        let base = EmbeddingSpaceIdentity::with_artifact_revision(
+            EmbeddingEngine::Candle,
+            "org/model",
+            384,
+            "artifact-sha256:aaa".to_string(),
+        );
+
+        // The same model at the same width, fingerprinted differently: a
+        // reinstall, a second machine, or weights that live outside the cache
+        // root. Every one of these used to mint a different space and lose all
+        // reuse against it.
+        for revision in [
+            "artifact-sha256:bbb",
+            "installation-epoch:8f14e45f-ea8f-4b1a-9c7c-6d7f2c3b4a5e",
+            "unresolved-runtime-cache-not-materialized",
+        ] {
+            let other = EmbeddingSpaceIdentity {
+                artifact_revision: revision.to_string(),
+                ..base.clone()
+            };
+            assert_eq!(base.id(), other.id(), "artifact revision {revision}");
+        }
+
+        // Constants that have never varied, and a schema version whose next
+        // bump would otherwise invalidate every index on disk.
+        let drifted = EmbeddingSpaceIdentity {
+            identity_schema_version: base.identity_schema_version + 7,
+            passage_input_recipe: "some-other-input-recipe".to_string(),
+            pooling_normalization_recipe: "some-other-pooling".to_string(),
+            ..base.clone()
+        };
+        assert_eq!(base.id(), drifted.id());
+    }
+
+    /// And it moves for all three things that do change what a vector means.
+    #[test]
+    fn engine_model_and_width_still_separate_spaces() {
+        let base = EmbeddingSpaceIdentity::for_test(EmbeddingEngine::Candle, "org/model", 384);
+        assert_ne!(
+            base.id(),
+            EmbeddingSpaceIdentity::for_test(EmbeddingEngine::Candle, "org/other", 384).id()
+        );
+        assert_ne!(
+            base.id(),
+            EmbeddingSpaceIdentity::for_test(EmbeddingEngine::Candle, "org/model", 768).id()
+        );
+        assert_ne!(
+            base.id(),
+            EmbeddingSpaceIdentity::for_test(EmbeddingEngine::Fastembed, "org/model", 384).id()
+        );
+    }
+
+    #[test]
+    fn artifact_revision_tracks_cache_content_and_says_so_when_there_is_none() {
         let cache = tempfile::tempdir().unwrap();
-        let first_epoch = artifact_revision_for_cache(cache.path(), "org/missing").unwrap();
-        let second_epoch = artifact_revision_for_cache(cache.path(), "org/missing").unwrap();
-        assert_eq!(first_epoch, second_epoch);
+        // No weights under this root, so there is nothing to fingerprint. The
+        // answer says that, and says the same thing on the next machine and
+        // after the next reinstall — where a minted epoch said something
+        // different every time, and was hashed into the space id.
+        let missing = artifact_revision_for_cache(cache.path(), "org/missing").unwrap();
+        assert_eq!(missing, "unresolved-runtime-cache-not-materialized");
+        assert_eq!(
+            missing,
+            artifact_revision_for_cache(cache.path(), "org/missing").unwrap()
+        );
 
         let snapshot = cache
             .path()

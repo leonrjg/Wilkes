@@ -2259,7 +2259,8 @@ impl AppContext {
                 &expected_identity,
                 snapshot_path,
                 true,
-            );
+            )
+            .await;
         }
 
         if let Some(existing) = {
@@ -2286,7 +2287,8 @@ impl AppContext {
                 &expected_identity,
                 snapshot_path,
                 true,
-            );
+            )
+            .await;
         }
 
         let adopted = if let Some(source_context) = source_workspace {
@@ -2379,6 +2381,7 @@ impl AppContext {
             snapshot_path,
             reused,
         )
+        .await
     }
 
     /// Materialize one embedding projection from the canonical admitted
@@ -2392,6 +2395,7 @@ impl AppContext {
         canonical: &Arc<Self>,
         canonical_snapshot_path: PathBuf,
         original_source_provenance: serde_json::Value,
+        source_workspace: Option<&Arc<Self>>,
     ) -> Result<ManagedDocumentExport, ConsumerError> {
         let _pending = PendingManagedOperation::new(&self.managed_pending_imports);
         let _import_guard = self.managed_import_lock.lock().await;
@@ -2444,7 +2448,8 @@ impl AppContext {
                 &expected_identity,
                 canonical_snapshot_path,
                 true,
-            );
+            )
+            .await;
         }
 
         let mut prepared = {
@@ -2479,32 +2484,124 @@ impl AppContext {
                 "document produced no chunks",
             ));
         }
-        let embedder = self.embedder.lock().clone().ok_or_else(|| {
-            ConsumerError::new(
-                ConsumerErrorCode::ManagedWorkspaceNotFound,
-                "managed embedder is unavailable",
-            )
-        })?;
-        let texts: Vec<&str> = prepared
+        // Coordinates this corpus already has, taken by content.
+        //
+        // The chunks are the canonical rendition's and stay that way — their
+        // ordinals, byte ranges and `chunk_ref`s are what every citation
+        // points at, and none of that comes from here. Only the vectors are
+        // adopted, matched per chunk by the hash of its text, which is the
+        // whole of the evidence needed: an embedding is a function of its text
+        // and its model, so the same text in the same space is the same
+        // vector wherever it was computed.
+        //
+        // Two places are asked. The workspace the document was imported from,
+        // which is the case this exists for — a library the user already
+        // indexed under this very model. And this projection's own index,
+        // which catches a passage repeated across documents for free.
+        //
+        // Space equality *is* checked, because it is the one thing that
+        // genuinely decides whether a vector may be read here at all. After
+        // the identity cut that is engine, model and width — not a fingerprint
+        // of a model cache, and not a recipe version.
+        let text_hashes: Vec<String> = prepared
             .chunks
             .iter()
-            .map(|(chunk, _)| chunk.text.as_str())
+            .map(|(chunk, _)| wilkes_core::embed::identity::sha256_bytes(chunk.text.as_bytes()))
             .collect();
-        let embeddings = embedder
-            .embed_passages(&texts)
-            .map_err(|error| format!("Could not embed canonical rendition: {error:#}"))?;
-        if embeddings.len() != prepared.chunks.len() {
+        let mut adopted: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+        for (label, candidate) in [
+            ("source workspace", source_workspace),
+            ("this space", Some(self)),
+        ] {
+            let Some(candidate) = candidate else { continue };
+            let index_arc = candidate.index.lock().clone();
+            let guard = match index_arc.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    tracing::warn!("{label} index lock was poisoned; embedding instead");
+                    continue;
+                }
+            };
+            let Some(index) = guard.as_ref() else {
+                continue;
+            };
+            match index.embedding_space_id() {
+                Ok(space) if space == expected_identity.id() => {
+                    match index.vectors_for_text_hashes(&text_hashes) {
+                        Ok(found) => {
+                            for (hash, embedding) in found {
+                                adopted.entry(hash).or_insert(embedding);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!("could not read vectors from {label}: {error:#}")
+                        }
+                    }
+                }
+                Ok(space) => tracing::debug!(
+                    "{label} is space {} and this projection is {}; nothing to adopt",
+                    space.as_str(),
+                    expected_identity.id().as_str()
+                ),
+                Err(error) => {
+                    tracing::debug!(
+                        "{label} names no embedding space, so nothing to adopt: {error}"
+                    )
+                }
+            }
+        }
+
+        let missing: Vec<&str> = prepared
+            .chunks
+            .iter()
+            .zip(&text_hashes)
+            .filter(|(_, hash)| !adopted.contains_key(*hash))
+            .map(|((chunk, _), _)| chunk.text.as_str())
+            .collect();
+        tracing::info!(
+            "projection import: {} of {} chunks adopted, {} to embed",
+            prepared.chunks.len() - missing.len(),
+            prepared.chunks.len(),
+            missing.len()
+        );
+        let mut computed = if missing.is_empty() {
+            Vec::new()
+        } else {
+            let embedder = self.embedder.lock().clone().ok_or_else(|| {
+                ConsumerError::new(
+                    ConsumerErrorCode::ManagedWorkspaceNotFound,
+                    "managed embedder is unavailable",
+                )
+            })?;
+            embedder
+                .embed_passages(&missing)
+                .map_err(|error| format!("Could not embed canonical rendition: {error:#}"))?
+        };
+        if computed.len() != missing.len() {
             return Err(ConsumerError::new(
                 ConsumerErrorCode::DocumentIndexIncomplete,
                 format!(
-                    "embedder returned {} vectors for {} canonical chunks",
-                    embeddings.len(),
-                    prepared.chunks.len()
+                    "embedder returned {} vectors for {} chunks it was asked to embed",
+                    computed.len(),
+                    missing.len()
                 ),
             ));
         }
-        for ((_, vector), embedding) in prepared.chunks.iter_mut().zip(embeddings) {
-            *vector = embedding;
+        // Adopted where we had it, freshly computed where we did not, in the
+        // canonical chunk order either way. `computed` is consumed front to
+        // back in the same order `missing` was collected.
+        let mut fresh = computed.drain(..);
+        for ((_, vector), hash) in prepared.chunks.iter_mut().zip(&text_hashes) {
+            *vector = match adopted.remove(hash) {
+                Some(embedding) => embedding,
+                None => fresh.next().ok_or_else(|| {
+                    ConsumerError::new(
+                        ConsumerErrorCode::DocumentIndexIncomplete,
+                        "ran out of computed vectors while filling canonical chunks",
+                    )
+                })?,
+            };
         }
         let expected_chunks = prepared.chunks.len();
         let managed = {
@@ -2540,6 +2637,7 @@ impl AppContext {
             canonical_snapshot_path,
             false,
         )
+        .await
     }
 
     /// What one document's reading surface needs to show a match.
@@ -2646,7 +2744,19 @@ impl AppContext {
         })
     }
 
-    fn managed_export(
+    /// Async because of the outline, which is a full read of the snapshot.
+    ///
+    /// Reading a document reaches the layout detector and the recognizers
+    /// through their worker proxies, and a proxy waits for the subprocess'
+    /// reply by blocking on the runtime handle. `Handle::block_on` panics on
+    /// one of the runtime's own threads, so extraction has a requirement no
+    /// signature states: it does not run inside an async task. Every other
+    /// extraction in this file satisfies it with `spawn_blocking`; this one
+    /// did not, because the reading was hidden behind a plain call to
+    /// `document_outline` in a synchronous helper, and every managed import
+    /// that reached it panicked the moment the document had a page worth
+    /// detecting on.
+    async fn managed_export(
         corpus_id: String,
         document: ManagedDocumentData,
         embedding_identity: &wilkes_core::embed::EmbeddingSpaceIdentity,
@@ -2669,9 +2779,14 @@ impl AppContext {
             _ => "application/octet-stream",
         }
         .to_string();
-        let registry = wilkes_core::extract::production_registry();
-        let declared_outline = wilkes_core::extract::document_outline(&snapshot_path, &registry)
-            .map_err(|error| format!("Could not read retained document outline: {error:#}"))?;
+        let outline_path = snapshot_path.clone();
+        let declared_outline = tokio::task::spawn_blocking(move || {
+            let registry = wilkes_core::extract::production_registry();
+            wilkes_core::extract::document_outline(&outline_path, &registry)
+        })
+        .await
+        .map_err(|error| format!("Managed outline task panicked: {error}"))?
+        .map_err(|error| format!("Could not read retained document outline: {error:#}"))?;
         let outline = resolve_outline(&declared_outline.entries, &document.chunks);
         let chunk_count = document.chunks.len();
         Ok(ManagedDocumentExport {
@@ -7157,9 +7272,7 @@ impl AppContext {
         let index = self
             .restore_index(&plan.selected, embedder.dimension())
             .await?;
-        if let Err(error) =
-            index.validate_local_embedding_space(&embedder.embedding_space_identity())
-        {
+        if let Err(error) = index.validate_embedding_space(&embedder.embedding_space_identity()) {
             error!("restore_state: incompatible embedding space: {error:#}");
             return None;
         }

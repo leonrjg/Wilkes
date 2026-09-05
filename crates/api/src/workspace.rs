@@ -1250,7 +1250,8 @@ impl WorkspaceManager {
             &request.embedding,
         )?;
 
-        self.catch_up_projection(&request.corpus_id, &id).await?;
+        self.catch_up_projection(&request.corpus_id, &id, None)
+            .await?;
 
         let canonical = self.managed_workspace_status(&request.corpus_id).await?;
         canonical
@@ -1274,6 +1275,7 @@ impl WorkspaceManager {
         &self,
         corpus_id: &str,
         projection_workspace_id: &str,
+        source_workspace: Option<&Arc<AppContext>>,
     ) -> anyhow::Result<()> {
         let child = self.context_for(projection_workspace_id).await?;
         child
@@ -1305,6 +1307,7 @@ impl WorkspaceManager {
                         "kind": "managed_corpus_projection",
                         "canonical_corpus_id": corpus_id,
                     }),
+                    source_workspace,
                 )
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -1318,7 +1321,17 @@ impl WorkspaceManager {
     /// One model being unavailable is not a reason to leave the others behind:
     /// the spaces are independent derivations of the same membership, and a
     /// space that cannot catch up simply goes on failing closed until it can.
-    pub async fn catch_up_corpus(&self, corpus_id: &str) -> anyhow::Result<Vec<(String, String)>> {
+    /// `source_workspace` is the library the document being imported came
+    /// from, when there is one. It is offered to each projection as a place to
+    /// adopt vectors from rather than recompute them — the reason it is
+    /// threaded this far is that the import handler resolves it and used to
+    /// drop it one line later, so a corpus re-embedded documents its own
+    /// Wilkes had already embedded under the same model.
+    pub async fn catch_up_corpus(
+        &self,
+        corpus_id: &str,
+        source_workspace: Option<&Arc<AppContext>>,
+    ) -> anyhow::Result<Vec<(String, String)>> {
         let status = self.managed_workspace_status(corpus_id).await?;
         let mut failures = Vec::new();
         for space in status.spaces.iter().filter(|space| !space.primary) {
@@ -1326,7 +1339,7 @@ impl WorkspaceManager {
                 continue;
             }
             if let Err(error) = self
-                .catch_up_projection(corpus_id, &space.workspace_id)
+                .catch_up_projection(corpus_id, &space.workspace_id, source_workspace)
                 .await
             {
                 failures.push((space.embedding_space_id.clone(), format!("{error:#}")));
@@ -2223,7 +2236,7 @@ mod tests {
         // reports per space: this environment has no embedder to load, so the
         // lagging space comes back as a named failure rather than as an error
         // that would have stopped every other space from catching up too.
-        let failures = manager.catch_up_corpus(&corpus_id).await.unwrap();
+        let failures = manager.catch_up_corpus(&corpus_id, None).await.unwrap();
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert_eq!(failures[0].0, lagging.embedding_space_id);
     }
@@ -2276,7 +2289,7 @@ mod tests {
         // No projection exists, so nothing is behind — and a corpus with one
         // that is level takes the same path.
         assert!(manager
-            .catch_up_corpus(&corpus.corpus_id)
+            .catch_up_corpus(&corpus.corpus_id, None)
             .await
             .unwrap()
             .is_empty());

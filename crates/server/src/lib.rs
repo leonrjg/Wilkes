@@ -447,7 +447,7 @@ async fn import_managed_document_handler(
     // goes on failing closed until it can. So the fan-out reports rather than
     // refuses, and whatever it could not do is left owed and retried.
     let failures = manager
-        .catch_up_corpus(&body.corpus_id)
+        .catch_up_corpus(&body.corpus_id, source_workspace.as_ref())
         .await
         .map_err(consumer_anyhow_err)?;
     for (space, error) in &failures {
