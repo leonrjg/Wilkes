@@ -72,6 +72,12 @@
   semantic lane is unavailable returns exact matches and reports what it could
   not reach, rather than failing or quietly returning a shorter list.
 
+  The MCP `search` tool defaults to it too. `mode` was required and had no
+  default, so every caller had to guess which half of the question it was
+  asking; omitting it now asks both, and each returned document carries the
+  same `evidence` the app shows. `exact` and `semantic` remain, as the
+  narrower searches they are.
+
 - Folders can be dropped onto the window to become library roots. A dropped
   folder joins the root strip and becomes the active root, as if it had been
   chosen through Open — previously a dropped folder was refused as an import,

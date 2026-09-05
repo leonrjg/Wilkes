@@ -41,6 +41,11 @@ const MAX_RELATED_DOCUMENTS_LIMIT: usize = 25;
 const DEFAULT_LIST_DOCUMENTS_LIMIT: usize = 50;
 const MAX_LIST_DOCUMENTS_LIMIT: usize = 500;
 const SEMANTIC_INDEX_GUIDANCE: &str = "The user can enable the semantic index in Wilkes Settings. Use exact search with mode='exact' instead in the meantime.";
+/// The combined mode has already returned whatever its exact lane found, so
+/// telling the caller to fall back to exact search would be telling it to
+/// repeat a search it has the results of. What it does not have is the related
+/// passages, and only the user can make those available.
+const COMBINED_INDEX_GUIDANCE: &str = "These results carry exact matches only; related passages need the semantic index, which the user can enable in Wilkes Settings.";
 const EXTERNAL_DOCUMENT_PATH_REQUIRED: &str =
     "External Wilkes MCP does not default document tools to the active document; pass path explicitly after reading list_context.";
 const WORKSPACE_DOCUMENT_PATH_REQUIRED: &str =
@@ -756,7 +761,9 @@ struct GetDocumentOutlineParams {
 struct SearchParams {
     /// Text to search for.
     query: String,
-    /// Required. Use exact for literal/regex matching, semantic for meaning-based search.
+    /// Optional. Defaults to combined, which searches wording and meaning at
+    /// once. Use exact for literal/regex matching, semantic for meaning only.
+    #[serde(default)]
     mode: SearchModeParam,
     /// Search location. Use all for a library-wide search; omit for the current root.
     scope: Option<SearchScopeParam>,
@@ -865,9 +872,13 @@ struct LiteratureSearchResponse<T> {
     results: Vec<T>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq,
+)]
 #[serde(rename_all = "snake_case")]
 enum SearchModeParam {
+    #[default]
+    Combined,
     Exact,
     Semantic,
 }
@@ -1029,6 +1040,12 @@ impl From<wilkes_core::types::FileEntry> for DocumentSummaryResponse {
 struct SearchFileResponse {
     path: String,
     file_type: wilkes_core::types::FileType,
+    /// Why this document is in the result set: `exact_phrase`,
+    /// `related_passage`, or both. Only the combined mode establishes more than
+    /// one of them, so a single-mode search omits the field entirely — its
+    /// `mode` already answers the question.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    evidence: Vec<wilkes_core::types::MatchEvidence>,
     /// Document title from cached metadata; null until the file is processed.
     title: Option<String>,
     /// Document author from cached metadata; null until the file is processed.
@@ -1173,7 +1190,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Search Wilkes-readable documents, including direct filename, cached-title and cached-author matches. You must explicitly set mode='exact' for literal/regex matching or mode='semantic' for meaning-based content search plus case-insensitive literal filename/title/author matching; mode has no default. Each returned match has kind='content', 'filename', 'title', or 'author'. Searches the active workspace unless workspace names another. Set scope='all' to search every configured library root of that workspace; omit scope to search its current root. If the user asks about a specific document, set file to that document path; omit file only for corpus-wide searches."
+        description = "Search Wilkes-readable documents, including direct filename, cached-title and cached-author matches. mode defaults to 'combined', which finds the query text as written and passages about the same subject in different words; each returned document carries evidence=['exact_phrase'], ['related_passage'], or both, so you can tell which. Set mode='exact' for literal/regex matching only (is_regex applies to this mode alone), or mode='semantic' for meaning-based content search only; both narrow what combined already covers, so prefer the default unless the user asked for one of them. Each returned match has kind='content', 'filename', 'title', or 'author'. Searches the active workspace unless workspace names another. Set scope='all' to search every configured library root of that workspace; omit scope to search its current root. If the user asks about a specific document, set file to that document path; omit file only for corpus-wide searches."
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         match search_documents_for_mcp(self, params).await {
@@ -1511,15 +1528,25 @@ async fn search_documents(
         wilkes_core::types::SearchScope::File { path } => Some(display_path(path)),
     };
     let query_text = query.pattern.clone();
-    let collected =
+    let mut collected =
         search
             .clone()
             .search(query, max_files)
             .await
+            // Only a semantic-only search fails for want of an index. Combined
+            // reduces instead, and says so through its stats below.
             .map_err(|message| match mode {
                 SearchModeParam::Semantic => with_semantic_index_guidance(message),
-                SearchModeParam::Exact => message,
+                SearchModeParam::Exact | SearchModeParam::Combined => message,
             })?;
+    if mode == SearchModeParam::Combined {
+        collected.stats.errors = collected
+            .stats
+            .errors
+            .into_iter()
+            .map(|error| with_index_guidance(error, COMBINED_INDEX_GUIDANCE))
+            .collect();
+    }
 
     let mut matches = Vec::with_capacity(collected.files.len());
     for file in collected.files {
@@ -1767,6 +1794,13 @@ async fn get_related_documents(
 }
 
 fn with_semantic_index_guidance(message: String) -> String {
+    with_index_guidance(message, SEMANTIC_INDEX_GUIDANCE)
+}
+
+/// Append `guidance` to a message that reports an unavailable semantic index,
+/// and leave every other message alone. Which sentence is the right one depends
+/// on what the caller can still do, so the caller supplies it.
+fn with_index_guidance(message: String, guidance: &str) -> String {
     let lower = message.to_ascii_lowercase();
     let index_unavailable = [
         "no semantic index",
@@ -1780,7 +1814,7 @@ fn with_semantic_index_guidance(message: String) -> String {
     .any(|needle| lower.contains(needle));
 
     if index_unavailable {
-        format!("{message} {SEMANTIC_INDEX_GUIDANCE}")
+        format!("{message} {guidance}")
     } else {
         message
     }
@@ -1818,6 +1852,7 @@ fn build_search_query(
             mode: match mode {
                 SearchModeParam::Exact => wilkes_core::types::SearchMode::Grep,
                 SearchModeParam::Semantic => wilkes_core::types::SearchMode::Semantic,
+                SearchModeParam::Combined => wilkes_core::types::SearchMode::Hybrid,
             },
             scope: if let Some(path) = params.file {
                 wilkes_core::types::SearchScope::File {
@@ -1847,6 +1882,7 @@ impl From<wilkes_core::types::FileMatches> for SearchFileResponse {
         Self {
             path: display_path(&file.path),
             file_type: file.file_type,
+            evidence: file.evidence,
             title: file.title,
             author: None,
             doi: None,
@@ -1994,6 +2030,9 @@ mod tests {
         assert_eq!(scope_schema["type"], "string");
         assert_eq!(scope_schema["enum"], serde_json::json!(["all"]));
 
+        // Only the query is required. `mode` defaults to combined, so a caller
+        // that has no reason to prefer wording over meaning does not have to
+        // decide between them to search at all.
         let required = search
             .get("required")
             .and_then(serde_json::Value::as_array)
@@ -2003,7 +2042,15 @@ mod tests {
                 .iter()
                 .filter_map(serde_json::Value::as_str)
                 .collect::<Vec<_>>(),
-            vec!["query", "mode"]
+            vec!["query"]
+        );
+        let mode_ref = properties["mode"]["$ref"].as_str().unwrap();
+        let mode_schema = search_value
+            .pointer(mode_ref.strip_prefix('#').unwrap())
+            .unwrap();
+        assert_eq!(
+            mode_schema["enum"],
+            serde_json::json!(["combined", "exact", "semantic"])
         );
     }
 
@@ -3269,6 +3316,46 @@ mod tests {
         assert_eq!(response.page, None);
         assert_eq!(response.page_range, Some(PageRange { start: 1, end: 5 }));
         assert_eq!(response.text, "active document text");
+    }
+
+    #[test]
+    fn an_omitted_mode_searches_wording_and_meaning_together() {
+        // The tool used to make the caller choose between the terminology and
+        // the problem before it had seen either. Omitting mode now asks for
+        // both, and a regular expression is not part of that question.
+        let params: SearchParams = serde_json::from_value(serde_json::json!({
+            "query": "instrumental variables weak identification",
+            "is_regex": true,
+        }))
+        .unwrap();
+        assert_eq!(params.mode, SearchModeParam::Combined);
+
+        let dir = tempdir().unwrap();
+        let (query, _) =
+            build_search_query(dir.path().to_path_buf(), params, 1024 * 1024).unwrap();
+
+        assert_eq!(query.mode, SearchMode::Hybrid);
+        assert!(
+            !query.is_regex,
+            "a regular expression describes wording, and belongs to exact search"
+        );
+    }
+
+    #[test]
+    fn a_reduced_combined_search_says_what_it_could_not_reach() {
+        // The combined mode has already returned its exact matches, so the
+        // guidance must not send the caller back to run them again.
+        let reduced = with_index_guidance(
+            "Combined search found exact matches only — related passages need the semantic index: No semantic index found. Build the index first."
+                .to_string(),
+            COMBINED_INDEX_GUIDANCE,
+        );
+        assert!(reduced.ends_with(COMBINED_INDEX_GUIDANCE));
+        assert!(!reduced.contains("mode='exact'"));
+
+        // An unrelated error is not an occasion to talk about the index.
+        let unrelated = with_index_guidance("Search query cannot be empty.".to_string(), COMBINED_INDEX_GUIDANCE);
+        assert_eq!(unrelated, "Search query cannot be empty.");
     }
 
     #[test]
