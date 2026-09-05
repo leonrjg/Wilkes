@@ -444,6 +444,73 @@ mod tests {
         );
     }
 
+    /// A chunk written with no vector gets no `vec_chunks` row, and the
+    /// passage is indexed all the same.
+    ///
+    /// This is what "the canonical corpus holds no vectors" is in the schema.
+    /// The corpus owns retained sources, extraction, chunking and stable
+    /// passage identity; its projections own coordinates, one model each. It
+    /// used to embed every chunk on every import under the model it was
+    /// *created* with — frozen at creation, reachable from no setting — into
+    /// an index that nothing read once a store served a projection.
+    #[test]
+    fn a_chunk_written_without_a_vector_is_indexed_and_stores_no_coordinates() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("passages.txt");
+        fs::write(&file, "a passage").unwrap();
+
+        let identity = EmbeddingSpaceIdentity::with_artifact_revision(
+            EmbeddingEngine::Candle,
+            "model",
+            1,
+            "artifact-sha256:one".to_string(),
+        );
+        let mut index = SemanticIndex::create_exact(root, &identity, Some(root)).unwrap();
+        index
+            .write_file_with_recipe(
+                PreparedFile {
+                    retained: Default::default(),
+                    path: file.clone(),
+                    full_text: "a passage".to_string(),
+                    chunks: vec![(test_chunk(&file, "a passage"), Vec::new())],
+                },
+                &ExtractionRecipe::new(100, 0),
+                None,
+                None,
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+
+        let chunks: i64 = index
+            .conn
+            .query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))
+            .unwrap();
+        let vectors: i64 = index
+            .conn
+            .query_row("SELECT count(*) FROM vec_chunks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(chunks, 1, "the passage is indexed");
+        assert_eq!(vectors, 0, "and carries no coordinates");
+
+        // Which is exactly what completeness reports: one admitted document,
+        // one required chunk, nothing embedded. A canonical corpus reads as
+        // ready on membership, and this is the number that says why it must
+        // not be read as coordinates.
+        let (documents, required, embedded) = index.managed_completeness().unwrap();
+        assert_eq!((documents, required, embedded), (1, 1, 0));
+
+        // The chunk still carries its text hash, so a projection can find the
+        // vector for it by content without this index holding one.
+        let hash: Option<String> = index
+            .conn
+            .query_row("SELECT text_sha256 FROM chunks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(hash.as_deref(), Some(sha256_bytes(b"a passage").as_str()));
+    }
+
     /// Vectors are reusable by content, across indexes that share a space.
     ///
     /// This is the reuse the managed corpus was missing: a library the user
@@ -6396,10 +6463,13 @@ impl SemanticIndex {
         let key_str = key.to_string_lossy().into_owned();
         let identity = Self::identity_for_path(&prepared.path)?;
 
-        // Validate dimensions before starting transaction.
+        // Validate dimensions before starting transaction. An empty vector is
+        // not a wrong-width one: it says this chunk carries no coordinates,
+        // which is how the canonical managed corpus writes every chunk it
+        // owns. A width is only checked where there is one.
         for (_, embedding) in &prepared.chunks {
             anyhow::ensure!(
-                embedding.len() == self.dimension,
+                embedding.is_empty() || embedding.len() == self.dimension,
                 "Dimension mismatch: expected {}, received {} for path {}",
                 self.dimension,
                 embedding.len(),
@@ -7538,11 +7608,16 @@ impl SemanticIndex {
         );
 
         let mut stmt = self.conn.prepare(
+            // No vectors. `ManagedDocumentData` carries chunk refs, text and
+            // geometry — a consumer reads passages here and embeds its own
+            // text — so the coordinates this used to read were decoded,
+            // validated and dropped on the floor. Reading them also inner-
+            // joined `vec_chunks`, which meant a corpus that owned passages
+            // and no vectors could not export a single document.
             "SELECT c.chunk_ref, c.chunk_idx, c.chunk_text, c.text_sha256,
                     c.byte_start, c.byte_end, c.origin_type, c.page, c.line, c.col,
-                    c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, v.embedding
+                    c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h
              FROM chunks c JOIN files f ON f.id = c.file_id
-             JOIN vec_chunks v ON v.rowid = c.id
              WHERE f.rendition_id = ?1
              ORDER BY c.chunk_idx",
         )?;
@@ -7574,7 +7649,6 @@ impl SemanticIndex {
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
                     origin,
-                    row.get::<_, Vec<u8>>(14)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -7586,7 +7660,7 @@ impl SemanticIndex {
         let mut chunks = Vec::with_capacity(rows.len());
         let mut descriptors = Vec::with_capacity(rows.len());
         for (expected_ordinal, row) in rows.into_iter().enumerate() {
-            let (stored_ref, ordinal, text, stored_text_sha256, byte_start, byte_end, origin, blob) =
+            let (stored_ref, ordinal, text, stored_text_sha256, byte_start, byte_end, origin) =
                 row;
             consumer_ensure!(
                 ordinal >= 0 && ordinal as usize == expected_ordinal,
@@ -7603,13 +7677,6 @@ impl SemanticIndex {
                 text_sha256 == stored_text_sha256,
                 ConsumerErrorCode::DocumentIndexIncomplete,
                 "chunk text hash mismatch",
-            );
-            let embedding = f32_slice_from_bytes(&blob)?;
-            consumer_ensure!(
-                embedding.len() == self.dimension
-                    && embedding.iter().all(|value| value.is_finite()),
-                ConsumerErrorCode::DocumentIndexIncomplete,
-                "invalid stored vector",
             );
             let byte_range = ByteRange {
                 start: byte_start as usize,

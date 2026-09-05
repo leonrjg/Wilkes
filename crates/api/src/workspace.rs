@@ -2005,10 +2005,14 @@ mod tests {
             })
             .await
             .unwrap();
-        // Configured, but holding no vectors: there is no coordinate system to
-        // name yet, and the manifest cannot predict the one a build will make.
+        // The canonical corpus holds no vectors and names no coordinate
+        // system. It owns sources, extraction, chunking and passage identity;
+        // its projections own the spaces, one model each.
         assert_eq!(status.embedding_space_id, None);
         assert!(status.embedding_space_identity.is_none());
+        assert!(status.spaces.is_empty());
+        // Not ready only because nothing has opened an index for it yet.
+        // Readiness here is membership, never coordinates.
         assert!(!status.ready);
 
         // The absent space is reported as an explicit null, not by dropping
@@ -2030,13 +2034,19 @@ mod tests {
         let space = index.embedding_space_identity().unwrap().id().0;
         drop(index);
 
-        // Once an index exists the corpus reports that index's own id, and
-        // keeps reporting it: the value never changes under the caller.
+        // And it still reports none once an index exists. The index is where
+        // passages live; the space it was created under is an artifact of the
+        // schema, not something this corpus serves, and publishing it is what
+        // made a consumer pin a coordinate system it could not change and a
+        // model it never chose.
         let status = manager
             .managed_workspace_status(&status.corpus_id)
             .await
             .unwrap();
-        assert_eq!(status.embedding_space_id, Some(space));
+        assert_eq!(status.embedding_space_id, None);
+        assert!(status.spaces.is_empty());
+        assert!(status.ready, "an open index is a ready canonical corpus");
+        let _ = space;
     }
 
     /// Writes one managed document into a corpus index the way an admission
@@ -2188,12 +2198,19 @@ mod tests {
             .find(|space| space.workspace_id == projection_id)
             .expect("the projection is listed as a space of its corpus")
             .clone();
+        // Every space is a projection now: the canonical corpus contributes
+        // none, because it holds no vectors to name one with.
         assert!(
-            status.spaces[0].primary,
-            "the primary space is listed first"
+            status.spaces.iter().all(|space| !space.primary),
+            "the canonical corpus is not one of its own spaces"
         );
-        assert_eq!(status.spaces[0].workspace_id, corpus_id);
-        assert!(!projection_space.primary);
+        assert!(
+            status
+                .spaces
+                .iter()
+                .all(|space| space.workspace_id != corpus_id),
+            "the corpus does not appear in its own space list"
+        );
         assert_ne!(
             projection_space.indexed_generation, status.corpus_generation,
             "an empty projection has not indexed the document the corpus admitted"
@@ -2240,10 +2257,20 @@ mod tests {
             .unwrap();
         assert_eq!(caught_up.indexed_generation, status.corpus_generation);
         assert!(caught_up.ready);
-        assert_ne!(
-            caught_up.embedding_space_id, status.spaces[0].embedding_space_id,
-            "two models are two coordinate systems under one corpus"
-        );
+        // Two models are two coordinate systems under one corpus. Compared
+        // against the embedders themselves rather than against a canonical
+        // space, which no longer exists to compare with.
+        let space_of = |selected: &SelectedEmbedder| {
+            wilkes_core::embed::identity::EmbeddingSpaceIdentity::for_test(
+                selected.engine,
+                selected.model.model_id(),
+                selected.dimension,
+            )
+            .id()
+            .0
+        };
+        assert_eq!(caught_up.embedding_space_id, space_of(&secondary));
+        assert_ne!(caught_up.embedding_space_id, space_of(&embedding));
         assert!(
             manager
                 .managed_space_context(&corpus_id, &caught_up.embedding_space_id)
@@ -2433,7 +2460,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(restored.corpus_id, source_status.corpus_id);
-        assert_eq!(restored.embedding_space_id, Some(space.clone()));
+        // The restored corpus names no space, like every canonical corpus: the
+        // backup carries its passages and their identity, which is what it is
+        // for. `space` is still what addresses the backup itself.
+        assert_eq!(restored.embedding_space_id, None);
         assert!(restored.ready);
         // Restore replaces the pre-created corpus rather than adding a second
         // one: the listing shows the user's own workspace and exactly one
@@ -2560,14 +2590,34 @@ mod tests {
             Some(wilkes_core::consumer::ConsumerErrorCode::ManagedWorkspaceProtected)
         );
 
-        let mut mismatch = SelectedEmbedder::default();
-        mismatch.dimension += 1;
+        // A different embedder is not a mismatch. The canonical corpus holds
+        // no vectors, so its recorded embedder decides nothing about what a
+        // consumer may ask for; models are chosen per projection. Comparing it
+        // here meant this endpoint refused, for the life of the corpus, any
+        // request naming a model other than the one it happened to be created
+        // with — and a consumer has only its live setting to send.
+        let mut other_model = SelectedEmbedder::default();
+        other_model.dimension += 1;
+        manager
+            .ensure_managed_workspace(EnsureManagedWorkspace {
+                owner: "underdog".to_string(),
+                corpus_key: "store-1".to_string(),
+                embedding: other_model,
+                chunk_size: 600,
+                chunk_overlap: 128,
+            })
+            .await
+            .expect("a different model is a different projection, not a refusal");
+
+        // Different chunking still is a mismatch, and always will be: every
+        // `chunk_ref` a consumer has cited derives from it, and re-chunking is
+        // the one thing here nobody can recompute their way out of.
         assert!(manager
             .ensure_managed_workspace(EnsureManagedWorkspace {
                 owner: "underdog".to_string(),
                 corpus_key: "store-1".to_string(),
-                embedding: mismatch,
-                chunk_size: 600,
+                embedding: SelectedEmbedder::default(),
+                chunk_size: 900,
                 chunk_overlap: 128,
             })
             .await
@@ -3012,8 +3062,18 @@ mod tests {
     /// about; once it has one, a request that declines to name a space is
     /// asking to be served whatever happens to be there, which is the thing
     /// a pinned consumer surface exists to prevent.
+    /// A canonical corpus answers unpinned, because it names no space to
+    /// disagree about.
+    ///
+    /// It used to stop answering the moment it held an index: the index's own
+    /// space became the corpus's, and every unpinned request was then refused
+    /// with `EMBEDDING_SPACE_MISMATCH: corpus=…, request=none`. That was a
+    /// coordinate system asserting itself over questions that never touch
+    /// coordinates — listing a library's files, resolving a passage's text —
+    /// and it is gone with the vectors. A projection still requires its pin,
+    /// because a projection is nothing but a space.
     #[tokio::test]
-    async fn a_managed_corpus_stops_answering_unpinned_once_it_holds_an_index() {
+    async fn a_canonical_corpus_answers_unpinned_because_it_names_no_space() {
         let dir = tempfile::tempdir().unwrap();
         let settings = dir.path().join("global-settings.json");
         let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
@@ -3048,10 +3108,17 @@ mod tests {
         .unwrap();
         drop(index);
 
-        let error = manager.consumer_index(&scope).await.unwrap_err();
-        assert_eq!(
-            error.code(),
-            Some(ConsumerErrorCode::EmbeddingSpaceMismatch)
+        // Still answers, and answers with no space, which is the truth about
+        // what it holds.
+        let resolved = manager
+            .consumer_index(&scope)
+            .await
+            .expect("an unpinned canonical request is answerable");
+        // Debug is where this type says which space it turned out to be, and
+        // for a canonical corpus the answer is none.
+        assert!(
+            format!("{resolved:?}").contains("Absent"),
+            "{resolved:?}"
         );
 
         manager.shutdown_all().await;
