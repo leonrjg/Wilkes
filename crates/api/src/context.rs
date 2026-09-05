@@ -1065,6 +1065,18 @@ fn resolve_outline<T: OutlineChunk>(
 /// Shared application state and lifecycle logic. Both the desktop (Tauri) and
 /// the server (axum) create exactly one `Arc<AppContext>` and delegate all
 /// business operations to it.
+/// What a managed workspace needs resident to do its job.
+///
+/// Two roles, and they need different things. The canonical corpus owns
+/// passages; a projection owns coordinates. Only one of them has a model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedRuntime {
+    /// A projection: it computes vectors, so its model is loaded.
+    WithEmbedder,
+    /// The canonical corpus: an index for its passages, and no model at all.
+    IndexOnly,
+}
+
 pub struct AppContext {
     /// Workspace-owned databases and conversation persistence.
     pub data_dir: PathBuf,
@@ -1967,9 +1979,84 @@ impl AppContext {
     /// Attach the immutable managed workspace configuration to a concrete
     /// embedder and index. This is idempotent and refuses any exact-space
     /// mismatch; it never rewrites the managed manifest.
+    /// Whether a model is resident for this workspace.
+    ///
+    /// The canonical corpus answers `false` for its whole life, and that is
+    /// the point of [`Self::ensure_managed_index`].
+    pub fn has_embedder(&self) -> bool {
+        self.embedder.lock().is_some()
+    }
+
+    /// Whether this workspace needs a model resident, or only its index.
+    ///
+    /// The canonical managed corpus owns retained sources, extraction,
+    /// chunking and stable passage identity, and no coordinate system. It has
+    /// nothing to embed, so it has no reason to install, load and hold a
+    /// model — and holding one meant every managed import spun up the embedder
+    /// the corpus was *created* under, which is frozen at creation and
+    /// reachable from no setting. A projection is the opposite: it is nothing
+    /// but a space, so its model is the whole of it.
     pub async fn ensure_managed_runtime(self: &Arc<Self>) -> Result<String, ConsumerError> {
+        self.ensure_managed_runtime_with(ManagedRuntime::WithEmbedder)
+            .await
+    }
+
+    /// An index and no model: for the canonical corpus, which stores passages
+    /// and never coordinates.
+    ///
+    /// Its index is opened as it stands rather than against the configured
+    /// embedder. The space such an index was created under is vestigial — it
+    /// holds no vectors for that space or any other — so validating it would
+    /// refuse to open a perfectly good pile of passages because a setting
+    /// elsewhere had changed.
+    pub async fn ensure_managed_index(self: &Arc<Self>) -> Result<String, ConsumerError> {
+        self.ensure_managed_runtime_with(ManagedRuntime::IndexOnly)
+            .await
+    }
+
+    async fn ensure_managed_runtime_with(
+        self: &Arc<Self>,
+        runtime: ManagedRuntime,
+    ) -> Result<String, ConsumerError> {
         let _pending = PendingManagedOperation::new(&self.managed_pending_builds);
         let _runtime_guard = self.managed_runtime_lock.lock().await;
+        if matches!(runtime, ManagedRuntime::IndexOnly) {
+            let settings = self.settings().await;
+            let selected = settings.semantic.selected.clone();
+            let identity = wilkes_core::embed::identity::EmbeddingSpaceIdentity::for_runtime(
+                selected.engine,
+                selected.model.model_id(),
+                selected.dimension,
+            );
+            {
+                let index_arc = self.index.lock().clone();
+                let guard = index_arc
+                    .lock()
+                    .map_err(|_| "Semantic index lock was poisoned".to_string())?;
+                if guard.is_some() {
+                    return Ok(identity.id().0);
+                }
+            }
+            let data_dir = self.data_dir.clone();
+            let root = data_dir.join("managed_sources");
+            let for_creation = identity.clone();
+            let index = tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&root)?;
+                let mut index = if data_dir.join("semantic_index.db").exists() {
+                    SemanticIndex::open_for_maintenance(&data_dir)?
+                } else {
+                    SemanticIndex::create_exact(&data_dir, &for_creation, Some(&root))?
+                };
+                index.activate_root(&root)?;
+                Ok::<_, anyhow::Error>(index)
+            })
+            .await
+            .map_err(|error| format!("Managed index task panicked: {error}"))?
+            .map_err(|error| format!("Could not open managed index: {error:#}"))?;
+            self.invalidate_topic_tree_cache();
+            *self.index.lock() = Arc::new(Mutex::new(Some(index)));
+            return Ok(identity.id().0);
+        }
         if let Some(embedder) = self.embedder.lock().clone() {
             let identity = embedder.embedding_space_identity();
             let index_arc = self.index.lock().clone();

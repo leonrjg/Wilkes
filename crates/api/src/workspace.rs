@@ -1302,7 +1302,7 @@ impl WorkspaceManager {
             .map_err(anyhow::Error::msg)?;
         let canonical_context = self.context_for(corpus_id).await?;
         canonical_context
-            .ensure_managed_runtime()
+            .ensure_managed_index()
             .await
             .map_err(anyhow::Error::msg)?;
 
@@ -1985,6 +1985,61 @@ mod tests {
         fn emit(&self, name: &str, _payload: serde_json::Value) {
             self.0.lock().unwrap().push(name.to_string());
         }
+    }
+
+    /// The canonical corpus opens its index and loads no model.
+    ///
+    /// This is the payoff, and it is the symptom that started the whole
+    /// investigation: a Wilkes log showing `load_embedder start:
+    /// model=AllMiniLML6V2` on a store whose settings named a different model
+    /// entirely. The canonical corpus was being ensured with an embedder it
+    /// had no use for, chosen when the corpus was created and unreachable
+    /// from any setting since.
+    #[tokio::test]
+    async fn the_canonical_corpus_opens_an_index_and_loads_no_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("global-settings.json");
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
+        let corpus = manager
+            .ensure_managed_workspace(EnsureManagedWorkspace {
+                owner: "underdog".to_string(),
+                corpus_key: "store-index-only".to_string(),
+                embedding: SelectedEmbedder::default(),
+                chunk_size: 600,
+                chunk_overlap: 128,
+            })
+            .await
+            .unwrap();
+
+        let context = manager.context_for(&corpus.corpus_id).await.unwrap();
+        context
+            .ensure_managed_index()
+            .await
+            .expect("an index with no model behind it");
+
+        // An index, so passages have somewhere to live.
+        assert!(
+            dir.path()
+                .join("workspaces")
+                .join(&corpus.corpus_id)
+                .join("semantic_index.db")
+                .exists()
+                || workspace_root(dir.path(), &corpus.corpus_id)
+                    .join("semantic_index.db")
+                    .exists(),
+            "the canonical corpus has an index"
+        );
+        // And no model. Nothing installed it, nothing loaded it, and no worker
+        // was asked for one — which is why this test can run at all without a
+        // downloadable embedder.
+        assert!(
+            !context.has_embedder(),
+            "the canonical corpus holds no embedder"
+        );
+
+        manager.shutdown_all().await;
     }
 
     #[tokio::test]
@@ -3116,10 +3171,7 @@ mod tests {
             .expect("an unpinned canonical request is answerable");
         // Debug is where this type says which space it turned out to be, and
         // for a canonical corpus the answer is none.
-        assert!(
-            format!("{resolved:?}").contains("Absent"),
-            "{resolved:?}"
-        );
+        assert!(format!("{resolved:?}").contains("Absent"), "{resolved:?}");
 
         manager.shutdown_all().await;
     }

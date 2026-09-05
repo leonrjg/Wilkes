@@ -283,10 +283,7 @@ async fn ensure_managed_workspace_handler(
         .context_for(&initial.corpus_id)
         .await
         .map_err(consumer_anyhow_err)?;
-    context
-        .ensure_managed_runtime()
-        .await
-        .map_err(consumer_err)?;
+    context.ensure_managed_index().await.map_err(consumer_err)?;
     let status = manager
         .managed_workspace_status(&initial.corpus_id)
         .await
@@ -403,10 +400,7 @@ async fn import_managed_document_handler(
         .context_for(&body.corpus_id)
         .await
         .map_err(consumer_anyhow_err)?;
-    managed
-        .ensure_managed_runtime()
-        .await
-        .map_err(consumer_err)?;
+    managed.ensure_managed_index().await.map_err(consumer_err)?;
     let (path, source_workspace) = match &body.source {
         ManagedImportSource::Path { path } => (path.clone(), None),
         ManagedImportSource::WilkesFile {
