@@ -137,11 +137,20 @@ pub fn chunk_content(
 /// the surrounding run rather than made into a boundary: the enrichment is
 /// still in the text either way, and a bad range must not be able to drop or
 /// duplicate bytes.
+///
+/// `reading_block`, never `reading_range`: a region that wrote bytes is not
+/// thereby a structural unit. An expression the page set inside a line is a
+/// run of words within the prose, and cutting a seam around it would split the
+/// sentence it belongs to — which is exactly what it did, until the two
+/// questions were given a field each. What still holds the enrichment of a
+/// *block* together is unchanged, and what stops a boundary falling inside a
+/// formula is [`indivisible_ranges`], which reads the source map and does not
+/// depend on this at all.
 fn structural_runs(content: &ExtractedContent) -> Vec<ByteRange> {
     let mut blocks: Vec<ByteRange> = content
         .images
         .iter()
-        .filter_map(|image| image.reading_range.clone())
+        .filter_map(|image| image.reading_block.clone())
         .filter(|range| {
             range.start < range.end
                 && range.end <= content.text.len()
@@ -346,6 +355,7 @@ mod tests {
                 pixel_height: 50,
                 image_sha256: "digest".into(),
                 reading_range: (start < end).then_some(ByteRange { start, end }),
+                reading_block: (start < end).then_some(ByteRange { start, end }),
                 reading_anchor: Some(start),
                 ocr_regions: Vec::new(),
                 description: None,
@@ -499,6 +509,68 @@ mod tests {
             "no body prose crosses the boundary: {:?}",
             passage.text
         );
+    }
+
+    /// The same rendition, with the region marked as an expression *inside* a
+    /// line: its bytes are placed, and no block is declared over them.
+    fn inline_content(text: String, start: usize, end: usize) -> ExtractedContent {
+        let mut content = image_content(text, start, end);
+        content.images[0].reading_block = None;
+        content
+    }
+
+    /// An expression inside a sentence is not a structural boundary.
+    ///
+    /// The contrast is the whole point, so both halves are asserted here: the
+    /// same bytes in the same place are three passages when a block is
+    /// declared over them and one when it is not. Cutting seams around an
+    /// inline expression is what stranded a sentence's own words in passages
+    /// as short as `"of "` — the prose between two expressions became a run,
+    /// and a run is chunked alone however little of it there is.
+    #[test]
+    fn an_inline_expression_does_not_cut_the_sentence_it_sits_in() {
+        let lead = "The basic idea is to choose two natural numbers e and d for which ";
+        let expr = "e \\cdot d - 1";
+        let tail = " is a multiple of the totient, and nothing else here matters.";
+        let text = format!("{lead}{expr}{tail}");
+        let start = text.find(expr).expect("the expression is there");
+        let end = start + expr.len();
+
+        let inline = chunk_content(
+            &inline_content(text.clone(), start, end),
+            PathBuf::from("doc.pdf"),
+            400,
+            60,
+        );
+        assert_eq!(
+            inline.len(),
+            1,
+            "one sentence is one passage: {:?}",
+            inline.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert!(
+            inline[0].text.contains(lead.trim()) && inline[0].text.contains(tail.trim()),
+            "the words either side stay with the expression: {:?}",
+            inline[0].text
+        );
+
+        let block = chunk_content(
+            &image_content(text.clone(), start, end),
+            PathBuf::from("doc.pdf"),
+            400,
+            60,
+        );
+        assert_eq!(block.len(), 3, "a declared block does still cut its seams");
+
+        for chunks in [&inline, &block] {
+            ensure_chunks_reconstruct(
+                &text,
+                chunks
+                    .iter()
+                    .map(|chunk| (&chunk.byte_range, chunk.text.as_str())),
+            )
+            .expect("chunks rebuild the reading either way");
+        }
     }
 
     /// The invariant every consumer of the chunk export rests on, with an

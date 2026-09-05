@@ -1275,10 +1275,34 @@ pub struct ExtractedImage {
     /// which two renditions of the same picture need not share. This is what
     /// makes the annotation cache addressable by the thing that was analyzed.
     pub image_sha256: String,
-    /// Where the enrichment block landed in the canonical reading. `None`
+    /// Where this image's reading landed in the canonical reading. `None`
     /// when nothing was serialized for this image, which is the ordinary case
     /// for a logo the recognizer read no text in.
+    ///
+    /// Where the bytes *are*, and nothing about what surrounds them. An
+    /// inline expression sets this exactly as a block does — it wrote bytes —
+    /// so a consumer asking "is there a structural boundary here" must ask
+    /// [`reading_block`](Self::reading_block) instead.
     pub reading_range: Option<ByteRange>,
+    /// The same range, set only for a region the page set apart as a block.
+    ///
+    /// Two kinds of region write bytes into the reading and only one of them
+    /// is a structural unit. A native image, or an expression the page
+    /// displayed between two paragraphs, is a block: it opens a line, carries
+    /// a label, and the prose on either side of it is not the sentence it
+    /// interrupts. An expression the page set *inside* a line is not — by
+    /// `Item::InlineImage`'s own contract it is "a run of words within" the
+    /// prose, with no label and no line of its own.
+    ///
+    /// This exists because [`reading_range`](Self::reading_range) cannot tell
+    /// those apart, and chunking asked it to: every region with bytes became a
+    /// structural run, so one sentence carrying three inline expressions was
+    /// cut into seven passages and its prose stranded in fragments as short as
+    /// `"of "`. The reading said inline, the chunker heard block. One field
+    /// answers each question now, and the boundary a passage is cut on is this
+    /// one.
+    #[serde(default)]
+    pub reading_block: Option<ByteRange>,
     /// Where the picture *is* in the reading: the zero-width offset between
     /// the text above it and the text below it, at the position the page drew
     /// it.
