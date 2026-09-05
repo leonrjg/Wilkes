@@ -4,6 +4,26 @@
 
 ### Added
 
+- Search considers wording and meaning together. The Semantic checkbox is now
+  Combined, and with it on a query runs both lanes over the same catalog: the
+  exact lane finds the query text as written, the semantic lane finds passages
+  about the same subject in whatever words they use, and the two rankings are
+  fused so a document both lanes found outranks either lane's own top hit.
+  "instrumental variables weak identification" no longer makes the reader
+  choose, before seeing either, between the terminology and the problem.
+
+  Each result says which of the two put it there — "Exact phrase", "Related
+  passage", or both — because a combined list whose rows do not explain
+  themselves is a list you cannot act on. Exact search is unchanged and stays a
+  click away, and a regular expression still describes wording, so while one is
+  in force the search is the exact lane alone and the checkbox says so; the
+  preference itself is untouched, and combined returns when the expression
+  goes.
+
+  The combined mode's exact lane needs no index, so a combined search whose
+  semantic lane is unavailable returns exact matches and reports what it could
+  not reach, rather than failing or quietly returning a shorter list.
+
 - Folders can be dropped onto the window to become library roots. A dropped
   folder joins the root strip and becomes the active root, as if it had been
   chosen through Open — previously a dropped folder was refused as an import,

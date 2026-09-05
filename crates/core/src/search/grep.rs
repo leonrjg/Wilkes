@@ -109,6 +109,7 @@ impl SearchProvider for GrepSearchProvider {
                                 title: document.title.clone(),
                                 field_matches,
                                 matches: Vec::new(),
+                                evidence: Vec::new(),
                             },
                         )
                     });
@@ -148,6 +149,7 @@ impl SearchProvider for GrepSearchProvider {
                         title: document.title.clone(),
                         field_matches,
                         matches,
+                        evidence: Vec::new(),
                     },
                 ))
             })

@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { api } from "../services";
-import { isUsableSemanticIndex } from "../lib/semantic";
+import { isUsableSemanticIndex, usesSemanticIndex } from "../lib/semantic";
 import type { FileMatches, SearchQuery, SearchStats } from "../lib/types";
 
 export type ResultContext =
@@ -105,7 +105,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
     const { lastQuery, search } = get();
     if (!lastQuery) return;
 
-    if (lastQuery.mode === "Semantic") {
+    if (usesSemanticIndex(lastQuery.mode)) {
       try {
         const all = lastQuery.scope?.type === "all";
         const indexStatus = await api.getIndexStatus(all ? undefined : lastQuery.root);
@@ -162,7 +162,8 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
   invalidateSemanticResultsForRoot: (root) =>
     set((state) => {
       if (
-        state.lastQuery?.mode !== "Semantic" ||
+        !state.lastQuery ||
+        !usesSemanticIndex(state.lastQuery.mode) ||
         (state.lastQuery.scope?.type !== "all" && state.lastQuery.root !== root)
       ) {
         return {};

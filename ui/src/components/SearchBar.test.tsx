@@ -153,19 +153,64 @@ describe("SearchBar", () => {
     );
   });
 
-  it("toggles semantic mode", () => {
+  it("toggles combined mode", () => {
     const setPreferSemanticMock = vi.fn();
     useSettingsStore.setState({ setPreferSemantic: setPreferSemanticMock });
 
     render(<SearchBar sourceSlot={<MockSourceSlot />} />);
-    const semanticToggle = screen.getByRole("button", { name: "Semantic search" });
+    const combinedToggle = screen.getByRole("button", { name: "Combined search" });
 
-    fireEvent.click(semanticToggle);
+    fireEvent.click(combinedToggle);
 
     expect(setPreferSemanticMock).toHaveBeenCalledWith(true);
   });
 
-  it("cancels an ongoing index when semantic mode is unchecked", () => {
+  it("searches wording and meaning together in combined mode", () => {
+    const searchMock = vi.fn();
+    useSearchStore.setState({ search: searchMock } as any);
+    useSemanticStore.setState({ readyForCurrentRoot: true } as any);
+    useSettingsStore.setState({ preferSemantic: true } as any);
+
+    render(<SearchBar sourceSlot={<MockSourceSlot />} />);
+    fireEvent.change(screen.getByPlaceholderText("Search…"), {
+      target: { value: "instrumental variables weak identification" },
+    });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+
+    expect(searchMock).toHaveBeenCalledWith(
+      expect.objectContaining({ mode: "Hybrid", is_regex: false }),
+    );
+  });
+
+  it("restricts a combined search to the exact lane while a regular expression is in force", () => {
+    const searchMock = vi.fn();
+    useSearchStore.setState({ search: searchMock } as any);
+    useSemanticStore.setState({ readyForCurrentRoot: true } as any);
+    useSettingsStore.setState({ preferSemantic: true } as any);
+
+    render(<SearchBar sourceSlot={<MockSourceSlot />} />);
+    const combinedToggle = screen.getByRole("button", { name: "Combined search" });
+    expect(combinedToggle).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    fireEvent.change(screen.getByPlaceholderText("Search…"), { target: { value: "weak.*ident" } });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+
+    expect(searchMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ mode: "Grep", is_regex: true }),
+    );
+    // The preference is untouched, so the checkbox returns on its own.
+    expect(screen.getByRole("button", { name: "Combined search" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("cancels an ongoing index when combined mode is unchecked", () => {
     const cancelEmbed = vi.spyOn(api, "cancelEmbed").mockResolvedValue(undefined);
     const setPreferSemanticMock = vi.fn();
     useSettingsStore.setState({
@@ -178,7 +223,7 @@ describe("SearchBar", () => {
     } as any);
 
     render(<SearchBar sourceSlot={<MockSourceSlot />} />);
-    fireEvent.click(screen.getByRole("button", { name: "Semantic search" }));
+    fireEvent.click(screen.getByRole("button", { name: "Combined search" }));
 
     expect(setPreferSemanticMock).toHaveBeenCalledWith(false);
     expect(cancelEmbed).toHaveBeenCalledOnce();
@@ -238,7 +283,7 @@ describe("SearchBar", () => {
     });
 
     expect(deferSemanticSearch).toHaveBeenCalledWith(
-      expect.objectContaining({ pattern: "semantic query", mode: "Semantic" }),
+      expect.objectContaining({ pattern: "semantic query", mode: "Hybrid" }),
     );
     expect(ensureCurrentRootIndexed).toHaveBeenCalled();
     expect(searchMock).not.toHaveBeenCalled();

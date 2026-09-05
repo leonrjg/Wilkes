@@ -21,11 +21,29 @@ pub struct IndexingConfig {
 
 // ── Search mode ───────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum SearchMode {
     #[default]
     Grep,
     Semantic,
+    /// Wording and meaning in one search: the exact lane and the semantic lane
+    /// run over the same catalog and their rankings are fused. Each admitted
+    /// document says which lane(s) admitted it — see [`MatchEvidence`].
+    Hybrid,
+}
+
+impl SearchMode {
+    /// True for the modes whose retrieval reaches the semantic index, and so
+    /// require a loaded embedder and a built index to contribute anything.
+    pub fn uses_semantic_index(self) -> bool {
+        matches!(self, SearchMode::Semantic | SearchMode::Hybrid)
+    }
+
+    /// True for the modes that match the query text against document content
+    /// literally, and so honour `is_regex` and `case_sensitive`.
+    pub fn uses_exact_matching(self) -> bool {
+        matches!(self, SearchMode::Grep | SearchMode::Hybrid)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -113,12 +131,33 @@ pub struct FileMatches {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub field_matches: Vec<SearchFieldMatch>,
     pub matches: Vec<Match>,
+    /// Why this document is in the result set, when more than one kind of
+    /// retrieval could have put it there. Populated only by
+    /// [`SearchMode::Hybrid`]; a single-lane search leaves it empty because
+    /// the mode already answers the question.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<MatchEvidence>,
 }
 
 impl FileMatches {
     pub fn total_match_count(&self) -> usize {
         self.field_matches.len() + self.matches.len()
     }
+}
+
+/// One retrieval lane's claim on a document, stated as the fact it establishes
+/// rather than as the mechanism that found it.
+///
+/// `ExactPhrase` means the query text occurs in the document (or in its
+/// filename, title or author) as written. `RelatedPassage` means a passage of
+/// the document is a nearest neighbour of the query in embedding space — it
+/// discusses the subject, in whatever words it uses. A document can carry both,
+/// and that is the case the combined mode exists to surface.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchEvidence {
+    ExactPhrase,
+    RelatedPassage,
 }
 
 /// One document admitted by the application's authoritative search catalog.

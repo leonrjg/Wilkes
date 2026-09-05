@@ -3,7 +3,7 @@ import { Search, Database, Check, Clock, Globe, Trash2, X } from "react-feather"
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
-import type { SearchQuery } from "../lib/types";
+import type { SearchMode, SearchQuery } from "../lib/types";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { api } from "../services";
 import { useResearchStore } from "../stores/useResearchStore";
@@ -12,6 +12,15 @@ interface Props {
   sourceSlot: React.ReactNode;
   settingsSlot?: React.ReactNode;
 }
+
+/** History rows name the mode a search actually ran in, in the words the
+ *  controls use. "Semantic" only appears for rows recorded before the combined
+ *  mode existed, or for a search the HTTP API asked for by name. */
+const SEARCH_MODE_LABELS: Record<SearchMode, string> = {
+  Grep: "Exact",
+  Semantic: "Semantic",
+  Hybrid: "Combined",
+};
 
 export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const search = useSearchStore((s) => s.search);
@@ -37,7 +46,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const [pattern, setPattern] = useState("");
   const [isRegex, setIsRegex] = useState(false);
   const [caseSensitive, setCaseSensitive] = useState(false);
-  const [isSemanticMode, setIsSemanticMode] = useState(preferSemantic);
+  const [isCombinedMode, setIsCombinedMode] = useState(preferSemantic);
   const [searchAll, setSearchAll] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const collections = useResearchStore((s) => s.collections);
@@ -57,26 +66,34 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const replayQueryRef = useRef<SearchQuery | null>(null);
   const historyRef = useRef<HTMLDivElement | null>(null);
 
-  // Sync semantic mode when the setting is loaded from the backend
+  // Sync combined mode when the setting is loaded from the backend
   useEffect(() => {
-    setIsSemanticMode(preferSemantic);
+    setIsCombinedMode(preferSemantic);
   }, [preferSemantic]);
+
+  // A regular expression describes wording, so while one is in force the
+  // search is the exact lane alone. The preference itself is untouched: this
+  // restricts the query, it does not turn semantic retrieval off, and the
+  // combined checkbox comes back the moment the expression does not.
+  const combinedInForce = isCombinedMode && !isRegex;
 
   const buildQuery = useCallback(
     (
       pat: string,
-      opts: { isRegex?: boolean; caseSensitive?: boolean; isSemanticMode?: boolean; searchAll?: boolean } = {},
+      opts: { isRegex?: boolean; caseSensitive?: boolean; isCombinedMode?: boolean; searchAll?: boolean } = {},
     ): SearchQuery => {
+      const regex = opts.isRegex ?? isRegex;
+      const combined = (opts.isCombinedMode ?? isCombinedMode) && !regex;
       return {
         pattern: pat,
-        is_regex: opts.isRegex ?? isRegex,
+        is_regex: regex,
         case_sensitive: opts.caseSensitive ?? caseSensitive,
         root: directory,
         max_results: maxResults,
         respect_gitignore: respectGitignore,
         max_file_size: maxFileSize,
         context_lines: contextLines,
-        mode: (opts.isSemanticMode ?? isSemanticMode) ? "Semantic" : "Grep",
+        mode: combined ? "Hybrid" : "Grep",
         scope: (opts.searchAll ?? searchAll) ? { type: "all" } : { type: "corpus" },
         supported_extensions: supportedExtensions,
         collection_id: selectedCollectionId,
@@ -90,7 +107,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
       respectGitignore,
       maxFileSize,
       contextLines,
-      isSemanticMode,
+      isCombinedMode,
       supportedExtensions,
       maxResults,
       searchAll,
@@ -118,13 +135,16 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const triggerSearch = useCallback(
     (
       pat: string,
-      opts?: { isRegex?: boolean; caseSensitive?: boolean; isSemanticMode?: boolean; searchAll?: boolean },
+      opts?: { isRegex?: boolean; caseSensitive?: boolean; isCombinedMode?: boolean; searchAll?: boolean },
       source: "user" | "reactive" = "reactive",
     ) => {
       const all = opts?.searchAll ?? searchAll;
       if (!pat.trim() || (!all && !directory)) return;
-      const semantic = opts?.isSemanticMode ?? isSemanticMode;
       const query = buildQuery(pat, opts);
+      // Ask the readiness question of the query actually being sent, so a
+      // regex-restricted combined search is not deferred for an index it will
+      // not reach.
+      const semantic = query.mode === "Hybrid";
       const ready = all ? semanticReadyGlobally : semanticReady;
       if (semantic && !ready && !all) {
         deferSemanticSearch(query);
@@ -133,7 +153,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
       }
       search(query);
     },
-    [search, buildQuery, deferSemanticSearch, directory, ensureCurrentRootIndexed, isSemanticMode, searchAll, semanticReady, semanticReadyGlobally],
+    [search, buildQuery, deferSemanticSearch, directory, ensureCurrentRootIndexed, searchAll, semanticReady, semanticReadyGlobally],
   );
 
   useEffect(() => {
@@ -176,7 +196,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
 
   // Auto-retry search once the index finishes building
   useEffect(() => {
-    if (!prevSemanticReady.current && semanticReady && isSemanticMode && pattern.trim()) {
+    if (!prevSemanticReady.current && semanticReady && combinedInForce && pattern.trim()) {
       triggerSearch(pattern);
     }
     prevSemanticReady.current = semanticReady;
@@ -194,18 +214,14 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     triggerSearch(pattern, { caseSensitive: next }, "user");
   };
 
-  const handleToggleSemantic = () => {
-    const next = !isSemanticMode;
-    setIsSemanticMode(next);
+  const handleToggleCombined = () => {
+    const next = !isCombinedMode;
+    setIsCombinedMode(next);
     setPreferSemantic(next);
     if (!next && semanticBuildRoot) {
       api.cancelEmbed().catch((e) => console.error("Cancel semantic index failed:", e));
     }
-    if (!next || semanticReady) {
-      triggerSearch(pattern, { isSemanticMode: next }, "user");
-    } else if (pattern.trim()) {
-      triggerSearch(pattern, { isSemanticMode: next }, "user");
-    }
+    triggerSearch(pattern, { isCombinedMode: next }, "user");
   };
 
   const handleToggleAll = () => {
@@ -236,7 +252,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     setPattern(query.pattern);
     setIsRegex(query.is_regex);
     setCaseSensitive(query.case_sensitive);
-    setIsSemanticMode(query.mode === "Semantic");
+    setIsCombinedMode(query.mode !== "Grep");
     setSearchAll(query.scope.type === "all");
     setSelectedCollection(collectionId);
     setSelectedTag(tagId);
@@ -255,24 +271,32 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
           <span className="text-[11px] font-bold tracking-tight">Aa</span>
         </Toggle>
         <Toggle
-          tooltip={semanticReady ? "Semantic search" : "Set up semantic search in Settings"}
-          active={isSemanticMode}
-          onToggle={handleToggleSemantic}
+          tooltip={
+            isRegex
+              ? "A regular expression searches wording only"
+              : semanticReady
+                ? "Combined search: exact phrases and related passages"
+                : "Set up semantic search in Settings"
+          }
+          ariaLabel="Combined search"
+          active={combinedInForce}
+          disabled={isRegex}
+          onToggle={handleToggleCombined}
           className="px-3 min-w-[100px]"
         >
           <div className="flex items-center gap-2">
             <div
               className={`w-3 h-3 rounded border flex items-center justify-center transition-colors ${
-                isSemanticMode
+                combinedInForce
                   ? "bg-white border-white text-[var(--accent-blue)]"
                   : "border-[var(--text-dim)]"
               }`}
             >
-              {isSemanticMode && <Check size={10} strokeWidth={4} />}
+              {combinedInForce && <Check size={10} strokeWidth={4} />}
             </div>
             <div className="flex items-center gap-1.5">
               <Database size={12} />
-              <span className="text-[10px] font-bold uppercase tracking-wider">Semantic</span>
+              <span className="text-[10px] font-bold uppercase tracking-wider">Combined</span>
             </div>
           </div>
         </Toggle>
@@ -366,7 +390,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
                   <div key={entry.id} className="group flex items-center gap-2 rounded px-2 py-1.5 hover:bg-[var(--bg-hover)]">
                     <button type="button" onClick={() => replayHistory(entry.query)} className="min-w-0 flex-1 text-left">
                       <div className="truncate text-xs text-[var(--text-main)]">{entry.query.pattern}</div>
-                      <div className="truncate text-[10px] text-[var(--text-dim)]">{new Date(entry.started_at_ms).toLocaleString()} · {entry.query.mode} · {entry.result_count} matches · {entry.status}{entry.collection_name ? ` · ${entry.collection_name}` : ""}</div>
+                      <div className="truncate text-[10px] text-[var(--text-dim)]">{new Date(entry.started_at_ms).toLocaleString()} · {SEARCH_MODE_LABELS[entry.query.mode] ?? entry.query.mode} · {entry.result_count} matches · {entry.status}{entry.collection_name ? ` · ${entry.collection_name}` : ""}</div>
                     </button>
                     <button type="button" aria-label={`Delete search ${entry.query.pattern}`} onClick={() => deleteHistory(entry.id).catch(console.error)} className="p-1 text-[var(--text-dim)] opacity-0 hover:text-red-400 group-hover:opacity-100 focus:opacity-100"><Trash2 size={12} /></button>
                   </div>
@@ -388,6 +412,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
 function Toggle({
   children,
   tooltip,
+  ariaLabel,
   active,
   disabled,
   onToggle,
@@ -395,6 +420,8 @@ function Toggle({
 }: {
   children: React.ReactNode;
   tooltip: string;
+  /** A stable name for a control whose tooltip changes with state. */
+  ariaLabel?: string;
   active: boolean;
   disabled?: boolean;
   onToggle: () => void;
@@ -405,6 +432,8 @@ function Toggle({
       <button
         onClick={onToggle}
         disabled={disabled}
+        aria-label={ariaLabel}
+        aria-pressed={active}
         className={`h-[32px] px-2 py-1 rounded text-xs font-mono font-semibold transition-all border flex items-center justify-center ${className} ${
           disabled
             ? "bg-[var(--bg-active)] text-[var(--text-dim)] border-transparent cursor-not-allowed"

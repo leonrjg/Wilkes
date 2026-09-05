@@ -9,6 +9,7 @@ use wilkes_core::embed::Embedder;
 use wilkes_core::generate::Generator;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::search::grep::GrepSearchProvider;
+use wilkes_core::search::hybrid::HybridSearchProvider;
 use wilkes_core::search::semantic::SemanticSearchProvider;
 use wilkes_core::search::{SearchOutcome, SearchProvider};
 use wilkes_core::types::{
@@ -177,33 +178,45 @@ pub fn start_search(
         // it must not be a read that reaches a model.
         let registry = wilkes_core::extract::exact_search_registry();
 
+        // When enabled, let the exact lane read PDF text the index already holds
+        // instead of re-extracting each file. `None` keeps every PDF on the
+        // live-extraction path.
+        let exact_lane = || {
+            let grep_index = if grep_use_index { index.clone() } else { None };
+            GrepSearchProvider::new().with_index(grep_index)
+        };
+        let semantic_lane = |embedder: Option<Arc<dyn Embedder>>| {
+            let (embedder, idx) = (embedder?, index.clone()?);
+            Some(
+                SemanticSearchProvider::new(
+                    embedder,
+                    idx,
+                    indexing.unwrap_or_else(|| IndexingConfig {
+                        chunk_size: 1000,
+                        chunk_overlap: 200,
+                        supported_extensions: query.supported_extensions.clone(),
+                    }),
+                )
+                .with_retrieval(retrieval, generator),
+            )
+        };
+
         let provider: Box<dyn SearchProvider> = match query.mode {
-            SearchMode::Semantic => match (embedder, index) {
-                (Some(emb), Some(idx)) => Box::new(
-                    SemanticSearchProvider::new(
-                        emb,
-                        idx,
-                        indexing.unwrap_or_else(|| IndexingConfig {
-                            chunk_size: 1000,
-                            chunk_overlap: 200,
-                            supported_extensions: query.supported_extensions.clone(),
-                        }),
-                    )
-                    .with_retrieval(retrieval, generator),
-                ),
-                _ => {
+            SearchMode::Semantic => match semantic_lane(embedder) {
+                Some(semantic) => Box::new(semantic),
+                None => {
                     return vec![
                         "Semantic search requires a loaded embedder and built index".into()
                     ]
                     .into();
                 }
             },
-            SearchMode::Grep => {
-                // When enabled, let grep read PDF text the index already holds
-                // instead of re-extracting each file. `None` keeps every PDF on
-                // the live-extraction path.
-                let grep_index = if grep_use_index { index } else { None };
-                Box::new(GrepSearchProvider::new().with_index(grep_index))
+            SearchMode::Grep => Box::new(exact_lane()),
+            // The exact lane is unconditional; the semantic one exists only if
+            // the host resolved an embedder and an index for this search, and
+            // the host is what says why when it did not.
+            SearchMode::Hybrid => {
+                Box::new(HybridSearchProvider::new(exact_lane(), semantic_lane(embedder)))
             }
         };
 
@@ -273,6 +286,7 @@ mod tests {
             title: None,
             field_matches: Vec::new(),
             matches: Vec::new(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -282,6 +296,7 @@ mod tests {
             title: None,
             field_matches: Vec::new(),
             matches: Vec::new(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -385,6 +400,59 @@ mod tests {
         let errors = handle.finish().await;
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("Semantic search requires"));
+    }
+
+    /// The combined mode's exact lane needs no index, so a hybrid search whose
+    /// semantic lane could not be resolved still returns exact matches instead
+    /// of failing. The host records *why* the lane is missing; what is asserted
+    /// here is that the search runs and labels what it found.
+    #[tokio::test]
+    async fn test_start_search_hybrid_without_semantic_lane_returns_exact_matches() {
+        use wilkes_core::types::MatchEvidence;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::write(root.join("iv.txt"), "weak identification of the instrument").unwrap();
+
+        let query = SearchQuery {
+            pattern: "weak identification".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: root.clone(),
+            max_results: 10,
+            respect_gitignore: true,
+            max_file_size: 1024 * 1024,
+            context_lines: 0,
+            mode: SearchMode::Hybrid,
+            scope: Default::default(),
+            supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
+        };
+
+        let mut handle = start_search(
+            query,
+            vec![text_document(root.join("iv.txt"))],
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            RetrievalSettings::default(),
+            None,
+            false,
+        );
+        let mut matches = Vec::new();
+        while let Some(m) = handle.rx.recv().await {
+            matches.push(m);
+        }
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].evidence, vec![MatchEvidence::ExactPhrase]);
+        assert!(matches[0].matches[0]
+            .matched_text
+            .contains("weak identification"));
+        assert!(handle.finish().await.is_empty());
     }
 
     #[tokio::test]

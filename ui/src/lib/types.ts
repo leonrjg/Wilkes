@@ -77,7 +77,9 @@ export interface NativeOpenRequest {
   errors: string[];
 }
 
-export type SearchMode = "Grep" | "Semantic";
+/** "Hybrid" is the combined mode: the exact lane and the semantic lane run
+ *  over the same catalog and their rankings are fused. */
+export type SearchMode = "Grep" | "Semantic" | "Hybrid";
 export type SearchScope =
   | { type: "corpus" }
   | { type: "all" }
@@ -115,6 +117,11 @@ export interface Match {
   score?: number;
 }
 
+/** Why a document is in the result set. `exact_phrase` means the query text
+ *  occurs in it as written; `related_passage` means one of its passages is a
+ *  nearest neighbour of the query in embedding space. Both can apply. */
+export type MatchEvidence = "exact_phrase" | "related_passage";
+
 export interface FileMatches {
   path: string;
   file_type: FileType;
@@ -123,6 +130,9 @@ export interface FileMatches {
   /** Direct identity-field hits, which have no document line/page position. */
   field_matches?: SearchFieldMatch[];
   matches: Match[];
+  /** Populated only by the combined mode; a single-lane search leaves it empty
+   *  because the mode already answers the question. */
+  evidence?: MatchEvidence[];
 }
 
 export type SearchField = "filename" | "title" | "author";

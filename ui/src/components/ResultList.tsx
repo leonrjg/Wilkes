@@ -38,6 +38,7 @@ import type {
   FileSortDirection,
   FileSortKey,
   Match,
+  MatchEvidence,
   MatchRef,
   OmittedFileEntry,
   SearchField,
@@ -915,6 +916,7 @@ export default function ResultList({
                         (row.fileMatches.field_matches?.length ?? 0)
                       }
                       title={row.fileMatches.title}
+                      evidence={row.fileMatches.evidence}
                       additionalRoots={additionalRootsForPath(row.path)}
                       onClick={() => onFileClick(row.path)}
                       onContextMenu={(event) =>
@@ -995,10 +997,41 @@ function formatOmittedReason(entry: OmittedFileEntry): string {
     : "File extension is not in the allowed extensions";
 }
 
+/** What each explanation states, in the words shown and the words behind them.
+ *  Both are facts about the document, not judgements of it: one says the query
+ *  occurs in it as written, the other that a passage of it is a near neighbour
+ *  of the query in embedding space. A combined search can establish either or
+ *  both, and a document that carries both is the case it exists to surface. */
+const EVIDENCE_LABELS: Record<MatchEvidence, { label: string; explanation: string }> = {
+  exact_phrase: {
+    label: "Exact phrase",
+    explanation: "Contains the query text as written",
+  },
+  related_passage: {
+    label: "Related passage",
+    explanation: "Discusses the subject, in its own words",
+  },
+};
+
+function EvidenceChips({ evidence }: { evidence: MatchEvidence[] }) {
+  return (
+    <span className="flex flex-shrink-0 items-center gap-1">
+      {evidence.map((kind) => (
+        <Tooltip key={kind} content={EVIDENCE_LABELS[kind].explanation}>
+          <span className="whitespace-nowrap rounded-full border border-[var(--border-main)] px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-[var(--text-muted)]">
+            {EVIDENCE_LABELS[kind].label}
+          </span>
+        </Tooltip>
+      ))}
+    </span>
+  );
+}
+
 function FileHeader({
   path,
   count,
   title,
+  evidence,
   additionalRoots,
   onClick,
   onContextMenu,
@@ -1006,6 +1039,9 @@ function FileHeader({
   path: string;
   count: number;
   title?: string | null;
+  /** Empty or absent for a single-lane search, where the mode already says
+   *  what found the document and a chip would only restate it. */
+  evidence?: MatchEvidence[];
   additionalRoots: string[];
   onClick: () => void;
   onContextMenu: (event: React.MouseEvent) => void;
@@ -1029,6 +1065,7 @@ function FileHeader({
           </Tooltip>
         )}
       </span>
+      {evidence && evidence.length > 0 && <EvidenceChips evidence={evidence} />}
       <span className="text-[10px] text-[var(--text-muted)] bg-[var(--bg-active)] px-1.5 py-0.5 rounded-full">
         {count}
       </span>

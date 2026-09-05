@@ -302,6 +302,7 @@ impl SearchProvider for SemanticSearchProvider {
                     title: document.title.clone(),
                     field_matches,
                     matches: Vec::new(),
+                    evidence: Vec::new(),
                 },
             );
         }
@@ -394,6 +395,7 @@ impl SearchProvider for SemanticSearchProvider {
                         title: document.title.clone(),
                         field_matches: Vec::new(),
                         matches: Vec::new(),
+                        evidence: Vec::new(),
                     },
                 );
             }

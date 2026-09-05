@@ -1,4 +1,5 @@
 pub mod grep;
+pub mod hybrid;
 pub(crate) mod pdf_projection;
 pub mod semantic;
 

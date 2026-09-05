@@ -6001,7 +6001,7 @@ impl AppContext {
         initiated_by: &str,
     ) -> Result<SearchHandle, String> {
         let settings = self.settings().await;
-        if query.mode == SearchMode::Grep && settings.grep_use_index && !self.is_index_loaded() {
+        if query.mode.uses_exact_matching() && settings.grep_use_index && !self.is_index_loaded() {
             self.activate_exact_index_from_disk().await;
         }
         let (resolved_library_roots, library_root_errors) = library_roots(&settings);
@@ -6094,6 +6094,32 @@ impl AppContext {
                 let index = settings.grep_use_index.then(|| self.index.lock().clone());
                 (None, index)
             }
+            // The combined mode's exact lane needs nothing, so an unavailable
+            // semantic lane reduces the search rather than failing it. This is
+            // the one place that knows *why* it is unavailable, so it is the
+            // one place that says so — the reduction reaches the user as a
+            // search error, never as a quietly shorter result list.
+            SearchMode::Hybrid => {
+                let prepared = if query.scope == SearchScope::All {
+                    self.prepare_global_semantic_runtime(&settings).await
+                } else {
+                    self.prepare_semantic_runtime(&query.root, &settings).await
+                };
+                match prepared {
+                    Ok(runtime) => {
+                        semantic_indexing = Some(runtime.indexing);
+                        (Some(runtime.embedder), Some(runtime.index))
+                    }
+                    Err(reason) => {
+                        warn!("combined search has no semantic lane: {reason}");
+                        catalog_errors.push(format!(
+                            "Combined search found exact matches only — related passages need the semantic index: {reason}"
+                        ));
+                        let index = settings.grep_use_index.then(|| self.index.lock().clone());
+                        (None, index)
+                    }
+                }
+            }
         };
 
         let log = {
@@ -6110,7 +6136,7 @@ impl AppContext {
         // needs the loaded generator; hand it over only when HyDE is on so the
         // provider does not hold a generator reference it will never use.
         let retrieval = settings.retrieval.clone();
-        let generator = if query.mode == SearchMode::Semantic && retrieval.hyde.enabled {
+        let generator = if query.mode.uses_semantic_index() && retrieval.hyde.enabled {
             self.generator.lock().clone()
         } else {
             None

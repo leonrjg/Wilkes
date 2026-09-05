@@ -267,6 +267,43 @@ describe("ResultList", () => {
     expect(screen.getByText("A Composed Document Title")).toBeInTheDocument();
   });
 
+  it("explains what admitted each result of a combined search", () => {
+    useSearchStore.setState({
+      hasQuery: true,
+      results: [
+        {
+          path: "/library/both.pdf",
+          file_type: "Pdf",
+          matches: [],
+          evidence: ["exact_phrase", "related_passage"],
+        },
+        {
+          path: "/library/related.pdf",
+          file_type: "Pdf",
+          matches: [],
+          evidence: ["related_passage"],
+        },
+      ],
+    });
+
+    renderWithToasts();
+
+    expect(screen.getAllByText("Related passage")).toHaveLength(2);
+    expect(screen.getAllByText("Exact phrase")).toHaveLength(1);
+  });
+
+  it("leaves single-lane results unlabelled, because the mode already says what found them", () => {
+    useSearchStore.setState({
+      hasQuery: true,
+      results: [{ path: "/library/exact.pdf", file_type: "Pdf", matches: [] }],
+    });
+
+    renderWithToasts();
+
+    expect(screen.queryByText("Exact phrase")).not.toBeInTheDocument();
+    expect(screen.queryByText("Related passage")).not.toBeInTheDocument();
+  });
+
   it("renders document-scope controls above the filename filter", () => {
     renderWithToasts();
     const collection = screen.getByRole("combobox", { name: "Smart collection" });

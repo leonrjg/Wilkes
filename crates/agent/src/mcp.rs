@@ -3504,6 +3504,7 @@ mod tests {
                         },
                         score: Some(0.91),
                     }],
+                    evidence: Vec::new(),
                 }],
                 stats: SearchStats {
                     files_scanned: 1,
@@ -3865,6 +3866,7 @@ mod tests {
                     },
                     score: Some(0.5),
                 }],
+                evidence: Vec::new(),
             }],
             stats: SearchStats::default(),
             truncated: false,
