@@ -2171,6 +2171,71 @@ mod tests {
         );
     }
 
+    /// A rendition is readable for projection whatever the runtime would
+    /// extract under today, and it says which recipe it is.
+    ///
+    /// This read used to take the caller's recipe and refuse when it differed
+    /// from the rendition's. That made every runtime recipe change — a
+    /// recognizer installed, an extractor version bumped — permanent: the
+    /// projection could not be brought level, and the import key bound to the
+    /// old recipe could not be rebound, because nothing deletes one.
+    #[test]
+    fn a_rendition_is_read_under_its_own_recipe_not_the_runtimes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("managed_sources");
+        fs::create_dir_all(&root).unwrap();
+        let document = root.join("document.txt");
+        fs::write(&document, "canonical passage").unwrap();
+        let admitted_under = ExtractionRecipe::new(100, 0);
+        let mut index = SemanticIndex::create(
+            dir.path(),
+            "primary",
+            2,
+            EmbeddingEngine::Candle,
+            Some(&root),
+        )
+        .unwrap();
+        index
+            .write_file_with_recipe(
+                PreparedFile {
+                    retained: Default::default(),
+                    path: document.clone(),
+                    chunks: vec![(test_chunk(&document, "canonical passage"), vec![1.0, 0.0])],
+                    full_text: "canonical passage".to_string(),
+                },
+                &admitted_under,
+                Some(Path::new("managed_sources/document.txt")),
+                None,
+                true,
+                false,
+                Some("canonical-import"),
+            )
+            .unwrap();
+
+        // What a runtime with different settings would produce. Nothing here
+        // consults it, which is the point.
+        let runtime_would_use = ExtractionRecipe::new(600, 128);
+        assert_ne!(admitted_under.id(), runtime_would_use.id());
+
+        let (prepared, recipe_id) = index
+            .managed_file_structure_for_reembedding(&document, &document)
+            .unwrap()
+            .expect("the rendition is admitted");
+        assert_eq!(
+            recipe_id,
+            admitted_under.id(),
+            "the recipe is the rendition's own"
+        );
+        assert_eq!(prepared.full_text, "canonical passage");
+
+        // And the membership read names the rendition, so a caller can key a
+        // catch-up on the thing it is catching up to.
+        let admitted = index.managed_admitted_renditions().unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].0, index.path_key_for_known_path(&document));
+        assert!(!admitted[0].1.is_empty(), "the rendition id is carried");
+    }
+
     #[test]
     fn managed_projection_reuses_structure_and_generation_but_not_vectors() {
         let canonical_dir = tempdir().unwrap();
@@ -2215,10 +2280,15 @@ mod tests {
             Some(&projection_root),
         )
         .unwrap();
-        let mut prepared = canonical
-            .managed_file_structure_for_reembedding(&document, &document, &recipe)
+        let (mut prepared, canonical_recipe_id) = canonical
+            .managed_file_structure_for_reembedding(&document, &document)
             .unwrap()
             .unwrap();
+        assert_eq!(
+            canonical_recipe_id,
+            recipe.id(),
+            "the read hands back the rendition's own recipe"
+        );
         assert_eq!(prepared.full_text, "canonical passage");
         assert_eq!(prepared.chunks.len(), 1);
         assert!(prepared.chunks[0].1.is_empty());
@@ -7104,9 +7174,39 @@ impl SemanticIndex {
         reused: bool,
         idempotency_key: Option<&str>,
     ) -> anyhow::Result<ManagedDocumentData> {
+        self.write_file_with_recipe_id(
+            prepared,
+            &recipe.id(),
+            managed_snapshot_relative_path,
+            original_source_provenance,
+            admitted,
+            reused,
+            idempotency_key,
+        )
+    }
+
+    /// The same write, under a recipe id the caller already holds.
+    ///
+    /// A recipe reaches this function only to be hashed, and a projection has
+    /// no recipe to hash: what it holds is the id of the rendition it is
+    /// reproducing, read off that rendition. Recomputing one from its own
+    /// runtime would derive a different `rendition_id` for the same passages,
+    /// which is the one thing a projection may not do — every space's
+    /// `chunk_ref`s are the canonical's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_file_with_recipe_id(
+        &mut self,
+        prepared: PreparedFile,
+        extraction_recipe_id: &str,
+        managed_snapshot_relative_path: Option<&Path>,
+        original_source_provenance: Option<&serde_json::Value>,
+        admitted: bool,
+        reused: bool,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<ManagedDocumentData> {
         let source_sha256 = sha256_file(&prepared.path)?;
         let snapshot = snapshot_id(&source_sha256);
-        let extraction_recipe_id = recipe.id();
+        let extraction_recipe_id = extraction_recipe_id.to_string();
         let descriptors: Vec<ChunkDescriptor> = prepared
             .chunks
             .iter()
@@ -8052,25 +8152,34 @@ impl SemanticIndex {
             .map(Option::flatten)
     }
 
-    /// Every retained snapshot this corpus has admitted, in a stable order.
+    /// Every retained snapshot this corpus has admitted, with the rendition it
+    /// was admitted as, in a stable order.
     ///
     /// The membership authority for a catch-up, deliberately, rather than the
     /// contents of `managed_sources/`: the directory can hold bytes the corpus
     /// never admitted — an interrupted import, a file someone dropped in — and
     /// projecting those would either fail the whole pass or invent membership
     /// the canonical corpus does not have.
-    pub fn managed_admitted_source_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+    ///
+    /// The rendition rides along because a catch-up is a catch-up *to* one:
+    /// the caller has to name which rendition it is projecting before it can
+    /// ask whether that work is already done, and reading it here costs a
+    /// column on a row already being read.
+    pub fn managed_admitted_renditions(&self) -> anyhow::Result<Vec<(PathBuf, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT file_path FROM files
-              WHERE admission_state = 'ready'
+            "SELECT file_path, rendition_id FROM files
+              WHERE admission_state = 'ready' AND rendition_id IS NOT NULL
               ORDER BY source_sha256, id",
         )?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut paths = Vec::new();
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut admitted = Vec::new();
         for row in rows {
-            paths.push(PathBuf::from(row?));
+            let (path, rendition) = row?;
+            admitted.push((PathBuf::from(path), rendition));
         }
-        Ok(paths)
+        Ok(admitted)
     }
 
     /// Read and verify the canonical, vector-free structure of one managed
@@ -8082,20 +8191,25 @@ impl SemanticIndex {
     /// or chunking the source again. The caller supplies `target_path` because
     /// projection indexes may share the canonical immutable snapshot while
     /// retaining their own file-row identity.
+    ///
+    /// The recipe id of that rendition comes back with it, and is not asked
+    /// for. A caller here is *reading* a rendition, not producing one, so it
+    /// has no recipe of its own to assert and nothing to check the answer
+    /// against; writing the passages back under this id is what makes a
+    /// projection's `chunk_ref`s identical to the canonical's by derivation
+    /// rather than by coincidence. It used to take the caller's recipe and
+    /// refuse when the two differed, which turned every runtime recipe change
+    /// — a recognizer installed, an extractor version bumped — into a
+    /// projection that could never be brought level again.
     pub fn managed_file_structure_for_reembedding(
         &self,
         path: &Path,
         target_path: &Path,
-        expected_recipe: &ExtractionRecipe,
-    ) -> anyhow::Result<Option<PreparedFile>> {
+    ) -> anyhow::Result<Option<(PreparedFile, String)>> {
         let Some(document) = self.managed_document_for_path(path)? else {
             return Ok(None);
         };
-        consumer_ensure!(
-            document.extraction_recipe_id == expected_recipe.id(),
-            ConsumerErrorCode::DocumentIndexIncomplete,
-            "canonical rendition uses a different extraction recipe",
-        );
+        let extraction_recipe_id = document.extraction_recipe_id.clone();
         let key = self.path_key_for_known_path(path);
         let full_text: Option<String> = self
             .conn
@@ -8133,15 +8247,18 @@ impl SemanticIndex {
                 )
             })
             .collect();
-        Ok(Some(PreparedFile {
-            path: target_path.to_path_buf(),
-            chunks,
-            full_text,
-            // Part of the rendition being reused, exactly like the chunks
-            // above: re-deriving them would mean extracting the source again,
-            // which is what this whole path exists not to do.
-            retained: self.retained_extraction_for_key(&key.to_string_lossy())?,
-        }))
+        Ok(Some((
+            PreparedFile {
+                path: target_path.to_path_buf(),
+                chunks,
+                full_text,
+                // Part of the rendition being reused, exactly like the chunks
+                // above: re-deriving them would mean extracting the source
+                // again, which is what this whole path exists not to do.
+                retained: self.retained_extraction_for_key(&key.to_string_lossy())?,
+            },
+            extraction_recipe_id,
+        )))
     }
 
     pub fn managed_document_for_import_key(

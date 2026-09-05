@@ -1313,12 +1313,18 @@ impl WorkspaceManager {
         let sources = canonical_context
             .managed_admitted_sources()
             .map_err(anyhow::Error::msg)?;
-        for source in sources {
-            let digest = wilkes_core::embed::identity::sha256_file(&source)?;
+        for (source, rendition) in sources {
+            // Keyed by the rendition, not by the source bytes. The key is
+            // bound to a rendition for the life of the index and nothing can
+            // rebind it, so a key that names less than what it is bound to
+            // becomes a tombstone the moment the unnamed part moves: the
+            // source digest survives a re-extraction, the rendition does not,
+            // and a corpus whose recipe had changed could never bring a
+            // projection level again.
             child
                 .import_managed_projection(
                     corpus_id.to_string(),
-                    format!("space-backfill-{digest}"),
+                    format!("space-backfill-{rendition}"),
                     &canonical_context,
                     source.clone(),
                     serde_json::json!({
@@ -2287,15 +2293,20 @@ mod tests {
         // Catching up is the canonical rendition re-embedded, not re-extracted:
         // the chunk structure comes from the corpus, only the coordinates are
         // the projection's own.
-        let mut prepared = canonical
-            .managed_file_structure_for_reembedding(&document, &document, &recipe)
+        let (mut prepared, canonical_recipe_id) = canonical
+            .managed_file_structure_for_reembedding(&document, &document)
             .unwrap()
             .expect("the canonical rendition is admitted");
+        assert_eq!(
+            canonical_recipe_id,
+            recipe.id(),
+            "the recipe comes from the rendition, not from the projection"
+        );
         prepared.chunks[0].1 = vec![0.0, 1.0];
         projection
-            .write_file_with_recipe(
+            .write_file_with_recipe_id(
                 prepared,
-                &recipe,
+                &canonical_recipe_id,
                 None,
                 None,
                 true,

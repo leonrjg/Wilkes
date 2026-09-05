@@ -2852,13 +2852,6 @@ impl AppContext {
         }
         let source_sha256 = wilkes_core::embed::identity::sha256_file(&canonical_snapshot_path)
             .map_err(|error| format!("Could not verify canonical managed snapshot: {error:#}"))?;
-        let settings = self.settings().await;
-        let recipe = ExtractionRecipe::for_path(
-            &canonical_snapshot_path,
-            &wilkes_core::extract::production_registry(),
-            settings.semantic.chunk_size,
-            settings.semantic.chunk_overlap,
-        );
         let expected_identity = {
             let index_arc = self.index.lock().clone();
             let guard = index_arc
@@ -2874,6 +2867,41 @@ impl AppContext {
                 })?
                 .embedding_space_identity()
                 .map_err(|error| error.to_string())?
+        };
+
+        // The canonical rendition first, because everything below is *about*
+        // it — including whether this import has already been done. It costs a
+        // read of passages already in the database and no extraction, which is
+        // the whole point of this path.
+        //
+        // Its recipe id comes from the rendition and is never recomputed here.
+        // A projection that derived one from its own runtime would write a
+        // different `rendition_id` for the same passages, and every space's
+        // `chunk_ref`s have to be the canonical's.
+        let (mut prepared, canonical_recipe_id) = {
+            let index_arc = canonical.index.lock().clone();
+            let guard = index_arc
+                .lock()
+                .map_err(|_| "Canonical semantic index lock was poisoned")?;
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    ConsumerError::new(
+                        ConsumerErrorCode::ManagedWorkspaceNotFound,
+                        "canonical index is unavailable",
+                    )
+                })?
+                .managed_file_structure_for_reembedding(
+                    &canonical_snapshot_path,
+                    &canonical_snapshot_path,
+                )
+                .map_err(|error| format!("Could not read canonical rendition: {error:#}"))?
+                .ok_or_else(|| {
+                    ConsumerError::new(
+                        ConsumerErrorCode::DocumentIndexIncomplete,
+                        "canonical snapshot is not admitted",
+                    )
+                })?
         };
 
         // Bound to a `let` before the `if let`, not inlined into it. A block
@@ -2892,7 +2920,11 @@ impl AppContext {
             guard
                 .as_ref()
                 .ok_or_else(|| "Managed index unavailable".to_string())?
-                .managed_document_for_import_key(&idempotency_key, &source_sha256, &recipe.id())
+                .managed_document_for_import_key(
+                    &idempotency_key,
+                    &source_sha256,
+                    &canonical_recipe_id,
+                )
                 .map_err(|error| error.to_string())?
         };
         if let Some(existing) = existing {
@@ -2905,33 +2937,6 @@ impl AppContext {
             )
             .await;
         }
-
-        let mut prepared = {
-            let index_arc = canonical.index.lock().clone();
-            let guard = index_arc
-                .lock()
-                .map_err(|_| "Canonical semantic index lock was poisoned")?;
-            guard
-                .as_ref()
-                .ok_or_else(|| {
-                    ConsumerError::new(
-                        ConsumerErrorCode::ManagedWorkspaceNotFound,
-                        "canonical index is unavailable",
-                    )
-                })?
-                .managed_file_structure_for_reembedding(
-                    &canonical_snapshot_path,
-                    &canonical_snapshot_path,
-                    &recipe,
-                )
-                .map_err(|error| format!("Could not read canonical rendition: {error:#}"))?
-                .ok_or_else(|| {
-                    ConsumerError::new(
-                        ConsumerErrorCode::DocumentIndexIncomplete,
-                        "canonical snapshot is not admitted",
-                    )
-                })?
-        };
         if prepared.chunks.is_empty() {
             return Err(ConsumerError::new(
                 ConsumerErrorCode::DocumentIndexIncomplete,
@@ -2982,7 +2987,7 @@ impl AppContext {
                 &expected_identity,
                 &text_hashes,
                 &source_sha256,
-                &recipe.id(),
+                &canonical_recipe_id,
                 label,
             ) {
                 adopted.entry(hash).or_insert(embedding);
@@ -3059,9 +3064,9 @@ impl AppContext {
                 .as_mut()
                 .ok_or_else(|| "Managed index unavailable".to_string())?;
             index
-                .write_file_with_recipe(
+                .write_file_with_recipe_id(
                     prepared,
-                    &recipe,
+                    &canonical_recipe_id,
                     None,
                     Some(&original_source_provenance),
                     true,
@@ -3099,9 +3104,10 @@ impl AppContext {
         crate::commands::preview::preview(match_ref, Some(index)).await
     }
 
-    /// The retained snapshots this managed corpus has admitted — what a
-    /// projection must hold to be level with it.
-    pub fn managed_admitted_sources(&self) -> Result<Vec<PathBuf>, ConsumerError> {
+    /// The retained snapshots this managed corpus has admitted, each with the
+    /// rendition it was admitted as — what a projection must hold to be level
+    /// with it.
+    pub fn managed_admitted_sources(&self) -> Result<Vec<(PathBuf, String)>, ConsumerError> {
         let index_arc = self.index.lock().clone();
         let guard = index_arc
             .lock()
@@ -3109,7 +3115,7 @@ impl AppContext {
         guard
             .as_ref()
             .ok_or_else(|| "Managed index unavailable".to_string())?
-            .managed_admitted_source_paths()
+            .managed_admitted_renditions()
             .map_err(|error| ConsumerError::from_anyhow(&error))
     }
 
