@@ -573,6 +573,121 @@ mod tests {
         }
     }
 
+    /// One worked example as the reading holds it: three prose runs, each
+    /// introducing the displayed formula that follows it.
+    ///
+    /// Verbatim from the corpus this was found in — passages 72 to 77 of a
+    /// cryptography coursebook — because the shape *is* the finding. None of
+    /// the three prose pieces is a sentence without the formula after it.
+    const WORKED_EXAMPLE: [&str; 6] = [
+        "example helps to understand this.\nExample\nConsider two sequences of bits \
+         a=a_{1}a_{2}\\ldots a_{n} and b=b_{1}b_{2}\\ldots b_{n} of equal length n. (If e.g. \
+         n =\n\\theta, then both sequences describe bytes.) Then we define a \u{2295}b as the \
+         bit sequence\n",
+        "Page formula: c=c_{1}c_{2}\\cdots c_{n}.\n",
+        "which is obtained by bitwise addition or XOR of a and b, i.e. for all i=1,  . . . ,  \
+         n we\nhave\n",
+        "Page formula: c_{i}=a_{i}\\oplus b_{i}.\n",
+        "It is now important to note the following, since this property is often used in \
+         encryption\nand decryption: If the bit sequence c is XORed again with b, the result a \
+         is returned,\nexpressed as a formula:\n",
+        "Page formula: (a\\oplus b)\\oplus b=a.\n",
+    ];
+
+    /// That example as one rendition, with the three formulas declared as
+    /// structural blocks or not.
+    fn worked_example(declare_blocks: bool) -> ExtractedContent {
+        let text: String = WORKED_EXAMPLE.concat();
+        let mut spans: Vec<ByteRange> = Vec::new();
+        let mut at = 0usize;
+        for (index, piece) in WORKED_EXAMPLE.iter().enumerate() {
+            if index % 2 == 1 {
+                spans.push(ByteRange {
+                    start: at,
+                    end: at + piece.len(),
+                });
+            }
+            at += piece.len();
+        }
+        let (first, rest) = spans.split_first().expect("three formulas");
+        let mut content = image_content(text, first.start, first.end);
+        for span in rest {
+            let mut image = content.images[0].clone();
+            image.id = format!("p23-v{}", span.start);
+            image.reading_range = Some(span.clone());
+            image.reading_block = Some(span.clone());
+            image.reading_anchor = Some(span.start);
+            content.images.push(image);
+        }
+        if !declare_blocks {
+            for image in content.images.iter_mut() {
+                image.reading_block = None;
+            }
+        }
+        content
+    }
+
+    /// A formula the page displayed is not a seam, and the clause that
+    /// introduces it is not a passage.
+    ///
+    /// Both halves asserted together, because the contrast is the finding: the
+    /// same 659 bytes are six passages when a block is declared over each
+    /// formula and far fewer when none is. Three of the six carry a formula
+    /// and nothing else; the other three end "…as the bit sequence", "we
+    /// have", "expressed as a formula:" and are cut off from what they name.
+    /// A run is chunked alone however little of it there is, and no overlap
+    /// crosses a run boundary, so neither half can reach the other afterwards.
+    #[test]
+    fn a_displayed_formula_does_not_cut_the_clause_that_introduces_it() {
+        let text: String = WORKED_EXAMPLE.concat();
+        let cut = chunk_content(&worked_example(true), PathBuf::from("doc.pdf"), 600, 128);
+        assert_eq!(
+            cut.len(),
+            6,
+            "a block per formula cuts the example into six: {:?}",
+            cut.iter().map(|chunk| &chunk.text).collect::<Vec<_>>()
+        );
+
+        let whole = chunk_content(&worked_example(false), PathBuf::from("doc.pdf"), 600, 128);
+        assert_eq!(
+            whole.len(),
+            2,
+            "the example is two windows of the configured size, not six runs: {:?}",
+            whole.iter().map(|chunk| &chunk.text).collect::<Vec<_>>()
+        );
+        // And the overlap is back: a seam is where a run ends, and a run's
+        // last chunk overlaps nothing after it. Two windows of one run do.
+        assert!(
+            whole[1].byte_range.start < whole[0].byte_range.end,
+            "consecutive windows of one run overlap: {:?} then {:?}",
+            whole[0].byte_range,
+            whole[1].byte_range
+        );
+        for (clause, formula) in [
+            ("as the bit sequence", "c=c_{1}"),
+            ("we\nhave", "c_{i}=a_{i}"),
+            ("expressed as a formula:", "(a\\oplus b)"),
+        ] {
+            assert!(
+                whole
+                    .iter()
+                    .any(|chunk| chunk.text.contains(clause) && chunk.text.contains(formula)),
+                "{clause:?} stays with the formula it introduces: {:?}",
+                whole.iter().map(|chunk| &chunk.text).collect::<Vec<_>>()
+            );
+        }
+
+        for chunks in [&cut, &whole] {
+            ensure_chunks_reconstruct(
+                &text,
+                chunks
+                    .iter()
+                    .map(|chunk| (&chunk.byte_range, chunk.text.as_str())),
+            )
+            .expect("chunks rebuild the reading either way");
+        }
+    }
+
     /// The invariant every consumer of the chunk export rests on, with an
     /// image block in the text: the chunks still rebuild the reading byte for
     /// byte, and every byte belongs to one.
