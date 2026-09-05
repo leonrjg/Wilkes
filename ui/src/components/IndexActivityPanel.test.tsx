@@ -209,16 +209,21 @@ describe("IndexActivityPanel", () => {
     renderPanel(api);
     await waitFor(() => expect(api.indexActivity).toHaveBeenCalledTimes(1));
 
-    // The event is a signal, not a fact: the view re-reads rather than
-    // accumulating, so it is identical whether or not it saw the stream.
-    vi.setSystemTime(new Date(Date.now() + 5000));
-    emit?.({ Build: { files_processed: 2, total_files: 4, done: false } });
-    await waitFor(() => expect(api.indexActivity).toHaveBeenCalledTimes(2));
+    // Past the throttle that keeps a fast build from refetching per document.
+    const real = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(real + 5000);
+    try {
+      // The event is a signal, not a fact: the view re-reads rather than
+      // accumulating, so it is identical whether or not it saw the stream.
+      emit?.({ Build: { files_processed: 2, total_files: 4, done: false } });
+      await waitFor(() => expect(api.indexActivity).toHaveBeenCalledTimes(2));
 
-    // A download event is not this view's business.
-    emit?.({ Download: { bytes_received: 1, total_bytes: 2, done: false } });
-    expect(api.indexActivity).toHaveBeenCalledTimes(2);
-    vi.useRealTimers();
+      // A download event is not this view's business.
+      emit?.({ Download: { bytes_received: 1, total_bytes: 2, done: false } });
+      expect(api.indexActivity).toHaveBeenCalledTimes(2);
+    } finally {
+      clock.mockRestore();
+    }
   });
 });
 

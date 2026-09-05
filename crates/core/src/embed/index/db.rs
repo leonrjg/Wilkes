@@ -24,6 +24,7 @@ use crate::{consumer_bail, consumer_ensure};
 
 use super::super::Embedder;
 use super::chunk::{chunk_content, ensure_chunks_reconstruct, Chunk};
+use super::job::{BuildReporter, DocumentOutcome, DocumentStage};
 use crate::embed::identity::{
     chunk_ref, rendition_id, sha256_bytes, sha256_file, snapshot_id, ChunkDescriptor,
 };
@@ -31,7 +32,6 @@ use crate::embed::{
     ChunkRef, DocumentSnapshotId, EmbeddingSpaceId, EmbeddingSpaceIdentity, ExtractionRecipe,
     IndexEmbeddingMetadata, RenditionId,
 };
-use super::job::{BuildReporter, DocumentOutcome, DocumentStage};
 
 fn system_time_ms(value: SystemTime) -> Option<i64> {
     value
@@ -2758,7 +2758,10 @@ mod tests {
             &[root.join("test.txt")],
             &registry,
             &MockEmbedder,
-            BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
+            BuildOptions::new(
+                BuildReporter::without_journal(tx),
+                Arc::new(AtomicBool::new(false)),
+            ),
             &indexing,
         )
         .unwrap();
@@ -2896,7 +2899,10 @@ mod tests {
             &paths,
             &registry,
             &RecordingEmbedder(log.clone()),
-            BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
+            BuildOptions::new(
+                BuildReporter::without_journal(tx),
+                Arc::new(AtomicBool::new(false)),
+            ),
             &IndexingConfig {
                 chunk_size: 100,
                 chunk_overlap: 0,
@@ -2972,7 +2978,10 @@ mod tests {
                 std::slice::from_ref(&path),
                 &registry,
                 &embedder,
-                BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
+                BuildOptions::new(
+                    BuildReporter::without_journal(tx),
+                    Arc::new(AtomicBool::new(false)),
+                ),
                 &txt_indexing(),
             )
             .unwrap();
@@ -3012,7 +3021,10 @@ mod tests {
                 std::slice::from_ref(&path),
                 &registry,
                 &CountingEmbedder::new(),
-                BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
+                BuildOptions::new(
+                    BuildReporter::without_journal(tx),
+                    Arc::new(AtomicBool::new(false)),
+                ),
                 &txt_indexing(),
             )
             .unwrap()
@@ -3144,7 +3156,10 @@ mod tests {
             &[root_a.join("a.txt")],
             &registry,
             &embedder,
-            BuildOptions::new(BuildReporter::without_journal(tx.clone()), Arc::new(AtomicBool::new(false))),
+            BuildOptions::new(
+                BuildReporter::without_journal(tx.clone()),
+                Arc::new(AtomicBool::new(false)),
+            ),
             &indexing,
         )
         .unwrap();
@@ -3154,7 +3169,10 @@ mod tests {
             &[root_b.join("b.txt")],
             &registry,
             &embedder,
-            BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
+            BuildOptions::new(
+                BuildReporter::without_journal(tx),
+                Arc::new(AtomicBool::new(false)),
+            ),
             &indexing,
         )
         .unwrap();
@@ -3184,7 +3202,10 @@ mod tests {
             std::slice::from_ref(&shared),
             &registry,
             &embedder,
-            BuildOptions::new(BuildReporter::without_journal(tx.clone()), Arc::new(AtomicBool::new(false))),
+            BuildOptions::new(
+                BuildReporter::without_journal(tx.clone()),
+                Arc::new(AtomicBool::new(false)),
+            ),
             &indexing,
         )
         .unwrap();
@@ -3197,7 +3218,10 @@ mod tests {
             std::slice::from_ref(&shared),
             &registry,
             &embedder,
-            BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
+            BuildOptions::new(
+                BuildReporter::without_journal(tx),
+                Arc::new(AtomicBool::new(false)),
+            ),
             &indexing,
         )
         .unwrap();
@@ -3551,7 +3575,10 @@ mod tests {
             std::slice::from_ref(&shared),
             &registry,
             &embedder,
-            BuildOptions::new(BuildReporter::without_journal(tx.clone()), Arc::new(AtomicBool::new(false))),
+            BuildOptions::new(
+                BuildReporter::without_journal(tx.clone()),
+                Arc::new(AtomicBool::new(false)),
+            ),
             &indexing,
         )
         .unwrap();
@@ -3563,7 +3590,10 @@ mod tests {
             std::slice::from_ref(&shared),
             &registry,
             &embedder,
-            BuildOptions::new(BuildReporter::without_journal(tx.clone()), Arc::new(AtomicBool::new(true))),
+            BuildOptions::new(
+                BuildReporter::without_journal(tx.clone()),
+                Arc::new(AtomicBool::new(true)),
+            ),
             &indexing,
         );
         assert!(cancelled.is_err());
@@ -3580,7 +3610,10 @@ mod tests {
             std::slice::from_ref(&shared),
             &registry,
             &embedder,
-            BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
+            BuildOptions::new(
+                BuildReporter::without_journal(tx),
+                Arc::new(AtomicBool::new(false)),
+            ),
             &indexing,
         )
         .unwrap();
@@ -3637,7 +3670,10 @@ mod tests {
             &[root.join("test.txt")],
             &registry,
             &WrongDimEmbedder,
-            BuildOptions::new(BuildReporter::without_journal(tx), Arc::new(AtomicBool::new(false))),
+            BuildOptions::new(
+                BuildReporter::without_journal(tx),
+                Arc::new(AtomicBool::new(false)),
+            ),
             &indexing,
         )
         .unwrap();
@@ -4579,12 +4615,9 @@ impl SemanticIndex {
             };
             match idx.write_file_with_recipe(prepared, &file.recipe, None, None, false, false, None)
             {
-                Ok(_) => settled.push((
-                    file.path,
-                    DocumentOutcome::Indexed,
-                    None,
-                    Some(chunk_count),
-                )),
+                Ok(_) => {
+                    settled.push((file.path, DocumentOutcome::Indexed, None, Some(chunk_count)))
+                }
                 Err(e) => {
                     error!(
                         "[SemanticIndex::build] skipping {}: failed to write index entry: {e:#}",
@@ -4947,12 +4980,12 @@ impl SemanticIndex {
         // A build that did not reach the end of its list cannot speak for the
         // documents it never looked at, and neither can one that was only ever
         // given part of the root.
-        let membership = if stopped || embed_failure.is_some() || options.scope == BuildScope::Subset
-        {
-            RootMembership::Additive
-        } else {
-            RootMembership::Authoritative
-        };
+        let membership =
+            if stopped || embed_failure.is_some() || options.scope == BuildScope::Subset {
+                RootMembership::Additive
+            } else {
+                RootMembership::Authoritative
+            };
 
         idx.finish_active_root_build()?;
         idx.validate_embedding_space(&embedding_identity)?;
@@ -8162,8 +8195,7 @@ impl SemanticIndex {
         let mut chunks = Vec::with_capacity(rows.len());
         let mut descriptors = Vec::with_capacity(rows.len());
         for (expected_ordinal, row) in rows.into_iter().enumerate() {
-            let (stored_ref, ordinal, text, stored_text_sha256, byte_start, byte_end, origin) =
-                row;
+            let (stored_ref, ordinal, text, stored_text_sha256, byte_start, byte_end, origin) = row;
             consumer_ensure!(
                 ordinal >= 0 && ordinal as usize == expected_ordinal,
                 ConsumerErrorCode::DocumentIndexIncomplete,

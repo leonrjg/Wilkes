@@ -451,12 +451,7 @@ impl IndexJobJournal {
 
     /// Move a document to a stage. Its outcome stays `Pending` — a stage is
     /// where it is, not what became of it.
-    pub fn note_stage(
-        &self,
-        job_id: i64,
-        path: &Path,
-        stage: DocumentStage,
-    ) -> anyhow::Result<()> {
+    pub fn note_stage(&self, job_id: i64, path: &Path, stage: DocumentStage) -> anyhow::Result<()> {
         self.conn.execute(
             "UPDATE job_documents SET stage = ?3, updated_at_ms = ?4
              WHERE job_id = ?1 AND path = ?2",
@@ -527,12 +522,7 @@ impl IndexJobJournal {
     }
 
     /// End a job. `detail` is kept verbatim for `Failed`.
-    pub fn finish(
-        &self,
-        job_id: i64,
-        state: JobState,
-        detail: Option<&str>,
-    ) -> anyhow::Result<()> {
+    pub fn finish(&self, job_id: i64, state: JobState, detail: Option<&str>) -> anyhow::Result<()> {
         anyhow::ensure!(
             state.is_terminal(),
             "finish() needs a terminal state, got {}",
@@ -565,9 +555,9 @@ impl IndexJobJournal {
     }
 
     fn counts_for(&self, job_id: i64) -> anyhow::Result<JobCounts> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT outcome, COUNT(*) FROM job_documents WHERE job_id = ?1 GROUP BY outcome")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT outcome, COUNT(*) FROM job_documents WHERE job_id = ?1 GROUP BY outcome",
+        )?;
         let rows = stmt
             .query_map(params![job_id], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
@@ -980,7 +970,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut journal = IndexJobJournal::open(dir.path()).unwrap();
         let root = PathBuf::from("/corpus");
-        let job = journal.begin(&root, &paths(&["/corpus/a.pdf", "/corpus/b.pdf"])).unwrap();
+        let job = journal
+            .begin(&root, &paths(&["/corpus/a.pdf", "/corpus/b.pdf"]))
+            .unwrap();
 
         let summary = journal.job(job).unwrap().unwrap();
         assert_eq!(summary.state, JobState::Running);
@@ -999,15 +991,25 @@ mod tests {
         let b = PathBuf::from("/corpus/b.pdf");
         let job = journal.begin(&root, &[a.clone(), b.clone()]).unwrap();
 
-        journal.note_stage(job, &a, DocumentStage::ReadingFigures).unwrap();
+        journal
+            .note_stage(job, &a, DocumentStage::ReadingFigures)
+            .unwrap();
         let docs = journal.documents(job, None, 10).unwrap();
         let row = docs.iter().find(|d| d.path == a).unwrap();
         assert_eq!(row.stage, DocumentStage::ReadingFigures);
         assert_eq!(row.outcome, DocumentOutcome::Pending);
 
-        journal.note_outcome(job, &a, DocumentOutcome::Indexed, None, Some(12)).unwrap();
         journal
-            .note_outcome(job, &b, DocumentOutcome::Failed, Some("mupdf: broken xref"), None)
+            .note_outcome(job, &a, DocumentOutcome::Indexed, None, Some(12))
+            .unwrap();
+        journal
+            .note_outcome(
+                job,
+                &b,
+                DocumentOutcome::Failed,
+                Some("mupdf: broken xref"),
+                None,
+            )
             .unwrap();
 
         let summary = journal.job(job).unwrap().unwrap();
@@ -1016,7 +1018,9 @@ mod tests {
         assert_eq!(summary.counts.pending, 0);
         assert!(!summary.has_remaining_work());
 
-        let failed = journal.documents(job, Some(DocumentOutcome::Failed), 10).unwrap();
+        let failed = journal
+            .documents(job, Some(DocumentOutcome::Failed), 10)
+            .unwrap();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].path, b);
         assert_eq!(failed[0].error.as_deref(), Some("mupdf: broken xref"));
@@ -1060,7 +1064,13 @@ mod tests {
                 .note_outcome(job, &all[0], DocumentOutcome::Indexed, None, Some(2))
                 .unwrap();
             journal
-                .note_outcome(job, &all[1], DocumentOutcome::Failed, Some("no reader"), None)
+                .note_outcome(
+                    job,
+                    &all[1],
+                    DocumentOutcome::Failed,
+                    Some("no reader"),
+                    None,
+                )
                 .unwrap();
             // No finish(): the process is gone mid-job.
         }
@@ -1106,7 +1116,13 @@ mod tests {
             .note_outcome(first, &all[0], DocumentOutcome::Indexed, None, Some(4))
             .unwrap();
         journal
-            .note_outcome(first, &all[1], DocumentOutcome::Failed, Some("no reader"), None)
+            .note_outcome(
+                first,
+                &all[1],
+                DocumentOutcome::Failed,
+                Some("no reader"),
+                None,
+            )
             .unwrap();
         journal.finish(first, JobState::Cancelled, None).unwrap();
 
@@ -1121,7 +1137,10 @@ mod tests {
             "the continuation still describes the whole corpus"
         );
         assert_eq!(summary.counts.pending, 1, "only the unread one is work");
-        assert_eq!(summary.counts.indexed, 1, "the saved one is carried, not redone");
+        assert_eq!(
+            summary.counts.indexed, 1,
+            "the saved one is carried, not redone"
+        );
         assert_eq!(summary.counts.failed, 1, "and so is the failure");
 
         // The failure is still retryable, from the new job.
@@ -1168,7 +1187,10 @@ mod tests {
             .unwrap();
 
         let summary = journal.job(retry).unwrap().unwrap();
-        assert_eq!(summary.counts.failed, 0, "the failure is being re-attempted");
+        assert_eq!(
+            summary.counts.failed, 0,
+            "the failure is being re-attempted"
+        );
         assert_eq!(summary.counts.pending, 1);
         assert_eq!(summary.counts.indexed, 1, "the rest is still accounted for");
         assert_eq!(summary.total_documents, 2);
@@ -1195,7 +1217,10 @@ mod tests {
             .begin_continuing(&root, &all[1..2], Some(first))
             .unwrap();
         let summary = journal.job(second).unwrap().unwrap();
-        assert_eq!(summary.total_documents, 2, "one reused verdict, one document");
+        assert_eq!(
+            summary.total_documents, 2,
+            "one reused verdict, one document"
+        );
         assert_eq!(summary.counts.reused, 1);
         assert_eq!(summary.counts.pending, 1);
     }
@@ -1221,7 +1246,9 @@ mod tests {
     fn finish_refuses_a_non_terminal_state() {
         let dir = tempdir().unwrap();
         let mut journal = IndexJobJournal::open(dir.path()).unwrap();
-        let job = journal.begin(&PathBuf::from("/c"), &paths(&["/c/a"])).unwrap();
+        let job = journal
+            .begin(&PathBuf::from("/c"), &paths(&["/c/a"]))
+            .unwrap();
         let err = journal.finish(job, JobState::Running, None).unwrap_err();
         assert!(err.to_string().contains("terminal state"));
     }
@@ -1260,7 +1287,11 @@ mod tests {
         // The newest begin() prunes; one running job is then added on top.
         let running = journal.begin(&root, &paths(&["/corpus/a"])).unwrap();
         let recent = journal.recent(100).unwrap();
-        assert!(recent.len() <= HISTORY_PER_ROOT + 1, "history is bounded: {}", recent.len());
+        assert!(
+            recent.len() <= HISTORY_PER_ROOT + 1,
+            "history is bounded: {}",
+            recent.len()
+        );
         assert!(recent.iter().any(|j| j.id == running));
         assert!(journal.job(ids[0]).unwrap().is_none(), "oldest was pruned");
     }
@@ -1286,8 +1317,12 @@ mod tests {
     fn forgetting_a_root_leaves_other_roots_intact() {
         let dir = tempdir().unwrap();
         let mut journal = IndexJobJournal::open(dir.path()).unwrap();
-        let a = journal.begin(&PathBuf::from("/a"), &paths(&["/a/1"])).unwrap();
-        let b = journal.begin(&PathBuf::from("/b"), &paths(&["/b/1"])).unwrap();
+        let a = journal
+            .begin(&PathBuf::from("/a"), &paths(&["/a/1"]))
+            .unwrap();
+        let b = journal
+            .begin(&PathBuf::from("/b"), &paths(&["/b/1"]))
+            .unwrap();
         journal.forget_root(&PathBuf::from("/a")).unwrap();
         assert!(journal.job(a).unwrap().is_none());
         assert!(journal.job(b).unwrap().is_some());
@@ -1336,7 +1371,10 @@ mod tests {
             assert_eq!(DocumentStage::from_str(stage.as_str()), stage);
         }
         // Unknown strings decay to the safest reading rather than panicking.
-        assert_eq!(DocumentOutcome::from_str("nonsense"), DocumentOutcome::Pending);
+        assert_eq!(
+            DocumentOutcome::from_str("nonsense"),
+            DocumentOutcome::Pending
+        );
         assert_eq!(JobState::from_str("nonsense"), JobState::Running);
         assert_eq!(DocumentStage::from_str("nonsense"), DocumentStage::Queued);
     }

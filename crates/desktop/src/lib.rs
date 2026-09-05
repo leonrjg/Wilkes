@@ -451,7 +451,9 @@ async fn retry_failed_documents_for_ctx(
     selected: SelectedEmbedder,
 ) -> Result<(), String> {
     info!("desktop::retry_failed_documents_for_ctx: root={root}");
-    Arc::clone(&ctx).retry_failed_documents(root, selected).await
+    Arc::clone(&ctx)
+        .retry_failed_documents(root, selected)
+        .await
 }
 
 /// What this build can embed with, as one answer.

@@ -17,11 +17,13 @@ use wilkes_core::completion::{
 use wilkes_core::directory_watcher::{DirectoryChangeBatch, DirectoryWatcher};
 use wilkes_core::embed::cluster::WardTree;
 use wilkes_core::embed::index::db::{
-    ChunkAccumulation, ManagedChunkData, ManagedDocumentData, TopicChunkData,
+    BuildScope, ChunkAccumulation, ManagedChunkData, ManagedDocumentData, TopicChunkData,
     TopicCoveragePrototype,
 };
 use wilkes_core::embed::index::semantic_updater::process_directory_change;
-use wilkes_core::embed::index::SemanticIndex;
+use wilkes_core::embed::index::{
+    BuildReporter, DocumentOutcome, IndexActivity, IndexJobJournal, JobState, SemanticIndex,
+};
 use wilkes_core::embed::installer::EmbedderInstaller;
 use wilkes_core::embed::{dispatch, ChunkRef, Embedder, ExtractionRecipe};
 use wilkes_core::generate::engines::dispatch as generate_dispatch;
@@ -44,10 +46,6 @@ use wilkes_core::integrations::zotero::model::ZoteroItem;
 use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::metadata::doi::find_dois;
-use wilkes_core::embed::index::db::BuildScope;
-use wilkes_core::embed::index::{
-    BuildReporter, DocumentOutcome, IndexActivity, IndexJobJournal, JobState,
-};
 use wilkes_core::models::progress::EmbedProgress;
 use wilkes_core::types::{
     Bookmark, BookmarkCluster, BookmarkClustersQuery, BookmarkClustersResult, ChunkTopic,
@@ -6759,9 +6757,10 @@ impl AppContext {
             root,
             selected.engine.as_str(),
             selected.model.model_id(),
-            documents
-                .as_ref()
-                .map_or_else(|| "whole root".to_string(), |s| s.documents.len().to_string())
+            documents.as_ref().map_or_else(
+                || "whole root".to_string(),
+                |s| s.documents.len().to_string()
+            )
         );
         let plan = match self.prepare_build_index(&root, &selected, documents).await {
             Ok(plan) => plan,
@@ -7285,9 +7284,7 @@ impl AppContext {
 
             let job = ctx.begin_job(&plan.root_path, &documents, plan.continues);
             let reporter = match job.clone() {
-                Some((journal, job_id)) => {
-                    BuildReporter::journalled(progress_tx, journal, job_id)
-                }
+                Some((journal, job_id)) => BuildReporter::journalled(progress_tx, journal, job_id),
                 None => BuildReporter::without_journal(progress_tx),
             };
 
@@ -10308,7 +10305,13 @@ mod tests {
             let mut guard = journal.lock().unwrap();
             let job = guard.begin(&root, &[root.join("a.txt")]).unwrap();
             guard
-                .note_outcome(job, &root.join("a.txt"), DocumentOutcome::Indexed, None, Some(1))
+                .note_outcome(
+                    job,
+                    &root.join("a.txt"),
+                    DocumentOutcome::Indexed,
+                    None,
+                    Some(1),
+                )
                 .unwrap();
             guard.finish(job, JobState::Completed, None).unwrap();
         }
@@ -10350,7 +10353,12 @@ mod tests {
         let root = dir.path().join("corpus");
         std::fs::create_dir_all(&root).unwrap();
         journal_a_stopped_job(&ctx, &root);
-        assert!(ctx.index_activity(root.clone()).await.unwrap().job.is_some());
+        assert!(ctx
+            .index_activity(root.clone())
+            .await
+            .unwrap()
+            .job
+            .is_some());
 
         // The coverage has to exist for deleting it to mean anything.
         drop(
@@ -10366,7 +10374,11 @@ mod tests {
 
         ctx.delete_index(Some(root.clone())).await.unwrap();
         assert!(
-            ctx.index_activity(root.clone()).await.unwrap().job.is_none(),
+            ctx.index_activity(root.clone())
+                .await
+                .unwrap()
+                .job
+                .is_none(),
             "the job history goes with the coverage it describes"
         );
     }

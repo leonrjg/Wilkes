@@ -2450,7 +2450,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/embed/build", post(build_index_handler))
         .route("/api/embed/activity", get(index_activity_handler))
         .route("/api/embed/continue", post(continue_index_job_handler))
-        .route("/api/embed/retry-failed", post(retry_failed_documents_handler))
+        .route(
+            "/api/embed/retry-failed",
+            post(retry_failed_documents_handler),
+        )
         .route("/api/embed/index", delete(delete_index_handler))
         .route("/api/embed/cancel", delete(cancel_embed_handler))
         // Worker
