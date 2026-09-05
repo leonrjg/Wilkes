@@ -140,6 +140,40 @@ The in-app chat continues to use its own private, session-scoped MCP server.
 Changing the external bind address or port, or rotating its token, does not
 affect open Wilkes chat sessions.
  
+## Deep links
+
+Other applications can send a reader straight to a document in Wilkes with a
+`wilkes://` link — a "Read on Wilkes" button, the same way an `obsidian://`
+link reaches a note.
+
+```
+wilkes://open?path=<absolute path>
+             [&workspace=<workspace id or name>]
+             [&page=<1-based page>]
+             [&line=<1-based line>[&col=<1-based column>]]
+```
+
+`workspace` decides which window opens:
+
+- **Without it**, the link names a file and nothing else, and it opens in the
+  standalone reader — the same window a file opened from Finder or Explorer
+  lands in. No workspace is switched and nothing about the running session
+  changes. This is the right form for an application that knows where a
+  document is on disk but not which library holds it.
+- **With it**, the link names a document *in a library*. Wilkes switches to
+  that workspace, makes the root containing the document the visible one, and
+  opens it in the main window exactly as a click in the file list would. The
+  workspace may be given by id or by name. A path outside every root of that
+  workspace is refused: the main window can only show what its library serves.
+
+`page` addresses a PDF and `line` a text document; naming both, or naming a
+page of something that is not a PDF, is refused rather than silently opened at
+the top. Every value must be percent-encoded — a path most of all.
+
+Wilkes is a single instance: a link clicked while it is already running is
+handled by the running application, and one clicked while it is not launches
+it and is honoured once the workspace has loaded.
+
 ## Interface
 <img width="1312" height="903" alt="image" src="https://github.com/user-attachments/assets/d2018970-5270-467d-9cc5-49a00ad5fa53" />
 <img width="1263" height="845" alt="SCR-20260410-sbcv" src="https://github.com/user-attachments/assets/8967b389-ad7b-4c2b-8724-c3cd4959b8be" />

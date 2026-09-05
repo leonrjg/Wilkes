@@ -94,8 +94,8 @@ export class TauriSearchApi implements SearchApi {
     return invoke<DocumentMetadata>("get_standalone_file_metadata", { path });
   }
 
-  async documentWindowReady(): Promise<NativeOpenRequest[]> {
-    return invoke<NativeOpenRequest[]>("document_window_ready");
+  async nativeOpenReady(): Promise<NativeOpenRequest[]> {
+    return invoke<NativeOpenRequest[]>("native_open_ready");
   }
 
   async onNativeOpen(handler: (request: NativeOpenRequest) => void): Promise<() => void> {

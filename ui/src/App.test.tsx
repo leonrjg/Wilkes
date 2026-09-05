@@ -29,6 +29,8 @@ vi.mock("./services", () => ({
       active_workspace_id: "workspace-1",
       workspaces: [{ id: "workspace-1", name: "Default", roots: [], active_root: "/test/dir" }],
     })),
+    onNativeOpen: vi.fn(() => Promise.resolve(() => {})),
+    nativeOpenReady: vi.fn(() => Promise.resolve([])),
     listTags: vi.fn(() => Promise.resolve([])),
     listSmartCollections: vi.fn(() => Promise.resolve([])),
     isGenerationReady: vi.fn(() => Promise.resolve(false)),
@@ -456,5 +458,86 @@ describe("App", () => {
 
     await vi.waitFor(() => expect(source.readClipboardFiles).toHaveBeenCalledTimes(1));
     expect(source.importFiles).not.toHaveBeenCalled();
+  });
+  describe("wilkes:// links that name a workspace", () => {
+    const CORPUS = {
+      id: "workspace-2",
+      name: "Corpus",
+      roots: ["/corpus"],
+      active_root: "/corpus",
+      read_only: false,
+      managed_by: null,
+    };
+    const DEFAULT_WORKSPACE = {
+      id: "workspace-1",
+      name: "Default",
+      roots: ["/test/dir"],
+      active_root: "/test/dir",
+      read_only: false,
+      managed_by: null,
+    };
+
+    /** Render with both libraries registered and one link already queued for
+     *  this window, which is how a link that launched the app arrives. */
+    async function openLink(request: Record<string, unknown>) {
+      vi.mocked(api.listWorkspaces).mockResolvedValue({
+        active_workspace_id: "workspace-1",
+        workspaces: [DEFAULT_WORKSPACE, CORPUS],
+      } as never);
+      vi.mocked(api.nativeOpenReady!).mockResolvedValue([request as never]);
+      const switchTo = vi.fn().mockResolvedValue(undefined);
+      const openFile = vi.fn();
+      useWorkspaceStore.setState({ switchTo });
+      useViewerStore.setState({ openFile });
+
+      render(
+        <ToastProvider>
+          <App />
+        </ToastProvider>,
+      );
+      await waitFor(() => expect(api.nativeOpenReady).toHaveBeenCalled());
+      return { switchTo, openFile, setDirectory: useSettingsStore.getState().setDirectory };
+    }
+
+    it("switches to that library, shows its root and opens the page named", async () => {
+      const origin = { PdfPage: { page: 7, bbox: null } };
+      const { switchTo, openFile, setDirectory } = await openLink({
+        paths: ["/corpus/book.pdf"],
+        errors: [],
+        workspace: "Corpus",
+        origin,
+      });
+
+      await waitFor(() => expect(switchTo).toHaveBeenCalledWith("workspace-2"));
+      await waitFor(() => expect(openFile).toHaveBeenCalledWith("/corpus/book.pdf", origin));
+      expect(setDirectory).toHaveBeenCalledWith("/corpus");
+    });
+
+    /** A document outside every root of the library the link named is not one
+     *  this window can show coherently: the file list would not contain it. */
+    it("refuses a document the named library does not serve", async () => {
+      const { switchTo, openFile } = await openLink({
+        paths: ["/elsewhere/book.pdf"],
+        errors: [],
+        workspace: "workspace-2",
+        origin: null,
+      });
+
+      expect(await screen.findByText(/is not in the "Corpus" library/)).toBeInTheDocument();
+      expect(switchTo).not.toHaveBeenCalled();
+      expect(openFile).not.toHaveBeenCalled();
+    });
+
+    it("says so when no library here answers to the name the link used", async () => {
+      const { openFile } = await openLink({
+        paths: ["/corpus/book.pdf"],
+        errors: [],
+        workspace: "Someone else's",
+        origin: null,
+      });
+
+      expect(await screen.findByText(/No library here is called/)).toBeInTheDocument();
+      expect(openFile).not.toHaveBeenCalled();
+    });
   });
 });

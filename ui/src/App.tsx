@@ -24,8 +24,10 @@ import { useCatalogueStore } from "./stores/useCatalogueStore";
 import { useActiveWorkspaceReadOnly, useWorkspaceStore } from "./stores/useWorkspaceStore";
 import { activeViewerTab, useViewerStore } from "./stores/useViewerStore";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
+import { useNativeOpen } from "./hooks/useNativeOpen";
+import { pathIsWithinRoot } from "./lib/configuredRoots";
 import { api, source, isTauri } from "./services";
-import type { AgentBackend } from "./lib/types";
+import type { AgentBackend, NativeOpenRequest } from "./lib/types";
 import type { DesktopSourceApi, PathKind, WebSourceApi } from "./services/api";
 
 export default function App() {
@@ -79,6 +81,7 @@ export default function App() {
   const activeViewerPath = useViewerStore((state) => activeViewerTab(state)?.path ?? null);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(320);
   const [bookmarksWidth, setBookmarksWidth] = useState(320);
   const [topicsWidth, setTopicsWidth] = useState(340);
@@ -98,8 +101,71 @@ export default function App() {
     loadWorkspaces()
       .then(() => Promise.all([loadSettings(), loadBookmarks()]))
       .then(() => restoreViewerSession())
-      .catch(console.error);
+      .catch(console.error)
+      // Even a failed load ends the wait. A link held back forever is the one
+      // outcome with nothing to show for it; a link answered against an empty
+      // workspace list at least says which library it could not find.
+      .finally(() => setWorkspaceLoaded(true));
   }, [loadWorkspaces, loadSettings, loadBookmarks, restoreViewerSession]);
+
+  /**
+   * A `wilkes://` link that named a workspace, opened here as a click in the
+   * file list would have opened it: the workspace it belongs to becomes the
+   * active one, its root becomes the visible root, and the document is shown
+   * at the place the link asked for.
+   *
+   * The link has to name a document this workspace actually serves. A path
+   * outside every root of it is not a document the main window can show
+   * coherently — the file list would not contain it and search would not
+   * reach it — so it is refused here rather than opened into a session that
+   * disagrees with the sidebar beside it.
+   */
+  const openFromLink = useCallback(
+    (request: NativeOpenRequest) => {
+      for (const error of request.errors) addToast(error, { type: "error" });
+      const path = request.paths[0];
+      if (!path) return;
+      if (!request.workspace) {
+        // The host routes a request naming no workspace to the standalone
+        // reader, so one arriving here has lost its address on the way.
+        console.error("An open request with no workspace reached the main window:", request);
+        addToast("Could not tell which library that link meant", { type: "error" });
+        return;
+      }
+      const named = request.workspace;
+      const { workspaces, activeWorkspaceId, switchTo } = useWorkspaceStore.getState();
+      const target =
+        workspaces.find((workspace) => workspace.id === named) ??
+        workspaces.find((workspace) => workspace.name.toLowerCase() === named.toLowerCase());
+      if (!target) {
+        addToast(`No library here is called "${named}"`, { type: "error" });
+        return;
+      }
+      const root = target.roots.find((candidate) => pathIsWithinRoot(path, candidate));
+      if (!root) {
+        addToast(`${path} is not in the "${target.name}" library`, { type: "error" });
+        return;
+      }
+      void (async () => {
+        try {
+          if (target.id !== activeWorkspaceId) await switchTo(target.id);
+        } catch (error) {
+          console.error("Could not switch to the workspace a link named:", error);
+          addToast(`Could not open the "${target.name}" library`, { type: "error" });
+          return;
+        }
+        setDirectory(root);
+        openFile(path, request.origin);
+      })();
+    },
+    [addToast, openFile, setDirectory],
+  );
+
+  useNativeOpen(
+    isTauri && workspaceLoaded,
+    openFromLink,
+    useCallback((message: string) => addToast(message, { type: "error" }), [addToast]),
+  );
 
   useEffect(() => {
     setFileFilterText("");

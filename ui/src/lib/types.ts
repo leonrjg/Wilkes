@@ -69,12 +69,22 @@ export interface StartupStatus {
   blockers: StartupBlocker[];
 }
 
-/** A file-open request authorized by the operating system. Invalid operands
- * remain visible so a multi-file request is never partially discarded without
- * explanation. */
+/** A request to show a document that came from outside the application: a
+ * file the operating system handed over, or a `wilkes://` link clicked in
+ * another one. Invalid operands remain visible so a multi-file request is
+ * never partially discarded without explanation.
+ *
+ * The host decides which window receives one, and `workspace` is the same
+ * fact read from the other side: a request that names no workspace is a
+ * document and nothing else, and reaches the standalone reader. */
 export interface NativeOpenRequest {
   paths: string[];
   errors: string[];
+  /** The workspace a link named, by id or by name. */
+  workspace: string | null;
+  /** Where in `paths[0]` to land. Only ever set for a single-path request;
+   *  `null` opens the document wherever a plain file open would. */
+  origin: SourceOrigin | null;
 }
 
 /** "Hybrid" is the combined mode: the exact lane and the semantic lane run

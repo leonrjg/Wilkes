@@ -81,12 +81,15 @@ export interface DataPaths {
 // Shared across desktop and web. All methods are identical.
 export interface SearchApi {
   getStartupStatus(): Promise<StartupStatus>;
-  /** Desktop document-window bridge. These are absent from the HTTP surface,
+  /** Desktop external-open bridge. These are absent from the HTTP surface,
    * where the operating system cannot launch a local file into the page. */
   getGlobalSettings?(): Promise<Settings>;
   previewStandalone?(matchRef: MatchRef): Promise<PreviewData>;
   getStandaloneFileMetadata?(path: string): Promise<DocumentMetadata>;
-  documentWindowReady?(): Promise<NativeOpenRequest[]>;
+  /** Announce that this window is listening, and take what arrived before it
+   * was. Answered per window, so the standalone reader and the main window
+   * each drain only what was addressed to them. */
+  nativeOpenReady?(): Promise<NativeOpenRequest[]>;
   onNativeOpen?(handler: (request: NativeOpenRequest) => void): Promise<() => void>;
   search(
     query: SearchQuery,

@@ -6,6 +6,7 @@ import type {
   DocumentMetadata,
   MatchRef,
   PreviewData,
+  SourceOrigin,
   ViewerMetadataStatus,
 } from "../lib/types";
 import { useSettingsStore } from "./useSettingsStore";
@@ -54,7 +55,7 @@ interface ViewerStore {
   enterStandaloneMode: () => void;
   switchWorkspace: (workspaceId: string) => Promise<void>;
   openMatch: (match: MatchRef) => void;
-  openFile: (path: string) => void;
+  openFile: (path: string, origin?: SourceOrigin | null) => void;
   activateTab: (id: string) => void;
   retryTab: (id: string) => void;
   reportTabLoadError: (id: string, error: unknown) => void;
@@ -482,7 +483,11 @@ export const useViewerStore = create<ViewerStore>()(
         ensureTabLoaded(id);
       },
 
-      openFile: (path) => get().openMatch(directFileMatch(path)),
+      // An origin is where the caller was told to land -- a link naming a
+      // page, say. Without one the file is opened wherever a plain open goes,
+      // which is the only place the path itself can say.
+      openFile: (path, origin) =>
+        get().openMatch(origin ? { path, origin } : directFileMatch(path)),
 
       activateTab: (id) => {
         if (!get().tabs.some((tab) => tab.id === id)) return;

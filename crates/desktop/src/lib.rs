@@ -59,9 +59,14 @@ fn get_startup_status(app: AppHandle) -> StartupStatus {
     app.state::<Arc<DesktopStartupState>>().status()
 }
 
+/// The calling window says it is listening, and takes whatever arrived
+/// before it was. Every window that shows external open requests calls this
+/// -- the standalone reader and the main window alike -- so the readiness
+/// handshake is one mechanism keyed by which window is asking.
 #[tauri::command]
-fn document_window_ready(app: AppHandle) -> Vec<NativeOpenRequest> {
-    app.state::<NativeOpenState>().mark_ready_and_drain()
+fn native_open_ready(window: tauri::WebviewWindow, app: AppHandle) -> Vec<NativeOpenRequest> {
+    app.state::<NativeOpenState>()
+        .mark_ready_and_drain(window.label())
 }
 
 #[tauri::command]
@@ -967,13 +972,12 @@ async fn update_settings_with_listeners(
 }
 
 fn handle_exit_event(app_handle: &AppHandle, event: tauri::RunEvent) {
+    // macOS delivers both kinds through `application:openURLs:` -- files the
+    // user opened with Wilkes, and `wilkes://` links clicked elsewhere -- so
+    // this is the one runtime entry point for either on this platform.
     #[cfg(target_os = "macos")]
     if let tauri::RunEvent::Opened { urls } = &event {
-        if let Err(error) =
-            native_open::deliver(app_handle, native_open::request_from_urls(urls.clone()))
-        {
-            error!("native file-open delivery failed: {error}");
-        }
+        native_open::deliver_all(app_handle, native_open::requests_from_urls(urls.clone()));
     }
 
     if matches!(
@@ -2105,13 +2109,13 @@ pub fn run() {
         // This must remain the first plugin: on Windows and Linux it owns the
         // handoff from a second OS "Open With" launch to this process.
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
-            let request = native_open::request_from_args(
-                args.into_iter().map(OsString::from).collect(),
-                std::path::Path::new(&cwd),
+            native_open::deliver_all(
+                app,
+                native_open::requests_from_args(
+                    args.into_iter().map(OsString::from).collect(),
+                    std::path::Path::new(&cwd),
+                ),
             );
-            if let Err(error) = native_open::deliver(app, request) {
-                error!("single-instance file-open delivery failed: {error}");
-            }
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -2211,19 +2215,19 @@ pub fn run() {
                 }
             });
 
-            let initial_request = native_open::request_from_args(
-                std::env::args_os().collect(),
-                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            native_open::deliver_all(
+                &handle,
+                native_open::requests_from_args(
+                    std::env::args_os().collect(),
+                    &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                ),
             );
-            if let Err(error) = native_open::deliver(&handle, initial_request) {
-                error!("initial file-open delivery failed: {error}");
-            }
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_startup_status,
-            document_window_ready,
+            native_open_ready,
             get_global_settings,
             preview_standalone,
             get_standalone_file_metadata,

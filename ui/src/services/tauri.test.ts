@@ -45,17 +45,23 @@ describe("TauriSearchApi", () => {
       path: matchRef.path,
     });
 
-    (invoke as any).mockResolvedValueOnce([{ paths: [matchRef.path], errors: [] }]);
-    await api.documentWindowReady();
-    expect(invoke).toHaveBeenLastCalledWith("document_window_ready");
+    const queued = {
+      paths: [matchRef.path],
+      errors: [],
+      workspace: null,
+      origin: null,
+    };
+    (invoke as any).mockResolvedValueOnce([queued]);
+    await api.nativeOpenReady();
+    expect(invoke).toHaveBeenLastCalledWith("native_open_ready");
 
     const handler = vi.fn();
     (listen as any).mockResolvedValue(() => {});
     await api.onNativeOpen(handler);
     expect(listen).toHaveBeenCalledWith("native-open", expect.any(Function));
     const eventHandler = (listen as any).mock.calls.at(-1)[1];
-    eventHandler({ payload: { paths: [matchRef.path], errors: [] } });
-    expect(handler).toHaveBeenCalledWith({ paths: [matchRef.path], errors: [] });
+    eventHandler({ payload: queued });
+    expect(handler).toHaveBeenCalledWith(queued);
   });
 
   it("should call invoke for getSettings", async () => {

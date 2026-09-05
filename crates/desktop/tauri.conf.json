@@ -82,6 +82,13 @@
       "../worker/requirements.txt": "requirements.txt"
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["wilkes"]
+      }
+    }
+  },
   "app": {
     "windows": [
       {

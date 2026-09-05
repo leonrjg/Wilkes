@@ -1,7 +1,8 @@
-import { useEffect } from "react";
+import { useCallback, useEffect } from "react";
 import PreviewPane from "./components/PreviewPane";
 import { useToasts } from "./components/Toast";
 import { api } from "./services";
+import { useNativeOpen } from "./hooks/useNativeOpen";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useViewerStore } from "./stores/useViewerStore";
 import type { NativeOpenRequest } from "./lib/types";
@@ -26,44 +27,25 @@ export default function DocumentApp() {
     };
   }, [addToast]);
 
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-
-    const openRequest = (request: NativeOpenRequest) => {
-      if (disposed) return;
-      for (const error of request.errors) {
-        addToast(error, { type: "error" });
-      }
-      const viewer = useViewerStore.getState();
-      for (const path of request.paths) viewer.openFile(path);
-    };
-
-    const connect = async () => {
-      if (!api.onNativeOpen || !api.documentWindowReady) {
-        addToast("Native file opening is unavailable in this build", { type: "error" });
-        return;
-      }
-      const nextUnlisten = await api.onNativeOpen(openRequest);
-      if (disposed) {
-        nextUnlisten();
-        return;
-      }
-      unlisten = nextUnlisten;
-      const queued = await api.documentWindowReady();
-      for (const request of queued) openRequest(request);
-    };
-
-    connect().catch((error) => {
-      console.error("Could not connect the native file-open bridge:", error);
-      if (!disposed) addToast("Could not receive files from the operating system", { type: "error" });
-    });
-
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [addToast]);
+  // Nothing here needs loading before a document can be shown, so this
+  // window is ready as soon as it exists.
+  useNativeOpen(
+    true,
+    useCallback(
+      (request: NativeOpenRequest) => {
+        for (const error of request.errors) addToast(error, { type: "error" });
+        const viewer = useViewerStore.getState();
+        // The origin belongs to the first path and only to it: a link names
+        // one document, and a multi-file open from the operating system names
+        // no place inside any of them.
+        request.paths.forEach((path, index) =>
+          viewer.openFile(path, index === 0 ? request.origin : null),
+        );
+      },
+      [addToast],
+    ),
+    useCallback((message: string) => addToast(message, { type: "error" }), [addToast]),
+  );
 
   return (
     <main className="h-screen min-h-0 overflow-hidden bg-[var(--bg-app)] text-[var(--text-main)]">

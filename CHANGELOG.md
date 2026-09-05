@@ -4,6 +4,22 @@
 
 ### Added
 
+- Other applications can send a reader straight to a document with a
+  `wilkes://open?path=...` link — a "Read on Wilkes" button, the way an
+  `obsidian://` link reaches a note. A link that names only a path opens the
+  standalone reader, which is what a file opened from Finder already does and
+  disturbs nothing about the running session. A link that also names a
+  workspace opens the main window instead: Wilkes switches to that workspace,
+  makes the root holding the document visible, and opens it as a click in the
+  file list would. `page` and `line` land the reader inside the document.
+
+  Naming a workspace is therefore what asks for the library, and it is the
+  only thing that does. A place the document cannot have — a page of something
+  that is not a PDF, a path outside every root of the workspace named — is
+  refused and said out loud rather than opened somewhere else, because a
+  reader who followed a link to page 40 has no way to notice they were given
+  page 1.
+
 - Long indexing runs have an activity view, under Settings › Activity. It names
   the document being read and the stage it is at, how much is already saved, and
   which documents need attention — with the reader's own error kept verbatim
