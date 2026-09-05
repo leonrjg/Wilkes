@@ -122,8 +122,8 @@ New commands: `index_activity`, `continue_index_job`, `retry_failed_documents`
 
 ## Verification
 
-- `cargo test --workspace` — all green (core 976 + 6 ignored, api 247, desktop
-  54, agent 71, server).
+- `cargo test --workspace` — all green: core 977 passed (6 ignored), api 247,
+  desktop 54, agent 71.
 - `cargo clippy --workspace --all-targets` — zero errors; no new warnings (the
   one I introduced, a complex tuple type, is fixed).
 - `npx tsc --noEmit` — clean.
@@ -134,6 +134,12 @@ New tests: 6 in `job.rs` for durable state, interruption and inheritance; 3 in
 adds-nothing case; 6 in `context.rs` for continue/retry selection, the activity
 report and history deletion; 2 delegate tests in `desktop`; 10 in
 `IndexActivityPanel.test.tsx`; 2 service-layer tests.
+
+One note on the working tree: the schedule carried a list of six files with
+uncommitted changes as of 00:57. By the time this ran they were already yours in
+`f3364d6..5bd9211` — six commits you made before turning in — so nothing of
+yours was in the tree when I started, and nothing of yours was swept into my
+commits. My first commit contains two files, both new.
 
 ## Not done, and why
 
