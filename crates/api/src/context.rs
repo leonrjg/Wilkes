@@ -10181,6 +10181,174 @@ mod tests {
         assert!(user.ensure_writable().is_ok());
     }
 
+    /// Record a finished job whose documents ended three different ways, as an
+    /// interrupted build would leave them.
+    fn journal_a_stopped_job(ctx: &Arc<AppContext>, root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let saved = root.join("saved.pdf");
+        let broke = root.join("broke.pdf");
+        let never = root.join("never.pdf");
+        let journal = ctx.job_journal().unwrap();
+        let mut guard = journal.lock().unwrap();
+        let job = guard
+            .begin(root, &[saved.clone(), broke.clone(), never.clone()])
+            .unwrap();
+        guard
+            .note_outcome(job, &saved, DocumentOutcome::Indexed, None, Some(7))
+            .unwrap();
+        guard
+            .note_outcome(
+                job,
+                &broke,
+                DocumentOutcome::Failed,
+                Some("mupdf: broken xref"),
+                None,
+            )
+            .unwrap();
+        guard.finish(job, JobState::Cancelled, None).unwrap();
+        (saved, broke, never)
+    }
+
+    /// Continuing is over what was never reached. The failure is deliberately
+    /// not in it: a document that broke the reader breaks it again, and a
+    /// continuation that swept failures up would re-attempt it forever.
+    #[tokio::test]
+    async fn continuing_selects_only_the_documents_never_reached() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("corpus");
+        let (_saved, _broke, never) = journal_a_stopped_job(&ctx, &root);
+
+        let remaining = ctx
+            .job_documents_with_outcome(&root, DocumentOutcome::Pending)
+            .unwrap();
+        assert_eq!(remaining, vec![never]);
+    }
+
+    /// Retrying is its own set, and its own act.
+    #[tokio::test]
+    async fn retrying_selects_only_the_documents_that_failed() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("corpus");
+        let (_saved, broke, _never) = journal_a_stopped_job(&ctx, &root);
+
+        let failed = ctx
+            .job_documents_with_outcome(&root, DocumentOutcome::Failed)
+            .unwrap();
+        assert_eq!(failed, vec![broke]);
+    }
+
+    /// The activity view reports the work that was saved, the failure with its
+    /// error, and the fact that there is more to do — after the process that
+    /// ran the job is gone.
+    #[tokio::test]
+    async fn activity_reports_saved_failed_and_remaining_after_the_job_ended() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("corpus");
+        let (saved, broke, never) = journal_a_stopped_job(&ctx, &root);
+
+        let activity = ctx.index_activity(root.clone()).await.unwrap();
+        let job = activity.job.expect("the stopped job is reported");
+        assert_eq!(job.state, JobState::Cancelled);
+        assert!(job.state.stopped_early());
+        assert_eq!(job.counts.saved(), 1);
+        assert_eq!(job.counts.failed, 1);
+        assert_eq!(job.counts.pending, 1);
+        assert!(job.has_remaining_work());
+
+        let by_path = |p: &Path| {
+            activity
+                .documents
+                .iter()
+                .find(|d| d.path == p)
+                .unwrap_or_else(|| panic!("{} is missing from the activity view", p.display()))
+                .clone()
+        };
+        assert_eq!(by_path(&saved).outcome, DocumentOutcome::Indexed);
+        assert_eq!(by_path(&never).outcome, DocumentOutcome::Pending);
+        let failed = by_path(&broke);
+        assert_eq!(failed.outcome, DocumentOutcome::Failed);
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("mupdf: broken xref"),
+            "the error is kept verbatim, not summarised away"
+        );
+    }
+
+    /// Neither action invents work. Offering "continue" or "retry" for a root
+    /// that has nothing to continue or retry is how a button that does nothing
+    /// gets shipped.
+    #[tokio::test]
+    async fn continuing_and_retrying_refuse_when_there_is_nothing_to_do() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("corpus");
+        let selected = SelectedEmbedder::default_for(EmbeddingEngine::Candle);
+        {
+            let journal = ctx.job_journal().unwrap();
+            let mut guard = journal.lock().unwrap();
+            let job = guard.begin(&root, &[root.join("a.txt")]).unwrap();
+            guard
+                .note_outcome(job, &root.join("a.txt"), DocumentOutcome::Indexed, None, Some(1))
+                .unwrap();
+            guard.finish(job, JobState::Completed, None).unwrap();
+        }
+
+        let err = Arc::clone(&ctx)
+            .continue_index_job(root.to_string_lossy().into_owned(), selected.clone())
+            .await
+            .unwrap_err();
+        assert!(err.contains("no remaining work"), "{err}");
+
+        let err = Arc::clone(&ctx)
+            .retry_failed_documents(root.to_string_lossy().into_owned(), selected)
+            .await
+            .unwrap_err();
+        assert!(err.contains("No documents failed"), "{err}");
+    }
+
+    /// A root nobody has indexed has no job to continue, and says so rather
+    /// than starting one silently.
+    #[tokio::test]
+    async fn continuing_a_root_with_no_recorded_job_reports_that() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("never-indexed");
+        let err = Arc::clone(&ctx)
+            .continue_index_job(
+                root.to_string_lossy().into_owned(),
+                SelectedEmbedder::default_for(EmbeddingEngine::Candle),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("No indexing job has been recorded"), "{err}");
+    }
+
+    /// Deleting a root's index deletes the report about it. A history that
+    /// outlived its index would offer to continue into a database that is gone.
+    #[tokio::test]
+    async fn deleting_a_root_forgets_its_job_history() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("corpus");
+        std::fs::create_dir_all(&root).unwrap();
+        journal_a_stopped_job(&ctx, &root);
+        assert!(ctx.index_activity(root.clone()).await.unwrap().job.is_some());
+
+        // The coverage has to exist for deleting it to mean anything.
+        drop(
+            SemanticIndex::create(
+                &ctx.data_dir,
+                "activity-test-model",
+                2,
+                EmbeddingEngine::Candle,
+                Some(&root),
+            )
+            .unwrap(),
+        );
+
+        ctx.delete_index(Some(root.clone())).await.unwrap();
+        assert!(
+            ctx.index_activity(root.clone()).await.unwrap().job.is_none(),
+            "the job history goes with the coverage it describes"
+        );
+    }
+
     fn running_embed_task() -> EmbedTaskHandle {
         EmbedTaskHandle {
             operation: EmbedOperation::Build,
