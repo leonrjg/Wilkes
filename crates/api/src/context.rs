@@ -614,9 +614,17 @@ pub struct ManagedDocumentExport {
     pub dimension: usize,
     pub passage_input_recipe: String,
     pub outline: Vec<ExportedOutlineEntry>,
-    /// What this document's extraction had to decide for itself — which pages
-    /// clustered into a body column and which were too ambiguous to reorder,
-    /// what was removed as furniture, how the wrap hyphens resolved.
+    /// What the read that anchored `outline` had to decide for itself — which
+    /// pages clustered into a body column and which were too ambiguous to
+    /// reorder, what was removed as furniture, how the wrap hyphens resolved.
+    ///
+    /// **The outline read's, not the imported rendition's.** They are the same
+    /// document read twice, and the same on every counter above; they differ
+    /// on the recognition counters, which are zero here because an outline
+    /// read runs no recognizer. Reporting the rendition's would mean either
+    /// storing them when it was written or extracting the document a second
+    /// time with the model — and the second is what this field used to do,
+    /// silently, on every managed import.
     pub extraction: wilkes_core::types::ExtractionDiagnostics,
     pub chunks: Vec<ChunkExport>,
     pub embedding_work: ManagedEmbeddingWork,
@@ -911,6 +919,11 @@ pub struct ExportedOutlineEntry {
     pub chunk_ordinal: usize,
     /// The locator as the document expressed it, kept for display.
     pub page: Option<u32>,
+    /// The offset in the reading the *outline* was read from, which for a PDF
+    /// is the document's own glyphs and not the enriched text these chunks
+    /// carry. Display and provenance only: `chunk_ordinal` is the position in
+    /// this export, and is what a consumer segments by. See
+    /// [`wilkes_core::types::OutlineEntry::byte_offset`].
     pub byte_offset: Option<usize>,
     /// What established `byte_offset` — the rung of the resolution ladder that
     /// answered. A consumer segmenting by this outline needs it to know which
@@ -1063,6 +1076,9 @@ pub const MAX_FIGURE_EDGE: u32 = 4096;
 pub struct FileOutlineExport {
     pub file_path: PathBuf,
     pub outline: Vec<wilkes_core::types::OutlineEntry>,
+    /// The outline read's own decisions. It runs no recognizer, so its
+    /// recognition counters are zero for every document; see
+    /// [`wilkes_core::types::DeclaredOutline`].
     pub extraction: wilkes_core::types::ExtractionDiagnostics,
 }
 
@@ -1120,6 +1136,10 @@ trait OutlineChunk {
     fn outline_ordinal(&self) -> usize;
     fn outline_byte_range(&self) -> &wilkes_core::types::ByteRange;
     fn outline_origin(&self) -> &wilkes_core::types::SourceOrigin;
+    /// The chunk's text as the rendition holds it. What a bookmark title is
+    /// looked for in, because it is the only material here that belongs to
+    /// the same reading as the chunks being resolved against.
+    fn outline_text(&self) -> &str;
 }
 
 impl OutlineChunk for ExportedChunk {
@@ -1133,6 +1153,10 @@ impl OutlineChunk for ExportedChunk {
 
     fn outline_origin(&self) -> &wilkes_core::types::SourceOrigin {
         &self.chunk.origin
+    }
+
+    fn outline_text(&self) -> &str {
+        &self.chunk.text
     }
 }
 
@@ -1148,14 +1172,48 @@ impl OutlineChunk for ManagedChunkData {
     fn outline_origin(&self) -> &wilkes_core::types::SourceOrigin {
         &self.origin
     }
+
+    fn outline_text(&self) -> &str {
+        &self.text
+    }
 }
 
-/// Position first, page second.
+/// The page a chunk was extracted from, or `None` for an unpaginated format.
+fn chunk_page<T: OutlineChunk>(chunk: &T) -> Option<u32> {
+    match chunk.outline_origin() {
+        wilkes_core::types::SourceOrigin::PdfPage { page, .. } => Some(*page),
+        _ => None,
+    }
+}
+
+/// Paginated documents by page and title; unpaginated ones by offset.
 ///
-/// A byte offset is where the heading is; a page is where the heading's page
-/// starts, which for a heading halfway down a page is up to a page early. Both
-/// are exported, so a consumer can see which one it got and how — the entry's
-/// `anchor` says which rung of the resolution ladder answered.
+/// **Why not by offset for both.** An outline's `byte_offset` is a position in
+/// the reading that produced it, and for a PDF that reading is the page's own
+/// glyphs — the outline is read without an analyzer, because an outline
+/// request must not run inference (see `MuPdfBackend::outline`). The chunks
+/// here come from an index built *with* one, where every recognized formula
+/// and table has superseded the words it covers. The two are the same document
+/// and not the same string: every offset past the first superseded region is
+/// displaced by however much text recognition added, which for a textbook is
+/// most of the book. Comparing them silently puts section boundaries on the
+/// wrong chunk, and does it worst on exactly the documents worth reading.
+///
+/// So for a paginated entry the page is taken as the bound — it is a fact
+/// about the file, and enrichment does not move a heading between pages — and
+/// the title locates the entry inside it, matched against the chunks' own text
+/// with the same normalization the PDF backend anchors by
+/// ([`wilkes_core::extract::outline::title_offset`]). That is the backend's
+/// second rung, asked of the reading the caller actually holds.
+///
+/// An unpaginated document has no enrichment to displace it — there is no
+/// analyzer for a Markdown file and no picture to read — so `TextOffset`
+/// entries keep the exact offset resolution they always had.
+///
+/// A title nothing on the page matches — renumbered, restyled, or set as an
+/// image — falls back to the first chunk at or after its page, which is the
+/// page rung and is where such an entry landed before. Entries that resolve
+/// past the end are dropped: a section that starts nowhere is not a section.
 fn resolve_outline<T: OutlineChunk>(
     outline: &[wilkes_core::types::OutlineEntry],
     chunks: &[T],
@@ -1163,20 +1221,40 @@ fn resolve_outline<T: OutlineChunk>(
     outline
         .iter()
         .filter_map(|entry| {
-            let ordinal = match (entry.byte_offset, entry.page) {
-                (Some(offset), _) => chunks
+            let ordinal = match (entry.page, entry.byte_offset) {
+                (Some(page), _) => {
+                    // The first chunk at or after the entry's page. A bookmark
+                    // pointing at a page whose text was not extracted — a
+                    // scanned appendix — resolves forward to the next page
+                    // that has some, which is where its section's text begins.
+                    let from = chunks
+                        .iter()
+                        .position(|chunk| chunk_page(chunk).is_some_and(|at| at >= page))?;
+                    // Then the title, within that page's own chunks only. A
+                    // heading whose words recur later in the document must not
+                    // pull its section to the recurrence.
+                    let landed = chunk_page(&chunks[from]);
+                    chunks[from..]
+                        .iter()
+                        .take_while(|chunk| chunk_page(*chunk) == landed)
+                        .find(|chunk| {
+                            wilkes_core::extract::outline::title_offset(
+                                chunk.outline_text(),
+                                &entry.title,
+                            )
+                            .is_some()
+                        })
+                        .map_or(
+                            chunks[from].outline_ordinal(),
+                            OutlineChunk::outline_ordinal,
+                        )
+                }
+                (None, Some(offset)) => chunks
                     .iter()
                     .find(|chunk| chunk.outline_byte_range().end > offset)
-                    .map(OutlineChunk::outline_ordinal),
-                (None, Some(page)) => chunks
-                    .iter()
-                    .find(|chunk| match chunk.outline_origin() {
-                        wilkes_core::types::SourceOrigin::PdfPage { page: at, .. } => *at >= page,
-                        _ => false,
-                    })
-                    .map(OutlineChunk::outline_ordinal),
-                (None, None) => None,
-            }?;
+                    .map(OutlineChunk::outline_ordinal)?,
+                (None, None) => return None,
+            };
             Some(ExportedOutlineEntry {
                 title: entry.title.clone(),
                 level: entry.level,
@@ -6825,22 +6903,64 @@ impl AppContext {
     }
 
     fn document_summary_input(&self, path: &Path) -> Result<DocumentSummaryInput, String> {
+        // The indexed reading first, and the file only when there is none.
+        // Summarizing an indexed document used to re-extract it from disk —
+        // the whole document, enriched, per press of the button — when the
+        // index already held the text the summary is made of.
+        let text = match self.indexed_document_text(path) {
+            Some(text) => text,
+            None => Self::read_document_text(path)?,
+        };
         Ok(DocumentSummaryInput {
             title: self.document_title(path),
-            text: Self::read_document_text(path)?,
+            text,
         })
     }
 
+    /// This document's text as the index holds it, or `None` when the index is
+    /// absent, does not hold it, or holds a legacy row with nothing stored.
+    ///
+    /// The one place that asks the index this question. Both readers that can
+    /// fall back to the file ask it first, so that a document the index holds
+    /// is never read from disk a second time under a second recipe.
+    fn indexed_document_text(&self, path: &Path) -> Option<String> {
+        let index = self.index.lock();
+        let guard = index.lock().unwrap_or_else(|p| p.into_inner());
+        guard.as_ref().and_then(|idx| {
+            idx.indexed_document_for_path(path)
+                .map_err(|error| {
+                    info!(path = %path.display(), %error, "indexed text read failed");
+                    error
+                })
+                .ok()
+                .flatten()
+                .map(|(text, _)| text)
+                .filter(|text| !text.trim().is_empty())
+        })
+    }
+
+    /// Read a document for a summary or a citation label, off the index.
+    ///
+    /// **Never enriches.** Both callers reach this only when the index cannot
+    /// answer — an unindexed file, or a legacy row with no stored text — and
+    /// neither is a place the user asked to spend a document's worth of
+    /// inference: one is a summary button, the other is a citation label being
+    /// filled in. Enriching here meant a recognition worker started behind a
+    /// spinner that said nothing about it, for a read whose result is one
+    /// paragraph of prose.
+    ///
+    /// The recipe therefore differs from the index's, and the previous comment
+    /// here was right that this is a second answer to what the document says.
+    /// The answer to that is above, in the callers: both consult the indexed
+    /// reading first and only land here when there is none to consult. Where
+    /// the index holds the document, the index is what is read.
     fn read_document_text(path: &Path) -> Result<String, String> {
         let text = if path
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
         {
-            // The configured registry, not a bare extractor: a summary read
-            // under a different recipe from the index's is a second answer to
-            // what this document says.
-            wilkes_core::extract::production_registry()
+            wilkes_core::extract::native_text_registry()
                 .find(path, None)
                 .ok_or_else(|| format!("No extractor for {}", path.display()))?
                 .extract(path)
@@ -6858,23 +6978,8 @@ impl AppContext {
     /// off the async runtime so citation labels still work without an index
     /// rebuild.
     async fn citation_reference_text(&self, path: &Path) -> Option<String> {
-        let indexed = {
-            let index = self.index.lock();
-            let guard = index.lock().unwrap_or_else(|p| p.into_inner());
-            guard.as_ref().and_then(|idx| {
-                idx.indexed_document_for_path(path)
-                    .map_err(|error| {
-                        info!(path = %path.display(), %error, "citation text index read failed");
-                        error
-                    })
-                    .ok()
-                    .flatten()
-                    .map(|(text, _)| text)
-                    .filter(|text| !text.trim().is_empty())
-            })
-        };
-        if indexed.is_some() {
-            return indexed;
+        if let Some(indexed) = self.indexed_document_text(path) {
+            return Some(indexed);
         }
 
         let path = path.to_path_buf();
@@ -8044,11 +8149,14 @@ impl AppContext {
     /// re-extract them live on every query; fill them once, in the background,
     /// off the index lock. Self-limiting: a cheap no-op query once nothing is
     /// stale, so it is safe to run on every load (startup and runtime toggle).
+    ///
+    /// Safe to run unattended because it runs no inference: the backfill reads
+    /// with the native-text registry it builds itself, and there is no
+    /// registry to pass it. See `SemanticIndex::backfill_missing_full_text`.
     fn spawn_full_text_backfill(&self) {
         let index_arc = Arc::clone(&*self.index.lock());
         tokio::task::spawn_blocking(move || {
-            let registry = wilkes_core::extract::production_registry();
-            let filled = SemanticIndex::backfill_missing_full_text(&index_arc, &registry);
+            let filled = SemanticIndex::backfill_missing_full_text(&index_arc);
             if filled > 0 {
                 info!("full_text backfill: filled {filled} legacy row(s)");
             }
@@ -9169,6 +9277,69 @@ mod tests {
         assert!(resolve_outline(&[entry(None, Some(999))], &chunks).is_empty());
         // No locator at all is not a position either.
         assert!(resolve_outline(&[entry(None, None)], &chunks).is_empty());
+    }
+
+    /// A paginated entry is placed by its page and its title, never by an
+    /// offset into a reading these chunks do not belong to.
+    ///
+    /// The outline is read without an analyzer; these chunks come from an
+    /// index built with one, where recognized formulas and tables displaced
+    /// every offset after the first of them. The byte offsets below are
+    /// therefore deliberately wrong for this rendition — as a real one would
+    /// be — and resolution must not consult them.
+    #[test]
+    fn a_paginated_entry_is_placed_by_page_and_title_not_by_a_stale_offset() {
+        let chunk = |ordinal: usize, page: u32, text: &str| ExportedChunk {
+            chunk: ChunkExport {
+                chunk_ref: ChunkRef(format!("chunk-{ordinal}")),
+                ordinal,
+                text: text.to_string(),
+                text_sha256: String::new(),
+                // Ranges that would resolve every entry below to chunk 0 if
+                // the offset were consulted at all.
+                byte_range: ByteRange {
+                    start: ordinal * 1000,
+                    end: ordinal * 1000 + 1000,
+                },
+                origin: SourceOrigin::PdfPage { page, bbox: None },
+            },
+            embedding: Vec::new(),
+        };
+        let chunks = vec![
+            chunk(0, 3, "Prose that opens the page."),
+            chunk(
+                1,
+                3,
+                "2.1 Methods and materials, in which the work is set out.",
+            ),
+            chunk(2, 4, "Appendix A, which is on the next page."),
+        ];
+        let entry = |title: &str, page: u32| wilkes_core::types::OutlineEntry {
+            title: title.to_string(),
+            level: 0,
+            page: Some(page),
+            byte_offset: Some(0),
+            anchor: wilkes_core::types::OutlineAnchor::DestinationCoordinate,
+        };
+
+        // The title is found on its page: the section starts in that chunk,
+        // not in the first chunk of the page and not where the offset points.
+        let resolved = resolve_outline(&[entry("2.1 Methods", 3)], &chunks);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].chunk_ordinal, 1);
+        // The locator the outline expressed survives alongside the resolution,
+        // stale as it is against this rendition.
+        assert_eq!(resolved[0].byte_offset, Some(0));
+
+        // A title nothing on the page matches — renumbered, restyled, set as
+        // an image — falls back to the page, which is where it landed before.
+        let renamed = resolve_outline(&[entry("Chapter the Second", 3)], &chunks);
+        assert_eq!(renamed[0].chunk_ordinal, 0);
+
+        // And a title that only appears on a *later* page does not pull the
+        // section forward to it: the page is the bound.
+        let elsewhere = resolve_outline(&[entry("Appendix A", 3)], &chunks);
+        assert_eq!(elsewhere[0].chunk_ordinal, 0);
     }
 
     #[tokio::test]

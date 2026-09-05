@@ -359,7 +359,7 @@ mod tests {
             &lane,
             &caller_tx,
             &hybrid_query(dir.path().to_path_buf()),
-            &crate::extract::exact_search_registry(),
+            &crate::extract::native_text_registry(),
             &[],
         )
         .unwrap();
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn a_search_with_no_semantic_lane_still_returns_the_exact_lane() {
-        use crate::extract::exact_search_registry;
+        use crate::extract::native_text_registry;
         use std::fs;
 
         let dir = tempfile::tempdir().unwrap();
@@ -516,7 +516,7 @@ mod tests {
                 collected
             });
             let outcome = provider
-                .search(&query, &exact_search_registry(), tx, &documents)
+                .search(&query, &native_text_registry(), tx, &documents)
                 .unwrap();
             (collector.join().unwrap(), outcome)
         });

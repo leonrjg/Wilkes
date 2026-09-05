@@ -54,8 +54,34 @@ impl PdfBackend for MuPdfBackend {
         })
     }
 
+    /// The document's bookmark tree, anchored in the page's own glyphs.
+    ///
+    /// **No analyzer, whatever this extractor was built with.** Enriching a
+    /// page means detecting its layout and recognizing the areas detection
+    /// marks out — a document's worth of inference, minutes for a textbook —
+    /// and an outline request is not a request to read the document's
+    /// pictures. It arrives from an export endpoint, an MCP tool call or a
+    /// managed import, none of which the user is watching a progress bar for,
+    /// and each of them started a recognition worker that ran to completion
+    /// with nothing on screen to say so. Inference happens where the user
+    /// asked for it, which is an indexing job.
+    ///
+    /// Passing `None` here rather than choosing a registry at the call site is
+    /// deliberate: there were four call sites and all four passed the
+    /// production registry. A rule the caller has to remember is one a fifth
+    /// caller will not.
+    ///
+    /// **What the offsets index.** This reading is the page's own glyphs, so
+    /// an entry's `byte_offset` is a position in *that* reading and not in an
+    /// enriched one, where recognized formulas and tables have superseded the
+    /// words they cover. Which rung of the ladder answered is still exact —
+    /// enrichment does not move a heading, only the text before it — so the
+    /// title, level, page and anchor are the same either way. A consumer
+    /// holding an enriched rendition must therefore resolve these entries
+    /// against it by page and title, not by offset; `resolve_outline` in the
+    /// API crate is the one that does.
     fn outline(&self, path: &Path) -> anyhow::Result<DeclaredOutline> {
-        let document = read_document(path, self.analyzer.as_deref())?;
+        let document = read_document(path, None)?;
         let anchors = PageAnchors::new(&document.reading);
         let mut entries = Vec::new();
         flatten_outline(
@@ -89,12 +115,12 @@ impl PdfBackend for MuPdfBackend {
 
 /// One PDF, read once: the sanitized reading, the metadata, and the open
 /// document the bookmark tree still has to be asked for.
-struct PdfDocument {
+pub(crate) struct PdfDocument {
     doc: Document,
     reading: Reading,
     page_count: u32,
     title: Option<String>,
-    diagnostics: ExtractionDiagnostics,
+    pub(crate) diagnostics: ExtractionDiagnostics,
     images: Vec<ExtractedImage>,
 }
 
@@ -105,7 +131,10 @@ struct PdfDocument {
 /// and there is exactly one of those. Asking for the outline therefore costs
 /// what extraction costs — the price of the offsets being real rather than a
 /// page number wearing an offset's clothes.
-fn read_document(path: &Path, analyzer: Option<&dyn ImageAnalyzer>) -> anyhow::Result<PdfDocument> {
+pub(crate) fn read_document(
+    path: &Path,
+    analyzer: Option<&dyn ImageAnalyzer>,
+) -> anyhow::Result<PdfDocument> {
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?;
@@ -545,7 +574,9 @@ fn anchor_entry(
 
     let page_start = reading.segments[first].text_range.start;
     let page_end = reading.segments[end - 1].text_range.end;
-    if let Some(offset) = title_offset(&reading.text[page_start..page_end], title) {
+    if let Some(offset) =
+        super::super::outline::title_offset(&reading.text[page_start..page_end], title)
+    {
         let absolute = page_start + offset;
         // Snap back to the start of the word the match begins inside, so a
         // section begins at a word and not in the middle of one.
@@ -586,23 +617,6 @@ fn destination_top(kind: DestinationKind) -> Option<f32> {
         | DestinationKind::FitV { .. }
         | DestinationKind::FitBV { .. } => None,
     }
-}
-
-/// The first occurrence of `title` in `text`, matched the way literal PDF
-/// search matches — the same normalization, because the question is the same
-/// one: does this string appear on this page, ignoring how the page set it.
-fn title_offset(text: &str, title: &str) -> Option<usize> {
-    use grep_matcher::Matcher;
-
-    let projection = crate::search::pdf_projection::PdfSearchProjection::new(text);
-    let matcher = crate::search::pdf_projection::literal_matcher(title, false).ok()?;
-    let found = matcher.find(projection.as_bytes()).ok()??;
-    projection
-        .raw_range(crate::types::ByteRange {
-            start: found.start(),
-            end: found.end(),
-        })
-        .map(|range| range.start)
 }
 
 /// Depth-first flattening of the bookmark tree into reading order.
@@ -2023,10 +2037,7 @@ mod tests {
         assert!(content.text.contains(NATIVE_EQUATION));
         assert!(content.images.is_empty());
 
-        let diagnostics = MuPdfBackend::default()
-            .outline(&path)
-            .expect("outline reads")
-            .diagnostics;
+        let diagnostics = read_document(&path, None).expect("reads").diagnostics;
         assert_eq!(diagnostics.typeset_regions_found, 0);
     }
 
@@ -2037,10 +2048,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_pdf(dir.path(), "math.pdf", MATH_PDF_BASE64);
 
+        // Read, not `outline`: an outline is anchored in the page's own
+        // glyphs and marks out no region at all, which is its own test below.
         let read = |latex| {
-            MuPdfBackend::new(Some(Arc::new(FormulaReader::new(latex))))
-                .outline(&path)
-                .expect("outline reads")
+            read_document(&path, Some(&FormulaReader::new(latex)))
+                .expect("reads")
                 .diagnostics
         };
 
@@ -2053,5 +2065,36 @@ mod tests {
         let refused = read(None);
         assert_eq!(refused.typeset_regions_found, 1);
         assert_eq!(refused.typeset_regions_superseded_native_text, 0);
+    }
+
+    /// Asking for a table of contents does not read the document's pictures.
+    ///
+    /// The backend here holds an analyzer that would supersede this page's
+    /// equation, and `extract` does exactly that. `outline` is handed the same
+    /// backend and marks out nothing: no survey, no detection, no crop, no
+    /// recognizer. That is the whole of the guarantee — an outline request
+    /// arrives from an export endpoint or a chat tool call, with no progress
+    /// bar in front of it and no way for a user to stop it, so it must not be
+    /// able to start minutes of inference.
+    #[test]
+    fn an_outline_read_runs_no_analyzer_even_when_the_extractor_has_one() {
+        let dir = tempdir().unwrap();
+        let path = write_pdf(dir.path(), "math.pdf", MATH_PDF_BASE64);
+        let latex = "c_i = a_i \\oplus b_i";
+
+        let backend = MuPdfBackend::new(Some(Arc::new(FormulaReader::new(Some(latex)))));
+        // The same backend, extracting: the region is found and it supersedes.
+        let extracted = backend.extract(&path).expect("extracts");
+        assert!(!extracted.text.contains(NATIVE_EQUATION));
+
+        let diagnostics = backend.outline(&path).expect("outline reads").diagnostics;
+        assert_eq!(
+            diagnostics.typeset_regions_found, 0,
+            "an outline read must not survey, detect or recognize anything"
+        );
+        assert_eq!(diagnostics.typeset_regions_superseded_native_text, 0);
+        // And the sanitation half is real: this read happened, and its
+        // diagnostics describe the reading the entries are anchored in.
+        assert_eq!(diagnostics.pages, 1);
     }
 }

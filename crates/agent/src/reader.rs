@@ -20,9 +20,21 @@ fn is_pdf(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
 }
 
+/// The page's own glyphs, never the enriched reading.
+///
+/// A chat tool call is not an indexing job. `get_document_text` and
+/// `fs/read_text_file` arrive mid-conversation, answer within a turn, and are
+/// waited on by a model — none of which is somewhere a user can see that a
+/// recognition worker just started on a four-hundred-page book, or stop it.
+/// Inference belongs to the indexing job the user started and is watching.
+///
+/// So the module's opening claim — the same `ExtractedContent` that backs
+/// search — is once again true: exact search reads with this same registry,
+/// for the same reason, and a chat read now gets what a search gets. What
+/// neither gets is text that exists only inside a picture; the way to have
+/// that is to index the file.
 fn registry() -> ExtractorRegistry {
-    let registry = wilkes_core::extract::production_registry();
-    registry
+    wilkes_core::extract::native_text_registry()
 }
 
 /// Read `path` on a thread of this module's own, never on the caller's.

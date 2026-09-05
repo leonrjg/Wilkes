@@ -481,6 +481,16 @@ pub struct OutlineEntry {
     /// Byte offset into `ExtractedContent.text`. Exact for documents whose
     /// outline lives in the text; for a PDF it is whatever [`OutlineAnchor`]
     /// says it is, and absent when nothing could establish it.
+    ///
+    /// *Into which reading.* A PDF's outline is anchored in the page's own
+    /// glyphs, because reading one must not run inference — so this offset
+    /// indexes the unenriched reading, not one in which recognized formulas
+    /// and tables have superseded the words they cover. The two agree on
+    /// every other field of this entry, and on nothing about this one past
+    /// the document's first recognized region. A consumer holding an
+    /// enriched rendition resolves by `page` and `title` instead; the offset
+    /// is still exported, because for an unenriched consumer it is exact and
+    /// for everyone it says how the entry was found.
     pub byte_offset: Option<usize>,
     /// How `byte_offset` was established — see [`OutlineAnchor`].
     pub anchor: OutlineAnchor,
@@ -510,13 +520,23 @@ pub enum OutlineAnchor {
     Page,
 }
 
-/// One document's declared outline, with what its extraction had to decide.
+/// One document's declared outline, with what the read that anchored it had
+/// to decide.
 ///
 /// The two travel together because they are produced together: resolving a
 /// bookmark to a byte offset means reading the document, and reading the
 /// document is where the sanitation judgements are made. A caller that asks
 /// for the outline is therefore holding the evidence for how good the offsets
 /// it just received are, without a second call to go and find it.
+///
+/// *Of which read.* The outline's, and no other — the page's own glyphs, no
+/// analyzer, because an outline request must not run inference. So the
+/// sanitation counters here are exactly the evidence they were always meant to
+/// be: column clustering, relocated marginalia and joined hyphens are what
+/// decide whether an offset is where the heading is. The recognition counters
+/// are zero, and mean "this read recognized nothing", not "this document holds
+/// nothing to recognize". What an *enriched* read of the document found is a
+/// fact about an indexing job, and is reported by the job that ran it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DeclaredOutline {
     pub entries: Vec<OutlineEntry>,

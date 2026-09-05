@@ -59,10 +59,11 @@ pub trait ContentExtractor: Send + Sync {
 /// parameter here for the same reason — a caller that could pass a different
 /// analyzer would eventually be one that did.
 ///
-/// Exact search is not one of them, and reads with
-/// [`exact_search_registry`] instead; the two callers are separated there
-/// rather than here, so this stays the only place that names the configured
-/// analyzer.
+/// Only a consumer that *produces a rendition* belongs here — an indexing
+/// job, the watcher's incremental update, a managed import. A consumer that
+/// merely wants to read a document reads with [`native_text_registry`]
+/// instead, and the two are separated there rather than here, so this stays
+/// the only place that names the configured analyzer.
 pub fn production_registry() -> ExtractorRegistry {
     let mut registry = ExtractorRegistry::new();
     registry.register(match image::configured() {
@@ -72,32 +73,47 @@ pub fn production_registry() -> ExtractorRegistry {
     registry
 }
 
-/// The extractors exact search reads a PDF with when the index cannot serve
-/// it: the page's own glyphs, and no enrichment, whatever the process's
-/// configured analyzer is.
+/// The extractors a host-side read uses when it must not run inference: the
+/// page's own glyphs, and no enrichment, whatever the process's configured
+/// analyzer is.
 ///
-/// **Why not [`production_registry`].** Enriching a page means detecting its
-/// layout and recognizing the areas that detection marks out — a document's
-/// worth of inference, minutes for a textbook. Exact search asked for that
-/// once per document it could not serve from the index, from inside the
-/// `rayon` loop over the corpus in [`crate::search::grep`], and so a search
-/// over a library whose index was narrower than the search's scope became an
-/// enrichment pass wearing a search's clothes: the log filled with
-/// PP-DocLayoutV2, and the search did not return.
+/// **Why.** Enriching a page means detecting its layout and recognizing the
+/// areas that detection marks out — a document's worth of inference, minutes
+/// for a textbook. That is what an indexing job is: the user starts it,
+/// watches it, and can cancel it by killing the workers running it. Every
+/// other read in the application is somebody asking a question — a search, an
+/// outline, a summary, a chat tool call — and none of them is a request to
+/// spend minutes reading the document's pictures, nor a place the user can
+/// see it happening or stop it.
 ///
-/// That loop is also the shape the worker invariant forbids: a host loop that
-/// submits per item is a loop that starts a worker per item, and a cancel
-/// kills exactly one of them. The unit here cannot be moved into the worker —
-/// the loop is over the corpus, not over one document's pages — so the only
-/// way to hold the invariant is for a search to submit nothing at all.
+/// **The four consumers, and what each of them cost.**
 ///
-/// **What it costs.** A PDF the index does not hold is searched for the text
-/// it typesets, not for text that exists only inside its pictures. That is
-/// the reading [`pdf::PdfExtractor::new`] documents, the count of files that
-/// took it is `live_pdf_fallbacks` in the search outcome, and the way to
-/// search a picture's text is to index the file — which is what the index is
-/// for.
-pub fn exact_search_registry() -> ExtractorRegistry {
+/// - *Exact search* asked for enrichment once per document it could not serve
+///   from the index, from inside the `rayon` loop over the corpus in
+///   [`crate::search::grep`], and so a search over a library whose index was
+///   narrower than the search's scope became an enrichment pass wearing a
+///   search's clothes: the log filled with PP-DocLayoutV2, and the search did
+///   not return. That loop is also the shape the worker invariant forbids: a
+///   host loop that submits per item is a loop that starts a worker per item,
+///   and a cancel kills exactly one of them. The unit here cannot be moved
+///   into the worker — the loop is over the corpus, not over one document's
+///   pages — so the only way to hold the invariant is for a search to submit
+///   nothing at all.
+/// - *Outline reading* ([`document_outline`]) resolved a bookmark tree by
+///   producing the document's reading, and produced an enriched one. Four
+///   call sites, all of them background: two export endpoints, a managed
+///   import and an MCP tool.
+/// - *Summaries and citation labels* re-read a PDF that the index, in the
+///   ordinary case, already holds the text of.
+/// - *The legacy `full_text` backfill*, which runs on every index load, in the
+///   background, over every pre-v4 row at once.
+///
+/// **What it costs.** A PDF read this way is read for the text it typesets,
+/// not for text that exists only inside its pictures. That is the reading
+/// [`pdf::PdfExtractor::new`] documents, the count of files a search took it
+/// for is `live_pdf_fallbacks` in the search outcome, and the way to search a
+/// picture's text is to index the file — which is what the index is for.
+pub fn native_text_registry() -> ExtractorRegistry {
     let mut registry = ExtractorRegistry::new();
     registry.register(Box::new(pdf::PdfExtractor::new()));
     registry
@@ -107,6 +123,13 @@ pub fn exact_search_registry() -> ExtractorRegistry {
 /// registry's extractor where there is one, the plain-text reading where there
 /// is not (`SemanticIndex::extract_content` makes the same two choices, and the
 /// two must not disagree about what a file is).
+///
+/// The registry decides *which* extractor reads the file, not whether that
+/// read runs inference: a PDF outline is anchored in the page's own glyphs
+/// whichever registry is passed, enforced in the backend rather than here —
+/// see `pdf::mupdf::MuPdfBackend::outline`. Callers therefore need not pick,
+/// and a caller that passes the production registry does not thereby start a
+/// recognition worker.
 pub fn document_outline(
     path: &Path,
     extractors: &ExtractorRegistry,
@@ -301,10 +324,12 @@ mod tests {
     /// visible while an analyzer is configured, which is why this test
     /// installs one.
     ///
-    /// The regression it stands against: exact search built its live PDF read
+    /// The regressions it stands against: exact search built its live PDF read
     /// from `production_registry`, so a search over documents the index could
     /// not serve ran layout detection and recognition once per document, from
-    /// inside the loop over the corpus.
+    /// inside the loop over the corpus. Outline reads, summaries, citation
+    /// labels, chat tool reads and the legacy `full_text` backfill each did
+    /// the same thing later, and each of them is now on this side of the line.
     #[test]
     fn exact_search_reads_glyphs_while_production_enriches() {
         struct Enriching;
@@ -336,7 +361,7 @@ mod tests {
         image::configure(Some(std::sync::Arc::new(Enriching)));
 
         let production = production_registry().image_analyzer_identity().to_string();
-        let search = exact_search_registry().image_analyzer_identity().to_string();
+        let search = native_text_registry().image_analyzer_identity().to_string();
 
         image::configure(restore);
 
@@ -346,7 +371,7 @@ mod tests {
         );
         assert_eq!(
             search, "",
-            "an exact search must not reach the configured analyzer"
+            "a native-text read must not reach the configured analyzer"
         );
     }
 

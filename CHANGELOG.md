@@ -242,6 +242,31 @@
 
 ### Fixed
 
+- Reading a document's table of contents no longer runs the recognizers. An
+  outline is anchored in a reading, so producing one meant producing the
+  reading — and it produced the enriched one, which is layout detection and
+  recognition over every page: minutes of inference for a book, started by an
+  export endpoint, a chat tool call or a managed import, with nothing on
+  screen to say it was happening and no way to stop it. Outlines are now read
+  from the page's own glyphs, enforced in the PDF backend rather than left to
+  each of the four callers to remember.
+
+  Four more reads that were never indexing jobs did the same thing and no
+  longer do: document summaries, citation labels, the chat's `get_document_text`
+  and `fs/read_text_file`, and the legacy `full_text` backfill that runs in the
+  background on every index load. Summaries and citation labels now prefer the
+  text the index already holds and only read the file when it holds none.
+  Inference happens where the user asked for it and can watch it: an indexing
+  job.
+
+  What a PDF read this way misses is text that exists only inside its
+  pictures — the same reading exact search has always fallen back to, and the
+  way to have that text is to index the file. Outline entries keep their
+  titles, levels, pages and anchors either way; what changes is that their byte
+  offsets index the unenriched reading, so an export that resolves an outline
+  against indexed chunks now places each entry by its page and title rather
+  than by an offset into a reading those chunks do not belong to.
+
 - A document indexed by the live file watcher now carries the same stable
   passage identities a build writes. The watcher called `write_file` where the
   build calls `write_file_with_recipe`, so a file edited while Wilkes was

@@ -150,7 +150,7 @@ impl SearchHandle {
 /// For `SearchMode::Grep`: `embedder` is ignored. When `grep_use_index` is
 /// enabled, `index` supplies stored PDF text and individual unavailable files
 /// are read live for the glyphs they typeset — see
-/// [`wilkes_core::extract::exact_search_registry`] for why a search's own read
+/// [`wilkes_core::extract::native_text_registry`] for why a search's own read
 /// never enriches.
 /// For `SearchMode::Semantic`: both must be `Some`, otherwise the search returns
 /// an immediate error. The desktop validates presence before calling.
@@ -176,7 +176,7 @@ pub fn start_search(
         // exactly the exact-search live read of a PDF the index cannot serve —
         // once per document, from inside a loop over the corpus, which is why
         // it must not be a read that reaches a model.
-        let registry = wilkes_core::extract::exact_search_registry();
+        let registry = wilkes_core::extract::native_text_registry();
 
         // When enabled, let the exact lane read PDF text the index already holds
         // instead of re-extracting each file. `None` keeps every PDF on the

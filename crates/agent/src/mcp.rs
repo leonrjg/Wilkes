@@ -1007,7 +1007,10 @@ struct GetDocumentOutlineResponse {
     /// The document's declared table of contents. Empty means the document
     /// declares no outline; it is not an extraction failure.
     outline: Vec<wilkes_core::types::OutlineEntry>,
-    /// Per-document extraction decisions made while resolving the outline.
+    /// Per-document extraction decisions made while resolving the outline —
+    /// the outline read's own, which runs no recognizer. Its recognition
+    /// counters are zero for every document; see
+    /// [`wilkes_core::types::DeclaredOutline`].
     extraction: wilkes_core::types::ExtractionDiagnostics,
 }
 

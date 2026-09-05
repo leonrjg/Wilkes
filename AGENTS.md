@@ -84,6 +84,47 @@ crosses. A loop inside a worker over a resident model — `DocLayout::detect_doc
 over a document's pages, `vision::spot_batch` over its images — is where a loop
 belongs, and is not a violation.
 
+## Invariant: inference runs only where the user asked for it
+
+A model runs when the user started a job that runs models — an index build, a
+continuation, a retry, a managed import. Nothing else in the application
+reaches a recognizer or the layout detector, however convenient the reading
+would be.
+
+**Why.** Reading a document with the models is minutes, and the only thing that
+makes minutes acceptable is that the user chose them: they started the build,
+they are watching it name documents, and they can stop it. Every read that
+borrowed that machinery for its own convenience spent the same minutes with
+nothing on screen and no way to stop it — a table of contents asked for by an
+export endpoint, a summary button, a citation label, a chat tool call, a
+legacy-row backfill that ran on every index load. Each was a full document's
+inference, invisible, and the last of them ran unattended at startup.
+
+**How to hold it.**
+- **Two registries, and the name says which.** `production_registry` enriches
+  and belongs to consumers that *produce a rendition*.
+  `native_text_registry` is the page's own glyphs and belongs to everything
+  that merely reads one. A new read starts from the second.
+- **Where a caller could get it wrong, take the choice away.** A PDF outline is
+  anchored without an analyzer inside the backend, whatever registry is passed,
+  because there were four callers and all four passed the production one. The
+  `full_text` backfill takes no registry at all for the same reason.
+- **Prefer what the index already holds.** A document the index has been read
+  once; reading it again from disk is a second answer to what it says as well
+  as a second cost. Summaries and citation labels consult the index first and
+  reach the file only when it holds nothing.
+- **A reading that did not enrich must not report as one that did.** The
+  diagnostics travelling with an outline describe the outline's own read, and
+  its recognition counters are zero because it recognized nothing — which is a
+  different claim from "this document holds nothing to recognize" and is
+  documented as such at every surface that publishes it.
+
+**Boundary.** This is about *starting* models, not about what a reading
+contains. A native-text read finds no text that exists only inside a picture,
+and that is the accepted cost: the way to have that text is to index the file.
+It does not bind `crates/core/examples/*`, where the whole process exists to
+exercise one model.
+
 ## Invariant: every document an indexing job touches has one durable verdict
 
 For every document in an indexing job, exactly one durable record says what the

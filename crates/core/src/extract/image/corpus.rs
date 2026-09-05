@@ -717,16 +717,24 @@ fn extract_scoped(
     )))
     .extract(&path)
     .expect("the fixture extracts");
-    let diagnostics = PdfExtractor::with_image_analyzer(Arc::new(NativeImageAnalyzer::new(
-        Box::new(ScriptedOcr::new(script)),
-        describer.map(|build| build()),
-        scope,
-        // These fixtures are about what a recognizer does with a picture, not
-        // about what marks pictures out.
-        None,
-    )))
-    .outline(&path)
-    .expect("the fixture's outline reads")
+    // The reading's diagnostics, from a reading — not from `outline`, which
+    // this used to ask because `DeclaredOutline` was the only public carrier
+    // of `ExtractionDiagnostics`. It no longer is a carrier of an *enriched*
+    // one: an outline is anchored in the page's own glyphs, precisely so that
+    // asking for a table of contents does not start a recognizer. Asking it
+    // here would report zero of everything these fixtures are about.
+    let diagnostics = crate::extract::pdf::mupdf::read_document(
+        &path,
+        Some(&NativeImageAnalyzer::new(
+            Box::new(ScriptedOcr::new(script)),
+            describer.map(|build| build()),
+            scope,
+            // These fixtures are about what a recognizer does with a picture,
+            // not about what marks pictures out.
+            None,
+        )),
+    )
+    .expect("the fixture reads")
     .diagnostics;
     (content, diagnostics)
 }

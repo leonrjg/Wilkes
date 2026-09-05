@@ -59,6 +59,31 @@ fn heading(line: &str, offset: usize) -> Option<OutlineEntry> {
     })
 }
 
+/// The first occurrence of `title` in `text`, matched the way literal PDF
+/// search matches — the same normalization, because the question is the same
+/// one: does this string appear in this text, ignoring how the page set it.
+///
+/// Shared rather than reimplemented by its second caller. Two consumers ask
+/// it: the PDF backend, locating a bookmark in the page it points at, and
+/// `resolve_outline` in the API crate, locating that same bookmark in the
+/// chunks of an enriched rendition. They must agree — a title the backend
+/// found and the resolver did not would be a section boundary that moved
+/// depending on which of them was asked — and the only way two normalizations
+/// agree is to be one normalization.
+pub fn title_offset(text: &str, title: &str) -> Option<usize> {
+    use grep_matcher::Matcher;
+
+    let projection = crate::search::pdf_projection::PdfSearchProjection::new(text);
+    let matcher = crate::search::pdf_projection::literal_matcher(title, false).ok()?;
+    let found = matcher.find(projection.as_bytes()).ok()??;
+    projection
+        .raw_range(crate::types::ByteRange {
+            start: found.start(),
+            end: found.end(),
+        })
+        .map(|range| range.start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

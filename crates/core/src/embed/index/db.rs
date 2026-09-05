@@ -3170,9 +3170,8 @@ mod tests {
         fs::write(&changed_path, "original body is now longer").unwrap();
 
         let index = Arc::new(Mutex::new(Some(idx)));
-        let registry = ExtractorRegistry::new();
 
-        let filled = SemanticIndex::backfill_missing_full_text(&index, &registry);
+        let filled = SemanticIndex::backfill_missing_full_text(&index);
         assert_eq!(filled, 1, "only the unchanged legacy row is backfilled");
 
         let guard = index.lock().unwrap();
@@ -3192,10 +3191,7 @@ mod tests {
 
         // Idempotent: the filled row is no longer stale and the edited row is
         // still correctly skipped, so a second pass writes nothing.
-        assert_eq!(
-            SemanticIndex::backfill_missing_full_text(&index, &registry),
-            0
-        );
+        assert_eq!(SemanticIndex::backfill_missing_full_text(&index), 0);
     }
 
     #[test]
@@ -6101,6 +6097,16 @@ impl SemanticIndex {
     /// exact (grep) search to re-extract the file live on every query — exactly
     /// the cost the column exists to remove.
     ///
+    /// **Reads with [`native_text_registry`](crate::extract::native_text_registry),
+    /// and takes no registry so that no caller can hand it another one.** This
+    /// runs on every index load, in the background, over every stale row at
+    /// once, with nothing on screen: it is the last place in the application
+    /// that should be starting recognition workers, and it was doing so once
+    /// per legacy PDF. What it stores is therefore the page's own glyphs —
+    /// which is exactly the reading these rows are served by today, since the
+    /// live grep fallback they force reads the same way. Filling them changes
+    /// what a query costs, not what it finds.
+    ///
     /// Only text is written; chunks and embeddings are left untouched. Extraction
     /// runs without holding the index lock — only the initial read of the stale
     /// set and each per-file write briefly take it — so concurrent search stays
@@ -6110,7 +6116,6 @@ impl SemanticIndex {
     /// the number of rows filled.
     pub fn backfill_missing_full_text(
         index: &Arc<std::sync::Mutex<Option<SemanticIndex>>>,
-        extractors: &ExtractorRegistry,
     ) -> usize {
         // Phase 1: snapshot the stale set under a brief lock, then release it so
         // extraction never blocks search.
@@ -6154,6 +6159,9 @@ impl SemanticIndex {
             return 0;
         }
 
+        // Built once for the whole pass, and built here rather than accepted
+        // as an argument: see this function's own doc comment.
+        let extractors = crate::extract::native_text_registry();
         let mut filled = 0usize;
         for (file_id, path, size_bytes, modified_at_ms) in stale {
             // Phase 2: extract with no lock held. Skip files that vanished or
@@ -6165,7 +6173,7 @@ impl SemanticIndex {
             if identity.size_bytes != size_bytes || identity.modified_at_ms != modified_at_ms {
                 continue;
             }
-            let text = match Self::extract_content(&path, extractors) {
+            let text = match Self::extract_content(&path, &extractors) {
                 Ok(content) => content.text,
                 Err(e) => {
                     error!(
