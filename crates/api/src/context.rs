@@ -2646,46 +2646,94 @@ impl AppContext {
     /// model, same width — and after the identity cut it is the whole of what
     /// a space id says. Anything that cannot be answered is answered as
     /// "nothing to adopt", said out loud, and the caller embeds instead.
+    /// Vectors this workspace's index can lend, and — when it can lend none —
+    /// which of the several possible reasons that was.
+    ///
+    /// "0 of 605 chunks adopted" is a number with four causes behind it and no
+    /// way to tell them apart, which is the diagnosability hole this whole
+    /// investigation kept falling into. Each one is named here, at the level
+    /// the count itself is logged at, so a miss explains itself the first time
+    /// rather than after a round trip.
     fn adoptable_vectors(
         &self,
         expected: &wilkes_core::embed::identity::EmbeddingSpaceIdentity,
         text_hashes: &[String],
+        source_sha256: &str,
+        expected_recipe: &str,
         label: &str,
     ) -> std::collections::HashMap<String, Vec<f32>> {
+        let empty = std::collections::HashMap::new;
         let index_arc = self.index.lock().clone();
         let guard = match index_arc.lock() {
             Ok(guard) => guard,
             Err(_) => {
                 tracing::warn!("{label} index lock was poisoned; embedding instead");
-                return std::collections::HashMap::new();
+                return empty();
             }
         };
         let Some(index) = guard.as_ref() else {
-            return std::collections::HashMap::new();
+            tracing::info!("{label} has no index open, so there is nothing to adopt");
+            return empty();
         };
-        match index.embedding_space_id() {
-            Ok(space) if space == expected.id() => {
-                match index.vectors_for_text_hashes(text_hashes) {
-                    Ok(found) => found,
-                    Err(error) => {
-                        tracing::warn!("could not read vectors from {label}: {error:#}");
-                        std::collections::HashMap::new()
-                    }
+        let space = match index.embedding_space_id() {
+            Ok(space) => space,
+            Err(error) => {
+                tracing::info!("{label} names no embedding space, so nothing to adopt: {error}");
+                return empty();
+            }
+        };
+        if space != expected.id() {
+            tracing::info!(
+                "{label} is space {} and this projection is {} ({} {} @{}); nothing to adopt",
+                space.as_str(),
+                expected.id().as_str(),
+                expected.engine.as_str(),
+                expected.model_id,
+                expected.dimension,
+            );
+            return empty();
+        }
+        let found = match index.vectors_for_text_hashes(text_hashes) {
+            Ok(found) => found,
+            Err(error) => {
+                tracing::warn!("could not read vectors from {label}: {error:#}");
+                return empty();
+            }
+        };
+        if found.is_empty() {
+            // Same space, same document, no shared text. That is chunking:
+            // the boundaries moved, so the passages are different passages,
+            // and their vectors are for spans this corpus does not have. Not a
+            // refusal to relax — the two indexes genuinely hold different
+            // things — but the remedy is concrete, so name it.
+            match index.renditions_for_source(source_sha256) {
+                Ok(renditions) if renditions.is_empty() => tracing::info!(
+                    "{label} shares this projection's space but has never indexed this \
+                     document, so there is nothing of it to adopt"
+                ),
+                Ok(renditions) => tracing::info!(
+                    "{label} shares this projection's space and holds this document as {}, \
+                     but under {} — this corpus chunks it as {}, so the passages are \
+                     different passages and no vector is reusable. Match the corpus's chunk \
+                     size and overlap to that workspace's to make them the same passages.",
+                    renditions
+                        .iter()
+                        .map(|(_, chunks)| format!("{chunks} chunks"))
+                        .collect::<Vec<_>>()
+                        .join(" and "),
+                    renditions
+                        .iter()
+                        .map(|(recipe, _)| recipe.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    expected_recipe,
+                ),
+                Err(error) => {
+                    tracing::warn!("could not describe {label}'s renditions: {error:#}")
                 }
             }
-            Ok(space) => {
-                tracing::debug!(
-                    "{label} is space {} and this projection is {}; nothing to adopt",
-                    space.as_str(),
-                    expected.id().as_str()
-                );
-                std::collections::HashMap::new()
-            }
-            Err(error) => {
-                tracing::debug!("{label} names no embedding space, so nothing to adopt: {error}");
-                std::collections::HashMap::new()
-            }
         }
+        found
     }
 
     pub async fn import_managed_projection(
@@ -2819,14 +2867,27 @@ impl AppContext {
             .collect();
         let mut adopted: std::collections::HashMap<String, Vec<f32>> =
             std::collections::HashMap::new();
+        if source_workspace.is_none() {
+            // The import named no library to adopt from — a plain path import,
+            // or a caller that resolved one and did not pass it on. Worth
+            // saying, because it is the difference between "nothing to reuse"
+            // and "nowhere was asked".
+            tracing::info!(
+                "no source workspace was offered for this import, so only this space is asked"
+            );
+        }
         for (label, candidate) in [
             ("source workspace", source_workspace),
             ("this space", Some(self)),
         ] {
             let Some(candidate) = candidate else { continue };
-            for (hash, embedding) in
-                candidate.adoptable_vectors(&expected_identity, &text_hashes, label)
-            {
+            for (hash, embedding) in candidate.adoptable_vectors(
+                &expected_identity,
+                &text_hashes,
+                &source_sha256,
+                &recipe.id(),
+                label,
+            ) {
                 adopted.entry(hash).or_insert(embedding);
             }
         }
@@ -14184,6 +14245,4 @@ exit 0
         assert!(ctx.list_tags().unwrap().is_empty());
         assert!(ctx.list_collections().unwrap().is_empty());
     }
-
-
 }

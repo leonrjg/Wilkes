@@ -444,6 +444,70 @@ mod tests {
         );
     }
 
+    /// Two indexes in one space adopt nothing when they chunk differently,
+    /// and the index can say that is what happened.
+    ///
+    /// This is the case behind "0 of 605 chunks adopted" on a document another
+    /// workspace had already embedded under the very same model. Nothing is
+    /// refusing: the boundaries moved, so the passages are different passages,
+    /// and their vectors are for spans this corpus does not have. The number
+    /// alone cannot distinguish that from a space mismatch or from a document
+    /// the source has never seen, so `renditions_for_source` supplies what
+    /// does.
+    #[test]
+    fn a_source_that_chunked_differently_is_reported_as_such() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("book.txt");
+        fs::write(&file, "one passage").unwrap();
+
+        let identity = EmbeddingSpaceIdentity::with_artifact_revision(
+            EmbeddingEngine::Candle,
+            "model",
+            1,
+            "artifact-sha256:one".to_string(),
+        );
+        let mut source = SemanticIndex::create_exact(root, &identity, Some(root)).unwrap();
+        let their_recipe = ExtractionRecipe::new(400, 0);
+        source
+            .write_file_with_recipe(
+                PreparedFile {
+                    retained: Default::default(),
+                    path: file.clone(),
+                    full_text: "one passage".to_string(),
+                    chunks: vec![(test_chunk(&file, "one passage"), vec![0.5])],
+                },
+                &their_recipe,
+                None,
+                None,
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+        let source_sha256 = sha256_file(&file).unwrap();
+
+        // The corpus asks for text it chunked its own way, and gets nothing —
+        // same space, same document, different spans.
+        let wanted = vec![sha256_bytes(b"one pass"), sha256_bytes(b"age")];
+        assert!(source.vectors_for_text_hashes(&wanted).unwrap().is_empty());
+
+        // And the index can say why: it holds this document, under a recipe
+        // that is not the asking corpus's.
+        let renditions = source.renditions_for_source(&source_sha256).unwrap();
+        assert_eq!(renditions.len(), 1);
+        assert_eq!(renditions[0].0, their_recipe.id());
+        assert_ne!(renditions[0].0, ExtractionRecipe::new(600, 128).id());
+        assert_eq!(renditions[0].1, 1);
+
+        // A document it has never seen reads differently, which is the other
+        // thing the bare count could have meant.
+        assert!(source
+            .renditions_for_source(&sha256_bytes(b"never indexed"))
+            .unwrap()
+            .is_empty());
+    }
+
     /// A chunk written with no vector gets no `vec_chunks` row, and the
     /// passage is indexed all the same.
     ///
@@ -8261,6 +8325,36 @@ impl SemanticIndex {
     /// Materialize an exactly verified whole rendition for copying into a
     /// different index. The returned vectors are owned values; the target will
     /// allocate fresh rowids and never depend on this index's lifecycle.
+    /// What this index holds for one source document, per rendition.
+    ///
+    /// A diagnostic, and it exists because "0 of 605 chunks adopted" is a
+    /// number with several possible causes and no way to tell them apart. Two
+    /// indexes in the same space adopt nothing from each other when they chunk
+    /// the document differently: the boundaries move, so the texts differ, so
+    /// no hash matches — and the vectors genuinely are for different spans,
+    /// which is not a refusal to be relaxed but a fact to be reported.
+    ///
+    /// Returns the extraction recipe each rendition was produced under and how
+    /// many chunks it holds, so a caller that found nothing can say whether
+    /// this index had never seen the document or had chunked it another way.
+    pub fn renditions_for_source(&self, source_sha256: &str) -> anyhow::Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.extraction_recipe_id, COUNT(c.id)
+               FROM files f LEFT JOIN chunks c ON c.file_id = f.id
+              WHERE f.source_sha256 = ?1
+              GROUP BY f.id, f.extraction_recipe_id",
+        )?;
+        let rows = stmt
+            .query_map(params![source_sha256], |row| {
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(recipe, chunks)| (recipe.unwrap_or_else(|| "unrecorded".into()), chunks))
+            .collect())
+    }
+
     /// Vectors this index already holds for the given chunk texts, by hash.
     ///
     /// An embedding is a pure function of its text and its model, so a chunk
