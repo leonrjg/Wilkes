@@ -336,7 +336,16 @@ export interface SourceApi {
 export interface DesktopSourceApi extends SourceApi {
   type: "desktop";
   pickDirectory(): Promise<string | null>;
-  importFiles(paths: string[], root: string, mode: "move" | "copy"): Promise<string[]>;
+  /** Imports into `root`, or into `folder` beneath it when given — created if
+   *  absent. The folder is for things that are not one file: a course is forty
+   *  PDFs that belong together, and loose in the root they are neither
+   *  attributable nor importable alongside a second course. */
+  importFiles(
+    paths: string[],
+    root: string,
+    mode: "move" | "copy",
+    folder?: string,
+  ): Promise<string[]>;
   readClipboardFiles(): Promise<string[]>;
   moveFile(path: string, targetRoot: string): Promise<string>;
   listDirectories(path: string): Promise<string[]>;

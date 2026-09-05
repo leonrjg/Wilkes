@@ -8838,6 +8838,7 @@ dependencies = [
 [[package]]
 name = "wilkes-chat"
 version = "0.1.0"
+source = "git+https://github.com/leonrjg/wilkes-chat?tag=v0.1.0#ca03c9f939440e1ccca08169d556266cd0619d6c"
 dependencies = [
  "agent-client-protocol",
  "anyhow",

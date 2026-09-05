@@ -27,6 +27,7 @@ pub async fn list_files_with_ignore(
     tokio::task::spawn_blocking(move || {
         let mut files = Vec::new();
         let mut omitted = Vec::new();
+        let mut directories = Vec::new();
         let mut builder = WalkBuilder::new(&root);
         builder
             .git_ignore(respect_gitignore)
@@ -37,11 +38,10 @@ pub async fn list_files_with_ignore(
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            if entry
-                .file_type()
-                .map(|t: std::fs::FileType| t.is_file())
-                .unwrap_or(false)
-            {
+            let file_type = entry.file_type();
+            if file_type.map(|kind| kind.is_dir()).unwrap_or(false) && entry.path() != root {
+                directories.push(entry.path().to_path_buf());
+            } else if file_type.map(|kind| kind.is_file()).unwrap_or(false) {
                 match classify_file(
                     entry.path().to_path_buf(),
                     entry.metadata().ok(),
@@ -55,7 +55,12 @@ pub async fn list_files_with_ignore(
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
         omitted.sort_by(|a, b| a.file.path.cmp(&b.file.path));
-        Ok(FileListResponse { files, omitted })
+        directories.sort();
+        Ok(FileListResponse {
+            files,
+            omitted,
+            directories,
+        })
     })
     .await?
 }
@@ -86,6 +91,7 @@ pub async fn list_single_file(
             return Ok(FileListResponse {
                 files: Vec::new(),
                 omitted: Vec::new(),
+                directories: Vec::new(),
             });
         }
         let (mut files, mut omitted) = (Vec::new(), Vec::new());
@@ -93,7 +99,11 @@ pub async fn list_single_file(
             Classified::Searchable(file) => files.push(file),
             Classified::Omitted(entry) => omitted.push(entry),
         }
-        Ok(FileListResponse { files, omitted })
+        Ok(FileListResponse {
+            files,
+            omitted,
+            directories: Vec::new(),
+        })
     })
     .await?
 }
@@ -258,9 +268,19 @@ pub enum FileImportMode {
     Copy,
 }
 
+/// Imports files into `root`, or into a named folder directly beneath it.
+///
+/// `folder` exists because some things are not one file. A course is forty
+/// PDFs that belong together, and importing them loose puts forty
+/// `lecture5.pdf`-shaped names in the root with nothing saying what they
+/// belong to — and refuses the second course outright, since two courses
+/// collide on exactly those names. The folder is created if it is not there
+/// and validated as a single component, so a caller cannot walk out of the
+/// root with it.
 pub async fn import_files_into_root(
     paths: Vec<PathBuf>,
     root: PathBuf,
+    folder: Option<String>,
     supported_extensions: Vec<String>,
     mode: FileImportMode,
 ) -> anyhow::Result<Vec<PathBuf>> {
@@ -275,6 +295,21 @@ pub async fn import_files_into_root(
     if !root_meta.is_dir() {
         anyhow::bail!("Root is not a directory: {}", root.display());
     }
+    // Reuses the name rule the rename path already enforces: one component, no
+    // separators, not `.` or `..`. A second rule here would be a second answer
+    // to "what may a caller call a thing in the root".
+    let root = match folder {
+        Some(name) => {
+            validate_new_file_name(&name)
+                .map_err(|err| anyhow::anyhow!("Import folder name is not usable: {err}"))?;
+            let target = root.join(&name);
+            tokio::fs::create_dir_all(&target).await.map_err(|err| {
+                anyhow::anyhow!("Cannot create import folder {}: {err}", target.display())
+            })?;
+            tokio::fs::canonicalize(&target).await?
+        }
+        None => root,
+    };
 
     let mut imports = Vec::with_capacity(paths.len());
     let mut targets = HashSet::with_capacity(paths.len());
@@ -330,7 +365,14 @@ pub async fn move_files_into_root(
     root: PathBuf,
     supported_extensions: Vec<String>,
 ) -> anyhow::Result<Vec<PathBuf>> {
-    import_files_into_root(paths, root, supported_extensions, FileImportMode::Move).await
+    import_files_into_root(
+        paths,
+        root,
+        None,
+        supported_extensions,
+        FileImportMode::Move,
+    )
+    .await
 }
 
 fn validate_new_file_name(name: &str) -> anyhow::Result<()> {
@@ -366,6 +408,7 @@ mod tests {
         fs::write(root.join("test.txt"), "hello").unwrap();
         fs::write(root.join("test.pdf"), "pdf content").unwrap();
         fs::write(root.join("test.exe"), "executable").unwrap();
+        fs::create_dir_all(root.join("empty/nested")).unwrap();
 
         let extensions = vec!["txt".to_string(), "pdf".to_string()];
         let files = list_files(root.to_path_buf(), extensions, 0).await.unwrap();
@@ -379,6 +422,10 @@ mod tests {
         assert_eq!(
             files.omitted[0].reason,
             OmittedFileReason::UnsupportedExtension
+        );
+        assert_eq!(
+            files.directories,
+            vec![root.join("empty"), root.join("empty/nested")]
         );
     }
 
@@ -646,6 +693,67 @@ mod tests {
         assert_eq!(fs::read_to_string(target).unwrap(), "pdf");
     }
 
+    /// Forty PDFs called `lecture5.pdf` and `ps1.pdf` loose in a root are
+    /// unattributable, and the second course to arrive collides with the first
+    /// on those very names. A course imports as a folder.
+    #[tokio::test]
+    async fn test_import_files_into_root_puts_them_in_a_named_folder() {
+        let source_dir = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let source = source_dir.path().join("lecture5.pdf");
+        fs::write(&source, "pdf").unwrap();
+
+        let imported = import_files_into_root(
+            vec![source.clone()],
+            root_dir.path().to_path_buf(),
+            Some("1.77 Water Quality Control (Spring 2006)".to_string()),
+            vec!["pdf".to_string()],
+            FileImportMode::Move,
+        )
+        .await
+        .unwrap();
+
+        let target = root_dir
+            .path()
+            .join("1.77 Water Quality Control (Spring 2006)")
+            .join("lecture5.pdf");
+        assert!(
+            target.exists(),
+            "the folder is created and the file is in it"
+        );
+        assert_eq!(imported, vec![target.canonicalize().unwrap()]);
+        assert!(!source.exists());
+    }
+
+    /// The folder is a name, not a path. Without this a caller could import
+    /// anywhere the process can write by naming its way out of the root.
+    #[tokio::test]
+    async fn test_import_folder_cannot_escape_the_root() {
+        let source_dir = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let source = source_dir.path().join("paper.pdf");
+        fs::write(&source, "pdf").unwrap();
+
+        for escape in ["../elsewhere", "a/b", "..", "/absolute"] {
+            let error = import_files_into_root(
+                vec![source.clone()],
+                root_dir.path().to_path_buf(),
+                Some(escape.to_string()),
+                vec!["pdf".to_string()],
+                FileImportMode::Copy,
+            )
+            .await
+            .expect_err(&format!("{escape} must be refused"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("Import folder name is not usable"),
+                "{escape}: {error}"
+            );
+        }
+        assert!(source.exists(), "nothing was moved");
+    }
+
     #[tokio::test]
     async fn test_import_files_into_root_copies_supported_files() {
         let source_dir = tempdir().unwrap();
@@ -656,6 +764,7 @@ mod tests {
         let imported = import_files_into_root(
             vec![source.clone()],
             root_dir.path().to_path_buf(),
+            None,
             vec!["pdf".to_string()],
             FileImportMode::Copy,
         )

@@ -25,6 +25,7 @@ const {
   mockListFiles,
   mockUpdateSettings,
   mockDeleteFile,
+  mockMoveFile,
   mockDeletionKind,
   mockIsTauri,
   mockSummarizeSearchResults,
@@ -39,6 +40,7 @@ const {
   mockListFiles: vi.fn().mockResolvedValue({ files: [], omitted: [] }),
   mockUpdateSettings: vi.fn().mockResolvedValue({}),
   mockDeleteFile: vi.fn().mockResolvedValue(undefined),
+  mockMoveFile: vi.fn().mockResolvedValue("/test/target/file.txt"),
   mockDeletionKind: { value: "permanent" as "trash" | "permanent" },
   mockIsTauri: { value: false },
   mockSummarizeSearchResults: vi.fn().mockResolvedValue(undefined),
@@ -59,10 +61,12 @@ vi.mock("../services", () => ({
     onGenerationStream: mockOnGenerationStream,
   },
   source: {
+    type: "desktop",
     get deletionKind() {
       return mockDeletionKind.value;
     },
     deleteFile: mockDeleteFile,
+    moveFile: mockMoveFile,
   },
   get isTauri() {
     return mockIsTauri.value;
@@ -136,10 +140,12 @@ describe("ResultList", () => {
     useSettingsStore.setState({
       fileList: [],
       omittedFileList: [],
+      directoryList: [],
       indexing: false,
       fileSortKey: "filename",
       fileSortDirection: "asc",
       fileDisplayFields: ["size"],
+      fileTreeEnabled: false,
     });
     useResearchStore.setState({
       tags: [],
@@ -160,6 +166,37 @@ describe("ResultList", () => {
   it("renders empty state when no query", () => {
     renderWithToasts();
     expect(screen.getByPlaceholderText("Filter files...")).toBeInTheDocument();
+  });
+
+  it("renders collapsible folders and moves files by drag-and-drop when enabled", async () => {
+    mockIsTauri.value = true;
+    useSettingsStore.setState({
+      directory: "/test",
+      fileTreeEnabled: true,
+      fileList: [
+        { path: "/test/file.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" },
+      ],
+      directoryList: ["/test/target"],
+    });
+    renderWithToasts();
+
+    const target = screen.getByRole("button", { name: "Expand folder target" });
+    const dragged = screen.getByRole("button", { name: /file\.txt/i });
+    expect(dragged).toHaveAttribute("draggable", "true");
+    mockListFiles.mockClear();
+
+    const values = new Map<string, string>();
+    const dataTransfer = {
+      effectAllowed: "none",
+      dropEffect: "none",
+      setData: (type: string, value: string) => values.set(type, value),
+      getData: (type: string) => values.get(type) ?? "",
+    };
+    fireEvent.dragStart(dragged, { dataTransfer });
+    fireEvent.drop(target, { dataTransfer });
+
+    await waitFor(() => expect(mockMoveFile).toHaveBeenCalledWith("/test/file.txt", "/test/target"));
+    await waitFor(() => expect(mockListFiles).toHaveBeenCalledWith("/test"));
   });
 
   it("discloses every HyDE passage used for semantic search", () => {

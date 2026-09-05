@@ -4256,6 +4256,7 @@ impl AppContext {
         &self,
         paths: Vec<PathBuf>,
         root: PathBuf,
+        folder: Option<String>,
         mode: crate::commands::files::FileImportMode,
     ) -> anyhow::Result<Vec<PathBuf>> {
         self.ensure_writable().map_err(anyhow::Error::msg)?;
@@ -4282,6 +4283,7 @@ impl AppContext {
         let imported = crate::commands::files::import_files_into_root(
             paths,
             root,
+            folder,
             s.supported_extensions,
             mode,
         )
@@ -4975,10 +4977,14 @@ impl AppContext {
         Ok(updated)
     }
 
-    /// Reconcile the two consumers of the shared index after a settings edit.
-    /// Semantic search owns the embedder; semantic search and index-backed exact
-    /// search jointly own index residency. Loads run off the settings write path,
-    /// while resources made unnecessary by the new state detach synchronously.
+    /// Reconcile the search runtime after a settings edit.
+    ///
+    /// These two toggles own the embedder, not index residency. The reading
+    /// surfaces read the retained extraction out of the same index and are
+    /// consumers of it whatever search prefers, so turning search off releases
+    /// the embedding model and nothing else; only deleting the index releases
+    /// the index. Loads run off the settings write path, while the model made
+    /// unnecessary by the new state detaches synchronously.
     fn on_search_runtime_settings_maybe_changed(
         self: &Arc<Self>,
         before: &Settings,
@@ -4991,13 +4997,9 @@ impl AppContext {
         }
 
         if !after.search_prefer_semantic {
-            // Semantic search is off. Its model must not remain resident, but
-            // exact search may still own the already-open index.
+            // Semantic search is off. Its model must not remain resident; the
+            // index stays open for every other reader of the extraction.
             self.detach_semantic_embedder();
-        }
-        if !after.search_prefer_semantic && !after.grep_use_index {
-            self.detach_search_index();
-            return;
         }
 
         let semantic_just_enabled = after.search_prefer_semantic && !before.search_prefer_semantic;
@@ -5013,15 +5015,16 @@ impl AppContext {
         }
     }
 
-    /// Release the semantic-only model state while preserving an index still
-    /// owned by index-backed exact search.
+    /// Release the semantic-only model state while preserving the index, which
+    /// the reading surfaces and index-backed exact search still read.
     fn detach_semantic_embedder(&self) {
         self.invalidate_topic_tree_cache();
         *self.embedder.lock() = None;
     }
 
-    /// Release the shared index after its final consumer is disabled. The
-    /// on-disk DB is preserved so either consumer can reactivate it cheaply.
+    /// Release the open index. The only reason to is that the index is going
+    /// away: no settings toggle owns its residency, because the reading
+    /// surfaces read it whenever one exists on disk.
     fn detach_search_index(&self) {
         self.invalidate_topic_tree_cache();
         *self.index.lock() = Arc::new(Mutex::new(None));
@@ -5054,40 +5057,46 @@ impl AppContext {
         }
     }
 
-    /// Activate every search resource required by the latest settings. Exact
-    /// index restoration is attempted after semantic restoration so it can
-    /// still succeed when the embedding model is unavailable.
+    /// Activate the runtime the latest settings require. The embedder is what
+    /// the search settings decide; the index is opened either way, after
+    /// semantic restoration so it can still succeed when the embedding model
+    /// is unavailable.
     async fn activate_required_search_runtime_from_disk(self: &Arc<Self>) {
         let settings = self.get_settings().await;
         if settings.search_prefer_semantic {
             self.activate_semantic_from_disk().await;
         }
-        let settings = self.get_settings().await;
-        if settings.grep_use_index && !self.is_index_loaded() {
-            self.activate_exact_index_from_disk().await;
-        }
+        self.activate_index_from_disk().await;
     }
 
-    /// Open only the existing index for exact search. This intentionally does
-    /// not install, probe, or retain an embedding model. Files changed while no
-    /// embedder is resident are rejected by identity checks and extracted live.
-    async fn activate_exact_index_from_disk(self: &Arc<Self>) {
+    /// Open the existing index without an embedder.
+    ///
+    /// Whether to open it is not a search question. The reading surfaces read
+    /// the retained extraction out of this same index — a PDF preview's
+    /// superseded areas, the reading regions behind them, figures — and they
+    /// are consumers of it whatever `search_prefer_semantic` and
+    /// `grep_use_index` say; index-backed exact search is one more consumer,
+    /// not the owner. So the only gate here is whether an index is open
+    /// already, and this is the single opener for the no-embedder case.
+    ///
+    /// This intentionally does not install, probe, or retain an embedding
+    /// model. Files changed while no embedder is resident are rejected by
+    /// identity checks and extracted live.
+    async fn activate_index_from_disk(self: &Arc<Self>) {
         if self.is_index_loaded() {
             return;
         }
         let settings = self.get_settings().await;
-        if !settings.grep_use_index {
-            return;
-        }
         let Some((_plan, index)) = self.load_restore_index_only(settings).await else {
             return;
         };
-        let latest = self.get_settings().await;
-        if !latest.grep_use_index || self.is_index_loaded() {
+        // Semantic restore or a concurrent build may have installed one while
+        // this open was in flight.
+        if self.is_index_loaded() {
             return;
         }
         self.restore_store_index_only(index);
-        info!("restore_state: exact-search index restored without embedder");
+        info!("restore_state: index restored without embedder");
     }
 
     /// React to a change in Zotero configuration by keeping the metadata cache
@@ -5827,7 +5836,7 @@ impl AppContext {
     ) -> Result<SearchHandle, String> {
         let settings = self.settings().await;
         if query.mode == SearchMode::Grep && settings.grep_use_index && !self.is_index_loaded() {
-            self.activate_exact_index_from_disk().await;
+            self.activate_index_from_disk().await;
         }
         let (resolved_library_roots, library_root_errors) = library_roots(&settings);
         query = Self::prepare_search_query(
@@ -6952,8 +6961,8 @@ impl AppContext {
                 }
             };
         } else {
-            *self.index.lock() = Arc::new(Mutex::new(None));
-            *self.embedder.lock() = None;
+            self.detach_search_index();
+            self.detach_semantic_embedder();
             crate::commands::embed::delete_index(&self.data_dir, None).await?;
             self.update_semantic_settings(|s| SemanticSettings {
                 index_path: None,
@@ -7305,9 +7314,15 @@ impl AppContext {
         info!("restore_state: embedder and index restored");
     }
 
-    /// Restore the search resources required by current settings and restart
-    /// the filesystem watcher. Semantic search loads the embedder plus index;
-    /// index-backed exact search can load the index alone. Run once after `new`.
+    /// Restore the runtime and restart the filesystem watcher. Run once after
+    /// `new`.
+    ///
+    /// An index that exists on disk is opened whenever anything in the process
+    /// reads from it, and the reading surfaces — PDF preview's superseded
+    /// areas, reading regions, figures — are among those readers. So the search
+    /// settings decide whether an *embedder* loads, never whether the reading
+    /// store is opened: semantic search loads the embedder plus the index,
+    /// everything else loads the index alone.
     pub async fn restore_state(self: Arc<Self>) {
         let settings = match get_scoped_settings(&self.settings_path, &self.workspace_path).await {
             Ok(s) => s,
@@ -7339,10 +7354,9 @@ impl AppContext {
                 }
             });
         }
-        if !settings.search_prefer_semantic && !settings.grep_use_index {
-            info!("restore_state: no search consumer requires the index");
-            return;
-        }
+        // No early return on the search toggles: they decide whether an
+        // embedder is needed, not whether the reading store is opened. An index
+        // on disk is opened for the reading surfaces regardless.
         self.activate_required_search_runtime_from_disk().await;
     }
 }
@@ -10053,32 +10067,85 @@ mod tests {
         assert_eq!(settings.semantic.selected.dimension, 384);
     }
 
+    /// With both search consumers off, an index on disk is still opened —
+    /// without an embedder — because the reading surfaces read it. The proof
+    /// is the surface itself: a PDF preview that carries the areas this
+    /// document's reading owns rather than the page's raw glyphs.
     #[tokio::test]
-    async fn test_restore_state_skips_index_when_both_consumers_are_off() {
+    async fn restore_state_opens_the_index_for_the_reading_surfaces_with_search_off() {
+        use wilkes_core::embed::index::chunk::Chunk;
+        use wilkes_core::embed::index::db::PreparedFile;
+        use wilkes_core::types::{
+            BoundingBox, ByteRange, MatchRef, PreviewData, ReadingRegion, RetainedExtraction,
+            SourceOrigin,
+        };
+
         let (dir, ctx) = test_ctx();
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
 
         // A fully restorable index DB sits on disk with the default selection,
-        // so only the absence of both runtime consumers can prevent restore.
+        // holding one document whose reading owns a page area.
         let selected = SelectedEmbedder::default();
-        SemanticIndex::create(
+        let mut index = SemanticIndex::create(
             &ctx.data_dir,
             selected.model.model_id(),
-            384,
+            selected.dimension,
             selected.engine,
             None,
         )
         .unwrap();
+        let pdf = root.join("paper.pdf");
+        std::fs::write(&pdf, "pdf bytes").unwrap();
+        let full_text = "1 A\\to A S\\colon A,B,Z_{A}\n".to_string();
+        let end = full_text.trim_end().len();
+        index
+            .write_file(PreparedFile {
+                path: pdf.clone(),
+                full_text: full_text.clone(),
+                retained: RetainedExtraction {
+                    reading_regions: vec![ReadingRegion {
+                        area_id: "p1-i0".to_string(),
+                        page: 1,
+                        bbox: BoundingBox {
+                            x: 10.0,
+                            y: 20.0,
+                            width: 300.0,
+                            height: 24.0,
+                        },
+                        text_range: ByteRange { start: 0, end },
+                    }],
+                    ..Default::default()
+                },
+                chunks: vec![(
+                    Chunk {
+                        file_path: pdf.clone(),
+                        text: full_text.clone(),
+                        byte_range: ByteRange {
+                            start: 0,
+                            end: full_text.len(),
+                        },
+                        origin: SourceOrigin::PdfPage {
+                            page: 1,
+                            bbox: None,
+                        },
+                    },
+                    vec![0.0; selected.dimension],
+                )],
+            })
+            .unwrap();
+        drop(index);
 
         // Persist settings with both semantic preference and index-backed exact
         // search off while the built index remains recorded on disk.
         let disabled = Settings {
             search_prefer_semantic: false,
+            grep_use_index: false,
             last_directory: Some(root),
             semantic: SemanticSettings {
                 enabled: true,
                 index_path: Some(ctx.data_dir.join("semantic_index.db")),
+                selected: selected.clone(),
                 ..SemanticSettings::default()
             },
             ..Settings::default()
@@ -10089,18 +10156,14 @@ mod tests {
         )
         .unwrap();
 
-        // Positive control: the same index is structurally restorable, proving
-        // the consumer settings are the gate rather than stale-selection reset.
-        let enabled = Settings {
-            search_prefer_semantic: true,
-            ..disabled.clone()
-        };
+        // Control: the index is structurally restorable, so nothing but the
+        // consumer question is in play here.
         let db_status = ctx
-            .load_restore_db_status(&enabled)
+            .load_restore_db_status(&disabled)
             .await
             .expect("db status present");
         assert!(!AppContext::restore_state_needs_reset(
-            &enabled,
+            &disabled,
             Some(&db_status)
         ));
 
@@ -10109,9 +10172,59 @@ mod tests {
         // Directory watching is independent of semantic restore, so it starts
         // for file-list invalidation even when semantic search is disabled.
         assert!(ctx.directory_watcher.lock().is_some());
+        // The embedder is what the search settings decide; it stays absent.
         assert!(ctx.embedder.lock().is_none());
-        assert!(!ctx.is_index_loaded());
+        assert!(!ctx.is_semantic_ready());
+        assert!(ctx.is_index_loaded());
         assert!(!ctx.get_settings().await.search_prefer_semantic);
+
+        let data = ctx
+            .preview(MatchRef {
+                path: pdf,
+                origin: SourceOrigin::PdfPage {
+                    page: 1,
+                    bbox: None,
+                },
+                text_range: None,
+            })
+            .await
+            .expect("a PDF match previews");
+        let PreviewData::Pdf { superseded, .. } = data else {
+            panic!("a PDF match previews as a PDF");
+        };
+        assert_eq!(superseded.len(), 1);
+        assert_eq!(superseded[0].text, full_text.trim_end());
+    }
+
+    /// The same startup path with nothing on disk opens nothing and reports no
+    /// error: the reading surfaces get the empty answer, not a failure.
+    #[tokio::test]
+    async fn restore_state_opens_nothing_when_no_index_exists_and_search_is_off() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let settings = Settings {
+            search_prefer_semantic: false,
+            grep_use_index: false,
+            last_directory: Some(root),
+            ..Settings::default()
+        };
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string(&settings).unwrap(),
+        )
+        .unwrap();
+
+        Arc::clone(&ctx).restore_state().await;
+
+        assert!(!ctx.is_index_loaded());
+        assert!(ctx.embedder.lock().is_none());
+        assert!(!ctx.is_semantic_ready());
+        assert!(ctx.directory_watcher.lock().is_some());
+        // Nothing was built, so nothing stale was recorded to clear either.
+        let after = ctx.get_settings().await;
+        assert!(!after.semantic.enabled);
+        assert!(after.semantic.index_path.is_none());
     }
 
     #[tokio::test]
@@ -10228,8 +10341,11 @@ mod tests {
         );
     }
 
+    /// Turning semantic preference off releases the embedder — the resource
+    /// that toggle owns — and nothing else. The index stays open with no
+    /// search consumer at all, because the reading surfaces read it.
     #[tokio::test]
-    async fn semantic_pref_off_with_no_exact_consumer_releases_embedder_and_index() {
+    async fn semantic_pref_off_with_no_exact_consumer_releases_only_the_embedder() {
         let (dir, ctx) = test_ctx();
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -10266,15 +10382,11 @@ mod tests {
             .unwrap();
 
         // Turning the toggle off must leave file-list watching active while
-        // releasing resident semantic state so file changes no longer reindex.
+        // releasing the resident model so file changes no longer reindex.
         assert!(ctx.directory_watcher.lock().is_some());
         assert!(ctx.embedder.lock().is_none());
-        assert!(ctx
-            .index
-            .lock()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_none());
+        // The reading surfaces keep their store.
+        assert!(ctx.is_index_loaded());
     }
 
     /// A text probe reaches the embedder in the query role and lands where
@@ -10362,8 +10474,11 @@ mod tests {
         assert!(ctx.directory_watcher.lock().is_some());
     }
 
+    /// Turning index-backed exact search on opens the index with no embedder;
+    /// turning it back off releases nothing, because the toggle owns the
+    /// embedder and the reading surfaces still read the index.
     #[tokio::test]
-    async fn exact_index_toggle_loads_and_releases_index_without_embedder() {
+    async fn exact_index_toggle_loads_index_without_embedder_and_keeps_it() {
         let (dir, ctx) = test_ctx();
         let selected = SelectedEmbedder::default();
         SemanticIndex::create(
@@ -10406,7 +10521,7 @@ mod tests {
         ctx.update_settings(serde_json::json!({ "grep_use_index": false }))
             .await
             .unwrap();
-        assert!(!ctx.is_index_loaded());
+        assert!(ctx.is_index_loaded());
         assert!(ctx.embedder.lock().is_none());
     }
 

@@ -105,8 +105,16 @@ pub struct SkippedResource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CourseManifest {
     pub course_url: String,
-    /// The course's path segment, used as the directory the documents land in.
+    /// The course's path segment, as MIT names it in the URL.
     pub slug: String,
+    /// The directory this course's documents belong in, both while staged and
+    /// once imported: `1.77 Water Quality Control (Spring 2006)`.
+    ///
+    /// A course is a folder, not a scattering of files. Forty PDFs called
+    /// `lecture5.pdf` and `ps1.pdf` loose in a library root are unattributable
+    /// the moment a second course joins them — and the import refuses the
+    /// second course outright, because two courses collide on those names.
+    pub folder: String,
     pub title: String,
     pub description: String,
     pub pages: Vec<CoursePage>,
@@ -170,6 +178,39 @@ struct RawCourse {
     course_title: Option<String>,
     #[serde(default)]
     course_description: Option<String>,
+    #[serde(default)]
+    primary_course_number: Option<String>,
+    #[serde(default)]
+    term: Option<String>,
+    /// A string in every course observed, but read either way for the same
+    /// reason `file_size` is: one publisher, two spellings of one number.
+    #[serde(default, deserialize_with = "flexible_text")]
+    year: Option<String>,
+}
+
+/// A field that is a string or a number, as the same string either way.
+fn flexible_text<'de, D: Deserializer<'de>>(de: D) -> Result<Option<String>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(de)?;
+    Ok(match value {
+        Some(serde_json::Value::String(s)) => Some(s),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    })
+}
+
+/// One of the facts a course is named by, refused when the course does not
+/// state it.
+///
+/// Not defaulted, and not filled in from the slug. These four fields name the
+/// folder every one of a course's documents lands in, and a course silently
+/// filed under `Untitled ( )` is one nobody will find again. All four are
+/// stated by every OCW course, so an absence is the feed having changed and
+/// has to stop the acquisition rather than colour it in.
+fn named<'a>(value: Option<&'a str>, field: &str, course: &str) -> anyhow::Result<&'a str> {
+    value
+        .map(str::trim)
+        .filter(|found| !found.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Course {course} states no {field}; cannot name its folder"))
 }
 
 // ── Reading a course ─────────────────────────────────────────────────────────
@@ -332,10 +373,25 @@ async fn read_course_at(
     });
     pages.sort_by_key(|page| page_rank(&page.title));
 
+    let title = named(course.course_title.as_deref(), "title", base)?;
+    let number = named(
+        course.primary_course_number.as_deref(),
+        "course number",
+        base,
+    )?;
+    let term = named(course.term.as_deref(), "term", base)?;
+    let year = named(course.year.as_deref(), "year", base)?;
+    let folder = safe_name(&format!("{number} {title} ({term} {year})"));
+    anyhow::ensure!(
+        !folder.is_empty(),
+        "Course {base} names nothing a directory can be called"
+    );
+
     Ok(CourseManifest {
         course_url: base.to_string(),
         slug,
-        title: course.course_title.unwrap_or_default(),
+        folder,
+        title: title.to_string(),
         description: course.course_description.unwrap_or_default(),
         pages,
         files,
@@ -463,19 +519,17 @@ fn strip_hash(stored: &str) -> &str {
     stored
 }
 
-/// A filename safe on every platform Wilkes runs on, and unique in this course.
-fn unique_filename(name: &str, used: &mut std::collections::HashSet<String>) -> String {
-    let (stem, extension) = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() && ext.chars().count() <= 5 => (stem, ext),
-        _ => (name, "pdf"),
-    };
-    let mut cleaned: String = stem
+/// One path component safe on every platform Wilkes runs on.
+///
+/// Shared by the course's folder and the documents inside it so a course
+/// cannot be filed under a name its own documents would have been refused.
+/// Parentheses survive because [`unique_filename`] itself appends `(2)` to
+/// disambiguate: stripping them from the name it is given while adding them to
+/// the name it returns would be one character class treated two ways.
+fn safe_name(raw: &str) -> String {
+    let cleaned: String = raw
         .chars()
         .map(|c| {
-            // Parentheses are kept because this function itself appends
-            // "(2)" to disambiguate: stripping them from the name it was
-            // given while adding them to the name it returns would be one
-            // character class treated two ways.
             if c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ' | '(' | ')') {
                 c
             } else {
@@ -483,14 +537,28 @@ fn unique_filename(name: &str, used: &mut std::collections::HashSet<String>) -> 
             }
         })
         .collect();
-    cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     // Counted in characters, so a title with accents is trimmed to 120 glyphs
     // rather than cut through the middle of one.
-    let trimmed: String = cleaned.chars().take(120).collect();
-    let stem = if trimmed.trim().is_empty() {
+    collapsed
+        .chars()
+        .take(120)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// A filename safe on every platform Wilkes runs on, and unique in this course.
+fn unique_filename(name: &str, used: &mut std::collections::HashSet<String>) -> String {
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ext.chars().count() <= 5 => (stem, ext),
+        _ => (name, "pdf"),
+    };
+    let cleaned = safe_name(stem);
+    let stem = if cleaned.is_empty() {
         "document".to_string()
     } else {
-        trimmed.trim().to_string()
+        cleaned
     };
     let mut candidate = format!("{stem}.{extension}");
     let mut counter = 2;
@@ -1154,6 +1222,7 @@ mod tests {
         let manifest = CourseManifest {
             course_url: "https://ocw.mit.edu/courses/c".into(),
             slug: "c".into(),
+            folder: "1.77 Water Quality Control (Spring 2006)".into(),
             title: "Water Quality Control".into(),
             description: "A course about water.".into(),
             pages: vec![
@@ -1220,7 +1289,10 @@ mod tests {
         let _course = server
             .mock("GET", format!("{path}/data.json").as_str())
             .with_status(200)
-            .with_body(r#"{"course_title":"Water Quality","course_description":"About water."}"#)
+            .with_body(
+                r#"{"course_title":"Water Quality","course_description":"About water.",
+                    "primary_course_number":"1.77","term":"Spring","year":"2006"}"#,
+            )
             .create_async()
             .await;
         let _map = server
@@ -1303,7 +1375,10 @@ mod tests {
         let _course = server
             .mock("GET", "/courses/c/data.json")
             .with_status(200)
-            .with_body(r#"{"course_title":"C"}"#)
+            .with_body(
+                r#"{"course_title":"C","primary_course_number":"1.00",
+                    "term":"Fall","year":2006}"#,
+            )
             .create_async()
             .await;
         let _map = server
@@ -1347,7 +1422,10 @@ mod tests {
         let _course = server
             .mock("GET", format!("{path}/data.json").as_str())
             .with_status(200)
-            .with_body(r#"{"course_title":"C"}"#)
+            .with_body(
+                r#"{"course_title":"C","primary_course_number":"1.00",
+                    "term":"Fall","year":2006}"#,
+            )
             .create_async()
             .await;
         let _map = server

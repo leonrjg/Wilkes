@@ -588,6 +588,16 @@ pub fn build_analyzer(
         dispatch::role(engine, &model_id, model_dir)? == dispatch::RecognizerRole::Page,
         "'{model_id}' reads formulas, not pages, and cannot be the page recognizer"
     );
+    // Switching off the page reader is what `enabled` means, and an analyzer
+    // with no page reader has nothing to route *to*: every area the detector
+    // marked out would fall through to a recognizer that is not there. So a
+    // configuration that asks for it is refused here rather than read around.
+    anyhow::ensure!(
+        !settings
+            .disabled_roles
+            .contains(&dispatch::RecognizerRole::Page),
+        "the page recognizer cannot be switched off; turn image analysis off instead"
+    );
     let scratch = cache_dir.join("recognition-scratch");
     let layout = attach_layout_detector(recognizers.clone(), model_dir, &scratch)?;
     let recognizer = worker_ocr::attach(
@@ -611,10 +621,13 @@ pub fn build_analyzer(
         model_dir,
         &scratch,
         settings.device.as_deref().unwrap_or("auto"),
+        &settings.disabled_roles,
     )? {
         analyzer = analyzer.with_formula_reader(formula);
     }
-    if let Some(table) = attach_table_reader(recognizers, model_dir, &scratch)? {
+    if let Some(table) =
+        attach_table_reader(recognizers, model_dir, &scratch, &settings.disabled_roles)?
+    {
         analyzer = analyzer.with_table_reader(table);
     }
     Ok(Some(Arc::new(
@@ -640,11 +653,24 @@ fn attach_formula_reader(
     model_dir: &std::path::Path,
     scratch: &std::path::Path,
     device: &str,
+    disabled: &[dispatch::RecognizerRole],
 ) -> anyhow::Result<Option<Box<dyn OcrEngine>>> {
     let Some(model) = dispatch::formula_model(model_dir) else {
         tracing::info!("this build ships no formula recognizer");
         return Ok(None);
     };
+    // Switched off is not the same fact as not installed, and it is logged as
+    // its own: an installation with the weights on disk and no formulas in
+    // its reading is otherwise indistinguishable from a download that never
+    // happened. What it costs is identical, which is why the sentence is.
+    if disabled.contains(&model.role) {
+        tracing::info!(
+            "the formula recognizer '{}' is installed but switched off; the areas the \
+             detector marks out as formulas will go to the page recognizer instead",
+            model.model_id
+        );
+        return Ok(None);
+    }
     if !model.is_cached {
         tracing::warn!(
             "the formula recognizer '{}' is not installed; the areas the detector marks out \
@@ -683,11 +709,24 @@ fn attach_table_reader(
     recognizers: crate::worker::manager::WorkerManager,
     model_dir: &std::path::Path,
     scratch: &std::path::Path,
+    disabled: &[dispatch::RecognizerRole],
 ) -> anyhow::Result<Option<Box<dyn table_structure::TableStructure>>> {
     let Some(model) = dispatch::table_model(model_dir) else {
         tracing::info!("this build ships no table structure model");
         return Ok(None);
     };
+    // As above: kept, and not spent. The reading that results is the one this
+    // library had before the model existed, and `identity` says so — a
+    // switched-off reader and an absent one produce the same recipe, because
+    // they produce the same reading.
+    if disabled.contains(&model.role) {
+        tracing::info!(
+            "the table structure model '{}' is installed but switched off; the areas the \
+             detector marks out as tables will go to the page recognizer instead",
+            model.model_id
+        );
+        return Ok(None);
+    }
     if !model.is_cached {
         tracing::warn!(
             "the table structure model '{}' is not installed; the areas the detector marks \
@@ -1766,6 +1805,37 @@ mod tests {
         )
         .expect("disabled is not a failure");
         assert!(built.is_none());
+    }
+
+    /// Switching off the page reader is not a thing that can be asked for:
+    /// every area the detector marks out routes to it, so an analyzer without
+    /// one has nothing to route to. `enabled` is where that question is
+    /// answered, and a settings file that answered it twice is refused rather
+    /// than read around — a build that quietly ignored the field would read
+    /// the whole library with the reader the user had just switched off.
+    #[test]
+    #[cfg(feature = "candle")]
+    fn the_page_reader_cannot_be_switched_off() {
+        let dir = tempfile::tempdir().expect("a temporary data directory");
+        let Err(error) = build_analyzer(
+            test_manager(),
+            dir.path(),
+            dir.path(),
+            &crate::types::ImageAnalysisSettings {
+                enabled: true,
+                engine: dispatch::RecognitionEngine::Vision,
+                model: None,
+                disabled_roles: vec![dispatch::RecognizerRole::Page],
+                ..Default::default()
+            },
+            "http://localhost:11434",
+        ) else {
+            panic!("a page reader that is switched off is a contradiction, not a build");
+        };
+        assert!(
+            format!("{error:#}").contains("cannot be switched off"),
+            "the failure should say which switch was asked for: {error:#}"
+        );
     }
 
     /// Enabled without the weights is an error, never a quiet disable: a

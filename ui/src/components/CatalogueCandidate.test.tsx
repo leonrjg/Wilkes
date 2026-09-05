@@ -6,6 +6,7 @@ vi.mock("../services", () => ({
   isTauri: true,
   api: {
     catalogueAcquire: vi.fn(),
+    catalogueAcquireCourse: vi.fn(),
     openPath: vi.fn(() => Promise.resolve()),
     updateSettings: vi.fn(() => Promise.resolve({})),
     listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
@@ -88,7 +89,14 @@ describe("CatalogueCandidate", () => {
     fireEvent.click(screen.getByLabelText(/Add Combinatorial Optimization/));
     await waitFor(() => {
       expect(acquire).toHaveBeenCalledWith("https://example.invalid/book.pdf");
-      expect(importFiles).toHaveBeenCalledWith(["/uploads/book.pdf"], "/library", "move");
+      // No folder for a single document: one file belongs in the root, and
+      // wrapping every book in a directory of its own would be worse.
+      expect(importFiles).toHaveBeenCalledWith(
+        ["/uploads/book.pdf"],
+        "/library",
+        "move",
+        undefined,
+      );
     });
     expect(await screen.findByText("Added")).toBeTruthy();
   });
@@ -110,6 +118,45 @@ describe("CatalogueCandidate", () => {
     expect(screen.getByLabelText(/Add Water Quality Control to library/)).toBeTruthy();
     expect(screen.getByText(/Add course/)).toBeTruthy();
     expect(screen.getByText(/A course, not a file/i)).toBeTruthy();
+  });
+
+  /// Forty PDFs called `lecture5.pdf` and `ps1.pdf` loose in a library root
+  /// are unattributable, and the second course to arrive collides with the
+  /// first on exactly those names. A course imports as a folder named after
+  /// itself — the same name it was staged under, so it does not change
+  /// identity by being admitted.
+  it("imports a course into a folder named after the course", async () => {
+    const acquireCourse = api.catalogueAcquireCourse as unknown as ReturnType<typeof vi.fn>;
+    acquireCourse.mockResolvedValue({
+      course_url: COURSE.landing_url,
+      title: "Water Quality Control",
+      folder: "1.77 Water Quality Control (Spring 2006)",
+      directory: "/uploads/1.77 Water Quality Control (Spring 2006)",
+      document: "/uploads/1.77 Water Quality Control (Spring 2006)/1.77.md",
+      documents: [
+        {
+          filename: "chapter1lecture.pdf",
+          path: "/uploads/1.77 Water Quality Control (Spring 2006)/chapter1lecture.pdf",
+          bytes: 10,
+          already_present: false,
+        },
+      ],
+      failures: [],
+      skipped: [],
+    });
+    render(<CatalogueCandidate hit={COURSE} />);
+    fireEvent.click(screen.getByLabelText(/Add Water Quality Control to library/));
+    await waitFor(() => {
+      expect(importFiles).toHaveBeenCalledWith(
+        [
+          "/uploads/1.77 Water Quality Control (Spring 2006)/1.77.md",
+          "/uploads/1.77 Water Quality Control (Spring 2006)/chapter1lecture.pdf",
+        ],
+        "/library",
+        "move",
+        "1.77 Water Quality Control (Spring 2006)",
+      );
+    });
   });
 
   /// Reading the manifest happens before a single document byte moves, and on

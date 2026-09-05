@@ -5,23 +5,23 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use chat::ChatManager;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
-use chat::ChatManager;
 use wilkes_api::commands::integrations::custom::ManifestSummary;
 use wilkes_api::context::{AppContext, EventEmitter};
 use wilkes_api::startup::StartupStatus;
 use wilkes_api::workspace::{WorkspaceManager, WorkspaceState, WorkspaceSummary};
 use wilkes_core::integrations::custom::ProbeReport;
 use wilkes_core::types::{
-    AddOutcome, Bookmark, BookmarkClustersQuery, BookmarkClustersResult,
-    ChunkTopicsQuery, ChunkTopicsResult, CitationResult, CollectionValidation, DataPaths,
-    DocumentMetadata, DocumentTagUpdate, EmbedderCapabilityManifest, EmbeddingEngine,
-    ExternalMcpSettings, FileListResponse, HttpApiSettings, IndexStatus, IntegrationStatus,
-    NewBookmark, NewSmartCollection, NewTag, OpenAlexWork, SearchLogEntry, SelectedEmbedder,
+    AddOutcome, Bookmark, BookmarkClustersQuery, BookmarkClustersResult, ChunkTopicsQuery,
+    ChunkTopicsResult, CitationResult, CollectionValidation, DataPaths, DocumentMetadata,
+    DocumentTagUpdate, EmbedderCapabilityManifest, EmbeddingEngine, ExternalMcpSettings,
+    FileListResponse, HttpApiSettings, IndexStatus, IntegrationStatus, NewBookmark,
+    NewSmartCollection, NewTag, OpenAlexWork, SearchLogEntry, SelectedEmbedder,
     SemanticScholarPaper, Settings, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::worker::manager::WorkerStatus;
@@ -204,10 +204,11 @@ async fn import_files_into_current_root_for_ctx(
     ctx: Arc<AppContext>,
     paths: Vec<String>,
     root: String,
+    folder: Option<String>,
     mode: wilkes_api::commands::files::FileImportMode,
 ) -> Result<Vec<String>, String> {
     let paths = paths.into_iter().map(PathBuf::from).collect();
-    ctx.import_files_into_current_root(paths, root.into(), mode)
+    ctx.import_files_into_current_root(paths, root.into(), folder, mode)
         .await
         .map(|paths| {
             paths
@@ -1292,14 +1293,20 @@ async fn rename_file(path: String, new_name: String, app: AppHandle) -> Result<S
     rename_file_for_path(app_context(&app), path, new_name).await
 }
 
+/// Imports files into the current root, or into `folder` beneath it — created
+/// if absent. The folder is for things that are not one file: a course is
+/// forty PDFs that belong together, and loose in the root they are neither
+/// attributable nor importable alongside a second course, which collides with
+/// them on names like `lecture5.pdf`.
 #[tauri::command]
 async fn import_files(
     paths: Vec<String>,
     root: String,
+    folder: Option<String>,
     mode: wilkes_api::commands::files::FileImportMode,
     app: AppHandle,
 ) -> Result<Vec<String>, String> {
-    import_files_into_current_root_for_ctx(app_context(&app), paths, root, mode).await
+    import_files_into_current_root_for_ctx(app_context(&app), paths, root, folder, mode).await
 }
 
 #[tauri::command]
@@ -2573,6 +2580,7 @@ mod tests {
             ctx,
             vec![source.display().to_string()],
             root_dir.path().display().to_string(),
+            None,
             wilkes_api::commands::files::FileImportMode::Move,
         )
         .await
@@ -2606,6 +2614,7 @@ mod tests {
             ctx,
             vec![source.display().to_string()],
             root_dir.path().display().to_string(),
+            None,
             wilkes_api::commands::files::FileImportMode::Copy,
         )
         .await

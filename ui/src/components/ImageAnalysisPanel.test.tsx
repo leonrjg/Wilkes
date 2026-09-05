@@ -108,6 +108,14 @@ const INVENTORY = {
   footprint_bytes: 1_928_447_087,
 };
 
+/// The venn paints the reading that happens, so a test about what it paints
+/// needs a configuration that is actually reading: the feature on, and the
+/// page reader on disk.
+const READING = {
+  ...SETTINGS,
+  image_analysis: { ...SETTINGS.image_analysis, enabled: true, model: GRANITE.model_id },
+} as unknown as Settings;
+
 describe("ImageAnalysisPanel", () => {
   const api = {
     imageRecognizerCatalogue: vi.fn(() => Promise.resolve(CATALOGUE)),
@@ -169,7 +177,7 @@ describe("ImageAnalysisPanel", () => {
     panel(SETTINGS);
 
     const download = await screen.findByRole("button", { name: /download recognizer/i });
-    const toggle = screen.getByRole("checkbox");
+    const toggle = screen.getByRole("checkbox", { name: /read the text drawn inside/i });
     expect((toggle as HTMLInputElement).disabled).toBe(true);
 
     fireEvent.click(download);
@@ -364,7 +372,7 @@ describe("ImageAnalysisPanel", () => {
   it("installs the formula reader through the recognizer install", async () => {
     panel(SETTINGS);
 
-    await screen.findByText(TEXIFY.display_name);
+    await screen.findAllByText(TEXIFY.display_name);
     fireEvent.click(screen.getByRole("button", { name: /download formula reader/i }));
     await waitFor(() =>
       expect(
@@ -380,7 +388,7 @@ describe("ImageAnalysisPanel", () => {
   it("installs the table reader through the recognizer install", async () => {
     panel(SETTINGS);
 
-    await screen.findByText(SLANET.display_name);
+    await screen.findAllByText(SLANET.display_name);
     fireEvent.click(screen.getByRole("button", { name: /download table reader/i }));
     await waitFor(() =>
       expect(
@@ -396,7 +404,7 @@ describe("ImageAnalysisPanel", () => {
   it("never offers the table reader as the page recognizer", async () => {
     panel(SETTINGS);
 
-    await screen.findByText(SLANET.display_name);
+    await screen.findAllByText(SLANET.display_name);
     expect(screen.queryByText(SLANET.description)).toBeNull();
   });
 
@@ -404,7 +412,7 @@ describe("ImageAnalysisPanel", () => {
     withModel(SLANET.model_id, { is_cached: true });
     panel(SETTINGS);
 
-    await screen.findByText(SLANET.display_name);
+    await screen.findAllByText(SLANET.display_name);
     expect(
       screen.queryByRole("button", { name: /download table reader/i }),
     ).toBeNull();
@@ -417,7 +425,7 @@ describe("ImageAnalysisPanel", () => {
   it("never offers the formula reader as the page recognizer", async () => {
     panel(SETTINGS);
 
-    await screen.findByText(TEXIFY.display_name);
+    await screen.findAllByText(TEXIFY.display_name);
     expect(screen.queryByText(TEXIFY.description)).toBeNull();
   });
 
@@ -425,10 +433,174 @@ describe("ImageAnalysisPanel", () => {
     withModel(TEXIFY.model_id, { is_cached: true });
     panel(SETTINGS);
 
-    await screen.findByText(TEXIFY.display_name);
+    await screen.findAllByText(TEXIFY.display_name);
     expect(
       screen.queryByRole("button", { name: /download formula reader/i }),
     ).toBeNull();
+  });
+
+  /// The whole claim of the diagram: a page reader that says it emits
+  /// formulas and tables owns those boxes, and owns them in its own colour,
+  /// so a user can see that installing nothing else still reads them.
+  it("paints every box in the page reader's colour when it emits every kind", async () => {
+    withModel(GRANITE.model_id, { is_cached: true });
+    panel(READING);
+
+    const outer = await screen.findByTestId("venn-page");
+    const formulas = screen.getByTestId("venn-formula");
+    const tables = screen.getByTestId("venn-table");
+
+    // A colour, and not the empty background: painted means read.
+    expect(outer.style.background).not.toBe("var(--bg-app)");
+    expect(formulas.style.background).toBe(outer.style.background);
+    expect(tables.style.background).toBe(outer.style.background);
+    expect(formulas.textContent).toContain(GRANITE.display_name);
+    expect(tables.textContent).toContain(GRANITE.display_name);
+  });
+
+  /// And the precedence: the specialists take their own boxes back the moment
+  /// they are on disk, while the page reader keeps the padding around them.
+  /// This is the reading the extraction actually performs, and the reason the
+  /// boxes are nested rather than listed.
+  it("gives each inner box back to its own reader, leaving the page reader the padding", async () => {
+    withCatalogue({
+      ...CATALOGUE,
+      models: CATALOGUE.models.map((model) =>
+        [GRANITE.model_id, TEXIFY.model_id, SLANET.model_id].includes(model.model_id)
+          ? { ...model, is_cached: true }
+          : model,
+      ),
+    });
+    panel(READING);
+
+    const outer = await screen.findByTestId("venn-page");
+    const formulas = screen.getByTestId("venn-formula");
+    const tables = screen.getByTestId("venn-table");
+
+    expect(outer.style.background).not.toBe("var(--bg-app)");
+    expect(formulas.style.background).not.toBe(outer.style.background);
+    expect(tables.style.background).not.toBe(outer.style.background);
+    expect(formulas.style.background).not.toBe(tables.style.background);
+    expect(formulas.textContent).toContain(TEXIFY.display_name);
+    expect(tables.textContent).toContain(SLANET.display_name);
+    // The padding is what is left: prose, and no kind a specialist took.
+    expect(outer.textContent).toContain("Reads text across the whole page.");
+  });
+
+  /// A page reader that cannot read a kind, and no specialist installed, is a
+  /// kind nothing reads — and the box must say so rather than inherit the
+  /// colour of a model that would return prose for it.
+  it("leaves a box unfilled when neither the page reader nor a specialist reads it", async () => {
+    const candle = {
+      ...SETTINGS,
+      image_analysis: {
+        ...SETTINGS.image_analysis,
+        enabled: true,
+        engine: "Candle",
+        model: PADDLE.model_id,
+      },
+    } as unknown as Settings;
+    withModel(PADDLE.model_id, { is_cached: true });
+    panel(candle);
+
+    const formulas = await screen.findByTestId("venn-formula");
+    expect(formulas.style.background).toBe("var(--bg-app)");
+    expect(formulas.style.borderStyle).toBe("dashed");
+  });
+
+  /// The point of de-selection: the weights stay, and the reading changes.
+  /// Before this there was no way to say "not this one" short of deleting the
+  /// download, which is a different question with a different cost.
+  it("de-selects a reader without touching its download", async () => {
+    withCatalogue({
+      ...CATALOGUE,
+      models: CATALOGUE.models.map((model) =>
+        [GRANITE.model_id, SLANET.model_id].includes(model.model_id)
+          ? { ...model, is_cached: true }
+          : model,
+      ),
+    });
+    const onUpdate = panel(READING);
+
+    fireEvent.click(
+      await screen.findByRole("checkbox", { name: /use slanet-plus for tables/i }),
+    );
+    await waitFor(() =>
+      expect(onUpdate).toHaveBeenCalledWith({
+        image_analysis: expect.objectContaining({ disabled_roles: ["table"] }),
+      }),
+    );
+    // Nothing was uninstalled to say it.
+    expect(
+      (api as unknown as { installImageRecognizer: { mock: { calls: unknown[][] } } })
+        .installImageRecognizer.mock.calls,
+    ).toHaveLength(0);
+  });
+
+  /// And what de-selecting *means* on the page: the kind falls back to the
+  /// page reader, in the page reader's colour, exactly as it does when the
+  /// specialist was never downloaded. Same reading, same recipe.
+  it("hands a de-selected reader's box back to the page reader", async () => {
+    withCatalogue({
+      ...CATALOGUE,
+      models: CATALOGUE.models.map((model) =>
+        [GRANITE.model_id, SLANET.model_id].includes(model.model_id)
+          ? { ...model, is_cached: true }
+          : model,
+      ),
+    });
+    panel({
+      ...READING,
+      image_analysis: { ...READING.image_analysis, disabled_roles: ["table"] },
+    } as unknown as Settings);
+
+    const outer = await screen.findByTestId("venn-page");
+    const tables = screen.getByTestId("venn-table");
+    expect(tables.style.background).toBe(outer.style.background);
+    expect(tables.textContent).toContain(GRANITE.display_name);
+    expect(
+      (screen.getByRole("checkbox", { name: /use slanet-plus for tables/i }) as HTMLInputElement)
+        .checked,
+    ).toBe(false);
+  });
+
+  /// Un-checking the outer box is the feature switch and nothing else: there
+  /// is no reading with the page reader off and a formula reader still on, so
+  /// this drives `enabled` rather than adding `page` to the list — which the
+  /// backend refuses outright.
+  it("de-selects general OCR by turning image analysis off", async () => {
+    withModel(GRANITE.model_id, { is_cached: true });
+    const onUpdate = panel(READING);
+
+    fireEvent.click(await screen.findByRole("checkbox", { name: /use general ocr/i }));
+    await waitFor(() =>
+      expect(onUpdate).toHaveBeenCalledWith({
+        image_analysis: expect.objectContaining({ enabled: false }),
+      }),
+    );
+    expect(onUpdate.mock.calls[0][0].image_analysis.disabled_roles ?? []).toEqual([]);
+  });
+
+  /// A reader that is not here cannot be de-selected, because it is not doing
+  /// anything to stop. Offering the checkbox anyway would make "off" mean two
+  /// different things in the same box.
+  it("cannot de-select a reader that is not installed", async () => {
+    panel(READING);
+
+    const box = await screen.findByRole("checkbox", { name: /use texify for formulas/i });
+    expect((box as HTMLInputElement).disabled).toBe(true);
+  });
+
+  /// The prose follows the box, because the three readers no longer have a
+  /// section each to carry it.
+  it("shows the focused box's account of itself", async () => {
+    panel(SETTINGS);
+
+    fireEvent.click(await screen.findByRole("button", { name: /tables/i }));
+    expect(screen.getByText(/rows, columns and merged cells/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /formulas/i }));
+    expect(screen.getByText(/where a document draws/i)).toBeTruthy();
   });
 
   it("says nothing about installing a detector that is already here", async () => {

@@ -25,9 +25,9 @@ use wilkes_core::types::IntegrationsSettings;
 
 use crate::{
     context::{ActiveDoc, ContextFile},
+    host::ContextStateHandle,
     reader,
     search::{SearchService, WorkspaceCatalog, WorkspaceDescriptor},
-    host::ContextStateHandle,
 };
 
 const DEFAULT_TEXT_CHAR_LIMIT: usize = 24_000;
@@ -2254,6 +2254,7 @@ mod tests {
                 .unwrap_or(FileListResponse {
                     files: Vec::new(),
                     omitted: Vec::new(),
+                    directories: Vec::new(),
                 }))
         }
 
@@ -3690,6 +3691,7 @@ mod tests {
                 doc_entry(library.path().join("c.pdf"), "Gamma", Some("10.1/c")),
             ],
             omitted: Vec::new(),
+            directories: Vec::new(),
         });
         let mcp = WilkesMcp::new(
             McpContext::Library(ExternalMcpContext::default()),
