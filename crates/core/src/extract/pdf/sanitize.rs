@@ -1014,6 +1014,10 @@ fn render(items: &[Item], images: &mut [ExtractedImage]) -> Reading {
                         provenance: piece.provenance,
                     });
                 }
+                // `reading_range` only: these bytes are a run of words inside
+                // a line, so there is no block here for a chunk boundary to
+                // fall against. Writing `reading_block` too would put a seam
+                // in the middle of the sentence this expression belongs to.
                 images[*index].reading_range = Some(ByteRange {
                     start,
                     end: text.len(),
@@ -1059,10 +1063,15 @@ fn render(items: &[Item], images: &mut [ExtractedImage]) -> Reading {
                         provenance: piece.provenance,
                     });
                 }
-                images[*index].reading_range = Some(ByteRange {
+                // A block, so both: where the bytes are, and that a structural
+                // boundary belongs on either side of them. This is the one
+                // branch that opens a line, and the seam follows the line.
+                let block = ByteRange {
                     start,
                     end: text.len(),
-                });
+                };
+                images[*index].reading_range = Some(block.clone());
+                images[*index].reading_block = Some(block);
             }
         }
     }
@@ -1156,6 +1165,7 @@ mod tests {
             pixel_height: 120,
             image_sha256: "digest".into(),
             reading_range: None,
+            reading_block: None,
             reading_anchor: None,
             ocr_regions: vec![ImageOcrRegion {
                 kind: RegionKind::Formula,
@@ -1226,6 +1236,12 @@ mod tests {
         assert!(!reading.text.contains("ci = ai"), "{:?}", reading.text);
         assert_eq!(diagnostics.typeset_regions_superseded_native_text, 1);
         assert!(images[0].reading_range.is_some(), "the block has a range");
+        // A displayed expression *is* a block, so it declares one: the seam
+        // belongs here, and the prose either side of it is not one sentence.
+        assert_eq!(
+            images[0].reading_block, images[0].reading_range,
+            "a block declares its range as a structural block"
+        );
 
         // The order is the page's: the formula is between the two paragraphs
         // it was drawn between, not appended after them.
@@ -1273,7 +1289,13 @@ mod tests {
             reading.text
         );
         assert_eq!(diagnostics.typeset_regions_superseded_native_text, 1);
+        // Placed, and not a block. Chunking reads the second of these, so a
+        // seam here would take the sentence apart exactly as a label would.
         assert!(images[0].reading_range.is_some());
+        assert!(
+            images[0].reading_block.is_none(),
+            "an expression inside a sentence is not a structural block"
+        );
     }
 
     // ── Regions that replace nothing ─────────────────────────────────────
@@ -1317,7 +1339,13 @@ mod tests {
             reading.text
         );
         assert_eq!(diagnostics.typeset_regions_superseded_native_text, 1);
+        // Placed, and not a block. Chunking reads the second of these, so a
+        // seam here would take the sentence apart exactly as a label would.
         assert!(images[0].reading_range.is_some());
+        assert!(
+            images[0].reading_block.is_none(),
+            "an expression inside a sentence is not a structural block"
+        );
     }
 
     /// Two drawn side by side after one word are read left to right, whatever

@@ -1549,9 +1549,11 @@ pub fn analyze(
                 pixel_width,
                 pixel_height,
                 image_sha256: found.digest(),
-                // Both offsets are into a reading that does not exist yet.
-                // `render` writes them, being the one place the text is built.
+                // Every offset here is into a reading that does not exist yet.
+                // `render` writes them, being the one place the text is built,
+                // and it is what decides which of these regions is a block.
                 reading_range: None,
+                reading_block: None,
                 reading_anchor: None,
                 ocr_regions: Vec::new(),
                 description: None,
@@ -2155,6 +2157,7 @@ mod tests {
             pixel_height: 10,
             image_sha256: "digest".to_string(),
             reading_range: None,
+            reading_block: None,
             reading_anchor: None,
             ocr_regions: vec![crate::types::ImageOcrRegion {
                 kind: RegionKind::Formula,
