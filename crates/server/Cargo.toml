@@ -20,6 +20,7 @@ recognize-onnx = ["wilkes-api/recognize-onnx", "wilkes-core/recognize-onnx"]
 
 [dependencies]
 wilkes-api = { path = "../api" }
+wilkes-agent = { path = "../agent" }
 wilkes-core = { path = "../core", default-features = false, features = ["fastembed", "candle", "generate"] }
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }

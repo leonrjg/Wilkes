@@ -8962,6 +8962,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+ "wilkes-agent",
  "wilkes-api",
  "wilkes-core",
 ]

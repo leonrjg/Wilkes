@@ -2231,7 +2231,11 @@ async fn set_worker_timeout_handler(
 /// desktop app on a loopback port. One definition, so a consumer cannot find
 /// an endpoint on one and not the other.
 pub fn api_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    // Both the headless server and the desktop's shared API serve the same
+    // workspace-aware MCP. Test-only contexts without a registry expose no MCP.
+    let mcp = state.workspaces.as_ref().map(|manager|
+        wilkes_agent::mcp::api_router(manager.clone()));
+    let router = Router::new()
         .route("/health", get(health_handler))
         // Core
         .route("/api/search", post(search_handler))
@@ -2462,7 +2466,8 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/worker/kill", post(kill_worker_handler))
         .route("/api/worker/timeout", patch(set_worker_timeout_handler))
         .layer(CorsLayer::permissive())
-        .with_state(state)
+        .with_state(state);
+    match mcp { Some(mcp) => router.merge(mcp), None => router }
 }
 
 // ── Serving ───────────────────────────────────────────────────────────────────

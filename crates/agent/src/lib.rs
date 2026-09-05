@@ -22,3 +22,5 @@ pub use wilkes_chat::backend::{
     auth_note, install_backend_adapter, label, package_spec, probe_backend_availability,
     resolve_launch_spec, BackendAvailability, NpmPackageSpec, ResolvedLaunchSpec,
 };
+
+pub mod library;

@@ -65,6 +65,8 @@ pub(crate) const WILKES_MCP_TOOL_NAMES: &[&str] = &[
     "list_documents",
     "search",
     "literature_search",
+    "list_smart_collections",
+    "read_library",
 ];
 
 pub(crate) struct McpRuntime {
@@ -213,6 +215,33 @@ pub async fn start_external(
     Ok(ExternalMcpRuntime { runtime })
 }
 
+/// Mount the same MCP implementation on the shared Wilkes HTTP API. This
+/// endpoint is loopback-only at the protocol boundary (Host and Origin),
+/// even when the outer API has a more permissive CORS policy.
+pub fn api_router(workspaces: Arc<dyn WorkspaceCatalog>) -> Router {
+    let service = mcp_service(McpContext::Library(ExternalMcpContext::default()),
+        PathBuf::new(), Some(workspaces), None,
+        rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+            .with_stateful_mode(false).with_json_response(true).with_sse_keep_alive(None));
+    Router::new().nest_service("/mcp", service)
+        .layer(middleware::from_fn(|request: Request, next: Next| async move {
+            if request.headers().contains_key("origin") {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            Ok(next.run(request).await)
+        }))
+}
+
+type McpService = rmcp::transport::streamable_http_server::StreamableHttpService<
+    WilkesMcp, rmcp::transport::streamable_http_server::session::local::LocalSessionManager>;
+
+fn mcp_service(context: McpContext, cwd: PathBuf, workspaces: Option<Arc<dyn WorkspaceCatalog>>,
+    integrations: Option<IntegrationsSettings>,
+    config: rmcp::transport::streamable_http_server::StreamableHttpServerConfig) -> McpService {
+    McpService::new(move || Ok(WilkesMcp::new(context.clone(),cwd.clone(),workspaces.clone(),integrations.clone())),
+        Default::default(),config)
+}
+
 #[derive(Clone, Copy, Debug)]
 enum HostValidation {
     LoopbackOnly,
@@ -248,21 +277,7 @@ async fn start_server(
         HostValidation::LoopbackOnly => config,
         HostValidation::Any => config.disable_allowed_hosts(),
     };
-    let service: rmcp::transport::streamable_http_server::StreamableHttpService<
-        WilkesMcp,
-        rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
-    > = rmcp::transport::streamable_http_server::StreamableHttpService::new(
-        move || {
-            Ok(WilkesMcp::new(
-                context.clone(),
-                cwd.clone(),
-                workspaces.clone(),
-                integrations.clone(),
-            ))
-        },
-        Default::default(),
-        config,
-    );
+    let service = mcp_service(context, cwd, workspaces, integrations, config);
 
     let router =
         Router::new()
@@ -1073,8 +1088,54 @@ enum SearchMatchKindResponse {
     Author,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadLibraryParams {
+    kind: crate::library::LibraryKind,
+    workspace: Option<String>,
+    #[serde(default)] offset: usize,
+    limit: Option<usize>,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EditLibraryParams {
+    workspace: Option<String>,
+    edit: crate::library::LibraryEdit,
+}
+
 #[tool_router]
 impl WilkesMcp {
+    #[tool(description = "Read bookmarks (quotes and notes), tags, or recent search_history from a workspace. Offset is zero-based and limit is 1..500 (default 50). Search history covers the most recent 1000 entries. Use list_smart_collections for collections.")]
+    async fn read_library(&self, Parameters(params): Parameters<ReadLibraryParams>) -> CallToolResult {
+        let result: Result<serde_json::Value,String> = async {
+            let limit=params.limit.unwrap_or(50);
+            if !(1..=500).contains(&limit) { return Err("limit must be 1..500".into()); }
+            let scope=self.scope(params.workspace.as_deref()).await?;
+            let value=scope.require_search("No research library is available")?.read_library(params.kind).await?;
+            let entries=value.as_array().ok_or("Research library returned an invalid list")?;
+            let items:Vec<_>=entries.iter().skip(params.offset).take(limit).collect();
+            let next=params.offset.saturating_add(items.len());
+            Ok(serde_json::json!({"items":items,"total":entries.len(),"next_offset":if next<entries.len(){Some(next)}else{None}}))
+        }.await;
+        match result {Ok(value)=>structured(value),Err(message)=>CallToolResult::error(vec![ContentBlock::text(message)])}
+    }
+
+    #[tool(description = "Edit the user's Wilkes research library: add/update/remove bookmarks; create/update/delete tags and smart collections; tag documents; rename a file while preserving its index and research links; refresh document metadata. Use only for user-requested changes. Paths must resolve inside the named workspace's library roots. Managed read_only workspaces refuse every edit. Existing files are never overwritten. Bookmark page/line numbers are 1-based. Collection expressions use Wilkes's existing CEL filter schema.")]
+    async fn edit_library(&self, Parameters(mut params): Parameters<EditLibraryParams>) -> CallToolResult {
+        let result:Result<serde_json::Value,String> = async {
+            let scope=self.scope(params.workspace.as_deref()).await?;
+            if scope.is_read_only() {return Err("MANAGED_WORKSPACE_PROTECTED: this workspace is owned by another application and can only be read".into());}
+            let roots=self.library_roots(&scope).await;
+            for path in params.edit.paths_mut() {
+                let canonical=path.canonicalize().map_err(|e|format!("{}: {e}",path.display()))?;
+                if !is_within_roots(&canonical,&roots) {return Err(format!("{} is outside this workspace's library roots",path.display()));}
+                *path=canonical;
+            }
+            scope.require_search("No research library is available")?.edit_library(params.edit).await
+        }.await;
+        match result {Ok(value)=>structured(value),Err(message)=>CallToolResult::error(vec![ContentBlock::text(message)])}
+    }
+
     #[tool(
         description = "List the current Wilkes context: every workspace and its id, the configured library roots and active root of the workspace read, the document currently visible in Wilkes, and any files explicitly added to an in-app chat. Read this first to learn the workspace ids other tools accept."
     )]
@@ -1281,9 +1342,9 @@ impl ServerHandler for WilkesMcp {
             .with_server_info(
                 Implementation::new("wilkes", env!("CARGO_PKG_VERSION"))
                     .with_title("Wilkes")
-                    .with_description("Local document search and literature tools"),
+                    .with_description("Document search, literature and research-library tools"),
             )
-            .with_instructions("Wilkes document context and literature tools. Context and search tools are read-only. The download tool writes a file into the current root and must only be used when the user asks to import or download it.")
+            .with_instructions("Wilkes document context and literature tools. Context and search tools are read-only. The download and edit_library tools write real library data and must only be used for user-requested changes. Managed read_only workspaces refuse writes.")
     }
 }
 

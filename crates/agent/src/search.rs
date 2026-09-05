@@ -22,6 +22,16 @@ pub struct CollectedSearch {
 /// embedders, and background reindexing.
 #[async_trait]
 pub trait SearchService: Send + Sync {
+    async fn read_library(self: Arc<Self>, kind: crate::library::LibraryKind) -> Result<serde_json::Value, String> {
+        let _ = kind;
+        Err("Research-library reads are not available in this session".into())
+    }
+
+    async fn edit_library(self: Arc<Self>, edit: crate::library::LibraryEdit) -> Result<serde_json::Value, String> {
+        let _ = edit;
+        Err("Research-library edits are not available in this session".into())
+    }
+
     async fn default_root(self: Arc<Self>) -> Option<PathBuf> {
         None
     }

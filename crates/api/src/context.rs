@@ -96,6 +96,50 @@ pub trait EventEmitter: Send + Sync + 'static {
 
 #[async_trait::async_trait]
 impl wilkes_agent::search::SearchService for AppContext {
+    async fn read_library(self: Arc<Self>, kind: wilkes_agent::library::LibraryKind) -> Result<serde_json::Value, String> {
+        use wilkes_agent::library::LibraryKind;
+        let result: anyhow::Result<serde_json::Value> = async {
+            Ok(match kind {
+                LibraryKind::Bookmarks => serde_json::to_value(self.list_bookmarks().await?)?,
+                LibraryKind::Tags => serde_json::to_value(self.list_tags()?)?,
+                LibraryKind::SearchHistory => serde_json::to_value(self.list_search_log(1000)?)?,
+            })
+        }.await;
+        result.map_err(|e|format!("{e:#}"))
+    }
+
+    async fn edit_library(self: Arc<Self>, edit: wilkes_agent::library::LibraryEdit) -> Result<serde_json::Value, String> {
+        use wilkes_agent::library::LibraryEdit as Edit;
+        use wilkes_core::types::*;
+        // Enforced here as well as at MCP: no adapter can write into an
+        // application-managed corpus through the research-library interface.
+        self.ensure_writable().map_err(|e|e.to_string())?;
+        let result: anyhow::Result<serde_json::Value> = async {
+            let value = match edit {
+                Edit::AddBookmark {path,location,quote,note} => serde_json::to_value(self.add_bookmark(NewBookmark {
+                    path,origin:location.into_origin().map_err(anyhow::Error::msg)?,quote,note,text_range:None,rects:vec![]
+                }).await?)?,
+                Edit::UpdateBookmarkNote {id,note} => serde_json::to_value(self.update_bookmark_note(&id,note).await?)?,
+                Edit::RemoveBookmark {id} => { self.remove_bookmark(&id).await?; serde_json::json!({"removed":id}) },
+                Edit::CreateTag {name,color} => serde_json::to_value(self.create_tag(NewTag {name,color})?)?,
+                Edit::UpdateTag {id,name,color} => serde_json::to_value(self.update_tag(&id,UpdateTag {name,color})?)?,
+                Edit::DeleteTag {id} => {self.delete_tag(&id)?;serde_json::json!({"removed":id})},
+                Edit::TagDocuments {paths,add_tag_ids,remove_tag_ids} => {
+                    self.update_document_tags(DocumentTagUpdate {paths,add_tag_ids,remove_tag_ids})?;
+                    serde_json::json!({"updated":true})
+                },
+                Edit::CreateCollection {name,expression} => serde_json::to_value(self.create_collection(NewSmartCollection {name,expression})?)?,
+                Edit::UpdateCollection {id,name,expression} => serde_json::to_value(self.update_collection(&id,UpdateSmartCollection {name,expression})?)?,
+                Edit::DeleteCollection {id} => {self.delete_collection(&id)?;serde_json::json!({"removed":id})},
+                Edit::RenameFile {path,new_name} => serde_json::json!({"path":self.rename_file(path,new_name).await?}),
+                Edit::RefreshMetadata {path} => serde_json::to_value(self.resolve_file_metadata(path).await?)?,
+            };
+            self.events.emit("research-state-updated",serde_json::json!({"kind":"mcp"}));
+            Ok(value)
+        }.await;
+        result.map_err(|e|format!("{e:#}"))
+    }
+
     async fn default_root(self: Arc<Self>) -> Option<PathBuf> {
         self.get_settings().await.last_directory
     }
