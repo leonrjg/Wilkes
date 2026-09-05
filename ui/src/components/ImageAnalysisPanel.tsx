@@ -3,6 +3,7 @@ import { Tooltip } from "@leonrjg/wilkes-reader";
 import type { SearchApi } from "../services/api";
 import {
   ALL_RECOGNITION_ENGINES,
+  type ImageAnalysisSettings,
   type EmbedProgress,
   type ImageScope,
   type InstallableModelStatus,
@@ -13,6 +14,7 @@ import {
   type Settings,
 } from "../lib/types";
 import ModelCatalog, { formatModelBytes } from "./ModelCatalog";
+import RecognizerVenn, { PAGE_REGION, type VennModel } from "./RecognizerVenn";
 
 interface Props {
   api: SearchApi;
@@ -25,14 +27,19 @@ interface DownloadProgress {
   total: number;
 }
 
-const DEFAULTS = {
+const DEFAULTS: ImageAnalysisSettings = {
   enabled: false,
   engine: "Onnx",
   model: null,
   device: null,
   describer_model: "",
   scope: "typeset_only",
-} as const;
+  // Empty, which is every reader spent — the reading a settings file written
+  // before this field existed was already producing. De-selection is a thing
+  // you do, never a thing an upgrade does to you: the other default would
+  // re-read every library that had a formula reader installed.
+  disabled_roles: [],
+};
 
 /** What each scope reads, in the terms the choice is actually made in: the
  *  cost, and what is given up. The second is the honest half — a formula the
@@ -79,6 +86,10 @@ const ENGINE_BLURBS: Record<RecognitionEngine, string> = {
 const HELPER_READERS: Array<{
   role: RecognizerRole;
   heading: string;
+  /** The name of this reader's box in the diagram. The kind itself, not the
+   *  model — the box is a piece of the page, and it exists whether or not a
+   *  model claims it. */
+  label: string;
   blurb: React.ReactNode;
   button: string;
   /** What is lost while it is not installed. Said where the download is
@@ -88,6 +99,7 @@ const HELPER_READERS: Array<{
   {
     role: "formula",
     heading: "Reading the formulas",
+    label: "Formulas",
     blurb: (
       <>
         A model that reads whole pages comes apart on a crop of one expression,
@@ -106,6 +118,7 @@ const HELPER_READERS: Array<{
   {
     role: "table",
     heading: "Reading the tables",
+    label: "Tables",
     blurb: (
       <>
         A ruled table the page typesets already holds its text as real glyphs;
@@ -148,6 +161,14 @@ type RecognizerCatalogEntry = RecognizerDescriptor & {
  */
 export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: Props) {
   const analysis = settings.image_analysis ?? DEFAULTS;
+  /** The roles switched off. A settings file older than the field has none,
+   *  which is every reader spent — the same reading it was already getting.
+   *  Memoized so the absent case is one array rather than a fresh one per
+   *  render, which is what the diagram's own memo is keyed on. */
+  const disabledRoles = useMemo(
+    () => analysis.disabled_roles ?? [],
+    [analysis.disabled_roles],
+  );
   const [supportedEngines, setSupportedEngines] = useState<RecognitionEngine[]>([]);
   const [detector, setDetector] = useState<InstallableModelStatus | null>(null);
   const [recognizers, setRecognizers] = useState<RecognizerDescriptor[]>([]);
@@ -162,6 +183,9 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [describerModel, setDescriberModel] = useState(analysis.describer_model ?? "");
+  // Which box of the diagram is being read about. The page reader's box to
+  // begin with, because it is the one choice that is always already made.
+  const [region, setRegion] = useState<string>(PAGE_REGION);
 
   useEffect(() => {
     setDescriberModel(analysis.describer_model ?? "");
@@ -185,6 +209,43 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
         return model ? [{ copy, model }] : [];
       }),
     [recognizers],
+  );
+
+  /** One box per role reader, and the kind each box stands for taken from the
+   *  reader's own `emits` rather than from its role name. The role says which
+   *  card it is; `emits` says which part of a page it takes, and that is what
+   *  the diagram is drawing. A row that declares no kind is a catalogue that
+   *  cannot say what the model reads — it is dropped from the diagram and said
+   *  out loud, rather than shown as an unfillable box. */
+  const helperBoxes = useMemo(
+    () =>
+      helpers.flatMap(({ copy, model }) => {
+        const kind = model.emits[0];
+        if (!kind) {
+          console.error(
+            `recognizer ${model.model_id} has role ${model.role} but declares no emitted kind; omitting its box`,
+          );
+          return [];
+        }
+        return [
+          {
+            kind,
+            label: copy.label,
+            // Absent from the list is chosen. Said here rather than in the
+            // diagram, so the diagram never has to know what a role is.
+            model: { ...model, selected: !disabledRoles.includes(model.role) },
+          },
+        ];
+      }),
+    [helpers, disabledRoles],
+  );
+
+  /** The role reader whose box is being read about, or null while the page
+   *  reader's own box is. */
+  const focused = useMemo(
+    () =>
+      helpers.find(({ model }) => model.emits[0] === region) ?? null,
+    [helpers, region],
   );
 
   const refreshCatalogue = useCallback(async () => {
@@ -356,6 +417,43 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api]);
 
+  /** Select or de-select one region's reader.
+   *
+   *  The page reader's own region is the feature switch: an analyzer with no
+   *  page reader has nothing to route to, so the backend refuses to build one
+   *  and this drives `enabled` instead of the list. The specialists go in and
+   *  out of the list, which leaves their weights alone — what changes is
+   *  whether they are attached, and therefore what the extraction recipe is
+   *  and which documents are re-read.
+   *
+   *  A region with no reader in the catalogue cannot be toggled; the caller
+   *  never offers one, and a call for one is a bug rather than a no-op, so it
+   *  is logged rather than swallowed. */
+  const handleToggleRegion = async (region: string, next: boolean) => {
+    if (region === PAGE_REGION) {
+      await handleToggle(next);
+      return;
+    }
+    const entry = helpers.find(({ model }) => model.emits[0] === region);
+    if (!entry) {
+      console.error(`no reader owns the '${region}' region; nothing to select`);
+      return;
+    }
+    const role = entry.model.role;
+    setBusy(true);
+    try {
+      await patch({
+        disabled_roles: next
+          ? disabledRoles.filter((off) => off !== role)
+          : [...disabledRoles.filter((off) => off !== role), role],
+      });
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const patch = async (next: Partial<Settings["image_analysis"]>) => {
     setError(null);
     await onUpdateSettings({ image_analysis: { ...analysis, ...next } });
@@ -449,6 +547,14 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
       setBusy(false);
     }
   };
+
+  /** The page reader's box. Its `selected` is the feature switch, because
+   *  that is the only sense in which a page reader can be de-selected: the
+   *  analyzer routes every marked-out area to one, so there is no reading
+   *  with the page reader turned off and something else still on. */
+  const pageBox: VennModel | null = selected
+    ? { ...selected, selected: analysis.enabled }
+    : null;
 
   const actionLabel = (() => {
     if (busy) return "Working…";
@@ -573,56 +679,115 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
         </section>
       )}
 
-      {/* The readers for what the detector finds. Their own sections rather
-          than rows in the picker below, because neither is an alternative to
-          the page reader — each runs alongside one, on the areas the detector
-          marks out for it. The picker offers page readers; these offer the
-          other roles. */}
-      {helpers.map(({ copy, model }) => (
-        <section key={copy.role}>
+      {/* What reads what, drawn as the containment it is rather than listed as
+          three unrelated downloads. The two role readers used to have a
+          section each; a user could read both and still not know that
+          installing one *takes formulas away* from the page reader they had
+          chosen. The boxes say it in one look, and the prose below says it for
+          whichever box is being looked at. */}
+      {helperBoxes.length > 0 && (
+        <section>
           <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-            {copy.heading}
+            What each model reads
           </h3>
-          <div className="space-y-2 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
-            <p className="text-[10px] italic text-[var(--text-dim)]">{copy.blurb}</p>
-            <div className="flex items-center gap-2 pt-1">
-              <span className="font-mono text-[10px] text-[var(--text-muted)]">
-                {model.display_name}
-              </span>
-              <span className="text-[9px] text-[var(--text-dim)]">
-                {formatModelBytes(model.footprint_bytes)}
-              </span>
-              {helperInventory[copy.role] && (
-                <a
-                  href={helperInventory[copy.role]!.license_url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-[9px] text-[var(--accent-blue)] underline"
-                >
-                  {helperInventory[copy.role]!.license}
-                </a>
-              )}
-              {model.is_cached ? (
-                <span className="ml-auto rounded bg-[var(--bg-active)] px-1.5 py-0.5 text-[9px] uppercase tracking-tighter text-[var(--text-dim)]">
-                  Installed
-                </span>
-              ) : (
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => void handleInstallHelper(model)}
-                  className="ml-auto rounded border border-[var(--border-main)] px-2 py-1 text-[10px] text-[var(--text-main)] disabled:opacity-50"
-                >
-                  {busy ? "Working…" : copy.button}
-                </button>
-              )}
-            </div>
-            {!model.is_cached && (
-              <p className="text-[10px] text-[var(--text-dim)]">{copy.absent}</p>
+          <div className="space-y-3 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
+            <RecognizerVenn
+              page={pageBox}
+              specialists={helperBoxes}
+              active={analysis.enabled}
+              focus={region}
+              onFocus={setRegion}
+              onToggle={(target, next) => void handleToggleRegion(target, next)}
+              disabled={busy}
+            />
+
+            {/* The focused region's own account of itself. One paragraph
+                rather than three sections: the boxes carry the structure, so
+                the prose only has to carry the part a box cannot — why this
+                kind needs its own reader at all. */}
+            <p className="text-[10px] italic text-[var(--text-dim)]">
+              {focused
+                ? focused.copy.blurb
+                : selected
+                  ? selected.description
+                  : "Choose a recognizer below and this box takes its colour."}
+            </p>
+
+            {focused && !focused.model.is_cached && (
+              <p className="text-[10px] text-[var(--text-dim)]">{focused.copy.absent}</p>
             )}
+
+            {/* Switched off costs exactly what absent costs — the same areas
+                go to the same page reader, and the recipe the library is read
+                under is the same one. What differs is only that turning it
+                back on is a click rather than a download, and both directions
+                re-read the documents this kind appears in. */}
+            {focused && focused.model.is_cached && disabledRoles.includes(focused.model.role) && (
+              <p className="text-[10px] text-[var(--text-dim)]">
+                Switched off, and still downloaded. The areas the detector marks
+                out here go to the page reader instead, which is the reading this
+                library had before {focused.model.display_name} was installed.
+                Turning it back on re-reads the documents that have them.
+              </p>
+            )}
+
+            {analysis.enabled && (
+              <p className="text-[10px] text-[var(--text-dim)]">
+                Selecting or de-selecting a reader is part of how a document is
+                read, not a display option: the documents that have this kind in
+                them are read and embedded again.
+              </p>
+            )}
+
+            {!analysis.enabled && (
+              <p className="text-[10px] text-[var(--text-dim)]">
+                Nothing is painted because nothing is read: image analysis is
+                off. Each box still names the model that would fill it.
+              </p>
+            )}
+
+            {/* One row per role reader, always shown. The diagram says whether
+                a kind is covered; this says what covering it costs and under
+                what licence, which is the half a colour cannot carry. */}
+            <div className="space-y-1.5 border-t border-[var(--border-main)] pt-2">
+              {helpers.map(({ copy, model }) => (
+                <div key={copy.role} className="flex items-center gap-2">
+                  <span className="font-mono text-[10px] text-[var(--text-muted)]">
+                    {model.display_name}
+                  </span>
+                  <span className="text-[9px] text-[var(--text-dim)]">
+                    {formatModelBytes(model.footprint_bytes)}
+                  </span>
+                  {helperInventory[copy.role] && (
+                    <a
+                      href={helperInventory[copy.role]!.license_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-[9px] text-[var(--accent-blue)] underline"
+                    >
+                      {helperInventory[copy.role]!.license}
+                    </a>
+                  )}
+                  {model.is_cached ? (
+                    <span className="ml-auto rounded bg-[var(--bg-active)] px-1.5 py-0.5 text-[9px] uppercase tracking-tighter text-[var(--text-dim)]">
+                      Installed
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void handleInstallHelper(model)}
+                      className="ml-auto rounded border border-[var(--border-main)] px-2 py-1 text-[10px] text-[var(--text-main)] disabled:opacity-50"
+                    >
+                      {busy ? "Working…" : copy.button}
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
         </section>
-      ))}
+      )}
 
       {/* Which pictures. Hidden while the feature is off, because it is a
           question about work that is not being done. It is the setting that

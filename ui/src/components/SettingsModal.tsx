@@ -709,6 +709,19 @@ export default function SettingsModal({
                   <section>
                     <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Appearance</h3>
                     <div className="space-y-3">
+                      <label className="flex items-start gap-2.5 cursor-pointer group">
+                        <input
+                          type="checkbox"
+                          aria-label="Show folders in file list"
+                          checked={settings.file_tree_enabled ?? false}
+                          onChange={(e) => handleUpdateSettings({ file_tree_enabled: e.target.checked })}
+                          className="mt-0.5 w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
+                        />
+                        <span className="flex flex-col">
+                          <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Show folders in file list</span>
+                          <span className="text-[10px] text-[var(--text-dim)] italic">Groups files by folder and enables drag-and-drop moves between them</span>
+                        </span>
+                      </label>
                       <div className="flex p-0.5 bg-[var(--bg-active)] rounded-lg w-fit">
                         {(["System", "Light", "Dark"] as const).map((t) => (
                           <button

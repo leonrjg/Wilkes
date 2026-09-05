@@ -2301,6 +2301,7 @@ mod tests {
                 .unwrap_or(FileListResponse {
                     files: Vec::new(),
                     omitted: Vec::new(),
+                    directories: Vec::new(),
                 }))
         }
 
@@ -3778,6 +3779,7 @@ mod tests {
                 doc_entry(library.path().join("c.pdf"), "Gamma", Some("10.1/c")),
             ],
             omitted: Vec::new(),
+            directories: Vec::new(),
         });
         let mcp = WilkesMcp::new(
             McpContext::Library(ExternalMcpContext::default()),

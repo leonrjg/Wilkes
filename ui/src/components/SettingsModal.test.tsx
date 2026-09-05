@@ -84,6 +84,7 @@ describe("SettingsModal", () => {
       sampling_overrides: {},
     },
     supported_extensions: ["ts"],
+    file_tree_enabled: false,
     external_mcp: {
       enabled: false,
       require_token: false,
@@ -179,6 +180,14 @@ describe("SettingsModal", () => {
     });
     fireEvent.click(screen.getByLabelText("Respect .gitignore files"));
     expect(mockApi.updateSettings).toHaveBeenCalledWith({ respect_gitignore: false });
+  });
+
+  it("configures the file list as a collapsible folder tree", async () => {
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+    fireEvent.click(screen.getByLabelText("Show folders in file list"));
+    expect(mockApi.updateSettings).toHaveBeenCalledWith({ file_tree_enabled: true });
   });
 
   it("updates theme", async () => {

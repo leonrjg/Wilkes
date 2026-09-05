@@ -57,9 +57,12 @@ interface CatalogueStore {
   toggleGrain: (grain: CatalogueGrain) => void;
   search: (query: string) => Promise<void>;
   acquire: (hit: CatalogueHit) => Promise<string | null>;
-  /** Fetches a whole course. Returns the paths to import — the generated
-   *  document first, because it is the thing that makes the rest a course. */
-  acquireCourse: (hit: CatalogueHit) => Promise<string[] | null>;
+  /** Fetches a whole course. Returns the folder it belongs in and the paths
+   *  to import — the generated document first, because it is the thing that
+   *  makes the rest a course. */
+  acquireCourse: (
+    hit: CatalogueHit,
+  ) => Promise<{ folder: string; paths: string[] } | null>;
   reset: () => void;
 }
 
@@ -175,7 +178,10 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       });
       // The generated document leads: it holds the syllabus and the reading
       // list, and it is what turns the rest of the list into a course.
-      return [course.document, ...course.documents.map((d) => d.path)];
+      return {
+        folder: course.folder,
+        paths: [course.document, ...course.documents.map((d) => d.path)],
+      };
     } catch (e: any) {
       set((state) => {
         const { [courseUrl]: _abandoned, ...courseProgress } = state.courseProgress;

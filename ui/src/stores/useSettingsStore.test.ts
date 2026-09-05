@@ -27,11 +27,13 @@ describe("useSettingsStore", () => {
       supportedExtensions: [],
       fileList: [],
       omittedFileList: [],
+      directoryList: [],
       preferSemantic: false,
       indexing: false,
       theme: "System",
       fileSortKey: "filename",
       fileSortDirection: "asc",
+      fileTreeEnabled: false,
     });
   });
 
@@ -72,12 +74,14 @@ describe("useSettingsStore", () => {
       supported_extensions: ["ts", "js"],
       file_sort_key: "modified",
       file_sort_direction: "desc",
+      file_tree_enabled: true,
     };
 
     (api.getSettings as any).mockResolvedValue(mockSettings);
     (api.listFiles as any).mockResolvedValue({
       files: [{ path: "/path/1/file.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" }],
       omitted: [],
+      directories: ["/path/1/empty"],
     });
     await useSettingsStore.getState().load();
     // Allow the directory-change subscription to resolve its async listFiles call
@@ -90,7 +94,9 @@ describe("useSettingsStore", () => {
     expect(state.preferSemantic).toBe(true);
     expect(state.fileSortKey).toBe("modified");
     expect(state.fileSortDirection).toBe("desc");
+    expect(state.fileTreeEnabled).toBe(true);
     expect(state.fileList.length).toBe(1);
+    expect(state.directoryList).toEqual(["/path/1/empty"]);
   });
 
   it("should handle load with no directory", async () => {

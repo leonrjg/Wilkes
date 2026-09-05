@@ -45,7 +45,8 @@ import type {
   SearchFieldMatch,
   SourceOrigin,
 } from "../lib/types";
-import { api } from "../services";
+import { api, isTauri, source } from "../services";
+import type { DesktopSourceApi } from "../services/api";
 import {
   formatDocumentFullDate,
   formatDocumentMonthYear,
@@ -69,6 +70,8 @@ import {
   pathIsWithinRoot,
   pathsEqual,
 } from "../lib/configuredRoots";
+import FileTree, { type FileTreeDragProps } from "./FileTree";
+import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
 
 function originLabel(origin: SourceOrigin): string {
   if ("TextFile" in origin) return `L${origin.TextFile.line}`;
@@ -421,6 +424,7 @@ export default function ResultList({
 
   const fileList = useSettingsStore((s) => s.fileList);
   const omittedFileList = useSettingsStore((s) => s.omittedFileList);
+  const directoryList = useSettingsStore((s) => s.directoryList);
   const indexing = useSettingsStore((s) => s.indexing);
   const refreshFileList = useSettingsStore((s) => s.refreshFileList);
   const fileSortKey = useSettingsStore((s) => s.fileSortKey);
@@ -428,6 +432,7 @@ export default function ResultList({
   const setFileSortKey = useSettingsStore((s) => s.setFileSortKey);
   const setFileSortDirection = useSettingsStore((s) => s.setFileSortDirection);
   const fileDisplayFields = useSettingsStore((s) => s.fileDisplayFields);
+  const fileTreeEnabled = useSettingsStore((s) => s.fileTreeEnabled);
   const toggleFileDisplayField = useSettingsStore((s) => s.toggleFileDisplayField);
   const directory = useSettingsStore((s) => s.directory);
   const favorites = useSettingsStore((s) => s.favorites);
@@ -446,6 +451,7 @@ export default function ResultList({
   const selectedCollectionId = useResearchStore((s) => s.selectedCollectionId);
   const selectedTagId = useResearchStore((s) => s.selectedTagId);
   const draftCollectionExpression = useResearchStore((s) => s.draftCollectionExpression);
+  const readOnly = useActiveWorkspaceReadOnly();
 
   const parentRef = useRef<HTMLDivElement>(null);
   const sortMenuTriggerRef = useRef<HTMLButtonElement>(null);
@@ -487,10 +493,24 @@ export default function ResultList({
 
   const displayedFileList = documents ?? fileList;
   const displayedOmittedFileList = documents ? [] : omittedFileList;
-  const sortedFileList = preserveDocumentOrder
-    ? displayedFileList
-    : sortFileEntries(displayedFileList, fileSortKey, fileSortDirection);
-  const sortedOmittedFileList = sortFileEntries(displayedOmittedFileList, fileSortKey, fileSortDirection);
+  const sortedFileList = React.useMemo(
+    () => preserveDocumentOrder
+      ? displayedFileList
+      : sortFileEntries(displayedFileList, fileSortKey, fileSortDirection),
+    [displayedFileList, fileSortDirection, fileSortKey, preserveDocumentOrder],
+  );
+  const sortedOmittedFileList = React.useMemo(
+    () => sortFileEntries(displayedOmittedFileList, fileSortKey, fileSortDirection),
+    [displayedOmittedFileList, fileSortDirection, fileSortKey],
+  );
+  const filteredVisibleFiles = React.useMemo(
+    () => filterFileEntries(sortedFileList, filterText),
+    [filterText, sortedFileList],
+  );
+  const filteredOmittedFiles = React.useMemo(
+    () => filterFileEntries(sortedOmittedFileList, filterText),
+    [filterText, sortedOmittedFileList],
+  );
   const rows = buildRows(results, expandedFiles);
 
   const { openFileMenu, fileMenu } = useFileContextMenu({
@@ -530,6 +550,19 @@ export default function ResultList({
     selectTopic(null);
     clearResults();
   };
+  const moveTreeFile = async (path: string, targetDirectory: string) => {
+    const parent = path.replace(/[/\\][^/\\]*$/, "");
+    if (pathsEqual(parent, targetDirectory)) return;
+    try {
+      await (source as DesktopSourceApi).moveFile(path, targetDirectory);
+      useViewerStore.getState().closePath(path);
+      await refreshFileList();
+      addToast(`Moved ${fileName(path)} to ${fileName(targetDirectory)}`, { type: "success" });
+    } catch (error) {
+      console.error("Failed to move file:", error);
+      addToast(error instanceof Error ? error.message : "Failed to move file", { type: "error" });
+    }
+  };
   const summaryInput = React.useMemo(
     () => buildSearchResultsSummaryInput(resultContext?.subject ?? "", results),
     [resultContext?.subject, results],
@@ -549,9 +582,6 @@ export default function ResultList({
     openSummaryKey === completedSummaryKey;
 
   if (!hasQuery) {
-    const filteredVisibleFiles = filterFileEntries(sortedFileList, filterText);
-    const filteredOmittedFiles = filterFileEntries(sortedOmittedFileList, filterText);
-
     return (
       <div className="flex flex-col h-full overflow-hidden relative bg-[var(--bg-app)]">
         {indexing && (
@@ -666,24 +696,51 @@ export default function ResultList({
           </Tooltip>
         </div>
         <div className="flex-1 overflow-y-auto">
-          {filteredVisibleFiles.map((entry) => (
-            <FileEntryRowAdapter
-              key={entry.path}
-              entry={entry}
-              leadingDetails={documentDetails?.(entry) ?? []}
-              accessory={documentAccessory?.(entry)}
-              displayFields={fileDisplayFields}
-              additionalRoots={additionalRootsForPath(entry.path)}
-              selected={selectedMatch?.path === entry.path}
-              onClick={() => onFileClick(entry.path)}
-              onContextMenu={(event) =>
-                openFileMenu(event, {
-                  kind: "file",
-                  path: entry.path,
-                  open: () => onFileClick(entry.path),
-                })}
+          {fileTreeEnabled && !documents && directory ? (
+            <FileTree
+              root={directory}
+              files={filteredVisibleFiles}
+              directories={filterText.trim() ? [] : directoryList}
+              movable={isTauri && !readOnly}
+              expandAll={filterText.trim().length > 0}
+              onMove={moveTreeFile}
+              renderFile={(entry, drag) => (
+                <FileEntryRowAdapter
+                  entry={entry}
+                  leadingDetails={documentDetails?.(entry) ?? []}
+                  accessory={documentAccessory?.(entry)}
+                  displayFields={fileDisplayFields}
+                  additionalRoots={additionalRootsForPath(entry.path)}
+                  selected={selectedMatch?.path === entry.path}
+                  drag={drag}
+                  onClick={() => onFileClick(entry.path)}
+                  onContextMenu={(event) =>
+                    openFileMenu(event, {
+                      kind: "file",
+                      path: entry.path,
+                      open: () => onFileClick(entry.path),
+                    })}
+                />
+              )}
             />
-          ))}
+          ) : filteredVisibleFiles.map((entry) => (
+              <FileEntryRowAdapter
+                key={entry.path}
+                entry={entry}
+                leadingDetails={documentDetails?.(entry) ?? []}
+                accessory={documentAccessory?.(entry)}
+                displayFields={fileDisplayFields}
+                additionalRoots={additionalRootsForPath(entry.path)}
+                selected={selectedMatch?.path === entry.path}
+                onClick={() => onFileClick(entry.path)}
+                onContextMenu={(event) =>
+                  openFileMenu(event, {
+                    kind: "file",
+                    path: entry.path,
+                    open: () => onFileClick(entry.path),
+                  })}
+              />
+            ))}
           {filteredVisibleFiles.length === 0 && sortedFileList.length > 0 && (
             <div className="px-3 py-8 text-center text-xs text-[var(--text-dim)] italic">
               No files match "{filterText}"
@@ -1206,6 +1263,7 @@ function FileEntryRowAdapter({
   selected,
   detail,
   muted = false,
+  drag,
   onClick,
   onContextMenu,
 }: {
@@ -1217,6 +1275,7 @@ function FileEntryRowAdapter({
   selected: boolean;
   detail?: string;
   muted?: boolean;
+  drag?: FileTreeDragProps;
   onClick: () => void;
   onContextMenu: (event: React.MouseEvent) => void;
 }) {
@@ -1247,6 +1306,10 @@ function FileEntryRowAdapter({
       accessory={accessory}
       selected={selected}
       muted={muted}
+      draggable={drag?.draggable}
+      onDragStart={drag?.onDragStart}
+      onDrag={drag?.onDrag}
+      onDragEnd={drag?.onDragEnd}
       onClick={onClick}
       onContextMenu={onContextMenu}
       onTagClick={(tag) => useResearchStore.getState().setSelectedTag(tag.id)}

@@ -661,8 +661,9 @@ export class TauriSourceApi implements DesktopSourceApi {
     paths: string[],
     root: string,
     mode: "move" | "copy",
+    folder?: string,
   ): Promise<string[]> {
-    return invoke<string[]>("import_files", { paths, root, mode });
+    return invoke<string[]>("import_files", { paths, root, mode, folder });
   }
 
   async readClipboardFiles(): Promise<string[]> {

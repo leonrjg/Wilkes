@@ -54,6 +54,7 @@ interface SettingsStore {
   supportedExtensions: string[];
   fileList: FileEntry[];
   omittedFileList: OmittedFileEntry[];
+  directoryList: string[];
   preferSemantic: boolean;
   indexing: boolean;
   theme: Theme;
@@ -64,6 +65,7 @@ interface SettingsStore {
   fileSortKey: FileSortKey;
   fileSortDirection: FileSortDirection;
   fileDisplayFields: FileDisplayField[];
+  fileTreeEnabled: boolean;
   chatBackend: AgentBackend;
 
   resetForWorkspace: () => void;
@@ -125,6 +127,7 @@ export const useSettingsStore = create<SettingsStore>()(
     supportedExtensions: [],
     fileList: [],
     omittedFileList: [],
+    directoryList: [],
     preferSemantic: false,
     indexing: false,
     theme: "System",
@@ -134,6 +137,7 @@ export const useSettingsStore = create<SettingsStore>()(
     fileSortKey: "filename",
     fileSortDirection: "asc",
     fileDisplayFields: ["size"],
+    fileTreeEnabled: false,
     chatBackend: "ClaudeCode",
 
     resetForWorkspace: () => set({
@@ -144,6 +148,7 @@ export const useSettingsStore = create<SettingsStore>()(
       semantic: null,
       fileList: [],
       omittedFileList: [],
+      directoryList: [],
       indexing: false,
     }),
 
@@ -167,8 +172,10 @@ export const useSettingsStore = create<SettingsStore>()(
         fileSortKey: s.file_sort_key ?? "filename",
         fileSortDirection: s.file_sort_direction ?? "asc",
         fileDisplayFields: s.file_display_fields ?? ["size"],
+        fileTreeEnabled: s.file_tree_enabled ?? false,
         chatBackend: s.chat_backend ?? "ClaudeCode",
         omittedFileList: [],
+        directoryList: [],
       });
     },
 
@@ -267,10 +274,14 @@ export const useSettingsStore = create<SettingsStore>()(
       if (!directory) return;
       try {
         const response = await listFilesForActiveFilters(directory);
-        set({ fileList: response.files, omittedFileList: response.omitted });
+        set({
+          fileList: response.files,
+          omittedFileList: response.omitted,
+          directoryList: response.directories ?? [],
+        });
       } catch (error) {
         // A failed filter must never leave the previous, now-misleading list visible.
-        set({ fileList: [], omittedFileList: [] });
+        set({ fileList: [], omittedFileList: [], directoryList: [] });
         console.error("Failed to refresh file list:", error);
       }
     },
@@ -368,6 +379,9 @@ export const useSettingsStore = create<SettingsStore>()(
       if (patch.file_display_fields) {
         set({ fileDisplayFields: patch.file_display_fields });
       }
+      if (patch.file_tree_enabled !== undefined) {
+        set({ fileTreeEnabled: patch.file_tree_enabled });
+      }
       if (patch.chat_backend) {
         set({ chatBackend: patch.chat_backend });
       }
@@ -437,8 +451,10 @@ export const useSettingsStore = create<SettingsStore>()(
         fileSortKey: settings.file_sort_key ?? "filename",
         fileSortDirection: settings.file_sort_direction ?? "asc",
         fileDisplayFields: settings.file_display_fields ?? ["size"],
+        fileTreeEnabled: settings.file_tree_enabled ?? false,
         chatBackend: settings.chat_backend ?? "ClaudeCode",
         omittedFileList: [],
+        directoryList: [],
       });
     },
 
@@ -463,13 +479,14 @@ useSettingsStore.subscribe(
           useSettingsStore.setState({
             fileList: response.files,
             omittedFileList: response.omitted,
+            directoryList: response.directories ?? [],
           }))
         .catch((error) => {
           console.error("Failed to refresh file list:", error);
-          useSettingsStore.setState({ fileList: [], omittedFileList: [] });
+          useSettingsStore.setState({ fileList: [], omittedFileList: [], directoryList: [] });
         });
     } else {
-      useSettingsStore.setState({ fileList: [], omittedFileList: [] });
+      useSettingsStore.setState({ fileList: [], omittedFileList: [], directoryList: [] });
     }
   }
 );

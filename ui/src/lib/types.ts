@@ -476,6 +476,7 @@ export interface FileListChanged {
 export interface FileListResponse {
   files: FileEntry[];
   omitted: OmittedFileEntry[];
+  directories?: string[];
 }
 
 export interface OmittedFileEntry extends FileEntry {
@@ -708,6 +709,17 @@ export interface ImageAnalysisSettings {
   describer_model: string;
   /** Which of the document's pictures are read. Defaults to `typeset_only`. */
   scope: ImageScope;
+  /** The role readers switched off: installed, and deliberately not spent.
+   *
+   *  Installing a reader used to be the whole of choosing it, so the only way
+   *  to stop reading formulas with one was to delete its weights. A role in
+   *  here stays downloaded and is not attached, and the areas the detector
+   *  marks out for it go to the page reader instead — the same reading, and
+   *  the same recipe, as an installation that never downloaded it.
+   *
+   *  `page` is not a member: reading pages is what `enabled` turns off, and
+   *  the backend refuses a configuration that says otherwise. */
+  disabled_roles: RecognizerRole[];
 }
 
 /** The recognizers Wilkes knows how to address.
@@ -1011,6 +1023,8 @@ export interface Settings {
   file_sort_key?: FileSortKey;
   file_sort_direction?: FileSortDirection;
   file_display_fields?: FileDisplayField[];
+  /** Group the recursive file listing into collapsible filesystem folders. */
+  file_tree_enabled?: boolean;
   /** Desired CSS-pixel body-text height used when PDFs are auto-zoomed. */
   pdf_auto_zoom_target_px: number;
   /** Persisted default agent for the chat pane (`SettingsModal`). The in-pane
@@ -1378,6 +1392,9 @@ export interface CourseSkip {
 export interface CatalogueCourse {
   course_url: string;
   title: string;
+  /** What the course's folder is called — `1.77 Water Quality Control (Spring
+   *  2006)` — under uploads now and under the library root once imported. */
+  folder: string;
   directory: string;
   document: string;
   documents: CourseDocument[];

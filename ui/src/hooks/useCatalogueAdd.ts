@@ -41,12 +41,18 @@ export function useCatalogueAdd() {
 
   /** The second step, shared by both kinds of candidate: whatever was staged
    *  in uploads is imported into the library root, or — on the web build,
-   *  where uploads *is* the root — the root is simply pointed at it. */
+   *  where uploads *is* the root — the root is simply pointed at it.
+   *
+   *  `folder` is passed for a course and omitted for a single document, so a
+   *  course keeps its folder across the move instead of arriving as forty
+   *  loose files the root cannot attribute to it. */
   const install = useCallback(
-    async (staged: string[]): Promise<void> => {
+    async (staged: string[], folder?: string): Promise<void> => {
       if (source.type === "desktop") {
-        await (source as DesktopSourceApi).importFiles(staged, directory, "move");
+        await (source as DesktopSourceApi).importFiles(staged, directory, "move", folder);
       } else if (!directory && staged.length > 0) {
+        // On the web build the files are already in their course folder under
+        // the served root, so the folder is where the root should point.
         setDirectory(parentDirectory(staged[0]));
       }
       await refreshFileList();
@@ -61,10 +67,10 @@ export function useCatalogueAdd() {
       // one file. Which of the two this is was decided in core and travels on
       // the hit, so this does not test the provider id to find out.
       if (hit.acquisition === "course") {
-        const staged = await acquireCourse(hit);
-        if (staged === null) return null;
-        await install(staged);
-        return staged[0] ?? null;
+        const course = await acquireCourse(hit);
+        if (course === null) return null;
+        await install(course.paths, course.folder);
+        return course.paths[0] ?? null;
       }
       const staged = await acquire(hit);
       if (staged === null) return null;

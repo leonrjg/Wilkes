@@ -164,6 +164,11 @@ pub struct CourseSkip {
 pub struct CatalogueCourseResponse {
     pub course_url: String,
     pub title: String,
+    /// What the course's folder is called — `1.77 Water Quality Control
+    /// (Spring 2006)` — under uploads now and under the library root once
+    /// imported. The same name in both places, so a course does not change
+    /// identity by being admitted.
+    pub folder: String,
     /// The directory under uploads holding the whole course.
     pub directory: String,
     /// The generated Markdown document: the syllabus, the calendar, the
@@ -420,7 +425,7 @@ pub async fn acquire_course(
             CatalogueError::Request(format!("Could not read that course: {error:#}"))
         })?;
 
-    let directory = uploads_dir.join(&manifest.slug);
+    let directory = uploads_dir.join(&manifest.folder);
     tokio::fs::create_dir_all(&directory)
         .await
         .map_err(|error| {
@@ -429,7 +434,7 @@ pub async fn acquire_course(
 
     // Written before the documents, so a course whose fetches are cancelled
     // partway still leaves behind the thing that says what it was.
-    let document_name = format!("{}.md", manifest.slug);
+    let document_name = format!("{}.md", manifest.folder);
     let document_path = directory.join(&document_name);
     tokio::fs::write(&document_path, ocw::course_document(&manifest))
         .await
@@ -491,6 +496,7 @@ pub async fn acquire_course(
     Ok(CatalogueCourseResponse {
         course_url: manifest.course_url,
         title: manifest.title,
+        folder: manifest.folder,
         directory: directory.display().to_string(),
         document: document_path.display().to_string(),
         documents,

@@ -37,6 +37,10 @@ interface Props {
   onClick: () => void;
   onContextMenu?: (event: React.MouseEvent) => void;
   onTagClick?: (tag: Tag) => void;
+  draggable?: boolean;
+  onDragStart?: (event: React.DragEvent<HTMLButtonElement>) => void;
+  onDrag?: (event: React.DragEvent<HTMLButtonElement>) => void;
+  onDragEnd?: (event: React.DragEvent<HTMLButtonElement>) => void;
 }
 
 export function fileName(path: string): string {
@@ -53,6 +57,10 @@ export function DocumentEntryRow({
   onClick,
   onContextMenu,
   onTagClick,
+  draggable = false,
+  onDragStart,
+  onDrag,
+  onDragEnd,
 }: Props) {
   const visibleDetails = details.filter(
     (field) =>
@@ -97,7 +105,13 @@ export function DocumentEntryRow({
       type="button"
       onClick={onClick}
       onContextMenu={onContextMenu}
+      draggable={draggable}
+      onDragStart={onDragStart}
+      onDrag={onDrag}
+      onDragEnd={onDragEnd}
       className={`w-full flex select-none flex-col gap-1 px-3 py-1.5 text-left hover:bg-[var(--bg-hover)] transition-colors ${
+        draggable ? "cursor-grab active:cursor-grabbing" : ""
+      } ${
         selected ? "bg-[var(--bg-active)]" : ""
       }`}
     >

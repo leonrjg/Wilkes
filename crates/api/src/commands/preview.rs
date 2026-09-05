@@ -110,6 +110,10 @@ pub(crate) fn pdf_preview(
 /// offers what the page draws, which is all that is known about it.
 fn superseded_areas(path: &std::path::Path, index: Option<IndexHandle>) -> Vec<SupersededArea> {
     let Some(index) = index else {
+        tracing::debug!(
+            "superseded_areas: no index handle was passed for {}; the preview will show the page's own glyphs",
+            path.display()
+        );
         return Vec::new();
     };
     let guard = match index.lock() {
@@ -117,6 +121,10 @@ fn superseded_areas(path: &std::path::Path, index: Option<IndexHandle>) -> Vec<S
         Err(poisoned) => poisoned.into_inner(),
     };
     let Some(index) = guard.as_ref() else {
+        tracing::info!(
+            "superseded_areas: no index is open, so this workspace's reading regions for {} cannot be read; the preview will show the page's own glyphs",
+            path.display()
+        );
         return Vec::new();
     };
     match index.superseded_areas_for_path(path) {

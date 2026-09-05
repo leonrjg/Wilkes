@@ -324,6 +324,7 @@ title = "title[0]"
         assert_eq!(settings.context_lines, 2);
         assert_eq!(settings.file_sort_key, FileSortKey::Filename);
         assert_eq!(settings.file_sort_direction, FileSortDirection::Asc);
+        assert!(!settings.file_tree_enabled);
         assert_eq!(settings.chat_custom_instructions, "");
         assert!(!settings.external_mcp.enabled);
         assert!(!settings.external_mcp.require_token);
@@ -341,7 +342,8 @@ title = "title[0]"
 
         let patch = serde_json::json!({
             "file_sort_key": "publication",
-            "file_display_fields": ["publication", "size"]
+            "file_display_fields": ["publication", "size"],
+            "file_tree_enabled": true
         });
 
         let updated = update_settings(&path, patch).await.unwrap();
@@ -350,6 +352,7 @@ title = "title[0]"
             updated.file_display_fields,
             vec![FileDisplayField::Publication, FileDisplayField::Size]
         );
+        assert!(updated.file_tree_enabled);
 
         let loaded = get_settings(&path).await.unwrap();
         assert_eq!(loaded.file_sort_key, FileSortKey::Publication);
@@ -357,6 +360,7 @@ title = "title[0]"
             loaded.file_display_fields,
             vec![FileDisplayField::Publication, FileDisplayField::Size]
         );
+        assert!(loaded.file_tree_enabled);
     }
 
     #[tokio::test]

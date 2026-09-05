@@ -1889,6 +1889,31 @@ pub struct ImageAnalysisSettings {
     /// made after it shipped is a setting with two meanings.
     #[serde(default)]
     pub scope: ImageScope,
+    /// The role readers switched off: installed, and deliberately not spent.
+    ///
+    /// Installing a reader used to be the whole of choosing it, so the only
+    /// way to stop reading formulas with one was to make its weights
+    /// disappear. That conflates two questions — "is this on disk" and "is
+    /// this how I want my library read" — and only the second is a setting.
+    /// A role in here is a reader that stays downloaded and is not attached,
+    /// so the areas the detector marks out for it go to the page reader
+    /// instead, exactly as they do when it was never installed.
+    ///
+    /// By role rather than by model id, because that is how the analyzer
+    /// finds these readers in the first place: there is one formula reader
+    /// per build, and naming it here would be a second copy of which-is-which.
+    ///
+    /// [`RecognizerRole::Page`] is not a member. Reading pages is what
+    /// `enabled` turns off, and a configuration that said otherwise would be
+    /// asking for an analyzer with nothing to analyze with; `build_analyzer`
+    /// refuses it rather than quietly reading on.
+    ///
+    /// Empty by default, which is what every settings file written before
+    /// this field existed says: every installed reader is spent, the recipe
+    /// is the one those libraries were read under, and nothing is re-read on
+    /// upgrade.
+    #[serde(default)]
+    pub disabled_roles: Vec<crate::extract::image::dispatch::RecognizerRole>,
 }
 
 /// Tasks whose sampling the user may override.
@@ -2450,6 +2475,11 @@ pub struct Settings {
     pub file_sort_direction: FileSortDirection,
     #[serde(default = "default_file_display_fields")]
     pub file_display_fields: Vec<FileDisplayField>,
+    /// Present the recursive library listing as collapsible folders. This is
+    /// deliberately a view preference: the catalogue and search boundary
+    /// continue to identify documents by their canonical filesystem paths.
+    #[serde(default)]
+    pub file_tree_enabled: bool,
     /// Desired CSS-pixel height for body text when a PDF is auto-zoomed.
     #[serde(default = "default_pdf_auto_zoom_target_px")]
     pub pdf_auto_zoom_target_px: f64,
@@ -2532,6 +2562,7 @@ impl Default for Settings {
             file_sort_key: FileSortKey::default(),
             file_sort_direction: FileSortDirection::default(),
             file_display_fields: default_file_display_fields(),
+            file_tree_enabled: false,
             pdf_auto_zoom_target_px: default_pdf_auto_zoom_target_px(),
             chat_backend: AgentBackend::default(),
             chat_config: Vec::new(),
@@ -3052,6 +3083,10 @@ pub struct FileListResponse {
     pub files: Vec<FileEntry>,
     #[serde(default)]
     pub omitted: Vec<OmittedFileEntry>,
+    /// Physical directories visited by the same walk. Search ignores these;
+    /// the desktop uses them to render empty folders as valid move targets.
+    #[serde(default)]
+    pub directories: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
