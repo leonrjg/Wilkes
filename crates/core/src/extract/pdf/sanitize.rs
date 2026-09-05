@@ -1036,6 +1036,7 @@ fn render(items: &[Item], images: &mut [ExtractedImage]) -> Reading {
                 // it interrupts and its block occupies the bytes after.
                 let anchor = text.len();
                 let pieces = serialize::enrichment_pieces(image);
+                let structural = serialize::is_structural_block(image);
                 let page = image.page;
                 images[*index].reading_anchor = Some(anchor);
                 if pieces.is_empty() {
@@ -1063,15 +1064,18 @@ fn render(items: &[Item], images: &mut [ExtractedImage]) -> Reading {
                         provenance: piece.provenance,
                     });
                 }
-                // A block, so both: where the bytes are, and that a structural
-                // boundary belongs on either side of them. This is the one
-                // branch that opens a line, and the seam follows the line.
+                // Where the bytes are, always. Whether a *structural boundary*
+                // belongs on either side of them is a second question, and
+                // `serialize::is_structural_block` owns it: this branch is the
+                // one that opens a line, and the page opening a line for a
+                // formula it typeset is typography, not a seam — the sentence
+                // that introduces the formula runs through it.
                 let block = ByteRange {
                     start,
                     end: text.len(),
                 };
                 images[*index].reading_range = Some(block.clone());
-                images[*index].reading_block = Some(block);
+                images[*index].reading_block = structural.then_some(block);
             }
         }
     }
@@ -1236,11 +1240,13 @@ mod tests {
         assert!(!reading.text.contains("ci = ai"), "{:?}", reading.text);
         assert_eq!(diagnostics.typeset_regions_superseded_native_text, 1);
         assert!(images[0].reading_range.is_some(), "the block has a range");
-        // A displayed expression *is* a block, so it declares one: the seam
-        // belongs here, and the prose either side of it is not one sentence.
-        assert_eq!(
-            images[0].reading_block, images[0].reading_range,
-            "a block declares its range as a structural block"
+        // Placed on a line of its own, and still not a seam. "prose above" and
+        // "prose below" are one sentence with a formula displayed inside it —
+        // the page opening a line for it is typography, and a passage cut here
+        // would strand the clause that introduces the expression.
+        assert!(
+            images[0].reading_block.is_none(),
+            "a formula the page displayed is not a structural block"
         );
 
         // The order is the page's: the formula is between the two paragraphs
@@ -1249,6 +1255,88 @@ mod tests {
         let formula = reading.text.find("Page formula:").expect("formula");
         let below = reading.text.find("prose below").expect("below");
         assert!(above < formula && formula < below, "{:?}", reading.text);
+    }
+
+    /// The same typeset region, read as another kind.
+    fn recognized_as(kind: crate::types::RegionKind, text: &str) -> ExtractedImage {
+        let mut image = recognized(true);
+        image.ocr_regions[0].kind = kind;
+        image.ocr_regions[0].text = text.into();
+        image
+    }
+
+    /// A table the page typeset keeps its boundary where a formula loses it.
+    ///
+    /// Not a hedge against the formula rule: a Markdown table that does not
+    /// start at the beginning of a line is not a Markdown table, so a table is
+    /// line-structured whatever set it, and the prose above it is a finished
+    /// sentence rather than the clause that introduces it.
+    #[test]
+    fn a_displayed_table_is_still_a_structural_block() {
+        let mut images = [recognized_as(
+            crate::types::RegionKind::Table,
+            "| a | b |\n| - | - |\n| 0 | 1 |",
+        )];
+        let mut diagnostics = ExtractionDiagnostics::default();
+        let reading = sanitize(
+            vec![page_with_a_formula_in_the_middle()],
+            &mut images,
+            &[],
+            &mut diagnostics,
+        );
+
+        assert!(reading.text.contains("Page table:"), "{:?}", reading.text);
+        assert_eq!(
+            images[0].reading_block, images[0].reading_range,
+            "a table declares its range as a structural block"
+        );
+    }
+
+    /// A picture the document embeds keeps its boundary too. Its transcription
+    /// and description are an account of something drawn beside the prose, and
+    /// the sentence above it does not run through it.
+    #[test]
+    fn an_embedded_picture_is_still_a_structural_block() {
+        let mut picture = recognized_as(crate::types::RegionKind::Text, "Figure 1: encryption");
+        picture.origin = crate::types::RegionOrigin::Embedded;
+        let mut images = [picture];
+        let page = Page {
+            number: 1,
+            height: 800.0,
+            blocks: vec![
+                Block {
+                    lines: vec![line(vec![
+                        word("prose", 100.0, 80.0),
+                        word("above", 140.0, 80.0),
+                    ])],
+                    image: None,
+                },
+                Block {
+                    lines: Vec::new(),
+                    image: Some(0),
+                },
+                Block {
+                    lines: vec![line(vec![
+                        word("prose", 100.0, 120.0),
+                        word("below", 140.0, 120.0),
+                    ])],
+                    image: None,
+                },
+            ],
+        };
+
+        let mut diagnostics = ExtractionDiagnostics::default();
+        let reading = sanitize(vec![page], &mut images, &[], &mut diagnostics);
+
+        assert!(
+            reading.text.contains("Figure 1: encryption"),
+            "{:?}",
+            reading.text
+        );
+        assert_eq!(
+            images[0].reading_block, images[0].reading_range,
+            "an embedded picture declares its range as a structural block"
+        );
     }
 
     /// An expression inside a sentence is spliced into it, not lifted out of

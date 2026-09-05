@@ -106,6 +106,39 @@ fn starts_a_line(kind: RegionKind) -> bool {
     )
 }
 
+/// Whether an image's enrichment block stands apart from the prose around it,
+/// so a passage boundary belongs on either side of it.
+///
+/// Two questions the reading used to answer with one flag: *does this open a
+/// line of its own*, and *is this a unit no passage may be cut across*. They
+/// agree for a picture the document embeds — its label, transcription and
+/// description are Wilkes' account of something drawn beside the text, and the
+/// prose on either side is not the sentence it interrupts.
+///
+/// They disagree for an expression the page typeset. It opens a line because
+/// that is how the page set it, but its reading stands *in place of* the
+/// document's own glyphs ([`RegionKind::supersedes_native_glyphs`]): a display
+/// formula is a constituent of the sentence that introduces it, not a block
+/// beside it. A seam there strands the clause that introduces it — "…as the
+/// bit sequence", "expressed as a formula:", "while Bob calculates" — in a
+/// passage of its own, and takes the overlap window with it, so neither half
+/// can reach the other. Measured on the corpus that prompted this: one
+/// definition and its three displayed formulas came out as six passages
+/// totalling 659 bytes under a 600-character window, and the formulas were
+/// then cited by nothing.
+///
+/// `starts_a_line` asks the same question of a kind, and a table, a chart or a
+/// code listing is line-structured whatever set it — those keep the boundary a
+/// formula loses. Answering it in two places is how the two questions came
+/// apart in the first place, so this is the one owner and the chunker's
+/// `structural_runs` is its one reader.
+pub fn is_structural_block(image: &ExtractedImage) -> bool {
+    image.origin != RegionOrigin::Typeset
+        || image
+            .accepted_ocr()
+            .any(|region| starts_a_line(region.kind))
+}
+
 /// Group accepted regions into labelled blocks, in the order the recognizer
 /// emitted them.
 ///

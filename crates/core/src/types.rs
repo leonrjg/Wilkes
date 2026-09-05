@@ -1343,23 +1343,31 @@ pub struct ExtractedImage {
     /// so a consumer asking "is there a structural boundary here" must ask
     /// [`reading_block`](Self::reading_block) instead.
     pub reading_range: Option<ByteRange>,
-    /// The same range, set only for a region the page set apart as a block.
+    /// The same range, set only for a region that stands apart from the prose
+    /// around it.
     ///
-    /// Two kinds of region write bytes into the reading and only one of them
-    /// is a structural unit. A native image, or an expression the page
-    /// displayed between two paragraphs, is a block: it opens a line, carries
-    /// a label, and the prose on either side of it is not the sentence it
-    /// interrupts. An expression the page set *inside* a line is not — by
-    /// `Item::InlineImage`'s own contract it is "a run of words within" the
-    /// prose, with no label and no line of its own.
+    /// Not every region that writes bytes is a structural unit. A picture the
+    /// document embeds is one: its label, transcription and description are
+    /// Wilkes' account of something drawn beside the text, and the prose on
+    /// either side is not the sentence it interrupts. An expression the page
+    /// typeset is not — its reading stands in place of the document's own
+    /// glyphs, which makes it a constituent of the sentence that introduces
+    /// it. `serialize::is_structural_block` owns that distinction and this
+    /// field is where its answer is recorded; a table, a chart and a code
+    /// listing are line-structured whatever set them, and keep the boundary.
     ///
     /// This exists because [`reading_range`](Self::reading_range) cannot tell
     /// those apart, and chunking asked it to: every region with bytes became a
     /// structural run, so one sentence carrying three inline expressions was
     /// cut into seven passages and its prose stranded in fragments as short as
-    /// `"of "`. The reading said inline, the chunker heard block. One field
-    /// answers each question now, and the boundary a passage is cut on is this
-    /// one.
+    /// `"of "`. The reading said inline, the chunker heard block.
+    ///
+    /// The field alone was not the whole fix. A *displayed* formula kept its
+    /// seam for another round, on the reasoning that a line of its own made it
+    /// a block — and cut "…as the bit sequence", "expressed as a formula:" and
+    /// "while Bob calculates" into passages of their own: the same failure one
+    /// typographic step further out. Where the page put a region is not the
+    /// test. What its bytes stand in place of is.
     #[serde(default)]
     pub reading_block: Option<ByteRange>,
     /// Where the picture *is* in the reading: the zero-width offset between

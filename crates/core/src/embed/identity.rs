@@ -16,7 +16,16 @@ pub const POOLING_NORMALIZATION_RECIPE: &str = "engine-native-pooling+l2-output-
 /// `ExtractionRecipe::id()`, hence rendition identity, hence
 /// `extracted_content_sha256` — so every managed document re-extracts and
 /// re-embeds rather than a v1 reading being mixed with a v2 one.
-pub const EXTRACTOR_RECIPE_VERSION: &str = "wilkes-extractors-v2";
+/// Bumped whenever an extractor's output changes for the same source, so a
+/// rendition produced by an older build stops claiming this runtime would
+/// reproduce it.
+///
+/// v3: a typeset region no longer declares a structural boundary unless its
+/// kind is line-structured (`serialize::is_structural_block`). The reading's
+/// bytes are unchanged — a display formula still opens its own line and
+/// carries its label — but the passages cut from them are not, so a v2
+/// rendition and a v3 one are different renditions of the same reading.
+pub const EXTRACTOR_RECIPE_VERSION: &str = "wilkes-extractors-v3";
 pub const CHUNKER_RECIPE_VERSION: &str = "text-splitter-0.27-trim-v1";
 
 macro_rules! opaque_id {
