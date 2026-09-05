@@ -8329,14 +8329,20 @@ impl SemanticIndex {
     ///
     /// A diagnostic, and it exists because "0 of 605 chunks adopted" is a
     /// number with several possible causes and no way to tell them apart. Two
-    /// indexes in the same space adopt nothing from each other when they chunk
-    /// the document differently: the boundaries move, so the texts differ, so
-    /// no hash matches — and the vectors genuinely are for different spans,
-    /// which is not a refusal to be relaxed but a fact to be reported.
+    /// indexes in the same space adopt nothing from each other when they read
+    /// the document differently: the text moves, so the hashes differ — and
+    /// the vectors genuinely are for other spans, which is not a refusal to be
+    /// relaxed but a fact to be reported.
     ///
-    /// Returns the extraction recipe each rendition was produced under and how
-    /// many chunks it holds, so a caller that found nothing can say whether
-    /// this index had never seen the document or had chunked it another way.
+    /// The recipe is the whole reading, not just the chunking: extractor
+    /// version, chunk size and overlap, and the image analyzer each sit in it,
+    /// and any one of them differing is enough. A workspace indexed by an
+    /// older runtime holds a different reading of the same file at the same
+    /// chunk geometry.
+    ///
+    /// Returns the recipe each rendition was produced under and how many
+    /// chunks it holds, so a caller that found nothing can say whether this
+    /// index had never seen the document or had read it another way.
     pub fn renditions_for_source(&self, source_sha256: &str) -> anyhow::Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT f.extraction_recipe_id, COUNT(c.id)

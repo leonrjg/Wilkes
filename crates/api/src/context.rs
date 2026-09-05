@@ -2713,9 +2713,11 @@ impl AppContext {
                 ),
                 Ok(renditions) => tracing::info!(
                     "{label} shares this projection's space and holds this document as {}, \
-                     but under {} — this corpus chunks it as {}, so the passages are \
-                     different passages and no vector is reusable. Match the corpus's chunk \
-                     size and overlap to that workspace's to make them the same passages.",
+                     but read under {} — this corpus reads it as {}, so the passages are \
+                     different passages and no vector is reusable. An extraction recipe \
+                     covers the chunk size and overlap, the extractor version, and the image \
+                     analyzer, and any one of them differing moves the text; re-index that \
+                     workspace under this runtime to make them the same passages.",
                     renditions
                         .iter()
                         .map(|(_, chunks)| format!("{chunks} chunks"))
