@@ -11,7 +11,7 @@ import DataPanel from "./DataPanel";
 import ExtensionsPanel from "./ExtensionsPanel";
 import IntegrationsPanel from "./IntegrationsPanel";
 import LogsPanel from "./LogsPanel";
-import WorkersPanel from "./WorkersPanel";
+import IndexActivityPanel from "./IndexActivityPanel";
 import { EditorState } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { basicSetup } from "codemirror";
@@ -174,7 +174,7 @@ export default function SettingsModal({
     | "extraction-images"
     | "catalogue"
     | "data"
-    | "workers"
+    | "activity"
     | "logs"
     | "technical";
 
@@ -466,7 +466,7 @@ export default function SettingsModal({
             <div className="flex flex-col gap-0.5 shrink-0">
               <span className="px-3 py-1 text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Advanced</span>
               <TabButton id="data" label="Data" indent />
-              <TabButton id="workers" label="Workers" indent />
+              <TabButton id="activity" label="Activity" indent />
               <TabButton id="logs" label="Logs" indent />
               <TabButton
                 id="technical"
@@ -1159,9 +1159,14 @@ export default function SettingsModal({
               <DataPanel api={api} isActive={activeTab === "data"} />
             </div>
 
-            <div className={activeTab === "workers" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "activity" ? "block h-full" : "hidden"}>
               {settings && (
-                <WorkersPanel api={api} settings={settings} onUpdateSettings={handleUpdateSettings} />
+                <IndexActivityPanel
+                  api={api}
+                  settings={settings}
+                  onUpdateSettings={handleUpdateSettings}
+                  isActive={activeTab === "activity"}
+                />
               )}
             </div>
 

@@ -462,6 +462,30 @@ describe("HttpSearchApi", () => {
     }));
   });
 
+  it("indexActivity, continueIndexJob and retryFailedDocuments hit their own routes", async () => {
+    const selected = { model: "m1", engine: "SBERT", dimension: 384 } as any;
+    (fetch as any).mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ root: "/root", job: null, documents: [], history: [] }),
+    });
+    await api.indexActivity("/a b");
+    expect(fetch).toHaveBeenCalledWith("/api/embed/activity?root=%2Fa%20b");
+
+    (fetch as any).mockResolvedValue({ ok: true, status: 202 });
+    await api.continueIndexJob("/root", selected);
+    expect(fetch).toHaveBeenCalledWith("/api/embed/continue", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ root: "/root", selected }),
+    }));
+
+    await api.retryFailedDocuments("/root", selected);
+    expect(fetch).toHaveBeenCalledWith("/api/embed/retry-failed", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ root: "/root", selected }),
+    }));
+  });
+
   it("cancelEmbed calls fetch with DELETE", async () => {
     (fetch as any).mockResolvedValue({ ok: true, status: 204 });
     await api.cancelEmbed();
@@ -587,6 +611,13 @@ describe("HttpSearchApi", () => {
     await expect(api.cancelEmbed()).rejects.toThrow("cancelEmbed failed: 500");
     await expect(api.getIndexStatus()).rejects.toThrow("getIndexStatus failed: 500");
     await expect(api.deleteIndex()).rejects.toThrow("deleteIndex failed: 500");
+    await expect(api.indexActivity("/")).rejects.toThrow("indexActivity failed: 500");
+    await expect(api.continueIndexJob("/", {} as any)).rejects.toThrow(
+      "continueIndexJob failed: 500",
+    );
+    await expect(api.retryFailedDocuments("/", {} as any)).rejects.toThrow(
+      "retryFailedDocuments failed: 500",
+    );
   });
 });
 

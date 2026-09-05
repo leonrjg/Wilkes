@@ -1094,11 +1094,74 @@ export interface DownloadProgress {
   done: boolean;
 }
 
+/** Where a document is in the reading, while a job is still working on it. */
+export type DocumentStage =
+  | "queued"
+  | "checking"
+  | "reading_figures"
+  | "extracting"
+  | "embedding";
+
+/** What became of a document. Everything but `pending` is terminal. */
+export type DocumentOutcome = "pending" | "reused" | "indexed" | "empty" | "failed";
+
+/** What became of a job. */
+export type JobState = "running" | "completed" | "cancelled" | "failed" | "interrupted";
+
+/**
+ * One document's worth of movement in a build.
+ *
+ * A notification carrying a copy: the durable answer to what happened to a
+ * document is the journal row the backend wrote before sending this, so a
+ * dropped event costs nothing but latency.
+ */
 export interface IndexBuildProgress {
   files_processed: number;
   total_files: number;
-  message: string;
+  job_id: number | null;
+  document: string | null;
+  stage: DocumentStage | null;
+  outcome: DocumentOutcome | null;
   done: boolean;
+}
+
+export interface JobCounts {
+  pending: number;
+  reused: number;
+  indexed: number;
+  empty: number;
+  failed: number;
+}
+
+export interface JobSummary {
+  id: number;
+  root: string;
+  started_at_ms: number;
+  ended_at_ms: number | null;
+  state: JobState;
+  detail: string | null;
+  total_documents: number;
+  counts: JobCounts;
+}
+
+export interface JobDocument {
+  path: string;
+  stage: DocumentStage;
+  outcome: DocumentOutcome;
+  /** Kept verbatim. Only ever set on a `failed` document. */
+  error: string | null;
+  chunks: number | null;
+  updated_at_ms: number;
+}
+
+/** One root's indexing activity: what is happening, and what happened before. */
+export interface IndexActivity {
+  root: string;
+  job: JobSummary | null;
+  /** Failures and unfinished documents first, bounded by `document_limit`. */
+  documents: JobDocument[];
+  document_limit: number;
+  history: JobSummary[];
 }
 
 export type EmbedProgress =

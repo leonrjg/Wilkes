@@ -236,6 +236,12 @@ export interface SearchApi {
   getModelSize(engine: EmbeddingEngine, modelId: string): Promise<number>;
   downloadModel(selected: SelectedEmbedder): Promise<void>;
   buildIndex(root: string, selected: SelectedEmbedder): Promise<void>;
+  /** What the most recent indexing job for `root` did, document by document. */
+  indexActivity(root: string): Promise<import("../lib/types").IndexActivity>;
+  /** Index the documents the last job for `root` never reached. */
+  continueIndexJob(root: string, selected: SelectedEmbedder): Promise<void>;
+  /** Re-attempt the documents the last job for `root` failed on. */
+  retryFailedDocuments(root: string, selected: SelectedEmbedder): Promise<void>;
   cancelEmbed(): Promise<void>;
   getIndexStatus(root?: string): Promise<IndexStatus>;
   isSemanticReady(): Promise<boolean>;

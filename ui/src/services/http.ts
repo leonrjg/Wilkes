@@ -604,6 +604,31 @@ export class HttpSearchApi implements SearchApi {
     if (!res.ok && res.status !== 202) throw new Error(`buildIndex failed: ${res.status}`);
   }
 
+  async indexActivity(root: string): Promise<import("../lib/types").IndexActivity> {
+    const res = await fetch(`/api/embed/activity?root=${encodeURIComponent(root)}`);
+    if (!res.ok) throw new Error(`indexActivity failed: ${res.status}`);
+    return res.json();
+  }
+
+  async continueIndexJob(root: string, selected: SelectedEmbedder): Promise<void> {
+    const res = await fetch("/api/embed/continue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root, selected }),
+    });
+    if (!res.ok && res.status !== 202) throw new Error(`continueIndexJob failed: ${res.status}`);
+  }
+
+  async retryFailedDocuments(root: string, selected: SelectedEmbedder): Promise<void> {
+    const res = await fetch("/api/embed/retry-failed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root, selected }),
+    });
+    if (!res.ok && res.status !== 202)
+      throw new Error(`retryFailedDocuments failed: ${res.status}`);
+  }
+
   async cancelEmbed(): Promise<void> {
     const res = await fetch("/api/embed/cancel", { method: "DELETE" });
     if (!res.ok && res.status !== 204) throw new Error(`cancelEmbed failed: ${res.status}`);

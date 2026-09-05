@@ -394,6 +394,18 @@ export class TauriSearchApi implements SearchApi {
     return invoke("build_index", { root, selected });
   }
 
+  async indexActivity(root: string): Promise<import("../lib/types").IndexActivity> {
+    return invoke("index_activity", { root });
+  }
+
+  async continueIndexJob(root: string, selected: SelectedEmbedder): Promise<void> {
+    return invoke("continue_index_job", { root, selected });
+  }
+
+  async retryFailedDocuments(root: string, selected: SelectedEmbedder): Promise<void> {
+    return invoke("retry_failed_documents", { root, selected });
+  }
+
   async cancelEmbed(): Promise<void> {
     return invoke("cancel_embed");
   }

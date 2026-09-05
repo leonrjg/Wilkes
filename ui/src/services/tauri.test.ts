@@ -240,6 +240,20 @@ describe("TauriSearchApi", () => {
     });
   });
 
+  it("should call index_activity, continue_index_job and retry_failed_documents", async () => {
+    const selected = { model: "model", engine: "SBERT", dimension: 384 } as any;
+    (invoke as any).mockResolvedValue({ root: "/root", job: null, documents: [], history: [] });
+    await api.indexActivity("/root");
+    expect(invoke).toHaveBeenCalledWith("index_activity", { root: "/root" });
+
+    await api.continueIndexJob("/root", selected);
+    expect(invoke).toHaveBeenCalledWith("continue_index_job", { root: "/root", selected });
+
+    // Two commands, because continuing and retrying are two decisions.
+    await api.retryFailedDocuments("/root", selected);
+    expect(invoke).toHaveBeenCalledWith("retry_failed_documents", { root: "/root", selected });
+  });
+
   it("should call get_index_status", async () => {
     (invoke as any).mockResolvedValue({ engine: "SBERT" });
     const status = await api.getIndexStatus();
