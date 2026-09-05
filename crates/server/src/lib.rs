@@ -453,6 +453,46 @@ async fn import_managed_document_handler(
     Ok(Json(exported))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentSnapshotBody {
+    #[serde(default)]
+    scope: ConsumerScope,
+    /// The id the import reply carried. A content hash, not an index-local
+    /// handle, which is why this route needs no addressable chunk identity —
+    /// a re-index reissues rowids, and reissues nothing here.
+    snapshot_id: String,
+}
+
+/// The retained bytes of one imported document, by snapshot id.
+///
+/// The read half of `documents/import`. A consumer that stored the snapshot id
+/// can open its own documents from here rather than from a path, which is the
+/// point: the path an import recorded is a path on *this* machine, and a
+/// consumer running on another one was, until this route, resolving it against
+/// its own filesystem and finding nothing.
+///
+/// Raw bytes for the same reason `/api/figure` serves them: this is a file,
+/// and a base64 envelope would cost every caller a third more bytes than the
+/// document weighs. The digest and the length ride on headers.
+async fn document_snapshot_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DocumentSnapshotBody>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let index = state.consumer_index(&body.scope).await?;
+    let snapshot = index
+        .into_context()
+        .managed_document_snapshot(body.snapshot_id)
+        .await
+        .map_err(consumer_err)?;
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, snapshot.media_type)
+        .header("x-wilkes-source-sha256", snapshot.source_sha256)
+        .header("x-wilkes-source-byte-len", snapshot.source_byte_len)
+        .body(Body::from(snapshot.bytes))
+        .unwrap())
+}
+
 /// A chunk request names an index with `scope` and its passages with refs, and
 /// that is the whole of its addressing.
 ///
@@ -2259,6 +2299,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/corpora/documents/import",
             post(import_managed_document_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/api/corpora/documents/snapshot",
+            post(document_snapshot_handler),
         )
         .route("/api/chunks/resolve", post(chunks_resolve_handler))
         .route("/api/chunks/accumulate", post(chunks_accumulate_handler))

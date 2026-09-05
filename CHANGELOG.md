@@ -4,6 +4,22 @@
 
 ### Added
 
+- An application that imported a document into a managed corpus can now read
+  its bytes back, with `POST /api/corpora/documents/snapshot` and the
+  `snapshot_id` the import reply carried. The corpus already retained an
+  immutable copy of every source it imported; until now nothing served it, so a
+  consumer wanting the document it had itself registered had to keep the
+  original path and open it directly. That works only while the consumer and
+  Wilkes share a filesystem — on separate machines the path resolves to nothing
+  and the consumer reports its whole library as missing, which is a fact about
+  the wrong disk rather than about the library.
+
+  The retained copy only, never the original it was taken from: the copy cannot
+  have been edited since the passages were carved out of it, and bytes that no
+  longer match the rendition a consumer holds are worse than a refusal, because
+  they look like an answer. A corpus retaining no such snapshot says so with
+  `DOCUMENT_INDEX_INCOMPLETE`.
+
 - Other applications can send a reader straight to a document with a
   `wilkes://open?path=...` link — a "Read on Wilkes" button, the way an
   `obsidian://` link reaches a note. A link that names only a path opens the

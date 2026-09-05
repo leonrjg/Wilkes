@@ -2117,6 +2117,60 @@ mod tests {
             .contains("CHUNK_REF_NOT_FOUND"));
     }
 
+    /// A consumer that stored a snapshot id can find the retained bytes with
+    /// it and nothing else — no path, no rowid, no root.
+    ///
+    /// The negative half is the point of the route: an id this corpus never
+    /// retained answers nothing rather than falling through to some file that
+    /// happens to be lying around, because a wrong document is worse than an
+    /// error to a caller that cannot tell the difference.
+    #[test]
+    fn a_retained_snapshot_is_found_by_its_id_alone() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("managed_sources");
+        fs::create_dir_all(&root).unwrap();
+        let document = root.join("document.txt");
+        fs::write(&document, "east north").unwrap();
+        let mut index =
+            SemanticIndex::create(dir.path(), "m", 2, EmbeddingEngine::Candle, Some(&root))
+                .unwrap();
+        let recipe = ExtractionRecipe::new(100, 0);
+        let managed = index
+            .write_file_with_recipe(
+                PreparedFile {
+                    retained: Default::default(),
+                    path: document.clone(),
+                    full_text: "east north".to_string(),
+                    chunks: vec![(test_chunk(&document, "east"), vec![3.0, 0.0])],
+                },
+                &recipe,
+                Some(Path::new("managed_sources/document.txt")),
+                Some(&serde_json::json!({"kind": "path"})),
+                true,
+                false,
+                Some("job-1"),
+            )
+            .unwrap();
+
+        let source = index
+            .managed_snapshot_source(managed.snapshot_id.as_str())
+            .unwrap()
+            .expect("the corpus retained it");
+        assert_eq!(
+            source.managed_snapshot_relative_path,
+            "managed_sources/document.txt"
+        );
+        assert_eq!(source.source_sha256, managed.source_sha256);
+
+        assert!(
+            index
+                .managed_snapshot_source("snapshot-this-corpus-never-saw")
+                .unwrap()
+                .is_none(),
+            "an unknown id is empty-handed, not approximately answered"
+        );
+    }
+
     #[test]
     fn managed_projection_reuses_structure_and_generation_but_not_vectors() {
         let canonical_dir = tempdir().unwrap();
@@ -3989,6 +4043,22 @@ pub struct FigureSource {
     /// and the fallback for a managed one imported before snapshots.
     pub file_path: PathBuf,
     pub image: RetainedImage,
+}
+
+/// Where one imported document's retained bytes are.
+///
+/// No `file_path` beside it, unlike [`FigureSource`]: there is nothing to fall
+/// back *to*. A caller asking by snapshot id is asking for the copy the corpus
+/// retained, and the original it was taken from is not that copy — it is a
+/// file on some machine that may since have become a different document.
+#[derive(Clone, Debug)]
+pub struct ManagedSnapshotSource {
+    /// Relative to the data directory; the caller resolves it, being the one
+    /// that knows where that is.
+    pub managed_snapshot_relative_path: String,
+    /// What the retained bytes hashed to when they were retained, so a caller
+    /// can check what it was served against what it recorded.
+    pub source_sha256: String,
 }
 
 /// How a caller names the document a figure belongs to.
@@ -8799,6 +8869,41 @@ impl SemanticIndex {
             file_path,
             image,
         }))
+    }
+
+    /// Where the retained bytes of one imported document are, by snapshot id.
+    ///
+    /// The retained copy only — never `file_path`, which is where the document
+    /// came *from*. That path belongs to whichever machine indexed it and may
+    /// have been edited, moved or deleted since; the snapshot is immutable and
+    /// is what the rendition was built from, so it is the only answer that
+    /// still describes the passages a consumer holds.
+    ///
+    /// A snapshot id is `identity::snapshot_id(source_sha256)`, so the same
+    /// bytes imported under two names are one snapshot with two file rows.
+    /// Any of them answers: what is being asked for is the bytes, and they are
+    /// the same bytes.
+    pub fn managed_snapshot_source(
+        &self,
+        snapshot_id: &str,
+    ) -> anyhow::Result<Option<ManagedSnapshotSource>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT managed_snapshot_relative_path, source_sha256 FROM files
+                  WHERE snapshot_id = ?1
+                    AND managed_snapshot_relative_path IS NOT NULL
+                    AND source_sha256 IS NOT NULL
+                  LIMIT 1",
+                params![snapshot_id],
+                |row| {
+                    Ok(ManagedSnapshotSource {
+                        managed_snapshot_relative_path: row.get(0)?,
+                        source_sha256: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     pub fn managed_chunks_for_refs(

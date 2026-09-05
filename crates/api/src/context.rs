@@ -1113,6 +1113,23 @@ pub struct LibraryFileExport {
     pub files: Vec<LibraryFile>,
 }
 
+/// One retained snapshot, as served.
+///
+/// The bytes travel raw rather than in a JSON envelope, for the reason
+/// `/api/figure` does: a course book is megabytes, every consumer that wants
+/// one wants the file, and base64 would make each of them carry a third more
+/// bytes than it asked for. The digest and the length ride on headers so a
+/// caller can check what it got without opening it.
+#[derive(Clone, Debug)]
+pub struct DocumentSnapshotExport {
+    pub bytes: Vec<u8>,
+    pub media_type: &'static str,
+    /// What the retained bytes hashed to when the corpus retained them — the
+    /// same `source_sha256` the import reply carried.
+    pub source_sha256: String,
+    pub source_byte_len: u64,
+}
+
 /// Most chunk refs one `resolve` request may name.
 ///
 /// The two surfaces this replaces disagreed: the export route capped at 64 on
@@ -3173,6 +3190,85 @@ impl AppContext {
         })
     }
 
+    /// What a retained snapshot is, told from its name.
+    ///
+    /// The extension rather than the bytes: the snapshot's name is the one the
+    /// original carried, the extraction registry already keyed off it to read
+    /// the document at all, and sniffing here could only disagree with the
+    /// decision that produced the passages. The fallback is the honest one —
+    /// `application/octet-stream` says "bytes, and I am not telling you what
+    /// kind", which is exactly what is known.
+    fn snapshot_media_type(path: &Path) -> &'static str {
+        match path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "pdf" => "application/pdf",
+            "md" | "markdown" => "text/markdown",
+            "txt" => "text/plain",
+            _ => "application/octet-stream",
+        }
+    }
+
+    /// The retained bytes of one imported document.
+    ///
+    /// The counterpart to `import_managed_document`: import hands back a
+    /// snapshot id and the passages carved out of it, and this hands back what
+    /// those passages were carved *from*. A consumer that stored the id can
+    /// therefore read its own documents without holding a path — which matters
+    /// because the path a registration recorded is a path on this machine, and
+    /// a consumer running somewhere else has no filesystem to resolve it
+    /// against and no business trying.
+    ///
+    /// Only the retained copy is served. Falling back to the original when the
+    /// snapshot is gone would answer a question nobody asked — the original
+    /// may have been edited since, and bytes that no longer match the
+    /// rendition are worse than an error, because they look like an answer.
+    pub async fn managed_document_snapshot(
+        &self,
+        snapshot_id: String,
+    ) -> Result<DocumentSnapshotExport, ConsumerError> {
+        let index_arc = self.index.lock().clone();
+        let data_dir = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = index_arc
+                .lock()
+                .map_err(|_| ConsumerError::untyped("Semantic index lock was poisoned"))?;
+            let index = guard
+                .as_ref()
+                .ok_or_else(|| ConsumerError::untyped("Semantic index unavailable"))?;
+            let source = index
+                .managed_snapshot_source(&snapshot_id)
+                .map_err(|error| ConsumerError::from_anyhow(&error))?
+                .ok_or_else(|| {
+                    ConsumerError::new(
+                        ConsumerErrorCode::DocumentIndexIncomplete,
+                        format!("This corpus retains no snapshot {snapshot_id}."),
+                    )
+                })?;
+            let path = data_dir.join(&source.managed_snapshot_relative_path);
+            let bytes = std::fs::read(&path).map_err(|error| {
+                ConsumerError::new(
+                    ConsumerErrorCode::DocumentIndexIncomplete,
+                    format!("Retained snapshot {snapshot_id} could not be read: {error}"),
+                )
+            })?;
+            Ok(DocumentSnapshotExport {
+                media_type: Self::snapshot_media_type(&path),
+                source_byte_len: bytes.len() as u64,
+                source_sha256: source.source_sha256,
+                bytes,
+            })
+        })
+        .await
+        .map_err(|error| {
+            ConsumerError::untyped(format!("Managed snapshot task panicked: {error}"))
+        })?
+    }
+
     /// Async because of the outline, which is a full read of the snapshot.
     ///
     /// Reading a document reaches the layout detector and the recognizers
@@ -3195,19 +3291,7 @@ impl AppContext {
         let source_byte_len = std::fs::metadata(&snapshot_path)
             .map_err(|error| format!("Could not read retained snapshot metadata: {error}"))?
             .len();
-        let media_type = match snapshot_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "pdf" => "application/pdf",
-            "md" | "markdown" => "text/markdown",
-            "txt" => "text/plain",
-            _ => "application/octet-stream",
-        }
-        .to_string();
+        let media_type = Self::snapshot_media_type(&snapshot_path).to_string();
         let outline_path = snapshot_path.clone();
         let declared_outline = tokio::task::spawn_blocking(move || {
             let registry = wilkes_core::extract::production_registry();
