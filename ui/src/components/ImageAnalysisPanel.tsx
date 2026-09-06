@@ -41,35 +41,17 @@ const DEFAULTS: ImageAnalysisSettings = {
   disabled_roles: [],
 };
 
-/** What each scope reads, in the terms the choice is actually made in: the
- *  cost, and what is given up. The second is the honest half — a formula the
- *  page typesets and a label inside a screenshot are both text a search should
- *  find, and only one of them is cheap. */
-const SCOPE_OPTIONS: Array<{ value: ImageScope; label: string; blurb: string }> = [
-  {
-    value: "typeset_only",
-    label: "Formulas and tables only",
-    blurb:
-      "Reads the equations and ruled tables the page draws with its own fonts and rules \u2014 the parts whose text does not survive into the reading any other way. A handful per document, so this costs seconds rather than hours. Diagrams, charts and scanned pages are left alone.",
-  },
-  {
-    value: "typeset_and_embedded",
-    label: "Those, and every picture",
-    blurb:
-      "Adds every raster the document embeds: diagrams, charts, screenshots, scanned pages. This is where the time goes \u2014 one recognizer call per picture, and a book can hold hundreds. Worth it for scanned documents, where the picture is the only text there is.",
-  },
+/** What each scope reads. The label is the whole of the choice; the cost it
+ *  carries is stated once, by the re-index warning below. */
+const SCOPE_OPTIONS: Array<{ value: ImageScope; label: string }> = [
+  { value: "typeset_only", label: "Formulas and tables only" },
+  { value: "typeset_and_embedded", label: "Those, and every picture" },
 ];
 
 const ENGINE_LABELS: Record<RecognitionEngine, string> = {
   Onnx: "ONNX",
   Candle: "Candle",
   Vision: "Apple Vision",
-};
-
-const ENGINE_BLURBS: Record<RecognitionEngine, string> = {
-  Onnx: "ONNX Runtime, in the recognition worker. Reads a whole page in one pass and covers formulas, tables and code as well as prose. Runs on the CPU, on one thread less than the machine has.",
-  Candle: "PaddleOCR-VL under candle. Transcribes text with precise per-region geometry, and nothing else. Uses the GPU via Metal (Apple Silicon) if available.",
-  Vision: "The recognizer built into macOS. Reads lines of prose about a hundred times faster than either model, with nothing to download \u2014 but no formulas, no tables and no figure regions. Choosing it trades that structure away.",
 };
 
 /** The readers that are not the page recognizer, in the order they are shown.
@@ -85,12 +67,10 @@ const ENGINE_BLURBS: Record<RecognitionEngine, string> = {
  *  row here and the card stays a single piece of markup. */
 const HELPER_READERS: Array<{
   role: RecognizerRole;
-  heading: string;
   /** The name of this reader's box in the diagram. The kind itself, not the
    *  model — the box is a piece of the page, and it exists whether or not a
    *  model claims it. */
   label: string;
-  blurb: React.ReactNode;
   button: string;
   /** What is lost while it is not installed. Said where the download is
    *  offered, because it cannot be inferred from the reading afterwards. */
@@ -98,38 +78,14 @@ const HELPER_READERS: Array<{
 }> = [
   {
     role: "formula",
-    heading: "Reading the formulas",
     label: "Formulas",
-    blurb: (
-      <>
-        A model that reads whole pages comes apart on a crop of one expression,
-        so formulas go to a model trained on exactly that and pictures go to the
-        page reader below. It recovers what the page's own text cannot carry at
-        all: where a document draws{" "}
-        <span className="font-mono">A ⋁ B ⇔ B ⋁ A</span>, the font names nothing
-        for the <span className="font-mono">⇔</span> and the operator is simply
-        missing from the text — this reads it back.
-      </>
-    ),
     button: "Download formula reader",
     absent:
       "Not installed — formulas will go to the page reader instead, which on measurement reads almost none of them. Reading still works, and installing this later re-reads the documents that have formulas in them.",
   },
   {
     role: "table",
-    heading: "Reading the tables",
     label: "Tables",
-    blurb: (
-      <>
-        A ruled table the page typesets already holds its text as real glyphs;
-        what is missing is only which cell each word sits in. So this model is
-        asked for the <em>grid</em> — rows, columns and merged cells — and the
-        cells are filled from the page's own text. Nothing transcribes glyphs
-        the document already has. Measured on a 168-page textbook: 23 ms a table
-        against the page reader's 7.4 s, and more than twice as many tables
-        admitted.
-      </>
-    ),
     button: "Download table reader",
     absent:
       "Not installed — ruled tables will go to the page reader instead, which on measurement re-typed a third of them correctly and returned prose for the rest. Reading still works, and installing this later re-reads the documents that have tables in them.",
@@ -574,7 +530,7 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
     <div className="flex flex-col gap-4 p-1">
       <section>
         <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-          Text inside pictures
+          Text in pictures
         </h3>
         <div className="space-y-3 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
           <label className="flex cursor-pointer items-center gap-2.5">
@@ -589,19 +545,6 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
               Read the text drawn inside diagrams, charts and scanned figures
             </span>
           </label>
-          <p className="text-[10px] italic text-[var(--text-dim)]">
-            A label inside a picture is invisible to search today. With this on,
-            it is transcribed into the document's text at the place the page
-            draws the picture, and search finds it there.
-          </p>
-          <p className="text-[10px] italic text-[var(--text-dim)]">
-            This is part of how a document is read, not a display option:
-            changing it re-reads and re-embeds every document that has a
-            picture in it. Recognition runs on this machine and is slow on a
-            CPU — measured at about half a minute for a small diagram, four
-            minutes for a full-width one, and several times that for a large
-            one. A library of a few hundred figures is an overnight job.
-          </p>
           {!configuredInstalled && (
             <p className="text-[10px] text-[var(--text-dim)]">
               Nothing to read with yet — install a recognizer below first.
@@ -616,24 +559,9 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
       {detector && (
         <section>
           <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-            Finding the formulas and tables
+            Layout detection
           </h3>
           <div className="space-y-2 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
-            <p className="text-[10px] italic text-[var(--text-dim)]">
-              An equation a page typesets is not a picture — it is glyphs from
-              a maths font, so the text a document carries for it is already
-              flattened: <span className="font-mono">c_i = a_i ⊕ b_i</span>{" "}
-              arrives as <span className="font-mono">ci = ai ⊕bi</span>. A
-              layout model looks at each page and says which areas are
-              formulas, tables and charts, so those areas can be read back as
-              what they were set as.
-            </p>
-            <p className="text-[10px] italic text-[var(--text-dim)]">
-              Without it nothing a page typesets is marked out, and a document
-              full of mathematics reads exactly like one with none. Pictures
-              the document embeds are still read; it is the formulas and tables
-              the page sets in type that go unnoticed.
-            </p>
             <div className="flex items-center gap-2 pt-1">
               <span className="font-mono text-[10px] text-[var(--text-muted)]">
                 {detector.inventory.name}
@@ -671,10 +599,6 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
                 the documents that have them.
               </p>
             )}
-            <p className="text-[10px] italic text-[var(--text-dim)]">
-              It runs once per page, on this machine, at roughly a quarter of a
-              second a page.
-            </p>
           </div>
         </section>
       )}
@@ -683,12 +607,12 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
           three unrelated downloads. The two role readers used to have a
           section each; a user could read both and still not know that
           installing one *takes formulas away* from the page reader they had
-          chosen. The boxes say it in one look, and the prose below says it for
-          whichever box is being looked at. */}
+          chosen. The boxes say it in one look, which is the whole of the
+          explanation this page offers. */}
       {helperBoxes.length > 0 && (
         <section>
           <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-            What each model reads
+            Model coverage
           </h3>
           <div className="space-y-3 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
             <RecognizerVenn
@@ -701,48 +625,21 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
               disabled={busy}
             />
 
-            {/* The focused region's own account of itself. One paragraph
-                rather than three sections: the boxes carry the structure, so
-                the prose only has to carry the part a box cannot — why this
-                kind needs its own reader at all. */}
-            <p className="text-[10px] italic text-[var(--text-dim)]">
-              {focused
-                ? focused.copy.blurb
-                : selected
-                  ? selected.description
-                  : "Choose a recognizer below and this box takes its colour."}
-            </p>
-
             {focused && !focused.model.is_cached && (
               <p className="text-[10px] text-[var(--text-dim)]">{focused.copy.absent}</p>
             )}
 
-            {/* Switched off costs exactly what absent costs — the same areas
-                go to the same page reader, and the recipe the library is read
-                under is the same one. What differs is only that turning it
-                back on is a click rather than a download, and both directions
-                re-read the documents this kind appears in. */}
             {focused && focused.model.is_cached && disabledRoles.includes(focused.model.role) && (
               <p className="text-[10px] text-[var(--text-dim)]">
-                Switched off, and still downloaded. The areas the detector marks
-                out here go to the page reader instead, which is the reading this
-                library had before {focused.model.display_name} was installed.
-                Turning it back on re-reads the documents that have them.
-              </p>
-            )}
-
-            {analysis.enabled && (
-              <p className="text-[10px] text-[var(--text-dim)]">
-                Selecting or de-selecting a reader is part of how a document is
-                read, not a display option: the documents that have this kind in
-                them are read and embedded again.
+                Switched off, and still downloaded — these areas go to the page
+                reader.
               </p>
             )}
 
             {!analysis.enabled && (
               <p className="text-[10px] text-[var(--text-dim)]">
                 Nothing is painted because nothing is read: image analysis is
-                off. Each box still names the model that would fill it.
+                off.
               </p>
             )}
 
@@ -797,13 +694,13 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
       {analysis.enabled && (
         <section>
           <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-            Which pictures
+            Scope
           </h3>
           <div className="space-y-2 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
             {SCOPE_OPTIONS.map((option) => (
               <label
                 key={option.value}
-                className="flex cursor-pointer items-start gap-2.5"
+                className="flex cursor-pointer items-center gap-2.5"
               >
                 <input
                   type="radio"
@@ -812,23 +709,13 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
                   checked={(analysis.scope ?? DEFAULTS.scope) === option.value}
                   disabled={busy}
                   onChange={() => void handleScope(option.value)}
-                  className="mt-0.5 h-3.5 w-3.5 accent-[var(--accent-blue)]"
+                  className="h-3.5 w-3.5 accent-[var(--accent-blue)]"
                 />
-                <span className="flex flex-col gap-0.5">
-                  <span className="text-xs text-[var(--text-main)]">
-                    {option.label}
-                  </span>
-                  <span className="text-[10px] italic text-[var(--text-dim)]">
-                    {option.blurb}
-                  </span>
+                <span className="text-xs text-[var(--text-main)]">
+                  {option.label}
                 </span>
               </label>
             ))}
-            <p className="text-[10px] text-[var(--text-dim)]">
-              Which areas count as a formula or a ruled table is decided by the
-              page's own evidence — the font a run is set in, the rules a table
-              is drawn with — and not by a model guessing at the layout.
-            </p>
           </div>
         </section>
       )}
@@ -836,7 +723,7 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
       {/* Engine selection */}
       <section>
         <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-          Recognition Engine
+          Engine
         </h3>
         <div className="flex w-full rounded-lg bg-[var(--bg-active)] p-0.5">
           {ALL_RECOGNITION_ENGINES.map((engine) => {
@@ -864,9 +751,6 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
             );
           })}
         </div>
-        <p className="selectable mt-1.5 px-1 text-[10px] text-[var(--text-dim)]">
-          {ENGINE_BLURBS[draftEngine]}
-        </p>
       </section>
 
       {/* Model list */}
@@ -886,8 +770,8 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
       {/* What choosing it would mean, and what it would download */}
       <section className="flex flex-col gap-3 rounded-xl border border-[var(--border-main)] bg-[var(--bg-active)]/30 p-3">
         {analysis.enabled && !isConfigured && (
-          <div className="rounded-lg border border-amber-900/50 bg-amber-900/20 p-1">
-            <p className="text-center text-[10px] leading-relaxed text-[var(--text-muted)]">
+          <div className="rounded-lg border border-[var(--accent-amber-border)] bg-[var(--accent-amber-muted)] p-1">
+            <p className="text-center text-[10px] leading-relaxed text-[var(--accent-amber)]">
               Changing the recognizer re-reads and re-embeds every document with
               a picture in it.
             </p>
@@ -1007,15 +891,9 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
 
       <section>
         <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-          What the picture shows
+          Descriptions
         </h3>
         <div className="space-y-3 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
-          <p className="text-[10px] italic text-[var(--text-dim)]">
-            Transcribing the labels of a diagram does not capture its arrows. A
-            vision model can describe them, in its own words, kept separate
-            from the document's own text and labelled as a description
-            throughout. Optional, and off unless you name a model.
-          </p>
           <label className="flex flex-col gap-1">
             <span className="text-xs text-[var(--text-muted)]">
               Ollama model, or empty for transcription only

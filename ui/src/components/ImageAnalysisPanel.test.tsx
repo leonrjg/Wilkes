@@ -165,12 +165,17 @@ describe("ImageAnalysisPanel", () => {
     return onUpdateSettings;
   };
 
-  /// The cost of the toggle is not a display preference, and the panel is the
-  /// only place the user is told so before paying it.
-  it("says what enabling costs before it is enabled", async () => {
+  /// The page states machine state and nothing else. What a recognizer is
+  /// for, what it costs and why a formula needs its own reader used to be
+  /// said here in paragraphs; the cost is now raised once, by the warning on
+  /// an enabled-but-unconfigured recognizer, and the rest is not said at all.
+  it("carries no explanatory prose", async () => {
     panel(SETTINGS);
-    await screen.findByText(/re-reads and re-embeds/i);
-    expect(screen.getByText(/four\s+minutes for a full-width one/i)).toBeTruthy();
+    await screen.findByRole("checkbox", { name: /read the text drawn inside/i });
+    expect(screen.queryByText(/re-reads and re-embeds/i)).toBeNull();
+    expect(screen.queryByText(/four\s+minutes for a full-width one/i)).toBeNull();
+    expect(screen.queryByText(/an equation a page typesets/i)).toBeNull();
+    expect(screen.queryByText(/ONNX Runtime, in the recognition worker/i)).toBeNull();
   });
 
   it("offers the download when the recognizer is missing, and no toggle to enable without it", async () => {
@@ -591,16 +596,16 @@ describe("ImageAnalysisPanel", () => {
     expect((box as HTMLInputElement).disabled).toBe(true);
   });
 
-  /// The prose follows the box, because the three readers no longer have a
-  /// section each to carry it.
-  it("shows the focused box's account of itself", async () => {
+  /// What a box says now is what a colour cannot: which reader is missing
+  /// from it, and where those areas go instead. That line follows the focus.
+  it("shows the focused box's missing reader", async () => {
     panel(SETTINGS);
 
     fireEvent.click(await screen.findByRole("button", { name: /tables/i }));
-    expect(screen.getByText(/rows, columns and merged cells/i)).toBeTruthy();
+    expect(screen.getByText(/ruled tables will go to the page reader/i)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: /formulas/i }));
-    expect(screen.getByText(/where a document draws/i)).toBeTruthy();
+    expect(screen.getByText(/formulas will go to the page reader/i)).toBeTruthy();
   });
 
   it("says nothing about installing a detector that is already here", async () => {

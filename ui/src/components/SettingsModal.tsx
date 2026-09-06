@@ -171,7 +171,7 @@ export default function SettingsModal({
     | "generation-chat"
     | "generation-models"
     | "servers"
-    | "extraction-images"
+    | "extraction-ocr"
     | "catalogue"
     | "data"
     | "activity"
@@ -456,9 +456,9 @@ export default function SettingsModal({
             <div className="flex flex-col gap-0.5 shrink-0">
               <span className="px-3 py-1 text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Extraction</span>
               <TabButton
-                id="extraction-images"
-                label="Images"
-                accessibleLabel="Image Analysis"
+                id="extraction-ocr"
+                label="OCR"
+                accessibleLabel="Optical character recognition"
                 indent
               />
             </div>
@@ -1148,7 +1148,7 @@ export default function SettingsModal({
               )}
             </div>
 
-            <div className={activeTab === "extraction-images" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "extraction-ocr" ? "block h-full" : "hidden"}>
               {settings && (
                 <ImageAnalysisPanel
                   api={api}
