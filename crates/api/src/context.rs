@@ -2594,6 +2594,18 @@ impl AppContext {
         // "handler does not implement Handler". `managed_export` became async
         // when the outline read moved to the blocking pool; this is what that
         // move requires of its callers.
+        //
+        // The rendition already held for these bytes is adopted only if this
+        // runtime would produce it. The recipe covers the chunk size and
+        // overlap, the extractor version and the image analyzer, and any one
+        // of them differing moves the passages — so a rendition read under
+        // another recipe is a different rendition of the same document, not
+        // this import's answer. Adopting it anyway is how a recipe change came
+        // to mean nothing: every re-extraction of an already-imported document
+        // handed back the passages it was run to replace, and bound its fresh
+        // idempotency key to them, carrying the stale recipe forward into a
+        // new binding. Falling through re-extracts, which is the one thing a
+        // recipe version exists to make happen.
         let existing = {
             let index_arc = self.index.lock().clone();
             let mut guard = index_arc
@@ -2604,7 +2616,8 @@ impl AppContext {
                 .ok_or_else(|| "Managed index unavailable".to_string())?;
             let existing = index
                 .managed_document_for_path(&snapshot_path)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())?
+                .filter(|held| held.extraction_recipe_id == recipe.id());
             if let Some(existing) = existing.as_ref() {
                 index
                     .bind_managed_import_key(&idempotency_key, existing)

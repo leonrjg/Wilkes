@@ -2228,6 +2228,18 @@ mod tests {
         );
         assert_eq!(prepared.full_text, "canonical passage");
 
+        // And the same value reaches the import path, which adopts a held
+        // rendition only when this runtime would produce it: the reply to
+        // "what is already here" has to say what recipe it is under, or the
+        // decision degrades to "something is here", which is what let a
+        // recipe change mean nothing.
+        let held = index
+            .managed_document_for_path(&document)
+            .unwrap()
+            .expect("the document is held");
+        assert_eq!(held.extraction_recipe_id, admitted_under.id());
+        assert_ne!(held.extraction_recipe_id, runtime_would_use.id());
+
         // And the membership read names the rendition, so a caller can key a
         // catch-up on the thing it is catching up to.
         let admitted = index.managed_admitted_renditions().unwrap();
