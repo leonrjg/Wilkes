@@ -215,9 +215,10 @@ pub fn start_search(
             // The exact lane is unconditional; the semantic one exists only if
             // the host resolved an embedder and an index for this search, and
             // the host is what says why when it did not.
-            SearchMode::Hybrid => {
-                Box::new(HybridSearchProvider::new(exact_lane(), semantic_lane(embedder)))
-            }
+            SearchMode::Hybrid => Box::new(HybridSearchProvider::new(
+                exact_lane(),
+                semantic_lane(embedder),
+            )),
         };
 
         let mut outcome = provider

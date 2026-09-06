@@ -201,7 +201,7 @@ export default function CataloguePanel({ api, isActive }: Props) {
       <section>
         <div className="flex flex-col gap-1.5 mb-4">
           <h3 className="text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">
-            Teaching catalogues
+            Learning catalogues
           </h3>
           <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">
             A local copy of what several open textbook, course and documentation

@@ -267,6 +267,14 @@ describe("TauriSearchApi", () => {
     expect(status).toEqual({ engine: "SBERT" });
   });
 
+  it("should call index_coverage", async () => {
+    const rows = [{ root: "/root", indexable: 3, covered: 3, complete: true }];
+    (invoke as any).mockResolvedValue(rows);
+    const coverage = await api.indexCoverage(["/root"]);
+    expect(invoke).toHaveBeenCalledWith("index_coverage", { roots: ["/root"] });
+    expect(coverage).toEqual(rows);
+  });
+
   it("should call download_model", async () => {
     (invoke as any).mockResolvedValue(undefined);
     await api.downloadModel({ model: "model", engine: "SBERT", dimension: 384 });

@@ -28,10 +28,16 @@ describe("FileTree", () => {
     });
   });
 
-  it("rejects a listing entry outside the listed root", () => {
-    expect(() => buildFileTree("/library", [file("/elsewhere/paper.txt")])).toThrow(
-      "is not under /library",
-    );
+  it("skips a listing entry outside the listed root", () => {
+    // A root switch re-renders with the new root while the previous root's
+    // entries are still in hand; that frame must draw, not throw.
+    const tree = buildFileTree("/library", [
+      file("/elsewhere/paper.txt"),
+      file("/library/kept.txt"),
+    ], ["/elsewhere/folder"]);
+
+    expect(tree.files.map((entry) => entry.path)).toEqual(["/library/kept.txt"]);
+    expect(tree.folders).toEqual([]);
   });
 
   it("keeps empty physical directories as collapsible drop targets", () => {

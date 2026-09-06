@@ -1,4 +1,4 @@
-//! A local mirror of the open teaching catalogues, and text search over it.
+//! A local mirror of the open learning catalogues, and text search over it.
 //!
 //! # Why a mirror rather than a passthrough
 //!
@@ -10,7 +10,7 @@
 //! for *teaches this to someone who does not know it*, because neither was
 //! asked to and neither could be.
 //!
-//! What makes a passthrough avoidable is that the teaching catalogues are
+//! What makes a passthrough avoidable is that the learning catalogues are
 //! small. Papers number in the hundreds of millions; open textbooks, courses
 //! and documentation sets number in the thousands. A few thousand records fit
 //! in a table, which means the ranking can happen here, against a query the

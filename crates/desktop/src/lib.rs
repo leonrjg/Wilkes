@@ -22,7 +22,7 @@ use wilkes_core::types::{
     ChunkTopicsResult, CitationResult, CollectionValidation, DataPaths, DocumentMetadata,
     DocumentTagUpdate, EmbedderCapabilityManifest, EmbeddingEngine, ExternalMcpSettings,
     FileListResponse, HttpApiSettings, IndexStatus, IntegrationStatus, NewBookmark,
-    NewSmartCollection, NewTag, OpenAlexWork, SearchLogEntry, SelectedEmbedder,
+    NewSmartCollection, NewTag, OpenAlexWork, RootCoverage, SearchLogEntry, SelectedEmbedder,
     SemanticScholarPaper, Settings, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::worker::manager::WorkerStatus;
@@ -436,6 +436,15 @@ async fn index_activity_for_ctx(
     root: String,
 ) -> Result<IndexActivity, String> {
     ctx.index_activity(PathBuf::from(root)).await
+}
+
+/// How much of each root the semantic index covers.
+async fn index_coverage_for_ctx(
+    ctx: Arc<AppContext>,
+    roots: Vec<String>,
+) -> Result<Vec<RootCoverage>, String> {
+    ctx.index_coverage(roots.into_iter().map(PathBuf::from).collect())
+        .await
 }
 
 /// Index the documents the last job for `root` never reached.
@@ -1793,6 +1802,11 @@ async fn index_activity(app: AppHandle, root: String) -> Result<IndexActivity, S
 }
 
 #[tauri::command]
+async fn index_coverage(app: AppHandle, roots: Vec<String>) -> Result<Vec<RootCoverage>, String> {
+    index_coverage_for_ctx(app_context(&app), roots).await
+}
+
+#[tauri::command]
 async fn continue_index_job(
     root: String,
     selected: SelectedEmbedder,
@@ -1885,7 +1899,7 @@ async fn load_generation_model(app: AppHandle) -> Result<bool, String> {
 
 // ── Catalogue ────────────────────────────────────────────────────────────────
 //
-// The mirror of the open teaching catalogues. Installation-wide, not
+// The mirror of the open learning catalogues. Installation-wide, not
 // workspace-owned: what it holds is what four public catalogues publish, which
 // is the same answer whichever workspace is open.
 
@@ -2299,6 +2313,7 @@ pub fn run() {
             download_model,
             build_index,
             index_activity,
+            index_coverage,
             continue_index_job,
             retry_failed_documents,
             embedder_capabilities,

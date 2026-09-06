@@ -53,9 +53,9 @@ use wilkes_core::types::{
     CitationReference, CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbedderModel,
     FileEntry, FileListResponse, FileType, IndexStatus, IndexingConfig, MetadataConflictValue,
     MetadataSourcePreference, NewBookmark, NewSmartCollection, NewTag, OmittedFileReason,
-    PreviewData, RelatedDocument, RelatedDocumentsQuery, SearchDocument, SearchLogEntry,
-    SearchMode, SearchQuery, SearchScope, SelectedEmbedder, SemanticSettings, Settings,
-    SmartCollection, Tag, TopicLibraryCoverage, UpdateSmartCollection, UpdateTag,
+    PreviewData, RelatedDocument, RelatedDocumentsQuery, RootCoverage, SearchDocument,
+    SearchLogEntry, SearchMode, SearchQuery, SearchScope, SelectedEmbedder, SemanticSettings,
+    Settings, SmartCollection, Tag, TopicLibraryCoverage, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::types::{
     GenerationSettings, GenerationStreamEvent, GenerationTask, GeneratorDescriptor,
@@ -4221,6 +4221,15 @@ impl AppContext {
 
     /// Fill cached topic labels immediately and generate only the misses in the
     /// background. Late labels are patched by the membership-derived key.
+    ///
+    /// Reading the cache and generating the misses are separate acts with
+    /// separate preconditions. A label already in the store was paid for by an
+    /// earlier run and costs nothing to show, so it is read whenever this
+    /// workspace names a model — including while generation is switched off.
+    /// Only the misses need consent and a loaded generator, and only they are
+    /// skipped when there is none. Gating the read on the generator too is what
+    /// left every topic permanently nameless the moment generation was
+    /// disabled, with the labels for those very clusters sitting in the store.
     async fn attach_chunk_topic_labels(
         self: &Arc<Self>,
         request_id: &str,
@@ -4232,16 +4241,19 @@ impl AppContext {
             self.finish_topic_operation(request_id);
             return;
         }
-        let Some(generator) = self.generator.lock().clone() else {
+        let settings = self.generation_settings().await;
+        // Whose labels this workspace is asking for: a question about the
+        // settings, answerable with no generator loaded. Distinct from
+        // `Generator::model_id` below, which names the model that actually
+        // produced a label and so is what a new label is written under.
+        let Some(configured_model_id) = settings
+            .model
+            .as_ref()
+            .map(|model| model.model_id().to_string())
+        else {
             self.finish_topic_operation(request_id);
             return;
         };
-        let settings = self.generation_settings().await;
-        if !settings.enabled {
-            self.finish_topic_operation(request_id);
-            return;
-        }
-        let model_id = generator.model_id().to_string();
         let keys: Vec<String> = topics
             .iter()
             .map(|topic| topic.cluster_key.clone())
@@ -4250,7 +4262,11 @@ impl AppContext {
             Ok(store) => store
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .cached_chunk_cluster_labels(&keys, &model_id, CHUNK_CLUSTER_LABEL_RECIPE_VERSION),
+                .cached_chunk_cluster_labels(
+                    &keys,
+                    &configured_model_id,
+                    CHUNK_CLUSTER_LABEL_RECIPE_VERSION,
+                ),
             Err(error) => Err(error),
         };
         let cached = match cached {
@@ -4286,6 +4302,19 @@ impl AppContext {
             self.finish_topic_operation(request_id);
             return;
         }
+        // Everything below runs a model, so it needs the user's consent and a
+        // loaded generator. Without either, the misses stay unnamed and the
+        // cache hits above are still attached — which is the whole point of
+        // reading the store before asking this question.
+        let generator = self.generator.lock().clone();
+        let generator = match generator {
+            Some(generator) if settings.enabled => generator,
+            _ => {
+                self.finish_topic_operation(request_id);
+                return;
+            }
+        };
+        let model_id = generator.model_id().to_string();
         let ctx = Arc::clone(self);
         let task_request_id = request_id.to_string();
         let task = tokio::spawn(async move {
@@ -7953,6 +7982,42 @@ impl AppContext {
         crate::commands::embed::get_index_status(&self.data_dir, root).await
     }
 
+    /// How much of each of `roots` the semantic index covers.
+    ///
+    /// Answers a question no status row can: whether a root's directory has
+    /// moved on from what was indexed. The interface asks it so that switching
+    /// to a root can say "this one is not indexed" instead of quietly starting
+    /// hours of inference the user did not ask for.
+    ///
+    /// Reads only. Both sources are consulted because neither is complete on
+    /// its own: the index says which documents it holds, and the journal says
+    /// which ones were read and found to hold no text — those have no index row
+    /// and never will, and counting them as missing would leave a root that has
+    /// been fully read permanently reported as incomplete.
+    pub async fn index_coverage(&self, roots: Vec<PathBuf>) -> Result<Vec<RootCoverage>, String> {
+        let extensions = self.settings().await.supported_extensions.clone();
+        // Read the journal's verdicts up front and let its lock go: the walks
+        // below are filesystem work, and a build running beside them writes to
+        // the journal a document at a time.
+        let settled_empty = {
+            let journal = self.job_journal().map_err(|e| format!("{e:#}"))?;
+            let journal = journal.lock().map_err(|_| {
+                "The index job journal is unavailable after an earlier panic".to_string()
+            })?;
+            roots
+                .iter()
+                .map(|root| {
+                    journal
+                        .paths_with_outcome_for_root(root, DocumentOutcome::Empty)
+                        .map_err(|e| format!("{e:#}"))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        };
+        crate::commands::embed::root_coverage(&self.data_dir, roots, extensions, settled_empty)
+            .await
+            .map_err(|e| format!("{e:#}"))
+    }
+
     // ── Worker management ─────────────────────────────────────────────────────
 
     /// Status of every worker. Two processes can die independently, so a single
@@ -9569,6 +9634,115 @@ mod tests {
         assert!(caches.document.is_some());
     }
 
+    /// A name already in the store was paid for by an earlier run. Switching
+    /// generation off stops new names being made; it does not make the old ones
+    /// unreadable, and a cloud of permanently nameless tags is what treating it
+    /// that way produced.
+    #[tokio::test]
+    async fn cached_topic_names_survive_generation_being_switched_off() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("cached-label-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let document = root.join("passages.txt");
+        std::fs::write(&document, "cached label passages").unwrap();
+
+        let mut settings = Settings::default();
+        settings.last_directory = Some(root.clone());
+        // The state under test: a model is chosen, generation is off, and no
+        // generator is loaded — so nothing below can run one.
+        settings.generation.enabled = false;
+        settings.generation.model = Some(wilkes_core::types::GeneratorModel(
+            "cached-label-model".to_string(),
+        ));
+        std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert!(ctx.generator.lock().is_none());
+
+        let mut index = SemanticIndex::create(
+            dir.path(),
+            "cached-label-embedder",
+            2,
+            EmbeddingEngine::Candle,
+            Some(&root),
+        )
+        .unwrap();
+        let chunks = [[1.0, 0.0], [0.99, 0.01], [0.0, 1.0], [0.01, 0.99]]
+            .into_iter()
+            .enumerate()
+            .map(|(number, vector)| {
+                let text = format!("cached label passage {number}");
+                (
+                    wilkes_core::embed::index::chunk::Chunk {
+                        file_path: document.clone(),
+                        text: text.clone(),
+                        byte_range: ByteRange {
+                            start: 0,
+                            end: text.len(),
+                        },
+                        origin: SourceOrigin::TextFile {
+                            line: (number + 1) as u32,
+                            col: 1,
+                        },
+                    },
+                    vector.to_vec(),
+                )
+            })
+            .collect();
+        index
+            .write_file(wilkes_core::embed::index::db::PreparedFile {
+                retained: Default::default(),
+                full_text: String::new(),
+                path: document.clone(),
+                chunks,
+            })
+            .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
+
+        let query = || ChunkTopicsQuery {
+            root: root.clone(),
+            path: None,
+            granularity: wilkes_core::types::BookmarkClusterGranularity::MuchFewer,
+        };
+
+        // Nothing is cached yet, and nothing can be generated, so the cloud
+        // comes back unnamed. This is the state the user sees today.
+        let first = Arc::clone(&ctx)
+            .chunk_topics("uncached".to_string(), query())
+            .await
+            .unwrap();
+        assert!(!first.topics.is_empty());
+        assert!(first.topics.iter().all(|topic| topic.label.is_none()));
+
+        // Stand in for an earlier run that had generation on.
+        {
+            let store = ctx.research_store().unwrap();
+            let mut store = store.lock().unwrap();
+            for topic in &first.topics {
+                store
+                    .upsert_chunk_cluster_label(
+                        &topic.cluster_key,
+                        "Cached Label Passages",
+                        "cached-label-model",
+                        CHUNK_CLUSTER_LABEL_RECIPE_VERSION,
+                    )
+                    .unwrap();
+            }
+        }
+
+        let second = Arc::clone(&ctx)
+            .chunk_topics("cached".to_string(), query())
+            .await
+            .unwrap();
+        assert_eq!(second.topics.len(), first.topics.len());
+        assert!(
+            second
+                .topics
+                .iter()
+                .all(|topic| topic.label.as_deref() == Some("Cached Label Passages")),
+            "generation is off, but the names it produced earlier are still readable: {:?}",
+            second.topics.iter().map(|t| &t.label).collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn document_topics_report_full_library_coverage_without_changing_membership() {
         let (dir, ctx) = test_ctx();
@@ -10758,6 +10932,20 @@ mod tests {
             Some("mupdf: broken xref"),
             "the error is kept verbatim, not summarised away"
         );
+    }
+
+    /// Coverage is a claim about an index, so a workspace without one says so
+    /// rather than reporting every root as holding nothing — "not indexed" and
+    /// "there is no index" lead to different actions.
+    #[tokio::test]
+    async fn coverage_refuses_when_the_workspace_has_no_index() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("corpus");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+
+        let err = ctx.index_coverage(vec![root]).await.unwrap_err();
+        assert!(err.contains("No semantic index found"), "{err}");
     }
 
     /// Neither action invents work. Offering "continue" or "retry" for a root

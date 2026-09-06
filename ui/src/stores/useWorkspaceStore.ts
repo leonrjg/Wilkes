@@ -42,6 +42,8 @@ function clearWorkspaceUi() {
     buildRoot: null,
     blockedRoot: null,
     error: null,
+    coverage: {},
+    coverageRoots: [],
   });
   useTopicsStore.getState().resetForWorkspace();
   useChatStore.getState().resetForWorkspace();

@@ -24,6 +24,7 @@ import type {
   GenerationDone,
   GenerationError,
   IndexStatus,
+  RootCoverage,
   AddOutcome,
   CitationResult,
   IntegrationStatus,
@@ -639,6 +640,16 @@ export class HttpSearchApi implements SearchApi {
     const res = await fetch(`/api/embed/status${query}`);
     if (!res.ok) throw new Error(`getIndexStatus failed: ${res.status}`);
     return res.json() as Promise<IndexStatus>;
+  }
+
+  async indexCoverage(roots: string[]): Promise<RootCoverage[]> {
+    const res = await fetch("/api/embed/coverage", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ roots }),
+    });
+    if (!res.ok) throw new Error(`indexCoverage failed: ${res.status}`);
+    return res.json() as Promise<RootCoverage[]>;
   }
 
   async deleteIndex(root?: string): Promise<void> {

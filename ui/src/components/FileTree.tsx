@@ -61,8 +61,17 @@ function relativeSegments(root: string, path: string): string[] | null {
 }
 
 /** Build the visible hierarchy from the authoritative recursive file list.
- * Folder identity remains the real filesystem path; no shadow IDs are made. */
+ * Folder identity remains the real filesystem path; no shadow IDs are made.
+ *
+ * Entries outside the root are skipped rather than rejected: switching roots
+ * re-renders the tree with the new root before the file list for it has
+ * arrived, so the previous root's entries — including whatever the reader
+ * still holds open — are legitimately present for a frame. Throwing there
+ * blanked the application. They are logged, not silently dropped. */
 export function buildFileTree(root: string, files: FileEntry[], directories: string[] = []): FileFolder {
+  const outsideRoot = (path: string) => {
+    console.debug(`File-tree entry is outside its root, skipped: ${path} is not under ${root}`);
+  };
   const tree: MutableFileFolder = {
     path: root,
     name: baseName(root),
@@ -70,10 +79,11 @@ export function buildFileTree(root: string, files: FileEntry[], directories: str
     files: [],
   };
 
-  const ensureFolder = (path: string): MutableFileFolder => {
+  const ensureFolder = (path: string): MutableFileFolder | null => {
     const segments = relativeSegments(root, path);
     if (segments === null) {
-      throw new Error(`File-list entry is outside its root: ${path} is not under ${root}`);
+      outsideRoot(path);
+      return null;
     }
     let folder = tree;
     segments.forEach((segment, index) => {
@@ -97,7 +107,8 @@ export function buildFileTree(root: string, files: FileEntry[], directories: str
   for (const file of files) {
     const segments = relativeSegments(root, file.path);
     if (segments === null) {
-      throw new Error(`File-list entry is outside its root: ${file.path} is not under ${root}`);
+      outsideRoot(file.path);
+      continue;
     }
     if (segments.length < 2) {
       tree.files.push(file);
@@ -105,6 +116,7 @@ export function buildFileTree(root: string, files: FileEntry[], directories: str
     }
     const directoryPath = joinPath(root, segments.slice(0, -1));
     const folder = ensureFolder(directoryPath);
+    if (!folder) continue;
     folder.files.push(file);
   }
 

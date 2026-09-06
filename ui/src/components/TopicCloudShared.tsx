@@ -10,6 +10,19 @@ import { useSettingsStore } from "../stores/useSettingsStore";
 
 export const DEFAULT_TOPIC_INPUT_CAP = 1500;
 
+/** Whether a topic that has no name yet is still waiting for one.
+ *
+ *  Names are written by the text generator. With generation switched off or no
+ *  model chosen, the backend attaches whatever names it already has cached and
+ *  generates nothing further — so a topic still unnamed at that point will stay
+ *  unnamed, and animating it as though it were loading claims otherwise. */
+export function useTopicNamesExpected() {
+  return useSettingsStore((state) => {
+    const generation = state.settings?.generation;
+    return Boolean(generation?.enabled && generation.model);
+  });
+}
+
 const GRANULARITIES: readonly BookmarkClusterGranularity[] = [
   "much_fewer",
   "fewer",
@@ -194,6 +207,7 @@ export function TopicCloudTags({
   onActivate,
   onActivateCoverage,
 }: TagsProps) {
+  const namesExpected = useTopicNamesExpected();
   const weights = result?.topics.map((topic) => topic.chunk_count) ?? [];
   const minWeight = weights.length ? Math.min(...weights) : 0;
   const maxWeight = weights.length ? Math.max(...weights) : 0;
@@ -209,7 +223,8 @@ export function TopicCloudTags({
       }),
     [maxWeight, minWeight, result],
   );
-  const labelsPending = tags.some(({ label }) => !label);
+  const unnamed = tags.some(({ label }) => !label);
+  const labelsPending = namesExpected && unnamed;
   const titleFor = (topic: ChunkTopic) => {
     const chunkNoun = topic.chunk_count === 1 ? "chunk" : "chunks";
     if (!documentScoped) {
@@ -242,60 +257,113 @@ export function TopicCloudTags({
   if (tags.length === 0) return null;
 
   return (
-    <div
-      aria-label={documentScoped ? "Document topic cloud" : "Chunk topic cloud"}
-      aria-busy={loading || labelsPending}
-      className={`flex flex-wrap items-center justify-center gap-x-3 gap-y-2 py-2 transition-opacity ${loading ? "opacity-50" : ""}`}
-    >
-      {tags.map(({ topic, label, fontSize }) =>
-        label ? (
-          <span
-            key={topic.cluster_key}
-            className="inline-flex max-w-full items-baseline gap-1.5"
-          >
-            <button
-              type="button"
-              aria-pressed={selectedTopicKey === topic.cluster_key}
-              title={titleFor(topic)}
-              onClick={() => onActivate(topic)}
-              style={{ fontSize: `${fontSize}px` }}
-              className={`max-w-full rounded px-1.5 py-0.5 leading-tight transition-colors ${
-                selectedTopicKey === topic.cluster_key
-                  ? "bg-[var(--accent-blue-muted)] text-[var(--accent-blue)]"
-                  : "text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-main)]"
-              }`}
+    <>
+      {!namesExpected && unnamed && (
+        <p className="mb-2 text-[10px] leading-snug text-[var(--text-dim)]">
+          These topics have no names: naming them runs the text generator, which
+          is off. The grouping below is unaffected — each tag is a cluster of
+          passages, sized by how many it holds.
+        </p>
+      )}
+      <div
+        aria-label={
+          documentScoped ? "Document topic cloud" : "Chunk topic cloud"
+        }
+        aria-busy={loading || labelsPending}
+        className={`flex flex-wrap items-center justify-center gap-x-3 gap-y-2 py-2 transition-opacity ${loading ? "opacity-50" : ""}`}
+      >
+        {tags.map(({ topic, label, fontSize }) =>
+          label ? (
+            <span
+              key={topic.cluster_key}
+              className="inline-flex max-w-full items-baseline gap-1.5"
             >
-              {label}
-            </button>
-            {documentScoped && topic.library_coverage && (
               <button
                 type="button"
-                aria-label={`Show related passages for ${label}`}
-                title={coverageTitleFor(topic)}
-                onClick={() => onActivateCoverage?.(topic)}
-                className="whitespace-nowrap rounded-full bg-[var(--bg-active)] px-1.5 py-0.5 text-xs font-medium tabular-nums text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-main)]"
+                aria-pressed={selectedTopicKey === topic.cluster_key}
+                title={titleFor(topic)}
+                onClick={() => onActivate(topic)}
+                style={{ fontSize: `${fontSize}px` }}
+                className={`max-w-full rounded px-1.5 py-0.5 leading-tight transition-colors ${
+                  selectedTopicKey === topic.cluster_key
+                    ? "bg-[var(--accent-blue-muted)] text-[var(--accent-blue)]"
+                    : "text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-main)]"
+                }`}
               >
-                {topic.library_coverage.related_document_count.toLocaleString()} /{" "}
-                {topic.library_coverage.eligible_document_count.toLocaleString()} docs
+                {label}
               </button>
-            )}
-          </span>
-        ) : (
-          <button
-            type="button"
-            key={topic.cluster_key}
-            aria-label="Open topic while label loads"
-            aria-busy="true"
-            title={titleFor(topic)}
-            onClick={() => onActivate(topic)}
-            style={{
-              width: `${Math.round(fontSize * 4.5)}px`,
-              height: `${Math.round(fontSize * 1.25)}px`,
-            }}
-            className="max-w-full animate-pulse rounded-full bg-[var(--bg-active)] opacity-70 transition-opacity hover:opacity-100"
-          />
-        ),
-      )}
-    </div>
+              {documentScoped && topic.library_coverage && (
+                <button
+                  type="button"
+                  aria-label={`Show related passages for ${label}`}
+                  title={coverageTitleFor(topic)}
+                  onClick={() => onActivateCoverage?.(topic)}
+                  className="whitespace-nowrap rounded-full bg-[var(--bg-active)] px-1.5 py-0.5 text-xs font-medium tabular-nums text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-main)]"
+                >
+                  {topic.library_coverage.related_document_count.toLocaleString()}{" "}
+                  /{" "}
+                  {topic.library_coverage.eligible_document_count.toLocaleString()}{" "}
+                  docs
+                </button>
+              )}
+            </span>
+          ) : namesExpected ? (
+            <button
+              type="button"
+              key={topic.cluster_key}
+              aria-label="Open topic while label loads"
+              aria-busy="true"
+              title={titleFor(topic)}
+              onClick={() => onActivate(topic)}
+              style={{
+                width: `${Math.round(fontSize * 4.5)}px`,
+                height: `${Math.round(fontSize * 1.25)}px`,
+              }}
+              className="max-w-full animate-pulse rounded-full bg-[var(--bg-active)] opacity-70 transition-opacity hover:opacity-100"
+            />
+          ) : (
+            // No name is coming, so the cluster is offered by the one property
+            // it can state for itself: its size. Everything a named tag can do
+            // it can do — the name was a handle on the passages, not the only
+            // one, and losing it must not cost the coverage reading beside it.
+            <span
+              key={topic.cluster_key}
+              className="inline-flex max-w-full items-baseline gap-1.5"
+            >
+              <button
+                type="button"
+                aria-pressed={selectedTopicKey === topic.cluster_key}
+                aria-label={`Open unnamed topic of ${titleFor(topic)}`}
+                title={titleFor(topic)}
+                onClick={() => onActivate(topic)}
+                style={{ fontSize: `${Math.round(fontSize * 0.8)}px` }}
+                className={`max-w-full rounded px-1.5 py-0.5 font-medium leading-tight tabular-nums transition-colors ${
+                  selectedTopicKey === topic.cluster_key
+                    ? "bg-[var(--accent-blue-muted)] text-[var(--accent-blue)]"
+                    : "text-[var(--text-dim)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-main)]"
+                }`}
+              >
+                {topic.chunk_count.toLocaleString()}{" "}
+                {topic.chunk_count === 1 ? "passage" : "passages"}
+              </button>
+              {documentScoped && topic.library_coverage && (
+                <button
+                  type="button"
+                  aria-label={`Show related passages for this unnamed topic of ${titleFor(topic)}`}
+                  title={coverageTitleFor(topic)}
+                  onClick={() => onActivateCoverage?.(topic)}
+                  className="whitespace-nowrap rounded-full bg-[var(--bg-active)] px-1.5 py-0.5 text-xs font-medium tabular-nums text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-main)]"
+                >
+                  {topic.library_coverage.related_document_count.toLocaleString()}{" "}
+                  /{" "}
+                  {topic.library_coverage.eligible_document_count.toLocaleString()}{" "}
+                  docs
+                </button>
+              )}
+            </span>
+          ),
+        )}
+      </div>
+    </>
   );
 }

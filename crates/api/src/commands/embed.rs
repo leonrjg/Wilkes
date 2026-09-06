@@ -8,7 +8,7 @@ use wilkes_core::embed::index::{BuildReporter, SemanticIndex};
 use wilkes_core::embed::installer::EmbedderInstaller;
 use wilkes_core::embed::Embedder;
 use wilkes_core::models::progress::ProgressTx;
-use wilkes_core::types::{IndexStatus, SelectedEmbedder};
+use wilkes_core::types::{IndexStatus, RootCoverage, SelectedEmbedder};
 
 pub struct BuildIndexOptions {
     pub manager: Option<wilkes_core::worker::manager::WorkerManager>,
@@ -208,6 +208,66 @@ pub async fn get_index_status(
     .await?
 }
 
+/// How much of each root the index covers, one directory walk per root.
+///
+/// `settled_empty` carries, per root, the paths the job journal says were read
+/// and found to hold no text. They are read out of the journal by the caller
+/// and passed in rather than looked up here, so that the journal's lock is not
+/// held across the walks below — a running build writes to it document by
+/// document.
+///
+/// No model is loaded and no document is read: this is `files` rows against
+/// directory entries. A root whose walk fails is reported as an error rather
+/// than as an empty directory, because "nothing to index" and "could not look"
+/// are opposite answers and only one of them means the user has nothing to do.
+pub async fn root_coverage(
+    data_dir: &Path,
+    roots: Vec<PathBuf>,
+    supported_extensions: Vec<String>,
+    settled_empty: Vec<Vec<PathBuf>>,
+) -> anyhow::Result<Vec<RootCoverage>> {
+    anyhow::ensure!(
+        roots.len() == settled_empty.len(),
+        "root_coverage was given {} root(s) but {} journal reading(s)",
+        roots.len(),
+        settled_empty.len()
+    );
+    let data_dir = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let index = SemanticIndex::open_for_maintenance(&data_dir)?;
+        roots
+            .into_iter()
+            .zip(settled_empty)
+            .map(|(root, empty)| {
+                let paths = collect_indexable_paths(&root, &supported_extensions);
+                // A document the index holds is covered; so is one a job read
+                // and found no text in, which the index has no row for and
+                // never will. Counted as one set rather than two tallies, so
+                // that a path both could name is counted once.
+                let empty: std::collections::HashSet<PathBuf> = empty
+                    .into_iter()
+                    .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+                    .collect();
+                let unheld: Vec<PathBuf> = index.unindexed_paths_for_root(&root, &paths)?;
+                let missing = unheld
+                    .into_iter()
+                    .filter(|path| {
+                        !empty
+                            .contains(&std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+                    })
+                    .count();
+                Ok(RootCoverage {
+                    indexable: paths.len(),
+                    covered: paths.len() - missing,
+                    complete: missing == 0,
+                    root,
+                })
+            })
+            .collect()
+    })
+    .await?
+}
+
 /// Delete the whole index database or, when `root` is supplied, only that root's coverage.
 pub async fn delete_index(data_dir: &Path, root: Option<PathBuf>) -> anyhow::Result<()> {
     let data_dir = data_dir.to_path_buf();
@@ -340,6 +400,161 @@ mod tests {
         // The index belongs to the workspace, the artefacts to the shared
         // cache: neither may be written where the other lives.
         assert!(!model_dir.join("semantic_index.db").exists());
+    }
+
+    /// Coverage is a claim about the directory as it is *now*, not as it was
+    /// when the build ran. A root indexed last month and added to since is what
+    /// the indicator exists to catch.
+    #[tokio::test]
+    async fn coverage_counts_files_added_since_the_build_as_missing() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("files");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("read.txt"), "hello world").unwrap();
+
+        let index_dir = dir.path().join("workspace");
+        std::fs::create_dir(&index_dir).unwrap();
+        let model_dir = dir.path().join("models");
+        std::fs::create_dir(&model_dir).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        let supported_extensions = vec!["txt".to_string()];
+
+        build_index_with_embedder(
+            root.clone(),
+            Arc::new(TestEmbedder),
+            BuildIndexOptions {
+                manager: None,
+                device: None,
+                model_dir,
+                index_dir: index_dir.clone(),
+                reporter: BuildReporter::without_journal(tx),
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                documents: collect_indexable_paths(&root, &supported_extensions),
+                scope: BuildScope::WholeRoot,
+                chunk_size: 600,
+                chunk_overlap: 128,
+                supported_extensions: supported_extensions.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let covered = root_coverage(
+            &index_dir,
+            vec![root.clone()],
+            supported_extensions.clone(),
+            vec![vec![]],
+        )
+        .await
+        .unwrap();
+        assert_eq!(covered[0].indexable, 1);
+        assert_eq!(covered[0].covered, 1);
+        assert!(covered[0].complete);
+
+        std::fs::write(root.join("arrived-later.txt"), "new").unwrap();
+        let covered = root_coverage(
+            &index_dir,
+            vec![root.clone()],
+            supported_extensions.clone(),
+            vec![vec![]],
+        )
+        .await
+        .unwrap();
+        assert_eq!(covered[0].indexable, 2);
+        assert_eq!(covered[0].covered, 1);
+        assert!(
+            !covered[0].complete,
+            "a file the index has never seen is missing"
+        );
+
+        // A document read and found to hold no text has no index row and never
+        // will. Counting it as missing would leave a fully-read root reported
+        // as incomplete for as long as it existed.
+        let covered = root_coverage(
+            &index_dir,
+            vec![root.clone()],
+            supported_extensions.clone(),
+            vec![vec![root.join("arrived-later.txt")]],
+        )
+        .await
+        .unwrap();
+        assert_eq!(covered[0].covered, 2);
+        assert!(covered[0].complete);
+    }
+
+    /// A root nothing has ever indexed is answered, not refused: "never
+    /// indexed" is exactly what the caller is asking about.
+    #[tokio::test]
+    async fn coverage_reports_a_root_the_index_has_never_seen() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("files");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        std::fs::write(root.join("b.txt"), "world").unwrap();
+
+        let index_dir = dir.path().join("workspace");
+        std::fs::create_dir(&index_dir).unwrap();
+        let model_dir = dir.path().join("models");
+        std::fs::create_dir(&model_dir).unwrap();
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("c.txt"), "elsewhere").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        let supported_extensions = vec!["txt".to_string()];
+
+        // An index has to exist for coverage to be a claim about anything, so
+        // one root is built and the *other* is the one under test.
+        build_index_with_embedder(
+            other.clone(),
+            Arc::new(TestEmbedder),
+            BuildIndexOptions {
+                manager: None,
+                device: None,
+                model_dir,
+                index_dir: index_dir.clone(),
+                reporter: BuildReporter::without_journal(tx),
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                documents: collect_indexable_paths(&other, &supported_extensions),
+                scope: BuildScope::WholeRoot,
+                chunk_size: 600,
+                chunk_overlap: 128,
+                supported_extensions: supported_extensions.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let covered = root_coverage(
+            &index_dir,
+            vec![root.clone(), other.clone()],
+            supported_extensions,
+            vec![vec![], vec![]],
+        )
+        .await
+        .unwrap();
+        assert_eq!(covered[0].root, root);
+        assert_eq!((covered[0].indexable, covered[0].covered), (2, 0));
+        assert!(!covered[0].complete);
+        assert!(
+            covered[1].complete,
+            "the built root is unaffected by the other"
+        );
+    }
+
+    /// One reading per root, or the zip below would silently pair a root with
+    /// another root's verdicts.
+    #[tokio::test]
+    async fn coverage_refuses_a_mismatched_number_of_journal_readings() {
+        let dir = tempdir().unwrap();
+        let err = root_coverage(
+            dir.path(),
+            vec![dir.path().to_path_buf(), dir.path().to_path_buf()],
+            vec!["txt".to_string()],
+            vec![vec![]],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("2 root(s) but 1"), "{err:#}");
     }
 
     #[tokio::test]

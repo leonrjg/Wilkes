@@ -7025,6 +7025,35 @@ impl SemanticIndex {
         Ok(rows)
     }
 
+    /// Which of `paths` this index does *not* hold under `root`.
+    ///
+    /// A read of `root_files` and `files` only: no extraction, no embedder, no
+    /// model. Presence is the test, not identity — a file whose bytes changed
+    /// since it was read is held but stale, and staleness is the directory
+    /// watcher's and a rebuild's business, not this list's.
+    ///
+    /// A root the index has never seen holds nothing, so every path comes back
+    /// rather than an error: "never indexed" is an answer this is asked for.
+    pub fn unindexed_paths_for_root(
+        &self,
+        root: &Path,
+        paths: &[PathBuf],
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let Some(root_id) = self.root_id_for_path(root)? else {
+            return Ok(paths.to_vec());
+        };
+        let indexed: HashSet<PathBuf> = self
+            .indexed_files_for_root(root_id)?
+            .into_iter()
+            .map(|row| row.path_key)
+            .collect();
+        Ok(paths
+            .iter()
+            .filter(|path| !indexed.contains(&Self::canonical_path(path)))
+            .cloned()
+            .collect())
+    }
+
     fn rename_key(&mut self, old_key: &Path, new_key: &Path) -> anyhow::Result<()> {
         let old_rel = old_key.to_string_lossy().into_owned();
         let new_rel = new_key.to_string_lossy().into_owned();

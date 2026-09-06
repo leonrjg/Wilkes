@@ -1,6 +1,7 @@
 import { render, screen, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import DirectoryPicker from "./DirectoryPicker";
+import DirectoryPicker, { describeCoverage } from "./DirectoryPicker";
+import { useSemanticStore } from "../stores/useSemanticStore";
 import { ToastProvider } from "./Toast";
 
 const { mockOpenPath, mockIsTauri, mockCreateDirectory, mockListDirectories, mockRenameFile } =
@@ -45,6 +46,7 @@ describe("DirectoryPicker", () => {
     vi.clearAllMocks();
     mockIsTauri.value = false;
     mockListDirectories.mockResolvedValue([]);
+    useSemanticStore.setState({ coverage: {}, refreshCoverage: vi.fn().mockResolvedValue(undefined) });
   });
 
   const renderWithToasts = (props = defaultProps) =>
@@ -228,5 +230,82 @@ describe("DirectoryPicker", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Open in file manager" }));
 
     expect(mockOpenPath).toHaveBeenCalledWith("/home/user/project");
+  });
+});
+
+describe("DirectoryPicker index coverage", () => {
+  const props = {
+    directory: "/home/user/project",
+    favorites: ["/home/user/other"],
+    recentDirs: [],
+    onChange: vi.fn(),
+    onPickDirectory: vi.fn(),
+  };
+
+  const renderWithToasts = () =>
+    render(
+      <ToastProvider>
+        <DirectoryPicker {...props} />
+      </ToastProvider>,
+    );
+
+  it("asks about exactly the roots it lists", () => {
+    const refreshCoverage = vi.fn().mockResolvedValue(undefined);
+    useSemanticStore.setState({ coverage: {}, refreshCoverage });
+    renderWithToasts();
+    expect(refreshCoverage).toHaveBeenCalledWith([
+      "/home/user/other",
+      "/home/user/project",
+    ]);
+  });
+
+  it("marks a fully indexed root apart from one the index is behind on", () => {
+    useSemanticStore.setState({
+      coverage: {
+        "/home/user/other": {
+          root: "/home/user/other",
+          indexable: 12,
+          covered: 12,
+          complete: true,
+        },
+        "/home/user/project": {
+          root: "/home/user/project",
+          indexable: 40,
+          covered: 9,
+          complete: false,
+        },
+      },
+      refreshCoverage: vi.fn().mockResolvedValue(undefined),
+    });
+    renderWithToasts();
+
+    const marks = document.querySelectorAll("[data-root-coverage]");
+    expect(Array.from(marks).map((m) => m.getAttribute("data-root-coverage"))).toEqual([
+      "complete",
+      "incomplete",
+    ]);
+    expect(
+      screen.getByLabelText(
+        "Not fully indexed — 9 of 40 documents are in the semantic index",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("leaves a root unmarked while its coverage is unknown", () => {
+    useSemanticStore.setState({
+      coverage: {},
+      refreshCoverage: vi.fn().mockResolvedValue(undefined),
+    });
+    renderWithToasts();
+    expect(document.querySelectorAll("[data-root-coverage]")).toHaveLength(0);
+  });
+
+  it("describes a root the index is behind on by what it is missing", () => {
+    expect(
+      describeCoverage({ root: "/a", indexable: 40, covered: 0, complete: false }),
+    ).toContain("0 of 40");
+    expect(
+      describeCoverage({ root: "/a", indexable: 40, covered: 40, complete: true }),
+    ).toContain("all 40");
   });
 });

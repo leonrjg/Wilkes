@@ -119,11 +119,21 @@ export default function DocumentTopicCloudPane({ currentPath, onClose }: Props) 
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3 custom-scrollbar">
-        {document.loading && !document.result && (
+        {!directory && (
+          <p className="text-xs text-[var(--text-dim)]">
+            Choose a folder to find topics.
+          </p>
+        )}
+        {directory && document.loading && !document.result && (
           <div className="flex items-center gap-2 text-xs text-[var(--text-dim)]">
             <Loader size={13} className="animate-spin" />
             Finding topics…
           </div>
+        )}
+        {directory && !document.loading && document.error && (
+          <p className="text-xs text-[var(--accent-red)]" role="alert">
+            {document.error}
+          </p>
         )}
         <TopicCloudTags
           loading={document.loading}

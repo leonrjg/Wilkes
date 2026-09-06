@@ -504,6 +504,19 @@ describe("HttpSearchApi", () => {
     expect(res).toEqual(mockStatus);
   });
 
+  it("indexCoverage posts the roots it wants covered", async () => {
+    const rows = [{ root: "/root", indexable: 3, covered: 1, complete: false }];
+    (fetch as any).mockResolvedValue({ ok: true, json: () => Promise.resolve(rows) });
+
+    const res = await api.indexCoverage(["/root"]);
+    expect(fetch).toHaveBeenCalledWith("/api/embed/coverage", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ roots: ["/root"] }),
+    });
+    expect(res).toEqual(rows);
+  });
+
   it("deleteIndex calls fetch with DELETE", async () => {
     (fetch as any).mockResolvedValue({ ok: true, status: 204 });
     await api.deleteIndex();

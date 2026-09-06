@@ -2173,6 +2173,26 @@ async fn index_activity_handler(
     Ok(Json(activity))
 }
 
+#[derive(Deserialize)]
+struct CoverageBody {
+    roots: Vec<String>,
+}
+
+/// How much of each root the semantic index covers.
+async fn index_coverage_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CoverageBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let roots = body
+        .roots
+        .iter()
+        .map(|root| confine_to_uploads(root, &uploads_dir))
+        .collect::<Result<Vec<_>, _>>()?;
+    let coverage = ctx.index_coverage(roots).await.map_err(server_err)?;
+    Ok(Json(coverage))
+}
+
 /// Index the documents the last job for this root never reached.
 async fn continue_index_job_handler(
     State(state): State<Arc<AppState>>,
@@ -2511,6 +2531,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/embed/download", post(download_model_handler))
         .route("/api/embed/build", post(build_index_handler))
         .route("/api/embed/activity", get(index_activity_handler))
+        .route("/api/embed/coverage", post(index_coverage_handler))
         .route("/api/embed/continue", post(continue_index_job_handler))
         .route(
             "/api/embed/retry-failed",

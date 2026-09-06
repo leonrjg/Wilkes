@@ -57,10 +57,10 @@ describe("CataloguePane", () => {
   });
 
   const submit = (text: string) => {
-    fireEvent.change(screen.getByLabelText("Search the teaching catalogues"), {
+    fireEvent.change(screen.getByLabelText("Search the learning catalogues"), {
       target: { value: text },
     });
-    fireEvent.submit(screen.getByLabelText("Search the teaching catalogues"));
+    fireEvent.submit(screen.getByLabelText("Search the learning catalogues"));
   };
 
   it("searches the mirror and lists what it holds", async () => {

@@ -10,6 +10,7 @@ import type {
 interface DocumentTopicsState {
   loading: boolean;
   requestId: string | null;
+  error: string | null;
   result: ChunkTopicsResult | null;
   root: string | null;
   path: string | null;
@@ -21,6 +22,7 @@ interface TopicsStore {
   paneOpen: boolean;
   loading: boolean;
   requestId: string | null;
+  error: string | null;
   result: ChunkTopicsResult | null;
   root: string | null;
   granularity: BookmarkClusterGranularity;
@@ -37,6 +39,14 @@ interface TopicsStore {
   selectDocumentTopic: (clusterKey: string | null) => void;
   applyLabel: (event: ChunkTopicLabelled) => void;
   resetForWorkspace: () => void;
+}
+
+/** Backend errors arrive as plain strings over the command bridge, Error
+ *  objects from the fetch transport. Both have to end up on screen: a pane
+ *  that is blank for no stated reason is indistinguishable from one that is
+ *  still working. */
+function errorText(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function cancelRequest(requestId: string | null) {
@@ -65,6 +75,7 @@ function patchLabel(
 const emptyDocumentState: DocumentTopicsState = {
   loading: false,
   requestId: null,
+  error: null,
   result: null,
   root: null,
   path: null,
@@ -76,6 +87,7 @@ export const useTopicsStore = create<TopicsStore>((set, get) => ({
   paneOpen: false,
   loading: false,
   requestId: null,
+  error: null,
   result: null,
   root: null,
   granularity: "much_fewer",
@@ -100,18 +112,22 @@ export const useTopicsStore = create<TopicsStore>((set, get) => ({
       loading: true,
       root,
       selectedTopicKey: null,
+      error: null,
       ...(get().root === root ? {} : { result: null }),
     });
     try {
       const result = await api.chunkTopics(requestId, { root, granularity });
       if (get().requestId === requestId && get().paneOpen) {
-        set({ result, loading: false });
+        set({ result, loading: false, error: null });
       }
     } catch (error) {
       if (get().requestId === requestId && get().paneOpen) {
-        set({ loading: false });
+        set({ loading: false, error: errorText(error) });
         throw error;
       }
+      // A superseded or closed-pane request still failed for a reason. It has
+      // nowhere to be shown, so it goes to the log rather than nowhere.
+      console.debug("Superseded topic request failed:", error);
     }
   },
 
@@ -129,6 +145,7 @@ export const useTopicsStore = create<TopicsStore>((set, get) => ({
         root,
         path,
         selectedTopicKey: null,
+        error: null,
         ...(sameDocument ? {} : { result: null }),
       },
     }));
@@ -140,16 +157,21 @@ export const useTopicsStore = create<TopicsStore>((set, get) => ({
       });
       if (get().document.requestId === requestId) {
         set((state) => ({
-          document: { ...state.document, result, loading: false },
+          document: { ...state.document, result, loading: false, error: null },
         }));
       }
     } catch (error) {
       if (get().document.requestId === requestId) {
         set((state) => ({
-          document: { ...state.document, loading: false },
+          document: {
+            ...state.document,
+            loading: false,
+            error: errorText(error),
+          },
         }));
         throw error;
       }
+      console.debug("Superseded document topic request failed:", error);
     }
   },
 
@@ -207,6 +229,7 @@ export const useTopicsStore = create<TopicsStore>((set, get) => ({
       paneOpen: false,
       loading: false,
       requestId: null,
+      error: null,
       result: null,
       root: null,
       selectedTopicKey: null,

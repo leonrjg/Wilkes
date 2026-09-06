@@ -61,6 +61,7 @@ describe("TopicCloudPane", () => {
       bookmarksDock: "Right",
       settings: {
         semantic: { topic_cloud_input_cap: 1500 },
+        generation: { enabled: true, model: "gemma-3" },
       } as any,
       refreshFileList: vi.fn().mockResolvedValue(undefined),
       setBookmarksDock: vi.fn(),
@@ -69,6 +70,7 @@ describe("TopicCloudPane", () => {
       paneOpen: true,
       loading: false,
       requestId: null,
+      error: null,
       result: null,
       root: null,
       granularity: "much_fewer",
@@ -76,6 +78,7 @@ describe("TopicCloudPane", () => {
       document: {
         loading: false,
         requestId: null,
+        error: null,
         result: null,
         root: null,
         path: null,
@@ -268,7 +271,7 @@ describe("TopicCloudPane", () => {
     expect(inputCap).toBeDisabled();
   });
 
-  it("uses a non-textual placeholder while a valid label is unavailable", async () => {
+  it("uses a non-textual placeholder while a label is still coming", async () => {
     vi.mocked(api.chunkTopics).mockResolvedValue({
       ...result,
       topics: [{ ...result.topics[0], label: null }],
@@ -293,5 +296,60 @@ describe("TopicCloudPane", () => {
     expect(
       screen.queryByText("Graph indexes speed up neighborhood traversal."),
     ).not.toBeInTheDocument();
+  });
+
+  it("offers an unnamed topic by its size when no name is coming", async () => {
+    useSettingsStore.setState({
+      settings: {
+        semantic: { topic_cloud_input_cap: 1500 },
+        generation: { enabled: false, model: "gemma-3" },
+      } as any,
+    });
+    vi.mocked(api.chunkTopics).mockResolvedValue({
+      ...result,
+      topics: [{ ...result.topics[0], label: null }],
+    });
+
+    render(
+      <ToastProvider>
+        <TopicCloudPane />
+      </ToastProvider>,
+    );
+
+    const tag = await screen.findByRole("button", {
+      name: "Open unnamed topic of 2 chunks across 2 documents",
+    });
+    expect(tag).toHaveTextContent("2 passages");
+    // Nothing is pending, so nothing claims to be.
+    expect(
+      screen.queryByRole("button", { name: "Open topic while label loads" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Chunk topic cloud")).toHaveAttribute(
+      "aria-busy",
+      "false",
+    );
+    expect(
+      screen.getByText(/runs the text generator, which is off/),
+    ).toBeInTheDocument();
+
+    // The tag is still a handle on the passages it groups.
+    fireEvent.click(tag);
+    await waitFor(() =>
+      expect(useSearchStore.getState().results).toHaveLength(2),
+    );
+  });
+
+  it("says why the cloud is empty instead of showing nothing", async () => {
+    vi.mocked(api.chunkTopics).mockRejectedValue("Semantic index unavailable.");
+
+    render(
+      <ToastProvider>
+        <TopicCloudPane />
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Semantic index unavailable.",
+    );
   });
 });

@@ -28,6 +28,7 @@ import type {
   GenerationDone,
   GenerationError,
   IndexStatus,
+  RootCoverage,
   AddOutcome,
   CitationResult,
   IntegrationStatus,
@@ -412,6 +413,10 @@ export class TauriSearchApi implements SearchApi {
 
   async getIndexStatus(root?: string): Promise<IndexStatus> {
     return invoke<IndexStatus>("get_index_status", { root: root ?? null });
+  }
+
+  async indexCoverage(roots: string[]): Promise<RootCoverage[]> {
+    return invoke<RootCoverage[]>("index_coverage", { roots });
   }
 
   async isSemanticReady(): Promise<boolean> {

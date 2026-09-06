@@ -24,6 +24,7 @@ export default function TopicCloudPane() {
       DEFAULT_TOPIC_INPUT_CAP,
   );
   const loading = useTopicsStore((state) => state.loading);
+  const error = useTopicsStore((state) => state.error);
   const result = useTopicsStore((state) => state.result);
   const granularity = useTopicsStore((state) => state.granularity);
   const selectedTopicKey = useTopicsStore((state) => state.selectedTopicKey);
@@ -104,11 +105,24 @@ export default function TopicCloudPane() {
       </header>
 
       <div className="flex-1 overflow-auto p-3 custom-scrollbar">
-        {loading && !result && (
+        {/* A pane with nothing in it and nothing to say about why reads as a
+            feature that does not work. Every state that produces no tags
+            names itself. */}
+        {!directory && (
+          <p className="text-xs text-[var(--text-dim)]">
+            Choose a folder to find topics.
+          </p>
+        )}
+        {directory && loading && !result && (
           <div className="flex items-center gap-2 text-xs text-[var(--text-dim)]">
             <Loader size={13} className="animate-spin" />
             Finding topics…
           </div>
+        )}
+        {directory && !loading && error && (
+          <p className="text-xs text-[var(--accent-red)]" role="alert">
+            {error}
+          </p>
         )}
         <TopicCloudTags
           loading={loading}

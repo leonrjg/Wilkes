@@ -1,4 +1,4 @@
-//! The open teaching catalogues Wilkes mirrors, and the trait they share.
+//! The open learning catalogues Wilkes mirrors, and the trait they share.
 //!
 //! Each provider answers one question — *what do you currently hold?* — and
 //! nothing else. No provider is asked to search, because none of them ranks

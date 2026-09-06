@@ -2394,6 +2394,27 @@ pub struct IndexStatus {
     pub db_size_bytes: Option<u64>,
 }
 
+/// How much of one root the semantic index covers.
+///
+/// [`IndexStatus`] counts what the index *holds*; this counts what it is
+/// *missing*, which is a different question and the only one that answers
+/// "is this root worth indexing". It is derived by listing the root's
+/// indexable files and asking the index and the job journal about each — a
+/// directory walk and two table reads, never a document read.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RootCoverage {
+    pub root: std::path::PathBuf,
+    /// Indexable files found under `root` now.
+    pub indexable: usize,
+    /// Of those, the ones the index holds plus the ones a job read and found
+    /// no text in. A document with nothing to index is accounted for, not
+    /// missing: the index has no row for it and never will.
+    pub covered: usize,
+    /// Whether every indexable file under `root` is accounted for. False when
+    /// no index exists, and false for a root no job has ever reached.
+    pub complete: bool,
+}
+
 // ── Settings ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -7,6 +7,7 @@ import { useSettingsStore } from "./useSettingsStore";
 vi.mock("../services", () => ({
   api: {
     getIndexStatus: vi.fn(),
+    indexCoverage: vi.fn().mockResolvedValue([]),
     buildIndex: vi.fn().mockResolvedValue(undefined),
     listFiles: vi.fn().mockResolvedValue({ files: [], omitted: [] }),
   },
@@ -60,10 +61,74 @@ describe("useSemanticStore", () => {
     useSemanticStore.setState({
       indexStatus: null,
       readyForCurrentRoot: false,
+      readyGlobally: false,
       status: "idle",
       buildRoot: null,
       blockedRoot: null,
       error: null,
+      coverage: {},
+      coverageRoots: [],
+    });
+  });
+
+  describe("refreshCoverage", () => {
+    const usableStatus = {
+      indexed_files: 5,
+      total_chunks: 10,
+      built_at: null,
+      build_duration_ms: null,
+      engine: "SBERT",
+      model_id: "intfloat/e5-small-v2",
+      dimension: 384,
+      root_path: null,
+      db_size_bytes: null,
+    };
+
+    it("keys each root's coverage by the root it was asked about", async () => {
+      (api.getIndexStatus as any).mockResolvedValue(usableStatus);
+      (api.indexCoverage as any).mockResolvedValue([
+        { root: "/a", indexable: 10, covered: 10, complete: true },
+        { root: "/b", indexable: 10, covered: 3, complete: false },
+      ]);
+
+      await useSemanticStore.getState().refreshCoverage(["/a", "/b"]);
+
+      expect(api.indexCoverage).toHaveBeenCalledWith(["/a", "/b"]);
+      expect(useSemanticStore.getState().coverage["/a"].complete).toBe(true);
+      expect(useSemanticStore.getState().coverage["/b"].covered).toBe(3);
+    });
+
+    it("does not walk any directory when no index exists to cover them", async () => {
+      (api.getIndexStatus as any).mockRejectedValue(new Error("No semantic index found"));
+
+      await useSemanticStore.getState().refreshCoverage(["/a"]);
+
+      expect(api.indexCoverage).not.toHaveBeenCalled();
+      expect(useSemanticStore.getState().coverage).toEqual({});
+    });
+
+    it("re-asks about the remembered roots when called with none", async () => {
+      (api.getIndexStatus as any).mockResolvedValue(usableStatus);
+      (api.indexCoverage as any).mockResolvedValue([
+        { root: "/a", indexable: 1, covered: 1, complete: true },
+      ]);
+
+      await useSemanticStore.getState().refreshCoverage(["/a"]);
+      await useSemanticStore.getState().refreshCoverage();
+
+      expect(api.indexCoverage).toHaveBeenNthCalledWith(2, ["/a"]);
+    });
+
+    it("leaves the roots unmarked rather than guessing when the backend fails", async () => {
+      (api.getIndexStatus as any).mockResolvedValue(usableStatus);
+      (api.indexCoverage as any).mockRejectedValue(new Error("journal unreadable"));
+      const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      await useSemanticStore.getState().refreshCoverage(["/a"]);
+
+      expect(useSemanticStore.getState().coverage).toEqual({});
+      expect(logged).toHaveBeenCalled();
+      logged.mockRestore();
     });
   });
 
@@ -166,7 +231,7 @@ describe("useSemanticStore", () => {
     );
   });
 
-  it("rebuilds automatically when switching to a different root with semantic enabled", async () => {
+  it("reads the new root's index state on a switch without starting a build", async () => {
     (api.getIndexStatus as any)
       .mockResolvedValueOnce({
         indexed_files: 5,
@@ -202,11 +267,10 @@ describe("useSemanticStore", () => {
     } as any);
     await flushAsync();
 
-    expect(api.buildIndex).toHaveBeenCalledTimes(1);
-    expect(api.buildIndex).toHaveBeenCalledWith(
-      "/second",
-      expect.objectContaining({ model: "intfloat/e5-small-v2" }),
-    );
+    // The detection still runs — the interface needs it to mark the root —
+    // but the hours of inference behind it are the user's to start.
+    expect(api.getIndexStatus).toHaveBeenCalledWith("/second");
+    expect(api.buildIndex).not.toHaveBeenCalled();
   });
 
   it("deduplicates repeated ensure calls while the same root is already building", async () => {

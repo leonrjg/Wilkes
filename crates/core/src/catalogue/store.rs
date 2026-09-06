@@ -1,4 +1,4 @@
-//! SQLite mirror of the teaching catalogues, with an FTS5 index for recall.
+//! SQLite mirror of the learning catalogues, with an FTS5 index for recall.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

@@ -420,7 +420,7 @@ export default function SettingsModal({
               <TabButton
                 id="catalogue"
                 label="Catalogues"
-                accessibleLabel="Teaching catalogues"
+                accessibleLabel="Learning catalogues"
               />
               {isTauri && (
                 <TabButton

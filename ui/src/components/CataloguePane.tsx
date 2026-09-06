@@ -12,7 +12,7 @@ const GRAIN_LABELS: Record<CatalogueGrain, string> = {
 };
 
 /**
- * Browsing the teaching catalogues for something to add.
+ * Browsing the learning catalogues for something to add.
  *
  * Sits with the other ways documents enter a library rather than with the
  * search results: looking for material to acquire is an acquisition, and the
@@ -33,7 +33,7 @@ export default function CataloguePane() {
     <div className="flex h-full flex-col border-l border-[var(--border-main)] bg-[var(--bg-sidebar)]">
       <div className="flex items-center justify-between border-b border-[var(--border-main)] px-3 py-2">
         <h2 className="text-[11px] font-bold uppercase tracking-wider text-[var(--text-dim)]">
-          Teaching catalogues
+          Learning catalogues
         </h2>
         <button
           type="button"
@@ -58,7 +58,7 @@ export default function CataloguePane() {
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             placeholder="What do you want to learn?"
-            aria-label="Search the teaching catalogues"
+            aria-label="Search the learning catalogues"
             className="w-full bg-transparent py-1.5 text-[11px] text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
           />
         </div>

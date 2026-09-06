@@ -72,7 +72,7 @@ export default function CatalogueGapStrip({ query }: Props) {
     return (
       <div className="mx-4 mb-4 rounded-lg border border-[var(--border-main)] bg-[var(--bg-active)] px-3 py-2">
         <p className="text-[10px] leading-relaxed text-[var(--text-muted)]">
-          The teaching catalogues have not been fetched yet. Settings ›
+          The learning catalogues have not been fetched yet. Settings ›
           Catalogues will fill them, and this search can then suggest open
           textbooks and courses when your library has nothing.
         </p>

@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { confirmDialog } from "../lib/utils/dialog";
 import { ChevronLeft, ChevronRight, Folder, FolderPlus, Star, X } from "react-feather";
 import { useToasts } from "./Toast";
@@ -7,10 +7,12 @@ import { api, isTauri, source } from "../services";
 import type { DesktopSourceApi } from "../services/api";
 import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileActions";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useSemanticStore } from "../stores/useSemanticStore";
 import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { DirectoryTree, isStrictAncestor, parentPath } from "./DirectoryTree";
 import { configuredLibraryRoots } from "../lib/configuredRoots";
+import type { RootCoverage } from "../lib/types";
 
 interface Props {
   directory: string;
@@ -32,6 +34,22 @@ function shortPath(p: string): string {
 
 function baseName(p: string): string {
   return p.replace(/[/\\]+$/, "").split(/[/\\]/).pop() || p;
+}
+
+/**
+ * What a root's coverage says, in one sentence.
+ *
+ * The counts are spelled out because "not indexed" and "indexed except for the
+ * forty files added last week" call for the same decision but not the same
+ * urgency, and the strip only has room for a dot.
+ */
+export function describeCoverage(coverage: RootCoverage): string {
+  if (coverage.complete) {
+    return coverage.indexable === 1
+      ? "Indexed — its 1 document is in the semantic index"
+      : `Indexed — all ${coverage.indexable} documents are in the semantic index`;
+  }
+  return `Not fully indexed — ${coverage.covered} of ${coverage.indexable} documents are in the semantic index`;
 }
 
 const ROOT_SCROLL_EDGE_TOLERANCE = 2;
@@ -160,6 +178,16 @@ export default function DirectoryPicker({
     [directory, favorites, recentDirs],
   );
 
+  // The strip is what knows which roots are on screen, so it is what asks how
+  // much of each the index holds. Keyed on the set rather than the array, so
+  // making an already-listed root active does not re-walk every directory.
+  const coverage = useSemanticStore((state) => state.coverage);
+  const refreshCoverage = useSemanticStore((state) => state.refreshCoverage);
+  const rootsKey = displayDirs.join("\0");
+  useEffect(() => {
+    refreshCoverage(rootsKey ? rootsKey.split("\0") : []).catch(console.error);
+  }, [rootsKey, refreshCoverage]);
+
   // Destinations for the "new folder" dialog. We surface each current root plus
   // a synthetic "[parent]" node per distinct parent of the top-level roots, so a
   // folder can be created as a sibling of the roots. The parent nodes only ever
@@ -274,6 +302,7 @@ export default function DirectoryPicker({
           {displayDirs.map((b) => {
             const favorite = isFavorite(b);
             const active = b === directory;
+            const rootCoverage = coverage[b];
 
             return (
               <div
@@ -308,6 +337,20 @@ export default function DirectoryPicker({
                     >
                       <X size={10} />
                     </button>
+                  </Tooltip>
+                )}
+                {rootCoverage && (
+                  <Tooltip content={describeCoverage(rootCoverage)}>
+                    <span
+                      role="img"
+                      aria-label={describeCoverage(rootCoverage)}
+                      data-root-coverage={rootCoverage.complete ? "complete" : "incomplete"}
+                      className={`ml-1 block h-1.5 w-1.5 flex-shrink-0 rounded-full ${
+                        rootCoverage.complete
+                          ? "bg-green-400"
+                          : "border border-amber-400 bg-transparent"
+                      }`}
+                    />
                   </Tooltip>
                 )}
                 <Tooltip content={b} className="font-mono break-all">

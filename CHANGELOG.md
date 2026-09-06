@@ -4,6 +4,17 @@
 
 ### Added
 
+- The root strip marks each root with what the semantic index holds for it: a
+  filled dot for a root that is fully indexed, a hollow one for a root the index
+  is behind on, and the count in the tooltip. Coverage is the directory as it is
+  now against the index as it is now, so a root indexed last month and added to
+  since reads as incomplete rather than as done. Both sources are consulted
+  because neither is complete alone: the index says which documents it holds,
+  and the job journal says which were read and found to hold no text — those
+  have no index row and never will, and counting them as missing would leave a
+  fully-read root reported as incomplete forever. Available to consumers as
+  `POST /api/embed/coverage`.
+
 - An application that imported a document into a managed corpus can now read
   its bytes back, with `POST /api/corpora/documents/snapshot`, the `corpus_id`,
   and the `snapshot_id` the import reply carried. Addressed by corpus, the way
@@ -144,7 +155,7 @@
   declared none, is now refused at the moment it crosses the 100 MiB limit
   rather than after all of it has been buffered.
 
-- The teaching catalogues are part of Wilkes rather than a route nobody called.
+- The learning catalogues are part of Wilkes rather than a route nobody called.
   Settings › Catalogues says what the mirror holds per provider, when each was
   last fetched, and syncs them one at a time so a five-minute refresh reports
   each catalogue as it lands instead of going quiet; a provider that fails is
@@ -212,7 +223,7 @@
   has established the model's prefixes at all.
 
 - The catalogue mirror is addressed at `/api/catalogue/*` rather than under a
-  consumer's name. Reading the open teaching catalogues has nothing to do with
+  consumer's name. Reading the open learning catalogues has nothing to do with
   which application asked, and a route path that names one consumer is a claim
   about ownership that was never true.
 
@@ -231,7 +242,7 @@
   the other spaces still follow, and catching up is idempotent from the
   canonical renditions, so the work is owed rather than lost.
 
-- A local mirror of the open teaching catalogues — LibreTexts, OpenStax, MIT
+- A local mirror of the open learning catalogues — LibreTexts, OpenStax, MIT
   OpenCourseWare and DevDocs — with BM25 search over it, at
   `POST /api/catalogue/{search,sync}` and `GET /api/catalogue/status`. These
   catalogues are small enough to hold whole, which is what makes searching them
@@ -261,6 +272,27 @@
   list.
 
 ### Fixed
+
+- The topic cloud shows the names it already has when text generation is off.
+  Topic names are generated, and they are cached against the model that wrote
+  them; but the cache was read only after checking that a generator was loaded
+  and generation was switched on, so turning generation off made every name
+  already paid for unreadable. Reading the cache and generating the misses are
+  now separate: the cache is consulted whenever a model is configured, and only
+  the misses need a loaded generator.
+
+  A topic with no name and none coming used to render as a pulsing placeholder
+  that never resolved — a whole cloud of them, indistinguishable from a pane
+  still loading. Such a topic now shows the one thing it can state about
+  itself, the number of passages it groups, and stays clickable; the pane says
+  once why the names are missing. The cloud also no longer reports itself as
+  busy while waiting for names that are not coming.
+
+- The topic cloud says why it is empty. A failed build left the pane blank with
+  the error in a toast that had already gone, which reads as a feature that
+  does nothing; the error is now kept and shown in the pane, and a pane with no
+  folder chosen says that instead of showing nothing. A superseded request that
+  failed is logged rather than discarded.
 
 - Reading a document's table of contents no longer runs the recognizers. An
   outline is anchored in a reading, so producing one meant producing the
@@ -308,6 +340,14 @@
   unrecognised content type is reported rather than guessed at.
 
 ### Changed
+
+- Switching roots no longer starts an index build. The detection behind it is
+  unchanged and now feeds the root strip's coverage marks instead: moving
+  between roots to look at a file used to commit the machine to hours of
+  inference on the strength of noticing that the root was not indexed, with the
+  only way to stop it being to find the build and cancel it. The reading is what
+  the interface needs in order to say a root is not indexed; starting the build
+  is the user's, from Settings → Semantic.
 
 - `catalogue/search` returns the `terms` each query reduced to alongside its
   hits. An empty result had two causes a caller could not tell apart — nothing

@@ -1112,6 +1112,22 @@ export interface IndexStatus {
   root_path: string | null;
   db_size_bytes: number | null;
 }
+
+/**
+ * How much of one root the semantic index covers.
+ *
+ * `IndexStatus` counts what the index holds; this counts what it is missing,
+ * which is what tells a root apart from one that has never been read. `covered`
+ * includes documents a job read and found no text in: they have no index row
+ * and never will, so counting them as missing would leave a fully-read root
+ * permanently reported as incomplete.
+ */
+export interface RootCoverage {
+  root: string;
+  indexable: number;
+  covered: number;
+  complete: boolean;
+}
 export interface DownloadProgress {
   bytes_received: number;
   total_bytes: number;

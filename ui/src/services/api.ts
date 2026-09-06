@@ -24,6 +24,7 @@ import type {
   GenerationDone,
   GenerationError,
   IndexStatus,
+  RootCoverage,
   AddOutcome,
   CitationResult,
   IntegrationStatus,
@@ -247,6 +248,9 @@ export interface SearchApi {
   retryFailedDocuments(root: string, selected: SelectedEmbedder): Promise<void>;
   cancelEmbed(): Promise<void>;
   getIndexStatus(root?: string): Promise<IndexStatus>;
+  /** How much of each root the index covers, so the interface can say which
+   *  roots are indexed without starting a build to find out. */
+  indexCoverage(roots: string[]): Promise<RootCoverage[]>;
   isSemanticReady(): Promise<boolean>;
   deleteIndex(root?: string): Promise<void>;
 

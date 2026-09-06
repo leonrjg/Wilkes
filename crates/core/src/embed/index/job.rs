@@ -711,6 +711,31 @@ impl IndexJobJournal {
         Ok(rows)
     }
 
+    /// Every path any of `root`'s jobs settled with `outcome`, deduplicated.
+    ///
+    /// The per-job [`paths_with_outcome`](Self::paths_with_outcome) answers
+    /// "what should this continuation or retry be over"; this one answers
+    /// "what does this root's history say about this file", which spans the
+    /// jobs. A document read once and found to hold no text stays read: the
+    /// job that reported it may be three continuations ago.
+    pub fn paths_with_outcome_for_root(
+        &self,
+        root: &Path,
+        outcome: DocumentOutcome,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT d.path FROM job_documents d
+             JOIN jobs j ON j.id = d.job_id
+             WHERE j.root = ?1 AND d.outcome = ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![Self::key(root), outcome.as_str()], |row| {
+                Ok(PathBuf::from(row.get::<_, String>(0)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Everything one root's activity view shows: the current or most recent
     /// job, a bounded slice of its documents, and the jobs before it.
     ///
@@ -1311,6 +1336,49 @@ mod tests {
             journal.finish(job, JobState::Cancelled, None).unwrap();
         }
         assert!(journal.job(kept).unwrap().is_some());
+    }
+
+    /// A verdict outlives the job that reached it. Asking per job would answer
+    /// "what did the last run say", and the run that read a document and found
+    /// nothing in it may be three continuations ago.
+    #[test]
+    fn a_root_verdict_spans_the_jobs_that_reached_it() {
+        let dir = tempdir().unwrap();
+        let mut journal = IndexJobJournal::open(dir.path()).unwrap();
+        let root = PathBuf::from("/corpus");
+
+        let first = journal
+            .begin(&root, &paths(&["/corpus/a", "/corpus/b"]))
+            .unwrap();
+        journal
+            .note_outcome(first, &PathBuf::from("/corpus/a"), DocumentOutcome::Empty, None, Some(0))
+            .unwrap();
+        journal.finish(first, JobState::Cancelled, None).unwrap();
+
+        let second = journal.begin(&root, &paths(&["/corpus/b"])).unwrap();
+        journal
+            .note_outcome(second, &PathBuf::from("/corpus/b"), DocumentOutcome::Empty, None, Some(0))
+            .unwrap();
+        journal.finish(second, JobState::Completed, None).unwrap();
+
+        let mut empty = journal
+            .paths_with_outcome_for_root(&root, DocumentOutcome::Empty)
+            .unwrap();
+        empty.sort();
+        assert_eq!(empty, paths(&["/corpus/a", "/corpus/b"]));
+
+        // The per-job question still gets the per-job answer.
+        assert_eq!(
+            journal
+                .paths_with_outcome(second, DocumentOutcome::Empty)
+                .unwrap(),
+            paths(&["/corpus/b"])
+        );
+        // And another root's history is not this root's.
+        assert!(journal
+            .paths_with_outcome_for_root(&PathBuf::from("/elsewhere"), DocumentOutcome::Empty)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
