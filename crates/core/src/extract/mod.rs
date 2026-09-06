@@ -294,6 +294,12 @@ mod tests {
             fn reads_embedded_images(&self) -> bool {
                 true
             }
+
+            /// Every kind, as before this configuration could switch a reader
+            /// off: this double routes what it is given.
+            fn reads_typeset_kind(&self, _: crate::types::RegionKind) -> bool {
+                true
+            }
             fn identity(&self) -> String {
                 "named-analyzer-v1".to_string()
             }
@@ -339,6 +345,12 @@ mod tests {
             }
             fn release(&self) {}
             fn reads_embedded_images(&self) -> bool {
+                true
+            }
+
+            /// Every kind, as before this configuration could switch a reader
+            /// off: this double routes what it is given.
+            fn reads_typeset_kind(&self, _: crate::types::RegionKind) -> bool {
                 true
             }
             fn identity(&self) -> String {
@@ -392,6 +404,12 @@ mod tests {
             // A test analyzer reads whatever it is handed; the scope is the
             // configuration's decision and these fixtures are not testing it.
             fn reads_embedded_images(&self) -> bool {
+                true
+            }
+
+            /// Every kind, as before this configuration could switch a reader
+            /// off: this double routes what it is given.
+            fn reads_typeset_kind(&self, _: crate::types::RegionKind) -> bool {
                 true
             }
             fn identity(&self) -> String {

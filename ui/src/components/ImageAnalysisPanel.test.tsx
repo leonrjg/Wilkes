@@ -171,7 +171,7 @@ describe("ImageAnalysisPanel", () => {
   /// an enabled-but-unconfigured recognizer, and the rest is not said at all.
   it("carries no explanatory prose", async () => {
     panel(SETTINGS);
-    await screen.findByRole("checkbox", { name: /read the text drawn inside/i });
+    await screen.findByRole("checkbox", { name: /read the text a page draws/i });
     expect(screen.queryByText(/re-reads and re-embeds/i)).toBeNull();
     expect(screen.queryByText(/four\s+minutes for a full-width one/i)).toBeNull();
     expect(screen.queryByText(/an equation a page typesets/i)).toBeNull();
@@ -182,7 +182,7 @@ describe("ImageAnalysisPanel", () => {
     panel(SETTINGS);
 
     const download = await screen.findByRole("button", { name: /download recognizer/i });
-    const toggle = screen.getByRole("checkbox", { name: /read the text drawn inside/i });
+    const toggle = screen.getByRole("checkbox", { name: /read the text a page draws/i });
     expect((toggle as HTMLInputElement).disabled).toBe(true);
 
     fireEvent.click(download);
@@ -569,21 +569,42 @@ describe("ImageAnalysisPanel", () => {
     ).toBe(false);
   });
 
-  /// Un-checking the outer box is the feature switch and nothing else: there
-  /// is no reading with the page reader off and a formula reader still on, so
-  /// this drives `enabled` rather than adding `page` to the list — which the
-  /// backend refuses outright.
-  it("de-selects general OCR by turning image analysis off", async () => {
-    withModel(GRANITE.model_id, { is_cached: true });
+  /// Un-checking the outer box de-selects one reader among three. The feature
+  /// stays on and the specialists keep reading the areas the detector marks
+  /// out for them; what the page reader alone held — charts, scanned figures,
+  /// the text inside a diagram — stops being read.
+  it("de-selects general OCR without turning image analysis off", async () => {
+    withCatalogue({
+      ...CATALOGUE,
+      models: CATALOGUE.models.map((model) =>
+        [GRANITE.model_id, SLANET.model_id].includes(model.model_id)
+          ? { ...model, is_cached: true }
+          : model,
+      ),
+    });
     const onUpdate = panel(READING);
 
     fireEvent.click(await screen.findByRole("checkbox", { name: /use general ocr/i }));
     await waitFor(() =>
       expect(onUpdate).toHaveBeenCalledWith({
-        image_analysis: expect.objectContaining({ enabled: false }),
+        image_analysis: expect.objectContaining({
+          enabled: true,
+          disabled_roles: ["page"],
+        }),
       }),
     );
-    expect(onUpdate.mock.calls[0][0].image_analysis.disabled_roles ?? []).toEqual([]);
+  });
+
+  /// The one configuration the backend refuses: nothing left attached. Said
+  /// before the write rather than reported back as a failed save, because the
+  /// settings that would cause it are still on screen.
+  it("refuses to switch off the last reader that is installed", async () => {
+    withModel(GRANITE.model_id, { is_cached: true });
+    const onUpdate = panel(READING);
+
+    fireEvent.click(await screen.findByRole("checkbox", { name: /use general ocr/i }));
+    expect(await screen.findByText(/switch off every reader/i)).toBeInTheDocument();
+    expect(onUpdate).not.toHaveBeenCalled();
   });
 
   /// A reader that is not here cannot be de-selected, because it is not doing

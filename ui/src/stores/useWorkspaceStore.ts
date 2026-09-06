@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { api } from "../services";
+import { confirmDialog } from "../lib/utils/dialog";
 import type { WorkspaceSummary } from "../lib/types";
 import { useBookmarksStore } from "./useBookmarksStore";
 import { useChatStore } from "./useChatStore";
@@ -17,9 +18,21 @@ interface WorkspaceStore {
   loading: boolean;
   switching: boolean;
   load: () => Promise<void>;
+  /**
+   * Re-reads the registry listing alone. Unlike `load`, it touches neither the
+   * editor nor the viewer: a page that only shows the list must not discard
+   * open buffers and tabs to refresh it.
+   */
+  refreshList: () => Promise<void>;
   createAndSwitch: (name: string) => Promise<void>;
   rename: (workspaceId: string, name: string) => Promise<void>;
   switchTo: (workspaceId: string) => Promise<void>;
+  /**
+   * Deletes a workspace and everything it owns, activating another one first
+   * when the target is the active workspace. Resolves to `false` when the
+   * switch that deletion required was declined.
+   */
+  remove: (workspaceId: string) => Promise<boolean>;
 }
 
 function clearWorkspaceUi() {
@@ -94,6 +107,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
   },
 
+  refreshList: async () => {
+    const state = await api.listWorkspaces();
+    set({
+      workspaces: state.workspaces,
+      activeWorkspaceId: state.active_workspace_id,
+    });
+  },
+
   createAndSwitch: async (name) => {
     const workspace = await api.createWorkspace(name);
     set((state) => ({ workspaces: [...state.workspaces, workspace] }));
@@ -107,13 +128,37 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }));
   },
 
+  remove: async (workspaceId) => {
+    // The backend refuses to delete the active workspace: activating one moves
+    // the window and reloads every store, and that is this store's job rather
+    // than a side effect of a delete. So the switch happens here, through the
+    // one path that already does all of it — and if the user declines it (the
+    // unsaved-editor prompt), nothing is deleted.
+    if (workspaceId === get().activeWorkspaceId) {
+      const successor = get().workspaces.find((workspace) => workspace.id !== workspaceId);
+      if (!successor) {
+        throw new Error("The last workspace cannot be deleted.");
+      }
+      await get().switchTo(successor.id);
+      if (get().activeWorkspaceId === workspaceId) return false;
+    }
+    const state = await api.deleteWorkspace(workspaceId);
+    useEditorStore.getState().forgetWorkspace(workspaceId);
+    useViewerStore.getState().forgetWorkspace(workspaceId);
+    set({
+      workspaces: state.workspaces,
+      activeWorkspaceId: state.active_workspace_id,
+    });
+    return true;
+  },
+
   switchTo: async (workspaceId) => {
     if (workspaceId === get().activeWorkspaceId || get().switching) return;
     const hasDirtyEditors = Object.values(useEditorStore.getState().buffers)
       .some((buffer) => buffer.dirty);
     if (
       hasDirtyEditors
-      && !window.confirm("Switch workspaces and discard unsaved editor changes?")
+      && !await confirmDialog("Switch workspaces and discard unsaved editor changes?")
     ) {
       return;
     }

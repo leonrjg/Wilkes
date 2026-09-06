@@ -275,10 +275,10 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
             isRegex
               ? "A regular expression searches wording only"
               : semanticReady
-                ? "Combined search: exact phrases and related passages"
+                ? "Semantic search: exact phrases and related passages"
                 : "Set up semantic search in Settings"
           }
-          ariaLabel="Combined search"
+          ariaLabel="Semantic search"
           active={combinedInForce}
           disabled={isRegex}
           onToggle={handleToggleCombined}
@@ -296,7 +296,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
             </div>
             <div className="flex items-center gap-1.5">
               <Database size={12} />
-              <span className="text-[10px] font-bold uppercase tracking-wider">Combined</span>
+              <span className="text-[10px] font-bold uppercase tracking-wider">Semantic</span>
             </div>
           </div>
         </Toggle>

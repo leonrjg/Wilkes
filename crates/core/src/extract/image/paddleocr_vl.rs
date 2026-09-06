@@ -1485,7 +1485,7 @@ mod tests {
         let capture = std::sync::Arc::new(super::super::corpus::ImageCapture::default());
         crate::extract::pdf::PdfExtractor::with_image_analyzer(std::sync::Arc::new(
             super::super::NativeImageAnalyzer::new(
-                Box::new(capture.clone()),
+                Some(Box::new(capture.clone())),
                 None,
                 crate::types::ImageScope::TypesetAndEmbedded,
                 None,

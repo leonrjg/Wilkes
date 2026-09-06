@@ -581,40 +581,85 @@ pub fn build_analyzer(
         .model
         .clone()
         .unwrap_or_else(|| engine.default_model().to_string());
-    anyhow::ensure!(
-        dispatch::installed(engine, &model_id, model_dir)?,
-        "the '{model_id}' recognizer is enabled but not installed"
-    );
-    // The catalogue holds formula readers beside page readers, so the setting
-    // can now name one. It is an error rather than a quiet substitution: a
-    // formula reader emits one whole-crop region and would read every page of
-    // the library as a single failed expression, which afterwards is
-    // indistinguishable from a library with no text in its pictures.
-    anyhow::ensure!(
-        dispatch::role(engine, &model_id, model_dir)? == dispatch::RecognizerRole::Page,
-        "'{model_id}' reads formulas, not pages, and cannot be the page recognizer"
-    );
-    // Switching off the page reader is what `enabled` means, and an analyzer
-    // with no page reader has nothing to route *to*: every area the detector
-    // marked out would fall through to a recognizer that is not there. So a
-    // configuration that asks for it is refused here rather than read around.
-    anyhow::ensure!(
-        !settings
-            .disabled_roles
-            .contains(&dispatch::RecognizerRole::Page),
-        "the page recognizer cannot be switched off; turn image analysis off instead"
-    );
+    // The page reader is a role like the other two, and switching it off is a
+    // configuration rather than a contradiction: the specialists read the
+    // areas the detector marks out as formulas and tables whether or not
+    // anything reads the rest. What it costs is stated where it is chosen and
+    // recorded in [`NativeImageAnalyzer::identity`], so a library read without
+    // a page reader is re-read if one is switched back on.
+    let page_off = settings
+        .disabled_roles
+        .contains(&dispatch::RecognizerRole::Page);
+    if !page_off {
+        anyhow::ensure!(
+            dispatch::installed(engine, &model_id, model_dir)?,
+            "the '{model_id}' recognizer is enabled but not installed"
+        );
+        // The catalogue holds formula readers beside page readers, so the
+        // setting can now name one. It is an error rather than a quiet
+        // substitution: a formula reader emits one whole-crop region and would
+        // read every page of the library as a single failed expression, which
+        // afterwards is indistinguishable from a library with no text in its
+        // pictures.
+        anyhow::ensure!(
+            dispatch::role(engine, &model_id, model_dir)? == dispatch::RecognizerRole::Page,
+            "'{model_id}' reads formulas, not pages, and cannot be the page recognizer"
+        );
+    }
     let scratch = cache_dir.join("recognition-scratch");
     let layout = attach_layout_detector(recognizers.clone(), model_dir, &scratch)?;
-    let recognizer = worker_ocr::attach(
+    let recognizer = if page_off {
+        tracing::info!(
+            "the page recognizer is switched off; only the areas the detector marks out for \
+             a specialist reader are read, and nothing else in a picture is"
+        );
+        None
+    } else {
+        Some(
+            worker_ocr::attach(
+                recognizers.clone(),
+                engine,
+                &model_id,
+                model_dir.to_path_buf(),
+                scratch.clone(),
+                settings.device.as_deref().unwrap_or("auto"),
+            )
+            .context("could not address the image recognizer")?,
+        )
+    };
+
+    let formula = attach_formula_reader(
         recognizers.clone(),
-        engine,
-        &model_id,
-        model_dir.to_path_buf(),
-        scratch.clone(),
+        model_dir,
+        &scratch,
         settings.device.as_deref().unwrap_or("auto"),
-    )
-    .context("could not address the image recognizer")?;
+        &settings.disabled_roles,
+        page_off,
+    )?;
+    let table = attach_table_reader(
+        recognizers,
+        model_dir,
+        &scratch,
+        &settings.disabled_roles,
+        page_off,
+    )?;
+
+    // Nothing left to read with is a configuration that would report as a
+    // library whose pictures hold no text, which is the outcome every refusal
+    // in this function exists to prevent. Refused here rather than built,
+    // because the settings that produced it are still on screen.
+    anyhow::ensure!(
+        recognizer.is_some() || formula.is_some() || table.is_some(),
+        "every reader is switched off or missing; turn image analysis off instead"
+    );
+    // With no page reader the detector is the only thing that marks a
+    // specialist's areas out, so a configuration without one reads nothing at
+    // all — the same empty answer, arrived at one step earlier.
+    anyhow::ensure!(
+        recognizer.is_some() || layout.is_some(),
+        "the page recognizer is switched off and no layout detector is installed, so nothing \
+         would mark out the formulas and tables the specialists read"
+    );
 
     let describer: Option<Box<dyn FigureDescriber>> = match settings.describer_model.trim() {
         "" => None,
@@ -622,23 +667,29 @@ pub fn build_analyzer(
     };
 
     let mut analyzer = NativeImageAnalyzer::new(recognizer, describer, settings.scope, layout);
-    if let Some(formula) = attach_formula_reader(
-        recognizers.clone(),
-        model_dir,
-        &scratch,
-        settings.device.as_deref().unwrap_or("auto"),
-        &settings.disabled_roles,
-    )? {
+    if let Some(formula) = formula {
         analyzer = analyzer.with_formula_reader(formula);
     }
-    if let Some(table) =
-        attach_table_reader(recognizers, model_dir, &scratch, &settings.disabled_roles)?
-    {
+    if let Some(table) = table {
         analyzer = analyzer.with_table_reader(table);
     }
     Ok(Some(Arc::new(
         analyzer.with_cache(cache::AnnotationCache::open(cache_dir)?),
     )))
+}
+
+/// What becomes of the areas a reader that is not here would have taken.
+///
+/// Two different facts, and the log must not say the first when the second is
+/// true: a library read with no page reader does not quietly transcribe its
+/// formulas worse, it does not read them at all.
+#[cfg(feature = "candle")]
+fn fallback_wording(page_off: bool) -> &'static str {
+    if page_off {
+        "are not read at all, because the page recognizer is switched off too"
+    } else {
+        "will go to the page recognizer instead"
+    }
 }
 
 /// Address the recognizer for formulas, or `None` when this installation has
@@ -660,7 +711,12 @@ fn attach_formula_reader(
     scratch: &std::path::Path,
     device: &str,
     disabled: &[dispatch::RecognizerRole],
+    page_off: bool,
 ) -> anyhow::Result<Option<Box<dyn OcrEngine>>> {
+    // What is lost is not the same sentence in both configurations: with a
+    // page reader the areas fall through to it, and with none they are not
+    // read at all. Said once, here, so every branch below says the true one.
+    let instead = fallback_wording(page_off);
     let Some(model) = dispatch::formula_model(model_dir) else {
         tracing::info!("this build ships no formula recognizer");
         return Ok(None);
@@ -672,7 +728,7 @@ fn attach_formula_reader(
     if disabled.contains(&model.role) {
         tracing::info!(
             "the formula recognizer '{}' is installed but switched off; the areas the \
-             detector marks out as formulas will go to the page recognizer instead",
+             detector marks out as formulas {instead}",
             model.model_id
         );
         return Ok(None);
@@ -680,7 +736,7 @@ fn attach_formula_reader(
     if !model.is_cached {
         tracing::warn!(
             "the formula recognizer '{}' is not installed; the areas the detector marks out \
-             as formulas will go to the page recognizer instead",
+             as formulas {instead}",
             model.model_id
         );
         return Ok(None);
@@ -716,7 +772,9 @@ fn attach_table_reader(
     model_dir: &std::path::Path,
     scratch: &std::path::Path,
     disabled: &[dispatch::RecognizerRole],
+    page_off: bool,
 ) -> anyhow::Result<Option<Box<dyn table_structure::TableStructure>>> {
+    let instead = fallback_wording(page_off);
     let Some(model) = dispatch::table_model(model_dir) else {
         tracing::info!("this build ships no table structure model");
         return Ok(None);
@@ -728,7 +786,7 @@ fn attach_table_reader(
     if disabled.contains(&model.role) {
         tracing::info!(
             "the table structure model '{}' is installed but switched off; the areas the \
-             detector marks out as tables will go to the page recognizer instead",
+             detector marks out as tables {instead}",
             model.model_id
         );
         return Ok(None);
@@ -736,7 +794,7 @@ fn attach_table_reader(
     if !model.is_cached {
         tracing::warn!(
             "the table structure model '{}' is not installed; the areas the detector marks \
-             out as tables will go to the page recognizer instead",
+             out as tables {instead}",
             model.model_id
         );
         return Ok(None);
@@ -878,6 +936,20 @@ pub trait ImageAnalyzer: Send + Sync {
     /// the expensive one.
     fn reads_embedded_images(&self) -> bool;
 
+    /// Whether this analyzer has a reader for the areas a page typesets as
+    /// `kind`.
+    ///
+    /// Asked *before* a crop is rendered, by the backend that would render it,
+    /// for the same reason [`Self::reads_embedded_images`] is asked before a
+    /// decode: a detection nothing routes is a render whose pixels are thrown
+    /// away. The build's own class mapping already drops the classes nothing
+    /// could ever read; this is the narrower question of what *this*
+    /// configuration reads, which changes when a reader is switched off.
+    ///
+    /// Required rather than defaulted, like its neighbour: an analyzer that
+    /// did not answer would be one whose routing the backend had to guess at.
+    fn reads_typeset_kind(&self, kind: RegionKind) -> bool;
+
     /// The layout detector this analyzer routes with, or `None` when it has
     /// none and therefore marks out nothing a page typesets.
     ///
@@ -913,7 +985,16 @@ pub trait ImageAnalyzer: Send + Sync {
 /// The analyzer Wilkes runs when one is configured: one recognizer, a
 /// describer if there is one, and a cache if there is somewhere to keep it.
 pub struct NativeImageAnalyzer {
-    ocr: Box<dyn OcrEngine>,
+    /// The recognizer for everything no specialist owns, or `None` when the
+    /// page reader is switched off.
+    ///
+    /// Optional because it is a role like the other two. With none attached
+    /// the analyzer reads exactly the areas the detector marks out for a
+    /// specialist and nothing else: a chart, an embedded raster, and a formula
+    /// whose own reader is absent are all *not read* rather than transcribed
+    /// badly. In [`Self::identity`], because that is a different reading of
+    /// the same document.
+    ocr: Option<Box<dyn OcrEngine>>,
     describer: Option<Box<dyn FigureDescriber>>,
     cache: Option<cache::AnnotationCache>,
     /// Which of a document's pictures this analyzer is spent on. Part of
@@ -951,7 +1032,7 @@ impl NativeImageAnalyzer {
     /// changes what a reading contains, and a call site that could omit it
     /// would eventually be one that did.
     pub fn new(
-        ocr: Box<dyn OcrEngine>,
+        ocr: Option<Box<dyn OcrEngine>>,
         describer: Option<Box<dyn FigureDescriber>>,
         scope: ImageScope,
         layout: Option<Box<dyn LayoutModel>>,
@@ -1004,10 +1085,25 @@ impl NativeImageAnalyzer {
     /// this repository's corpus, ten inline crops through granite-docling
     /// yielded no admissible region and four decodes ran to the token cap, so
     /// what this mostly buys is the cost of trying.
-    fn route(&self, found: &DiscoveredImage) -> Route {
-        match (found.origin, found.kind) {
+    fn route(&self, found: &DiscoveredImage) -> Option<Route> {
+        self.route_of(found.origin, found.kind)
+    }
+
+    /// The routing rule itself, in the two terms it actually decides on.
+    ///
+    /// Separate from [`Self::route`] so [`Self::reads_typeset_kind`] can ask
+    /// the same question before a crop exists, and answer it with this rule
+    /// rather than a second copy of it — a second copy is how a build ends up
+    /// rendering crops for a reader it switched off.
+    ///
+    /// `None` means no reader owns the region. That is only ever the case with
+    /// the page reader switched off: it is the router's answer to "nothing
+    /// reads this", and the caller settles the image as not read rather than
+    /// transcribing it with something else.
+    fn route_of(&self, origin: RegionOrigin, kind: Option<RegionKind>) -> Option<Route> {
+        match (origin, kind) {
             (RegionOrigin::Typeset, Some(RegionKind::Formula)) if self.formula.is_some() => {
-                Route::Formula
+                Some(Route::Formula)
             }
             // Typeset only. An embedded raster the detector called a table has
             // no text layer under it to fill a grid from, so the structure
@@ -1018,9 +1114,9 @@ impl NativeImageAnalyzer {
             // reason: what a plotted curve says is not written under it as
             // glyphs, so there is nothing for a grid to hold.
             (RegionOrigin::Typeset, Some(RegionKind::Table)) if self.table.is_some() => {
-                Route::Table
+                Some(Route::Table)
             }
-            _ => Route::Page,
+            _ => self.ocr.as_ref().map(|_| Route::Page),
         }
     }
 
@@ -1046,7 +1142,11 @@ impl NativeImageAnalyzer {
                 .as_ref()
                 .expect("route() says Table only when a table reader is attached")
                 .identity(),
-            Route::Page => self.ocr.identity(),
+            Route::Page => self
+                .ocr
+                .as_ref()
+                .expect("route() says Page only when a page reader is attached")
+                .identity(),
         }
     }
 
@@ -1148,7 +1248,9 @@ impl ImageAnalyzer for NativeImageAnalyzer {
             self.layout
                 .as_ref()
                 .map_or_else(|| "no-detector".to_string(), |layout| layout.identity()),
-            self.ocr.identity(),
+            self.ocr
+                .as_ref()
+                .map_or_else(|| "no-page-reader".to_string(), |ocr| ocr.identity()),
             self.describer
                 .as_ref()
                 .map_or_else(|| "no-describer".to_string(), |d| d.identity()),
@@ -1167,7 +1269,15 @@ impl ImageAnalyzer for NativeImageAnalyzer {
     }
 
     fn reads_embedded_images(&self) -> bool {
-        matches!(self.scope, ImageScope::TypesetAndEmbedded)
+        // Both halves. The scope says whether the rasters were asked for; the
+        // page reader is the only thing that reads one, because a specialist
+        // takes typeset areas only. Switched off, an embedded raster is a
+        // decode this reading would spend and then discard.
+        matches!(self.scope, ImageScope::TypesetAndEmbedded) && self.ocr.is_some()
+    }
+
+    fn reads_typeset_kind(&self, kind: RegionKind) -> bool {
+        self.route_of(RegionOrigin::Typeset, Some(kind)).is_some()
     }
 
     fn layout(&self) -> Option<&dyn LayoutModel> {
@@ -1178,7 +1288,9 @@ impl ImageAnalyzer for NativeImageAnalyzer {
     /// that holds anything: the cache is files, and a describer is a server
     /// this process does not own.
     fn release(&self) {
-        self.ocr.release();
+        if let Some(ocr) = &self.ocr {
+            ocr.release();
+        }
         if let Some(formula) = &self.formula {
             formula.release();
         }
@@ -1204,11 +1316,11 @@ impl ImageAnalyzer for NativeImageAnalyzer {
         // same recipe already answered. What is left is the batch — and only
         // that, so re-reading a document whose figures are all cached sends
         // nothing at all.
-        let mut pending: Vec<usize> = Vec::new();
+        let mut pending: Vec<(usize, Route)> = Vec::new();
         for (index, (image, found)) in images.iter_mut().zip(discovered).enumerate() {
             image.analyzer_identity = identity.clone();
 
-            // Asked first, because it is the only one of these that is a
+            // Asked first, because these are the only ones of these that are a
             // statement about the configuration rather than about the image.
             if found.withheld_by_scope {
                 let reason = withheld_reason(image.origin);
@@ -1219,6 +1331,21 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                 image.status = ImageAnalysisStatus::NotRead { reason };
                 continue;
             }
+
+            // Nothing reads this. Only reachable with the page reader switched
+            // off: what no specialist owns falls to it, and with none attached
+            // the region is not read rather than handed to a reader that would
+            // answer about something else. The same status a withheld scope
+            // uses, because it is the same kind of fact.
+            let Some(route) = self.route(found) else {
+                let reason = "no reader is configured for this kind of region".to_string();
+                if image.origin == RegionOrigin::Embedded {
+                    diagnostics.native_images_not_read += 1;
+                }
+                debug!("image {} not read: {reason}", image.id);
+                image.status = ImageAnalysisStatus::NotRead { reason };
+                continue;
+            };
 
             if found.decoded.is_none() {
                 let reason = found
@@ -1258,7 +1385,7 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                 continue;
             }
 
-            pending.push(index);
+            pending.push((index, route));
         }
 
         if pending.is_empty() {
@@ -1274,10 +1401,7 @@ impl ImageAnalyzer for NativeImageAnalyzer {
         // One call per reader rather than one overall, because a batch is the
         // unit that crosses into one of them. They are kept in separate lists
         // rather than interleaved so no model is loaded to answer nothing.
-        let mut routed: Vec<(usize, Route)> = Vec::with_capacity(pending.len());
-        for index in &pending {
-            routed.push((*index, self.route(&discovered[*index])));
-        }
+        let routed = pending;
 
         let mut read: HashMap<usize, std::result::Result<ImageRecognition, String>> =
             HashMap::with_capacity(routed.len());
@@ -1358,6 +1482,8 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                         .map(|spotted| spotted.into_iter().map(Ok).collect()),
                     Route::Page => self
                         .ocr
+                        .as_deref()
+                        .expect("route() says Page only when a page reader is attached")
                         .spot_batch(&batch)
                         .map(|spotted| spotted.into_iter().map(Ok).collect()),
                 };
@@ -1431,7 +1557,11 @@ impl ImageAnalyzer for NativeImageAnalyzer {
                     .as_ref()
                     .expect("route() says Table only when a table reader is attached")
                     .admission_threshold(),
-                Route::Page => self.ocr.admission_threshold(),
+                Route::Page => self
+                    .ocr
+                    .as_ref()
+                    .expect("route() says Page only when a page reader is attached")
+                    .admission_threshold(),
             };
             match read.get(&index).expect("every routed image was answered") {
                 Ok(read) => {
@@ -1755,6 +1885,12 @@ mod tests {
             fn reads_embedded_images(&self) -> bool {
                 true
             }
+
+            /// Every kind, as before this configuration could switch a reader
+            /// off: this double routes what it is given.
+            fn reads_typeset_kind(&self, _: crate::types::RegionKind) -> bool {
+                true
+            }
             fn analyze(
                 &self,
                 _images: &mut [ExtractedImage],
@@ -1818,15 +1954,15 @@ mod tests {
         assert!(built.is_none());
     }
 
-    /// Switching off the page reader is not a thing that can be asked for:
-    /// every area the detector marks out routes to it, so an analyzer without
-    /// one has nothing to route to. `enabled` is where that question is
-    /// answered, and a settings file that answered it twice is refused rather
-    /// than read around — a build that quietly ignored the field would read
-    /// the whole library with the reader the user had just switched off.
+    /// The page reader can be switched off — it is a role like the other two
+    /// — but only while something else is still attached. With no specialist
+    /// installed there is nothing left to read with, and an analyzer built
+    /// anyway would report every picture in the library as holding no text.
+    /// Refused rather than built, and the message names what is missing rather
+    /// than which flag was set.
     #[test]
     #[cfg(feature = "candle")]
-    fn the_page_reader_cannot_be_switched_off() {
+    fn the_page_reader_cannot_be_the_only_reader_switched_off() {
         let dir = tempfile::tempdir().expect("a temporary data directory");
         let Err(error) = build_analyzer(
             test_manager(),
@@ -1841,11 +1977,12 @@ mod tests {
             },
             "http://localhost:11434",
         ) else {
-            panic!("a page reader that is switched off is a contradiction, not a build");
+            panic!("an analyzer with every reader off reads nothing; it is not a build");
         };
         assert!(
-            format!("{error:#}").contains("cannot be switched off"),
-            "the failure should say which switch was asked for: {error:#}"
+            format!("{error:#}").contains("every reader is switched off or missing"),
+            "the failure should say what is left rather than which switch was asked for: \
+             {error:#}"
         );
     }
 
@@ -1942,7 +2079,7 @@ mod tests {
 
         let analyzer = |model: &'static str, threshold: f32, prompt: &'static str| {
             NativeImageAnalyzer::new(
-                Box::new(Recognizer(model, threshold)),
+                Some(Box::new(Recognizer(model, threshold))),
                 Some(Box::new(Describer(prompt))),
                 ImageScope::TypesetAndEmbedded,
                 Some(Box::new(Detector("detector-v1"))),
@@ -1984,7 +2121,7 @@ mod tests {
         assert_ne!(
             baseline,
             NativeImageAnalyzer::new(
-                Box::new(Recognizer("weights-a", 0.6)),
+                Some(Box::new(Recognizer("weights-a", 0.6))),
                 None,
                 ImageScope::TypesetAndEmbedded,
                 Some(Box::new(Detector("detector-v1"))),
@@ -1998,7 +2135,7 @@ mod tests {
         // the two would be mixed in one index.
         let scoped = |scope| {
             NativeImageAnalyzer::new(
-                Box::new(Recognizer("weights-a", 0.6)),
+                Some(Box::new(Recognizer("weights-a", 0.6))),
                 Some(Box::new(Describer("prompt-v1"))),
                 scope,
                 Some(Box::new(Detector("detector-v1"))),
@@ -2016,7 +2153,7 @@ mod tests {
         // different readings and the recipe has to say so.
         let detected = |detector: Option<&'static str>| {
             NativeImageAnalyzer::new(
-                Box::new(Recognizer("weights-a", 0.6)),
+                Some(Box::new(Recognizer("weights-a", 0.6))),
                 Some(Box::new(Describer("prompt-v1"))),
                 ImageScope::TypesetAndEmbedded,
                 detector.map(|name| Box::new(Detector(name)) as Box<dyn LayoutModel>),
@@ -2033,7 +2170,7 @@ mod tests {
         // installed, and what the annotation cache key follows.
         let tabled = |table: Option<&'static str>| {
             let analyzer = NativeImageAnalyzer::new(
-                Box::new(Recognizer("weights-a", 0.6)),
+                Some(Box::new(Recognizer("weights-a", 0.6))),
                 Some(Box::new(Describer("prompt-v1"))),
                 ImageScope::TypesetAndEmbedded,
                 Some(Box::new(Detector("detector-v1"))),
@@ -2118,38 +2255,75 @@ mod tests {
             kind: Some(kind),
         };
         let bare = NativeImageAnalyzer::new(
-            Box::new(SilentReader),
+            Some(Box::new(SilentReader)),
             None,
             ImageScope::TypesetAndEmbedded,
             None,
         );
         let with_table = NativeImageAnalyzer::new(
-            Box::new(SilentReader),
+            Some(Box::new(SilentReader)),
             None,
             ImageScope::TypesetAndEmbedded,
             None,
         )
         .with_table_reader(Box::new(TableReader("slanet")));
 
+        // The same pair again with no page reader, which is what "read the
+        // tables and nothing else" is: a table still routes, and every kind
+        // that used to fall through to the page reader now routes nowhere.
+        let table_only = NativeImageAnalyzer::new(None, None, ImageScope::TypesetAndEmbedded, None)
+            .with_table_reader(Box::new(TableReader("slanet")));
+        let nothing = NativeImageAnalyzer::new(None, None, ImageScope::TypesetAndEmbedded, None);
+
         assert_eq!(
             with_table.route(&found(RegionOrigin::Typeset, RegionKind::Table)),
-            Route::Table
+            Some(Route::Table)
         );
         assert_eq!(
             bare.route(&found(RegionOrigin::Typeset, RegionKind::Table)),
-            Route::Page,
+            Some(Route::Page),
             "with no table reader a typeset table goes where it always did"
         );
         assert_eq!(
             with_table.route(&found(RegionOrigin::Typeset, RegionKind::Chart)),
-            Route::Page,
+            Some(Route::Page),
             "a chart draws its values rather than setting them; there is nothing for a grid \
              to hold"
         );
         assert_eq!(
             with_table.route(&found(RegionOrigin::Embedded, RegionKind::Table)),
-            Route::Page,
+            Some(Route::Page),
             "an embedded raster has no text layer under it to fill a grid from"
+        );
+
+        assert_eq!(
+            table_only.route(&found(RegionOrigin::Typeset, RegionKind::Table)),
+            Some(Route::Table),
+            "switching off the page reader does not switch off the table reader"
+        );
+        assert_eq!(
+            table_only.route(&found(RegionOrigin::Typeset, RegionKind::Chart)),
+            None,
+            "a chart has no reader once the page reader is off; it is not read at all"
+        );
+        assert_eq!(
+            table_only.route(&found(RegionOrigin::Embedded, RegionKind::Table)),
+            None,
+            "an embedded raster is the page reader's, and there is no page reader"
+        );
+        assert!(
+            table_only.reads_typeset_kind(RegionKind::Table)
+                && !table_only.reads_typeset_kind(RegionKind::Chart),
+            "the question the renderer asks is answered by the router, not beside it"
+        );
+        assert!(
+            !table_only.reads_embedded_images(),
+            "the scope asked for the rasters and nothing is left that reads one"
+        );
+        assert_eq!(
+            nothing.route(&found(RegionOrigin::Typeset, RegionKind::Table)),
+            None,
+            "with every reader off nothing routes; build_analyzer refuses to build this"
         );
     }
     use super::*;

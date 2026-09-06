@@ -1,6 +1,11 @@
 import { render, screen, fireEvent, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import LogsPanel from "./LogsPanel";
+import { confirmDialog } from "../lib/utils/dialog";
+
+vi.mock("../lib/utils/dialog", () => ({
+  confirmDialog: vi.fn(),
+}));
 
 describe("LogsPanel", () => {
   const mockApi = {
@@ -15,7 +20,7 @@ describe("LogsPanel", () => {
     mockApi.getLogs.mockResolvedValue(["Log line 1", "Log line 2"]);
 
     // Mock confirm
-    vi.stubGlobal("confirm", vi.fn(() => true));
+    vi.mocked(confirmDialog).mockResolvedValue(true);
   });
 
   afterEach(() => {

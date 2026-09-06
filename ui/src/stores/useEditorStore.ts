@@ -52,6 +52,8 @@ interface EditorStore {
   excludeFromContext(path: string, excludedPath: string): void;
   restoreToContext(path: string, restoredPath: string): void;
   switchWorkspace(workspaceId: string): void;
+  /** Drops the completion scopes a deleted workspace left behind. */
+  forgetWorkspace(workspaceId: string): void;
 }
 
 function readScopes(): Record<string, CompletionScope> {
@@ -304,5 +306,13 @@ export const useEditorStore = create<EditorStore>((set) => ({
     activeWorkspaceId = workspaceId;
     storedScopes = typeof localStorage === "undefined" ? {} : readScopes();
     set({ buffers: {}, activeEditorPath: null });
+  },
+  forgetWorkspace(workspaceId) {
+    if (typeof localStorage === "undefined") return;
+    try {
+      localStorage.removeItem(`${SCOPE_STORAGE_KEY}.${workspaceId}`);
+    } catch (error) {
+      console.error("Could not clear the completion scopes of a deleted workspace:", error);
+    }
   },
 }));

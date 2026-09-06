@@ -4,6 +4,7 @@ pub mod ipc;
 pub mod manager;
 mod process;
 mod python_env;
+mod residency;
 mod runtime;
 
 /// Default time an idle model worker remains resident before it is unloaded.

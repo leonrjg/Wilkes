@@ -282,6 +282,14 @@ export class HttpSearchApi implements SearchApi {
     return res.json();
   }
 
+  async deleteWorkspace(workspaceId: string): Promise<import("../lib/types").WorkspaceState> {
+    const res = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}`, {
+      method: "DELETE",
+    });
+    if (!res.ok) throw new Error(`deleteWorkspace failed: ${res.status}`);
+    return res.json();
+  }
+
   async listBookmarks(): Promise<Bookmark[]> {
     const res = await fetch("/api/bookmarks");
     if (!res.ok) throw new Error(`listBookmarks failed: ${res.status}`);

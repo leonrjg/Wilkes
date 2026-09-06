@@ -708,7 +708,7 @@ fn extract_scoped(
     // order images are met, so a reused engine would answer the second
     // reading with whatever the first left over.
     let content = PdfExtractor::with_image_analyzer(Arc::new(NativeImageAnalyzer::new(
-        Box::new(ScriptedOcr::new(script.clone())),
+        Some(Box::new(ScriptedOcr::new(script.clone()))),
         describer.map(|build| build()),
         scope,
         // These fixtures are about what a recognizer does with a picture, not
@@ -726,7 +726,7 @@ fn extract_scoped(
     let diagnostics = crate::extract::pdf::mupdf::read_document(
         &path,
         Some(&NativeImageAnalyzer::new(
-            Box::new(ScriptedOcr::new(script)),
+            Some(Box::new(ScriptedOcr::new(script))),
             describer.map(|build| build()),
             scope,
             // These fixtures are about what a recognizer does with a picture,
@@ -1745,7 +1745,7 @@ fn a_second_reading_takes_its_annotation_from_the_cache() {
     let analyzer = |script| {
         Arc::new(
             NativeImageAnalyzer::new(
-                Box::new(ScriptedOcr::new(script)),
+                Some(Box::new(ScriptedOcr::new(script))),
                 None,
                 crate::types::ImageScope::TypesetAndEmbedded,
                 None,

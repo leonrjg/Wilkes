@@ -1185,6 +1185,17 @@ async fn rename_workspace(
 }
 
 #[tauri::command]
+async fn delete_workspace(app: AppHandle, workspace_id: String) -> Result<WorkspaceState, String> {
+    // No search cancellation and no chat teardown, unlike `switch_workspace`:
+    // the manager refuses to delete the active workspace, so nothing this
+    // window is showing belongs to the one going away.
+    workspace_manager(&app)
+        .delete(&workspace_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn switch_workspace(app: AppHandle, workspace_id: String) -> Result<WorkspaceState, String> {
     let manager = workspace_manager(&app);
     let current = manager.state().await.map_err(|error| error.to_string())?;
@@ -2328,6 +2339,7 @@ pub fn run() {
             create_workspace,
             rename_workspace,
             switch_workspace,
+            delete_workspace,
             open_path,
             reveal_path,
             is_semantic_ready,

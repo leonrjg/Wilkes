@@ -94,6 +94,9 @@ describe("TauriSearchApi", () => {
 
     await api.switchWorkspace("b");
     expect(invoke).toHaveBeenLastCalledWith("switch_workspace", { workspaceId: "b" });
+
+    await api.deleteWorkspace("b");
+    expect(invoke).toHaveBeenLastCalledWith("delete_workspace", { workspaceId: "b" });
   });
 
   it("should configure the external MCP endpoint", async () => {

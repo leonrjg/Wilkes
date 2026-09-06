@@ -158,7 +158,7 @@ describe("SearchBar", () => {
     useSettingsStore.setState({ setPreferSemantic: setPreferSemanticMock });
 
     render(<SearchBar sourceSlot={<MockSourceSlot />} />);
-    const combinedToggle = screen.getByRole("button", { name: "Combined search" });
+    const combinedToggle = screen.getByRole("button", { name: "Semantic search" });
 
     fireEvent.click(combinedToggle);
 
@@ -191,7 +191,7 @@ describe("SearchBar", () => {
     useSettingsStore.setState({ preferSemantic: true } as any);
 
     render(<SearchBar sourceSlot={<MockSourceSlot />} />);
-    const combinedToggle = screen.getByRole("button", { name: "Combined search" });
+    const combinedToggle = screen.getByRole("button", { name: "Semantic search" });
     expect(combinedToggle).toHaveAttribute("aria-pressed", "true");
 
     fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
@@ -204,7 +204,7 @@ describe("SearchBar", () => {
       expect.objectContaining({ mode: "Grep", is_regex: true }),
     );
     // The preference is untouched, so the checkbox returns on its own.
-    expect(screen.getByRole("button", { name: "Combined search" })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: "Semantic search" })).toHaveAttribute(
       "aria-pressed",
       "false",
     );
@@ -223,7 +223,7 @@ describe("SearchBar", () => {
     } as any);
 
     render(<SearchBar sourceSlot={<MockSourceSlot />} />);
-    fireEvent.click(screen.getByRole("button", { name: "Combined search" }));
+    fireEvent.click(screen.getByRole("button", { name: "Semantic search" }));
 
     expect(setPreferSemanticMock).toHaveBeenCalledWith(false);
     expect(cancelEmbed).toHaveBeenCalledOnce();

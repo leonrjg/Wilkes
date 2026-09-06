@@ -67,9 +67,9 @@ interface Props {
   /** Which region's prose the panel is showing. */
   focus: string;
   onFocus: (region: string) => void;
-  /** Select or de-select a region's reader. `PAGE_REGION` is the feature
-   *  switch itself: there is no reading without a page reader, so choosing it
-   *  and turning image analysis on are one act. */
+  /** Select or de-select a region's reader, `PAGE_REGION` included: the page
+   *  reader is a role like the two below it, and switching it off leaves them
+   *  reading while what only it read goes unread. */
   onToggle: (region: string, next: boolean) => void;
   disabled?: boolean;
 }
@@ -118,8 +118,12 @@ export function assignColours(models: VennModel[]): Record<string, string> {
 function absence(model: VennModel | null, active: boolean): string {
   if (!model) return "not read";
   if (!model.is_cached) return `${model.display_name} — not downloaded`;
-  if (!model.selected) return `${model.display_name} — switched off`;
+  // The outer state first, because it is the one the reader must undo before
+  // any of these boxes means anything: a reader that is both switched off and
+  // sitting under a switched-off feature is undone by the toggle above, and
+  // saying "switched off" would send them to a checkbox that is disabled.
   if (!active) return `${model.display_name} — image analysis is off`;
+  if (!model.selected) return `${model.display_name} — switched off`;
   return model.display_name;
 }
 
@@ -222,17 +226,17 @@ export default function RecognizerVenn({
         data-testid="venn-page"
       >
         <div className="flex items-center gap-2 px-1.5 py-1">
-          {/* The page reader's own checkbox is the feature switch. There is no
-              reading without a page reader — every area the detector marks out
-              routes to one — so "use general OCR" and "read the text inside
-              pictures" are the same question, and the backend refuses a
-              configuration that answers them differently. One box, one
-              setting, driven from either end. */}
+          {/* One role among three, and de-selected the same way. What it holds
+              is the remainder — whatever no reader below claimed — so
+              switching it off leaves those kinds unread and leaves the
+              specialists reading exactly as before. Whether pictures are
+              looked at at all is a different question, answered by `active`
+              and by the toggle above this diagram. */}
           <input
             type="checkbox"
             aria-label="Use general OCR"
-            checked={active}
-            disabled={disabled || !page?.is_cached}
+            checked={!!page?.selected}
+            disabled={disabled || !active || !page?.is_cached}
             onChange={(event) => onToggle(PAGE_REGION, event.target.checked)}
             className="h-3 w-3 shrink-0 accent-[var(--accent-blue)]"
           />

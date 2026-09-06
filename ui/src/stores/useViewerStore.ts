@@ -54,6 +54,8 @@ interface ViewerStore {
   restoreSession: () => Promise<void>;
   enterStandaloneMode: () => void;
   switchWorkspace: (workspaceId: string) => Promise<void>;
+  /** Drops the persisted tab session a deleted workspace left behind. */
+  forgetWorkspace: (workspaceId: string) => void;
   openMatch: (match: MatchRef) => void;
   openFile: (path: string, origin?: SourceOrigin | null) => void;
   activateTab: (id: string) => void;
@@ -432,6 +434,14 @@ export const useViewerStore = create<ViewerStore>()(
         });
         const activeTabId = useViewerStore.getState().activeTabId;
         if (activeTabId) ensureTabLoaded(activeTabId);
+      },
+
+      forgetWorkspace: (workspaceId) => {
+        try {
+          localStorage.removeItem(`${VIEWER_SESSION_STORAGE_KEY}.${workspaceId}`);
+        } catch (error) {
+          console.error("Could not clear the viewer session of a deleted workspace:", error);
+        }
       },
 
       openMatch: (match) => {

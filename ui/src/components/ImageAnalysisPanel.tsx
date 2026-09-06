@@ -75,6 +75,10 @@ const HELPER_READERS: Array<{
   /** What is lost while it is not installed. Said where the download is
    *  offered, because it cannot be inferred from the reading afterwards. */
   absent: string;
+  /** The same, for a configuration with the page reader switched off. Two
+   *  sentences rather than one with a clause, because they are two different
+   *  outcomes: falling through to a worse reader, and not being read. */
+  absentWithNoPageReader: string;
 }> = [
   {
     role: "formula",
@@ -82,6 +86,8 @@ const HELPER_READERS: Array<{
     button: "Download formula reader",
     absent:
       "Not installed — formulas will go to the page reader instead, which on measurement reads almost none of them. Reading still works, and installing this later re-reads the documents that have formulas in them.",
+    absentWithNoPageReader:
+      "Not installed, and the page reader is switched off — so formulas are not read at all. Installing this later re-reads the documents that have formulas in them.",
   },
   {
     role: "table",
@@ -89,6 +95,8 @@ const HELPER_READERS: Array<{
     button: "Download table reader",
     absent:
       "Not installed — ruled tables will go to the page reader instead, which on measurement re-typed a third of them correctly and returned prose for the rest. Reading still works, and installing this later re-reads the documents that have tables in them.",
+    absentWithNoPageReader:
+      "Not installed, and the page reader is switched off — so ruled tables are not read at all. Installing this later re-reads the documents that have tables in them.",
   },
 ];
 
@@ -269,6 +277,25 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
   const isConfigured =
     draftEngine === analysis.engine && effectiveDraftModel === configuredModel;
 
+  /** Whether the page reader is one of the roles switched off. What it costs
+   *  is said in several places below, and it is a different sentence from the
+   *  one a specialist's absence carries — with no page reader there is nothing
+   *  for an unread area to fall through to. */
+  const pageOff = !!selected && disabledRoles.includes(selected.role);
+
+  /** The roles this installation could read with: on disk, and therefore
+   *  attachable. A role with no weights already contributes nothing, so it is
+   *  the last *installed* one that must not be switched off — the backend
+   *  refuses an analyzer with no reader left. */
+  const readableRoles = useMemo(() => {
+    const roles: RecognizerRole[] = [];
+    if (selected?.is_cached) roles.push(selected.role);
+    for (const { model } of helpers) {
+      if (model.is_cached) roles.push(model.role);
+    }
+    return roles;
+  }, [selected, helpers]);
+
   // The inventory describes the recipe rather than this machine, so it is read
   // for whatever is *selected* and whether or not it is installed: it is what
   // the download is disclosed by, and disclosing it afterwards would be no
@@ -375,34 +402,46 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
 
   /** Select or de-select one region's reader.
    *
-   *  The page reader's own region is the feature switch: an analyzer with no
-   *  page reader has nothing to route to, so the backend refuses to build one
-   *  and this drives `enabled` instead of the list. The specialists go in and
-   *  out of the list, which leaves their weights alone — what changes is
-   *  whether they are attached, and therefore what the extraction recipe is
-   *  and which documents are re-read.
+   *  Every region is one role in the same list, the page reader included. The
+   *  weights are left alone either way — what changes is whether the reader is
+   *  attached, and therefore what the extraction recipe is and which documents
+   *  are re-read. Switching the page reader off leaves the specialists reading
+   *  the areas the detector marks out for them, and everything else in a
+   *  picture unread.
+   *
+   *  The feature switch is a different question and stays where it is: `enabled`
+   *  says whether pictures are looked at at all, and this list says who reads
+   *  what once they are.
    *
    *  A region with no reader in the catalogue cannot be toggled; the caller
    *  never offers one, and a call for one is a bug rather than a no-op, so it
    *  is logged rather than swallowed. */
   const handleToggleRegion = async (region: string, next: boolean) => {
-    if (region === PAGE_REGION) {
-      await handleToggle(next);
-      return;
-    }
-    const entry = helpers.find(({ model }) => model.emits[0] === region);
-    if (!entry) {
+    const role =
+      region === PAGE_REGION
+        ? selected?.role
+        : helpers.find(({ model }) => model.emits[0] === region)?.model.role;
+    if (!role) {
       console.error(`no reader owns the '${region}' region; nothing to select`);
       return;
     }
-    const role = entry.model.role;
+    // The backend refuses an analyzer with nothing left to read with, because
+    // that configuration reports as a library whose pictures hold no text.
+    // Said here too, before the write, so the refusal is not the first the
+    // user hears of it.
+    const after = next
+      ? disabledRoles.filter((off) => off !== role)
+      : [...disabledRoles.filter((off) => off !== role), role];
+    if (!next && readableRoles.every((each) => after.includes(each))) {
+      setError(
+        "That would switch off every reader. Turn off \u201cread the text drawn inside " +
+          "pictures\u201d above instead — it is the same reading, said once.",
+      );
+      return;
+    }
     setBusy(true);
     try {
-      await patch({
-        disabled_roles: next
-          ? disabledRoles.filter((off) => off !== role)
-          : [...disabledRoles.filter((off) => off !== role), role],
-      });
+      await patch({ disabled_roles: after });
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -504,12 +543,12 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
     }
   };
 
-  /** The page reader's box. Its `selected` is the feature switch, because
-   *  that is the only sense in which a page reader can be de-selected: the
-   *  analyzer routes every marked-out area to one, so there is no reading
-   *  with the page reader turned off and something else still on. */
+  /** The page reader's box. De-selected like any other reader: what it holds
+   *  is whatever no specialist claimed — charts, embedded rasters, and a kind
+   *  whose own reader is absent — and switching it off leaves those unread
+   *  rather than switching the feature off. */
   const pageBox: VennModel | null = selected
-    ? { ...selected, selected: analysis.enabled }
+    ? { ...selected, selected: !disabledRoles.includes(selected.role) }
     : null;
 
   const actionLabel = (() => {
@@ -542,7 +581,8 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
               className="h-3.5 w-3.5 accent-[var(--accent-blue)]"
             />
             <span className="text-xs text-[var(--text-main)]">
-              Read the text drawn inside diagrams, charts and scanned figures
+              Read the text a page draws rather than sets — formulas, ruled
+              tables, diagrams and scanned figures
             </span>
           </label>
           {!configuredInstalled && (
@@ -626,13 +666,24 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
             />
 
             {focused && !focused.model.is_cached && (
-              <p className="text-[10px] text-[var(--text-dim)]">{focused.copy.absent}</p>
+              <p className="text-[10px] text-[var(--text-dim)]">
+                {pageOff ? focused.copy.absentWithNoPageReader : focused.copy.absent}
+              </p>
             )}
 
             {focused && focused.model.is_cached && disabledRoles.includes(focused.model.role) && (
               <p className="text-[10px] text-[var(--text-dim)]">
-                Switched off, and still downloaded — these areas go to the page
-                reader.
+                {pageOff
+                  ? "Switched off, and still downloaded — and the page reader is off too, so these areas are not read at all."
+                  : "Switched off, and still downloaded — these areas go to the page reader."}
+              </p>
+            )}
+
+            {pageOff && analysis.enabled && (
+              <p className="text-[10px] text-[var(--text-dim)]">
+                The page reader is switched off: only the areas the detector
+                marks out for a reader above are read. Charts, scanned figures
+                and the text drawn inside a diagram are not.
               </p>
             )}
 
@@ -716,6 +767,14 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
                 </span>
               </label>
             ))}
+            {pageOff && (
+              <p className="text-[10px] text-[var(--text-dim)]">
+                The page reader is switched off, and it is the only reader a
+                raster goes to — so the second choice reads nothing the first
+                does not, and the pictures are found and counted rather than
+                decoded.
+              </p>
+            )}
           </div>
         </section>
       )}

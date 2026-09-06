@@ -68,6 +68,11 @@ describe("HttpSearchApi", () => {
       "/api/workspaces/b/activate",
       expect.objectContaining({ method: "POST" }),
     );
+    await api.deleteWorkspace("b");
+    expect(fetch).toHaveBeenLastCalledWith(
+      "/api/workspaces/b",
+      expect.objectContaining({ method: "DELETE" }),
+    );
   });
 
   it("updateBookmarkNote sends a PATCH with the note body", async () => {

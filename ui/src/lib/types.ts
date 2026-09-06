@@ -717,8 +717,12 @@ export interface ImageAnalysisSettings {
    *  marks out for it go to the page reader instead — the same reading, and
    *  the same recipe, as an installation that never downloaded it.
    *
-   *  `page` is not a member: reading pages is what `enabled` turns off, and
-   *  the backend refuses a configuration that says otherwise. */
+   *  `page` is a member like the other two, and the only one whose areas have
+   *  nowhere to fall through to: with it switched off, what no specialist
+   *  claims — charts, embedded rasters, a kind whose own reader is missing —
+   *  is not read at all. Whether the pictures are looked at in the first place
+   *  is `enabled`, a different question. The backend refuses only the empty
+   *  case: every role off and nothing left attached. */
   disabled_roles: RecognizerRole[];
 }
 

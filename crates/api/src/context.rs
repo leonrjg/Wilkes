@@ -1351,8 +1351,15 @@ pub struct AppContext {
     /// Serialises `load_generator`, so two settings changes cannot download and
     /// attach concurrently.
     generator_load_lock: tokio::sync::Mutex<()>,
-    /// Serializes analyzer loads against each other: each one reads 1.9 GB
-    /// of weights into memory, and two at once would hold both.
+    /// Serializes analyzer loads against each other, so that two settings
+    /// edits in flight cannot install the older one's analyzer last.
+    ///
+    /// Not a memory bound, though it was described as one for as long as the
+    /// weights were read here. They are read in the recognition worker now,
+    /// and what this assembles is the address of one — so a lock held per
+    /// context bounded nothing, least of all across the several contexts the
+    /// host opens. What bounds resident weights is `worker::residency`, which
+    /// is process-wide because that is the scope the memory is scarce in.
     image_analyzer_load_lock: tokio::sync::Mutex<()>,
     /// Claimed by each load before it queues behind the lock. Only the newest
     /// claim may assign the generator; an older one that finishes later would
@@ -2846,15 +2853,26 @@ impl AppContext {
         found
     }
 
+    /// Brings one projection level with the canonical corpus for one document,
+    /// and answers nothing but whether it succeeded.
+    ///
+    /// Deliberately not a `ManagedDocumentExport`. An export carries the
+    /// document's declared outline, and reading that outline is a full read of
+    /// the snapshot from disk — the text layer of every page, sanitized —
+    /// which this path has no consumer for: catching up is a write, and its
+    /// one caller drops whatever it is handed. Returning an export made an
+    /// idempotent no-op cost a complete parse of every document in the corpus,
+    /// once per call, to build a value that was discarded a frame later.
+    /// `import_managed_document` is the path whose export is an HTTP response
+    /// body, and it is the only one that builds one.
     pub async fn import_managed_projection(
         self: &Arc<Self>,
-        corpus_id: String,
         idempotency_key: String,
         canonical: &Arc<Self>,
         canonical_snapshot_path: PathBuf,
         original_source_provenance: serde_json::Value,
         source_workspace: Option<&Arc<Self>>,
-    ) -> Result<ManagedDocumentExport, ConsumerError> {
+    ) -> Result<(), ConsumerError> {
         let _pending = PendingManagedOperation::new(&self.managed_pending_imports);
         let _import_guard = self.managed_import_lock.lock().await;
         if idempotency_key.trim().is_empty() || idempotency_key.len() > 256 {
@@ -2920,11 +2938,11 @@ impl AppContext {
         // Bound to a `let` before the `if let`, not inlined into it. A block
         // used as an `if let` scrutinee lives until the end of the whole `if
         // let` statement, so the index lock guard inside it would still be
-        // held across the `.await` below — and a guard that reaches an await
-        // makes the future non-Send, which surfaces a route at a time as
-        // "handler does not implement Handler". `managed_export` became async
-        // when the outline read moved to the blocking pool; this is what that
-        // move requires of its callers.
+        // alive for the whole body — and a guard that reaches an await makes
+        // the future non-Send, which surfaces a route at a time as "handler
+        // does not implement Handler". That is what happened here while the
+        // body awaited `managed_export`; the binding is what keeps a body that
+        // awaits again from reintroducing it.
         let existing = {
             let index_arc = self.index.lock().clone();
             let guard = index_arc
@@ -2941,14 +2959,15 @@ impl AppContext {
                 .map_err(|error| error.to_string())?
         };
         if let Some(existing) = existing {
-            return Self::managed_export(
-                corpus_id,
-                existing,
-                &expected_identity,
-                canonical_snapshot_path,
-                true,
-            )
-            .await;
+            // The whole of the reuse path. Said rather than passed over in
+            // silence because "already held" and "embedded just now" cost
+            // different minutes, and a catch-up that is entirely no-ops should
+            // be readable in the log as one.
+            tracing::info!(
+                "projection import: this key already holds {} chunks, nothing to do",
+                existing.chunks.len()
+            );
+            return Ok(());
         }
         if prepared.chunks.is_empty() {
             return Err(ConsumerError::new(
@@ -3094,14 +3113,7 @@ impl AppContext {
                 "projection verification failed",
             ));
         }
-        Self::managed_export(
-            corpus_id,
-            managed,
-            &expected_identity,
-            canonical_snapshot_path,
-            false,
-        )
-        .await
+        Ok(())
     }
 
     /// What one document's reading surface needs to show a match.

@@ -2,6 +2,8 @@ import { render, screen, fireEvent, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import DataPanel from "./DataPanel";
 import { useSemanticStore } from "../stores/useSemanticStore";
+import { useWorkspaceStore } from "../stores/useWorkspaceStore";
+import { confirmDialog } from "../lib/utils/dialog";
 
 const mockApi = {
   getDataPaths: vi.fn(),
@@ -9,6 +11,10 @@ const mockApi = {
   openPath: vi.fn(),
   deleteIndex: vi.fn(),
 };
+
+vi.mock("../lib/utils/dialog", () => ({
+  confirmDialog: vi.fn(),
+}));
 
 vi.mock("../services", () => ({
   isTauri: true,
@@ -36,11 +42,12 @@ describe("DataPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.stubGlobal("isTauri", true);
+    useWorkspaceStore.setState({ refreshList: vi.fn().mockResolvedValue(undefined) } as any);
     mockApi.getDataPaths.mockResolvedValue(mockPaths);
     mockApi.getIndexStatus.mockResolvedValue(mockIndexStatus);
     mockApi.openPath.mockResolvedValue(undefined);
     mockApi.deleteIndex.mockResolvedValue(undefined);
-    vi.stubGlobal("confirm", vi.fn(() => true));
+    vi.mocked(confirmDialog).mockResolvedValue(true);
     useSemanticStore.setState({
       indexStatus: mockIndexStatus as any,
       readyForCurrentRoot: true,
@@ -97,7 +104,7 @@ describe("DataPanel", () => {
       fireEvent.click(deleteButton);
     });
     
-    expect(window.confirm).toHaveBeenCalled();
+    expect(confirmDialog).toHaveBeenCalled();
     expect(mockApi.deleteIndex).toHaveBeenCalled();
     expect(useSemanticStore.getState().handleCurrentRootIndexRemoved).toHaveBeenCalled();
   });
@@ -107,13 +114,120 @@ describe("DataPanel", () => {
       render(<DataPanel api={mockApi as any} isActive={true} />);
     });
     
-    vi.stubGlobal("confirm", vi.fn(() => false));
+    vi.mocked(confirmDialog).mockResolvedValue(false);
     const deleteButton = screen.getByText("Delete current index");
     await act(async () => {
       fireEvent.click(deleteButton);
     });
     
     expect(mockApi.deleteIndex).not.toHaveBeenCalled();
+  });
+
+  describe("workspaces", () => {
+    const remove = vi.fn().mockResolvedValue(true);
+
+    beforeEach(() => {
+      remove.mockClear();
+      useWorkspaceStore.setState({
+        workspaces: [
+          { id: "w1", name: "Thesis", roots: ["/library"], active_root: "/library", read_only: false, managed_by: null },
+          {
+            id: "corpus",
+            name: "Underdog semantic corpus",
+            roots: ["/app/data/workspaces/corpus/managed_sources"],
+            active_root: "/app/data/workspaces/corpus/managed_sources",
+            read_only: true,
+            managed_by: "underdog",
+          },
+        ],
+        activeWorkspaceId: "w1",
+        remove,
+      } as any);
+    });
+
+    it("re-reads the registry when the page becomes active", async () => {
+      const refreshList = vi.fn().mockResolvedValue(undefined);
+      useWorkspaceStore.setState({ refreshList } as any);
+
+      const { rerender } = render(<DataPanel api={mockApi as any} isActive={false} />);
+      await act(async () => {
+        rerender(<DataPanel api={mockApi as any} isActive={true} />);
+      });
+
+      expect(refreshList).toHaveBeenCalled();
+    });
+
+    it("lists every workspace, managed ones included, and marks the active one", async () => {
+      await act(async () => {
+        render(<DataPanel api={mockApi as any} isActive={true} />);
+      });
+
+      expect(screen.getByText("Thesis")).toBeInTheDocument();
+      expect(screen.getByText("Underdog semantic corpus")).toBeInTheDocument();
+      expect(screen.getByText("Active")).toBeInTheDocument();
+      expect(screen.getByText("underdog")).toBeInTheDocument();
+      expect(screen.getByText("/library")).toBeInTheDocument();
+    });
+
+    // Read-only protects a managed corpus's content, not its existence: the
+    // bytes are on the user's disk and reclaiming them is theirs to decide.
+    it("deletes a managed workspace after confirmation", async () => {
+      await act(async () => {
+        render(<DataPanel api={mockApi as any} isActive={true} />);
+      });
+
+      const button = screen.getByRole("button", { name: "Delete workspace Underdog semantic corpus" });
+      expect(button).toBeEnabled();
+      await act(async () => {
+        fireEvent.click(button);
+      });
+
+      expect(confirmDialog).toHaveBeenCalled();
+      expect(remove).toHaveBeenCalledWith("corpus");
+    });
+
+    it("deletes nothing when the confirmation is refused", async () => {
+      await act(async () => {
+        render(<DataPanel api={mockApi as any} isActive={true} />);
+      });
+
+      vi.mocked(confirmDialog).mockResolvedValue(false);
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Delete workspace Thesis" }));
+      });
+
+      expect(remove).not.toHaveBeenCalled();
+    });
+
+    it("withholds deletion of the last remaining workspace", async () => {
+      useWorkspaceStore.setState({
+        workspaces: [
+          { id: "w1", name: "Thesis", roots: [], active_root: null, read_only: false, managed_by: null },
+        ],
+      } as any);
+
+      await act(async () => {
+        render(<DataPanel api={mockApi as any} isActive={true} />);
+      });
+
+      expect(screen.getByRole("button", { name: "Delete workspace Thesis" })).toBeDisabled();
+      // And a workspace with no folder open still says so rather than showing
+      // an empty line.
+      expect(screen.getByText("No folder open")).toBeInTheDocument();
+    });
+
+    it("surfaces a failed deletion instead of leaving the row as it was", async () => {
+      remove.mockRejectedValueOnce(new Error("Workspace is busy"));
+
+      await act(async () => {
+        render(<DataPanel api={mockApi as any} isActive={true} />);
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Delete workspace Thesis" }));
+      });
+
+      expect(screen.getByText("Workspace is busy")).toBeInTheDocument();
+    });
   });
 
   it("renders empty state when no index status", async () => {

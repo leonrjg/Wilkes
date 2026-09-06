@@ -185,16 +185,11 @@ describe("IndexActivityPanel", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("journal unreadable");
   });
 
-  it("keeps worker diagnostics beneath the job, collapsed until asked for", async () => {
+  it("shows the workers beneath the job without being asked", async () => {
     const api = makeApi();
     renderPanel(api);
 
-    const toggle = await screen.findByRole("button", { name: /Worker Diagnostics/i });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(api.getWorkerStatuses).not.toHaveBeenCalled();
-
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(await screen.findByText(/Worker Status/i)).toBeInTheDocument();
     await waitFor(() => expect(api.getWorkerStatuses).toHaveBeenCalled());
   });
 

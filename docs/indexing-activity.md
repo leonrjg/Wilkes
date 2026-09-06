@@ -103,14 +103,14 @@ this work exists to end, reintroduced by the fix for it.
 Deleting a root's index deletes its job history: a report about coverage the
 workspace no longer has would offer to continue into a database that is gone.
 
-### 6. One place, with diagnostics beneath it
+### 6. One place, with the workers beneath it
 
-Settings › **Activity** (was "Workers"). `IndexActivityPanel` shows the job
-state, a plain-English sentence naming what was saved, per-outcome counts, the
-document list with failures and unfinished documents first, each failure's error
+Settings › **Workers**. `IndexActivityPanel` shows the job state, a
+plain-English sentence naming what was saved, per-outcome counts, the document
+list with failures and unfinished documents first, each failure's error
 verbatim, earlier jobs, and the two action buttons. `WorkersPanel` is unchanged
-and rendered *beneath* it in a collapsed "Worker diagnostics" disclosure — a view
-above it, not a second copy of it.
+and rendered *beneath* it, always visible — a view above it, not a second copy
+of it.
 
 The panel treats every progress event as a signal to re-read the journal, never
 as a fact to accumulate. That is what makes it identical whether it watched the

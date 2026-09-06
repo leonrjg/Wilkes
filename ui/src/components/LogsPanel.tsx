@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import type { SearchApi } from "../services/api";
 import { CopyButton } from "./CopyButton";
+import { confirmDialog } from "../lib/utils/dialog";
 
 interface LogsPanelProps {
   api: SearchApi;
@@ -34,7 +35,7 @@ export default function LogsPanel({ api }: LogsPanelProps) {
   }, [api]);
 
   const handleClear = async () => {
-    if (confirm("Are you sure you want to clear the logs?")) {
+    if (await confirmDialog("Are you sure you want to clear the logs?")) {
       try {
         await api.clearLogs();
         setLogs([]);

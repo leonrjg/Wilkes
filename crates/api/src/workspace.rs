@@ -1063,6 +1063,105 @@ impl WorkspaceManager {
         Ok(state)
     }
 
+    /// Removes a workspace from the registry and deletes everything it owns
+    /// on disk.
+    ///
+    /// Managed or not. A protected corpus refuses every *write* — the import
+    /// API is its only writer — but refusing to delete it too left the user
+    /// with gigabytes of an application's index and no way to reclaim them
+    /// except by finding the directory themselves. Protecting the content of
+    /// a corpus is not the same as protecting its existence, and only the
+    /// second is the user's to decide.
+    ///
+    /// Deleting a canonical corpus deletes the workspaces that project it
+    /// into other embedding spaces: those exist only to hold vectors for its
+    /// membership, they are never listed on their own, and leaving them
+    /// behind would leave a projection of a corpus that no longer exists.
+    ///
+    /// The active workspace is refused rather than switched away from.
+    /// Activating one moves the user's window, shuts a context down and
+    /// rewrites the registry; a caller that wants that has [`Self::switch`],
+    /// and one that does not would be surprised to find the window somewhere
+    /// else because it deleted a workspace it was not looking at.
+    pub async fn delete(&self, id: &str) -> anyhow::Result<WorkspaceState> {
+        // The same lock `switch` and `context_for` take: no workspace may
+        // become active, and no context may be opened for one, between the
+        // decision below and the removal that follows it.
+        let _switch_guard = self.switch_lock.lock().await;
+        let removals = {
+            let _registry_guard = self.registry_lock.lock();
+            let registry = load_registry(&self.app_data_dir)?;
+            anyhow::ensure!(
+                registry.workspace_ids.iter().any(|item| item == id),
+                "Unknown workspace"
+            );
+            let mut removals = vec![id.to_string()];
+            for candidate in &registry.workspace_ids {
+                let manifest =
+                    read_manifest(&workspace_manifest_path(&self.app_data_dir, candidate))?;
+                if matches!(
+                    &manifest.kind,
+                    WorkspaceKind::ApplicationManaged {
+                        parent_corpus_id: Some(parent),
+                        ..
+                    } if parent == id
+                ) && !removals.contains(candidate)
+                {
+                    removals.push(candidate.clone());
+                }
+            }
+            anyhow::ensure!(
+                !removals.contains(&registry.active_workspace_id),
+                "The active workspace cannot be deleted. Switch to another workspace first."
+            );
+            removals
+        };
+
+        // Contexts first, registry second, files last. A context holds this
+        // workspace's index and metadata databases open, and the registry is
+        // what makes the workspace real: an interruption after the registry
+        // is written leaves files nothing names, which is recoverable, while
+        // the opposite order would leave the registry naming a workspace
+        // whose manifest is gone — and every listing reads every manifest.
+        for removal in &removals {
+            let scoped = { self.scoped.lock().remove(removal) };
+            if let Some(context) = scoped {
+                context.shutdown().await;
+            }
+        }
+        {
+            let _registry_guard = self.registry_lock.lock();
+            let mut registry = load_registry(&self.app_data_dir)?;
+            registry
+                .workspace_ids
+                .retain(|candidate| !removals.contains(candidate));
+            atomic_write_json(&registry_path(&self.app_data_dir), &registry)?;
+        }
+        for removal in &removals {
+            let root = workspace_root(&self.app_data_dir, removal);
+            if let Err(error) = std::fs::remove_dir_all(&root) {
+                // Not a failure of the deletion: the workspace is gone from
+                // the registry and nothing will open it again. What is left
+                // is bytes, and the path to them is named here rather than
+                // swallowed so the user can be told where to look.
+                tracing::error!(
+                    workspace = %removal,
+                    path = %root.display(),
+                    %error,
+                    "workspace was deregistered but its directory could not be removed"
+                );
+            }
+        }
+        drop(_switch_guard);
+
+        let state = self.state().await?;
+        self.events.emit(
+            "workspace-changed",
+            serde_json::to_value(&state).unwrap_or_default(),
+        );
+        Ok(state)
+    }
+
     /// Create or retrieve one application's protected corpus workspace.
     /// Configuration is immutable after the first successful ensure.
     pub async fn ensure_managed_workspace(
@@ -1268,6 +1367,24 @@ impl WorkspaceManager {
             &request.embedding,
         )?;
 
+        // Catching up offers every admitted source in the corpus to the
+        // projection, and a projection already level with its corpus takes
+        // nothing from any of them: the sweep is a hash and an index lookup
+        // per document, answering a question the corpus generation has already
+        // answered for all of them at once. `catch_up_corpus` has always made
+        // this check per space; ensuring a space did not, so a caller that put
+        // to this endpoint on a timer paid the sweep every time. The check is
+        // the same one, and it must stay the same one.
+        let status = self.managed_workspace_status(&request.corpus_id).await?;
+        if let Some(level) = status
+            .spaces
+            .iter()
+            .find(|space| space.workspace_id == id)
+            .filter(|space| space.ready && space.indexed_generation == status.corpus_generation)
+        {
+            return Ok(level.clone());
+        }
+
         self.catch_up_projection(&request.corpus_id, &id, None)
             .await?;
 
@@ -1323,7 +1440,6 @@ impl WorkspaceManager {
             // projection level again.
             child
                 .import_managed_projection(
-                    corpus_id.to_string(),
                     format!("space-backfill-{rendition}"),
                     &canonical_context,
                     source.clone(),
@@ -1993,6 +2109,121 @@ mod tests {
         }
     }
 
+    /// Deleting is not writing into a corpus, so a managed one is deletable
+    /// exactly like a user workspace — and its hidden projections go with it,
+    /// because a projection of a corpus that no longer exists is nothing.
+    #[tokio::test]
+    async fn deleting_a_managed_corpus_removes_its_projections_and_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("global-settings.json");
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
+        let corpus = manager
+            .ensure_managed_workspace(EnsureManagedWorkspace {
+                owner: "underdog".to_string(),
+                corpus_key: "store-delete".to_string(),
+                embedding: SelectedEmbedder::default(),
+                chunk_size: 600,
+                chunk_overlap: 128,
+            })
+            .await
+            .unwrap();
+        let parent_semantic = read_manifest(&workspace_manifest_path(
+            dir.path(),
+            &corpus.corpus_id,
+        ))
+        .unwrap()
+        .semantic
+        .unwrap();
+        let projection = manager
+            .ensure_projection_workspace(
+                &corpus.corpus_id,
+                "underdog",
+                "store-delete",
+                &parent_semantic,
+                &SelectedEmbedder {
+                    engine: EmbeddingEngine::Candle,
+                    model: EmbedderModel("projection-model".to_string()),
+                    dimension: 2,
+                },
+            )
+            .unwrap();
+        assert_ne!(projection, corpus.corpus_id);
+
+        let state = manager.delete(&corpus.corpus_id).await.unwrap();
+
+        assert!(
+            !state
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == corpus.corpus_id),
+            "the corpus is gone from the listing"
+        );
+        let registry = load_registry(dir.path()).unwrap();
+        assert!(!registry.workspace_ids.contains(&corpus.corpus_id));
+        assert!(
+            !registry.workspace_ids.contains(&projection),
+            "the projection went with the corpus that owned it"
+        );
+        assert!(!workspace_root(dir.path(), &corpus.corpus_id).exists());
+        assert!(!workspace_root(dir.path(), &projection).exists());
+
+        manager.shutdown_all().await;
+    }
+
+    /// The registry's own invariant is that the active workspace is one it
+    /// names. Deleting it would move the user's window as a side effect of a
+    /// delete, so it is refused and the caller switches first.
+    #[tokio::test]
+    async fn the_active_workspace_is_refused_and_left_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("global-settings.json");
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
+        let active = manager.active_workspace_id().unwrap();
+
+        let error = manager.delete(&active).await.unwrap_err().to_string();
+        assert!(
+            error.contains("active workspace cannot be deleted"),
+            "unexpected refusal: {error}"
+        );
+        assert!(workspace_root(dir.path(), &active).exists());
+        assert_eq!(manager.active_workspace_id().unwrap(), active);
+
+        // And unknown ids are refused rather than quietly succeeding.
+        assert!(manager.delete("not-a-workspace").await.is_err());
+
+        manager.shutdown_all().await;
+    }
+
+    /// A workspace deleted while the caller was reading it: the context this
+    /// manager opened for it is shut down before its files go, and the
+    /// manager will not hand out another one afterwards.
+    #[tokio::test]
+    async fn deleting_a_workspace_retires_the_context_opened_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("global-settings.json");
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
+        let created = manager.create("Second".to_string()).await.unwrap();
+        manager.context_for(&created.id).await.unwrap();
+        assert!(manager.scoped.lock().contains_key(&created.id));
+
+        manager.delete(&created.id).await.unwrap();
+
+        assert!(!manager.scoped.lock().contains_key(&created.id));
+        assert!(!workspace_root(dir.path(), &created.id).exists());
+        assert!(
+            manager.context_for(&created.id).await.is_err(),
+            "a deleted workspace cannot be opened again"
+        );
+
+        manager.shutdown_all().await;
+    }
+
     /// The canonical corpus opens its index and loads no model.
     ///
     /// This is the payoff, and it is the symptom that started the whole
@@ -2376,6 +2607,137 @@ mod tests {
         let failures = manager.catch_up_corpus(&corpus_id, None).await.unwrap();
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert_eq!(failures[0].0, lagging.embedding_space_id);
+    }
+
+    /// Ensuring a space that is already level is a status read and nothing
+    /// else.
+    ///
+    /// The endpoint behind this is idempotent and callers put to it freely —
+    /// on a timer, in one case. Every call used to sweep the corpus, offering
+    /// each admitted source to the projection in turn, and the projection took
+    /// nothing from any of them. This environment can load no model, so a
+    /// sweep is an error: `Ok` here is the proof that none was attempted.
+    #[tokio::test]
+    async fn ensuring_a_level_space_sweeps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) = WorkspaceManager::new(
+            dir.path().to_path_buf(),
+            dir.path().join("global-settings.json"),
+            Arc::clone(&events),
+        )
+        .unwrap();
+        let embedding = SelectedEmbedder {
+            engine: EmbeddingEngine::Candle,
+            model: EmbedderModel("primary-model".to_string()),
+            dimension: 2,
+        };
+        let corpus = manager
+            .ensure_managed_workspace(EnsureManagedWorkspace {
+                owner: "underdog".to_string(),
+                corpus_key: "store-ensure-level".to_string(),
+                embedding: embedding.clone(),
+                chunk_size: 600,
+                chunk_overlap: 128,
+            })
+            .await
+            .unwrap();
+        let corpus_id = corpus.corpus_id.clone();
+        let canonical_root = workspace_root(dir.path(), &corpus_id);
+        let canonical_sources = canonical_root.join("managed_sources");
+        let recipe = wilkes_core::embed::ExtractionRecipe::new(600, 128);
+        let document = canonical_sources.join("document.txt");
+        let mut canonical = SemanticIndex::create(
+            &canonical_root,
+            embedding.model.model_id(),
+            embedding.dimension,
+            embedding.engine,
+            Some(&canonical_sources),
+        )
+        .unwrap();
+        admit(
+            &mut canonical,
+            &document,
+            "canonical passage",
+            vec![1.0, 0.0],
+            &recipe,
+        );
+
+        // The projection is built and brought level by hand, because computing
+        // its vectors for real needs a model this test cannot download.
+        let secondary = SelectedEmbedder {
+            engine: EmbeddingEngine::Candle,
+            model: EmbedderModel("secondary-model".to_string()),
+            dimension: 2,
+        };
+        let manifest = read_manifest(&workspace_manifest_path(dir.path(), &corpus_id)).unwrap();
+        let projection_id = manager
+            .ensure_projection_workspace(
+                &corpus_id,
+                "underdog",
+                "store-ensure-level",
+                manifest.semantic.as_ref().unwrap(),
+                &secondary,
+            )
+            .unwrap();
+        let projection_root = workspace_root(dir.path(), &projection_id);
+        let mut projection = SemanticIndex::create(
+            &projection_root,
+            secondary.model.model_id(),
+            secondary.dimension,
+            secondary.engine,
+            Some(&projection_root.join("managed_sources")),
+        )
+        .unwrap();
+        let (mut prepared, canonical_recipe_id) = canonical
+            .managed_file_structure_for_reembedding(&document, &document)
+            .unwrap()
+            .expect("the canonical rendition is admitted");
+        prepared.chunks[0].1 = vec![0.0, 1.0];
+        projection
+            .write_file_with_recipe_id(
+                prepared,
+                &canonical_recipe_id,
+                None,
+                None,
+                true,
+                false,
+                Some("projected"),
+            )
+            .unwrap();
+
+        let ensured = manager
+            .ensure_managed_space(EnsureManagedEmbeddingSpace {
+                corpus_id: corpus_id.clone(),
+                embedding: secondary.clone(),
+            })
+            .await
+            .expect("a level space is ensured without catching anything up");
+        assert_eq!(ensured.workspace_id, projection_id);
+        assert!(ensured.ready);
+        let status = manager.managed_workspace_status(&corpus_id).await.unwrap();
+        assert_eq!(ensured.indexed_generation, status.corpus_generation);
+
+        // And a space that is genuinely behind still owes the sweep, which
+        // this environment cannot perform: the skip is the level check, not a
+        // blanket refusal to catch up.
+        admit(
+            &mut canonical,
+            &canonical_sources.join("second.txt"),
+            "a second canonical passage",
+            vec![0.5, 0.5],
+            &recipe,
+        );
+        assert!(
+            manager
+                .ensure_managed_space(EnsureManagedEmbeddingSpace {
+                    corpus_id: corpus_id.clone(),
+                    embedding: secondary,
+                })
+                .await
+                .is_err(),
+            "a projection behind its corpus is work owed, not work skipped"
+        );
     }
 
     /// The cheap path has to stay cheap, because it is the one that runs after

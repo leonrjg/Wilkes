@@ -107,6 +107,7 @@ export interface SearchApi {
   createWorkspace(name: string): Promise<WorkspaceSummary>;
   renameWorkspace(workspaceId: string, name: string): Promise<WorkspaceSummary>;
   switchWorkspace(workspaceId: string): Promise<WorkspaceState>;
+  deleteWorkspace(workspaceId: string): Promise<WorkspaceState>;
   /** Desktop-only lifecycle controls for the opt-in external MCP endpoint. */
   getExternalMcpStatus?(): Promise<ExternalMcpStatus>;
   /** Desktop-only live viewer context exposed by the external MCP endpoint. */

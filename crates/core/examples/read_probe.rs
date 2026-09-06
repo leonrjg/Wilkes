@@ -121,7 +121,7 @@ fn main() -> anyhow::Result<()> {
     let (reader, reader_name) = page_reader(&dir)?;
     eprintln!("page reader for this run: {reader_name}");
     let analyzer = NativeImageAnalyzer::new(
-        reader,
+        Some(reader),
         None,
         ImageScope::TypesetOnly,
         Some(dispatch::load_layout_detector_local(

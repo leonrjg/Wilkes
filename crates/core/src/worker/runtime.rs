@@ -5,14 +5,15 @@ use std::time::Duration;
 use std::{future::Future, pin::Pin};
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time::timeout;
 
-use super::ipc::{CancelSignal, WorkerEvent, WorkerRequest, WorkerRole};
+use super::ipc::{CancelSignal, WorkerEvent, WorkerKind, WorkerRequest, WorkerRole};
 use super::manager::{
     GenerationWorkerStatus, ManagerCommand, ManagerEvent, WorkerPaths, WorkerStatus,
 };
 use super::process::{Stop, WorkerProcess};
+use super::residency::{self, Residency};
 use super::DEFAULT_IDLE_TIMEOUT_SECS;
 
 #[async_trait]
@@ -81,6 +82,7 @@ impl WorkerSession for WorkerProcess {
 
 pub(super) async fn supervised_manager_loop(
     paths: WorkerPaths,
+    kind: WorkerKind,
     initial_rx: mpsc::Receiver<ManagerCommand>,
     event_tx: mpsc::Sender<ManagerEvent>,
     active_pid: Arc<AtomicU32>,
@@ -90,6 +92,9 @@ pub(super) async fn supervised_manager_loop(
 ) {
     let mut rx = initial_rx;
     let spawner: Arc<dyn WorkerProcessSpawner> = Arc::new(RealWorkerProcessSpawner);
+    // Resolved once, here, rather than per start: the kind a manager supervises
+    // is fixed for its whole life, and so is the semaphore that admits it.
+    let residency = residency::for_kind(kind);
     loop {
         let runtime = WorkerRuntime::new(
             paths.clone(),
@@ -99,6 +104,7 @@ pub(super) async fn supervised_manager_loop(
             Arc::clone(&active_process),
             Arc::clone(&status),
             Arc::clone(&spawner),
+            Arc::clone(&residency),
         );
         let handle = tokio::task::spawn(runtime.run());
         match handle.await {
@@ -157,6 +163,15 @@ struct WorkerRuntime {
     /// Commands taken off the channel while a request was in flight, held back
     /// until it finished. Only the cancel signal is acted on mid-request.
     deferred: VecDeque<ManagerCommand>,
+    /// The semaphore that admits a worker of this manager's kind, shared with
+    /// every other manager of that kind in the process.
+    residency_semaphore: Arc<Semaphore>,
+    /// Held for exactly as long as this manager has a live worker. Taken before
+    /// the spawn and dropped in `clear_active_worker`, which is where every
+    /// stop funnels — an idle timeout, a restart for a new kind, a closed
+    /// channel and a death under a request alike — so there is no path that
+    /// ends a worker without admitting the next one.
+    residency: Option<Residency>,
     /// Whether the worker this manager last held ended by dying under a
     /// request, rather than by being stopped on purpose.
     last_stop_was_a_death: bool,
@@ -240,6 +255,7 @@ impl WorkerRuntime {
         active_process_slot: ActiveProcessSlot,
         status: Arc<RwLock<WorkerStatus>>,
         spawner: Arc<dyn WorkerProcessSpawner>,
+        residency_semaphore: Arc<Semaphore>,
     ) -> Self {
         Self {
             paths,
@@ -255,6 +271,8 @@ impl WorkerRuntime {
             active_device: None,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             deferred: VecDeque::new(),
+            residency_semaphore,
+            residency: None,
             last_stop_was_a_death: false,
             replacements: 0,
         }
@@ -438,6 +456,26 @@ impl WorkerRuntime {
             );
         }
 
+        // Taken here rather than at the top of `ensure_worker`, because a
+        // restart releases the old worker's permit on its way through
+        // `clear_active_worker` above: asking for one before that ran would be
+        // this manager queueing behind itself.
+        if self.residency.is_none() {
+            match Arc::clone(&self.residency_semaphore).acquire_owned().await {
+                Ok(permit) => self.residency = Some(permit),
+                Err(e) => {
+                    // The semaphore lives for the process and is never closed,
+                    // so this cannot happen — but a worker started without a
+                    // permit is one nothing bounds, so it is an error rather
+                    // than a start.
+                    let message = format!("worker residency unavailable: {e}");
+                    tracing::error!("WorkerManager: {message}");
+                    let _ = reply.send(WorkerEvent::Error(message)).await;
+                    return Err(());
+                }
+            }
+        }
+
         match self.spawner.spawn(&self.paths, req, &self.active_pid).await {
             Ok(proc) => {
                 self.last_stop_was_a_death = false;
@@ -450,6 +488,10 @@ impl WorkerRuntime {
                 Ok(())
             }
             Err(e) => {
+                // Nothing was started, so nothing is holding weights: keeping
+                // the permit would bar every other manager of this kind on
+                // behalf of a process that does not exist.
+                self.residency = None;
                 let _ = reply.send(WorkerEvent::Error(e)).await;
                 Err(())
             }
@@ -491,6 +533,9 @@ impl WorkerRuntime {
         self.active_role = None;
         self.active_model = None;
         self.active_device = None;
+        // After the shutdown, never before it: the permit says a process of
+        // this kind holds models, and until the stop returns one still does.
+        self.residency = None;
         self.update_status_idle();
     }
 
@@ -624,6 +669,21 @@ mod tests {
         mpsc::Sender<ManagerCommand>,
         mpsc::Receiver<ManagerEvent>,
     ) {
+        test_runtime_sharing(Arc::new(Semaphore::new(1)))
+    }
+
+    /// A runtime admitted by a caller-supplied semaphore, so a test can build
+    /// two that contend the way two managers of one kind in two workspaces do.
+    fn test_runtime_sharing(
+        residency: Arc<Semaphore>,
+    ) -> (
+        WorkerRuntime,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        mpsc::Sender<ManagerCommand>,
+        mpsc::Receiver<ManagerEvent>,
+    ) {
         let paths = WorkerPaths {
             python_path: std::path::PathBuf::from("python"),
             python_package_dir: std::path::PathBuf::from("pkg"),
@@ -666,6 +726,7 @@ mod tests {
                 spawn_should_fail: false,
                 send_should_fail: false,
             }),
+            residency,
         );
         (
             runtime,
@@ -736,6 +797,88 @@ mod tests {
         assert_eq!(
             runtime.replacements, 1,
             "starting a worker to replace one that died under a request is the violation"
+        );
+    }
+
+    /// Two managers of one kind cannot hold a worker at the same time.
+    ///
+    /// This is the whole bound. The host builds a manager per kind per
+    /// `AppContext`, and it opens an `AppContext` per workspace anything
+    /// reaches — so before this, two workspaces reading at once meant two
+    /// recognize workers, each keeping four models resident, and the machine
+    /// held two copies of weights that are gigabytes apiece.
+    #[tokio::test]
+    async fn a_second_manager_of_one_kind_waits_for_the_first_to_let_go() {
+        let shared = Arc::new(Semaphore::new(1));
+        let (mut first, first_spawns, _s, _sd, _tx, _ev) =
+            test_runtime_sharing(Arc::clone(&shared));
+        let (mut second, second_spawns, _s2, _sd2, _tx2, _ev2) =
+            test_runtime_sharing(Arc::clone(&shared));
+
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        first
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+        assert_eq!(first_spawns.load(Ordering::Relaxed), 1);
+
+        // The second manager's request while the first still holds its worker.
+        // It must not start one: the assertion is that this future does not
+        // finish, so it is raced against a timeout rather than awaited.
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        let blocked = second.handle_submit(Box::new(embed_request("model-b")), reply_tx);
+        assert!(
+            timeout(Duration::from_millis(50), blocked).await.is_err(),
+            "the second manager started a worker while the first still held one"
+        );
+        assert_eq!(
+            second_spawns.load(Ordering::Relaxed),
+            0,
+            "no second worker of this kind may exist"
+        );
+
+        // The first worker goes at its idle timeout, which is what releases the
+        // permit — and the second is admitted without anything telling it to
+        // retry.
+        first.handle_idle_timeout().await;
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        assert!(
+            timeout(
+                Duration::from_secs(5),
+                second.handle_submit(Box::new(embed_request("model-b")), reply_tx)
+            )
+            .await
+            .is_ok(),
+            "the permit the first worker held was not released when it died"
+        );
+        assert_eq!(second_spawns.load(Ordering::Relaxed), 1);
+    }
+
+    /// A spawn that fails started nothing, so it must hold nothing. Otherwise
+    /// one manager that cannot start its worker bars every other manager of
+    /// that kind for the life of the process.
+    #[tokio::test]
+    async fn a_worker_that_failed_to_start_holds_no_residency() {
+        let shared = Arc::new(Semaphore::new(1));
+        let (mut runtime, spawn_calls, _s, _sd, _tx, _ev) =
+            test_runtime_sharing(Arc::clone(&shared));
+        runtime.spawner = Arc::new(FakeSpawner {
+            spawn_calls: Arc::clone(&spawn_calls),
+            send_calls: Arc::new(AtomicUsize::new(0)),
+            shutdown_calls: Arc::new(AtomicUsize::new(0)),
+            spawn_should_fail: true,
+            send_should_fail: false,
+        });
+
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        runtime
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+
+        assert!(runtime.residency.is_none());
+        assert_eq!(
+            shared.available_permits(),
+            1,
+            "a spawn that failed left the kind barred"
         );
     }
 
@@ -1139,6 +1282,7 @@ mod tests {
                 spawn_should_fail: true,
                 send_should_fail: false,
             }),
+            Arc::new(Semaphore::new(1)),
         );
 
         let req = WorkerRequest {
@@ -1286,6 +1430,7 @@ mod tests {
                 spawn_should_fail: false,
                 send_should_fail: true,
             }),
+            Arc::new(Semaphore::new(1)),
         );
 
         let req = WorkerRequest {

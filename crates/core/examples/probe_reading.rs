@@ -45,6 +45,12 @@ impl ImageAnalyzer for Recorder {
     fn reads_embedded_images(&self) -> bool {
         false
     }
+
+    /// Every kind, as before this configuration could switch a reader
+    /// off: this double routes what it is given.
+    fn reads_typeset_kind(&self, _: wilkes_core::types::RegionKind) -> bool {
+        true
+    }
     fn analyze(
         &self,
         _images: &mut [ExtractedImage],

@@ -143,6 +143,7 @@ impl WorkerManager {
         let sender: SenderSlot = Arc::new(std::sync::Mutex::new(tx));
         let fut = supervised_manager_loop(
             paths,
+            kind,
             rx,
             event_tx,
             Arc::clone(&active_pid),

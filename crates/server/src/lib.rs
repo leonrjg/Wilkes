@@ -267,6 +267,21 @@ async fn switch_workspace_handler(
         .map_err(|error| server_err(error.to_string()))
 }
 
+async fn delete_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(workspace_id): axum::extract::Path<String>,
+) -> Result<Json<WorkspaceState>, (StatusCode, Json<ErrorBody>)> {
+    let manager = state
+        .workspaces
+        .as_ref()
+        .ok_or_else(|| server_err("Workspace manager is unavailable"))?;
+    manager
+        .delete(&workspace_id)
+        .await
+        .map(Json)
+        .map_err(|error| server_err(error.to_string()))
+}
+
 async fn ensure_managed_workspace_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<EnsureManagedWorkspace>,
@@ -2322,7 +2337,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             "/api/workspaces",
             get(list_workspaces_handler).post(create_workspace_handler),
         )
-        .route("/api/workspaces/{id}", patch(rename_workspace_handler))
+        .route(
+            "/api/workspaces/{id}",
+            patch(rename_workspace_handler).delete(delete_workspace_handler),
+        )
         .route(
             "/api/workspaces/{id}/activate",
             post(switch_workspace_handler),

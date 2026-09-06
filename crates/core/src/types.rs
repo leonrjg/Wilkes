@@ -1931,10 +1931,15 @@ pub struct ImageAnalysisSettings {
     /// finds these readers in the first place: there is one formula reader
     /// per build, and naming it here would be a second copy of which-is-which.
     ///
-    /// [`RecognizerRole::Page`] is not a member. Reading pages is what
-    /// `enabled` turns off, and a configuration that said otherwise would be
-    /// asking for an analyzer with nothing to analyze with; `build_analyzer`
-    /// refuses it rather than quietly reading on.
+    /// [`RecognizerRole::Page`] is a member like the other two, and it is the
+    /// one whose absence has nowhere to fall through to: what only the page
+    /// reader read — a chart, an embedded raster, a formula whose own reader
+    /// is missing — is then not read at all rather than read worse. That is a
+    /// different question from `enabled`, which says whether the pictures are
+    /// looked at in the first place. The one configuration `build_analyzer`
+    /// refuses is the empty one: every role in here and nothing left attached
+    /// reads as a library whose pictures hold no text, so it is an error and
+    /// not a build.
     ///
     /// Empty by default, which is what every settings file written before
     /// this field existed says: every installed reader is spent, the recipe

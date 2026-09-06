@@ -4,6 +4,27 @@
 
 ### Added
 
+- Advanced > Data lists every workspace on this installation and deletes any of
+  them, the corpora other applications keep here included. A managed corpus
+  refuses every write — its owning application is its only writer — and that
+  protects its contents, not its existence: the index is gigabytes on the
+  user's own disk, and until now the only way to reclaim them was to find the
+  directory by hand. Deleting a corpus takes the hidden projections that
+  re-embed it with it, since a projection of a corpus that is gone is nothing.
+  The active workspace is deleted by activating another one first, and the last
+  remaining workspace is not deletable at all. What goes is the workspace's own
+  index, settings, bookmarks, research and uploads; the documents in the
+  folders it indexed are left where they are. Available to consumers as
+  `DELETE /api/workspaces/{id}`.
+
+- Clearing the logs, deleting an index and switching away from a workspace with
+  unsaved edits ask before they act again. They called `window.confirm`, which
+  the desktop shell's dialog plugin patches and its capabilities do not permit:
+  the call failed with `plugin:dialog|confirm not allowed by ACL` and the
+  caller read that as the user saying no, so the button did nothing and said
+  nothing. Every confirmation in the application now goes through the one
+  helper that asks the way this installation permits.
+
 - The root strip marks each root with what the semantic index holds for it: a
   filled dot for a root that is fully indexed, a hollow one for a root the index
   is behind on, and the count in the tooltip. Coverage is the directory as it is
@@ -273,6 +294,20 @@
 
 ### Fixed
 
+- Two workspaces reading at once no longer hold two copies of the same weights.
+  A worker is bounded by a permit shared across the whole process rather than
+  by the manager that starts it: the host builds a manager per worker kind per
+  workspace context, and it opens a context for every workspace anything
+  reaches — the HTTP API opens one per corpus it is asked about, a managed
+  import opens one for the corpus and one for each projection of it, and each
+  stays open for the life of the application. Nothing could see across them, so
+  a second workspace reading meant a second recognition worker, and a
+  recognition worker keeps four models resident by design. One permit per kind,
+  so a build — which alternates recognition and embedding, and holds one worker
+  of each — runs exactly as before, while the second workspace asking for the
+  same kind waits for the first worker to reach its idle timeout instead of
+  doubling the memory.
+
 - The topic cloud shows the names it already has when text generation is off.
   Topic names are generated, and they are cached against the model that wrote
   them; but the cache was read only after checking that a generator was loaded
@@ -340,6 +375,29 @@
   unrecognised content type is reported rather than guessed at.
 
 ### Changed
+
+- General OCR is a reader that can be switched off, not the feature switch. The
+  page recognizer used to answer two questions at once — "is a page reader
+  attached" and "are pictures read at all" — so switching it off in Extraction →
+  OCR switched off the formula and table readers with it, and the layout
+  detector besides. It is now a role in `image_analysis.disabled_roles` like the
+  other two: with it off, the specialists still read the areas the detector
+  marks out for them, and what only the page reader read — charts, embedded
+  rasters, and a kind whose own reader is missing — is not read rather than read
+  worse. Those detections are dropped before their crops are rendered, and the
+  stage log still counts them as detected and not read. The one configuration
+  refused is the empty one: every reader off, which would report as a library
+  whose pictures hold no text. `enabled` keeps its own meaning and the panel's
+  top toggle keeps driving it.
+
+  This changes the extraction recipe, so a library read with the page reader
+  switched off is re-read if it is switched back on, exactly as the other two
+  roles behave.
+
+- The Activity page is now Workers, and the worker rows are always on screen.
+  They were behind a "Worker Diagnostics" disclosure beneath the job, which is a
+  click away from the question the page is opened to answer once a document has
+  stopped moving.
 
 - Switching roots no longer starts an index build. The detection behind it is
   unchanged and now feeds the root strip's coverage marks instead: moving

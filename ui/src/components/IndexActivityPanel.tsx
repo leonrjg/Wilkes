@@ -135,7 +135,6 @@ export default function IndexActivityPanel({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<null | "continue" | "retry">(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const lastRefresh = useRef(0);
 
   const refresh = useCallback(async () => {
@@ -386,24 +385,8 @@ export default function IndexActivityPanel({
 
       {/* Beneath the job, not beside it: the per-process detail matters once a
           document has stopped moving and the question becomes which model is
-          holding it up. */}
-      <section>
-        <button
-          onClick={() => setShowDiagnostics((open) => !open)}
-          aria-expanded={showDiagnostics}
-          className="flex items-center gap-1.5 text-[10px] font-medium text-[var(--text-dim)] uppercase tracking-wider hover:text-[var(--text-main)] transition-colors"
-        >
-          <span className={showDiagnostics ? "rotate-90 transition-transform" : "transition-transform"}>
-            ▸
-          </span>
-          Worker Diagnostics
-        </button>
-        {showDiagnostics && (
-          <div className="mt-3">
-            <WorkersPanel api={api} settings={settings} onUpdateSettings={onUpdateSettings} />
-          </div>
-        )}
-      </section>
+          holding it up, so it is on screen whenever the job is. */}
+      <WorkersPanel api={api} settings={settings} onUpdateSettings={onUpdateSettings} />
     </div>
   );
 }

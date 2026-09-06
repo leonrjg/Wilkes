@@ -245,6 +245,15 @@ pub(crate) fn read_document(
     // holding every page of the document open across both passes. It lands in
     // the `page render + detection` figure the stage log reports below.
     if let Some(detector) = detector {
+        // What this configuration actually routes, which is narrower than what
+        // the build can read: a reader that is switched off leaves its kind to
+        // nobody, and rendering a crop for it would be pixels thrown away. The
+        // analyzer answers with its own router rather than a rule kept here.
+        let reads_kind = |kind: Option<crate::types::RegionKind>| {
+            kind.is_some_and(|kind| {
+                analyzer.is_some_and(|analyzer| analyzer.reads_typeset_kind(kind))
+            })
+        };
         let detect_started = std::time::Instant::now();
         let mut renders_failed = 0u32;
         let side = detector.input_side();
@@ -282,12 +291,20 @@ pub(crate) fn read_document(
                     for region in &found {
                         let entry = detected.entry(region.label).or_insert((0, false));
                         entry.0 += 1;
-                        entry.1 = region.kind.is_some();
+                        entry.1 = reads_kind(region.kind);
                     }
+                    // Dropped here rather than rendered and then not read: the
+                    // stage log above still counts them, so "detected and not
+                    // read" stays the true number whether the class has no
+                    // reader in this build or has one that is switched off.
+                    let routed: Vec<crate::extract::image::LayoutRegion> = found
+                        .into_iter()
+                        .filter(|region| reads_kind(region.kind))
+                        .collect();
                     pending.extend(typeset::regions(
                         (index + 1) as u32,
                         page_box,
-                        &found,
+                        &routed,
                         survey,
                     ));
                 }
@@ -1435,6 +1452,12 @@ mod tests {
             fn reads_embedded_images(&self) -> bool {
                 true
             }
+
+            /// Every kind, as before this configuration could switch a reader
+            /// off: this double routes what it is given.
+            fn reads_typeset_kind(&self, _: crate::types::RegionKind) -> bool {
+                true
+            }
             fn identity(&self) -> String {
                 "fixed-analyzer-v1".to_string()
             }
@@ -1512,6 +1535,12 @@ mod tests {
             }
             fn release(&self) {}
             fn reads_embedded_images(&self) -> bool {
+                true
+            }
+
+            /// Every kind, as before this configuration could switch a reader
+            /// off: this double routes what it is given.
+            fn reads_typeset_kind(&self, _: crate::types::RegionKind) -> bool {
                 true
             }
             fn identity(&self) -> String {
@@ -1758,6 +1787,12 @@ mod tests {
         fn reads_embedded_images(&self) -> bool {
             self.reads_embedded
         }
+
+        /// Every kind, as before this configuration could switch a reader
+        /// off: this double routes what it is given.
+        fn reads_typeset_kind(&self, _: crate::types::RegionKind) -> bool {
+            true
+        }
         fn identity(&self) -> String {
             "formula-reader-v1".to_string()
         }
@@ -1886,6 +1921,12 @@ mod tests {
                 Some(&self.detector)
             }
             fn reads_embedded_images(&self) -> bool {
+                true
+            }
+
+            /// Every kind, as before this configuration could switch a reader
+            /// off: this double routes what it is given.
+            fn reads_typeset_kind(&self, _: crate::types::RegionKind) -> bool {
                 true
             }
             fn identity(&self) -> String {

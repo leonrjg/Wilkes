@@ -171,6 +171,10 @@ export class TauriSearchApi implements SearchApi {
     return invoke<WorkspaceState>("switch_workspace", { workspaceId });
   }
 
+  async deleteWorkspace(workspaceId: string): Promise<WorkspaceState> {
+    return invoke<WorkspaceState>("delete_workspace", { workspaceId });
+  }
+
   async getExternalMcpStatus(): Promise<ExternalMcpStatus> {
     return invoke<ExternalMcpStatus>("get_external_mcp_status");
   }
