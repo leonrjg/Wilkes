@@ -44,6 +44,13 @@ body,
      outline close buttons and by SemanticPanel, but never defined here until
      now -- so those hovers resolved to an invalid colour and did nothing. */
   --accent-red: #dc2626;
+  /* Advisory notices — a caution the user should read before proceeding, not
+     an error. Amber fixed to one theme is why these banners were unreadable in
+     light mode: dark-mode amber text is a mid-yellow, and a mid-yellow on a
+     near-white wash carries no contrast. Both themes get their own triple. */
+  --accent-amber: #92400e;
+  --accent-amber-muted: #fef3c7;
+  --accent-amber-border: #fcd34d;
 
   /* Highlight roles — the single source of truth for every viewer (PDF,
      Markdown, CodeMirror, result list). Hue carries the source: blue is text
@@ -89,6 +96,9 @@ body,
   --accent-blue-hover: #60a5fa;
   --accent-blue-muted: #1e3a8a;
   --accent-red: #f87171;
+  --accent-amber: #fcd34d;
+  --accent-amber-muted: #2a1b06;
+  --accent-amber-border: #5a2f0d;
 }
 
 * {

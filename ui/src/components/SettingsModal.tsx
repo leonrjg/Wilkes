@@ -948,7 +948,7 @@ export default function SettingsModal({
                       </div>
 
                       {externalMcpBindAddress.trim() !== "::1" && !externalMcpBindAddress.trim().startsWith("127.") && (
-                        <div role="status" className="p-2 bg-amber-900/20 border border-amber-800/50 rounded text-[10px] text-amber-300">
+                        <div role="status" className="p-2 bg-[var(--accent-amber-muted)] border border-[var(--accent-amber-border)] rounded text-[10px] text-[var(--accent-amber)]">
                           {externalMcpRequireToken
                             ? "A non-loopback address exposes Wilkes MCP to the network. Keep the bearer token private and use host firewall rules where appropriate."
                             : "A non-loopback address exposes Wilkes MCP without authentication. Anyone who can reach this address can use its tools; use host firewall rules to restrict access."}
@@ -1130,7 +1130,7 @@ export default function SettingsModal({
                       )}
 
                       {httpApiBindAddress.trim() !== "::1" && !httpApiBindAddress.trim().startsWith("127.") && (
-                        <div role="status" className="p-2 bg-amber-900/20 border border-amber-800/50 rounded text-[10px] text-amber-300">
+                        <div role="status" className="p-2 bg-[var(--accent-amber-muted)] border border-[var(--accent-amber-border)] rounded text-[10px] text-[var(--accent-amber)]">
                           A non-loopback address exposes this API without authentication, and it
                           can write as well as read — anyone who can reach the address can change
                           settings and rebuild the index. Use host firewall rules to restrict access.
