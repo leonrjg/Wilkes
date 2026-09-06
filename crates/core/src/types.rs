@@ -2482,8 +2482,10 @@ pub struct Settings {
     pub search_prefer_semantic: bool,
     /// When enabled, exact (grep) search reads a PDF's text from the semantic
     /// index instead of re-extracting it, falling back to live extraction only
-    /// for files the index does not yet hold. Off by default.
-    #[serde(default)]
+    /// for files the index does not yet hold. On by default: re-extracting a
+    /// document the index already holds is the same text at a much higher
+    /// price, and the fallback means an unindexed corpus behaves as before.
+    #[serde(default = "default_grep_use_index")]
     pub grep_use_index: bool,
     #[serde(default)]
     pub semantic: SemanticSettings,
@@ -2552,6 +2554,14 @@ pub struct Settings {
     pub image_analysis: ImageAnalysisSettings,
 }
 
+fn default_max_file_size() -> u64 {
+    50 * 1024 * 1024
+}
+
+fn default_grep_use_index() -> bool {
+    true
+}
+
 fn default_file_display_fields() -> Vec<FileDisplayField> {
     vec![FileDisplayField::Size]
 }
@@ -2576,11 +2586,11 @@ impl Default for Settings {
             recent_dirs: Vec::new(),
             last_directory: None,
             respect_gitignore: true,
-            max_file_size: 10 * 1024 * 1024,
+            max_file_size: default_max_file_size(),
             context_lines: 2,
             theme: Theme::default(),
             search_prefer_semantic: false,
-            grep_use_index: false,
+            grep_use_index: default_grep_use_index(),
             semantic: SemanticSettings::default(),
             integrations: IntegrationsSettings::default(),
             primary_metadata_source: MetadataSourcePreference::default(),
@@ -3636,6 +3646,27 @@ mod tests {
         assert_eq!(s.context_lines, 2);
         assert_eq!(s.chat_backend, AgentBackend::ClaudeCode);
         assert_eq!(s.pdf_auto_zoom_target_px, 15.5);
+        assert_eq!(s.max_file_size, 50 * 1024 * 1024);
+        assert!(s.grep_use_index);
+    }
+
+    /// A settings file written before the toggle existed must read back as the
+    /// same value a fresh install starts with; otherwise the serde default and
+    /// `Settings::default` would be two answers to one question.
+    #[test]
+    fn grep_use_index_absent_from_an_older_settings_file_reads_as_the_default() {
+        let json = r#"{
+            "favorites": [],
+            "recent_dirs": [],
+            "respect_gitignore": true,
+            "max_file_size": 10485760,
+            "context_lines": 2,
+            "theme": "System"
+        }"#;
+
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.grep_use_index, Settings::default().grep_use_index);
+        assert!(settings.grep_use_index);
     }
 
     #[test]

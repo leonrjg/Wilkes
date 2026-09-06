@@ -122,7 +122,7 @@ export const useSettingsStore = create<SettingsStore>()(
     directory: "",
     semantic: null,
     respectGitignore: true,
-    maxFileSize: 10 * 1024 * 1024,
+    maxFileSize: 50 * 1024 * 1024,
     contextLines: 2,
     supportedExtensions: [],
     fileList: [],
