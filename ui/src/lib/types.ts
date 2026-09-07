@@ -568,6 +568,8 @@ export interface SemanticSettings {
   chunk_overlap: number;
   topic_cloud_input_cap: number;
   worker_timeout_secs: number;
+  /** Texts the embedding worker puts through the model in one forward pass. */
+  embed_batch_size: number;
 }
 
 export type GenerationTask =

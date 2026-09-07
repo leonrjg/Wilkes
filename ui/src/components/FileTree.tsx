@@ -3,14 +3,9 @@ import { ChevronDown, ChevronRight, Folder } from "react-feather";
 import type { FileEntry } from "../lib/types";
 import { pathIsWithinRoot, pathsEqual } from "../lib/configuredRoots";
 
-export const FILE_TREE_DRAG_TYPE = "application/x-wilkes-file-path";
-
-export interface FileTreeDragProps {
-  draggable: boolean;
-  onDragStart: (event: React.DragEvent<HTMLButtonElement>) => void;
-  onDrag: (event: React.DragEvent<HTMLButtonElement>) => void;
-  onDragEnd: (event: React.DragEvent<HTMLButtonElement>) => void;
-}
+export type FileTreeDragProps = Pick<React.ButtonHTMLAttributes<HTMLButtonElement>,
+  "draggable" | "onDragStart" | "onPointerDown" | "onClickCapture" | "style"
+>;
 
 interface FileFolder {
   path: string;
@@ -154,14 +149,16 @@ export default function FileTree({
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [draggedPath, setDraggedPath] = useState<string | null>(null);
-  const draggedPathRef = useRef<string | null>(null);
-  const dropTargetRef = useRef<string | null>(null);
-  const moveDispatchedRef = useRef(false);
-  const dragCancelledRef = useRef(false);
+  const treeRef = useRef<HTMLUListElement>(null);
+  const cancelDragRef = useRef<(() => void) | null>(null);
+  const suppressClickRef = useRef(false);
 
   useEffect(() => {
     setCollapsed(new Set());
   }, [root]);
+
+  // A gesture belongs to the tree and permissions it started with.
+  useEffect(() => () => cancelDragRef.current?.(), [root, movable]);
 
   const toggle = (path: string) => {
     setCollapsed((current) => {
@@ -172,118 +169,146 @@ export default function FileTree({
     });
   };
 
-  const setActiveDropTarget = (path: string | null) => {
-    dropTargetRef.current = path;
-    setDropTarget(path);
-  };
-
-  useEffect(() => {
-    if (!draggedPath) return;
-    const cancelDrag = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      dragCancelledRef.current = true;
-      setActiveDropTarget(null);
-    };
-    window.addEventListener("keydown", cancelDrag, true);
-    return () => window.removeEventListener("keydown", cancelDrag, true);
-  }, [draggedPath]);
-
-  const folderAtPoint = (clientX: number, clientY: number): string | null => {
-    if (
-      !Number.isFinite(clientX)
-      || !Number.isFinite(clientY)
-      || (clientX === 0 && clientY === 0)
-      || typeof document.elementFromPoint !== "function"
-    ) return null;
-    const element = document.elementFromPoint(clientX, clientY);
-    return element
-      ?.closest<HTMLElement>("[data-file-tree-folder-path]")
-      ?.dataset.fileTreeFolderPath ?? null;
-  };
-
-  const dispatchMove = (targetDirectory: string | null) => {
-    const path = draggedPathRef.current;
-    if (!path || !targetDirectory || moveDispatchedRef.current) return;
-    if (pathsEqual(parentPath(path), targetDirectory)) return;
-    moveDispatchedRef.current = true;
-    void onMove(path, targetDirectory);
-  };
-
-  const finishDrag = () => {
-    draggedPathRef.current = null;
-    setDraggedPath(null);
-    setActiveDropTarget(null);
+  const folderAtPoint = (x: number, y: number): string | null => {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    const element = document.elementFromPoint(x, y);
+    const container = treeRef.current;
+    if (!element || !container?.contains(element)) return null;
+    const folder = element.closest<HTMLElement>("[data-file-tree-folder-path]");
+    if (folder) return folder.dataset.fileTreeFolderPath ?? null;
+    // Root-level file rows are not implicit targets for the undrawn root.
+    return element === container ? root : null;
   };
 
   const dragProps = (entry: FileEntry): FileTreeDragProps => ({
-    draggable: movable,
-    onDragStart: (event) => {
-      draggedPathRef.current = entry.path;
-      moveDispatchedRef.current = false;
-      dragCancelledRef.current = false;
-      setDraggedPath(entry.path);
-      event.dataTransfer.effectAllowed = "move";
-      event.dataTransfer.setData(FILE_TREE_DRAG_TYPE, entry.path);
-      event.dataTransfer.setData("text/plain", entry.path);
+    draggable: false,
+    // Suppress the browser's native drag session, including drags of children.
+    onDragStart: (event) => event.preventDefault(),
+    style: movable ? { touchAction: "none" } : undefined,
+    onClickCapture: (event) => {
+      if (!suppressClickRef.current || event.detail === 0) return;
+      suppressClickRef.current = false;
+      event.preventDefault();
+      event.stopPropagation();
     },
-    onDrag: (event) => {
-      const target = folderAtPoint(event.clientX, event.clientY);
-      if (target !== dropTargetRef.current) setActiveDropTarget(target);
-    },
-    onDragEnd: (event) => {
-      // Some desktop webviews consume the DOM `drop` event. Resolve the folder
-      // under the pointer once more, falling back to the last folder that was
-      // visibly highlighted when the webview omits drag-end coordinates.
-      if (!moveDispatchedRef.current && !dragCancelledRef.current) {
-        dispatchMove(
-          folderAtPoint(event.clientX, event.clientY) ?? dropTargetRef.current,
-        );
-      }
-      finishDrag();
-    },
-  });
+    onPointerDown: movable ? (event) => {
+      if (event.button !== 0 || !event.isPrimary || cancelDragRef.current) return;
+      suppressClickRef.current = false;
+      const source = event.currentTarget;
+      // Tags and detail disclosures keep their own click behaviour.
+      if (event.target instanceof Element
+        && event.target.closest('[role="button"], a, input, select, textarea')
+        && event.target !== source) return;
 
-  // Drag-and-drop for one folder, applied to the folder's own tree item and, for
-  // the root — which has no row of its own — to the tree container.
-  const dropHandlers = (folderPath: string) => movable ? {
-    onDragEnter: (event: React.DragEvent<HTMLElement>) => {
-      if (!draggedPathRef.current) return;
-      event.preventDefault();
-      event.stopPropagation();
-      setActiveDropTarget(folderPath);
-      // Revealing a closed destination on hover makes its eventual parent
-      // unambiguous and lets the user continue into a deeper folder.
-      setCollapsed((current) => {
-        if (!current.has(folderPath)) return current;
-        const next = new Set(current);
-        next.delete(folderPath);
-        return next;
-      });
-    },
-    onDragOver: (event: React.DragEvent<HTMLElement>) => {
-      if (!draggedPathRef.current) return;
-      event.preventDefault();
-      event.stopPropagation();
-      event.dataTransfer.dropEffect = pathsEqual(
-        parentPath(draggedPathRef.current),
-        folderPath,
-      ) ? "none" : "move";
-      if (dropTargetRef.current !== folderPath) setActiveDropTarget(folderPath);
-    },
-    onDragLeave: (event: React.DragEvent<HTMLElement>) => {
-      event.stopPropagation();
-      if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
-        if (dropTargetRef.current === folderPath) setActiveDropTarget(null);
-      }
-    },
-    onDrop: (event: React.DragEvent<HTMLElement>) => {
-      if (!draggedPathRef.current) return;
-      event.preventDefault();
-      event.stopPropagation();
-      dispatchMove(folderPath);
-      finishDrag();
-    },
-  } : {};
+      const pointerId = event.pointerId;
+      const startX = event.clientX;
+      const startY = event.clientY;
+      let x = startX;
+      let y = startY;
+      let active = false;
+      let target: string | null = null;
+      let hoverSince = performance.now();
+      let frame = 0;
+      let previousFrame = performance.now();
+
+      const updateTarget = () => {
+        const next = folderAtPoint(x, y);
+        if (next !== target) {
+          target = next;
+          hoverSince = performance.now();
+          setDropTarget(next);
+        }
+      };
+      const finish = () => {
+        cancelDragRef.current = null;
+        cancelAnimationFrame(frame);
+        window.removeEventListener("pointermove", move, true);
+        window.removeEventListener("pointerup", release, true);
+        window.removeEventListener("pointercancel", cancelPointer, true);
+        window.removeEventListener("keydown", keydown, true);
+        window.removeEventListener("blur", finish);
+        source.removeEventListener("lostpointercapture", cancelPointer);
+        if (source.hasPointerCapture(pointerId)) source.releasePointerCapture(pointerId);
+        setDraggedPath(null);
+        setDropTarget(null);
+      };
+      const cancelPointer = (e: PointerEvent) => {
+        if (e.pointerId === pointerId) finish();
+      };
+      const keydown = (e: KeyboardEvent) => {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          finish();
+        }
+      };
+      const tick = (now: number) => {
+        const seconds = Math.min(now - previousFrame, 32) / 1000;
+        previousFrame = now;
+        // Scroll the sidebar's existing scroll container, then hit-test the
+        // new layout even when the pointer has not moved.
+        let scroller: HTMLElement | null = treeRef.current;
+        while (scroller) {
+          if (/(auto|scroll)/.test(getComputedStyle(scroller).overflowY)
+            && scroller.scrollHeight > scroller.clientHeight) {
+            const rect = scroller.getBoundingClientRect();
+            if (x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom) {
+              const edge = Math.min(32, rect.height / 3);
+              const direction = y < rect.top + edge ? -1 : y > rect.bottom - edge ? 1 : 0;
+              scroller.scrollTop += direction * 360 * seconds;
+            }
+            break;
+          }
+          scroller = scroller.parentElement;
+        }
+        updateTarget();
+        if (target && now - hoverSince >= 600) {
+          const path = target;
+          setCollapsed((current) => {
+            if (!current.has(path)) return current;
+            const next = new Set(current);
+            next.delete(path);
+            return next;
+          });
+        }
+        frame = requestAnimationFrame(tick);
+      };
+      const move = (e: PointerEvent) => {
+        if (e.pointerId !== pointerId) return;
+        if ((e.buttons & 1) === 0) { finish(); return; }
+        x = e.clientX;
+        y = e.clientY;
+        if (!active && Math.hypot(x - startX, y - startY) < 6) return;
+        e.preventDefault();
+        if (!active) {
+          active = true;
+          suppressClickRef.current = true;
+          setDraggedPath(entry.path);
+          previousFrame = performance.now();
+          frame = requestAnimationFrame(tick);
+        }
+        updateTarget();
+      };
+      const release = (e: PointerEvent) => {
+        if (e.pointerId !== pointerId) return;
+        const destination = folderAtPoint(e.clientX, e.clientY);
+        // Never substitute a remembered hover for a release. A layout change
+        // that has not yet been highlighted cancels rather than surprises.
+        const accepted = active && destination !== null && destination === target
+          && !pathsEqual(parentPath(entry.path), destination);
+        finish();
+        if (accepted) void onMove(entry.path, destination);
+      };
+
+      source.setPointerCapture(pointerId);
+      cancelDragRef.current = finish;
+      window.addEventListener("pointermove", move, true);
+      window.addEventListener("pointerup", release, true);
+      window.addEventListener("pointercancel", cancelPointer, true);
+      window.addEventListener("keydown", keydown, true);
+      window.addEventListener("blur", finish);
+      source.addEventListener("lostpointercapture", cancelPointer);
+    } : undefined,
+  });
 
   const renderChildren = (folder: FileFolder, depth: number): React.ReactNode => (
     <>
@@ -314,7 +339,6 @@ export default function FileTree({
         role="treeitem"
         aria-expanded={open}
         data-file-tree-folder-path={folder.path}
-        {...dropHandlers(folder.path)}
       >
         <button
           type="button"
@@ -361,13 +385,13 @@ export default function FileTree({
     <ul
       role="tree"
       aria-label="Files and folders"
-      data-file-tree-folder-path={tree.path}
+      data-file-tree-root-path={tree.path}
       className={`min-h-full py-0.5 ${
         rootIsTarget && !rootAlreadyHere
           ? "rounded ring-2 ring-inset ring-[var(--accent-blue)]"
           : ""
       }`}
-      {...dropHandlers(tree.path)}
+      ref={treeRef}
     >
       {renderChildren(tree, 0)}
     </ul>

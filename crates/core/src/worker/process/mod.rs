@@ -253,6 +253,7 @@ exit 0
         std::fs::write(&paths.requirements_path, "torch\n").unwrap();
 
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "embed".to_string(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
@@ -318,6 +319,7 @@ echo '"Done"'
             data_dir: dir.path().to_path_buf(),
         };
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "generate".to_string(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
@@ -377,6 +379,7 @@ echo '"Done"'
         std::fs::write(&paths.requirements_path, "torch\n").unwrap();
 
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "embed".to_string(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
@@ -423,6 +426,7 @@ echo '"Done"'
         std::fs::write(&paths.requirements_path, "torch\n").unwrap();
 
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "embed".to_string(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
@@ -475,6 +479,7 @@ exit 0
         std::fs::write(&paths.requirements_path, "torch\n").unwrap();
 
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "embed".to_string(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
@@ -518,6 +523,7 @@ exit 0
         std::fs::write(&paths.requirements_path, "torch\n").unwrap();
 
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "embed".to_string(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),
@@ -558,6 +564,7 @@ exit 0
         };
 
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "embed".to_string(),
             role: WorkerRole::Embed(EmbeddingEngine::SBERT),
             model: "intfloat/e5-small-v2".to_string(),
@@ -631,6 +638,7 @@ exit 0
         std::fs::write(&paths.requirements_path, "torch\n").unwrap();
 
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "embed".to_string(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),

@@ -74,7 +74,7 @@ describe("SettingsModal", () => {
     theme: "System",
     pdf_auto_zoom_target_px: 15.5,
     search_prefer_semantic: false,
-    semantic: { enabled: true, index_path: null, worker_timeout_secs: 300 },
+    semantic: { enabled: true, index_path: null, worker_timeout_secs: 300, embed_batch_size: 16 },
     generation: {
       enabled: false,
       engine: "candle",

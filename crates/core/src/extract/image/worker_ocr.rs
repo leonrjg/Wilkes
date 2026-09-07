@@ -128,6 +128,7 @@ impl OcrEngine for WorkerOcr {
         let expected = image_paths.len();
 
         let request = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "recognize".to_string(),
             role: WorkerRole::Recognize(self.engine),
             model: self.model_id.clone(),

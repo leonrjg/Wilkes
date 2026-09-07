@@ -24,6 +24,7 @@ export default function WorkersPanel({ api, settings, onUpdateSettings }: Worker
   const [statuses, setStatuses] = useState<WorkerStatus[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [timeoutSecs, setTimeoutSecs] = useState<string>(settings.semantic.worker_timeout_secs.toString());
+  const [batchSize, setBatchSize] = useState<string>(settings.semantic.embed_batch_size.toString());
 
   const fetchStatus = async () => {
     try {
@@ -68,6 +69,29 @@ export default function WorkersPanel({ api, settings, onUpdateSettings }: Worker
         }
       });
       await fetchStatus();
+      setError(null);
+    } catch (e: any) {
+      setError(e.toString());
+    }
+  };
+
+  const handleApplyBatchSize = async () => {
+    const size = parseInt(batchSize, 10);
+    // Rejected rather than clamped: this is the control that decides whether a
+    // build fits in memory, and silently substituting a number would leave the
+    // user reading a value the worker is not using.
+    if (isNaN(size) || size < 1) {
+      setError("Embedding batch size must be a positive integer.");
+      return;
+    }
+
+    try {
+      await onUpdateSettings({
+        semantic: {
+          ...settings.semantic,
+          embed_batch_size: size,
+        },
+      });
       setError(null);
     } catch (e: any) {
       setError(e.toString());
@@ -199,6 +223,7 @@ export default function WorkersPanel({ api, settings, onUpdateSettings }: Worker
                 placeholder="300"
               />
               <button
+                aria-label="Apply idle timeout"
                 onClick={handleApplyTimeout}
                 className="px-3 py-1.5 bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] text-[var(--text-main)] text-xs font-medium rounded transition-colors border border-[var(--border-main)]"
               >
@@ -207,6 +232,33 @@ export default function WorkersPanel({ api, settings, onUpdateSettings }: Worker
             </div>
             <p className="text-[10px] text-[var(--text-dim)] italic">
               Worker processes will be shut down after this duration of inactivity to free system resources.
+            </p>
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <label className="text-xs text-[var(--text-muted)]">Embedding Batch Size (texts)</label>
+            <div className="flex gap-2">
+              <input
+                type="number"
+                min="1"
+                value={batchSize}
+                onChange={(e) => setBatchSize(e.target.value)}
+                className="w-32 bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
+                placeholder="16"
+              />
+              <button
+                aria-label="Apply embedding batch size"
+                onClick={handleApplyBatchSize}
+                className="px-3 py-1.5 bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] text-[var(--text-main)] text-xs font-medium rounded transition-colors border border-[var(--border-main)]"
+              >
+                Apply
+              </button>
+            </div>
+            <p className="text-[10px] text-[var(--text-dim)] italic">
+              How many texts the embedding worker puts through the model at once. This
+              sets its peak memory, and nothing else does: the largest single batch
+              decides it, not the size of a document. Raise it for speed on a machine
+              with memory to spare; lower it if indexing makes the machine swap.
             </p>
           </div>
         </div>

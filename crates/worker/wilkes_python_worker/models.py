@@ -2,6 +2,20 @@ from typing import Any, List
 from functools import lru_cache
 from .ipc import emit
 
+#: Texts put through the model in one forward pass when the request names none.
+#:
+#: The host sends this on every embed request, read from the user's settings —
+#: see `SemanticSettings::default_embed_batch_size`, which is where the number
+#: and the measurements behind it live. This copy is only for a request that
+#: arrived without one, which means a host older than this worker.
+#:
+#: It matters because the worker's peak memory is set by its largest single
+#: batch and nothing else: not the size of the request, and not how many
+#: batches it is split into. On the machine this was measured on, a batch of
+#: the corpus's longest chunks cost 5.6 GB at 16 and over 9.5 GB at 32, on a
+#: model that occupies 1.9 GB at rest.
+DEFAULT_BATCH_SIZE = 16
+
 @lru_cache(maxsize=2)
 def get_model(model_id: str, device: str) -> Any:
     emit({"Progress": {"Build": {

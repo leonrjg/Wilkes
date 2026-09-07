@@ -159,22 +159,23 @@ pub fn get_installer(
     model: EmbedderModel,
     manager: WorkerManager,
     device: String,
+    batch_size: usize,
 ) -> Arc<dyn EmbedderInstaller> {
     match engine {
-        EmbeddingEngine::SBERT => {
-            Arc::new(super::sbert::SBERTInstaller::new(model, manager, device))
-        }
+        EmbeddingEngine::SBERT => Arc::new(super::sbert::SBERTInstaller::new(
+            model, manager, device, batch_size,
+        )),
 
         #[cfg(feature = "candle")]
-        EmbeddingEngine::Candle => {
-            Arc::new(super::candle::CandleInstaller::new(model, manager, device))
-        }
+        EmbeddingEngine::Candle => Arc::new(super::candle::CandleInstaller::new(
+            model, manager, device, batch_size,
+        )),
         #[cfg(not(feature = "candle"))]
         EmbeddingEngine::Candle => panic!("Candle feature is disabled"),
 
         #[cfg(feature = "fastembed")]
         EmbeddingEngine::Fastembed => Arc::new(super::fastembed::FastembedInstaller::new(
-            model, manager, device,
+            model, manager, device, batch_size,
         )),
         #[cfg(not(feature = "fastembed"))]
         EmbeddingEngine::Fastembed => panic!("Fastembed feature is disabled"),
@@ -256,6 +257,7 @@ pub async fn prepare_embedder(
     model: &EmbedderModel,
     data_dir: &Path,
     device: &str,
+    batch_size: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
 ) -> anyhow::Result<PreparedEmbedder> {
     match engine {
@@ -264,8 +266,12 @@ pub async fn prepare_embedder(
             let (manager, _event_rx, loop_fut) =
                 crate::worker::manager::WorkerManager::new(paths, WorkerKind::Embed);
             let background_task = tokio::spawn(loop_fut);
-            let installer =
-                super::sbert::SBERTInstaller::new(model.clone(), manager, device.to_string());
+            let installer = super::sbert::SBERTInstaller::new(
+                model.clone(),
+                manager,
+                device.to_string(),
+                batch_size,
+            );
             let (probe_tx, _probe_rx) = tokio::sync::mpsc::channel(1);
             installer.install(data_dir, probe_tx).await?;
             let embedder = installer.build(data_dir)?;
@@ -386,6 +392,7 @@ mod tests {
             EmbedderModel("intfloat/e5-small-v2".to_string()),
             manager.clone(),
             "cpu".to_string(),
+            16,
         );
         assert!(installer.is_available(dir.path()));
 
@@ -396,6 +403,7 @@ mod tests {
                 EmbedderModel("m".to_string()),
                 manager.clone(),
                 "cpu".to_string(),
+                16,
             );
             assert!(!installer.is_available(dir.path()));
         }

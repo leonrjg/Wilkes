@@ -204,6 +204,15 @@ pub struct WorkerRequest {
     #[serde(default = "default_device")]
     pub device: String, // "auto", "cpu", "mps", "cuda", etc.
     pub texts: Option<Vec<String>>, // Used by "embed" mode
+    /// Texts the worker may put through the model at once, for "embed" mode.
+    ///
+    /// Travels with the request rather than being a constant in the worker,
+    /// because it is the user's resource control and the host is what holds
+    /// the settings. Defaulted rather than required so that a host and worker
+    /// of different versions still parse each other, exactly as `device` and
+    /// `mode` are.
+    #[serde(default = "default_embed_batch_size")]
+    pub batch_size: usize,
     /// Used by "generate" mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generate: Option<GenerationRequest>,
@@ -263,6 +272,10 @@ impl WorkerRequest {
 
 fn default_mode() -> String {
     "embed".to_string()
+}
+
+pub(crate) fn default_embed_batch_size() -> usize {
+    crate::types::SemanticSettings::default_embed_batch_size()
 }
 
 fn default_device() -> String {
@@ -371,6 +384,7 @@ mod tests {
 
     fn sample_request() -> WorkerRequest {
         WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "embed".to_string(),
             role: WorkerRole::Embed(EmbeddingEngine::Fastembed),
             model: "model".to_string(),

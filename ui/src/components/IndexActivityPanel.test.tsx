@@ -8,7 +8,7 @@ const ROOT = "/corpus";
 
 const settings = {
   last_directory: ROOT,
-  semantic: { worker_timeout_secs: 300, selected: { engine: "Candle" } },
+  semantic: { worker_timeout_secs: 300, embed_batch_size: 16, selected: { engine: "Candle" } },
 } as unknown as Settings;
 
 function job(overrides: Partial<JobSummary> = {}): JobSummary {

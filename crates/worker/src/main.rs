@@ -174,6 +174,7 @@ trait ModelLoader: Send + Sync {
     async fn load(
         &self,
         key: &LoadedModelKey,
+        batch_size: usize,
         event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
     ) -> anyhow::Result<LoadedModel>;
 }
@@ -184,6 +185,7 @@ impl ModelLoader for RealModelLoader {
     async fn load(
         &self,
         key: &LoadedModelKey,
+        batch_size: usize,
         event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
     ) -> anyhow::Result<LoadedModel> {
         match key.role {
@@ -194,6 +196,7 @@ impl ModelLoader for RealModelLoader {
                     &model,
                     &key.model_dir,
                     &key.device,
+                    batch_size,
                     event_tx,
                 )
                 .await?;
@@ -794,7 +797,7 @@ async fn get_or_load<'a>(
         key.model_dir.display()
     );
     active.evict_to_fit();
-    let loaded = loader.load(&key, event_tx).await?;
+    let loaded = loader.load(&key, req.batch_size, event_tx).await?;
     tracing::info!("[worker] model load succeeded");
     active.loaded.push(loaded);
     Ok(active.loaded.last().expect("just pushed"))
@@ -823,6 +826,7 @@ mod tests {
         async fn load(
             &self,
             key: &LoadedModelKey,
+            _batch_size: usize,
             _event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
         ) -> anyhow::Result<LoadedModel> {
             let payload = match key.role {
@@ -960,6 +964,7 @@ mod tests {
         async fn load(
             &self,
             _key: &LoadedModelKey,
+            _batch_size: usize,
             _event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
         ) -> anyhow::Result<LoadedModel> {
             Err(anyhow::anyhow!("load failed"))
@@ -968,6 +973,7 @@ mod tests {
 
     fn request(mode: &str, role: WorkerRole, data_dir: PathBuf) -> WorkerRequest {
         WorkerRequest {
+            batch_size: 16,
             mode: mode.to_string(),
             role,
             model: "model-a".to_string(),
@@ -1583,7 +1589,7 @@ mod tests {
             model_dir: PathBuf::from("/tmp/non-existent-model-dir"),
             device: "cpu".to_string(),
         };
-        assert!(loader.load(&key, None).await.is_err());
+        assert!(loader.load(&key, 16, None).await.is_err());
     }
 
     #[tokio::test]
@@ -1617,6 +1623,7 @@ mod tests {
             async fn load(
                 &self,
                 key: &LoadedModelKey,
+                _batch_size: usize,
                 _event_tx: Option<&tokio::sync::mpsc::Sender<WorkerEvent>>,
             ) -> anyhow::Result<LoadedModel> {
                 Ok(LoadedModel {

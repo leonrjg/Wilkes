@@ -121,15 +121,24 @@ pub struct SBERTInstaller {
     pub model: EmbedderModel,
     pub manager: WorkerManager,
     pub device: String,
+    /// Texts one forward pass may hold. Travels with the device because it is
+    /// the same kind of fact: what the machine this runs on can afford.
+    pub batch_size: usize,
     pub dimension: std::sync::Mutex<Option<usize>>,
 }
 
 impl SBERTInstaller {
-    pub fn new(model: EmbedderModel, manager: WorkerManager, device: String) -> Self {
+    pub fn new(
+        model: EmbedderModel,
+        manager: WorkerManager,
+        device: String,
+        batch_size: usize,
+    ) -> Self {
         Self {
             model,
             manager,
             device,
+            batch_size,
             dimension: std::sync::Mutex::new(None),
         }
     }
@@ -158,6 +167,7 @@ impl EmbedderInstaller for SBERTInstaller {
 
         // Otherwise, perform the Live Probe asynchronously.
         let request = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "info".to_string(),
             role: WorkerRole::Embed(EmbeddingEngine::SBERT),
             model: model_id.to_string(),
@@ -269,6 +279,7 @@ impl EmbedderInstaller for SBERTInstaller {
                 query_prefix: prefixes.query_prefix,
                 passage_prefix: prefixes.passage_prefix,
                 embedding_space_identity,
+                batch_size: self.batch_size,
             },
         )))
     }
@@ -314,8 +325,12 @@ mod tests {
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
             crate::worker::ipc::WorkerKind::Embed,
         );
-        let installer =
-            SBERTInstaller::new(EmbedderModel("m".to_string()), manager, "cpu".to_string());
+        let installer = SBERTInstaller::new(
+            EmbedderModel("m".to_string()),
+            manager,
+            "cpu".to_string(),
+            16,
+        );
         assert_eq!(installer.model.model_id(), "m");
         assert_eq!(installer.device, "cpu");
     }
@@ -331,6 +346,7 @@ mod tests {
             EmbedderModel("intfloat/e5-small-v2".to_string()),
             manager,
             "cpu".to_string(),
+            16,
         );
         let (tx, _) = tokio::sync::mpsc::channel(1);
         installer.install(dir.path(), tx).await.unwrap();
@@ -344,8 +360,12 @@ mod tests {
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
             crate::worker::ipc::WorkerKind::Embed,
         );
-        let installer =
-            SBERTInstaller::new(EmbedderModel("m".to_string()), manager, "cpu".to_string());
+        let installer = SBERTInstaller::new(
+            EmbedderModel("m".to_string()),
+            manager,
+            "cpu".to_string(),
+            16,
+        );
         assert!(!installer.is_available(dir.path()));
 
         *installer.dimension.lock().unwrap() = Some(128);
@@ -359,6 +379,7 @@ mod tests {
             )
             .0,
             "cpu".to_string(),
+            16,
         );
         assert!(builtin.is_available(dir.path()));
     }
@@ -374,6 +395,7 @@ mod tests {
             EmbedderModel("intfloat/e5-small-v2".to_string()),
             manager,
             "cpu".to_string(),
+            16,
         );
 
         // Build should succeed for built-in models
@@ -394,6 +416,7 @@ mod tests {
             EmbedderModel("custom/model".to_string()),
             manager,
             "cpu".to_string(),
+            16,
         );
 
         match installer.build(dir.path()) {

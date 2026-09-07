@@ -294,6 +294,22 @@
 
 ### Fixed
 
+- Indexing no longer takes the machine into swap collapse. How many texts the
+  embedding worker puts through the model at once is now a setting, under
+  Workers, and it defaults to sixteen. It is the only thing that decides the
+  worker's peak memory: not the size of a request, and not how many batches it
+  is split into — peak was flat across four of them — because
+  sentence-transformers sorts a request longest first and the first batch is
+  therefore always the largest chunks in it. Measured on a 24 GB machine
+  against the longest chunks a real corpus holds, peak footprint went 4.3 GB at
+  a batch of four, 5.6 at sixteen, 8.5 at twenty-four and past 9.5 at
+  thirty-two, on a model that occupies 1.9 GB at rest; at thirty-two, with the
+  rest of the machine, that was enough to leave every application on it paged
+  out and the kernel killing idle daemons to reclaim. Sixteen is the last size
+  before the curve turns sharp. Raise it where there is memory to spare — a
+  machine with more of it can afford more, which is why it is a setting and not
+  a constant — and lower it if indexing makes the machine swap.
+
 - Two workspaces reading at once no longer hold two copies of the same weights.
   A worker is bounded by a permit shared across the whole process rather than
   by the manager that starts it: the host builds a manager per worker kind per

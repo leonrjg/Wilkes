@@ -439,6 +439,7 @@ mod tests {
 
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
         let req = Box::new(WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "test".to_string(),
             role: WorkerRole::Embed(EmbeddingEngine::Fastembed),
             model: "test_model".to_string(),
@@ -501,6 +502,7 @@ mod tests {
 
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
         let req = Box::new(WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "test".to_string(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "m".to_string(),

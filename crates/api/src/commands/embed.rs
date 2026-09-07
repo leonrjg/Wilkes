@@ -13,6 +13,10 @@ use wilkes_core::types::{IndexStatus, RootCoverage, SelectedEmbedder};
 pub struct BuildIndexOptions {
     pub manager: Option<wilkes_core::worker::manager::WorkerManager>,
     pub device: Option<String>,
+    /// Texts the embedding worker may put through the model at once. Required
+    /// alongside the device, and for the same reason: both say what the
+    /// machine running the build can afford, and neither has a safe guess.
+    pub batch_size: Option<usize>,
     /// Where model artefacts are cached. One directory for the whole
     /// installation; never the workspace's own directory, or every workspace
     /// downloads the same model again and derives its own embedding-space
@@ -70,6 +74,11 @@ pub async fn download_model(
         selected.model,
         manager,
         device,
+        // Downloading artefacts runs no forward pass, so this installer never
+        // embeds anything and the value cannot matter. The default rather than
+        // a zero, so that an installer reused by mistake is slow rather than
+        // broken.
+        wilkes_core::types::SemanticSettings::default_embed_batch_size(),
     );
     installer.install(&model_dir, tx).await
 }
@@ -160,12 +169,16 @@ pub async fn build_index(
         .device
         .clone()
         .ok_or_else(|| anyhow::anyhow!("device is required for build_index"))?;
+    let batch_size = options
+        .batch_size
+        .ok_or_else(|| anyhow::anyhow!("batch_size is required for build_index"))?;
 
     let installer = wilkes_core::embed::dispatch::get_installer(
         selected.engine,
         selected.model,
         manager,
         device,
+        batch_size,
     );
 
     build_index_with_installer(root, installer, options).await
@@ -379,6 +392,7 @@ mod tests {
         assert_eq!(documents.len(), 1, "the walk is the caller's now");
 
         let options = BuildIndexOptions {
+            batch_size: Some(16),
             manager: None,
             device: None,
             model_dir: model_dir.clone(),
@@ -423,6 +437,7 @@ mod tests {
             root.clone(),
             Arc::new(TestEmbedder),
             BuildIndexOptions {
+                batch_size: Some(16),
                 manager: None,
                 device: None,
                 model_dir,
@@ -508,6 +523,7 @@ mod tests {
             other.clone(),
             Arc::new(TestEmbedder),
             BuildIndexOptions {
+                batch_size: Some(16),
                 manager: None,
                 device: None,
                 model_dir,
@@ -579,6 +595,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(10);
 
         let options = BuildIndexOptions {
+            batch_size: Some(16),
             manager: None,
             device: None,
             model_dir: model_dir.clone(),
@@ -606,6 +623,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let options = BuildIndexOptions {
+            batch_size: Some(16),
             manager: None,
             device: None,
             model_dir: dir.path().to_path_buf(),

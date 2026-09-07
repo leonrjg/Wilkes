@@ -13,6 +13,9 @@ pub struct WorkerEmbedderConfig {
     pub query_prefix: String,
     pub passage_prefix: String,
     pub embedding_space_identity: EmbeddingSpaceIdentity,
+    /// Texts the worker may put through the model at once. The user's resource
+    /// control for embedding; see `SemanticSettings::default_embed_batch_size`.
+    pub batch_size: usize,
 }
 
 /// Implements `Embedder` by dispatching to a worker subprocess via `WorkerManager`.
@@ -30,6 +33,7 @@ pub struct WorkerEmbedder {
     query_prefix: String,
     passage_prefix: String,
     embedding_space_identity: EmbeddingSpaceIdentity,
+    batch_size: usize,
 }
 
 impl WorkerEmbedder {
@@ -45,11 +49,13 @@ impl WorkerEmbedder {
             query_prefix: config.query_prefix,
             passage_prefix: config.passage_prefix,
             embedding_space_identity: config.embedding_space_identity,
+            batch_size: config.batch_size,
         }
     }
 
     fn send_embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         let request = WorkerRequest {
+            batch_size: self.batch_size,
             mode: "embed".to_string(),
             role: WorkerRole::Embed(self.engine),
             model: self.model_id.clone(),
@@ -166,6 +172,7 @@ mod tests {
             WorkerManager::new(paths, crate::worker::ipc::WorkerKind::Embed);
 
         let config = WorkerEmbedderConfig {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             model_id: "test-model".to_string(),
             dimension: 384,
             device: "cpu".to_string(),
@@ -202,6 +209,7 @@ mod tests {
         tokio::spawn(loop_fut);
 
         let config = WorkerEmbedderConfig {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             model_id: "test-model".to_string(),
             dimension: 384,
             device: "cpu".to_string(),
@@ -274,6 +282,7 @@ mod tests {
         tokio::spawn(loop_fut);
 
         let config = WorkerEmbedderConfig {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             model_id: "m".to_string(),
             dimension: 384,
             device: "cpu".to_string(),

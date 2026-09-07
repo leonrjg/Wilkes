@@ -2129,6 +2129,15 @@ pub struct SemanticSettings {
     /// Idle timeout for worker processes in seconds.
     #[serde(default = "SemanticSettings::default_worker_timeout")]
     pub worker_timeout_secs: u64,
+    /// Texts the embedding worker puts through the model in one forward pass.
+    ///
+    /// The resource control for embedding, and the only one: a request carries
+    /// however many chunks a document has, and the worker's peak memory is set
+    /// by its largest single batch rather than by the size of the request.
+    /// See [`SemanticSettings::default_embed_batch_size`] for what the default
+    /// is measured against.
+    #[serde(default = "SemanticSettings::default_embed_batch_size")]
+    pub embed_batch_size: usize,
 }
 
 #[derive(Deserialize)]
@@ -2149,6 +2158,8 @@ struct SemanticSettingsSerde {
     topic_cloud_input_cap: usize,
     #[serde(default = "SemanticSettings::default_worker_timeout")]
     worker_timeout_secs: u64,
+    #[serde(default = "SemanticSettings::default_embed_batch_size")]
+    embed_batch_size: usize,
 }
 
 #[derive(Deserialize)]
@@ -2173,6 +2184,8 @@ struct LegacySemanticSettingsSerde {
     topic_cloud_input_cap: usize,
     #[serde(default = "SemanticSettings::default_worker_timeout")]
     worker_timeout_secs: u64,
+    #[serde(default = "SemanticSettings::default_embed_batch_size")]
+    embed_batch_size: usize,
 }
 
 fn deserialize_custom_models<'de, D>(deserializer: D) -> Result<Vec<CustomModel>, D::Error>
@@ -2228,6 +2241,28 @@ impl SemanticSettings {
         crate::worker::DEFAULT_IDLE_TIMEOUT_SECS
     }
 
+    /// Sixteen.
+    ///
+    /// Measured, on the 24 GB machine this was found on, against the worst
+    /// batch a real corpus produces. It is the worst batch that matters and
+    /// not the average one: sentence-transformers sorts a request longest
+    /// first, so the first batch is always the largest chunks in it, and a
+    /// default that survives the average would fail on every document's first
+    /// batch. Against chunks of 4454 characters — the largest the index
+    /// actually holds — peak footprint went 4.3 GB at a batch of 4, 4.4 at 8,
+    /// 5.6 at 16, 7.7 at 20, 8.5 at 24, and past 9.5 at 32. Sixteen is the
+    /// last point before the curve turns sharp, and four times the throughput
+    /// of the timid end of it.
+    ///
+    /// Peak does not grow with the number of batches — it was flat across four
+    /// of them — so this bounds the whole run and not just one request.
+    ///
+    /// Machine-specific by nature: a machine with more memory can afford more,
+    /// and that is why it is a setting rather than a constant.
+    pub const fn default_embed_batch_size() -> usize {
+        16
+    }
+
     fn default_dimension() -> usize {
         384 // Default for AllMiniLML6V2
     }
@@ -2258,6 +2293,7 @@ impl<'de> Deserialize<'de> for SemanticSettings {
                 chunk_overlap: parsed.chunk_overlap,
                 topic_cloud_input_cap: parsed.topic_cloud_input_cap,
                 worker_timeout_secs: parsed.worker_timeout_secs,
+                embed_batch_size: parsed.embed_batch_size,
             })
         } else {
             let parsed = serde_json::from_value::<LegacySemanticSettingsSerde>(value)
@@ -2276,6 +2312,7 @@ impl<'de> Deserialize<'de> for SemanticSettings {
                 chunk_overlap: parsed.chunk_overlap,
                 topic_cloud_input_cap: parsed.topic_cloud_input_cap,
                 worker_timeout_secs: parsed.worker_timeout_secs,
+                embed_batch_size: parsed.embed_batch_size,
             })
         }
     }
@@ -2293,6 +2330,7 @@ impl Default for SemanticSettings {
             chunk_overlap: Self::default_chunk_overlap(),
             topic_cloud_input_cap: Self::default_topic_cloud_input_cap(),
             worker_timeout_secs: Self::default_worker_timeout(),
+            embed_batch_size: Self::default_embed_batch_size(),
         }
     }
 }

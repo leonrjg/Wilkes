@@ -739,6 +739,9 @@ pub struct CandleInstaller {
     pub model: EmbedderModel,
     pub manager: crate::worker::manager::WorkerManager,
     pub device: String,
+    /// Texts one forward pass may hold. Travels with the device because it is
+    /// the same kind of fact: what the machine this runs on can afford.
+    pub batch_size: usize,
 }
 
 impl CandleInstaller {
@@ -746,11 +749,13 @@ impl CandleInstaller {
         model: EmbedderModel,
         manager: crate::worker::manager::WorkerManager,
         device: String,
+        batch_size: usize,
     ) -> Self {
         Self {
             model,
             manager,
             device,
+            batch_size,
         }
     }
 }
@@ -828,6 +833,7 @@ impl EmbedderInstaller for CandleInstaller {
                 query_prefix: prefixes.query_prefix,
                 passage_prefix: prefixes.passage_prefix,
                 embedding_space_identity,
+                batch_size: self.batch_size,
             },
         )))
     }
@@ -1220,8 +1226,12 @@ mod tests {
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
             crate::worker::ipc::WorkerKind::Embed,
         );
-        let installer =
-            CandleInstaller::new(EmbedderModel("m1".to_string()), manager, "cpu".to_string());
+        let installer = CandleInstaller::new(
+            EmbedderModel("m1".to_string()),
+            manager,
+            "cpu".to_string(),
+            16,
+        );
         assert_eq!(installer.model.0, "m1");
 
         assert!(!installer.is_available(dir.path()));
@@ -1248,8 +1258,12 @@ mod tests {
             crate::worker::manager::WorkerPaths::resolve(dir.path()),
             crate::worker::ipc::WorkerKind::Embed,
         );
-        let installer =
-            CandleInstaller::new(EmbedderModel("m1".to_string()), manager, "cpu".to_string());
+        let installer = CandleInstaller::new(
+            EmbedderModel("m1".to_string()),
+            manager,
+            "cpu".to_string(),
+            16,
+        );
 
         // Mock it so it skips download
         let repo_dir = dir.path().join("models--m1");

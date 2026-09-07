@@ -42,7 +42,7 @@ vi.mock("./services", () => ({
       max_file_size: 1024,
       theme: "Dark",
       search_prefer_semantic: false,
-      semantic: { enabled: true, index_path: null, worker_timeout_secs: 300 },
+      semantic: { enabled: true, index_path: null, worker_timeout_secs: 300, embed_batch_size: 16 },
       generation: {
         enabled: false,
         engine: "candle",

@@ -740,6 +740,7 @@ mod tests {
 
     fn embed_request(model: &str) -> WorkerRequest {
         WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: model.to_string(),
             device: "cpu".to_string(),
@@ -964,6 +965,7 @@ mod tests {
         });
 
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             role: WorkerRole::Generate(GenerationEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
@@ -1101,6 +1103,7 @@ mod tests {
         let (mut runtime, spawn_calls, _send_calls, shutdown_calls, _tx, _event_rx) =
             test_runtime();
         let first = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
@@ -1146,6 +1149,7 @@ mod tests {
     #[test]
     fn test_serialize_request_for_worker_round_trips_json() {
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
@@ -1193,6 +1197,7 @@ mod tests {
         let (mut runtime, spawn_calls, send_calls, shutdown_calls, _tx, mut event_rx) =
             test_runtime();
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
@@ -1286,6 +1291,7 @@ mod tests {
         );
 
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
@@ -1312,6 +1318,7 @@ mod tests {
         let (mut runtime, spawn_calls, _send_calls, _shutdown_calls, _tx, _event_rx) =
             test_runtime();
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
@@ -1339,6 +1346,7 @@ mod tests {
         let (mut runtime, spawn_calls, _send_calls, shutdown_calls, _tx, _event_rx) =
             test_runtime();
         let first = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
@@ -1372,6 +1380,7 @@ mod tests {
         let (mut runtime, _spawn_calls, _send_calls, _shutdown_calls, _tx, _event_rx) =
             test_runtime();
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),
@@ -1434,6 +1443,7 @@ mod tests {
         );
 
         let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             role: WorkerRole::Embed(EmbeddingEngine::Candle),
             model: "model-a".to_string(),
             device: "cpu".to_string(),

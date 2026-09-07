@@ -7,6 +7,7 @@ import {
   within,
 } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { capturePointer, pointerEvent } from "../test/pointerDrag";
 import { ToastProvider } from "./Toast";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
@@ -182,18 +183,19 @@ describe("ResultList", () => {
 
     const target = screen.getByRole("button", { name: "Collapse folder target" });
     const dragged = screen.getByRole("button", { name: /file\.txt/i });
-    expect(dragged).toHaveAttribute("draggable", "true");
+    expect(dragged).toHaveAttribute("draggable", "false");
     mockListFiles.mockClear();
-
-    const values = new Map<string, string>();
-    const dataTransfer = {
-      effectAllowed: "none",
-      dropEffect: "none",
-      setData: (type: string, value: string) => values.set(type, value),
-      getData: (type: string) => values.get(type) ?? "",
-    };
-    fireEvent.dragStart(dragged, { dataTransfer });
-    fireEvent.drop(target, { dataTransfer });
+    capturePointer(dragged);
+    const originalHitTest = Object.getOwnPropertyDescriptor(document, "elementFromPoint");
+    Object.defineProperty(document, "elementFromPoint", { configurable: true, value: () => target });
+    try {
+      pointerEvent(dragged, "pointerdown");
+      pointerEvent(window, "pointermove", { clientX: 40 });
+      pointerEvent(window, "pointerup", { clientX: 40, buttons: 0 });
+    } finally {
+      if (originalHitTest) Object.defineProperty(document, "elementFromPoint", originalHitTest);
+      else Reflect.deleteProperty(document, "elementFromPoint");
+    }
 
     await waitFor(() => expect(mockMoveFile).toHaveBeenCalledWith("/test/file.txt", "/test/target"));
     await waitFor(() => expect(mockListFiles).toHaveBeenCalledWith("/test"));

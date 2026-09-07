@@ -310,6 +310,10 @@ struct JobScope {
 struct BuildIndexPlan {
     root_path: PathBuf,
     device: String,
+    /// Texts one forward pass may hold, read from the settings with the device
+    /// and carried with it: a build that ran under one is not the same build
+    /// under another, and neither has a safe guess at the call site.
+    batch_size: usize,
     chunk_size: usize,
     chunk_overlap: usize,
     supported_extensions: Vec<String>,
@@ -326,6 +330,8 @@ struct BuildIndexPlan {
 #[derive(Clone, Debug)]
 struct DownloadModelPlan {
     device: String,
+    /// Read with the device: the embedder this plan later loads embeds with it.
+    batch_size: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -333,6 +339,8 @@ struct RestoreStatePlan {
     db_status: IndexStatus,
     selected: SelectedEmbedder,
     device: String,
+    /// Read with the device, from the same settings, for the same reason.
+    batch_size: usize,
 }
 
 struct RestoreLoadedState {
@@ -2312,6 +2320,7 @@ impl AppContext {
             selected.model.clone(),
             self.worker_manager.clone(),
             device,
+            settings.semantic.embed_batch_size,
         );
         let (progress_tx, _progress_rx) = mpsc::channel(8);
         installer
@@ -7286,6 +7295,7 @@ impl AppContext {
         Ok(BuildIndexPlan {
             root_path,
             device: settings.semantic.device_for(selected.engine).to_string(),
+            batch_size: settings.semantic.embed_batch_size,
             chunk_size: settings.semantic.chunk_size,
             chunk_overlap: settings.semantic.chunk_overlap,
             supported_extensions: settings.supported_extensions.clone(),
@@ -7427,6 +7437,7 @@ impl AppContext {
 
         Ok(DownloadModelPlan {
             device: settings.semantic.device_for(selected.engine).to_string(),
+            batch_size: settings.semantic.embed_batch_size,
         })
     }
 
@@ -7444,6 +7455,7 @@ impl AppContext {
         crate::commands::embed::BuildIndexOptions {
             manager: Some(manager),
             device: Some(plan.device.clone()),
+            batch_size: Some(plan.batch_size),
             model_dir,
             index_dir,
             reporter,
@@ -7841,6 +7853,7 @@ impl AppContext {
                             selected.clone(),
                             manager,
                             plan.device.clone(),
+                            plan.batch_size,
                         )
                         .await
                     {
@@ -7865,9 +7878,15 @@ impl AppContext {
         selected: SelectedEmbedder,
         manager: WorkerManager,
         device: String,
+        batch_size: usize,
     ) -> Result<(), String> {
-        let installer =
-            dispatch::get_installer(selected.engine, selected.model.clone(), manager, device);
+        let installer = dispatch::get_installer(
+            selected.engine,
+            selected.model.clone(),
+            manager,
+            device,
+            batch_size,
+        );
         self.probe_and_load_downloaded_model_with(installer).await
     }
 
@@ -8152,6 +8171,7 @@ impl AppContext {
         } else {
             RestoreStatePreparation::Ready(RestoreStatePlan {
                 device: settings.semantic.device_for(selected.engine).to_string(),
+                batch_size: settings.semantic.embed_batch_size,
                 db_status,
                 selected,
             })
@@ -8214,7 +8234,7 @@ impl AppContext {
         let plan = self.load_restore_plan(settings).await?;
 
         let embedder = self
-            .restore_embedder(&plan.selected, plan.device.clone())
+            .restore_embedder(&plan.selected, plan.device.clone(), plan.batch_size)
             .await?;
         let index = self
             .restore_index(&plan.selected, embedder.dimension())
@@ -8246,12 +8266,14 @@ impl AppContext {
         &self,
         selected: &SelectedEmbedder,
         device: String,
+        batch_size: usize,
     ) -> Option<Arc<dyn Embedder>> {
         let installer = dispatch::get_installer(
             selected.engine,
             selected.model.clone(),
             self.worker_manager.clone(),
             device,
+            batch_size,
         );
         self.restore_embedder_with(installer).await
     }
@@ -11184,6 +11206,7 @@ mod tests {
     fn test_build_index_options_and_cleanup_partial_files() {
         let dir = tempdir().unwrap();
         let plan = BuildIndexPlan {
+            batch_size: 16,
             root_path: dir.path().join("root"),
             device: "cpu".to_string(),
             chunk_size: 123,
@@ -11478,6 +11501,7 @@ mod tests {
         )
         .unwrap();
         let plan = RestoreStatePlan {
+            batch_size: 16,
             db_status: IndexStatus {
                 indexed_files: 1,
                 total_chunks: 1,
@@ -12066,6 +12090,7 @@ mod tests {
         )
         .unwrap();
         let plan = BuildIndexPlan {
+            batch_size: 16,
             root_path: root.clone(),
             device: "cpu".to_string(),
             chunk_size: 64,
@@ -12160,6 +12185,7 @@ mod tests {
         std::fs::write(&stale, "stale").unwrap();
 
         let plan = BuildIndexPlan {
+            batch_size: 16,
             root_path: root,
             device: "cpu".to_string(),
             chunk_size: 64,
@@ -12231,6 +12257,7 @@ exit 0
         std::fs::create_dir_all(&root).unwrap();
 
         let plan = BuildIndexPlan {
+            batch_size: 16,
             root_path: root,
             device: "cpu".to_string(),
             chunk_size: 64,
@@ -14601,6 +14628,7 @@ exit 0
         );
 
         let plan = DownloadModelPlan {
+            batch_size: 16,
             device: "cpu".to_string(),
         };
         let selected = SelectedEmbedder {

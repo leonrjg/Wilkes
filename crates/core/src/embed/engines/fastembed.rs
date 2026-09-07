@@ -389,6 +389,9 @@ pub struct FastembedInstaller {
     pub model: EmbedderModel,
     pub manager: crate::worker::manager::WorkerManager,
     pub device: String,
+    /// Texts one forward pass may hold. Travels with the device because it is
+    /// the same kind of fact: what the machine this runs on can afford.
+    pub batch_size: usize,
 }
 
 impl FastembedInstaller {
@@ -396,11 +399,13 @@ impl FastembedInstaller {
         model: EmbedderModel,
         manager: crate::worker::manager::WorkerManager,
         device: String,
+        batch_size: usize,
     ) -> Self {
         Self {
             model,
             manager,
             device,
+            batch_size,
         }
     }
 }
@@ -462,6 +467,7 @@ impl EmbedderInstaller for FastembedInstaller {
                 query_prefix: prefixes.query_prefix,
                 passage_prefix: prefixes.passage_prefix,
                 embedding_space_identity,
+                batch_size: self.batch_size,
             },
         )))
     }
@@ -558,6 +564,7 @@ mod tests {
             EmbedderModel("BGEBaseENV15".to_string()),
             manager,
             "cpu".to_string(),
+            16,
         );
         assert_eq!(installer.model.0, "BGEBaseENV15");
 
@@ -598,6 +605,7 @@ mod tests {
             EmbedderModel("BGEBaseENV15".to_string()),
             manager,
             "cpu".to_string(),
+            16,
         );
 
         let (tx, _rx) = tokio::sync::mpsc::channel(2);
@@ -627,6 +635,7 @@ mod tests {
             EmbedderModel("BGEBaseENV15".to_string()),
             manager,
             "cpu".to_string(),
+            16,
         );
         assert!(!installer.is_available(dir.path()));
     }
@@ -662,6 +671,7 @@ mod tests {
             EmbedderModel("BGEBaseENV15".to_string()),
             manager,
             "cpu".to_string(),
+            16,
         );
         let avail = installer.is_available(dir.path());
         assert!(avail);

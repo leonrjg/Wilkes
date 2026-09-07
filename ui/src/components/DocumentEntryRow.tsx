@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type React from "react";
 import { Folder, Tag as TagIcon } from "react-feather";
 import { Tooltip } from "@leonrjg/wilkes-reader";
+import type { FileTreeDragProps } from "./FileTree";
 import type { FileType, Tag } from "../lib/types";
 
 export type DetailIcon = React.ComponentType<React.SVGProps<SVGSVGElement> & { size?: number }>;
@@ -37,10 +38,7 @@ interface Props {
   onClick: () => void;
   onContextMenu?: (event: React.MouseEvent) => void;
   onTagClick?: (tag: Tag) => void;
-  draggable?: boolean;
-  onDragStart?: (event: React.DragEvent<HTMLButtonElement>) => void;
-  onDrag?: (event: React.DragEvent<HTMLButtonElement>) => void;
-  onDragEnd?: (event: React.DragEvent<HTMLButtonElement>) => void;
+  drag?: FileTreeDragProps;
 }
 
 export function fileName(path: string): string {
@@ -57,10 +55,7 @@ export function DocumentEntryRow({
   onClick,
   onContextMenu,
   onTagClick,
-  draggable = false,
-  onDragStart,
-  onDrag,
-  onDragEnd,
+  drag,
 }: Props) {
   const visibleDetails = details.filter(
     (field) =>
@@ -105,12 +100,9 @@ export function DocumentEntryRow({
       type="button"
       onClick={onClick}
       onContextMenu={onContextMenu}
-      draggable={draggable}
-      onDragStart={onDragStart}
-      onDrag={onDrag}
-      onDragEnd={onDragEnd}
+      {...drag}
       className={`w-full flex select-none flex-col gap-1 px-3 py-1.5 text-left hover:bg-[var(--bg-hover)] transition-colors ${
-        draggable ? "cursor-grab active:cursor-grabbing" : ""
+        drag?.onPointerDown ? "cursor-grab active:cursor-grabbing" : ""
       } ${
         selected ? "bg-[var(--bg-active)]" : ""
       }`}

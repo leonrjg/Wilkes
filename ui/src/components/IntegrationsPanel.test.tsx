@@ -21,6 +21,7 @@ function settings(enabled = false): Settings {
       chunk_size: 600,
       chunk_overlap: 128,
       worker_timeout_secs: 300,
+      embed_batch_size: 16,
     },
     integrations: {
       zotero: {

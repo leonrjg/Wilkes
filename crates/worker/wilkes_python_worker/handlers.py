@@ -1,7 +1,7 @@
 import numpy as np
 
 from .ipc import emit
-from .models import get_model, safe_encode
+from .models import DEFAULT_BATCH_SIZE, get_model, safe_encode
 from .protocol import WorkerRequest, event_done, event_embeddings, event_error, event_info
 
 
@@ -15,8 +15,20 @@ def embed_texts(request: WorkerRequest) -> None:
         emit(event_done())
         return
 
+    # The host's setting, not a constant here: it is the user's resource
+    # control, and the host is what holds the settings. Absent only when a
+    # host older than this worker sent the request, which is the one case the
+    # worker's own default is the right answer for.
+    batch_size = request.get("batch_size", DEFAULT_BATCH_SIZE)
+    if not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError(
+            f"batch_size must be a positive integer, got {batch_size!r}"
+        )
+
     model = get_model(model_id, device)
-    embeddings = safe_encode(model, texts, show_progress_bar=True)
+    embeddings = safe_encode(
+        model, texts, batch_size=batch_size, show_progress_bar=True
+    )
     emit(event_embeddings(embeddings.tolist()))
     emit(event_done())
 

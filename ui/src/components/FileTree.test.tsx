@@ -1,7 +1,8 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { capturePointer, pointerEvent } from "../test/pointerDrag";
 import type { FileEntry } from "../lib/types";
-import FileTree, { buildFileTree, FILE_TREE_DRAG_TYPE } from "./FileTree";
+import FileTree, { buildFileTree } from "./FileTree";
 
 const file = (path: string): FileEntry => ({
   path,
@@ -9,6 +10,25 @@ const file = (path: string): FileEntry => ({
   file_type: "PlainText",
   extension: "txt",
 });
+
+const originalElementFromPoint = Object.getOwnPropertyDescriptor(document, "elementFromPoint");
+
+afterEach(() => {
+  if (originalElementFromPoint) {
+    Object.defineProperty(document, "elementFromPoint", originalElementFromPoint);
+  } else {
+    Reflect.deleteProperty(document, "elementFromPoint");
+  }
+});
+
+function stubElementFromPoint(element: Element): ReturnType<typeof vi.fn> {
+  const implementation = vi.fn(() => element);
+  Object.defineProperty(document, "elementFromPoint", {
+    configurable: true,
+    value: implementation,
+  });
+  return implementation;
+}
 
 describe("FileTree", () => {
   it("groups the recursive listing into real containing-folder paths", () => {
@@ -64,133 +84,226 @@ describe("FileTree", () => {
     expect(screen.getByRole("button", { name: "Collapse folder articles" })).toBeInTheDocument();
   });
 
-  it("starts expanded, collapses folders, and moves a dragged file into the dropped-on folder", () => {
+  function setup(movable = true) {
     const onMove = vi.fn().mockResolvedValue(undefined);
-    render(
-      <FileTree
-        root="/library"
-        files={[file("/library/root.txt"), file("/library/articles/paper.txt")]}
-        movable
-        onMove={onMove}
-        renderFile={(entry, drag) => (
-          <button {...drag}>{entry.path.split("/").pop()}</button>
-        )}
-      />,
-    );
-
-    expect(screen.getByText("root.txt")).toBeInTheDocument();
-    expect(screen.getByText("paper.txt")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Collapse folder articles" }));
-    expect(screen.queryByText("paper.txt")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Expand folder articles" }));
-    expect(screen.getByText("paper.txt")).toBeInTheDocument();
-
-    const values = new Map<string, string>();
-    const dataTransfer = {
-      effectAllowed: "none",
-      dropEffect: "none",
-      setData: (type: string, value: string) => values.set(type, value),
-      getData: (type: string) => values.get(type) ?? "",
+    const onClick = vi.fn();
+    const props = {
+      root: "/library",
+      files: [
+        file("/library/source/paper.txt"),
+        file("/library/parent/inside.txt"),
+        file("/library/other.txt"),
+      ],
+      directories: ["/library/parent/child", "/library/second"],
+      movable,
+      onMove,
+      renderFile: (entry: FileEntry, drag: import("./FileTree").FileTreeDragProps) => (
+        <button {...drag} onClick={onClick}>{entry.path.split("/").pop()}</button>
+      ),
     };
-    fireEvent.dragStart(screen.getByText("paper.txt"), { dataTransfer });
-    expect(values.get(FILE_TREE_DRAG_TYPE)).toBe("/library/articles/paper.txt");
-    // The root has no row of its own, so its drop target is the tree container.
-    const root = screen.getByRole("tree");
-    fireEvent.dragEnter(root, { dataTransfer });
-    expect(root.className).toContain("ring-[var(--accent-blue)]");
-    fireEvent.drop(root, {
-      dataTransfer,
-    });
+    const view = render(<FileTree {...props} />);
+    const source = screen.getByText("paper.txt");
+    const parent = screen.getByRole("button", { name: "Collapse folder parent" });
+    const child = screen.getByRole("button", { name: "Collapse folder child" });
+    const second = screen.getByRole("button", { name: "Collapse folder second" });
+    capturePointer(source);
+    const hit = stubElementFromPoint(parent);
+    const start = () => {
+      pointerEvent(source, "pointerdown");
+      pointerEvent(window, "pointermove", { clientX: 40, clientY: 40 });
+    };
+    const release = () => pointerEvent(window, "pointerup", { clientX: 40, clientY: 40, buttons: 0 });
+    return { ...view, props, source, parent, child, second, hit, start, release, onMove, onClick };
+  }
 
-    expect(onMove).toHaveBeenCalledWith("/library/articles/paper.txt", "/library");
+  it("moves once to the highlighted nested folder, using coordinates despite pointer capture", () => {
+    const { source, parent, child, hit, start, release, onMove } = setup();
+    start();
+    expect(screen.getByText("Drop here").closest("button")).toBe(parent);
+    hit.mockReturnValue(child.querySelector("span")!);
+    pointerEvent(source, "pointermove", { clientX: 40, clientY: 60 });
+    expect(screen.getByText("Drop here").closest("button")).toBe(child);
+    release();
+    release();
+    expect(onMove).toHaveBeenCalledExactlyOnceWith("/library/source/paper.txt", "/library/parent/child");
+    expect(source.releasePointerCapture).toHaveBeenCalledWith(1);
   });
 
-  it("makes an empty folder's whole tree item a clear drop target", () => {
-    const onMove = vi.fn().mockResolvedValue(undefined);
-    render(
-      <FileTree
-        root="/library"
-        files={[file("/library/paper.txt")]}
-        directories={["/library/empty"]}
-        movable
-        onMove={onMove}
-        renderFile={(entry, drag) => <button {...drag}>{entry.path.split("/").pop()}</button>}
-      />,
-    );
-
-    const dataTransfer = {
-      effectAllowed: "none",
-      dropEffect: "none",
-      setData: vi.fn(),
-      getData: vi.fn(() => ""),
-    };
-    fireEvent.dragStart(screen.getByText("paper.txt"), { dataTransfer });
-    const emptyFolder = screen
-      .getByRole("button", { name: "Collapse folder empty" })
-      .closest("li")!;
-    fireEvent.dragEnter(emptyFolder, { dataTransfer });
-    expect(screen.getByText("Drop here")).toBeInTheDocument();
-    fireEvent.drop(emptyFolder, { dataTransfer });
-
-    expect(onMove).toHaveBeenCalledWith("/library/paper.txt", "/library/empty");
-  });
-
-  it("moves to the visibly highlighted folder when the webview swallows drop", () => {
-    const onMove = vi.fn().mockResolvedValue(undefined);
-    render(
-      <FileTree
-        root="/library"
-        files={[file("/library/paper.txt")]}
-        directories={["/library/empty"]}
-        movable
-        onMove={onMove}
-        renderFile={(entry, drag) => <button {...drag}>{entry.path.split("/").pop()}</button>}
-      />,
-    );
-
-    const dataTransfer = {
-      effectAllowed: "none",
-      dropEffect: "none",
-      setData: vi.fn(),
-      getData: vi.fn(() => ""),
-    };
-    const draggedFile = screen.getByText("paper.txt");
-    fireEvent.dragStart(draggedFile, { dataTransfer });
-    fireEvent.dragEnter(screen.getByRole("button", { name: "Collapse folder empty" }), {
-      dataTransfer,
-    });
-    fireEvent.dragEnd(draggedFile, { clientX: 0, clientY: 0, dataTransfer });
-
-    expect(onMove).toHaveBeenCalledWith("/library/paper.txt", "/library/empty");
-  });
-
-  it("does not use the drag-end fallback after the user cancels with Escape", () => {
-    const onMove = vi.fn().mockResolvedValue(undefined);
-    render(
-      <FileTree
-        root="/library"
-        files={[file("/library/paper.txt")]}
-        directories={["/library/empty"]}
-        movable
-        onMove={onMove}
-        renderFile={(entry, drag) => <button {...drag}>{entry.path.split("/").pop()}</button>}
-      />,
-    );
-
-    const dataTransfer = {
-      effectAllowed: "none",
-      dropEffect: "none",
-      setData: vi.fn(),
-      getData: vi.fn(() => ""),
-    };
-    const draggedFile = screen.getByText("paper.txt");
-    fireEvent.dragStart(draggedFile, { dataTransfer });
-    fireEvent.dragEnter(screen.getByRole("button", { name: "Collapse folder empty" }), {
-      dataTransfer,
-    });
-    fireEvent.keyDown(window, { key: "Escape" });
-    fireEvent.dragEnd(draggedFile, { clientX: 0, clientY: 0, dataTransfer });
-
+  it("cancels when release disagrees with the last highlighted folder", () => {
+    const { hit, second, start, release, onMove } = setup();
+    start();
+    hit.mockReturnValue(second);
+    release();
     expect(onMove).not.toHaveBeenCalled();
+  });
+
+  it("moves into a folder when dropped over a file within that folder", () => {
+    const { hit, parent, start, release, onMove } = setup();
+    hit.mockReturnValue(screen.getByText("inside.txt"));
+    start();
+    expect(screen.getByText("Drop here").closest("button")).toBe(parent);
+    release();
+    expect(onMove).toHaveBeenCalledExactlyOnceWith("/library/source/paper.txt", "/library/parent");
+  });
+
+  it("uses the enclosing folder when dropped on its subtree padding", () => {
+    const { hit, parent, start, release, onMove } = setup();
+    hit.mockReturnValue(parent.parentElement!);
+    start();
+    expect(screen.getByText("Drop here").closest("button")).toBe(parent);
+    release();
+    expect(onMove).toHaveBeenCalledExactlyOnceWith("/library/source/paper.txt", "/library/parent");
+  });
+
+  it.each(["outside", "root-level file", "another tree"])("does not move on %s", (where) => {
+    const { hit, start, release, onMove } = setup();
+    start();
+    const foreign = document.createElement("button");
+    foreign.dataset.fileTreeFolderPath = "/foreign";
+    hit.mockReturnValue(where === "root-level file" ? screen.getByText("other.txt") : foreign);
+    pointerEvent(window, "pointermove", { clientX: 50 });
+    expect(screen.queryByText("Drop here")).not.toBeInTheDocument();
+    release();
+    expect(onMove).not.toHaveBeenCalled();
+  });
+
+  it("moves to root only on its own empty space", () => {
+    const { hit, start, release, onMove } = setup();
+    hit.mockReturnValue(screen.getByRole("tree"));
+    start();
+    expect(screen.getByRole("tree").className).toContain("ring-[var(--accent-blue)]");
+    release();
+    expect(onMove).toHaveBeenCalledExactlyOnceWith("/library/source/paper.txt", "/library");
+  });
+
+  it("does not move to the file's current folder", () => {
+    const { hit, start, release, onMove } = setup();
+    hit.mockReturnValue(screen.getByRole("button", { name: "Collapse folder source" }));
+    start();
+    expect(screen.getByText("Already here")).toBeInTheDocument();
+    release();
+    expect(onMove).not.toHaveBeenCalled();
+  });
+
+  it.each(["Escape", "pointercancel", "lostpointercapture", "blur", "buttons released"])(
+    "cancels on %s without moving on a later release", (reason) => {
+      const { source, start, release, onMove } = setup();
+      start();
+      if (reason === "Escape") fireEvent.keyDown(window, { key: "Escape" });
+      else if (reason === "blur") fireEvent(window, new Event("blur"));
+      else if (reason === "buttons released") pointerEvent(window, "pointermove", { buttons: 0 });
+      else pointerEvent(reason === "lostpointercapture" ? source : window, reason);
+      expect(screen.queryByText("Drop here")).not.toBeInTheDocument();
+      release();
+      expect(onMove).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps ordinary clicks and suppresses the click following a drag", () => {
+    const { source, start, release, onClick, onMove } = setup();
+    pointerEvent(source, "pointerdown");
+    pointerEvent(window, "pointermove", { clientX: 22 });
+    release();
+    fireEvent.click(source, { detail: 1 });
+    expect(onClick).toHaveBeenCalledTimes(1);
+    expect(onMove).not.toHaveBeenCalled();
+    start();
+    release();
+    fireEvent.click(source, { detail: 1 });
+    expect(onClick).toHaveBeenCalledTimes(1);
+    pointerEvent(source, "pointerdown");
+    release();
+    fireEvent.click(source, { detail: 1 });
+    expect(onClick).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores other pointers and secondary buttons", () => {
+    const { source, start, release, onMove } = setup();
+    pointerEvent(source, "pointerdown", { button: 2 });
+    pointerEvent(window, "pointermove", { clientX: 50 });
+    release();
+    expect(onMove).not.toHaveBeenCalled();
+    start();
+    pointerEvent(window, "pointercancel", { pointerId: 2 });
+    pointerEvent(window, "pointerup", { pointerId: 2 });
+    expect(onMove).not.toHaveBeenCalled();
+    release();
+    expect(onMove).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables movement in a read-only tree", () => {
+    const { start, release, onMove } = setup(false);
+    start();
+    release();
+    expect(onMove).not.toHaveBeenCalled();
+    expect(screen.queryByText("Drop here")).not.toBeInTheDocument();
+  });
+
+  it.each(["root", "permission", "unmount"])("cancels when %s changes", (change) => {
+    const { start, release, onMove, rerender, unmount, props } = setup();
+    start();
+    if (change === "unmount") unmount();
+    else rerender(<FileTree {...props} root={change === "root" ? "/new" : props.root} movable={change !== "permission"} />);
+    release();
+    expect(onMove).not.toHaveBeenCalled();
+  });
+
+  it("recomputes the highlight after scrolling under a stationary pointer", () => {
+    let tick: FrameRequestCallback = () => {};
+    const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => { tick = callback; return 1; });
+    const { hit, second, start, release, onMove } = setup();
+    start();
+    hit.mockReturnValue(second);
+    fireEvent.scroll(screen.getByRole("tree"));
+    act(() => tick(performance.now() + 16));
+    expect(screen.getByText("Drop here").closest("button")).toBe(second);
+    release();
+    expect(onMove).toHaveBeenCalledExactlyOnceWith("/library/source/paper.txt", "/library/second");
+    raf.mockRestore();
+  });
+
+  it("auto-scrolls near the sidebar edge and stops on cancellation", () => {
+    let tick: FrameRequestCallback = () => {};
+    const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => { tick = callback; return 123; });
+    const cancel = vi.spyOn(window, "cancelAnimationFrame");
+    const { start, release, onMove } = setup();
+    const scroller = screen.getByRole("tree").parentElement!;
+    scroller.style.overflowY = "auto";
+    Object.defineProperties(scroller, { scrollHeight: { value: 800 }, clientHeight: { value: 200 } });
+    vi.spyOn(scroller, "getBoundingClientRect").mockReturnValue({
+      left: 0, right: 300, top: 0, bottom: 200, width: 300, height: 200, x: 0, y: 0,
+      toJSON: () => ({}),
+    });
+    start();
+    pointerEvent(window, "pointermove", { clientX: 40, clientY: 190 });
+    act(() => tick(performance.now() + 16));
+    expect(scroller.scrollTop).toBeGreaterThan(0);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(cancel).toHaveBeenCalledWith(123);
+    release();
+    expect(onMove).not.toHaveBeenCalled();
+    raf.mockRestore();
+    cancel.mockRestore();
+  });
+
+  it("does not use a stale target when release coordinates are invalid", () => {
+    const { start, onMove } = setup();
+    start();
+    pointerEvent(window, "pointerup", { clientX: NaN, clientY: NaN, buttons: 0 });
+    expect(onMove).not.toHaveBeenCalled();
+  });
+
+  it("expands a closed hovered folder after a delay", () => {
+    let tick: FrameRequestCallback = () => {};
+    const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => { tick = callback; return 1; });
+    const { parent, start, release } = setup();
+    fireEvent.click(parent);
+    expect(screen.queryByRole("button", { name: "Collapse folder child" })).not.toBeInTheDocument();
+    start();
+    expect(screen.queryByRole("button", { name: "Collapse folder child" })).not.toBeInTheDocument();
+    act(() => tick(performance.now() + 650));
+    expect(screen.getByRole("button", { name: "Collapse folder child" })).toBeInTheDocument();
+    release();
+    raf.mockRestore();
   });
 });

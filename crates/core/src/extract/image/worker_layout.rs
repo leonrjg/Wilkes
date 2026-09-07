@@ -133,6 +133,7 @@ impl LayoutModel for WorkerLayout {
         }
 
         let request = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "layout".to_string(),
             role: WorkerRole::Layout(self.engine),
             model: self.model_id.clone(),

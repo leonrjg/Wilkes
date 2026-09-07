@@ -45,6 +45,7 @@ impl WorkerGenerator {
 
     fn worker_request(&self, req: GenerationRequest) -> WorkerRequest {
         WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
             mode: "generate".to_string(),
             role: WorkerRole::Generate(self.engine),
             model: self.model_id.clone(),

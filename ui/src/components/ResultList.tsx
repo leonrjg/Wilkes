@@ -1306,10 +1306,7 @@ function FileEntryRowAdapter({
       accessory={accessory}
       selected={selected}
       muted={muted}
-      draggable={drag?.draggable}
-      onDragStart={drag?.onDragStart}
-      onDrag={drag?.onDrag}
-      onDragEnd={drag?.onDragEnd}
+      drag={drag}
       onClick={onClick}
       onContextMenu={onContextMenu}
       onTagClick={(tag) => useResearchStore.getState().setSelectedTag(tag.id)}

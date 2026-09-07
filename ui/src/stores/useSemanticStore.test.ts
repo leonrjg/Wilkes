@@ -38,6 +38,7 @@ describe("useSemanticStore", () => {
         chunk_size: 1000,
         chunk_overlap: 200,
         worker_timeout_secs: 300,
+        embed_batch_size: 16,
       },
       load: async () => {
         const settings = await (api as any).getSettings();
@@ -208,6 +209,7 @@ describe("useSemanticStore", () => {
         chunk_size: 1000,
         chunk_overlap: 200,
         worker_timeout_secs: 300,
+        embed_batch_size: 16,
       },
     });
     (api.getIndexStatus as any).mockResolvedValue({

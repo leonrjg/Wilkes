@@ -17,6 +17,7 @@ class WorkerRequest(TypedDict):
     model: str                      # HuggingFace model ID
     device: str                     # "auto" | "cpu" | "mps" | "cuda"
     texts: Optional[List[str]]      # present in "embed" mode
+    batch_size: int                 # present in "embed" mode: texts per forward pass
 
 
 # ── Outbound (Python → Rust, emitted as JSON lines on stdout) ─────────────────

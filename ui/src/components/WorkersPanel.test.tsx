@@ -12,6 +12,7 @@ describe("WorkersPanel", () => {
   const mockSettings = {
     semantic: {
       worker_timeout_secs: 300,
+      embed_batch_size: 16,
     },
   } as any;
 
@@ -183,7 +184,7 @@ describe("WorkersPanel", () => {
     const input = screen.getByPlaceholderText("300");
     fireEvent.change(input, { target: { value: "600" } });
     
-    const applyButton = screen.getByText("Apply");
+    const applyButton = screen.getByLabelText("Apply idle timeout");
     await act(async () => {
       fireEvent.click(applyButton);
     });
@@ -194,6 +195,41 @@ describe("WorkersPanel", () => {
     }));
   });
 
+  it("applies a new embedding batch size", async () => {
+    await act(async () => {
+      render(<WorkersPanel api={mockApi} settings={mockSettings} onUpdateSettings={mockOnUpdateSettings} />);
+    });
+
+    fireEvent.change(screen.getByPlaceholderText("16"), { target: { value: "8" } });
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Apply embedding batch size"));
+    });
+
+    expect(mockOnUpdateSettings).toHaveBeenCalledWith(expect.objectContaining({
+      semantic: expect.objectContaining({ embed_batch_size: 8 })
+    }));
+  });
+
+  // The control that decides whether a build fits in memory. A value that is
+  // not a batch size is refused and said so, rather than quietly becoming one
+  // the user never chose and cannot see.
+  it.each([["0", "zero"], ["-4", "negative"], ["", "empty"]])(
+    "refuses a %s batch size rather than substituting one",
+    async (value) => {
+      await act(async () => {
+        render(<WorkersPanel api={mockApi} settings={mockSettings} onUpdateSettings={mockOnUpdateSettings} />);
+      });
+
+      fireEvent.change(screen.getByPlaceholderText("16"), { target: { value } });
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText("Apply embedding batch size"));
+      });
+
+      expect(mockOnUpdateSettings).not.toHaveBeenCalled();
+      expect(screen.getByText(/must be a positive integer/i)).toBeInTheDocument();
+    }
+  );
+
   it("handles error during timeout update", async () => {
     await act(async () => {
       render(<WorkersPanel api={mockApi} settings={mockSettings} onUpdateSettings={mockOnUpdateSettings} />);
@@ -203,7 +239,7 @@ describe("WorkersPanel", () => {
     const input = screen.getByPlaceholderText("300");
     fireEvent.change(input, { target: { value: "600" } });
     
-    const applyButton = screen.getByText("Apply");
+    const applyButton = screen.getByLabelText("Apply idle timeout");
     await act(async () => {
       fireEvent.click(applyButton);
     });
