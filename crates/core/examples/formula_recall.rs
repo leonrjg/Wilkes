@@ -1401,14 +1401,14 @@ fn read_anchored(
     raw: &Path,
 ) -> anyhow::Result<()> {
     use wilkes_core::extract::image::ocr::{latex_parses, OcrEngine};
-    use wilkes_core::extract::image::texify::Texify;
+    use wilkes_core::extract::image::texify;
     use wilkes_core::extract::pdf::typeset::render as render_region;
 
     let dir = model_dir();
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let texify = Texify::load(&dir, 1, threads)
+    let texify = texify::load(&dir, 1, threads)
         .with_context(|| format!("Texify is not loadable from {}", dir.display()))?;
     println!(
         "\n══ every anchored crop, read by the real recognizer ══\n\

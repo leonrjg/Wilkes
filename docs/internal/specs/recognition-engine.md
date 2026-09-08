@@ -510,7 +510,7 @@ exist, which is not.
 - **q4f16 under CoreML.** Rejected for the CPU default on reasoning, not on
   measurement. Revisiting it requires a benchmark, not an argument.
 
-### Formula selection and PP-FormulaNet_plus-S
+### Formula selection, PP-FormulaNet_plus-S and UniMERNet-S
 
 `image_analysis.formula_model` names a formula-role catalogue entry. An absent
 value resolves to the catalogue's `is_role_default` entry, Texify, preserving
@@ -551,3 +551,40 @@ real crops and checks release/reload determinism. It is a standalone example
 process, not a host-process inference path. The community graph's precise
 source checkpoint/exporter version is unspecified; an executable smoke check
 does not establish equivalence to Paddle inference or recognition accuracy.
+
+UniMERNet-S is the third formula-role entry. It is the Donut Swin encoder over
+mBART decoder that Texify also is, exported by Optimum into the same three
+graphs — encoder, first-step decoder, decoder-with-past — so it runs through
+Texify's cached decode loop rather than a second copy of it. That loop, the
+cache discovery and the reader pool moved to `donut_formula.rs` and are driven
+by a `Checkpoint`: graph names, `pixel_values` shape, preprocessing function,
+identity, start/EOS tokens and token cap. `texify.rs` and `unimernet.rs` hold
+one checkpoint each. The pixel tensor's length is checked against the declared
+shape at every crop.
+
+The artifacts are the int8 export at `Cooper114/unimernet-onnx`, pinned at
+commit `411ee762…` by size and SHA-256, plus the same `wanderkid/unimernet`
+vocabulary PP-FormulaNet reads with — one BPE across all three formula
+readers. `install` verifies each file before publishing it and `load` verifies
+again, then asserts the 50,000-token vocabulary and `</s>` at 2. The export
+declares no licence; the inventory discloses UniMERNet's Apache-2.0 and names
+the export separately. Provenance is otherwise weak: the repository is
+anonymous with no downloads. What stands behind it is the commit pin, the
+digests, a vocabulary that hashes to UniMERNet's own, and a decode that
+returns correct LaTeX for printed, screen-captured and handwritten crops.
+
+Preprocessing is UniMERNet's eval transform at a 192x672 frame, and it is the
+same function PP-FormulaNet runs at 384x384 — `unimernet::fit_and_gray`, called
+by both, because PP-FormulaNet is PaddlePaddle's re-implementation of this
+architecture and inherited the recipe. The transform yields one grey plane; the
+encoder declares three channels, so the plane is repeated. Both readers' recipe
+identities name the transform, so a single copy is what keeps a change from
+landing in one reader's stored readings and not the other's.
+
+**UniMERNet-T is not shipped.** All four UniMERNet checkpoints publish PyTorch
+`.pth` only; no ONNX export of the tiny checkpoint is available on the model
+hub, ModelScope, or OAR OCR's releases, and the one project claiming one hosts
+its artifacts in a repository that answers 401. A permanently uninstallable
+catalogue row is worse than no row. The tiny and small checkpoints share this
+vocabulary, this input frame and this transform, so a tiny export would be four
+digests and a display name.

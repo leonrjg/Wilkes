@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use image::{imageops, RgbImage};
+use image::RgbImage;
 use ort::{session::Session, value::Tensor};
 use tokenizers::Tokenizer;
 
@@ -128,63 +128,21 @@ pub fn install(
     Ok(())
 }
 
-/// OAR's crop/fit/black-pad recipe. Use RGB luminance explicitly: `image`'s
-/// generic luma conversion uses different coefficients from Pillow/OpenCV.
-/// Resample directly to the fitted size, as OAR does, rather than allocating
-/// Paddle's intermediate image with its short edge enlarged to 384 pixels.
-/// This resampling choice is versioned in the extraction identity.
+/// UniMERNet's crop/fit/black-pad recipe, at this export's square frame.
+///
+/// The transform itself is [`super::unimernet::fit_and_gray`] and is not
+/// repeated here: PP-FormulaNet is PaddlePaddle's re-implementation of
+/// UniMERNet and inherited its preprocessing whole — the same threshold at
+/// 200, the same black padding, the same 0.7931/0.1738 grey statistics. What
+/// is this export's own is the frame, which is square where UniMERNet's is
+/// wide. Two copies of one recipe would be two places for it to drift, and
+/// both readers name it in their identity, so a drift in one copy would
+/// silently change what one of their stored readings means.
+///
+/// `pub` so a probe that measured the encoder against its own resize would be
+/// measuring a model nobody runs. Pure, and holds no state.
 pub fn preprocess(crop: &RgbImage) -> Result<Vec<f32>> {
-    anyhow::ensure!(crop.width() > 0 && crop.height() > 0, "empty formula image");
-    let luma = |p: &image::Rgb<u8>| -> u8 {
-        (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32).round() as u8
-    };
-    let (mut low, mut high) = (u8::MAX, u8::MIN);
-    for p in crop.pixels() {
-        let v = luma(p);
-        low = low.min(v);
-        high = high.max(v);
-    }
-    let mut bounds = (crop.width(), crop.height(), 0, 0);
-    if high > low {
-        for (x, y, p) in crop.enumerate_pixels() {
-            if (luma(p) - low) as f32 * 255.0 / ((high - low) as f32) < 200.0 {
-                bounds.0 = bounds.0.min(x);
-                bounds.1 = bounds.1.min(y);
-                bounds.2 = bounds.2.max(x);
-                bounds.3 = bounds.3.max(y);
-            }
-        }
-    }
-    let cropped = if bounds.0 <= bounds.2 && bounds.1 <= bounds.3 {
-        imageops::crop_imm(
-            crop,
-            bounds.0,
-            bounds.1,
-            bounds.2 - bounds.0 + 1,
-            bounds.3 - bounds.1 + 1,
-        )
-        .to_image()
-    } else {
-        crop.clone()
-    };
-    let scale = SIDE as f64 / cropped.width().max(cropped.height()) as f64;
-    let w = ((cropped.width() as f64 * scale) as u32).clamp(1, SIDE);
-    let h = ((cropped.height() as f64 * scale) as u32).clamp(1, SIDE);
-    let resized = imageops::resize(&cropped, w, h, imageops::FilterType::Triangle);
-    let mut padded = RgbImage::new(SIDE, SIDE);
-    imageops::overlay(
-        &mut padded,
-        &resized,
-        ((SIDE - w) / 2) as i64,
-        ((SIDE - h) / 2) as i64,
-    );
-    Ok(padded
-        .pixels()
-        .map(|p| {
-            let gray = (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0;
-            (gray - 0.7931) / 0.1738
-        })
-        .collect())
+    super::unimernet::fit_and_gray(crop, SIDE, SIDE)
 }
 
 /// End at the first EOS. Missing EOS means an unfinished decode even when the
@@ -309,6 +267,7 @@ impl OcrEngine for PpFormulaNet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::imageops;
     /// Each artifact is fetched from somewhere that cannot move under it: the
     /// graph from a release asset, the vocabulary from a commit. A branch
     /// would let a re-export change what every stored reading means while the

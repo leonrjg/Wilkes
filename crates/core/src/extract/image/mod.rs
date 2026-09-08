@@ -41,6 +41,10 @@ pub mod dispatch;
 /// same one the ONNX recognizer already uses.
 #[cfg(feature = "recognize-onnx")]
 pub mod doclayout;
+/// The Donut-encoder / mBART-decoder formula readers, as one runner: the
+/// cached decode loop `texify` and `unimernet` are two checkpoints of.
+#[cfg(feature = "recognize-onnx")]
+pub mod donut_formula;
 #[cfg(feature = "recognize-onnx")]
 pub mod granite_docling;
 pub mod ocr;
@@ -62,6 +66,8 @@ pub mod serialize;
 pub mod table_structure;
 #[cfg(feature = "recognize-onnx")]
 pub mod texify;
+#[cfg(feature = "recognize-onnx")]
+pub mod unimernet;
 #[cfg(all(feature = "recognize-vision", target_os = "macos"))]
 pub mod vision;
 /// The layout detector as the host addresses it, over the worker protocol.

@@ -47,7 +47,7 @@ use ort::value::{DynValue, Tensor};
 use tokenizers::Tokenizer;
 
 use wilkes_core::extract::image::doclayout::{self, DocLayout, Pass, Recipe};
-use wilkes_core::extract::image::texify;
+use wilkes_core::extract::image::{donut_formula, texify};
 use wilkes_core::extract::pdf::typeset::{self, PageSurvey, WordBox};
 use wilkes_core::types::{BoundingBox, RegionKind};
 
@@ -441,7 +441,7 @@ struct Recognizer {
     /// `None` is the *old* loop, kept in this probe and nowhere else: it is
     /// the baseline every table below is a difference against, and a baseline
     /// recalled rather than run is not one.
-    with_past: Option<(Session, texify::CacheShape)>,
+    with_past: Option<(Session, donut_formula::CacheShape)>,
     tokenizer: Tokenizer,
 }
 
@@ -451,7 +451,7 @@ impl Recognizer {
         let decoder = session(&dir.join(texify::DECODER_GRAPH), threads, coreml)?;
         let with_past = if cached {
             let graph = session(&dir.join(texify::DECODER_WITH_PAST_GRAPH), threads, coreml)?;
-            let shape = texify::CacheShape::discover(&decoder, &graph)?;
+            let shape = donut_formula::CacheShape::discover(&decoder, &graph)?;
             Some((graph, shape))
         } else {
             None
@@ -466,7 +466,7 @@ impl Recognizer {
     }
 
     /// Read one crop through the cached decoder pair, exactly as
-    /// `texify::Texify::read` does: step 0 through the graph that takes no
+    /// `donut_formula::DonutFormula::read` does: step 0 through the graph that takes no
     /// past, every later step through the one that takes it, the
     /// cross-attention cache handed back unchanged the whole way.
     ///
@@ -570,7 +570,7 @@ impl Recognizer {
             )
             .map_err(|e| anyhow::anyhow!("could not detokenize: {e}"))?;
         Ok((
-            texify::unwrap_delimiters(&text).to_string(),
+            donut_formula::unwrap_delimiters(&text).to_string(),
             (confidence / ids.len().max(1) as f64) as f32,
             cost,
         ))
@@ -688,7 +688,7 @@ impl Recognizer {
                     true,
                 )
                 .map_err(|e| anyhow::anyhow!("could not detokenize: {e}"))?;
-            answers.push(texify::unwrap_delimiters(&text).to_string());
+            answers.push(donut_formula::unwrap_delimiters(&text).to_string());
         }
         let confidences = ids
             .iter()
@@ -930,7 +930,7 @@ struct Options {
     /// page twice.
     crops: usize,
     /// Which decoder the Texify stage runs: the cached pair, which is what
-    /// `texify::Texify` ships, or the single graph that re-runs the whole
+    /// `texify`'s checkpoint ships, or the single graph that re-runs the whole
     /// prefix every step, which is what it shipped before. `--decoder
     /// uncached` is the only way to get the second, and it exists so a
     /// before-and-after is two rows of one run rather than two runs of two
@@ -1130,7 +1130,7 @@ fn mode_gate(options: &Options) -> anyhow::Result<()> {
 /// Recognition laid out the way production lays it out: N readers of M threads
 /// each, handed one document's crops in one call.
 ///
-/// Through [`texify::Texify`] itself and not through this probe's own decode
+/// Through [`texify::load`] itself and not through this probe's own decode
 /// loop, because what is under measurement here is the *distribution* — which
 /// reader takes which crop, and what several of them cost at once — and that
 /// belongs to the engine. A probe that spread the crops itself would be
@@ -1142,13 +1142,13 @@ fn mode_gate(options: &Options) -> anyhow::Result<()> {
 /// of them four times.
 fn mode_readers(options: &Options) -> anyhow::Result<()> {
     use wilkes_core::extract::image::ocr::OcrEngine as _;
-    use wilkes_core::extract::image::texify::Texify;
+    use wilkes_core::extract::image::texify;
 
     let threads = options.texify_threads.unwrap_or(4);
     let readers = options.lanes.max(1);
     let (math, _) = select(&options.fixture, options.math, options.prose);
     let crops = thinned(crops_of(&math, options.threads)?, options.crops);
-    let engine = Texify::load(&model_dir(), readers, threads)?;
+    let engine = texify::load(&model_dir(), readers, threads)?;
     println!(
         "\n{} crop(s) over {} page(s) in one call · {readers} reader(s) x {threads} thread(s)",
         crops.len(),
@@ -1704,11 +1704,11 @@ fn thinned(crops: Vec<RgbImage>, keep: usize) -> Vec<RgbImage> {
 /// finding and not an identity, and it has to be measured rather than argued.
 ///
 /// The production engine is read beside them, over the same crops, because a
-/// probe that agreed with itself and disagreed with `texify::Texify` would
+/// probe that agreed with itself and disagreed with `texify::load` would
 /// have measured a decode nobody runs.
 fn mode_equivalence(options: &Options) -> anyhow::Result<()> {
     use wilkes_core::extract::image::ocr::OcrEngine;
-    use wilkes_core::extract::image::texify::Texify;
+    use wilkes_core::extract::image::texify;
 
     let threads = options.texify_threads.unwrap_or(options.threads);
     let (math, _) = select(&options.fixture, options.math, options.prose);
@@ -1722,7 +1722,7 @@ fn mode_equivalence(options: &Options) -> anyhow::Result<()> {
 
     let mut old = Recognizer::load(threads, false, false)?;
     let mut new = Recognizer::load(threads, false, true)?;
-    let engine = Texify::load(&model_dir(), 1, threads)?;
+    let engine = texify::load(&model_dir(), 1, threads)?;
 
     let (mut differ, mut engine_differs) = (0usize, 0usize);
     let (mut worst, mut total_delta) = (0f64, 0f64);
@@ -1768,7 +1768,7 @@ fn mode_equivalence(options: &Options) -> anyhow::Result<()> {
         total_delta / n.max(1) as f64,
         worst
     );
-    println!("{engine_differs} of {n} reading(s) differ between texify::Texify and this probe");
+    println!("{engine_differs} of {n} reading(s) differ between texify::load and this probe");
     Ok(())
 }
 

@@ -276,6 +276,31 @@ pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
         emits: vec![RegionKind::Formula],
     });
 
+    // The third formula reader, and the one the other two descend from:
+    // Texify is the same architecture and PP-FormulaNet is the same recipe,
+    // and all three decode with the same vocabulary. Offered because it is a
+    // different model trained on different data — photographed and
+    // handwritten expressions among it — and not because anything here has
+    // measured the three against each other.
+    #[cfg(feature = "recognize-onnx")]
+    models.push(RecognizerDescriptor {
+        engine: RecognitionEngine::Onnx,
+        model_id: super::unimernet::MODEL_ID.to_string(),
+        role: RecognizerRole::Formula,
+        display_name: "UniMERNet-S".to_string(),
+        description: "Reads one cropped expression back as LaTeX, including photographed \
+                      and handwritten ones. The model PP-FormulaNet re-implements and \
+                      Texify is a cousin of."
+            .to_string(),
+        is_default: false,
+        is_role_default: false,
+        is_engine_default: false,
+        is_cached: super::unimernet::is_installed(model_dir),
+        footprint_bytes: super::unimernet::footprint_bytes(),
+        admission_threshold: super::unimernet::ADMISSION_THRESHOLD,
+        emits: vec![RegionKind::Formula],
+    });
+
     #[cfg(feature = "recognize-onnx")]
     models.push(RecognizerDescriptor {
         engine: RecognitionEngine::Onnx,
@@ -407,6 +432,7 @@ pub fn identity(engine: RecognitionEngine, model_id: &str) -> anyhow::Result<Str
             super::granite_docling::MODEL_ID => Ok(super::granite_docling::identity()),
             super::texify::MODEL_ID => Ok(super::texify::identity()),
             super::pp_formulanet::MODEL_ID => Ok(super::pp_formulanet::identity()),
+            super::unimernet::MODEL_ID => Ok(super::unimernet::identity()),
             super::table_structure::MODEL_ID => Ok(super::table_structure::identity()),
             other => anyhow::bail!("unknown onnx recognizer '{other}'"),
         },
@@ -611,7 +637,16 @@ pub fn load_recognizer_local(
             }
             super::texify::MODEL_ID => {
                 let (readers, threads) = recognizer_layout(RecognizerRole::Formula, device);
-                Ok(Box::new(super::texify::Texify::load(
+                Ok(Box::new(super::texify::load(model_dir, readers, threads)?))
+            }
+            // The same runner as the arm above, under a different
+            // checkpoint: both are the three-graph Donut/mBART export
+            // [`super::donut_formula`] drives. Laid out by role, like every
+            // other formula reader, and not by model id — see
+            // [`recognizer_layout`] for why that is the axis.
+            super::unimernet::MODEL_ID => {
+                let (readers, threads) = recognizer_layout(RecognizerRole::Formula, device);
+                Ok(Box::new(super::unimernet::load(
                     model_dir, readers, threads,
                 )?))
             }
@@ -697,7 +732,7 @@ pub fn load_recognizer_local(
 /// threads, ignored the readers, and every document's crops went through one
 /// reader in a single queue. What that cost, over the 124 crops the five
 /// heaviest pages of the `formula_recall` fixture produce, handed to
-/// [`super::texify::Texify`] in one call on the same 10-core M4:
+/// [`super::texify`] in one call on the same 10-core M4:
 ///
 /// | layout | wall | ms/crop | ms/page | cores | peak |
 /// |--------|------|---------|---------|-------|------|
@@ -799,6 +834,7 @@ pub fn inventory(
             super::granite_docling::MODEL_ID => Ok(super::granite_docling::inventory()),
             super::texify::MODEL_ID => Ok(super::texify::inventory()),
             super::pp_formulanet::MODEL_ID => Ok(super::pp_formulanet::inventory()),
+            super::unimernet::MODEL_ID => Ok(super::unimernet::inventory()),
             super::table_structure::MODEL_ID => Ok(super::table_structure::inventory()),
             other => anyhow::bail!("unknown onnx recognizer '{other}'"),
         },
@@ -845,6 +881,7 @@ pub fn install(
             }
             super::texify::MODEL_ID => super::texify::install(model_dir, progress),
             super::pp_formulanet::MODEL_ID => super::pp_formulanet::install(model_dir, progress),
+            super::unimernet::MODEL_ID => super::unimernet::install(model_dir, progress),
             super::table_structure::MODEL_ID => {
                 super::table_structure::install(model_dir, progress)
             }
@@ -1239,13 +1276,35 @@ mod tests {
             assert_eq!(
                 models.iter().filter(|model| model.role == role).count(),
                 if role == RecognizerRole::Formula {
-                    2
+                    3
                 } else {
                     1
                 },
                 "unexpected number of models for {role:?}"
             );
         }
+        // Exactly one of the formula readers is what an unset setting
+        // resolves to. Two would make the choice depend on the order this
+        // catalogue happened to be built in, which is the thing
+        // `is_role_default` exists to stop.
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| model.role == RecognizerRole::Formula && model.is_role_default)
+                .count(),
+            1
+        );
+        // And every one of them reads under its own recipe. Two that shared
+        // one would let a library half-read by each report as wholly read by
+        // either.
+        let mut recipes: Vec<String> = models
+            .iter()
+            .filter(|model| model.role == RecognizerRole::Formula)
+            .map(|model| identity(model.engine, &model.model_id).unwrap())
+            .collect();
+        recipes.sort();
+        recipes.dedup();
+        assert_eq!(recipes.len(), 3);
         assert!(
             models
                 .iter()

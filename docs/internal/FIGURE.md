@@ -1301,6 +1301,45 @@ reading, and that is all it proves. The comparison above was measured for
 Texify against granite-docling; nothing here measures PP-FormulaNet against
 either.
 
+Amended 2026-09-08. There is a **third** row, and finding it is what took the
+decode loop out of `texify.rs`.
+
+UniMERNet-T was asked for and is not what shipped: all four UniMERNet
+checkpoints publish a PyTorch `.pth` and nothing else, and there is no ONNX
+export of the tiny one anywhere a search reaches — the one project that claims
+one keeps its artifacts in a repository that answers 401. A catalogue row whose
+weights cannot be fetched is a download button that always fails, so what is
+pinned is the small checkpoint, which does have an export. The two differ in
+the encoder's depth and in nothing this file cares about: same vocabulary, same
+192x672 frame, same transform.
+
+What the third row is, though, is the model the other two came from. Texify is
+the same architecture — a Donut Swin encoder over an mBART decoder, exported by
+Optimum into the same three graphs. PP-FormulaNet is PaddlePaddle's
+re-implementation of it and inherited its preprocessing whole, down to the
+threshold at 200 and the 0.7931/0.1738 grey. And the vocabulary all three
+decode with is UniMERNet's, which the amendment above is the story of. So the
+third reader arrived with almost nothing of its own: a frame, four digests, and
+the observation that its training data included photographs and handwriting.
+
+Which is why nothing was written twice. A second copy of the cached decode
+loop would have been a second place for the cross-attention cache to be
+recomputed by accident — with the table above still printed beside it,
+describing neither — so the loop, the cache discovery and the reader pool moved
+to `donut_formula.rs` and are driven by a `Checkpoint`. What stayed in
+`texify.rs` is what was Texify's own: its pins, its square paper frame, its
+ImageNet statistics, and those measurements, which were taken through that loop
+and are still taken through it. `pp_formulanet.rs`'s preprocessing went the
+same way for the same reason — it now calls `unimernet::fit_and_gray` at 384
+rather than keeping a second copy of a recipe both readers name in their
+identity.
+
+What is still not established is which of the three is better. One handwritten
+crop is the only place they have been seen to disagree on substance —
+UniMERNet read `9 × 9 + 13 × 13 - (3+3+1) = 243` and Texify read the same
+expression with `(9+7)+1)` in the middle — and one crop is an anecdote, not a
+measurement. Three readers now offer themselves and nothing ranks them.
+
 #### A region owns words
 
 The first run of Texify against inline crops returned nonsense, and the crops
