@@ -1276,7 +1276,26 @@ inside itself, so one invocation reads one crop and the document's loop stays in
 the worker where a kill ends it — no `CacheShape` to discover and no two graphs
 to keep agreeing. Both readers are in the analyzer identity, so switching
 between them re-reads the library, which is what makes the choice safe to
-offer. What is not established is which is better: the smoke example proves the
+offer.
+
+Its vocabulary is **UniMERNet's**, which the search for a mirror is what
+found. The tokenizer was first pinned to OAR's `pp-formulanet-tokenizer.json`
+on ModelScope, and ModelScope answered 403 for a user while serving the same
+path from here — so the question looked like where else the file could be had.
+It is nowhere else: not on the HuggingFace hub, not among the eighty-eight
+assets of OAR's release, not in its repository. What is elsewhere is the file
+itself. OAR's is UniMERNet's `tokenizer.json` with a newline appended —
+2,140,014 bytes against 2,140,013, identical once parsed, the same 50,000
+merges and the same `</s>` at 2 — so there was never a mirror to find, only
+two spellings of one vocabulary and a question of which to pin. UniMERNet's:
+the original rather than a copy of it, under the Apache-2.0 PP-FormulaNet is
+already disclosed under, from the host the other recognizers come from.
+
+Texify's `tokenizer.json` is the same bytes a third time, already on disk
+whenever both readers are installed, and is still downloaded again rather than
+shared. Sharing it would put `vikp/texify`'s CC-BY-SA-4.0 on the licence line
+of an Apache-2.0 row, and couple two recognizers' install directories, to save
+two megabytes. What is not established is which is better: the smoke example proves the
 path executes and that releasing and reloading the sessions returns the same
 reading, and that is all it proves. The comparison above was measured for
 Texify against granite-docling; nothing here measures PP-FormulaNet against

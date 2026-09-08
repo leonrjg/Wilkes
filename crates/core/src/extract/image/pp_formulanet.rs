@@ -18,15 +18,37 @@ use crate::types::Point;
 
 pub const MODEL_ID: &str = "pp-formulanet-plus-s";
 pub const GRAPH: &str = "pp-formulanet_plus-s.onnx";
-pub const TOKENIZER: &str = "pp-formulanet-tokenizer.json";
+pub const TOKENIZER: &str = "tokenizer.json";
 pub const SIDE: u32 = 384;
 pub const ADMISSION_THRESHOLD: f32 = 0.0;
 const VOCAB_SIZE: usize = 50_000;
+/// Filename, size, SHA-256 and where each is fetched from.
+///
+/// The vocabulary is **UniMERNet's**, taken from UniMERNet. OAR republishes it
+/// as `pp-formulanet-tokenizer.json` on ModelScope, and that file is this file
+/// with a newline appended: 2,140,014 bytes against 2,140,013, the same 50,000
+/// merges, the same ids, the same `</s>` at 2, identical once parsed. So there
+/// is one vocabulary here and two places it is spelled, and the reasons to
+/// pin this one are that it is the original rather than a copy of it, that
+/// UniMERNet's Apache-2.0 is the licence PP-FormulaNet is already disclosed
+/// under, and that it is served from the host the other recognizers are
+/// fetched from — ModelScope has answered 403 for this path for at least one
+/// user, and while it serves the file when asked from here, a second host in
+/// the install path is a second thing that has to be reachable.
+///
+/// Not Texify's copy of the same bytes, though it is byte-identical and
+/// already on disk when both readers are installed: that copy is disclosed
+/// under `vikp/texify`'s CC-BY-SA-4.0, and reaching for it would put those
+/// terms on an Apache-2.0 row to save two megabytes.
 const ARTIFACTS: &[(&str, u64, &str, &str)] = &[
     (GRAPH, 231_878_904, "449d205c8fb2fe0a9b134a5e4a0f2421c2e7812fd902ea67dfda4e9ef4588978",
      "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/pp-formulanet_plus-s.onnx"),
-    (TOKENIZER, 2_140_014, "2811d82701ec97c192fa256aa2b4516929373870ae660326cc5b1dc879b95ff2",
-     "https://www.modelscope.cn/models/greatv/oar-ocr/resolve/master/pp-formulanet-tokenizer.json"),
+    // A commit and not a branch. The digest below is what actually holds the
+    // vocabulary still — a moved branch fails verification rather than
+    // changing what stored readings mean — but a commit fails by not being
+    // found, which is the failure that says what happened.
+    (TOKENIZER, 2_140_013, "02c318d9cfa95bf323371762b8f838a82709530274d36dba6eca880f0add6cc4",
+     "https://huggingface.co/wanderkid/unimernet/resolve/4be874ffb637a90929de479109c8a377689b5a09/tokenizer.json"),
 ];
 
 pub fn identity() -> String {
@@ -63,7 +85,9 @@ pub fn inventory() -> crate::types::RecognizerInventory {
             "PP-FormulaNet_plus-S by PaddlePaddle (Apache-2.0)".to_string(),
             "ONNX export published by OAR OCR; source checkpoint and exporter version unspecified"
                 .to_string(),
-            "Tokenizer matches PaddlePaddle's published inference configuration".to_string(),
+            "Vocabulary from UniMERNet (Apache-2.0, wanderkid/unimernet), which is \
+             what OAR republishes for this model and parses identically to it"
+                .to_string(),
         ],
         artifacts: ARTIFACTS
             .iter()
@@ -285,6 +309,32 @@ impl OcrEngine for PpFormulaNet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Each artifact is fetched from somewhere that cannot move under it: the
+    /// graph from a release asset, the vocabulary from a commit. A branch
+    /// would let a re-export change what every stored reading means while the
+    /// digest here still described the file it replaced.
+    #[test]
+    fn both_artifacts_are_pinned_to_something_that_cannot_move() {
+        let revision = ARTIFACTS[1]
+            .3
+            .split("/resolve/")
+            .nth(1)
+            .and_then(|tail| tail.split('/').next())
+            .expect("the vocabulary is fetched through a /resolve/<revision>/ path");
+        assert_eq!(revision.len(), 40, "a branch, not a commit: {revision}");
+        assert!(revision.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(ARTIFACTS[0].3.contains("/releases/download/v0.3.0/"));
+        for (name, size, hash, url) in ARTIFACTS {
+            assert_eq!(hash.len(), 64, "{name} is not pinned by digest");
+            assert!(*size > 0, "{name} has no size to verify against");
+            assert!(url.starts_with("https://"), "{name} is fetched over {url}");
+        }
+        // Both digests are in the identity, so a copy-paste that made them
+        // equal would make two different files describe one reading.
+        assert_ne!(ARTIFACTS[0].2, ARTIFACTS[1].2);
+        assert!(identity().contains(ARTIFACTS[0].2) && identity().contains(ARTIFACTS[1].2));
+    }
+
     #[test]
     fn preprocessing_handles_uniform_thin_and_empty_images() {
         assert!(preprocess(&RgbImage::new(0, 1)).is_err());

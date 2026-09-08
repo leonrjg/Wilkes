@@ -520,9 +520,18 @@ change that choice. Unknown ids and page/table ids are refused. The existing
 a newly selected model. Missing weights retain the existing specialist-absence
 behavior; the interface offers the selected model's download.
 
-PP-FormulaNet_plus-S uses the OAR OCR v0.3.0 FP32 ONNX export and the matching
-50,000-token BPE tokenizer. Both files are pinned by size and SHA-256 in
-`pp_formulanet.rs`; the tokenizer matches Paddle's published configuration.
+PP-FormulaNet_plus-S uses the OAR OCR v0.3.0 FP32 ONNX export and UniMERNet's
+50,000-token BPE vocabulary. Both files are pinned by size and SHA-256 in
+`pp_formulanet.rs`, the graph to a release asset and the vocabulary to a commit.
+The vocabulary is taken from `wanderkid/unimernet` rather than from OAR's
+republished `pp-formulanet-tokenizer.json` on ModelScope. The two parse to the
+same tokenizer — same merges, same ids, same `</s>` at 2 — differing in one
+trailing newline OAR appended, so this pins the original rather than a copy of
+it, under the Apache-2.0 PP-FormulaNet is already disclosed under, from the
+host the other recognizers are fetched from. ModelScope has answered 403 on
+that path for at least one user while serving it to others. Texify's copy is
+byte-identical and already on disk when both readers are installed; it is not
+reused, because it is disclosed under `vikp/texify`'s CC-BY-SA-4.0.
 The graph takes `[batch, 1, 384, 384]` floats and emits int64 token ids, with its
 autoregressive loop inside the graph. It needs no additional inference runtime.
 The existing recognition worker receives the entire document's crop list and
