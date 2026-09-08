@@ -66,7 +66,16 @@ impl RecognitionEngine {
     /// The model this engine reads with unless told otherwise.
     pub fn default_model(&self) -> &'static str {
         match self {
-            RecognitionEngine::Onnx => super::granite_docling::MODEL_ID,
+            RecognitionEngine::Onnx => {
+                #[cfg(feature = "recognize-onnx")]
+                {
+                    super::granite_docling::MODEL_ID
+                }
+                #[cfg(not(feature = "recognize-onnx"))]
+                {
+                    ""
+                }
+            }
             RecognitionEngine::Candle => {
                 #[cfg(feature = "candle")]
                 {
@@ -156,6 +165,8 @@ pub struct RecognizerDescriptor {
     pub description: String,
     /// The recognizer a fresh install reads with — one across the catalogue.
     pub is_default: bool,
+    /// The default for this role when no explicit model was selected.
+    pub is_role_default: bool,
     /// The recognizer this *engine* reads with unless told otherwise. What a
     /// picker selects when the engine is switched, and what an
     /// `ImageAnalysisSettings::model` of `None` resolves to. Derived here
@@ -226,6 +237,7 @@ pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
                       tables. Smaller and broader than PaddleOCR-VL."
             .to_string(),
         is_default: true,
+        is_role_default: true,
         is_engine_default: super::granite_docling::MODEL_ID
             == RecognitionEngine::Onnx.default_model(),
         is_cached: super::granite_docling::is_installed(model_dir),
@@ -256,10 +268,28 @@ pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
                       reader cannot read."
             .to_string(),
         is_default: false,
+        is_role_default: true,
         is_engine_default: false,
         is_cached: super::texify::is_installed(model_dir),
         footprint_bytes: super::texify::footprint_bytes(),
         admission_threshold: super::texify::ADMISSION_THRESHOLD,
+        emits: vec![RegionKind::Formula],
+    });
+
+    #[cfg(feature = "recognize-onnx")]
+    models.push(RecognizerDescriptor {
+        engine: RecognitionEngine::Onnx,
+        model_id: super::pp_formulanet::MODEL_ID.to_string(),
+        role: RecognizerRole::Formula,
+        display_name: "PP-FormulaNet_plus-S".to_string(),
+        description: "Reads cropped formulas as LaTeX using PP-FormulaNet_plus-S. Runs on CPU."
+            .to_string(),
+        is_default: false,
+        is_role_default: false,
+        is_engine_default: false,
+        is_cached: super::pp_formulanet::is_installed(model_dir),
+        footprint_bytes: super::pp_formulanet::footprint_bytes(),
+        admission_threshold: super::pp_formulanet::ADMISSION_THRESHOLD,
         emits: vec![RegionKind::Formula],
     });
 
@@ -279,6 +309,7 @@ pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
                       text. Nothing transcribes glyphs the document already holds."
             .to_string(),
         is_default: false,
+        is_role_default: true,
         is_engine_default: false,
         is_cached: super::table_structure::is_installed(model_dir),
         footprint_bytes: super::table_structure::footprint_bytes(),
@@ -297,6 +328,7 @@ pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
                           per-region geometry."
                 .to_string(),
             is_default: false,
+            is_role_default: false,
             is_engine_default: checkpoint.name == RecognitionEngine::Candle.default_model(),
             is_cached: super::paddleocr_vl::is_installed(model_dir, checkpoint),
             footprint_bytes: checkpoint.footprint_bytes(),
@@ -316,6 +348,7 @@ pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
                       no formulas, no tables, nothing to download."
             .to_string(),
         is_default: false,
+        is_role_default: false,
         is_engine_default: super::vision::MODEL_ID == RecognitionEngine::Vision.default_model(),
         // Part of the operating system, so there is nothing to install and
         // nothing an uninstall could take away.
@@ -373,6 +406,7 @@ pub fn identity(engine: RecognitionEngine, model_id: &str) -> anyhow::Result<Str
         RecognitionEngine::Onnx => match model_id {
             super::granite_docling::MODEL_ID => Ok(super::granite_docling::identity()),
             super::texify::MODEL_ID => Ok(super::texify::identity()),
+            super::pp_formulanet::MODEL_ID => Ok(super::pp_formulanet::identity()),
             super::table_structure::MODEL_ID => Ok(super::table_structure::identity()),
             other => anyhow::bail!("unknown onnx recognizer '{other}'"),
         },
@@ -474,16 +508,24 @@ pub fn load_layout_detector_local(
     )?))
 }
 
-/// The formula recognizer this build ships, or `None` when it ships none.
-///
-/// Found by role rather than by name, so the one place that knows which model
-/// reads formulas is the catalogue row that declares it. A build compiled
-/// without the ONNX recognizer has no such row and therefore no formula
-/// reader, which is a configuration and not an error.
-pub fn formula_model(model_dir: &Path) -> Option<RecognizerDescriptor> {
-    list_models(model_dir)
+/// Resolve the formula choice without loading weights. An absent setting uses
+/// the catalogue's explicit role default, never its installation-dependent order.
+/// Unknown ids and ids belonging to another role are errors, not substitutions.
+pub fn formula_model(
+    model_dir: &Path,
+    selected: Option<&str>,
+) -> anyhow::Result<Option<RecognizerDescriptor>> {
+    let models = list_models(model_dir);
+    if let Some(id) = selected {
+        return models
+            .into_iter()
+            .find(|model| model.role == RecognizerRole::Formula && model.model_id == id)
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("unknown formula recognizer '{id}'"));
+    }
+    Ok(models
         .into_iter()
-        .find(|model| model.role == RecognizerRole::Formula)
+        .find(|model| model.role == RecognizerRole::Formula && model.is_role_default))
 }
 
 /// The table structure model this build ships, or `None` when it ships none.
@@ -561,6 +603,12 @@ pub fn load_recognizer_local(
             // take the threads and drop the reader count on the floor, which
             // made every document's crops one serial queue; see
             // [`recognizer_layout`]'s second table for what that cost.
+            super::pp_formulanet::MODEL_ID => {
+                let (readers, threads) = recognizer_layout(RecognizerRole::Formula, device);
+                Ok(Box::new(super::pp_formulanet::PpFormulaNet::load(
+                    model_dir, readers, threads,
+                )?))
+            }
             super::texify::MODEL_ID => {
                 let (readers, threads) = recognizer_layout(RecognizerRole::Formula, device);
                 Ok(Box::new(super::texify::Texify::load(
@@ -750,6 +798,7 @@ pub fn inventory(
         RecognitionEngine::Onnx => match model_id {
             super::granite_docling::MODEL_ID => Ok(super::granite_docling::inventory()),
             super::texify::MODEL_ID => Ok(super::texify::inventory()),
+            super::pp_formulanet::MODEL_ID => Ok(super::pp_formulanet::inventory()),
             super::table_structure::MODEL_ID => Ok(super::table_structure::inventory()),
             other => anyhow::bail!("unknown onnx recognizer '{other}'"),
         },
@@ -795,6 +844,7 @@ pub fn install(
                 super::granite_docling::install(model_dir, progress)
             }
             super::texify::MODEL_ID => super::texify::install(model_dir, progress),
+            super::pp_formulanet::MODEL_ID => super::pp_formulanet::install(model_dir, progress),
             super::table_structure::MODEL_ID => {
                 super::table_structure::install(model_dir, progress)
             }
@@ -852,6 +902,43 @@ fn checkpoint(model_id: &str) -> anyhow::Result<super::paddleocr_vl::Checkpoint>
 mod tests {
     use super::*;
     use crate::types::ImageAnalysisSettings;
+
+    #[cfg(feature = "recognize-onnx")]
+    #[test]
+    fn formula_selection_is_explicit_and_independent_of_install_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let pp = super::super::pp_formulanet::MODEL_ID;
+        let selected = formula_model(dir.path(), Some(pp)).unwrap().unwrap();
+        assert_eq!(selected.model_id, pp);
+        assert!(!selected.is_cached);
+        let install = super::super::pp_formulanet::install_dir(dir.path());
+        std::fs::create_dir_all(&install).unwrap();
+        for artifact in super::super::pp_formulanet::inventory().artifacts {
+            std::fs::File::create(install.join(artifact.filename))
+                .unwrap()
+                .set_len(artifact.size_bytes)
+                .unwrap();
+        }
+        assert!(
+            formula_model(dir.path(), Some(pp))
+                .unwrap()
+                .unwrap()
+                .is_cached
+        );
+        assert_eq!(
+            formula_model(dir.path(), None).unwrap().unwrap().model_id,
+            super::super::texify::MODEL_ID
+        );
+        assert!(formula_model(dir.path(), Some("unknown")).is_err());
+        assert!(formula_model(dir.path(), Some(super::super::granite_docling::MODEL_ID)).is_err());
+        let old: ImageAnalysisSettings =
+            serde_json::from_value(serde_json::json!({"enabled": true})).unwrap();
+        assert!(old.formula_model.is_none());
+        assert_ne!(
+            identity(selected.engine, pp).unwrap(),
+            identity(selected.engine, super::super::texify::MODEL_ID).unwrap()
+        );
+    }
 
     /// The default is the ONNX engine, and its default model is catalogued.
     /// A default nobody ships is a build that cannot recognize anything.
@@ -1139,7 +1226,7 @@ mod tests {
         assert!(table_model(dir.path()).unwrap().is_cached);
     }
 
-    /// Each role is offered exactly once and none of them is offered as
+    /// Each role offers its readers and none of them is offered as
     /// another. The picker filters on this, so a table reader that answered to
     /// `Page` would be selectable as the page recognizer and would read every
     /// page of the library as an empty grid.
@@ -1151,8 +1238,12 @@ mod tests {
         for role in [RecognizerRole::Formula, RecognizerRole::Table] {
             assert_eq!(
                 models.iter().filter(|model| model.role == role).count(),
-                1,
-                "{role:?} is not offered exactly once"
+                if role == RecognizerRole::Formula {
+                    2
+                } else {
+                    1
+                },
+                "unexpected number of models for {role:?}"
             );
         }
         assert!(
@@ -1162,7 +1253,7 @@ mod tests {
             "the default recognizer reads pages"
         );
         assert_ne!(
-            formula_model(dir.path()).unwrap().model_id,
+            formula_model(dir.path(), None).unwrap().unwrap().model_id,
             table_model(dir.path()).unwrap().model_id
         );
     }

@@ -35,6 +35,10 @@ generate = ["candle", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
 name = "vision_smoke"
 required-features = ["recognize-vision"]
 
+[[example]]
+name = "formula_smoke"
+required-features = ["recognize-onnx"]
+
 [build-dependencies]
 cc = "1"
 

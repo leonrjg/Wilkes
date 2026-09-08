@@ -1894,6 +1894,9 @@ pub struct ImageAnalysisSettings {
     /// The recognizer's model id. Absent takes the engine's default.
     #[serde(default)]
     pub model: Option<String>,
+    /// Formula recognizer id. Absent preserves the catalogue default (Texify).
+    #[serde(default)]
+    pub formula_model: Option<String>,
     /// "auto", "cpu", "metal". Absent takes the recognizer's default.
     #[serde(default)]
     pub device: Option<String>,
@@ -1928,8 +1931,8 @@ pub struct ImageAnalysisSettings {
     /// instead, exactly as they do when it was never installed.
     ///
     /// By role rather than by model id, because that is how the analyzer
-    /// finds these readers in the first place: there is one formula reader
-    /// per build, and naming it here would be a second copy of which-is-which.
+    /// finds these readers in the first place: the selected formula reader
+    /// can change while the role remains switched off.
     ///
     /// [`RecognizerRole::Page`] is a member like the other two, and it is the
     /// one whose absence has nowhere to fall through to: what only the page

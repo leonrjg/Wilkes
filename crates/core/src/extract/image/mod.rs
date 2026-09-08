@@ -54,6 +54,8 @@ pub mod onnx_vlm;
 /// dependency added to reach it.
 #[cfg(feature = "candle")]
 pub mod paddleocr_vl;
+#[cfg(feature = "recognize-onnx")]
+pub mod pp_formulanet;
 pub mod serialize;
 /// Reading a table the page typesets: the grid from a structure model in the
 /// worker, the text from the page in the host.
@@ -629,6 +631,7 @@ pub fn build_analyzer(
     };
 
     let formula = attach_formula_reader(
+        settings.formula_model.as_deref(),
         recognizers.clone(),
         model_dir,
         &scratch,
@@ -706,6 +709,7 @@ fn fallback_wording(page_off: bool) -> &'static str {
 /// ever loaded here — see [`dispatch`]'s invariant.
 #[cfg(feature = "candle")]
 fn attach_formula_reader(
+    selected: Option<&str>,
     recognizers: crate::worker::manager::WorkerManager,
     model_dir: &std::path::Path,
     scratch: &std::path::Path,
@@ -717,7 +721,7 @@ fn attach_formula_reader(
     // page reader the areas fall through to it, and with none they are not
     // read at all. Said once, here, so every branch below says the true one.
     let instead = fallback_wording(page_off);
-    let Some(model) = dispatch::formula_model(model_dir) else {
+    let Some(model) = dispatch::formula_model(model_dir, selected)? else {
         tracing::info!("this build ships no formula recognizer");
         return Ok(None);
     };
@@ -1935,6 +1939,49 @@ mod tests {
             crate::worker::ipc::WorkerKind::Recognize,
         )
         .0
+    }
+
+    #[cfg(all(feature = "candle", feature = "recognize-onnx"))]
+    #[test]
+    fn formula_attachment_uses_the_selection_without_loading_a_model() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let pp = pp_formulanet::MODEL_ID;
+        let install = pp_formulanet::install_dir(dir.path());
+        std::fs::create_dir_all(&install).unwrap();
+        // Deliberately invalid graphs: attaching must never load or infer.
+        for artifact in pp_formulanet::inventory().artifacts {
+            std::fs::File::create(install.join(artifact.filename))
+                .unwrap()
+                .set_len(artifact.size_bytes)
+                .unwrap();
+        }
+        let attach = |choice, disabled: &[dispatch::RecognizerRole]| {
+            attach_formula_reader(
+                choice,
+                test_manager(),
+                dir.path(),
+                dir.path(),
+                "cpu",
+                disabled,
+                false,
+            )
+        };
+        assert_eq!(
+            attach(Some(pp), &[]).unwrap().unwrap().identity(),
+            pp_formulanet::identity()
+        );
+        assert!(
+            attach(None, &[]).unwrap().is_none(),
+            "an installed alternative never replaces the missing default"
+        );
+        assert!(attach(Some(pp), &[dispatch::RecognizerRole::Formula])
+            .unwrap()
+            .is_none());
+        assert!(attach(Some("not-a-formula-model"), &[]).is_err());
     }
 
     /// Disabled is answered without touching the disk: the settings say no

@@ -23,6 +23,7 @@ const GRANITE = {
   description: "Reads a page in one pass.",
   is_default: true,
   is_engine_default: true,
+  is_role_default: true,
   is_cached: false,
   footprint_bytes: 560_000_000,
   admission_threshold: 0.4,
@@ -37,6 +38,7 @@ const PADDLE = {
   description: "Transcribes with per-region geometry.",
   is_default: false,
   is_engine_default: true,
+  is_role_default: true,
   is_cached: false,
   footprint_bytes: 1_928_447_087,
   admission_threshold: 0.6,
@@ -68,10 +70,22 @@ const TEXIFY = {
   description: "Reads one cropped expression back as LaTeX.",
   is_default: false,
   is_engine_default: false,
+  is_role_default: true,
   is_cached: false,
   footprint_bytes: 320_847_936,
   admission_threshold: 0,
   emits: ["formula"],
+};
+
+/// A second row for the same role, and the reason `is_role_default` exists:
+/// which model reads formulas is now a choice, so "the formula reader" can no
+/// longer be "the one formula row" the catalogue happens to list first.
+const PP_FORMULANET = {
+  ...TEXIFY,
+  model_id: "pp-formulanet-plus-s",
+  display_name: "PP-FormulaNet_plus-S",
+  description: "Reads cropped formulas as LaTeX using PP-FormulaNet_plus-S.",
+  is_role_default: false,
 };
 
 /// The third role. It transcribes nothing at all — it answers the grid and the
@@ -85,6 +99,7 @@ const SLANET = {
   description: "Reads the grid of a ruled table the page typesets.",
   is_default: false,
   is_engine_default: false,
+  is_role_default: true,
   is_cached: false,
   footprint_bytes: 7_758_305,
   admission_threshold: 0,
@@ -385,6 +400,73 @@ describe("ImageAnalysisPanel", () => {
           .installImageRecognizer,
       ).toHaveBeenCalledWith(TEXIFY.engine, TEXIFY.model_id),
     );
+  });
+
+  /// An absent `formula_model` is Texify because Texify declares itself the
+  /// role default, not because it comes first: a newly installed alternative
+  /// that reordered the catalogue would otherwise silently change what every
+  /// existing library is read with.
+  it("holds the formula default against catalogue order, and saves a choice", async () => {
+    withCatalogue({ ...CATALOGUE, models: [PP_FORMULANET, ...CATALOGUE.models] });
+    const update = panel(READING);
+
+    const selector = await screen.findByRole("combobox", { name: "Formula model" });
+    expect(selector).toHaveValue(TEXIFY.model_id);
+
+    fireEvent.change(selector, { target: { value: PP_FORMULANET.model_id } });
+    await waitFor(() =>
+      expect(update).toHaveBeenCalledWith({
+        image_analysis: expect.objectContaining({
+          formula_model: PP_FORMULANET.model_id,
+          model: GRANITE.model_id,
+        }),
+      }),
+    );
+  });
+
+  /// The section belongs to the selected reader, not to the default one, so
+  /// the download offered is the one the settings would actually load. The
+  /// role switch is by role and stays untouched by the choice.
+  it("offers the selected formula reader's download, leaving the role switch alone", async () => {
+    withCatalogue({ ...CATALOGUE, models: [...CATALOGUE.models, PP_FORMULANET] });
+    const update = panel({
+      ...READING,
+      image_analysis: {
+        ...READING.image_analysis,
+        formula_model: PP_FORMULANET.model_id,
+        disabled_roles: ["formula" as const],
+      },
+    } as unknown as Settings);
+
+    expect(await screen.findByRole("combobox", { name: "Formula model" })).toHaveValue(
+      PP_FORMULANET.model_id,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /download formula reader/i }));
+    await waitFor(() =>
+      expect(
+        (api as unknown as { installImageRecognizer: (e: string, m: string) => void })
+          .installImageRecognizer,
+      ).toHaveBeenCalledWith(PP_FORMULANET.engine, PP_FORMULANET.model_id),
+    );
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  /// A settings file naming a reader this build does not ship is held and
+  /// named, not quietly resolved to the default: substituting would re-read
+  /// the whole library under a model nobody chose. The card goes with it,
+  /// because there is no reader here whose cost and licence it could state.
+  it("names a formula reader this build does not ship rather than replacing it", async () => {
+    panel({
+      ...READING,
+      image_analysis: { ...READING.image_analysis, formula_model: "gone" },
+    } as unknown as Settings);
+
+    const selector = await screen.findByRole("combobox", { name: "Formula model" });
+    expect(selector).toHaveValue("gone");
+    expect(screen.getByRole("option", { name: /unavailable: gone/i })).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: /download formula reader/i }),
+    ).toBeNull();
   });
 
   /// The table reader is a catalogue row too, so the same install path serves

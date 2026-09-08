@@ -1257,6 +1257,31 @@ so a library read under the old one is re-read. The encoder is now the largest
 stage of a math-heavy page at 44%, which is the next measurement and a
 different one.
 
+Amended 2026-09-07. The formula reader is **chosen** rather than found.
+`image_analysis.formula_model` names a formula-role row and
+`dispatch::formula_model` resolves it, so the sentence above — nothing outside
+the arm that owns the checkpoint names the model — still holds for the page and
+table roles but no longer for this one. An absent setting takes the row that
+declares `is_role_default`, Texify, and not whichever formula row the catalogue
+lists first: installing a second reader must not silently change what an
+existing library was read with. A name no formula row answers to, or one
+belonging to the page or table role, is refused at `build_analyzer` rather than
+substituted — the same refusal a page setting naming a formula reader already
+got. `disabled_roles` is still by role, which is now the point rather than an
+accident: switching formulas off is one switch whichever reader is selected.
+
+The second row is **PP-FormulaNet_plus-S**, OAR OCR's FP32 ONNX export at 234 MB
+against Texify's quantized 543. Its graph carries the autoregressive loop
+inside itself, so one invocation reads one crop and the document's loop stays in
+the worker where a kill ends it — no `CacheShape` to discover and no two graphs
+to keep agreeing. Both readers are in the analyzer identity, so switching
+between them re-reads the library, which is what makes the choice safe to
+offer. What is not established is which is better: the smoke example proves the
+path executes and that releasing and reloading the sessions returns the same
+reading, and that is all it proves. The comparison above was measured for
+Texify against granite-docling; nothing here measures PP-FormulaNet against
+either.
+
 #### A region owns words
 
 The first run of Texify against inline crops returned nonsense, and the crops

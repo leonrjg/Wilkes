@@ -509,3 +509,36 @@ exist, which is not.
   configuration id, so exposing it later is a recipe change, not a preference.
 - **q4f16 under CoreML.** Rejected for the CPU default on reasoning, not on
   measurement. Revisiting it requires a benchmark, not an argument.
+
+### Formula selection and PP-FormulaNet_plus-S
+
+`image_analysis.formula_model` names a formula-role catalogue entry. An absent
+value resolves to the catalogue's `is_role_default` entry, Texify, preserving
+existing libraries. Catalogue sorting and installation of an alternative never
+change that choice. Unknown ids and page/table ids are refused. The existing
+`disabled_roles` switch continues to disable the whole formula role, including
+a newly selected model. Missing weights retain the existing specialist-absence
+behavior; the interface offers the selected model's download.
+
+PP-FormulaNet_plus-S uses the OAR OCR v0.3.0 FP32 ONNX export and the matching
+50,000-token BPE tokenizer. Both files are pinned by size and SHA-256 in
+`pp_formulanet.rs`; the tokenizer matches Paddle's published configuration.
+The graph takes `[batch, 1, 384, 384]` floats and emits int64 token ids, with its
+autoregressive loop inside the graph. It needs no additional inference runtime.
+The existing recognition worker receives the entire document's crop list and
+runs bounded parallel readers; killing the worker ends all of those loops.
+
+Preprocessing crops normalized foreground below 200, fits with triangle
+resampling, centers on black, and applies grayscale normalization with mean
+0.7931 and standard deviation 0.1738. Direct fitting follows OAR's bounded-size
+approach rather than Paddle's two-stage intermediate enlargement. The recipe
+identity includes this choice and both artifact digests. Decoding stops at EOS;
+missing EOS is truncated and invalid vocabulary ids are errors. Decoded LaTeX
+retains its whitespace rather than applying upstream display normalization.
+Formula admission still uses the shared LaTeX parser, not a confidence score.
+
+`formula_smoke <model_dir> <model_id> <png>...` exercises worker dispatch over
+real crops and checks release/reload determinism. It is a standalone example
+process, not a host-process inference path. The community graph's precise
+source checkpoint/exporter version is unspecified; an executable smoke check
+does not establish equivalence to Paddle inference or recognition accuracy.

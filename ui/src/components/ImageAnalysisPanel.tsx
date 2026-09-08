@@ -163,16 +163,40 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
     () => recognizers.filter((model) => model.role === "page"),
     [recognizers],
   );
+  // Which model reads formulas is a setting rather than the role's only row,
+  // so it is resolved once, here: the card, the picker and the download all
+  // have to name the same reader, and asking three times is how they would
+  // eventually name three. An absent setting takes the row that declares
+  // itself the role default, never whichever formula row is listed first — a
+  // newly installed alternative must not change what a library was read with.
+  // A named row this build does not ship resolves to nothing, which is the
+  // same refusal `dispatch::formula_model` answers with.
+  const formulaReaders = useMemo(
+    () => recognizers.filter((model) => model.role === "formula"),
+    [recognizers],
+  );
+  const formulaChoice = useMemo(
+    () =>
+      analysis.formula_model
+        ? formulaReaders.find((model) => model.model_id === analysis.formula_model)
+        : formulaReaders.find((model) => model.is_role_default),
+    [formulaReaders, analysis.formula_model],
+  );
   // The cards above the picker, one per role in HELPER_READERS that this build
   // actually ships. A role with no catalogue row is a build that cannot read
   // that kind at all, and it is simply absent rather than shown as broken.
   const helpers = useMemo(
     () =>
       HELPER_READERS.flatMap((copy) => {
-        const model = recognizers.find((entry) => entry.role === copy.role);
+        const model =
+          copy.role === "formula"
+            ? formulaChoice
+            : recognizers.find(
+                (entry) => entry.role === copy.role && entry.is_role_default,
+              );
         return model ? [{ copy, model }] : [];
       }),
-    [recognizers],
+    [recognizers, formulaChoice],
   );
 
   /** One box per role reader, and the kind each box stands for taken from the
@@ -698,6 +722,40 @@ export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: 
                 a kind is covered; this says what covering it costs and under
                 what licence, which is the half a colour cannot carry. */}
             <div className="space-y-1.5 border-t border-[var(--border-main)] pt-2">
+              {/* Only this role has more than one row to choose between; the
+                  others are shown by the cards below and picked by nothing.
+                  A setting naming a reader this build no longer ships is held
+                  and named rather than quietly replaced, because replacing it
+                  would re-read the library under a model nobody chose. */}
+              {formulaReaders.length > 0 && (
+                <label className="flex items-center gap-2 text-[10px] text-[var(--text-main)]">
+                  Formula model
+                  <select
+                    aria-label="Formula model"
+                    className="min-w-0 rounded border border-[var(--border-main)] bg-[var(--bg-input)] px-2 py-1"
+                    disabled={busy}
+                    value={analysis.formula_model ?? formulaChoice?.model_id ?? ""}
+                    onChange={(event) => {
+                      const formula_model = event.target.value;
+                      setBusy(true);
+                      patch({ formula_model })
+                        .catch((cause) => setError(String(cause)))
+                        .finally(() => setBusy(false));
+                    }}
+                  >
+                    {analysis.formula_model && !formulaChoice && (
+                      <option value={analysis.formula_model}>
+                        Unavailable: {analysis.formula_model}
+                      </option>
+                    )}
+                    {formulaReaders.map((entry) => (
+                      <option key={entry.model_id} value={entry.model_id}>
+                        {entry.display_name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
               {helpers.map(({ copy, model }) => (
                 <div key={copy.role} className="flex items-center gap-2">
                   <span className="font-mono text-[10px] text-[var(--text-muted)]">

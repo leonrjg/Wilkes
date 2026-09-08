@@ -704,6 +704,8 @@ export interface ImageAnalysisSettings {
   engine: RecognitionEngine;
   /** The recognizer's model id. Null takes the engine's default. */
   model: string | null;
+  /** Formula reader id. Absent uses the catalogue role default. */
+  formula_model?: string | null;
   /** "auto" | "cpu" | "metal". Null takes the recognizer's default. */
   device: string | null;
   /** The Ollama tag figures are described with; empty means transcription
@@ -762,6 +764,8 @@ export interface RecognizerDescriptor {
    *  picker selects when the engine is switched, and what an absent
    *  `image_analysis.model` resolves to. */
   is_engine_default: boolean;
+  /** Used when the role has no explicit model selection. */
+  is_role_default: boolean;
   is_cached: boolean;
   footprint_bytes: number;
   admission_threshold: number;
