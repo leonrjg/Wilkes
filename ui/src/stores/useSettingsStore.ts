@@ -24,6 +24,18 @@ function resolveColorScheme(theme: Theme): ColorScheme {
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
+/** Mirror a resolved appearance onto <html> for CSS to select on. The only
+ *  writer of that class: the store decides, this projects. It runs once when
+ *  the store is created so the projection is never absent while the decision
+ *  exists -- StartupGate renders before anything loads the saved settings, and
+ *  without this it painted the light palette over a dark installation. */
+function projectColorScheme(colorScheme: ColorScheme): ColorScheme {
+  const root = window.document.documentElement;
+  root.classList.remove("light", "dark");
+  root.classList.add(colorScheme);
+  return colorScheme;
+}
+
 // The one registration that follows the OS while the theme is "System". Held
 // module-side so switching away from System removes it, and switching back
 // installs exactly one -- the previous code added a listener only if System was
@@ -108,11 +120,7 @@ export const useSettingsStore = create<SettingsStore>()(
         media.addEventListener("change", systemThemeListener);
       }
 
-      const colorScheme = resolveColorScheme(theme);
-      const root = window.document.documentElement;
-      root.classList.remove("light", "dark");
-      root.classList.add(colorScheme);
-      set({ colorScheme });
+      set({ colorScheme: projectColorScheme(resolveColorScheme(theme)) });
     };
 
     return {
@@ -131,7 +139,7 @@ export const useSettingsStore = create<SettingsStore>()(
     preferSemantic: false,
     indexing: false,
     theme: "System",
-    colorScheme: resolveColorScheme("System"),
+    colorScheme: projectColorScheme(resolveColorScheme("System")),
     maxResults: 50,
     bookmarksDock: "Right",
     fileSortKey: "filename",
