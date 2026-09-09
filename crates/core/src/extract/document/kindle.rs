@@ -6,8 +6,9 @@
 //! document of one page holding nothing. That silent emptiness is what
 //! [`super::format::guard_container`] used to refuse outright.
 //!
-//! **What it does instead.** The `mobi` crate decompresses the PalmDOC records
-//! and hands over the raw KF8 flow and the image resources. The flow is not a
+//! **What it does instead.** [`Container`] reads the file's own record table,
+//! strips each text record's trailing entries and decompresses it, which
+//! yields the raw KF8 flow and the image resources. The flow is not a
 //! document: it is 162 concatenated XHTML skeletons for one measured book,
 //! with the bulk of the prose in bare fragments between them, and MuPDF reads
 //! nothing from it as it stands. Three things make it readable:
