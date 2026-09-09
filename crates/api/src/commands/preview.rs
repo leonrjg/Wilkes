@@ -11,6 +11,26 @@ pub async fn preview(
     match_ref: MatchRef,
     index: Option<IndexHandle>,
 ) -> anyhow::Result<PreviewData> {
+    // Which preview a document gets is decided by the file, not by the origin
+    // the match carries. An origin can disagree: a document with no source map
+    // — a comic archive, a scan with no text layer — yields chunks that resolve
+    // to nothing, and those used to be recorded as `TextFile` positions. A row
+    // like that sends a zip of images to `read_to_string`, and the user sees
+    // "stream did not contain valid UTF-8" for a file that opens perfectly from
+    // the tree. Rows written before that was fixed are still in indexes, so
+    // this has to hold regardless of what arrives.
+    if wilkes_core::extract::document::format::PagedFormat::for_path(&match_ref.path).is_some() {
+        let (page, bbox) = match &match_ref.origin {
+            SourceOrigin::PdfPage { page, bbox } => (*page, bbox.clone()),
+            _ => (1, None),
+        };
+        return if renders_as_pdf(&match_ref.path) {
+            preview_pdf(&match_ref, page, bbox, index).await
+        } else {
+            preview_book(match_ref.path.clone(), page, bbox).await
+        };
+    }
+
     match &match_ref.origin {
         SourceOrigin::TextFile { .. } => preview_text(&match_ref).await,
         // A laid-out page. Only a PDF's pages are in the file the webview
@@ -252,6 +272,67 @@ mod tests {
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use tempfile::NamedTempFile;
+
+    /// A comic archive with a stale text-file origin must still open.
+    ///
+    /// The regression: a document with no source map — a comic archive, a scan
+    /// with no text layer — used to yield chunks recorded at `TextFile`
+    /// positions, and previewing one sent a zip to `read_to_string`, which
+    /// answered "stream did not contain valid UTF-8" for a file that opens
+    /// perfectly from the file tree. Rows like that are still in indexes built
+    /// before the chunker was fixed, so the preview must not trust the origin
+    /// over the file.
+    #[tokio::test]
+    async fn a_paged_file_with_a_stale_text_origin_is_not_read_as_utf8() {
+        use wilkes_core::types::SourceOrigin;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comic.cbz");
+        // Bytes that are definitively not UTF-8, as a real archive's are.
+        std::fs::write(&path, [0x50, 0x4B, 0x03, 0x04, 0xFF, 0xFE, 0x00, 0x80]).unwrap();
+
+        let outcome = preview(
+            MatchRef {
+                path: path.clone(),
+                origin: SourceOrigin::TextFile { line: 1, col: 0 },
+                text_range: None,
+            },
+            None,
+        )
+        .await;
+
+        // It may fail because these bytes are not a readable archive, but it
+        // must not fail by trying to read them as text.
+        if let Err(error) = outcome {
+            let message = error.to_string();
+            assert!(
+                !message.contains("UTF-8"),
+                "a paged file must never be read as text: {message}"
+            );
+        }
+    }
+
+    /// And a genuine text file still takes the text path.
+    #[tokio::test]
+    async fn a_text_file_is_still_previewed_as_text() {
+        use wilkes_core::types::{PreviewData, SourceOrigin};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "first line\nsecond line\n").unwrap();
+
+        let data = preview(
+            MatchRef {
+                path,
+                origin: SourceOrigin::TextFile { line: 2, col: 1 },
+                text_range: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(data, PreviewData::Text { .. }));
+    }
 
     /// The preview a reader opens a PDF with carries the areas whose text this
     /// document's reading owns — the whole point of routing it through the

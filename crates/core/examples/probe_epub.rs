@@ -412,6 +412,18 @@ fn wilkes_path(path: &str) {
                     outline
                 );
                 println!("  images discovered: {}", content.images.len());
+                println!(
+                    "  source map: {} segments, text {} bytes; first origins: {:?}",
+                    content.source_map.segments.len(),
+                    content.text.len(),
+                    content
+                        .source_map
+                        .segments
+                        .iter()
+                        .take(2)
+                        .map(|s| format!("{:?}", s.origin))
+                        .collect::<Vec<_>>()
+                );
                 let meta = wilkes_core::metadata::document::DocumentMetadataExtractor;
                 use wilkes_core::metadata::FileMetadataExtractor;
                 match meta.extract_metadata(path) {

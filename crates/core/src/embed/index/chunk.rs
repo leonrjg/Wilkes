@@ -113,12 +113,26 @@ pub fn chunk_content(
                         })
                 })
                 .unwrap_or_else(|| {
-                    let line = content.text[..byte_range.start]
-                        .bytes()
-                        .filter(|&b| b == b'\n')
-                        .count() as u32
-                        + 1;
-                    SourceOrigin::TextFile { line, col: 0 }
+                    // Nothing in the source map covers this chunk. What that
+                    // means depends on what kind of document it is, and
+                    // answering "line N of a text file" for all of them is how
+                    // a comic archive — 196 pages, no text, and so no source
+                    // map at all — came to be recorded as a text position and
+                    // then handed to a reader that read it as UTF-8.
+                    match content.metadata.page_count {
+                        Some(_) => SourceOrigin::PdfPage {
+                            page: 1,
+                            bbox: None,
+                        },
+                        None => {
+                            let line = content.text[..byte_range.start]
+                                .bytes()
+                                .filter(|&b| b == b'\n')
+                                .count() as u32
+                                + 1;
+                            SourceOrigin::TextFile { line, col: 0 }
+                        }
+                    }
                 });
             Chunk {
                 text,
@@ -363,6 +377,67 @@ mod tests {
                 status: ImageAnalysisStatus::Complete,
             }],
         }
+    }
+
+    /// A paginated document whose source map covers nothing must not be
+    /// recorded at a text-file position.
+    ///
+    /// The case: a comic archive is 196 pages of images with no text, so
+    /// extraction yields an empty source map. Every chunk fell through to the
+    /// text fallback and was stored as "line 1", and opening such a match sent
+    /// a zip to `read_to_string` — "stream did not contain valid UTF-8" for a
+    /// file that opens perfectly from the file tree.
+    #[test]
+    fn a_paginated_document_with_no_source_map_is_not_given_a_text_position() {
+        let content = ExtractedContent {
+            text: "some text with no mapping at all behind it".to_string(),
+            source_map: SourceMap {
+                segments: Vec::new(),
+            },
+            metadata: FileMetadata {
+                path: PathBuf::from("comic.cbz"),
+                size_bytes: 0,
+                mime: Some("application/vnd.comicbook+zip".into()),
+                title: None,
+                page_count: Some(196),
+            },
+            images: Vec::new(),
+        };
+
+        let chunks = chunk_content(&content, PathBuf::from("comic.cbz"), 20, 0);
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(
+                matches!(chunk.origin, SourceOrigin::PdfPage { .. }),
+                "a paginated document must not yield {:?}",
+                chunk.origin
+            );
+        }
+    }
+
+    /// And a document that really is text keeps its line positions.
+    #[test]
+    fn an_unpaginated_document_with_no_source_map_keeps_its_lines() {
+        let content = ExtractedContent {
+            text: "first line\nsecond line\nthird line\n".to_string(),
+            source_map: SourceMap {
+                segments: Vec::new(),
+            },
+            metadata: FileMetadata {
+                path: PathBuf::from("notes.txt"),
+                size_bytes: 0,
+                mime: None,
+                title: None,
+                page_count: None,
+            },
+            images: Vec::new(),
+        };
+
+        let chunks = chunk_content(&content, PathBuf::from("notes.txt"), 12, 0);
+        assert!(!chunks.is_empty());
+        assert!(chunks
+            .iter()
+            .all(|chunk| matches!(chunk.origin, SourceOrigin::TextFile { .. })));
     }
 
     #[test]
